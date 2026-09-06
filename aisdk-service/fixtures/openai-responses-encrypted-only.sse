@@ -1,0 +1,16 @@
+data: {"type":"response.created","response":{"id":"resp_selfcheck_encrypted","created_at":1,"model":"responses-encrypted-only"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_selfcheck_2","encrypted_content":null}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_selfcheck_2","encrypted_content":"ENCRYPTED_ONLY_SELFCHECK"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_selfcheck_2"}}
+
+data: {"type":"response.output_text.delta","item_id":"msg_selfcheck_2","output_index":1,"delta":"好的"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_selfcheck_2"}}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":530,"output_tokens_details":{"reasoning_tokens":512}}}}
+
+data: [DONE]
+

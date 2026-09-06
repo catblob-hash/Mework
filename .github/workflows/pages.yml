@@ -1,0 +1,55 @@
+# Builds the documentation site from website/content and publishes it to
+# GitHub Pages. Enable Pages once in the repository settings with
+# "Source: GitHub Actions"; the workflow's `enablement: true` also creates the
+# site on first run when the token is allowed to.
+name: Documentation site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - "docs/context-injections/prompt-profile*.json"
+      - "scripts/build-site.mjs"
+      - "src/mework-icon.svg"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies (marked is the only one the build uses)
+        run: npm ci --ignore-scripts
+      - name: Build
+        run: node scripts/build-site.mjs --out website/dist
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

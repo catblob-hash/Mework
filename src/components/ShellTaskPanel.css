@@ -1,0 +1,49 @@
+/* One `bash` / `powershell` command's output, read-only.
+   Wears the interactive terminal's dark surface on purpose: it is the same kind of artifact, and
+   a build log that changed colour depending on who started it would read as a different thing. */
+.shell-task-panel {
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--color-171817); color: var(--color-d8ddd8);
+}
+.shell-task-panel__header {
+  min-height: 34px; flex: 0 0 auto; padding: 6px 10px 6px 13px;
+  display: flex; align-items: center; gap: 9px;
+  border-bottom: 1px solid var(--color-30332f); background: var(--color-202220);
+}
+.shell-task-panel__command {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--color-cbd1cb); font: 10px var(--mono);
+}
+.shell-task-panel__status {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  white-space: nowrap; color: var(--color-889088); font-size: 9px;
+}
+.shell-task-panel__status--running { color: var(--color-78c9a2); }
+.shell-task-panel__status--failed { color: var(--color-ef8d8d); }
+.shell-task-panel__stop.icon-button,
+.shell-task-panel__copy.icon-button {
+  width: 25px; height: 25px; min-width: 25px; flex-basis: 25px; color: var(--color-959c95);
+}
+.shell-task-panel__stop.icon-button:hover:not(:disabled),
+.shell-task-panel__copy.icon-button:hover:not(:disabled) {
+  background: var(--color-343734); color: var(--color-ffffff);
+}
+.shell-task-panel__copy--success.icon-button { color: var(--color-78c9a2); }
+.shell-task-panel__copy--error.icon-button { color: var(--color-ef8d8d); }
+.shell-task-panel__stop.icon-button:disabled { cursor: wait; opacity: .58; }
+
+/* The page keeps the tail; the model's copy of the same command keeps the head. Saying so is the
+   whole point — a suffix presented as the whole output would be a quiet lie. */
+.shell-task-panel__truncation,
+.shell-task-panel__error {
+  flex: 0 0 auto; margin: 0; padding: 6px 13px;
+  border-bottom: 1px solid var(--color-30332f); font-size: 9.5px; line-height: 14px;
+}
+.shell-task-panel__truncation { color: var(--color-889088); }
+.shell-task-panel__error { color: var(--color-ef8d8d); }
+
+.shell-task-panel__viewport {
+  flex: 1; min-height: 0; padding: 7px 10px 5px; overflow: hidden; background: var(--color-171817);
+}
+.shell-task-panel__viewport .xterm { height: 100%; }

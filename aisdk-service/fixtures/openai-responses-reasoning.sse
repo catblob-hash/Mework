@@ -1,0 +1,22 @@
+data: {"type":"response.created","response":{"id":"resp_selfcheck_reasoning","created_at":1,"model":"responses-reasoning"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_selfcheck_1","encrypted_content":null}}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_selfcheck_1","output_index":0,"summary_index":0,"delta":"先读 step.rs"}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_selfcheck_1","output_index":0,"summary_index":0,"delta":"，再决定改哪里"}
+
+data: {"type":"response.reasoning_summary_part.done","item_id":"rs_selfcheck_1","output_index":0,"summary_index":0}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_selfcheck_1","encrypted_content":"ENCRYPTED_REASONING_SELFCHECK"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_selfcheck_1"}}
+
+data: {"type":"response.output_text.delta","item_id":"msg_selfcheck_1","output_index":1,"delta":"读完了"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_selfcheck_1"}}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":31,"output_tokens":940,"output_tokens_details":{"reasoning_tokens":900}}}}
+
+data: [DONE]
+

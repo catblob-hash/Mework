@@ -1,0 +1,21 @@
+[package]
+name = "mework-agent-kernel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+[lib]
+# Hosts and tests import this crate as `agent_kernel`; the package name follows the workspace `mework-` prefix convention.
+# (For example: mework-workflow-core / workflow_core).
+name = "agent_kernel"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# Deliberately closed: this crate implements formal/tla/AgentKernel.tla and must not
+# depend on the engine, host, or async runtime.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

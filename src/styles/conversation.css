@@ -1,0 +1,489 @@
+/* Main conversation */
+.main-pane { grid-column: auto; min-width: 0; height: 100%; display: flex; flex-direction: column; background: var(--app); }
+.topbar { height: var(--topbar-height); flex: 0 0 var(--topbar-height); padding: 0 12px 0 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: var(--color-f7f7f5-ap92); }
+.topbar__leading, .topbar__actions { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.conversation-title { min-width: 0; padding-left: 2px; }
+.conversation-title > div { height: 15px; display: flex; align-items: center; gap: 3px; font-size: 10px; color: var(--faint); }
+.conversation-title h1 { max-width: 420px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 650; }
+.topbar__empty { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.topbar__empty-title { font-size: 15px; margin: 0; }
+.topbar__empty-tagline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--faint); }
+.topbar-button { height: 32px; padding: 0 9px; display: inline-flex; align-items: center; gap: 6px; border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; }
+.topbar-button:hover, .topbar-button--active { background: var(--hover); color: var(--text); }
+.topbar-sidebar-toggle { position: relative; width: 32px; height: 32px; flex-basis: 32px; margin-left: 1px; }
+.topbar-sidebar-toggle--active { color: var(--text); background: var(--hover); }
+/* Unread marker on the task button: the tasks moved since the panel was last
+   open. It sits on the icon's top-right corner, ringed in the topbar's own
+   background so it stays legible over the hover fill. */
+.topbar-sidebar-toggle__dot {
+  position: absolute; top: 6px; right: 6px; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 1.5px var(--color-f7f7f5-ap92);
+}
+.save-status { height: 26px; display: inline-flex; align-items: center; gap: 4px; padding: 0 5px; color: var(--faint); font-size: 10px; }
+.save-status--error { color: var(--danger); }
+/* Truncate the host rejection reason in the top bar; the title retains the full text. */
+.save-status__reason { max-width: 30ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.85; }
+.conversation-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; }
+.conversation-pane[hidden] { display: none; }
+/* The subagent transcript replaces the conversation in the same track, so it
+   takes the pane's full height rather than stacking above the hidden one. */
+.main-pane__subagent { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.main-pane__subagent > * { flex: 1; min-height: 0; }
+/* Preview / read-only shell output / review, each taking the whole message area beside the
+   hidden conversation pane. Mirrors the subagent transcript because to the user they are the
+   same move: the task bar sends you here, the back arrow sends you home. */
+.main-pane__page { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.main-pane__page[hidden] { display: none; }
+.main-pane__page > * { flex: 1; min-height: 0; }
+.conversation-view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.conversation-overview { width: 100%; min-height: 46px; padding-top: 12px; flex: 0 0 auto; position: relative; z-index: 40; display: flex; align-items: flex-start; justify-content: center; }
+.conversation-overview__prompt-slot { width: min(820px, calc(100% - 48px)); max-width: 820px; min-width: 0; flex: 0 0 auto; display: flex; align-items: center; gap: 12px; }
+.workflow-history { width: min(820px, calc(100% - 48px)); margin: 8px auto; padding: 12px; max-height: 50vh; overflow: auto; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
+.workflow-history h3 { margin: 0 0 6px; font-size: 13px; }
+.workflow-history > p { color: var(--muted); }
+.workflow-history details { padding: 8px 0; }
+.workflow-history summary { cursor: pointer; overflow-wrap: anywhere; }
+.workflow-history button { padding: 5px 8px; text-align: left; border-radius: 5px; }
+.workflow-history button:disabled { opacity: .6; cursor: default; }
+.workflow-history .conversation-view { min-height: 220px; max-height: 40vh; }
+.conversation-overview__text-action {
+  min-height: 26px; padding: 0 3px; position: relative; isolation: isolate;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 0; background: transparent; box-shadow: none;
+  color: var(--muted); text-align: left; white-space: nowrap;
+  transition: color .16s ease;
+}
+.conversation-overview__text-action::before {
+  content: ""; position: absolute; z-index: -1; inset: -4px -8px; border-radius: 50%;
+  background: radial-gradient(ellipse closest-side, var(--app) 0 76%, transparent 100%);
+  transition: background .16s ease;
+}
+.conversation-overview__text-action:hover,
+.conversation-overview__text-action:focus-visible,
+.conversation-overview__text-action[aria-expanded="true"] { color: var(--text); }
+.conversation-overview__text-action:focus-visible { outline: none; }
+.conversation-overview__text-action:hover::before,
+.conversation-overview__text-action:focus-visible::before,
+.conversation-overview__text-action[aria-expanded="true"]::before {
+  background: radial-gradient(ellipse closest-side, var(--hover) 0 76%, transparent 100%);
+}
+.conversation-overview__text-action > span { position: relative; z-index: 1; font-size: 11px; font-weight: 650; }
+/* Show the system prompt without a title and use the remaining row width. App omits this entry when no prompt exists. */
+.primary-system-prompt {
+  flex: 1 1 auto; min-width: 0; min-height: 26px; padding: 0 3px;
+  display: inline-flex; align-items: center;
+  border: 0; border-radius: 0; background: transparent; box-shadow: none;
+  color: var(--muted); text-align: left; transition: color .16s ease;
+}
+.primary-system-prompt:hover, .primary-system-prompt:focus-visible { color: var(--text); }
+.primary-system-prompt > span {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; font-weight: 500; line-height: 1.5;
+}
+
+.context-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative; }
+.context-stream { width: min(820px, calc(100% - 48px)); min-height: 100%; margin: 0 auto; padding: 24px 0 28px; display: flex; flex-direction: column; translate: 0 0; transition: translate .32s cubic-bezier(.2, .75, .25, 1); }
+/* Appearance settings are applied as data attributes; this is their sole CSS consumer. */
+:root[data-wide-messages="true"] .context-stream { width: min(1180px, calc(100% - 48px)); }
+.context-slot { width: 100%; position: relative; content-visibility: auto; contain-intrinsic-size: auto 140px; }
+.context-slot + .context-slot { margin-top: 16px; }
+.context-card {
+  width: 100%; position: relative; border-radius: 10px; font-size: 13px; line-height: 1.58; color: var(--text);
+  scroll-margin: 120px; transition: background .12s, border-color .12s, box-shadow .12s;
+}
+.context-card:focus-visible { outline-offset: 3px; }
+.context-card__header { height: 25px; display: flex; align-items: center; gap: 7px; padding: 0 3px 4px; color: var(--faint); }
+.context-card__kind { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 650; letter-spacing: .01em; }
+.context-card__local-only { padding: 1px 5px; border: 1px solid var(--color-d6c5a6); border-radius: 999px; color: var(--color-795d2e); background: var(--color-fbf6eb); font-size: 9px; font-weight: 650; }
+.context-card__hook-injected { padding: 1px 5px; border: 1px solid var(--color-a9c5b5); border-radius: 999px; color: var(--color-356449); background: var(--color-edf7f0); font-size: 9px; font-weight: 650; }
+.context-card__time { font-size: 9.5px; }
+.context-actions { margin-left: auto; display: flex; gap: 1px; opacity: 0; transform: translateY(2px); transition: opacity .12s, transform .12s; }
+.context-actions .icon-button { width: 26px; height: 25px; flex-basis: 26px; }
+.context-card:hover .context-actions, .context-card:focus-within .context-actions { opacity: 1; transform: none; }
+.context-card__content { white-space: pre-wrap; overflow-wrap: anywhere; }
+.context-card__images { margin-bottom: 8px; }
+/* Citation chips from server-side retrieval or grounding below assistant content. */
+.context-card__sources { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+.context-card__source { display: inline-flex; align-items: center; max-width: 260px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; color: var(--muted); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+a.context-card__source:hover { background: var(--hover); color: var(--text); }
+.context-editor__images { margin-bottom: 10px; }
+.context-card--system { padding: 9px 12px 11px; border: 1px solid var(--color-dfdfd9); border-left: 3px solid var(--color-8d8d87); background: var(--color-f1f1ee); }
+.context-card--system .context-card__header { padding-left: 0; }
+.context-card--system .context-card__content { color: var(--color-4c4c49); font-size: 12.5px; }
+.context-card--hook { border-left-color: var(--color-6f73a8); background: var(--color-f3f3f9); }
+.context-card--hook .context-card__kind { color: var(--color-55598c); }
+.context-card--hook .context-card__content { max-height: 240px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11.5px; line-height: 1.55; }
+.context-card--hook-blocked { border-color: var(--color-d8aaaa); border-left-color: var(--color-a04b4b); background: var(--color-fbf1f1); }
+.context-card--hook-blocked .context-card__kind, .context-card--hook-failed .context-card__kind { color: var(--color-944848); }
+.context-card--hook-failed { border-left-color: var(--color-b86b4a); background: var(--color-fcf4ef); }
+.context-card--user { width: auto; max-width: 78%; margin-left: auto; padding: 9px 12px 11px; border: 1px solid var(--color-dce3f3); background: var(--color-eef2f9); border-bottom-right-radius: 3px; }
+.context-card--user.context-card--has-actions { padding-right: 68px; }
+.context-card--user.context-card--has-user-toolbar { margin-bottom: 24px; }
+.context-card--user > .context-actions { position: absolute; top: 50%; right: 8px; margin-left: 0; transform: translateY(-50%); }
+.context-card--user:hover > .context-actions, .context-card--user:focus-within > .context-actions { transform: translateY(-50%); }
+.user-message-toolbar { position: absolute; top: calc(100% + 3px); right: 0; height: 22px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; color: var(--faint); white-space: nowrap; }
+.user-message-toolbar__action { width: 22px; height: 22px; flex: 0 0 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; background: transparent; color: var(--muted); }
+.user-message-toolbar__action:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.user-message-toolbar__action:disabled { opacity: .42; }
+.user-message-toolbar__branches { display: inline-flex; align-items: center; gap: 1px; font-size: 10px; font-variant-numeric: tabular-nums; }
+.user-message-toolbar__branches .icon-button { width: 21px; height: 21px; flex-basis: 21px; }
+.user-message-toolbar__branches > span { min-width: 29px; text-align: center; }
+.context-card--assistant { max-width: 86%; padding: 2px 3px 4px 0; }
+.context-card--assistant .context-card__kind { color: var(--color-565650); }
+.context-card--assistant .context-actions { margin-left: 0; }
+.context-card--assistant .context-card__content { font-size: var(--message-font-size); font-family: var(--message-font-family); }
+.context-card--user .context-card__content { font-size: var(--message-font-size); font-family: var(--message-font-family); }
+.markdown-content { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+
+/*
+ * Streaming reveal: each 100 ms commit fades its newly arrived tail in from
+ * left to right, so text appears to be written rather than to blink into place
+ * a block at a time.
+ *
+ * A mask, not opacity: opacity would dim the already-settled text too. The
+ * sweep runs from `--stream-reveal-from` (where the previous commit's text
+ * ended) to the end, so only the new tail moves. `--stream-reveal` has to be
+ * registered with @property — an unregistered custom property is a plain token
+ * and jumps rather than interpolating.
+ *
+ * The two tick values carry identical keyframes. Alternating between them is
+ * what restarts the animation each commit: re-setting the same animation name
+ * does not replay a running animation.
+ */
+@property --stream-reveal {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 100%;
+}
+
+@keyframes markdown-stream-reveal-a {
+  from { --stream-reveal: var(--stream-reveal-from, 0%); }
+  to { --stream-reveal: 100%; }
+}
+@keyframes markdown-stream-reveal-b {
+  from { --stream-reveal: var(--stream-reveal-from, 0%); }
+  to { --stream-reveal: 100%; }
+}
+
+.markdown-content[data-stream-tick] {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    var(--color-000000) var(--stream-reveal),
+    transparent calc(var(--stream-reveal) + 9%)
+  );
+  mask-image: linear-gradient(
+    to right,
+    var(--color-000000) var(--stream-reveal),
+    transparent calc(var(--stream-reveal) + 9%)
+  );
+  animation-duration: 100ms;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+.markdown-content[data-stream-tick="0"] { animation-name: markdown-stream-reveal-a; }
+.markdown-content[data-stream-tick="1"] { animation-name: markdown-stream-reveal-b; }
+
+@media (prefers-reduced-motion: reduce) {
+  /* The reveal is decoration; text must still land fully opaque without it. */
+  .markdown-content[data-stream-tick] { -webkit-mask-image: none; mask-image: none; animation: none; }
+}
+.markdown-content > :first-child { margin-top: 0; }
+.markdown-content > :last-child { margin-bottom: 0; }
+.markdown-content p { margin: .48em 0; }
+.markdown-content h1, .markdown-content h2, .markdown-content h3,
+.markdown-content h4, .markdown-content h5, .markdown-content h6 { margin: 1.05em 0 .42em; color: var(--text); line-height: 1.3; }
+.markdown-content h1 { font-size: 1.42em; }
+.markdown-content h2 { font-size: 1.25em; }
+.markdown-content h3 { font-size: 1.12em; }
+.markdown-content h4, .markdown-content h5, .markdown-content h6 { font-size: 1em; }
+.markdown-content ul, .markdown-content ol { margin: .5em 0; padding-left: 1.65em; }
+.markdown-content li { margin: .18em 0; }
+.markdown-content li > p { margin: .18em 0; }
+.markdown-content ul.contains-task-list { padding-left: .25em; list-style: none; }
+.markdown-content .task-list-item { display: flex; align-items: flex-start; gap: .45em; }
+.markdown-content .task-list-item > input { margin-top: .38em; accent-color: var(--accent); }
+.markdown-content blockquote { margin: .65em 0; padding: .05em 0 .05em .85em; border-left: 2px solid var(--border-strong); color: var(--muted); }
+.markdown-content blockquote > :first-child { margin-top: 0; }
+.markdown-content blockquote > :last-child { margin-bottom: 0; }
+.markdown-content a { color: var(--color-315eae); text-decoration: underline; text-decoration-color: var(--color-315eae-ap35); text-underline-offset: 2px; }
+.markdown-content a:hover { text-decoration-color: currentColor; }
+.markdown-content code { border-radius: 4px; font: .9em/1.55 var(--mono); }
+.markdown-content :not(pre) > code { padding: .08em .32em; background: var(--color-edede9); color: var(--color-343431); }
+.markdown-content pre { max-width: 100%; margin: .65em 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--color-e0e0db); border-radius: 8px; background: var(--color-f1f1ee); color: var(--color-343431); line-height: 1.55; }
+.markdown-content pre code { white-space: pre; overflow-wrap: normal; }
+:root[data-code-wrap="true"] .markdown-content pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Collapse code blocks above this height; expand them on focus or hover. CSS avoids per-block state during streaming rerenders. */
+:root[data-code-collapse="true"] .markdown-content pre { max-height: 22em; }
+:root[data-code-collapse="true"] .markdown-content pre:hover,
+:root[data-code-collapse="true"] .markdown-content pre:focus-within { max-height: none; }
+.markdown-content hr { height: 1px; margin: .9em 0; border: 0; background: var(--border); }
+.markdown-content__table-scroll { max-width: 100%; margin: .7em 0; overflow-x: auto; }
+.markdown-content table { width: max-content; min-width: min(100%, 360px); border-collapse: collapse; font-size: .94em; }
+.markdown-content th, .markdown-content td { padding: .38em .62em; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+.markdown-content th { background: var(--color-f1f1ee); font-weight: 650; }
+.markdown-content img { display: block; max-width: 100%; height: auto; margin: .7em 0; border-radius: 8px; }
+.markdown-content .katex { font-size: 1.02em; }
+.markdown-content .katex-display { max-width: 100%; margin: .72em 0; padding: .15em 0; overflow-x: auto; overflow-y: hidden; text-align: left; }
+.markdown-content .katex-display > .katex { text-align: left; }
+.context-card--streaming .context-card__kind { color: var(--accent); }
+.stream-waiting { min-height: 30px; margin-top: 12px; padding: 2px 3px; display: flex; align-items: center; gap: 9px; color: var(--color-65655f); --pulse-color: var(--color-343431); }
+.stream-waiting__square { width: 11px; height: 11px; flex: 0 0 11px; border-radius: 3px; background: var(--color-343431); transform-origin: center; animation: stream-waiting-pulse 1.25s cubic-bezier(.45, 0, .55, 1) infinite; }
+.stream-waiting__square--tool { width: 8px; height: 8px; flex-basis: 8px; border-radius: 2.5px; background: currentColor; }
+/* One line per call in flight. Usually there is exactly one; async tools are
+   what make it a column rather than a single row. */
+.stream-waiting__activities { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.stream-waiting__activity { min-width: 0; display: inline-flex; align-items: baseline; gap: 5px; overflow: hidden; white-space: nowrap; font-size: 11.5px; font-weight: 570; animation: stream-waiting-activity-in .22s cubic-bezier(.2, .75, .25, 1); }
+.stream-waiting__activity-title { flex: 0 0 auto; }
+.stream-waiting__activity-target { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 10.5px/1.5 var(--mono); color: var(--faint); }
+.stream-waiting__activity-count { flex: 0 0 auto; font: 500 10.5px/1.5 var(--mono); color: var(--faint); }
+.stream-waiting__dots { height: 5px; display: inline-flex; align-items: center; gap: 2px; }
+.stream-waiting__dots i { width: 2.5px; height: 2.5px; display: block; border-radius: 50%; background: currentColor; animation: stream-waiting-dot 1.2s ease-in-out infinite; }
+.stream-waiting__dots i:nth-child(2) { animation-delay: .14s; }
+.stream-waiting__dots i:nth-child(3) { animation-delay: .28s; }
+.stream-waiting--retry { color: var(--color-92600d); --pulse-color: var(--color-92600d); }
+.stream-waiting--retry .stream-waiting__cat { color: var(--color-c98a1b); }
+.stream-waiting__retry-message { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ab7d3c); font-size: 10px; }
+@keyframes stream-waiting-pulse { 50% { transform: scale(.56); opacity: .58; } }
+@keyframes stream-waiting-activity-in { from { opacity: 0; transform: translateX(-4px); } }
+@keyframes stream-waiting-dot { 0%, 60%, 100% { opacity: .28; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+
+/* Streaming mascot. The silhouette is one flat colour, so overlapping parts fuse;
+   `transform-box: view-box` lets every origin be written in raw viewBox units. */
+.stream-waiting__cat { width: 36px; height: 23px; flex: 0 0 36px; color: var(--color-343431); fill: currentColor; }
+.stream-cat, .stream-cat-leg, .stream-cat-tail, .stream-cat-head, .stream-cat-ear { transform-box: view-box; }
+.stream-cat { transform-origin: 36px 39px; }
+.stream-cat-tail { fill: none; stroke: currentColor; stroke-width: 4.4; stroke-linecap: round; transform-origin: 15px 21px; }
+.stream-cat-head { transform-origin: 45px 21px; }
+.stream-cat-ear--front { transform-origin: 55px 11px; }
+.stream-cat-leg--hind-far { opacity: .45; transform-origin: 18.75px 29px; }
+.stream-cat-leg--fore-far { opacity: .45; transform-origin: 38.75px 29px; }
+.stream-cat-leg--hind-near { transform-origin: 23.75px 29px; }
+.stream-cat-leg--fore-near { transform-origin: 43.75px 29px; }
+
+/* Walking: diagonal leg pairs swing out of phase over one stride, body bobs twice per stride. */
+.stream-waiting__cat--walk .stream-cat { animation: stream-cat-bob .34s ease-in-out infinite; }
+.stream-waiting__cat--walk .stream-cat-leg { animation: stream-cat-step-a .68s ease-in-out infinite; }
+.stream-waiting__cat--walk .stream-cat-leg--fore-far,
+.stream-waiting__cat--walk .stream-cat-leg--hind-near { animation-name: stream-cat-step-b; }
+.stream-waiting__cat--walk .stream-cat-tail { animation: stream-cat-walk-tail 1.36s ease-in-out infinite; }
+.stream-waiting__cat--walk .stream-cat-head { animation: stream-cat-walk-head .68s ease-in-out infinite; }
+
+/* Grooming: near foreleg lifts to the muzzle, head dips and licks four times, then resets. */
+.stream-waiting__cat--groom .stream-cat-head { animation: stream-cat-groom-head 3.4s ease-in-out infinite; }
+.stream-waiting__cat--groom .stream-cat-leg--fore-near { animation: stream-cat-groom-paw 3.4s ease-in-out infinite; }
+.stream-waiting__cat--groom .stream-cat-tail { animation: stream-cat-groom-tail 3.4s ease-in-out infinite; }
+
+/* Idle tail-wag: only the tail, a slow breath, an ear flick and the odd glance away. */
+.stream-waiting__cat--idle .stream-cat { animation: stream-cat-breathe 3.4s ease-in-out infinite; }
+.stream-waiting__cat--idle .stream-cat-tail { animation: stream-cat-wag 1.7s ease-in-out infinite; }
+.stream-waiting__cat--idle .stream-cat-ear--front { animation: stream-cat-ear-twitch 3.4s ease-in-out infinite; }
+.stream-waiting__cat--idle .stream-cat-head { animation: stream-cat-gaze 3.4s ease-in-out infinite; }
+
+/*
+ * Mood transitions.
+ *
+ * A mood used to swap as a jump cut: the outgoing loop was torn off wherever it
+ * happened to be — mid-stride, or with the grooming paw still folded up at the
+ * muzzle — and the incoming one started from the neutral pose. Two things
+ * remove that discontinuity, and they only work together.
+ *
+ * First, every duration inside one mood divides that mood's loop period (walk
+ * 1.36s, groom 3.4s, idle 3.4s) and one of them equals it, and the component
+ * only ever dwells for a whole number of those periods — measured against the
+ * equal-length animation's own clock, not the timer's. Parts of a mood therefore
+ * reach their shared 0% keyframe — the neutral standing pose — at the same
+ * instant the dwell expires. `keeps every part of a mood on one shared loop
+ * period` pins the divisibility; break it and the beat starts from a pose the
+ * cat was never in.
+ *
+ * Second, the beat below also starts and ends neutral, so the incoming loop
+ * picks up exactly where the beat puts the cat down.
+ *
+ * The beat is keyed on the DESTINATION only. Every mood rests on the same
+ * neutral pose, so the source contributes nothing a beat could react to — which
+ * is what turns six ordered pairs into three animations. The duration is
+ * mirrored by CAT_TRANSITION_MS on the component side, which owns the watchdog
+ * that has to outlast it.
+ *
+ * Nothing here is `infinite`: the beat is a one-shot, and its end on the root
+ * group is the event the component commits the new mood on.
+ */
+.stream-waiting__cat--to-walk .stream-cat { animation: stream-cat-to-walk .56s ease-in-out; }
+.stream-waiting__cat--to-walk .stream-cat-leg { animation: stream-cat-to-walk-step-a .56s ease-in-out; }
+.stream-waiting__cat--to-walk .stream-cat-leg--fore-far,
+.stream-waiting__cat--to-walk .stream-cat-leg--hind-near { animation-name: stream-cat-to-walk-step-b; }
+.stream-waiting__cat--to-walk .stream-cat-tail { animation: stream-cat-to-walk-tail .56s ease-in-out; }
+
+.stream-waiting__cat--to-groom .stream-cat { animation: stream-cat-to-groom .56s ease-in-out; }
+.stream-waiting__cat--to-groom .stream-cat-tail { animation: stream-cat-to-groom-tail .56s ease-in-out; }
+.stream-waiting__cat--to-groom .stream-cat-ear--front { animation: stream-cat-to-groom-ear .56s ease-in-out; }
+
+.stream-waiting__cat--to-idle .stream-cat { animation: stream-cat-to-idle .56s ease-in-out; }
+.stream-waiting__cat--to-idle .stream-cat-tail { animation: stream-cat-to-idle-tail .56s ease-in-out; }
+.stream-waiting__cat--to-idle .stream-cat-head { animation: stream-cat-to-idle-head .56s ease-in-out; }
+
+@keyframes stream-cat-step-a { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(27deg); } 75% { transform: rotate(-27deg); } }
+@keyframes stream-cat-step-b { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(-27deg); } 75% { transform: rotate(27deg); } }
+@keyframes stream-cat-bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1.7px); } }
+@keyframes stream-cat-walk-tail { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(-7deg); } 75% { transform: rotate(9deg); } }
+@keyframes stream-cat-walk-head { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(3deg); } }
+@keyframes stream-cat-groom-head {
+  0%, 6% { transform: rotate(0deg); }
+  16% { transform: rotate(16deg); }
+  24% { transform: rotate(10deg); }
+  32% { transform: rotate(17deg); }
+  40% { transform: rotate(10deg); }
+  48% { transform: rotate(17deg); }
+  56% { transform: rotate(11deg); }
+  64% { transform: rotate(16deg); }
+  76%, 100% { transform: rotate(0deg); }
+}
+@keyframes stream-cat-groom-paw {
+  0%, 6% { transform: rotate(0deg); }
+  16%, 64% { transform: rotate(-95deg); }
+  76%, 100% { transform: rotate(0deg); }
+}
+@keyframes stream-cat-groom-tail { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(5deg); } }
+@keyframes stream-cat-wag { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(-16deg); } 75% { transform: rotate(21deg); } }
+@keyframes stream-cat-breathe { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.035); } }
+@keyframes stream-cat-ear-twitch { 0%, 80%, 100% { transform: rotate(0deg); } 84% { transform: rotate(-15deg); } 88% { transform: rotate(7deg); } 92% { transform: rotate(-9deg); } 96% { transform: rotate(2deg); } }
+/* Glance and flick sit in disjoint windows of the shared cycle, so the two never
+   fire together and the idle loop still reads as two separate thoughts. */
+@keyframes stream-cat-gaze { 0%, 30%, 100% { transform: rotate(0deg); } 44%, 62% { transform: rotate(-5deg); } }
+
+/*
+ * The three transition beats. Each one is a wind-down the cat shares with every
+ * mood, folded into the first third, followed by an anticipation of the mood it
+ * is about to start.
+ *
+ * The numbers are bounded by what the drawing can afford rather than by taste.
+ * The neutral silhouette paints [4.12, 61.00] x [3.40, 39.00] inside a 72x46
+ * viewBox, so the top edge is the scarce margin and everything below leans on
+ * the roomy bottom and the legs instead. The widest existing extremes — the
+ * walk bob's 1.7 units of headroom and the idle wag's -16deg to 21deg on the
+ * tail — are treated as the envelope; no beat here reaches past them.
+ */
+@keyframes stream-cat-to-walk {
+  /* Weight rocks onto the hind legs, then the front lifts into the first stride. */
+  0%, 100% { transform: rotate(0deg) translateY(0); }
+  30% { transform: rotate(2.6deg) translateY(.9px); }
+  64% { transform: rotate(-1.8deg) translateY(-1px); }
+}
+/* Ends travelling in the same direction the walk loop opens with, so the handover reads as one stride. */
+@keyframes stream-cat-to-walk-step-a { 0%, 100% { transform: rotate(0deg); } 32% { transform: rotate(9deg); } 72% { transform: rotate(-18deg); } }
+@keyframes stream-cat-to-walk-step-b { 0%, 100% { transform: rotate(0deg); } 32% { transform: rotate(-9deg); } 72% { transform: rotate(18deg); } }
+@keyframes stream-cat-to-walk-tail { 0%, 100% { transform: rotate(0deg); } 44% { transform: rotate(14deg); } }
+@keyframes stream-cat-to-groom {
+  /* Settles back onto the haunches: the rear sinks and the shoulders come up. */
+  0%, 100% { transform: rotate(0deg) translateY(0); }
+  38% { transform: rotate(-1.7deg) translateY(1px); }
+  74% { transform: rotate(.5deg) translateY(-.2px); }
+}
+@keyframes stream-cat-to-groom-tail { 0%, 100% { transform: rotate(0deg); } 46% { transform: rotate(-12deg); } 78% { transform: rotate(4deg); } }
+/* The flick lands late, so it reads as the last thing before the cat starts washing. */
+@keyframes stream-cat-to-groom-ear { 0%, 52%, 86%, 100% { transform: rotate(0deg); } 62% { transform: rotate(-13deg); } 74% { transform: rotate(6deg); } }
+@keyframes stream-cat-to-idle {
+  /* Drops its weight, then breathes back up into the idle loop's own breath. */
+  0%, 100% { transform: translateY(0) scaleY(1); }
+  28% { transform: translateY(1.5px) scaleY(.955); }
+  62% { transform: translateY(-.35px) scaleY(1.012); }
+}
+@keyframes stream-cat-to-idle-tail { 0%, 100% { transform: rotate(0deg); } 24% { transform: rotate(19deg); } 58% { transform: rotate(-13deg); } 84% { transform: rotate(6deg); } }
+@keyframes stream-cat-to-idle-head { 0%, 100% { transform: rotate(0deg); } 30% { transform: rotate(6deg); } 70% { transform: rotate(-3deg); } }
+.context-card--reasoning { padding: 7px 10px 9px; background: var(--color-f2f2ef); border-left: 3px solid var(--color-a8a89f); }
+.context-card--reasoning .context-card__header { padding-left: 0; }
+.context-card--reasoning:not(.context-card--encrypted) { max-width: 88%; padding: 0; border-left: 0; border-radius: 0; background: transparent; }
+.reasoning-content { min-width: 0; }
+.reasoning-content__heading { min-height: 27px; display: flex; align-items: center; gap: 2px; }
+.reasoning-content__heading .context-actions { margin-left: 0; }
+.reasoning-content__summary { width: auto; min-height: 27px; padding: 2px 1px; display: flex; align-items: center; gap: 7px; border-radius: 6px; background: transparent; color: var(--color-666660); font-size: 12px; font-weight: 600; text-align: left; }
+.reasoning-content__summary:hover { color: var(--text); }
+.reasoning-content__summary--static { padding-left: 23px; cursor: default; }
+.reasoning-content__summary--static:hover { color: var(--color-666660); }
+.reasoning-content__meta { flex: 0 0 auto; color: var(--faint); font: 9.5px var(--mono); }
+.reasoning-content__summary svg { flex: 0 0 auto; color: var(--color-8c8c85); }
+.context-card--streaming .reasoning-content__summary { color: var(--accent); }
+.reasoning-content__panel { margin-left: 7px; padding: 5px 0 0 18px; position: relative; border-left: 1px solid var(--color-d4d4ce); }
+.reasoning-content__viewport { overflow: hidden; transition: max-height .26s cubic-bezier(.4, 0, .2, 1); }
+.reasoning-content__body { margin: 0; overflow-wrap: anywhere; color: var(--color-5f5f5a); font-size: 12.5px; line-height: 1.62; }
+.reasoning-content__body .markdown-content h1, .reasoning-content__body .markdown-content h2,
+.reasoning-content__body .markdown-content h3, .reasoning-content__body .markdown-content h4,
+.reasoning-content__body .markdown-content h5, .reasoning-content__body .markdown-content h6 { color: var(--color-4d4d48); }
+.reasoning-content__panel--preview.reasoning-content__panel--overflowing .reasoning-content__viewport { -webkit-mask-image: linear-gradient(to bottom, var(--color-000000) 62%, transparent 100%); mask-image: linear-gradient(to bottom, var(--color-000000) 62%, transparent 100%); }
+.reasoning-content__toggle { min-width: 36px; height: 21px; margin: 2px 0 0 -4px; padding: 0 4px; display: block; border-radius: 4px; background: transparent; color: var(--color-8b8b85); font-size: 10.5px; text-align: left; transition: color .12s, opacity .12s, background .12s; }
+.reasoning-content__toggle--expand { opacity: 0; }
+.reasoning-content__toggle--suppressed { opacity: 0 !important; pointer-events: none; }
+.reasoning-content__panel--preview:hover .reasoning-content__toggle--expand,
+.reasoning-content__panel--preview:focus-within .reasoning-content__toggle--expand { opacity: .58; }
+.reasoning-content__toggle--collapse { opacity: .58; }
+.reasoning-content__toggle:hover, .reasoning-content__toggle:focus-visible { opacity: 1 !important; color: var(--color-3f3f3b); background: var(--color-ecece7); }
+.context-card--encrypted { border-left-color: var(--color-9c7c48); background: var(--color-f5f2eb); }
+.context-card--tool-group { border-radius: 0; }
+.tool-call-group__heading { min-height: 29px; margin: 0; }
+.tool-call-group__toggle { width: 100%; min-height: 29px; padding: 1px 3px; display: flex; align-items: center; gap: 7px; border-radius: 6px; background: transparent; color: var(--color-5f5f5a); font-size: 11.75px; font-weight: 610; text-align: left; }
+.tool-call-group__toggle:hover, .tool-call-group__toggle:focus-visible { color: var(--text); background: var(--color-000000-ap2_6); }
+.tool-call-group__toggle > span:nth-child(2) { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-call-group__toggle > .disclosure-chevron { color: var(--color-888881); }
+.tool-call-group__lead-icon { width: 18px; height: 18px; flex: 0 0 18px; display: grid; place-items: center; color: var(--color-777771); }
+.tool-call-group__list { max-height: min(48vh, 430px); margin: 2px 0 0 9px; padding: 1px 2px 3px 13px; overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; border-left: 1px solid var(--color-dcdcd6); }
+.tool-call-group__item { position: relative; min-width: 0; background: transparent; }
+.tool-call-group__item-heading { min-width: 0; display: flex; align-items: center; border-radius: 6px; background: transparent; }
+.tool-call-group__item-heading:hover, .tool-call-group__item:focus-within > .tool-call-group__item-heading { background: var(--color-000000-ap2_6); }
+.tool-context__summary { flex: 1; min-width: 0; min-height: 32px; padding: 1px 5px 1px 2px; display: flex; align-items: center; gap: 6px; background: transparent; text-align: left; }
+.tool-context__summary > .disclosure-chevron { flex: 0 0 auto; color: var(--color-94948d); }
+.tool-context__icon { width: 18px; height: 18px; flex: 0 0 18px; display: grid; place-items: center; color: var(--color-777771); }
+.tool-context__copy { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 7px; }
+.tool-context__name { flex: 0 0 auto; max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-4f4f4a); font-size: 11.25px; font-weight: 570; }
+.tool-context__copy code { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font: 9.75px var(--mono); }
+.tool-context__stat { flex: 0 0 auto; color: var(--faint); font: 9.5px var(--mono); }
+.execution-status { width: 18px; height: 18px; margin-left: 1px; padding: 0; flex: 0 0 18px; display: grid; place-items: center; border-radius: 50%; background: transparent; }
+.execution-status--success { color: var(--success); }
+.execution-status--error { color: var(--danger); }
+.execution-status--announced, .execution-status--ready { color: var(--color-8d8d86); }
+.execution-status--running { color: var(--accent); }
+.execution-status--halted { color: var(--warning); }
+.tool-call-group__item--announced .tool-context__summary, .tool-call-group__item--ready .tool-context__summary { color: var(--color-66665f); }
+.tool-call-group__item--running .tool-context__name, .tool-call-group__item--running .tool-context__copy code { color: var(--accent); }
+.tool-call-group__item--error .tool-context__name, .tool-call-group__item--error .tool-context__copy code { color: var(--danger); }
+.tool-call-group__item--halted .tool-context__name { color: var(--warning); }
+.tool-call-group__open-agent { height: 21px; margin-right: 4px; padding: 0 7px 0 5px; flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: 7px; background: var(--color-fafaf8); color: var(--color-545450); font-size: 10px; white-space: nowrap; }
+.tool-call-group__open-agent > svg { flex: 0 0 auto; color: var(--color-8b611d); }
+.tool-call-group__open-agent:hover, .tool-call-group__open-agent:focus-visible { color: var(--text); background: var(--hover); }
+.tool-call-group__actions { flex: 0 0 auto; margin: 0 3px 0 0; opacity: 0; transform: translateY(1px); }
+.tool-call-group:hover .tool-call-group__actions { opacity: 0; }
+.tool-call-group__item:hover .tool-call-group__actions, .tool-call-group__item:focus-within .tool-call-group__actions { opacity: 1; transform: none; }
+.tool-call-group__actions .icon-button { width: 24px; height: 24px; flex-basis: 24px; }
+.tool-context__details { margin: 2px 3px 8px 25px; background: transparent; }
+.tool-context__details .tool-renderer { box-shadow: 0 1px 2px var(--color-000000-ap2_5); }
+.tool-context__details .diff-output { margin: 8px; }
+.tool-call-group__insertion { z-index: 3; }
+.diff-output { margin: 6px 10px 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--color-ffffff); }
+.diff-output__header { min-height: 31px; padding: 5px 8px 5px 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); background: var(--color-fafaf8); }
+.diff-output__header code { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-4e4e49); font: 9.75px var(--mono); }
+.diff-output__stats { flex: 0 0 auto; display: inline-flex; gap: 4px; }
+.diff-output__stat { min-width: 25px; padding: 2px 5px; border-radius: 4px; font: 650 8.5px var(--mono); text-align: center; }
+.diff-output__stat--addition { color: var(--success); background: var(--success-soft); }
+.diff-output__stat--deletion { color: var(--danger); background: var(--danger-soft); }
+.diff-output__body { max-height: 240px; overflow: auto; background: var(--color-fdfdfc); }
+.diff-output__line { min-width: max-content; min-height: 20px; display: grid; grid-template-columns: 34px 34px 20px minmax(220px, 1fr); font: 10px/20px var(--mono); color: var(--color-50504c); }
+.diff-output__line-number { padding: 0 5px; border-right: 1px solid var(--color-000000-ap5); color: var(--color-a0a099); text-align: right; user-select: none; }
+.diff-output__line-select { min-width: 0; min-height: 20px; border-width: 0 1px 0 0; border-style: solid; border-color: var(--color-000000-ap5); border-radius: 0; background: transparent; font: inherit; line-height: inherit; cursor: pointer; }
+.diff-output__line-select:hover { color: var(--text); background: var(--hover); }
+.diff-output__line-select:focus-visible { position: relative; z-index: 1; outline: 1px solid var(--accent); outline-offset: -2px; }
+.diff-output__line-select[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); font-weight: 700; }
+.diff-output__marker { color: var(--color-85857f); text-align: center; user-select: none; }
+.diff-output__content { min-height: 20px; padding: 0 9px 0 3px; white-space: pre; }
+.diff-output__line--addition { color: var(--color-246b4e); background: var(--color-eaf7f0); }
+.diff-output__line--addition .diff-output__marker { color: var(--success); font-weight: 700; }
+.diff-output__line--deletion { color: var(--color-994040); background: var(--color-fff0f0); }
+.diff-output__line--deletion .diff-output__marker { color: var(--danger); font-weight: 700; }
+.diff-output__line--file, .diff-output__line--hunk, .diff-output__line--meta { min-width: 100%; }
+.diff-output__line--file .diff-output__line-number, .diff-output__line--file .diff-output__marker,
+.diff-output__line--hunk .diff-output__line-number, .diff-output__line--hunk .diff-output__marker,
+.diff-output__line--meta .diff-output__line-number, .diff-output__line--meta .diff-output__marker { display: none; }
+.diff-output__line--file .diff-output__content, .diff-output__line--hunk .diff-output__content, .diff-output__line--meta .diff-output__content { grid-column: 1 / -1; padding: 0 10px; }
+.diff-output__line--file { color: var(--color-777771); background: var(--color-f7f7f4); }
+.diff-output__line--hunk { color: var(--color-4b659b); background: var(--color-edf2fb); }
+.diff-output__line--meta { color: var(--color-8a7655); background: var(--color-fff9ec); font-style: italic; }
+.diff-output__empty { padding: 16px 10px; color: var(--faint); font-size: 10px; text-align: center; }
+.diff-output__summary { padding: 6px 9px; border-top: 1px solid var(--border); color: var(--muted); background: var(--color-fafaf8); font-size: 9px; }

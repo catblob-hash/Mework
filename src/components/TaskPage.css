@@ -1,0 +1,55 @@
+/* One page in the message area: preview, read-only shell output, git review.
+   What is left of the right sidebar's shell once the tabs, the add menu, the launcher home and
+   the width drag are gone — a way back, a title, and a measurable content box. */
+.task-page {
+  width: 100%; flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+  color: var(--text); background: var(--app);
+}
+.task-page[hidden] { display: none; }
+
+/* Matches .subagent-panel__header: the transcript page and these pages are the same kind of
+   thing to the user, so they must not arrive wearing different chrome. */
+.task-page__header {
+  min-height: var(--topbar-height); flex: 0 0 var(--topbar-height); padding: 7px 9px 6px 13px;
+  display: flex; align-items: center; gap: 9px;
+  border-bottom: 1px solid var(--border); background: var(--color-fbfbf9-ap94);
+}
+.task-page__back {
+  width: 31px; height: 31px; flex: 0 0 31px; display: grid; place-items: center;
+  border-radius: 7px; background: transparent; color: var(--muted);
+}
+.task-page__back:hover { color: var(--text); background: var(--hover); }
+.task-page__heading { flex: 1; min-width: 0; }
+.task-page__heading > span {
+  display: block; color: var(--faint); font-size: 8.5px;
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.task-page__heading h2 {
+  margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px; line-height: 19px;
+}
+.task-page__actions { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+
+/* The approval and question docks live inside the conversation pane, which is hidden while a
+   page is up. Without this the model would just look stuck. */
+.task-page__attention {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  padding: 7px 13px; text-align: left;
+  border-bottom: 1px solid var(--border); background: var(--warning-soft); color: var(--warning);
+  font-size: 11px; font-weight: 600;
+}
+.task-page__attention > span:first-child {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-page__attention-action { flex: 0 0 auto; text-decoration: underline; }
+.task-page__attention:hover { background: var(--hover); }
+
+/* The rectangle the native browser child is positioned from. It has to hold BrowserPanel and
+   nothing else: the host reserves `occludedTop` inside it for the browser's own chrome, so any
+   extra padding here would slide the remote page under the trusted UI above it. */
+.task-page__content {
+  width: 100%; flex: 1; min-width: 0; min-height: 0;
+  position: relative; display: flex; overflow: hidden;
+}
+.task-page__content > * { flex: 1; min-width: 0; min-height: 0; }

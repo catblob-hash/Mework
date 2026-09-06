@@ -1,0 +1,1171 @@
+{
+  "keyCount": 197,
+  "keys": [
+    {
+      "description": "Section appended to the system prompt when the conversation exposes the application data directory.",
+      "id": "system.app_data_dir",
+      "placeholders": [
+        "path"
+      ]
+    },
+    {
+      "description": "Section appended to the system prompt listing the MCP servers selected for the conversation; `{servers}` is one `system.capability_row` per server.",
+      "id": "system.mcp_section",
+      "placeholders": [
+        "servers"
+      ]
+    },
+    {
+      "description": "Description used for an MCP server whose configuration has no description.",
+      "id": "system.mcp_server_default_description",
+      "placeholders": []
+    },
+    {
+      "description": "Section appended to the system prompt listing the lifecycle hooks selected for the conversation; `{hook_names}` is the joined name list and `{hooks}` one `system.capability_row` per hook.",
+      "id": "system.hooks_section",
+      "placeholders": [
+        "hook_names",
+        "hooks"
+      ]
+    },
+    {
+      "description": "One row of the MCP-server or hook list in the system prompt.",
+      "id": "system.capability_row",
+      "placeholders": [
+        "name",
+        "description"
+      ]
+    },
+    {
+      "description": "Suffix added to a hook's description when the hook has a matcher.",
+      "id": "system.hook_matcher_detail",
+      "placeholders": [
+        "matcher"
+      ]
+    },
+    {
+      "description": "Description of a SessionStart hook.",
+      "id": "system.hook_event.session_start",
+      "placeholders": []
+    },
+    {
+      "description": "Description of an InstructionsLoaded hook.",
+      "id": "system.hook_event.instructions_loaded",
+      "placeholders": []
+    },
+    {
+      "description": "Description of a UserPromptSubmit hook.",
+      "id": "system.hook_event.user_prompt_submit",
+      "placeholders": []
+    },
+    {
+      "description": "Description of a PreToolUse hook.",
+      "id": "system.hook_event.pre_tool_use",
+      "placeholders": []
+    },
+    {
+      "description": "Description of a PermissionRequest hook.",
+      "id": "system.hook_event.permission_request",
+      "placeholders": []
+    },
+    {
+      "description": "Description of a PostToolUse hook.",
+      "id": "system.hook_event.post_tool_use",
+      "placeholders": []
+    },
+    {
+      "description": "Description of a Stop hook.",
+      "id": "system.hook_event.stop",
+      "placeholders": []
+    },
+    {
+      "description": "Safety boundary appended to the system prompt whenever `web_search` is enabled. Empty by default: the search backend is one the user configured and is therefore trusted. Fill it in to warn the model that web evidence is untrusted.",
+      "id": "system.web_safety",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `ls` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `ls` overrides this key.",
+      "id": "tool.ls.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `grep` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `grep` overrides this key.",
+      "id": "tool.grep.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `find` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `find` overrides this key.",
+      "id": "tool.find.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `read` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `read` overrides this key.",
+      "id": "tool.read.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `write` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `write` overrides this key.",
+      "id": "tool.write.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `edit` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `edit` overrides this key.",
+      "id": "tool.edit.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `powershell` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `powershell` overrides this key.",
+      "id": "tool.powershell.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `bash` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `bash` overrides this key.",
+      "id": "tool.bash.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `web_search` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `web_search` overrides this key.",
+      "id": "tool.web_search.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `web_fetch` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `web_fetch` overrides this key.",
+      "id": "tool.web_fetch.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `playwright` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `playwright` overrides this key.",
+      "id": "tool.playwright.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `agent_spawn` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `agent_spawn` overrides this key.",
+      "id": "tool.agent_spawn.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `send_message` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `send_message` overrides this key.",
+      "id": "tool.send_message.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `followup_task` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `followup_task` overrides this key.",
+      "id": "tool.followup_task.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `task_wait` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `task_wait` overrides this key.",
+      "id": "tool.task_wait.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `task_list` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `task_list` overrides this key.",
+      "id": "tool.task_list.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `read_global_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `read_global_memory` overrides this key.",
+      "id": "tool.read_global_memory.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `read_project_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `read_project_memory` overrides this key.",
+      "id": "tool.read_project_memory.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `create_global_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `create_global_memory` overrides this key.",
+      "id": "tool.create_global_memory.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `create_project_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `create_project_memory` overrides this key.",
+      "id": "tool.create_project_memory.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `edit_global_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `edit_global_memory` overrides this key.",
+      "id": "tool.edit_global_memory.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `edit_project_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `edit_project_memory` overrides this key.",
+      "id": "tool.edit_project_memory.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `ask_user` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `ask_user` overrides this key.",
+      "id": "tool.ask_user.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `fork` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `fork` overrides this key.",
+      "id": "tool.fork.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `todo` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `todo` overrides this key.",
+      "id": "tool.todo.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `workflow` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `workflow` overrides this key.",
+      "id": "tool.workflow.description",
+      "placeholders": []
+    },
+    {
+      "description": "Addendum appended (after a `---` separator) to the system prompt of every spawned subagent and workflow step.",
+      "id": "subagent.addendum",
+      "placeholders": []
+    },
+    {
+      "description": "Schema description of the child-only `subagent_update` tool.",
+      "id": "subagent.update_tool_description",
+      "placeholders": []
+    },
+    {
+      "description": "Schema description of `subagent_update.message`.",
+      "id": "subagent.update_message_description",
+      "placeholders": []
+    },
+    {
+      "description": "Tool result a child receives after a successful `subagent_update` call.",
+      "id": "subagent.update_ack",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the child-only `structured_output` tool when the spawning schema has none.",
+      "id": "subagent.structured_output_root_seed",
+      "placeholders": []
+    },
+    {
+      "description": "Sentence appended to every `structured_output` schema description.",
+      "id": "subagent.structured_output_lifecycle",
+      "placeholders": []
+    },
+    {
+      "description": "User context injected once when a schema-bound child ends a round without calling `structured_output`.",
+      "id": "subagent.structured_output_nudge",
+      "placeholders": []
+    },
+    {
+      "description": "Tool result of a valid `structured_output` call.",
+      "id": "subagent.structured_output_settled",
+      "placeholders": []
+    },
+    {
+      "description": "Tool result of a `structured_output` call that failed schema validation.",
+      "id": "subagent.structured_output_rejected",
+      "placeholders": [
+        "error",
+        "attempt",
+        "max_attempts"
+      ]
+    },
+    {
+      "description": "Final assistant text of a child whose `structured_output` calls failed validation too many times.",
+      "id": "subagent.structured_output_exhausted",
+      "placeholders": [
+        "max_attempts"
+      ]
+    },
+    {
+      "description": "Notice prepended to a schema-bound child's final text when it never called `structured_output`.",
+      "id": "subagent.missing_structured_output",
+      "placeholders": []
+    },
+    {
+      "description": "Result envelope body (or suffix) when a child's model request failed.",
+      "id": "subagent.failed",
+      "placeholders": [
+        "reason"
+      ]
+    },
+    {
+      "description": "Reason used in `subagent.failed` when the host has none.",
+      "id": "subagent.failed_unknown_reason",
+      "placeholders": []
+    },
+    {
+      "description": "Result envelope body when a child finished without any text.",
+      "id": "subagent.no_text_result",
+      "placeholders": []
+    },
+    {
+      "description": "Suffix appended when a child's final text was cut to the output limit.",
+      "id": "subagent.result_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "Result envelope body when the host force-stopped a child that ignored a stop request.",
+      "id": "subagent.forced_stop",
+      "placeholders": [
+        "name"
+      ]
+    },
+    {
+      "description": "Result envelope body when a task worker crashed.",
+      "id": "subagent.worker_panic",
+      "placeholders": []
+    },
+    {
+      "description": "Fenced block appended to a result envelope that carries a structured result.",
+      "id": "subagent.structured_result_block",
+      "placeholders": [
+        "body"
+      ]
+    },
+    {
+      "description": "Body of `subagent.structured_result_block` when the value cannot be serialized.",
+      "id": "subagent.structured_unserializable",
+      "placeholders": []
+    },
+    {
+      "description": "Suffix inside `subagent.structured_result_block` when the value was cut to the inline limit.",
+      "id": "subagent.structured_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "Schema description of the on-demand `skill` tool.",
+      "id": "skill.tool_description",
+      "placeholders": []
+    },
+    {
+      "description": "Schema description of `skill.name`.",
+      "id": "skill.name_description",
+      "placeholders": []
+    },
+    {
+      "description": "Heading of the trigger list appended to the `skill` tool description.",
+      "id": "skill.listing_heading",
+      "placeholders": []
+    },
+    {
+      "description": "One row of the skill trigger list.",
+      "id": "skill.listing_row",
+      "placeholders": [
+        "name",
+        "trigger"
+      ]
+    },
+    {
+      "description": "Tool result of a successful `skill` call.",
+      "id": "skill.result",
+      "placeholders": [
+        "directory",
+        "body"
+      ]
+    },
+    {
+      "description": "Heading of the agent-role list appended to the `agent_spawn` / `workflow` tool description.",
+      "id": "role.listing_heading",
+      "placeholders": []
+    },
+    {
+      "description": "One row of the agent-role list.",
+      "id": "role.listing_row",
+      "placeholders": [
+        "name",
+        "description"
+      ]
+    },
+    {
+      "description": "Tool result of a valid `ask_user` call; the turn pauses afterwards.",
+      "id": "task.ask_user_pending",
+      "placeholders": []
+    },
+    {
+      "description": "Leading notice of a `task_wait` result that timed out before any named task settled.",
+      "id": "task.wait_timeout_all_pending",
+      "placeholders": [
+        "seconds",
+        "pending",
+        "max_seconds"
+      ]
+    },
+    {
+      "description": "Leading notice of a `task_wait` result that timed out with some results delivered.",
+      "id": "task.wait_timeout_partial",
+      "placeholders": [
+        "seconds",
+        "delivered",
+        "pending",
+        "max_seconds"
+      ]
+    },
+    {
+      "description": "Stands in for `{pending}` when the wait named no specific task.",
+      "id": "task.wait_pending_fallback",
+      "placeholders": []
+    },
+    {
+      "description": "`task_wait` result when nothing is running and nothing is waiting to be collected.",
+      "id": "task.wait_idle",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of a progress-update envelope: `[agent · progress update]`.",
+      "id": "task.progress_update_label",
+      "placeholders": []
+    },
+    {
+      "description": "Body of a result envelope whose task returned no text.",
+      "id": "task.no_text_result",
+      "placeholders": []
+    },
+    {
+      "description": "Footer line of a result envelope in a `task_wait` result.",
+      "id": "task.cost_line",
+      "placeholders": [
+        "tokens",
+        "tool_uses",
+        "duration_ms"
+      ]
+    },
+    {
+      "description": "Stands in for `{tokens}` when the provider reported no usage.",
+      "id": "task.cost_unknown_tokens",
+      "placeholders": []
+    },
+    {
+      "description": "Heading of the status roll-up that ends a `task_wait` result. The renderer recognizes the built-in English and Chinese headings.",
+      "id": "task.wait_status_heading",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of a completed task.",
+      "id": "task.status.completed",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of an interrupted task.",
+      "id": "task.status.interrupted",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of a failed task.",
+      "id": "task.status.failed",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of a task stopped by the user.",
+      "id": "task.status.stopped",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of a task that hit its round limit.",
+      "id": "task.status.round_limit",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of a running task.",
+      "id": "task.status.running",
+      "placeholders": []
+    },
+    {
+      "description": "Status word of a subagent that finished its turn and is waiting.",
+      "id": "task.status.idle",
+      "placeholders": []
+    },
+    {
+      "description": "`task_list` result when the conversation has no tasks.",
+      "id": "task.list_empty",
+      "placeholders": []
+    },
+    {
+      "description": "First line of a non-empty `task_list` result.",
+      "id": "task.list_total",
+      "placeholders": [
+        "total"
+      ]
+    },
+    {
+      "description": "Suffix of a `task_list` row (and a `task_wait` observation) carrying the task's label.",
+      "id": "task.list_row_label",
+      "placeholders": [
+        "label"
+      ]
+    },
+    {
+      "description": "Suffix of a `task_list` row for a subagent that `followup_task` can continue.",
+      "id": "task.list_continuable",
+      "placeholders": []
+    },
+    {
+      "description": "Line under a `task_list` row showing the task's latest progress update.",
+      "id": "task.list_latest_update",
+      "placeholders": [
+        "update"
+      ]
+    },
+    {
+      "description": "Suffix of a `task_list` status for a finished task whose result is in the timeline.",
+      "id": "task.list_result_in_timeline",
+      "placeholders": []
+    },
+    {
+      "description": "Suffix of a `task_list` status for a finished task that can only be viewed.",
+      "id": "task.list_view_only",
+      "placeholders": []
+    },
+    {
+      "description": "`task_list` group title for subagents.",
+      "id": "task.group.subagents",
+      "placeholders": []
+    },
+    {
+      "description": "`task_list` group title for workflow runs.",
+      "id": "task.group.workflows",
+      "placeholders": []
+    },
+    {
+      "description": "`task_list` group title for terminals.",
+      "id": "task.group.terminals",
+      "placeholders": []
+    },
+    {
+      "description": "`task_list` group title for background shell commands.",
+      "id": "task.group.shell_commands",
+      "placeholders": []
+    },
+    {
+      "description": "`task_list` group title for browser tabs.",
+      "id": "task.group.browser_tabs",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a suspended browser tab.",
+      "id": "task.browser.suspended",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a loading browser tab.",
+      "id": "task.browser.loading",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a loaded browser tab.",
+      "id": "task.browser.loaded",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a terminal with a running command.",
+      "id": "task.terminal.running",
+      "placeholders": []
+    },
+    {
+      "description": "Status of an idle terminal.",
+      "id": "task.terminal.idle",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a terminal whose shell exited.",
+      "id": "task.terminal.exited",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a closed terminal.",
+      "id": "task.terminal.closed",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a background command that exited successfully.",
+      "id": "task.shell.completed",
+      "placeholders": [
+        "code"
+      ]
+    },
+    {
+      "description": "Status of a background command that exited with an error.",
+      "id": "task.shell.failed",
+      "placeholders": [
+        "code"
+      ]
+    },
+    {
+      "description": "Status of a background command that was aborted.",
+      "id": "task.shell.aborted",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a background command that is being aborted.",
+      "id": "task.shell.aborting",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a running background command.",
+      "id": "task.shell.running",
+      "placeholders": []
+    },
+    {
+      "description": "Status of a background command that finished without an exit code.",
+      "id": "task.shell.finished",
+      "placeholders": []
+    },
+    {
+      "description": "Result envelope body of a finished background shell command.",
+      "id": "task.shell_result",
+      "placeholders": [
+        "shell_ref",
+        "tool_name",
+        "exit",
+        "body"
+      ]
+    },
+    {
+      "description": "Stands in for `{exit}` when the exit code is known.",
+      "id": "task.shell_exit_code",
+      "placeholders": [
+        "code"
+      ]
+    },
+    {
+      "description": "Stands in for `{exit}` when the exit code is unknown.",
+      "id": "task.shell_exit_unknown",
+      "placeholders": []
+    },
+    {
+      "description": "Stands in for `{body}` when the command produced no output.",
+      "id": "task.shell_no_output",
+      "placeholders": []
+    },
+    {
+      "description": "Result envelope body of a background command the user stopped, carrying whatever it printed first.",
+      "id": "task.shell_stopped_by_user",
+      "placeholders": [
+        "shell_ref",
+        "tool_name",
+        "body"
+      ]
+    },
+    {
+      "description": "Result envelope body of a background command that failed to execute.",
+      "id": "task.shell_failed_to_run",
+      "placeholders": [
+        "shell_ref",
+        "error"
+      ]
+    },
+    {
+      "description": "Receipt of a foreground command that ran out of time and was adopted by a task slot instead of being stopped.",
+      "id": "task.shell_timeout_backgrounded",
+      "placeholders": [
+        "shell_ref",
+        "seconds"
+      ]
+    },
+    {
+      "description": "Suffix appended when a task result was cut to the output limit.",
+      "id": "task.output_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "Sentence appended to a task's result when the user closed that task from the sidebar.",
+      "id": "task.stopped_by_user",
+      "placeholders": []
+    },
+    {
+      "description": "`send_message` result when the target is running and will read the message this turn.",
+      "id": "task.send.delivered",
+      "placeholders": [
+        "target"
+      ]
+    },
+    {
+      "description": "`send_message` result when the target is idle and will not wake up.",
+      "id": "task.send.queued_idle",
+      "placeholders": [
+        "target"
+      ]
+    },
+    {
+      "description": "`followup_task` result when the target is running and will continue after its current turn.",
+      "id": "task.followup.queued",
+      "placeholders": [
+        "target"
+      ]
+    },
+    {
+      "description": "`followup_task` result when the message was queued but no worker slot is free.",
+      "id": "task.followup.capacity",
+      "placeholders": [
+        "target",
+        "limit"
+      ]
+    },
+    {
+      "description": "`followup_task` result when an idle target was woken.",
+      "id": "task.followup.woken",
+      "placeholders": [
+        "target"
+      ]
+    },
+    {
+      "description": "Preamble of the background-task notification delivered to the main agent when a task finished without a `task_wait`.",
+      "id": "task.notification_preamble",
+      "placeholders": []
+    },
+    {
+      "description": "`<summary>` of a completed-task notification.",
+      "id": "task.notification.completed",
+      "placeholders": [
+        "task"
+      ]
+    },
+    {
+      "description": "`<summary>` of a failed-task notification.",
+      "id": "task.notification.failed",
+      "placeholders": [
+        "task"
+      ]
+    },
+    {
+      "description": "`<summary>` of a round-limit notification.",
+      "id": "task.notification.round_limit",
+      "placeholders": [
+        "task"
+      ]
+    },
+    {
+      "description": "`<summary>` of an interrupted-task notification.",
+      "id": "task.notification.interrupted",
+      "placeholders": [
+        "task"
+      ]
+    },
+    {
+      "description": "`<summary>` of a stopped-task notification.",
+      "id": "task.notification.stopped",
+      "placeholders": [
+        "task"
+      ]
+    },
+    {
+      "description": "Tool result of `fork` when the request was raised for the user to decide.",
+      "id": "fork.request_submitted",
+      "placeholders": []
+    },
+    {
+      "description": "Tool result of `fork` under full access, where the child is created without asking.",
+      "id": "fork.created_automatically",
+      "placeholders": []
+    },
+    {
+      "description": "System prompt of the isolated executor that runs a provider-native `web_search`.",
+      "id": "web.executor_system_prompt",
+      "placeholders": [
+        "budget_line"
+      ]
+    },
+    {
+      "description": "`{budget_line}` when the conversation sets no search cap.",
+      "id": "web.executor_budget_unlimited",
+      "placeholders": []
+    },
+    {
+      "description": "`{budget_line}` when the conversation caps searches per call.",
+      "id": "web.executor_budget_limited",
+      "placeholders": [
+        "max_searches"
+      ]
+    },
+    {
+      "description": "User message given to the isolated web-search executor.",
+      "id": "web.executor_task",
+      "placeholders": [
+        "query"
+      ]
+    },
+    {
+      "description": "Heading of the source list appended to native web-search findings.",
+      "id": "web.sources_heading",
+      "placeholders": []
+    },
+    {
+      "description": "One row of the appended source list.",
+      "id": "web.source_row",
+      "placeholders": [
+        "label",
+        "url"
+      ]
+    },
+    {
+      "description": "Line appended to native findings when the provider reported search failures.",
+      "id": "web.search_warnings",
+      "placeholders": [
+        "warnings"
+      ]
+    },
+    {
+      "description": "`notice` field of the JSON result of a native `web_search`. Empty by default, and then the field is omitted entirely; fill it in to label the findings as untrusted.",
+      "id": "web.findings_notice",
+      "placeholders": []
+    },
+    {
+      "description": "`notice` field of the JSON result of a catalog-provider `web_search` or a `web_fetch`. Empty by default, and then the field is omitted entirely; fill it in to label the results as untrusted.",
+      "id": "web.results_notice",
+      "placeholders": []
+    },
+    {
+      "description": "Prefix put in front of a retrieved line that looks like an instruction. Empty by default, so such a line is passed through unmarked; the control characters a line could hide behind are stripped either way.",
+      "id": "web.untrusted_marker",
+      "placeholders": []
+    },
+    {
+      "description": "First line inside the `<mework-memory>` block that carries MEWORK.md and MEMORY.md.",
+      "id": "memory.context_intro",
+      "placeholders": []
+    },
+    {
+      "description": "Name of the global memory tier.",
+      "id": "memory.tier.global",
+      "placeholders": []
+    },
+    {
+      "description": "Name of the project memory tier.",
+      "id": "memory.tier.project",
+      "placeholders": []
+    },
+    {
+      "description": "Heading above a tier's MEWORK.md inside the memory block.",
+      "id": "memory.instructions_heading",
+      "placeholders": [
+        "tier"
+      ]
+    },
+    {
+      "description": "Heading above a tier's MEMORY.md inside the memory block.",
+      "id": "memory.index_heading",
+      "placeholders": [
+        "tier"
+      ]
+    },
+    {
+      "description": "Tool result of a successful `create_*_memory` call.",
+      "id": "memory.created",
+      "placeholders": [
+        "tier",
+        "name"
+      ]
+    },
+    {
+      "description": "Tool result of a successful `edit_*_memory` call.",
+      "id": "memory.updated",
+      "placeholders": [
+        "tier",
+        "name"
+      ]
+    },
+    {
+      "description": "Banner inside the project-instructions block (MEWORK.md / AGENTS.md style files found in the workspace).",
+      "id": "project_memory.untrusted_banner",
+      "placeholders": []
+    },
+    {
+      "description": "Assistant text written when a SessionStart hook blocked the turn.",
+      "id": "hook.session_start_blocked",
+      "placeholders": [
+        "reason"
+      ]
+    },
+    {
+      "description": "Assistant text written when a UserPromptSubmit hook blocked the turn.",
+      "id": "hook.user_prompt_blocked",
+      "placeholders": [
+        "reason"
+      ]
+    },
+    {
+      "description": "Reason given to the model when a hook denied a tool call without a reason of its own.",
+      "id": "hook.blocked_by",
+      "placeholders": [
+        "name"
+      ]
+    },
+    {
+      "description": "Reason given to the model when a hook blocked an action and no hook name is available.",
+      "id": "hook.blocked_default",
+      "placeholders": []
+    },
+    {
+      "description": "User context injected when a Stop hook asks to continue without giving a reason.",
+      "id": "hook.continue_fallback",
+      "placeholders": []
+    },
+    {
+      "description": "Assistant text written when a Stop hook asked to continue too many times in a row.",
+      "id": "hook.stop_limit_reached",
+      "placeholders": [
+        "limit"
+      ]
+    },
+    {
+      "description": "Assistant text written when the Stop hook was skipped because the named agent's definition was revoked.",
+      "id": "hook.stop_skipped_definition_revoked",
+      "placeholders": [
+        "error"
+      ]
+    },
+    {
+      "description": "Tool result substituted when a PostToolUse hook rejects a call whose effects cannot be rolled back.",
+      "id": "hook.post_tool_not_rolled_back",
+      "placeholders": [
+        "reason",
+        "tool"
+      ]
+    },
+    {
+      "description": "Tool result of a call that was not executed because a hook interrupted the turn.",
+      "id": "hook.interrupted_call_skipped",
+      "placeholders": []
+    },
+    {
+      "description": "Tool result of a call that was not executed because the turn paused for a user answer.",
+      "id": "hook.pending_question_call_skipped",
+      "placeholders": []
+    },
+    {
+      "description": "Prefix of the tool description of an MCP tool that requires user interaction on every call.",
+      "id": "mcp.mandatory_description_prefix",
+      "placeholders": []
+    },
+    {
+      "description": "Assistant text written when the model ended a turn without any text.",
+      "id": "run.no_text_reply",
+      "placeholders": []
+    },
+    {
+      "description": "Line appended to a workflow receipt when its run directory could not be created.",
+      "id": "workflow.not_recoverable",
+      "placeholders": []
+    },
+    {
+      "description": "Result of a workflow run that was cancelled or whose turn ended.",
+      "id": "workflow.aborted_cancelled",
+      "placeholders": []
+    },
+    {
+      "description": "Result of a workflow run aborted by a host event-channel failure.",
+      "id": "workflow.aborted_channel",
+      "placeholders": [
+        "detail"
+      ]
+    },
+    {
+      "description": "Line appended to a failed workflow result explaining how to resume it.",
+      "id": "workflow.resume_hint",
+      "placeholders": [
+        "run_id"
+      ]
+    },
+    {
+      "description": "Resume hint used when journal writes failed, so a resume replays nothing.",
+      "id": "workflow.resume_degraded",
+      "placeholders": [
+        "run_id"
+      ]
+    },
+    {
+      "description": "Line appended to a resume hint when steps kept starting without ever finishing.",
+      "id": "workflow.resume_repeated_warning",
+      "placeholders": [
+        "count"
+      ]
+    },
+    {
+      "description": "Result of a workflow run that exceeded the run deadline.",
+      "id": "workflow.timeout",
+      "placeholders": [
+        "seconds",
+        "unfinished"
+      ]
+    },
+    {
+      "description": "Progress note written when the script returned while steps were still running.",
+      "id": "workflow.losers_cancelled",
+      "placeholders": [
+        "count",
+        "steps"
+      ]
+    },
+    {
+      "description": "Error of a workflow step that finished without returning its required structured result.",
+      "id": "workflow.step_no_structured",
+      "placeholders": []
+    },
+    {
+      "description": "Error of a workflow step that ended in a non-completed status.",
+      "id": "workflow.step_ended_with",
+      "placeholders": [
+        "status"
+      ]
+    },
+    {
+      "description": "Suffix of a step output preview in the workflow timeline context.",
+      "id": "workflow.step_preview_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "Error of a workflow step that produced no result.",
+      "id": "workflow.step_no_result",
+      "placeholders": []
+    },
+    {
+      "description": "Error of a workflow step that had not started when the run was aborted.",
+      "id": "workflow.step_not_started",
+      "placeholders": []
+    },
+    {
+      "description": "`<summary>` of the notification delivered when a workflow run was interrupted by an application restart.",
+      "id": "workflow.restart_summary",
+      "placeholders": [
+        "task"
+      ]
+    },
+    {
+      "description": "Body of the notification delivered when a workflow run was interrupted by an application restart.",
+      "id": "workflow.restart_notice",
+      "placeholders": [
+        "task",
+        "script",
+        "reusable_steps",
+        "run_id"
+      ]
+    },
+    {
+      "description": "Last line of an `ls` result that hit the entry limit.",
+      "id": "tool.ls_limit",
+      "placeholders": [
+        "limit"
+      ]
+    },
+    {
+      "description": "`ls` result for an empty directory.",
+      "id": "tool.ls_empty",
+      "placeholders": []
+    },
+    {
+      "description": "Line in a `grep` result for a file that could not be read.",
+      "id": "tool.grep_skipped",
+      "placeholders": [
+        "error"
+      ]
+    },
+    {
+      "description": "Last line of a `grep` result that hit the match limit.",
+      "id": "tool.grep_limit",
+      "placeholders": [
+        "limit"
+      ]
+    },
+    {
+      "description": "`grep` result when nothing matched.",
+      "id": "tool.grep_no_match",
+      "placeholders": []
+    },
+    {
+      "description": "Last line of a `find` result that hit the entry limit.",
+      "id": "tool.find_limit",
+      "placeholders": [
+        "limit"
+      ]
+    },
+    {
+      "description": "`find` result when nothing matched.",
+      "id": "tool.find_no_match",
+      "placeholders": []
+    },
+    {
+      "description": "`read` result for an image file (the image itself is attached).",
+      "id": "tool.read_image",
+      "placeholders": [
+        "path",
+        "mime",
+        "width",
+        "height",
+        "bytes"
+      ]
+    },
+    {
+      "description": "`read` result when the requested line range is past the end of the file.",
+      "id": "tool.read_range_out_of_bounds",
+      "placeholders": []
+    },
+    {
+      "description": "Last line of a `read` result that hit the line limit.",
+      "id": "tool.read_limit",
+      "placeholders": [
+        "limit"
+      ]
+    },
+    {
+      "description": "`write` result.",
+      "id": "tool.write_done",
+      "placeholders": [
+        "bytes",
+        "path"
+      ]
+    },
+    {
+      "description": "`edit` result.",
+      "id": "tool.edit_done",
+      "placeholders": [
+        "path"
+      ]
+    },
+    {
+      "description": "Suffix when a command's output was cut to the limit.",
+      "id": "tool.shell_output_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "Shell result when the user aborted the command.",
+      "id": "tool.shell_user_aborted",
+      "placeholders": []
+    },
+    {
+      "description": "Stands in for the exit code when the process reported none.",
+      "id": "tool.shell_exit_unknown",
+      "placeholders": []
+    },
+    {
+      "description": "Status line of a finished shell command that printed nothing.",
+      "id": "tool.shell_completed",
+      "placeholders": [
+        "code"
+      ]
+    },
+    {
+      "description": "Leading line of a failed shell result, before its stderr and stdout.",
+      "id": "tool.shell_exit_code",
+      "placeholders": [
+        "code"
+      ]
+    },
+    {
+      "description": "Shell result when the deadline expired and no task slot was free to adopt the running command, so it was stopped.",
+      "id": "tool.shell_timed_out",
+      "placeholders": [
+        "seconds"
+      ]
+    },
+    {
+      "description": "Suffix when a tool result was cut to the output limit.",
+      "id": "tool.output_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "Suffix when a write/edit diff was cut to the limit.",
+      "id": "tool.diff_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "Separator used when the host joins names into a list (hook names, task addresses, status roll-ups).",
+      "id": "format.list_separator",
+      "placeholders": []
+    }
+  ],
+  "kind": "mework-prompt-profile-keys",
+  "note": "Every host injection point a tool-description file may override under `prompts`. Generated by prompt_profile.rs tests; regenerate with: cargo test --lib -- prompt_profile::tests::regenerate_prompt_profile_baselines --ignored",
+  "source": "src-tauri/src/prompt_profile.rs::PromptKey"
+}

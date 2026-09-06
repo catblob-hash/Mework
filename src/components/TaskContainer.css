@@ -1,0 +1,126 @@
+/* Task container: one row per subagent, workflow and terminal process. */
+.task-container {
+  grid-column: 4; height: 100%; min-height: 0; position: relative;
+  display: flex; flex-direction: column;
+  background: var(--sidebar); border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+.task-container--closed { width: 0 !important; border-left-width: 0; }
+
+.task-container-resize-handle { position: absolute; z-index: 24; top: 0; left: 0; width: 8px; height: 100%; cursor: col-resize; touch-action: none; }
+.task-container-resize-handle::after { content: ""; position: absolute; top: 0; left: 0; width: 2px; height: 100%; background: var(--focus); opacity: 0; transition: opacity .14s ease; }
+.task-container-resize-handle:hover::after,
+.task-container-resize-handle:focus-visible::after,
+.task-container-resize-active .task-container-resize-handle::after { opacity: .72; }
+.task-container-resize-handle:focus-visible { outline-offset: -3px; }
+/* A drag must not select the rows it passes over, nor flip the cursor back. */
+.task-container-resize-active { cursor: col-resize; user-select: none; }
+
+.task-container__header {
+  height: var(--topbar-height); flex: 0 0 var(--topbar-height);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 0 8px 0 14px; border-bottom: 1px solid var(--border);
+}
+.task-container__title { margin: 0; font-size: 12px; font-weight: 650; color: var(--text); }
+
+.task-container__body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 8px 16px; }
+.task-container__empty { margin: 24px 12px; font-size: 11.5px; color: var(--faint); text-align: center; }
+.task-container__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.task-container__group { margin-top: 10px; }
+.task-container__group-title { margin: 0 8px 5px; font-size: 11px; font-weight: 600; color: var(--faint); }
+
+.task-container__finished { margin-top: 10px; }
+.task-container__finished-toggle {
+  width: 100%; display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px; background: transparent; border-radius: 6px;
+  font-size: 11px; font-weight: 600; color: var(--faint); text-align: left;
+}
+.task-container__finished-toggle:hover { background: var(--hover); color: var(--muted); }
+.task-container__finished-chevron { transition: transform .14s; flex: 0 0 auto; }
+.task-container__finished-chevron--open { transform: rotate(90deg); }
+.task-container__finished-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/*
+ * One task row. Nothing is inset: depth is expressed by the vertical rule on the
+ * left rather than by indentation, and a row with nothing to expand draws no
+ * disclosure placeholder, so every row — however deep, expandable or not —
+ * starts at the panel's left edge.
+ */
+.task-row { list-style: none; position: relative; }
+.task-row__main {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 6px 6px 6px; border-radius: 7px;
+  transition: background .14s;
+}
+.task-row__main[role="button"]:hover { background: var(--hover); }
+.task-row--selected > .task-row__main { background: var(--active); }
+
+.task-row__icon { flex: 0 0 auto; display: inline-flex; color: var(--faint); }
+.task-row__icon--running { color: var(--color-725c3c); }
+.task-row__icon--failed { color: var(--danger); }
+
+.task-row__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.task-row__label {
+  font-size: 11.5px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.task-row__detail {
+  font-size: 10px; color: var(--faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Finished rows go light, running rows stay dark, failures read red. */
+.task-row--finished .task-row__label { color: var(--muted); font-weight: 560; }
+.task-row--failed .task-row__label { color: var(--danger); }
+/* Colour for the running label's sweep; the utility itself is theme-agnostic. */
+.task-row--running { --pulse-color: var(--text); }
+
+.task-row__stop { width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px; }
+.task-row__stop:hover:not(:disabled) { color: var(--danger); background: var(--danger-soft); }
+.task-row__stop-spinner { animation: spin 1s linear infinite; }
+
+/* Child count / tokens / tool calls / elapsed, in that fixed order. */
+.task-metrics {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px;
+  font: 9.5px var(--mono, ui-monospace, monospace); font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+.task-metrics__cell { min-width: 0; white-space: nowrap; }
+.task-row--running .task-metrics { color: var(--muted); }
+.task-row--failed .task-metrics { color: var(--danger); }
+
+/* Todo plan, hosted at the top of the panel. */
+.task-status {
+  margin: 0 0 8px; padding-bottom: 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
+}
+.task-status__toggle {
+  width: 100%; display: flex; align-items: center; gap: 6px;
+  padding: 4px 6px; background: transparent; border-radius: 6px; text-align: left;
+}
+.task-status__toggle:hover { background: var(--hover); }
+.task-status__chevron { flex: 0 0 auto; transition: transform .14s; color: var(--faint); }
+.task-status__chevron--open { transform: rotate(90deg); }
+.task-status__summary {
+  flex: 1; min-width: 0; font-size: 11px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.task-status__count { flex: 0 0 auto; font-size: 9.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.task-status__progress { height: 1px; margin: 4px 6px 0; overflow: hidden; background: var(--border); }
+.task-status__progress > span { display: block; height: 100%; background: var(--success); transition: width .24s cubic-bezier(.2, .75, .25, 1); }
+.task-status__todo { margin: 6px 0 0; padding: 0 6px 0 26px; list-style: none; display: flex; flex-direction: column; gap: 5px; }
+.task-status__todo-item { min-width: 0; display: flex; align-items: flex-start; gap: 7px; color: var(--muted); font-size: 10.5px; line-height: 1.4; }
+.task-status__todo-copy { min-width: 0; display: flex; flex-direction: column; overflow-wrap: anywhere; }
+.task-status__todo-copy small { color: var(--faint); font-size: 9px; font-weight: 450; }
+.task-status__todo-marker { width: 8px; height: 8px; margin-top: 3px; flex: 0 0 8px; border: 1.5px solid var(--border-strong); border-radius: 50%; }
+.task-status__todo-item--in_progress { color: var(--accent); font-weight: 560; }
+.task-status__todo-item--in_progress .task-status__todo-marker { border-color: var(--accent); background: var(--accent-soft); }
+.task-status__todo-item--completed { color: var(--faint); text-decoration: line-through; }
+.task-status__todo-item--completed .task-status__todo-marker { border-color: var(--success); background: var(--success); box-shadow: inset 0 0 0 2px var(--color-ffffff); }
+
+@media (prefers-reduced-motion: reduce) {
+  .task-status__progress > span { transition-duration: .01ms; }
+  .task-row__stop-spinner { animation-duration: .01ms; animation-iteration-count: 1; }
+}
+
+/* A workflow occupies a list slot but is not a row: it draws its own panel. */
+.task-container__workflow { list-style: none; }

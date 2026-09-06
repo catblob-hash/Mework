@@ -1,0 +1,93 @@
+/* Every colour here is an existing semantic token. State follows the same
+   mapping the todo plan already uses — accent for in flight, success for done,
+   danger for failed — so a user reads the two surfaces the same way. */
+
+.workflow-run-card {
+  width: 100%;
+  max-width: 420px;
+  display: grid;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
+  text-align: left;
+  scroll-margin: 120px;
+  transition: background .14s, border-color .14s;
+}
+
+.workflow-run-card--openable:hover { background: var(--subtle); border-color: var(--border-strong); }
+.workflow-run-card--failed { border-color: color-mix(in srgb, var(--danger) 38%, var(--border)); }
+
+/* The title line reads the way the task panel's bar does: what kind of task
+   this is, then its wall time and what it has spent. The kind carries the
+   title's weight because it *is* the title — the run's own name is a pool
+   handle the roster hands out ("a1") and never appears here. */
+.workflow-run-card__title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflow-run-card__kind { flex: 0 0 auto; font-weight: 650; }
+
+.workflow-run-card__metrics {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.workflow-run-card__chevron { flex: 0 0 auto; color: var(--faint); }
+.workflow-run-card--openable:hover .workflow-run-card__chevron { color: var(--muted); }
+
+.workflow-run-card__meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* One square per plan slot. They wrap rather than shrink: a fifty-step plan
+   should grow the strip by a line, not turn every square into a hairline. */
+.workflow-run-card__strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.workflow-run-card__pip {
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+
+.workflow-run-card__pip--finished { background: var(--success); }
+.workflow-run-card__pip--running { background: var(--accent); animation: workflow-pip-pulse 1.6s ease-in-out infinite; }
+.workflow-run-card__pip--failed { background: var(--danger); }
+.workflow-run-card__pip--skipped { background: var(--warning); }
+.workflow-run-card__pip--cached { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+
+@keyframes workflow-pip-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .42; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workflow-run-card { transition-duration: .01ms; }
+  .workflow-run-card__pip--running { animation: none; }
+}

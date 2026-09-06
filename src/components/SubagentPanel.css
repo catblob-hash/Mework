@@ -1,0 +1,70 @@
+.conversation-pane {
+  container-name: conversation-pane;
+  container-type: inline-size;
+}
+
+.subagent-avatar-stack { display: flex; padding-left: 4px; }
+.subagent-avatar-stack .subagent-avatar + .subagent-avatar { margin-left: -5px; }
+.subagent-avatar {
+  width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center;
+  border: 0; border-radius: 50%; color: var(--muted, var(--color-6b6b67)); background: transparent; box-shadow: none;
+}
+.subagent-avatar--compact { width: 20px; height: 20px; flex-basis: 20px; border-radius: 50%; }
+.subagent-avatar--amber { color: var(--color-c77a1f); }
+.subagent-avatar--green { color: var(--color-287a38); }
+.subagent-avatar--mint { color: var(--color-279070); }
+.subagent-avatar--blue { color: var(--color-3769bb); }
+.subagent-avatar--violet { color: var(--color-6254aa); }
+.subagent-avatar--rose { color: var(--color-aa4f6a); }
+
+.subagent-panel-content { width: 100%; min-width: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; color: var(--text, var(--color-1b1b1a)); background: var(--app, var(--color-f7f7f5)); }
+.subagent-panel__header {
+  min-height: var(--topbar-height, 56px); flex: 0 0 var(--topbar-height, 56px); padding: 7px 9px 6px 13px;
+  display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--border, var(--color-dfdfda)); background: var(--color-fbfbf9-ap94);
+}
+.subagent-panel__header > svg { flex: 0 0 auto; color: var(--muted, var(--color-6b6b67)); }
+.subagent-panel__header > div { flex: 1; min-width: 0; }
+.subagent-panel__header span:not(.subagent-status) { display: block; color: var(--faint, var(--color-989892)); font-size: 8.5px; text-transform: uppercase; letter-spacing: .06em; }
+.subagent-panel__header h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; line-height: 19px; }
+.subagent-panel__icon-button { width: 31px; height: 31px; flex: 0 0 31px; display: grid; place-items: center; border-radius: 7px; background: transparent; color: var(--muted, var(--color-6b6b67)); }
+.subagent-panel__icon-button:hover { color: var(--text, var(--color-1b1b1a)); background: var(--hover, var(--color-e9e9e5)); }
+.subagent-panel__body { flex: 1; min-height: 0; overflow: hidden; display: flex; }
+.subagent-panel__body > .conversation-view { flex: 1; min-width: 0; }
+
+/* Search-group navigation: the parent link and this agent's direct children.
+   A dispatcher, its executors and their page readers are one tree, so the
+   panel has to offer a way across it instead of showing unrelated peers. */
+.subagent-panel__group {
+  flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  padding: 6px 9px 6px 13px; border-bottom: 1px solid var(--border, var(--color-dfdfda));
+  background: var(--subtle, var(--color-f3f3f0));
+}
+.subagent-panel__group-parent, .subagent-panel__group-child {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 100%;
+  padding: 3px 8px; border-radius: 999px; font-size: 10.5px; line-height: 15px;
+  background: var(--color-fbfbf9-ap94); color: var(--muted, var(--color-6b6b67));
+  border: 1px solid var(--border, var(--color-dfdfda));
+}
+.subagent-panel__group-parent > span, .subagent-panel__group-child > span {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.subagent-panel__group-parent:hover, .subagent-panel__group-child:hover {
+  color: var(--text, var(--color-1b1b1a)); background: var(--hover, var(--color-e9e9e5));
+}
+.subagent-panel__group-child--running { color: var(--accent, var(--color-356ae6)); }
+
+.subagent-status { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 999px; font-size: 8.5px; font-weight: 650; white-space: nowrap; }
+.subagent-status--running { color: var(--accent, var(--color-356ae6)); background: var(--accent-soft, var(--color-edf2ff)); }
+.subagent-status--completed { color: var(--success, var(--color-218a62)); background: var(--success-soft, var(--color-eaf7f1)); }
+.subagent-status--interrupted { color: var(--muted, var(--color-6b6b67)); background: var(--subtle, var(--color-f3f3f0)); }
+.subagent-status--failed { color: var(--danger, var(--color-c43d3d)); background: var(--danger-soft, var(--color-fff0f0)); }
+/* A deliberate stop is not an error, so it reads muted like `interrupted`. */
+.subagent-status--stopped { color: var(--muted, var(--color-6b6b67)); background: var(--subtle, var(--color-f3f3f0)); }
+/* Truncated but valid output: a caution, not a failure. */
+.subagent-status--roundLimit { color: var(--warning, var(--color-a56312)); background: var(--warning-soft, var(--color-fff5e5)); }
+.subagent-status__spinner { animation: subagent-spin 1s linear infinite; }
+
+@keyframes subagent-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .subagent-status__spinner { animation-duration: .01ms; animation-iteration-count: 1; }
+}

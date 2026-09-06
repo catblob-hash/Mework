@@ -1,0 +1,186 @@
+/* The roles pane of the conversation-preset editor. It fills its tab body
+ * rather than sitting as a bordered card inside another page. */
+.agent-definitions {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.agent-definitions__empty {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.agent-definitions__list {
+  min-height: 0;
+  overflow: auto;
+}
+
+.agent-definition-row {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--color-eeeeea);
+}
+
+.agent-definition-row > svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.agent-definition-row__copy {
+  min-width: 0;
+  flex: 1;
+  padding: 5px 0;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.agent-definition-row__copy > span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agent-definition-row__copy strong {
+  overflow: hidden;
+  font: 10px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-definition-row__copy small {
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 8.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-definition-row__model {
+  font-family: var(--mono);
+}
+
+/* A role whose bound model no longer resolves is hidden from the listing the
+ * host sends the model, so naming it fails exactly like a name that was never
+ * configured. The row has to say so, or it reads as working. */
+.agent-definition-row__model--unavailable {
+  color: var(--warning);
+}
+
+/* Always the last row of the list, one row below the final role. */
+.agent-definition-add {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  margin-top: 8px;
+  color: var(--muted);
+  background: transparent;
+}
+
+.agent-definition-add:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.agent-definition-add:disabled {
+  opacity: .5;
+}
+
+.agent-definition-row__copy:hover strong {
+  color: var(--accent);
+}
+
+.agent-definition-row__action {
+  width: 27px;
+  height: 27px;
+  flex: 0 0 27px;
+}
+
+.agent-definition-row__action--danger:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.agent-definition-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agent-definition-editor .field {
+  margin-bottom: 12px;
+}
+
+.agent-definition-editor__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.agent-definition-editor__tools {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-definition-editor__tools .tool-settings-groups {
+  max-height: 280px;
+  margin-top: 8px;
+  overflow-y: auto;
+}
+
+.agent-definition-editor__warning,
+.agent-definition-editor__error {
+  margin: 0;
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.agent-definition-editor__warning {
+  color: var(--warning);
+}
+
+.agent-definition-editor__error {
+  color: var(--danger);
+}
+
+.agent-definition-delete {
+  margin: 0;
+  padding: 8px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-definition-delete > svg {
+  color: var(--danger);
+}
+
+.agent-definition-delete strong {
+  font: 10.5px var(--mono);
+}
+
+@media (max-width: 620px) {
+  .agent-definition-editor__grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}

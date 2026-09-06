@@ -1,0 +1,208 @@
+/* Every colour is an existing semantic token. The panel sits inside the task
+   container, which is 260–520px wide, so the steps are built to survive its
+   narrowest setting: the name takes the slack and the metrics stay at their
+   content width.
+
+   The header is not this file's own invention: it borrows `.task-row`'s classes
+   from TaskContainer.css outright, so a run's bar is the same bar every other
+   task draws rather than a copy of one that can drift away from it.
+
+   Because that file is imported after this one, anything here that overrides a
+   `.task-row` declaration is written as a descendant of `.workflow-panel__bar`
+   to outrank it. A flat class would lose the tie and silently do nothing —
+   which is also why `.workflow-panel__meta` carries no rule of its own and is
+   only the name the tests address the run's metrics by.
+
+   Containment is what nesting used to be. A run is one soft block holding its
+   bar, its phases and its steps; a step is a smaller soft block inside it. No
+   part of it collapses, so there is no disclosure anywhere except the run log,
+   which is narration rather than structure. */
+
+.workflow-panel {
+  margin: 0;
+  padding: 2px 4px 4px;
+  border-radius: 9px;
+  background: var(--task-block);
+  color: var(--text);
+}
+
+/* The bar. Everything visual comes from `.task-row`; the block behind it is the
+   panel's own, so the bar must not paint a second one on top of it. */
+.workflow-panel__bar,
+.workflow-panel__bar:hover { background: transparent; }
+
+/* The run's name takes the slack and its time and tokens follow the metrics
+   column every other task row uses. */
+.workflow-panel__bar .task-metrics { flex: 0 0 auto; }
+
+.workflow-panel__body { padding: 0 2px; }
+
+.workflow-panel__description {
+  margin: 0 0 4px;
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* One phase: a caption over its steps. It is a label, not a control — nothing
+   under it is hidden — so it carries no hover background and no hit area. */
+.workflow-phase { margin: 0 0 4px; }
+
+.workflow-phase__head {
+  min-width: 0;
+  margin: 0 0 3px;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workflow-phase__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: .02em;
+  color: var(--faint);
+}
+
+.workflow-phase--running .workflow-phase__title { color: var(--accent); }
+.workflow-phase--failed .workflow-phase__title { color: var(--danger); }
+
+.workflow-phase__count {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The steps. One tile each, a size down from a task row: same icon / name /
+   sub-line / metrics arrangement, tighter type and tighter padding. */
+.workflow-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.workflow-step { list-style: none; min-width: 0; }
+
+.workflow-step__main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 5px;
+  border-radius: 6px;
+  background: var(--task-block-nested);
+  transition: background .14s;
+}
+
+.workflow-step__main[role="button"]:hover { background: var(--hover); }
+.workflow-step--selected > .workflow-step__main { background: var(--active); }
+
+.workflow-step__icon { flex: 0 0 11px; display: inline-flex; color: var(--faint); }
+.workflow-step__icon--finished { color: var(--success); }
+.workflow-step__icon--cached { color: var(--accent); }
+.workflow-step__icon--running { color: var(--accent); }
+.workflow-step__icon--failed { color: var(--danger); }
+.workflow-step__icon--skipped { color: var(--warning); }
+
+.workflow-step__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+.workflow-step__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.workflow-step--failed .workflow-step__label { color: var(--danger); }
+.workflow-step--pending .workflow-step__label { color: var(--muted); }
+/* Colour for the running label's sweep; the utility itself is theme-agnostic. */
+.workflow-step--running { --pulse-color: var(--text); }
+
+.workflow-step__detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.workflow-step__metrics {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: 9px var(--mono, ui-monospace, monospace);
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
+.workflow-step--failed .workflow-step__metrics { color: var(--danger); }
+
+.workflow-panel__pending-dot {
+  width: 6px;
+  height: 6px;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
+}
+
+.workflow-step__skip {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+
+.workflow-step__main:hover .workflow-step__skip,
+.workflow-step__main:focus-within .workflow-step__skip { opacity: 1; }
+
+.workflow-panel__logs { margin-top: 4px; }
+
+.workflow-panel__logs-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 4px;
+  background: transparent;
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: left;
+}
+
+.workflow-panel__logs-toggle:hover { background: var(--hover); color: var(--text); }
+
+.workflow-panel__log-list {
+  margin: 3px 0 0;
+  padding: 0 4px;
+  display: grid;
+  gap: 2px;
+  max-height: 160px;
+  overflow: auto;
+  color: var(--faint);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.workflow-panel__spinner { animation: spin 1s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .workflow-panel__spinner { animation-duration: .01ms; animation-iteration-count: 1; }
+  .workflow-step__skip { transition-duration: .01ms; }
+}

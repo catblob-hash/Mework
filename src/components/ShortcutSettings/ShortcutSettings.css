@@ -1,0 +1,302 @@
+/* Reuse the settings-page card shell while constraining controls to this namespace, so global heading actions do not affect other settings pages. */
+.shortcut-settings-page {
+  max-width: 920px;
+  margin: 0 auto;
+}
+
+.shortcut-settings-page .settings-page-heading {
+  align-items: center;
+}
+
+.shortcut-settings-page__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shortcut-settings-page__action-button.icon-button {
+  width: 30px;
+  height: 30px;
+  flex-basis: 30px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+}
+
+.shortcut-settings-page__search {
+  width: 190px;
+  min-height: 30px;
+  padding-left: 8px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--faint);
+}
+
+.shortcut-settings-page__search:focus-within {
+  border-color: var(--muted);
+}
+
+.shortcut-settings-page__search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 10.5px;
+}
+
+.shortcut-settings-page__search-close.icon-button {
+  width: 24px;
+  height: 24px;
+  flex-basis: 24px;
+  border-radius: 5px;
+}
+
+.shortcut-settings-page__group-select {
+  min-height: 30px;
+  max-width: 154px;
+  padding: 0 25px 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background-color: var(--panel);
+  color: var(--text);
+  font-size: 10.5px;
+}
+
+.shortcut-settings-page__menu-wrap {
+  position: relative;
+}
+
+.shortcut-settings-page__menu {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 154px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: 0 12px 34px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8);
+}
+
+.shortcut-settings-page__menu > button {
+  width: 100%;
+  min-height: 29px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 10.5px;
+  text-align: left;
+}
+
+.shortcut-settings-page__menu > button:hover {
+  background: var(--hover);
+}
+
+.shortcut-settings-page__menu-divider {
+  height: 1px;
+  margin: 4px;
+  border: 0;
+  background: var(--border);
+}
+
+.shortcut-settings-page__menu > .shortcut-settings-page__menu-danger {
+  color: var(--danger);
+}
+
+.shortcut-settings-page__menu > .shortcut-settings-page__menu-danger:hover {
+  background: var(--danger-soft);
+}
+
+.shortcut-settings-page__card.settings-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.shortcut-settings-page__row {
+  min-height: 52px;
+  padding: 8px 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 14rem 2.5rem;
+  align-items: center;
+  gap: 12px;
+  transition: opacity .14s;
+}
+
+.shortcut-settings-page__row:not(:last-child) {
+  border-bottom: 1px solid var(--border);
+}
+
+/* Disabled rows remain interactive for recording, undo, and toggling; only empty bindings disable controls. */
+.shortcut-settings-page__row--disabled {
+  opacity: .56;
+}
+
+.shortcut-settings-page__row--disabled:focus-within,
+.shortcut-settings-page__row--disabled:hover {
+  opacity: .82;
+}
+
+.shortcut-settings-page__label {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 560;
+}
+
+.shortcut-settings-page__label > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shortcut-settings-page__undo.icon-button {
+  width: 23px;
+  height: 23px;
+  flex-basis: 23px;
+  margin-left: -4px;
+  border-radius: 5px;
+  color: var(--faint);
+}
+
+.shortcut-settings-page__binding-cell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+}
+
+.shortcut-settings-page__binding {
+  min-width: 112px;
+  min-height: 30px;
+  padding: 3px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.shortcut-settings-page__binding:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--hover);
+  color: var(--text);
+}
+
+.shortcut-settings-page__binding:disabled {
+  cursor: not-allowed;
+  opacity: .5;
+}
+
+.shortcut-settings-page__binding--empty {
+  border-style: dashed;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.shortcut-settings-page__binding kbd,
+.shortcut-settings-page__recording kbd {
+  min-width: 22px;
+  min-height: 21px;
+  padding: 2px 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--subtle);
+  color: var(--text);
+  font: 9.5px var(--mono);
+  box-shadow: 0 1px 0 var(--border);
+}
+
+/* The recorder is not a text input: fixed width prevents modifier keys from shifting the column, and its focus captures keys before application shortcuts. */
+.shortcut-settings-page__recording {
+  width: 14rem;
+  min-height: 32px;
+  padding: 3px 7px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px dashed var(--focus);
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--muted);
+  font-size: 9.5px;
+}
+
+.shortcut-settings-page__recording:focus-visible {
+  outline-color: var(--focus);
+}
+
+.shortcut-settings-page__pending-caps {
+  min-width: 0;
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 3px;
+}
+
+.shortcut-settings-page__conflict {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--danger);
+  font-size: 8.5px;
+}
+
+.shortcut-settings-page__switch-wrap {
+  width: 2.5rem;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.shortcut-settings-page__switch-wrap .switch {
+  flex: 0 0 auto;
+}
+
+.shortcut-settings-page__empty {
+  min-height: 128px;
+  padding: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--faint);
+  font-size: 10.5px;
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .shortcut-settings-page .settings-page-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .shortcut-settings-page__actions {
+    width: 100%;
+  }
+
+  .shortcut-settings-page__search {
+    flex: 1;
+    width: auto;
+  }
+}

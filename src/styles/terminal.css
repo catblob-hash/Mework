@@ -1,0 +1,25 @@
+/* Per-conversation terminal */
+.terminal-panel-region { flex: 0 0 auto; position: relative; z-index: 3; }
+.terminal-panel-region__inner { min-height: 0; }
+.terminal-panel-region.collapse-region--closed > .terminal-panel-region__inner { transform: translateY(8px); }
+.terminal-panel {
+  height: clamp(210px, 31vh, 340px); min-height: 0; display: flex; flex-direction: column;
+  border-top: 1px solid var(--color-30332f); background: var(--color-171817); color: var(--color-d8ddd8);
+  box-shadow: 0 -10px 28px var(--color-000000-ap9);
+}
+.terminal-panel__header { height: 34px; flex: 0 0 34px; padding: 0 10px 0 13px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--color-30332f); background: var(--color-202220); color: var(--color-aeb5ae); }
+.terminal-panel__identity { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; }
+.terminal-panel__identity > svg { flex: 0 0 auto; color: var(--color-cbd1cb); }
+.terminal-panel__identity strong { flex: 0 0 auto; color: var(--color-e5e9e5); font-size: 10.5px; font-weight: 650; }
+.terminal-panel__identity span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-818981); font: 9px var(--mono); }
+.terminal-panel__status { max-width: 220px; min-width: 0; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-889088); font-size: 9px; }
+.terminal-panel__status--running { color: var(--color-78c9a2); }
+.terminal-panel__status--error { color: var(--color-ef8d8d); }
+.terminal-panel--input-disabled .terminal-panel__status { color: var(--warning); }
+.terminal-panel--input-disabled .terminal-panel__viewport { opacity: .72; }
+.terminal-panel__retry { height: 25px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; border-radius: 5px; background: var(--color-2d302d); color: var(--color-d0d5d0); font-size: 9px; }
+.terminal-panel__retry:hover { background: var(--color-383c38); color: var(--color-ffffff); }
+.terminal-panel__terminate { width: 25px; height: 25px; flex-basis: 25px; color: var(--color-959c95); }
+.terminal-panel__terminate:hover:not(:disabled) { background: var(--color-343734); color: var(--color-ffffff); }
+.terminal-panel__viewport { flex: 1; min-height: 0; padding: 7px 10px 5px; overflow: hidden; background: var(--color-171817); }
+.terminal-panel__viewport .xterm { height: 100%; }

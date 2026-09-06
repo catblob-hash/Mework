@@ -1,0 +1,17 @@
+[package]
+name = "mework-workflow-script"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "workflow_script"
+path = "src/lib.rs"
+
+[dependencies]
+mework-workflow-core = { path = "../workflow-core" }
+# Use QuickJS-NG defaults: scripts are single bodies without imports, and the engine
+# must remain on the driver worker thread, so parallel support is intentionally disabled.
+rquickjs = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

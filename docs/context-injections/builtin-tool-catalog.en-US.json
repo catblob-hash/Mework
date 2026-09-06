@@ -1,0 +1,1062 @@
+{
+  "kind": "mework-builtin-tool-catalog-snapshot",
+  "language": "en-US",
+  "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
+  "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
+  "toolCount": 27,
+  "tools": [
+    {
+      "name": "ls",
+      "label": "List files",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true,
+          "defaultValue": ".",
+          "placeholder": "."
+        },
+        {
+          "name": "depth",
+          "label": "Recursion depth",
+          "type": "number",
+          "required": false,
+          "defaultValue": 1,
+          "help": "0 lists only the current directory."
+        }
+      ]
+    },
+    {
+      "name": "grep",
+      "label": "Search content",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "pattern",
+          "label": "Search pattern",
+          "type": "string",
+          "required": true,
+          "placeholder": "TODO|FIXME"
+        },
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": false,
+          "defaultValue": "."
+        },
+        {
+          "name": "case_sensitive",
+          "label": "Case sensitive",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false
+        }
+      ]
+    },
+    {
+      "name": "powershell",
+      "label": "PowerShell",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "Get-ChildItem -Force"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": false,
+          "placeholder": "List files in the current directory"
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "placeholder": "120000"
+        },
+        {
+          "name": "run_in_background",
+          "label": "Run in background",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false
+        }
+      ]
+    },
+    {
+      "name": "bash",
+      "label": "Bash",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "git status --short"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": false,
+          "placeholder": "Show working tree status"
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "placeholder": "120000"
+        },
+        {
+          "name": "run_in_background",
+          "label": "Run in background",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false
+        }
+      ]
+    },
+    {
+      "name": "write",
+      "label": "Write file",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true,
+          "placeholder": "src/example.ts"
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "edit",
+      "label": "Edit file",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "find",
+          "label": "Find text",
+          "type": "multiline",
+          "required": true
+        },
+        {
+          "name": "replace",
+          "label": "Replacement",
+          "type": "multiline",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "label": "Find files",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "*.tsx"
+        },
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": false,
+          "defaultValue": "."
+        }
+      ]
+    },
+    {
+      "name": "read",
+      "label": "Read file",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "start_line",
+          "label": "Start line",
+          "type": "number",
+          "required": false,
+          "defaultValue": 1,
+          "help": "Text files only; 1-based."
+        },
+        {
+          "name": "end_line",
+          "label": "End line",
+          "type": "number",
+          "required": false,
+          "help": "Text files only; inclusive."
+        }
+      ]
+    },
+    {
+      "name": "web_search",
+      "label": "Web search",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "Anthropic Claude 4.5 release date",
+          "help": "One self-contained query; no pronouns pointing back at the conversation. Break a long question into several searches."
+        }
+      ]
+    },
+    {
+      "name": "web_fetch",
+      "label": "Fetch web pages",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "urls",
+          "label": "URLs",
+          "type": "json",
+          "required": true,
+          "placeholder": "[\"https://example.com/docs/changelog\"]",
+          "help": "Absolute http(s) page URLs. Search first when you do not know the URL."
+        }
+      ]
+    },
+    {
+      "name": "playwright",
+      "label": "Browser",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": true,
+          "placeholder": "click",
+          "help": "navigate、snapshot、click、type、fill_form、select、hover、key、scroll、evaluate、wait、screenshot、console、network、dialog、file_upload、upload_image、resize、tab_new、tab_list、tab_select、tab_close、close"
+        },
+        {
+          "name": "url",
+          "label": "URL",
+          "type": "string",
+          "required": false,
+          "placeholder": "https://example.com",
+          "help": "navigate, tab_new. navigate also accepts back / forward / reload."
+        },
+        {
+          "name": "max_chars",
+          "label": "Maximum characters",
+          "type": "number",
+          "required": false,
+          "defaultValue": 30000,
+          "help": "snapshot; range 1,000-60,000."
+        },
+        {
+          "name": "selector",
+          "label": "CSS selector",
+          "type": "string",
+          "required": false,
+          "placeholder": "button[type=submit]",
+          "help": "click、type、select、hover、scroll、wait、screenshot、file_upload、upload_image"
+        },
+        {
+          "name": "ref",
+          "label": "Element ref",
+          "type": "string",
+          "required": false,
+          "placeholder": "e12",
+          "help": "Same actions as selector; provide either one. scroll, screenshot, and file_upload/upload_image while a file chooser is open may provide neither."
+        },
+        {
+          "name": "button",
+          "label": "Mouse button",
+          "type": "string",
+          "required": false,
+          "defaultValue": "left",
+          "help": "click；left | right | middle"
+        },
+        {
+          "name": "double",
+          "label": "Double-click",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false,
+          "help": "click; double-click."
+        },
+        {
+          "name": "modifiers",
+          "label": "Modifier keys",
+          "type": "json",
+          "required": false,
+          "placeholder": "[\"Control\"]",
+          "help": "click; array of modifier keys: Control, Shift, Alt, Meta."
+        },
+        {
+          "name": "text",
+          "label": "Text",
+          "type": "multiline",
+          "required": false,
+          "help": "type: the text to enter. wait: page text that must appear."
+        },
+        {
+          "name": "clear",
+          "label": "Clear",
+          "type": "boolean",
+          "required": false,
+          "help": "type: clear the current value first (default true). console, network: clear captured entries after reading (default false)."
+        },
+        {
+          "name": "submit",
+          "label": "Submit after typing",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false,
+          "help": "type; press Enter after typing."
+        },
+        {
+          "name": "slowly",
+          "label": "Type key by key",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false,
+          "help": "type; dispatch individual key events."
+        },
+        {
+          "name": "fields",
+          "label": "Form fields",
+          "type": "json",
+          "required": false,
+          "placeholder": "[{\"ref\":\"e3\",\"value\":\"Alex\"},{\"ref\":\"e5\",\"checked\":true}]",
+          "help": "fill_form; array of up to 50 fields. Each item has selector or ref plus value, values, or checked."
+        },
+        {
+          "name": "values",
+          "label": "Option values",
+          "type": "json",
+          "required": false,
+          "help": "select; a string or an array of strings."
+        },
+        {
+          "name": "key",
+          "label": "Key",
+          "type": "string",
+          "required": false,
+          "placeholder": "Enter or Control+L",
+          "help": "key"
+        },
+        {
+          "name": "repeat",
+          "label": "Repeat count",
+          "type": "number",
+          "required": false,
+          "defaultValue": 1,
+          "help": "key; repeat count: 1-50."
+        },
+        {
+          "name": "x",
+          "label": "Horizontal distance",
+          "type": "number",
+          "required": false,
+          "defaultValue": 0,
+          "help": "scroll; horizontal scroll amount."
+        },
+        {
+          "name": "y",
+          "label": "Vertical distance",
+          "type": "number",
+          "required": false,
+          "defaultValue": 600,
+          "help": "scroll; vertical scroll amount."
+        },
+        {
+          "name": "script",
+          "label": "JavaScript",
+          "type": "multiline",
+          "required": false,
+          "placeholder": "document.title",
+          "help": "evaluate; supports await and the final expression becomes the return value. With ref, that element is bound to the element variable."
+        },
+        {
+          "name": "text_gone",
+          "label": "Text to disappear",
+          "type": "string",
+          "required": false,
+          "placeholder": "Loading",
+          "help": "wait; text that must disappear."
+        },
+        {
+          "name": "load",
+          "label": "Wait for load",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false,
+          "help": "wait; wait until document.readyState is complete. Can be combined with the other conditions."
+        },
+        {
+          "name": "timeout_ms",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "defaultValue": 5000,
+          "help": "wait; maximum 30,000."
+        },
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": false,
+          "defaultValue": "browser-screenshot.png",
+          "placeholder": "artifacts/page.png",
+          "help": "screenshot; a workspace-relative .png path."
+        },
+        {
+          "name": "full_page",
+          "label": "Full page",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false,
+          "help": "screenshot; capture the entire page instead of the viewport."
+        },
+        {
+          "name": "only_errors",
+          "label": "Errors only",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false,
+          "help": "console; return errors only."
+        },
+        {
+          "name": "limit",
+          "label": "Result limit",
+          "type": "number",
+          "required": false,
+          "help": "console (default 100), network (default 50); maximum result count 1-200."
+        },
+        {
+          "name": "filter",
+          "label": "URL filter",
+          "type": "string",
+          "required": false,
+          "placeholder": "/api/",
+          "help": "network; filter by a URL substring."
+        },
+        {
+          "name": "accept",
+          "label": "Accept",
+          "type": "boolean",
+          "required": false,
+          "placeholder": "true",
+          "help": "dialog; answer the open dialog: true accepts, false dismisses (default true)."
+        },
+        {
+          "name": "prompt_text",
+          "label": "Prompt text",
+          "type": "string",
+          "required": false,
+          "help": "dialog; the answer for an open prompt dialog, used only when accepting."
+        },
+        {
+          "name": "paths",
+          "label": "File paths",
+          "type": "json",
+          "required": false,
+          "placeholder": "\"artifacts/report.pdf\"",
+          "help": "file_upload; a workspace-relative path or an array of up to 10 paths."
+        },
+        {
+          "name": "image_id",
+          "label": "Image number",
+          "type": "string",
+          "required": false,
+          "placeholder": "3",
+          "help": "upload_image; the conversation image number, e.g. 3, #3, or [Image #3]."
+        },
+        {
+          "name": "filename",
+          "label": "File name",
+          "type": "string",
+          "required": false,
+          "placeholder": "photo.png",
+          "help": "upload_image; the file name the page sees. Defaults to the attachment's own name."
+        },
+        {
+          "name": "width",
+          "label": "Width",
+          "type": "number",
+          "required": false,
+          "placeholder": "1280",
+          "help": "resize; range 320-7,680."
+        },
+        {
+          "name": "height",
+          "label": "Height",
+          "type": "number",
+          "required": false,
+          "placeholder": "720",
+          "help": "resize; range 240-4,320."
+        },
+        {
+          "name": "tab",
+          "label": "Tab ID",
+          "type": "string",
+          "required": false,
+          "placeholder": "main",
+          "help": "tab_select, tab_close; a tab value returned by tab_list. main is the conversation's own page."
+        }
+      ]
+    },
+    {
+      "name": "agent_spawn",
+      "label": "Subagent",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "prompt",
+          "label": "Prompt",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "Inspect routing under src/ and summarize the key files",
+          "help": "Child agents do not see this conversation by default; include all required context in the task."
+        },
+        {
+          "name": "agent_type",
+          "label": "Named agent type",
+          "type": "string",
+          "required": false,
+          "placeholder": "code-reviewer",
+          "help": "Optional trusted definition slug; the available names and what each is for are listed in this turn's available-agents context. Resolved by the host; cannot be combined with context=conversation."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "review-api",
+          "help": "Required. Name the child yourself: it is the address send_message / followup_task / task_wait take, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree."
+        },
+        {
+          "name": "label",
+          "label": "Display name",
+          "type": "string",
+          "required": false,
+          "placeholder": "Inspect routing",
+          "help": "Short name shown in the timeline."
+        },
+        {
+          "name": "context",
+          "label": "Initial context",
+          "type": "string",
+          "required": false,
+          "defaultValue": "none",
+          "help": "none (default): task only; conversation: include a copy of the current conversation history."
+        },
+        {
+          "name": "schema",
+          "label": "Output schema",
+          "type": "json",
+          "required": false,
+          "placeholder": "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\"}},\"required\":[\"verdict\"]}",
+          "help": "Optional JSON Schema subset. When set, the child must call structured_output with a result matching it, and that value comes back with task_wait. The top level must be an object schema; type, properties, required, items, enum, const, additionalProperties, minItems/maxItems, minLength/maxLength and minimum/maximum are supported and every other keyword is rejected on the spot."
+        }
+      ]
+    },
+    {
+      "name": "send_message",
+      "label": "Send message",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "target",
+          "label": "Child agent",
+          "type": "string",
+          "required": true,
+          "placeholder": "a1",
+          "help": "Name returned by agent_spawn."
+        },
+        {
+          "name": "message",
+          "label": "Message",
+          "type": "multiline",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "followup_task",
+      "label": "Follow up",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "target",
+          "label": "Child agent",
+          "type": "string",
+          "required": true,
+          "placeholder": "a1",
+          "help": "Name returned by agent_spawn."
+        },
+        {
+          "name": "message",
+          "label": "Message",
+          "type": "multiline",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "task_wait",
+      "label": "Wait for tasks",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "tasks",
+          "label": "Tasks",
+          "type": "json",
+          "required": false,
+          "placeholder": "[\"a1\", \"shell:shell-1\"]",
+          "help": "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a browser page as browser:<tab>. The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and browser pages excluded)."
+        },
+        {
+          "name": "timeout_seconds",
+          "label": "Timeout (seconds)",
+          "type": "number",
+          "required": false,
+          "defaultValue": 60,
+          "help": "5-600 seconds; default: 60."
+        }
+      ]
+    },
+    {
+      "name": "task_list",
+      "label": "List tasks",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "skill",
+      "label": "Skill",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "commit-helper",
+          "help": "Name of a skill this conversation selected; the schema lists them as an enum."
+        }
+      ]
+    },
+    {
+      "name": "read_global_memory",
+      "label": "Read global memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "user-preferences",
+          "help": "A document name listed in the memory index. The .md suffix is optional."
+        }
+      ]
+    },
+    {
+      "name": "read_project_memory",
+      "label": "Read project memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "build-environment",
+          "help": "A document name listed in the memory index. The .md suffix is optional."
+        }
+      ]
+    },
+    {
+      "name": "create_global_memory",
+      "label": "Create global memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "user-preferences",
+          "help": "A single document name inside the memory directory. Path separators are forbidden; the .md suffix is optional."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true,
+          "help": "The document's complete Markdown body."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The user's long-standing language and code-style preferences",
+          "help": "One sentence describing what this memory records. It is written into the MEMORY.md index so a later run can decide whether to read the document."
+        }
+      ]
+    },
+    {
+      "name": "create_project_memory",
+      "label": "Create project memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "build-environment",
+          "help": "A single document name inside the memory directory. Path separators are forbidden; the .md suffix is optional."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true,
+          "help": "The document's complete Markdown body."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "Tests must run in the project's own environment",
+          "help": "One sentence describing what this memory records. It is written into the MEMORY.md index so a later run can decide whether to read the document."
+        }
+      ]
+    },
+    {
+      "name": "edit_global_memory",
+      "label": "Edit global memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "user-preferences",
+          "help": "The memory document to modify. The .md suffix is optional."
+        },
+        {
+          "name": "old_text",
+          "label": "Original text",
+          "type": "multiline",
+          "required": true,
+          "help": "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        },
+        {
+          "name": "new_text",
+          "label": "New text",
+          "type": "multiline",
+          "required": true,
+          "help": "The replacement text. Leave it empty to delete the passage."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The user's long-standing language and code-style preferences",
+          "help": "One sentence describing this memory after the change. It refreshes the document's entry in the MEMORY.md index."
+        }
+      ]
+    },
+    {
+      "name": "edit_project_memory",
+      "label": "Edit project memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "build-environment",
+          "help": "The memory document to modify. The .md suffix is optional."
+        },
+        {
+          "name": "old_text",
+          "label": "Original text",
+          "type": "multiline",
+          "required": true,
+          "help": "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        },
+        {
+          "name": "new_text",
+          "label": "New text",
+          "type": "multiline",
+          "required": true,
+          "help": "The replacement text. Leave it empty to delete the passage."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "Tests must run in the project's own environment",
+          "help": "One sentence describing this memory after the change. It refreshes the document's entry in the MEMORY.md index."
+        }
+      ]
+    },
+    {
+      "name": "workflow",
+      "label": "Workflow",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "script",
+          "label": "JavaScript",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "export const meta = { name: \"…\", description: \"…\" }\n…",
+          "help": "JavaScript orchestration starting with `export const meta = {…}`: spawn steps with agent()/parallel()/pipeline(), narrate with phase()/log(); the body's return value is the run result. Adding { isolation: \"worktree\" } to a step gives it its own git worktree checked out from HEAD (uncommitted changes are not in it; a step that leaves changes keeps its worktree, one that changes nothing has it removed)."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "review-sweep",
+          "help": "Required. This run's address in the same namespace agents are named in, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree, so a resume still needs a fresh one."
+        },
+        {
+          "name": "args",
+          "label": "Arguments",
+          "type": "json",
+          "required": false,
+          "help": "JSON value exposed to the script as the global `args`, verbatim; pass arrays and objects directly, not as encoded strings."
+        },
+        {
+          "name": "token_budget",
+          "label": "Token budget",
+          "type": "number",
+          "required": false,
+          "help": "Hard token ceiling for this run, readable as budget in the script; once exhausted, further agent() calls throw."
+        },
+        {
+          "name": "resume_run_id",
+          "label": "Resume run ID",
+          "type": "string",
+          "required": false,
+          "placeholder": "run0a1b2c3d",
+          "help": "Run id from a previous run of this same script; journaled steps replay, the first unjournaled one and everything after it re-runs."
+        }
+      ]
+    },
+    {
+      "name": "todo",
+      "label": "Todo",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": true,
+          "placeholder": "create",
+          "help": "create, update, get, list."
+        },
+        {
+          "name": "taskId",
+          "label": "Task ID",
+          "type": "string",
+          "required": false,
+          "placeholder": "task-1",
+          "help": "update, get; the opaque ID returned by create."
+        },
+        {
+          "name": "subject",
+          "label": "Task subject",
+          "type": "string",
+          "required": false,
+          "placeholder": "Implement user authentication",
+          "help": "Required by create; optional patch field for update."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "multiline",
+          "required": false,
+          "placeholder": "Add login and signup endpoints and cover them with tests.",
+          "help": "Required by create; optional patch field for update."
+        },
+        {
+          "name": "activeForm",
+          "label": "Active form",
+          "type": "string",
+          "required": false,
+          "placeholder": "Implementing user authentication",
+          "help": "create, update; short present-continuous text shown while the task is in_progress."
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "type": "string",
+          "required": false,
+          "placeholder": "in_progress",
+          "help": "update; pending | in_progress | completed | deleted"
+        },
+        {
+          "name": "owner",
+          "label": "Owner",
+          "type": "string",
+          "required": false,
+          "help": "update."
+        },
+        {
+          "name": "addBlocks",
+          "label": "Add blocked tasks",
+          "type": "json",
+          "required": false,
+          "help": "update; array of task IDs that this task blocks."
+        },
+        {
+          "name": "addBlockedBy",
+          "label": "Add blockers",
+          "type": "json",
+          "required": false,
+          "help": "update; array of task IDs that block this task."
+        },
+        {
+          "name": "metadata",
+          "label": "Metadata",
+          "type": "json",
+          "required": false,
+          "help": "create writes the whole object; update merges keys, and a null value removes that key."
+        }
+      ]
+    },
+    {
+      "name": "ask_user",
+      "label": "Ask user",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "questions",
+          "label": "Questions",
+          "type": "json",
+          "required": true,
+          "placeholder": "[{\"question\":\"Which approach should I use?\",\"header\":\"Approach\",\"options\":[{\"label\":\"Approach A\",\"description\":\"Keep the change small\"},{\"label\":\"Approach B\",\"description\":\"Perform a full rewrite\"}],\"multiSelect\":false}]",
+          "help": "Claude Code AskUserQuestion format: 1-4 questions, each with header, question, 2-4 label/description options, and multiSelect. Do not add Other."
+        }
+      ]
+    },
+    {
+      "name": "fork",
+      "label": "Fork conversation",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "prompt",
+          "label": "Prompt",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "The task to complete in the forked conversation",
+          "help": "First user message of the forked conversation; state the task and the background it needs"
+        },
+        {
+          "name": "inherit_context",
+          "label": "Inherit context",
+          "type": "boolean",
+          "required": true,
+          "defaultValue": true,
+          "help": "true copies the timeline so far and the completed tasks; false starts with only this prompt"
+        }
+      ]
+    }
+  ]
+}

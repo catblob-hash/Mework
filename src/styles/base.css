@@ -1,0 +1,161 @@
+:root {
+  font-family: var(--app-font-family);
+  color: var(--color-1b1b1a);
+  background: var(--color-f7f7f5);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  /* Appearance settings override these variables through CSSOM at runtime.
+     Variables provide a single override point. */
+  --app-font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+  --message-font-family: var(--app-font-family);
+  --message-font-size: 14px;
+  --app: var(--color-f7f7f5);
+  --sidebar: var(--color-efefeb);
+  --panel: var(--color-ffffff);
+  --subtle: var(--color-f3f3f0);
+  --hover: var(--color-e9e9e5);
+  --active: var(--color-e4e4df);
+  --text: var(--color-1b1b1a);
+  --muted: var(--color-6b6b67);
+  --faint: var(--color-989892);
+  --border: var(--color-dfdfda);
+  --border-strong: var(--color-d1d1cb);
+  --accent: var(--color-356ae6);
+  --accent-soft: var(--color-edf2ff);
+  --focus: var(--color-4d7cfe);
+  --success: var(--color-218a62);
+  --success-soft: var(--color-eaf7f1);
+  --warning: var(--color-a56312);
+  --warning-soft: var(--color-fff5e5);
+  --danger: var(--color-c43d3d);
+  --danger-soft: var(--color-fff0f0);
+  /* Keep task backgrounds ordered: base < nested < hover < active. */
+  --task-block: color-mix(in srgb, var(--hover) 55%, transparent);
+  --task-block-nested: color-mix(in srgb, var(--hover) 30%, transparent);
+  --sidebar-width: 264px;
+  --settings-width: 368px;
+  --right-sidebar-width: 560px;
+  --task-container-width: 340px;
+  --topbar-height: 56px;
+  /* Reserve the classic scrollbar width so fixed headers align with scrolling content. */
+  --scrollbar-size: 10px;
+  --mono: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  /* WebView2 draws the platform I-beam from the native window theme, which drifts
+     from the app theme whenever the two disagree, and the glyph then matches the
+     surface it sits on and disappears. Ship our own I-beam instead: a glyph in the
+     theme's ink plus a halo in its paper, so it stays legible even when the two
+     themes momentarily disagree. `text` is the fallback if the image is refused. */
+  --cursor-text: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' width='16' height='24' viewBox='0 0 16 24'%3e%3cpath d='M4 3h8M8 3v18M4 21h8' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3e%3cpath d='M4 3h8M8 3v18M4 21h8' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3e%3c/svg%3e") 8 12, text;
+}
+
+:root[data-theme="night"] {
+  --cursor-text: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' width='16' height='24' viewBox='0 0 16 24'%3e%3cpath d='M4 3h8M8 3v18M4 21h8' fill='none' stroke='black' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3e%3cpath d='M4 3h8M8 3v18M4 21h8' fill='none' stroke='white' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3e%3c/svg%3e") 8 12, text;
+}
+
+
+* {
+  box-sizing: border-box;
+}
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+body { min-width: 680px; min-height: 520px; background: var(--app); }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { border: 0; }
+button, [role="button"] { -webkit-tap-highlight-color: transparent; }
+button:not(:disabled) { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .48; }
+textarea { resize: vertical; }
+/* Disabled fields keep the cursor their own rules give them. */
+input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"], [type="button"], [type="submit"], [type="reset"]):not(:disabled),
+textarea:not(:disabled),
+[contenteditable="true"] { cursor: var(--cursor-text); }
+::selection { background: var(--color-cfdcff); }
+::-webkit-scrollbar { width: var(--scrollbar-size); height: var(--scrollbar-size); }
+::-webkit-scrollbar-thumb { background: var(--color-c8c8c1); border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-aaaaaa); border: 2px solid transparent; background-clip: padding-box; }
+
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
+
+.app-shell {
+  width: 100%; height: 100%; display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 0;
+  grid-template-rows: minmax(0, 1fr);
+  background: var(--app); overflow: clip;
+  transition: grid-template-columns .24s cubic-bezier(.2, .75, .25, 1);
+}
+.app-shell--resizing { transition: none; }
+/* Keep the third track a length on both ends of the transition. Changing
+   between `0` and `minmax(...)` is discrete, so the drawer would jump. */
+.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(480px, 1fr) var(--settings-width) 0; }
+.app-shell--sidebar-closed { grid-template-columns: 0 minmax(0, 1fr) 0 0; }
+.app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: 0 minmax(480px, 1fr) var(--settings-width) 0; }
+/* The task container is the outermost track, so it stays put while the settings
+   drawer in track 3 opens and closes beside it. */
+.app-shell--tasks-open { grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 var(--task-container-width); }
+.app-shell--tasks-open.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(360px, 1fr) var(--settings-width) var(--task-container-width); }
+.app-shell--tasks-open.app-shell--sidebar-closed { grid-template-columns: 0 minmax(0, 1fr) 0 var(--task-container-width); }
+.app-shell--tasks-open.app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: 0 minmax(360px, 1fr) var(--settings-width) var(--task-container-width); }
+
+.icon-button {
+  width: 32px; height: 32px; flex: 0 0 32px; display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border-radius: 7px; color: var(--muted); transition: background .14s, color .14s;
+}
+.icon-button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.icon-button--danger:hover:not(:disabled) { color: var(--danger); background: var(--danger-soft); }
+
+.button {
+  min-height: 36px; padding: 0 14px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
+  gap: 7px; font-size: 13px; font-weight: 600; border: 1px solid transparent; transition: .14s ease;
+}
+.button--small { min-height: 31px; padding: 0 10px; font-size: 12px; }
+.button--primary { background: var(--color-20201f); color: var(--color-ffffff); border-color: var(--color-20201f); }
+.button--primary:hover:not(:disabled) { background: var(--color-343432); transform: translateY(-1px); }
+.button--secondary { background: var(--panel); border-color: var(--border-strong); }
+.button--secondary:hover:not(:disabled), .button--ghost:hover:not(:disabled) { background: var(--hover); }
+.button--ghost { background: transparent; color: var(--muted); }
+.button--danger { background: var(--danger); color: var(--color-ffffff); }
+.button--danger:hover:not(:disabled) { background: var(--color-ab3030); }
+.text-button { background: transparent; color: var(--accent); padding: 3px 4px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; border-radius: 5px; }
+.text-button:hover { background: var(--accent-soft); }
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/*
+ * Copy that describes work still in flight: the text sits at half its own
+ * colour and a full-strength band sweeps across it, left to right, forever.
+ *
+ * The sweep is a gradient clipped to the glyphs, so the text underneath has to
+ * be transparent — which is why the host must name the colour in
+ * `--pulse-color` instead of the rule reading `currentColor`, and why anything
+ * that paints with `currentColor` (the waiting dots, an icon) has to sit
+ * outside the pulsing element rather than inside it.
+ *
+ * Wrapped in @supports because without `background-clip: text` the transparent
+ * text would simply vanish; browsers that lack it get plain copy.
+ */
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .pulse-text {
+    --pulse-dim: color-mix(in srgb, var(--pulse-color, currentColor) 50%, transparent);
+    background-image: linear-gradient(
+      90deg,
+      var(--pulse-dim) 0%, var(--pulse-dim) 36%,
+      var(--pulse-color, currentColor) 50%,
+      var(--pulse-dim) 64%, var(--pulse-dim) 100%
+    );
+    background-size: 320% 100%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: pulse-text-sweep 1.9s cubic-bezier(.42, 0, .58, 1) infinite;
+  }
+}
+/* The gradient is three times the box, so the highlight at its centre crosses
+   from the right edge to the left as the position runs 100% → 0%. */
+@keyframes pulse-text-sweep { from { background-position: 100% 0; } to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  /* The global kill switch only freezes the animation, which would strand the
+     copy at half strength. Drop the sweep entirely and paint the plain colour. */
+  .pulse-text { background-image: none; color: var(--pulse-color, inherit); }
+}

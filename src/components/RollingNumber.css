@@ -1,0 +1,22 @@
+/* The wheels are drawn from generated content on purpose: they must add no text
+   of their own, so that the plain value underneath stays the only thing a
+   selection, a copy, or a test can pick up. */
+.rolling-number { position: relative; display: inline-block; font-variant-numeric: tabular-nums; white-space: pre; }
+.rolling-number__value { display: inline-block; }
+/* Hidden rather than removed while the wheels turn: it is still what sets the
+   width the overlay is laid out against. */
+.rolling-number--rolling > .rolling-number__value { color: transparent; }
+.rolling-number__roll { position: absolute; inset: 0; display: flex; align-items: flex-start; overflow: hidden; user-select: none; pointer-events: none; }
+.rolling-number__roll > * { flex: 0 0 auto; height: 1lh; }
+.rolling-number__glyph::before { content: attr(data-glyph); }
+.rolling-number__digit { overflow: hidden; }
+.rolling-number__cells { display: block; transform: translateY(calc(var(--rolling-offset, 0) * -1lh)); transition: transform .42s cubic-bezier(.22, .61, .36, 1); }
+.rolling-number__cell { display: block; height: 1lh; }
+.rolling-number__cell::before { content: attr(data-digit); }
+@media (prefers-reduced-motion: reduce) {
+  /* The global kill switch squashes the transition to .01ms, which turns the
+     roll into the jump it was meant to replace — with the value hidden while it
+     happens. Drop the overlay and let the plain text change instead. */
+  .rolling-number__roll { display: none; }
+  .rolling-number--rolling > .rolling-number__value { color: inherit; }
+}

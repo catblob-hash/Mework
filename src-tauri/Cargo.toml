@@ -1,0 +1,127 @@
+[workspace]
+members = [
+    # Agent kernel state machine: implementation projection of formal/tla/AgentKernel.tla.
+    # This pure-logic crate is driven by the host; workspace membership includes
+    # its guard tests and conformance exports in `cargo test --workspace`.
+    "agent-kernel",
+    "workflow-core",
+    # The rquickjs adapter is the workflow tool's only script-engine implementation;
+    # the host uses it through ScriptSpec/ScriptSource.
+    "workflow-script",
+]
+
+[package]
+name = "mework"
+version = "1.0.0"
+description = "Mework — Mew. Work."
+authors = ["Mework contributors"]
+license = "GPL-3.0-or-later"
+# `app_update` reads releases from this repository's GitHub API; it is a runtime contract.
+repository = "https://github.com/catblob-hash/Mework"
+edition = "2021"
+rust-version = "1.77.2"
+default-run = "mework"
+
+[lib]
+name = "mework_lib"
+crate-type = ["lib"]
+
+[[bin]]
+name = "mework"
+path = "src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "mework-browser-dev"
+path = "src/browser_dev_main.rs"
+required-features = ["browser-dev"]
+test = false
+bench = false
+
+[build-dependencies]
+embed-resource = "3.0.11"
+resvg = { version = "0.45.1", default-features = false }
+tauri-build = { version = "2.4", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chacha20poly1305 = "0.10"
+axum = { version = "0.8", features = ["ws"], optional = true }
+cookie = "0.18"
+dirs = "6"
+fs2 = "0.4"
+futures-util = { version = "0.3", optional = true }
+globset = "0.4"
+httpdate = "1"
+# Engine-agnostic workflow decision layer. The host uses `workflow_core::`, and
+# `subagent_schema` is re-exported from its `schema` module.
+mework-workflow-core = { path = "workflow-core" }
+# rquickjs/QuickJS-NG script source for the workflow tool.
+mework-workflow-script = { path = "workflow-script" }
+mework-agent-kernel = { path = "agent-kernel" }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+# Persists the conversation data plane. `bundled` compiles SQLite from source,
+# avoiding system-library and OpenSSL toolchain dependencies; keys remain only
+# in the operating-system credential store.
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
+similar = "2.7"
+tauri = { version = "2.8", features = ["unstable", "devtools"] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+wait-timeout = "0.2"
+# Skills may be installed from ZIP archives. Enable only deflate, the common ZIP
+# method, to avoid adding bzip2, zstd, and deflate64 C dependencies.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+portable-pty = "0.9"
+base64 = "0.22.1"
+gif = "=0.13.3"
+image-webp = "=0.2.4"
+zune-jpeg = "=0.4.21"
+zeroize = "1.8"
+png = "=0.17.16"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+webview2-com = "0.38.2"
+# Deliberately minimal. Mework has no desktop-automation line at all, so the
+# shipped binary must not even be able to reach the APIs one would need: no
+# Graphics_Capture / WinRT Direct3D (Windows Graphics Capture), no
+# Win32_UI_Input_KeyboardAndMouse (`SendInput`), no Win32_Storage_Xps
+# (`PrintWindow`), no Win32_System_StationsAndDesktops (desktop switching), no
+# Win32_Security_WinTrust (host Authenticode), and no Win32_System_Registry
+# (the deleted VM backend probe was its only user). A source audit is weaker
+# than an import audit; keep this list closed so reintroducing host control
+# requires visibly re-adding a feature here.
+windows = { version = "0.61.3", features = ["Foundation", "Win32_Foundation"] }
+windows-core = "0.61.2"
+# Win32_System_Com is COM *initialization* only (CoInitializeEx/CoUninitialize).
+# `external_open` needs it because ShellExecuteW may delegate to a Shell
+# extension, which is a COM object, so the calling thread must have an
+# apartment. It buys no host-control capability and must not grow into one.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+browser-dev = ["dep:axum", "dep:futures-util"]

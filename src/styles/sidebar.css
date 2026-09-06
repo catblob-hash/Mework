@@ -1,0 +1,119 @@
+/* Sidebar */
+.sidebar {
+  grid-column: 1; width: var(--sidebar-width); min-width: 0; height: 100%; position: relative; display: flex; flex-direction: column;
+  background: var(--sidebar); border-right: 1px solid var(--border); padding: 10px 9px 8px; overflow: hidden;
+  opacity: 1; transform: translateX(0); visibility: visible;
+  transition: opacity .16s ease, transform .24s cubic-bezier(.2, .75, .25, 1), visibility 0s;
+}
+.sidebar--closed { opacity: 0; transform: translateX(-18px); visibility: hidden; pointer-events: none; transition-delay: 0s, 0s, .24s; }
+.sidebar-resize-handle { position: absolute; z-index: 12; top: 0; right: 0; width: 8px; height: 100%; cursor: col-resize; touch-action: none; }
+.sidebar-resize-handle::after { content: ""; position: absolute; top: 0; right: 0; width: 2px; height: 100%; background: var(--focus); opacity: 0; transition: opacity .14s ease; }
+.sidebar-resize-handle:hover::after, .sidebar-resize-handle:focus-visible::after, .sidebar-resize-active .sidebar-resize-handle::after { opacity: .72; }
+.sidebar-resize-handle:focus-visible { outline-offset: -3px; }
+.sidebar-resize-active, .sidebar-resize-active * { cursor: col-resize !important; user-select: none !important; }
+.sidebar__brand { height: 40px; padding: 0 5px 8px; display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 650; }
+.sidebar__brand > span { flex: 1; }
+.brand-mark { width: 25px; height: 25px; display: block; flex: 0 0 25px; user-select: none; }
+.new-task-button {
+  width: 100%; height: 38px; display: flex; align-items: center; gap: 10px; padding: 0 10px; background: transparent;
+  border: 0; border-radius: 8px; font-size: 13px; font-weight: 600;
+}
+.new-task-button:hover { background: var(--hover); }
+.new-task-button span { flex: 1; text-align: left; }
+kbd { font-family: inherit; font-size: 10px; color: var(--faint); font-weight: 500; }
+.sidebar__section-heading { height: 41px; margin-top: 12px; padding: 0 5px 0 8px; display: flex; align-items: center; }
+.sidebar__section-heading > span { flex: 1; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; font-weight: 700; color: var(--faint); }
+.sidebar__section-heading--settings { margin-top: 4px; }
+.settings-sidebar__nav { flex: 1; min-height: 0; padding: 3px 0 12px; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+.settings-sidebar__nav .settings-nav__item { width: 100%; flex: 0 0 36px; }
+.workspace-list { flex: 1; overflow: auto; min-height: 0; padding-bottom: 12px; }
+.workspace-group { position: relative; border-radius: 8px; transition: opacity .14s, transform .14s, background .14s, box-shadow .14s; }
+.workspace-group + .workspace-group { margin-top: 9px; }
+.workspace-heading { height: 32px; display: flex; align-items: center; }
+.workspace-heading > button:first-of-type { flex: 1; min-width: 0; height: 32px; display: flex; align-items: center; gap: 6px; padding: 0 7px; background: transparent; border-radius: 6px; color: var(--color-4e4e4a); font-size: 12px; font-weight: 650; }
+.workspace-heading > button:first-of-type:hover { background: var(--hover); }
+.workspace-heading > button:first-of-type span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-heading > button:first-of-type .workspace-heading__name { flex: 1; min-width: 0; text-align: left; }
+.workspace-heading > button:first-of-type > svg:first-child { transition: transform .18s ease; }
+.workspace-heading .icon-button { width: 27px; height: 27px; flex-basis: 27px; opacity: 0; }
+.workspace-heading:hover .icon-button, .workspace-heading:focus-within .icon-button { opacity: 1; }
+.workspace-options { flex: 0 0 auto; display: inline-flex; }
+/* The menu is portaled to document.body, so :focus-within no longer holds while it
+   is open. Keep its trigger visible to prevent the row's actions from fading. */
+.workspace-heading .icon-button.popover-menu__trigger--open { opacity: 1; }
+.collapse-region {
+  display: grid; grid-template-rows: 1fr; opacity: 1; visibility: visible;
+  transition: grid-template-rows .26s cubic-bezier(.4, 0, .2, 1), opacity .2s cubic-bezier(.4, 0, .2, 1), visibility 0s;
+}
+.collapse-region--closed {
+  grid-template-rows: 0fr; opacity: 0; visibility: hidden; pointer-events: none;
+  transition: grid-template-rows .26s cubic-bezier(.4, 0, .2, 1), opacity .2s cubic-bezier(.4, 0, .2, 1), visibility 0s linear .26s;
+}
+.collapse-region__inner { min-height: 0; overflow: hidden; transform: translateY(0); transition: transform .26s cubic-bezier(.4, 0, .2, 1); }
+.collapse-region--closed > .collapse-region__inner { transform: translateY(-5px); }
+.disclosure-chevron { flex: 0 0 auto; transform: rotate(0deg); transition: transform .22s cubic-bezier(.4, 0, .2, 1); }
+.disclosure-chevron--open { transform: rotate(90deg); }
+.conversation-list { position: relative; padding-left: 13px; }
+.conversation-list::before { content: ""; position: absolute; left: 10px; top: 1px; bottom: 2px; width: 1px; background: var(--color-d7d7d1); }
+.conversation-row { min-height: 36px; display: flex; align-items: center; margin: 1px 0 1px 3px; border-radius: 7px; position: relative; transition: opacity .14s, transform .14s, background .14s, box-shadow .14s; }
+.conversation-row:hover { background: var(--color-e8e8e3); }
+.conversation-row--active { background: var(--color-deded8); }
+.conversation-row--active:hover { background: var(--color-dcdcd6); }
+/* Child conversations: each nesting level adds one indent step, and the list's
+   own guide line repeats for the level. */
+.conversation-list--nested { padding-left: 14px; }
+.conversation-row--nested { margin-left: 3px; }
+/* The disclosure sits in the row's fixed left gutter, so it never reflows the
+   title; rows that have one push the title and the pulse past it. */
+.conversation-row__disclosure { position: absolute; left: 2px; top: 50%; width: 18px; height: 18px; margin-top: -9px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: inherit; cursor: pointer; }
+.conversation-row__disclosure:hover { background: var(--color-dcdcd6); }
+.conversation-row__disclosure ~ .conversation-row__main .conversation-row__pulse { left: 22px; }
+.conversation-row__disclosure ~ .conversation-row__main .conversation-row__title { padding-left: 14px; }
+.conversation-row__disclosure ~ .conversation-row__main .conversation-row__time { padding-left: 14px; }
+.conversation-row__main { flex: 1; min-width: 0; height: 36px; padding: 4px 7px 4px 22px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; background: transparent; }
+/* Reserve the same 22px left padding for every row so the pulse occupies a
+   fixed gap and does not shift titles when it appears or disappears. */
+.conversation-row__pulse { position: absolute; left: 8px; top: 50%; width: 6px; height: 6px; margin-top: -3px; border-radius: 50%; background: var(--color-725c3c); animation: conversation-pulse 1.9s cubic-bezier(.45, 0, .55, 1) infinite; pointer-events: none; }
+@keyframes conversation-pulse { 50% { opacity: .18; transform: scale(.72); } }
+@media (prefers-reduced-motion: reduce) { .conversation-row__pulse { animation: none; } }
+.conversation-row__title { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; line-height: 16px; text-align: left; }
+.conversation-row__time { font-size: 10px; color: var(--faint); line-height: 12px; }
+.conversation-row__actions { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 1px; margin-right: 3px; opacity: 0; transition: opacity .12s; }
+.conversation-row__actions .icon-button { width: 27px; height: 27px; flex-basis: 27px; }
+.conversation-row:hover .conversation-row__actions, .conversation-row:focus-within .conversation-row__actions { opacity: 1; }
+.conversation-row--editing { padding-left: 6px; }
+.conversation-row--editing .conversation-row__actions { opacity: 1; }
+.conversation-row__rename-input { flex: 1; min-width: 0; height: 28px; padding: 0 7px; border: 1px solid var(--color-aeb9d2); border-radius: 6px; outline: 0; background: var(--color-ffffff); font: 12.5px var(--sans); box-shadow: 0 0 0 2px var(--color-4d7cfe-ap10); }
+.sidebar-delete-confirm--armed:not(:disabled) { opacity: 1; background: var(--danger); color: var(--color-ffffff); }
+.sidebar-delete-confirm--armed:hover:not(:disabled), .sidebar-delete-confirm--armed:focus-visible { background: var(--color-ab3030); color: var(--color-ffffff); }
+.sidebar-delete-confirm__label { font-size: 9px; line-height: 1; font-weight: 700; white-space: nowrap; }
+.conversation-list__empty { margin: 7px 10px; font-size: 11px; color: var(--faint); }
+.sortable-surface { position: relative; cursor: grab; user-select: none; }
+.sortable-surface:active { cursor: grabbing; }
+button.sortable-surface:not(:disabled),
+.workspace-heading.sortable-surface > button:first-of-type,
+.conversation-row.sortable-surface > .conversation-row__main { cursor: grab; }
+button.sortable-surface:active,
+.workspace-heading.sortable-surface > button:first-of-type:active,
+.conversation-row.sortable-surface > .conversation-row__main:active { cursor: grabbing; }
+/* Settings rails sort by drag, but the whole row is also the click target that
+   opens the entry, so hovering one must not promise a drag. An actual drag still
+   shows `grabbing` through `.pointer-sort-active` below. */
+.provider-rail__row.sortable-surface,
+.provider-rail__row.sortable-surface:active,
+.mcp-row.sortable-surface,
+.mcp-row.sortable-surface:active { cursor: default; }
+.sortable-surface--dragging { opacity: .38 !important; transform: scale(.985); }
+.pointer-sort-active, .pointer-sort-active * { cursor: grabbing !important; user-select: none !important; }
+.conversation-row--dragging, .workspace-group--dragging { opacity: .38; transform: scale(.985); }
+.drop-target--before::before, .drop-target--after::after { content: ""; position: absolute; z-index: 4; left: 4px; right: 4px; height: 2px; border-radius: 99px; background: var(--accent); pointer-events: none; }
+.workspace-group.drop-target--before::before, .conversation-row.drop-target--before::before { top: 0; }
+.workspace-group.drop-target--after::after, .conversation-row.drop-target--after::after { bottom: 0; }
+.provider-list__item.drop-target--before::before { top: -2px; }
+.provider-list__item.drop-target--after::after { bottom: -2px; }
+.sidebar__footer { min-height: 42px; border-top: 1px solid var(--border); padding-top: 7px; display: flex; align-items: center; }
+.sidebar__footer > button { flex: 1; min-width: 0; height: 34px; display: flex; align-items: center; gap: 9px; padding: 0 9px; background: transparent; border-radius: 7px; font-size: 12.5px; text-align: left; }
+.sidebar__footer > button:hover { background: var(--hover); }
+.version-badge { margin-right: 8px; border: 1px solid var(--border-strong); border-radius: 999px; padding: 2px 6px; font-size: 9px; color: var(--faint); }
+/* Browser-dev uses a separate data domain; isolation from release data is intentional. */
+.version-badge--dev-domain { border-color: var(--color-d97706); color: var(--color-d97706); cursor: help; white-space: nowrap; }

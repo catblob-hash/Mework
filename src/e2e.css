@@ -1,0 +1,159 @@
+@import "./palette.css";
+
+html[data-e2e-page="memory"] {
+  color-scheme: light;
+}
+
+#memory-e2e-summary {
+  position: fixed;
+  z-index: 2147483647;
+  right: 12px;
+  bottom: 12px;
+  width: min(560px, calc(100vw - 24px));
+  box-sizing: border-box;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, Canvas 94%, transparent);
+  color: color-mix(in srgb, CanvasText 74%, transparent);
+  box-shadow: 0 8px 28px var(--color-000000-ap13);
+  font: 12px/1.45 Inter, ui-sans-serif, system-ui, sans-serif;
+  backdrop-filter: blur(12px);
+}
+
+#memory-e2e-summary[data-state="ready"] {
+  color: var(--color-287a38);
+}
+
+#memory-e2e-summary[data-state="failed"] {
+  color: var(--color-c43d3d);
+}
+
+#image-e2e-status {
+  position: fixed;
+  z-index: 2147483647;
+  top: 12px;
+  right: 12px;
+  width: min(420px, calc(100vw - 24px));
+  max-height: min(52vh, 520px);
+  box-sizing: border-box;
+  padding: 12px 14px;
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, Canvas 94%, transparent);
+  color: CanvasText;
+  box-shadow: 0 12px 38px var(--color-000000-ap16);
+  font: 12px/1.45 Inter, ui-sans-serif, system-ui, sans-serif;
+  backdrop-filter: blur(14px);
+}
+
+#image-e2e-status strong,
+#image-e2e-status output {
+  display: block;
+}
+
+#image-e2e-status output {
+  margin-top: 4px;
+  color: color-mix(in srgb, CanvasText 72%, transparent);
+}
+
+#image-e2e-status output[data-state="PASS"],
+#image-e2e-results b[data-state="PASS"] {
+  color: var(--color-218a62);
+}
+
+#image-e2e-status output[data-state="FAIL"],
+#image-e2e-results b[data-state="FAIL"],
+#image-e2e-failure {
+  color: var(--color-c43d3d);
+}
+
+#image-e2e-results {
+  display: grid;
+  gap: 5px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+#image-e2e-results li {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 7px;
+}
+
+#image-e2e-failure {
+  margin: 9px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+html[data-e2e-page="web-search"] {
+  color-scheme: light dark;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+html[data-e2e-page="web-search"] body {
+  margin: 0;
+  background: Canvas;
+  color: CanvasText;
+}
+
+html[data-e2e-page="web-search"] main {
+  width: min(980px, calc(100% - 40px));
+  margin: 28px auto 60px;
+}
+
+html[data-e2e-page="web-search"] h1 {
+  margin-bottom: 6px;
+  font-size: 23px;
+}
+
+html[data-e2e-page="web-search"] p {
+  line-height: 1.55;
+}
+
+html[data-e2e-page="web-search"] output {
+  display: block;
+  margin: 16px 0;
+  font-weight: 750;
+}
+
+html[data-e2e-page="web-search"] ol {
+  display: grid;
+  gap: 8px;
+  padding-left: 24px;
+}
+
+html[data-e2e-page="web-search"] li {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.6fr) 82px 1.4fr;
+  gap: 12px;
+  align-items: baseline;
+}
+
+html[data-e2e-page="web-search"] code {
+  overflow-wrap: anywhere;
+}
+
+html[data-e2e-page="web-search"] .pass {
+  color: var(--color-218a62);
+}
+
+html[data-e2e-page="web-search"] .fail {
+  color: var(--color-c43d3d);
+}
+
+html[data-e2e-page="web-search"] .blocked {
+  color: var(--color-a56312);
+}
+
+html[data-e2e-page="web-search"] pre {
+  max-height: 320px;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid ButtonBorder;
+  border-radius: 8px;
+  white-space: pre-wrap;
+}

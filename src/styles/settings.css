@@ -1,0 +1,72 @@
+/* Global settings */
+.global-settings-layout { height: 580px; max-height: calc(100vh - 190px); display: grid; grid-template-columns: 190px minmax(0, 1fr); }
+.global-settings-layout--page { width: 100%; height: auto; max-height: none; min-height: 0; flex: 1; display: block; }
+.global-settings-layout--page .global-settings-content { width: 100%; height: 100%; }
+.settings-nav { padding: 11px 9px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--border); background: var(--color-f6f6f3); }
+/* Group titles are non-interactive and non-collapsible, with no separators between groups. The first title has no top padding so it aligns with subsequent groups. */
+.settings-nav__group-title { padding: 9px 9px 2px; color: var(--faint); font-size: 9.5px; }
+.settings-nav__group-title:first-child { padding-top: 0; }
+.settings-nav__item { height: 36px; padding: 0 9px; display: flex; align-items: center; gap: 8px; border-radius: 7px; background: transparent; color: var(--muted); text-align: left; font-size: 11.5px; }
+.settings-nav__item span { flex: 1; }
+.settings-nav__item > svg:last-child { opacity: 0; }
+.settings-nav__item:hover { background: var(--hover); }
+.settings-nav__item--active { background: var(--color-e5e5e0); color: var(--text); font-weight: 600; }
+.settings-nav__item--active > svg:last-child { opacity: 1; color: var(--faint); }
+.global-settings-content { min-width: 0; min-height: 0; overflow: auto; }
+.settings-page { min-height: 100%; padding: 21px 22px 30px; }
+.settings-editor-page { height: 100%; min-height: 0; padding-bottom: 0; display: flex; flex-direction: column; overflow: hidden; }
+.settings-editor-page > .settings-page-heading { flex: 0 0 auto; }
+.settings-page-heading { min-height: 54px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.settings-page-heading h3 { margin: 0; font-size: 14px; }
+.settings-page-heading p { margin: 3px 0 0; color: var(--muted); font-size: 10.5px; }
+.settings-page-heading__actions { display: flex; align-items: center; gap: 6px; }
+.settings-card { margin-top: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
+.settings-card__heading { min-height: 39px; display: flex; align-items: flex-start; justify-content: space-between; }
+.settings-card__heading > div { display: flex; gap: 8px; }
+.settings-card__heading span { display: flex; flex-direction: column; }
+.settings-card__heading strong { font-size: 11.5px; }
+.settings-card__heading small { color: var(--faint); font-size: 9px; }
+/* List rows are flex containers because switches and delete buttons cannot nest inside the button. Paint hover and selection here so their backgrounds include trailing controls. */
+.provider-list__row { display: flex; align-items: center; gap: 4px; padding-right: 4px; border-radius: 7px; transition: background .14s; }
+.provider-list__row:hover { background: var(--hover); }
+.provider-list__row:has(> .provider-list__item--active) { background: var(--color-e5e5e0); }
+.provider-list__row:has(> .provider-list__item--active):hover { background: var(--color-dcdcd6); }
+.provider-list__row > .provider-list__item { flex: 1; min-width: 0; }
+.provider-list__row > .provider-list__item:hover { background: transparent; }
+/* `__row` owns the selected background; the nested `__item` must remain transparent to avoid an inset overlap. */
+.provider-list__row > .provider-list__item--active { background: transparent; }
+.provider-list__row > .switch { flex: 0 0 auto; }
+/* Tabs fill the strip between its top and bottom gray borders; labels are vertically centered and the strip has no second bottom rule. */
+.preset-pane-tabs { flex: 0 0 auto; display: flex; align-items: stretch; border-bottom: 1px solid var(--border); }
+.preset-pane-tab { min-height: 30px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; border-radius: 0; background: transparent; color: var(--muted); font-size: 10px; font-weight: 560; }
+.preset-pane-tab:hover { color: var(--text); background: var(--hover); }
+.preset-pane-tab--active { color: var(--text); background: var(--color-e5e5e0); font-weight: 650; }
+/* `scrollbar-gutter` reserves scrollbar space instead of shrinking the content when it appears. */
+.preset-pane-body { flex: 1; min-height: 0; padding: 11px 13px 14px; overflow-y: auto; scrollbar-gutter: stable; }
+.preset-pane-body > .settings-section { padding: 0; border-bottom: 0; }
+
+/* API providers */
+.provider-list { min-height: 0; padding: 7px; overflow-y: auto; border-right: 1px solid var(--border); background: var(--color-f7f7f4); }
+.provider-list__item { width: 100%; min-height: 51px; padding: 6px; display: flex; align-items: center; gap: 6px; border-radius: 7px; background: transparent; text-align: left; transition: opacity .14s, transform .14s, background .14s, box-shadow .14s; }
+.provider-list__item:hover { background: var(--hover); }
+.provider-list__item--active { background: var(--color-e5e5e0); }
+.provider-list__main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.provider-list__item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10.5px; }
+.provider-list__item small { margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 7.8px; }
+.provider-detail__heading { min-height: 45px; padding: 0 0 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); }
+.provider-detail__heading > div { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.provider-detail__heading strong { font-size: 12px; }
+.provider-detail__heading > div > span { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font: 8.5px var(--mono); }
+.provider-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.provider-field-grid .field { margin-bottom: 9px; }
+.provider-field-grid .field:last-child { grid-column: 1 / -1; margin-bottom: 0; }
+
+.model-editor-backdrop { position: fixed; inset: 0; z-index: 1300; padding: 24px; display: flex; align-items: center; justify-content: center; background: var(--color-1e1e1c-ap30); backdrop-filter: blur(2px); animation: fade-in .12s ease-out; }
+.model-editor-dialog { width: min(560px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--color-cecec8); border-radius: 12px; background: var(--panel); box-shadow: 0 24px 80px var(--color-000000-ap22), 0 3px 10px var(--color-000000-ap10); }
+.model-editor-dialog__header { min-height: 66px; padding: 14px 14px 12px 18px; display: flex; align-items: flex-start; gap: 16px; border-bottom: 1px solid var(--border); }
+.model-editor-dialog__header > div { flex: 1; min-width: 0; }
+.model-editor-dialog__header h3 { margin: 0; font-size: 14px; }
+.model-editor-dialog__header p { margin: 3px 0 0; color: var(--muted); font-size: 9.5px; }
+.model-editor-dialog__body { padding: 16px 18px 8px; overflow: auto; }
+.model-editor-dialog__body .field { margin-bottom: 12px; }
+.model-editor-dialog__footer { min-height: 57px; padding: 10px 14px; display: flex; justify-content: flex-end; align-items: center; gap: 7px; border-top: 1px solid var(--border); background: var(--color-fafaf8); }

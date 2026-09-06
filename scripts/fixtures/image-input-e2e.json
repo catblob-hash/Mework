@@ -1,0 +1,17 @@
+{
+  "openai_chat": {
+    "name": "user-openai_chat.png",
+    "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP5z8AAAAMRAQT7MzJpAAAAAElFTkSuQmCC",
+    "sha256": "bf8dfcbc032c96dbbec552761b19099f5ea906618b4d617269f4c58d543f177a"
+  },
+  "openai_responses": {
+    "name": "user-openai_responses.png",
+    "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mNh+M8AAAISAQRJxCH+AAAAAElFTkSuQmCC",
+    "sha256": "29cdba8a2b122ec898d64e51693616414cc685d637ab2fec8b2ebba85e14a248"
+  },
+  "anthropic": {
+    "name": "user-anthropic_messages.png",
+    "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mNhYPgPAAETAQQ6RGJqAAAAAElFTkSuQmCC",
+    "sha256": "172bf4d16ba48a6d6ea47618895883499378988ec463905e8f8040e4369bc757"
+  }
+}

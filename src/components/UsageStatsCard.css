@@ -1,0 +1,388 @@
+/* The isolated namespace prevents collisions with global rules. */
+
+.usage-stats {
+  flex: 1;
+  min-height: 260px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 20px;
+  padding: 24px 0;
+}
+
+.usage-stats__greeting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  color: var(--text);
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+}
+
+.usage-stats__card {
+  width: 100%;
+  max-width: 540px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.usage-stats__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.usage-stats__segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--subtle);
+}
+
+.usage-stats__segmented > button {
+  padding: 4px 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.usage-stats__segmented--compact > button { padding: 4px 8px; }
+
+.usage-stats__segmented > button:hover { color: var(--text); }
+
+.usage-stats__segmented > button.is-active {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 2px var(--color-000000-ap8);
+}
+
+.usage-stats__tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.usage-stats__tile {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--subtle);
+}
+
+.usage-stats__tile-label {
+  color: var(--faint);
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-stats__tile-value {
+  color: var(--text);
+  font-size: 14.5px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-stats__heatmap {
+  display: flex;
+  gap: 3px;
+  overflow: hidden;
+}
+
+.usage-stats__heatmap-week {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.usage-stats__heatmap-cell {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--subtle);
+}
+
+.usage-stats__heatmap-cell--l1 { background: color-mix(in srgb, var(--accent) 22%, var(--subtle)); }
+.usage-stats__heatmap-cell--l2 { background: color-mix(in srgb, var(--accent) 45%, var(--subtle)); }
+.usage-stats__heatmap-cell--l3 { background: color-mix(in srgb, var(--accent) 70%, var(--subtle)); }
+.usage-stats__heatmap-cell--l4 { background: var(--accent); }
+.usage-stats__heatmap-cell--future { background: transparent; }
+
+.usage-stats__note {
+  margin: 0;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.usage-stats__models {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.usage-stats__chart {
+  display: grid;
+  /* The axis track has to be allowed below its natural 34px. At the 680px
+     minimum window with both side panels open the card interior is a couple of
+     pixels wide, and a fixed track there would push the plot out of the card and
+     under `.context-scroll`'s horizontal clip. */
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  grid-template-rows: 168px auto;
+  column-gap: 8px;
+  padding-top: 6px;
+}
+
+.usage-stats__chart-axis {
+  position: relative;
+  grid-column: 1;
+  grid-row: 1;
+  width: 34px;
+  max-width: 100%;
+}
+
+.usage-stats__chart-tick {
+  position: absolute;
+  right: 0;
+  transform: translateY(50%);
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.usage-stats__chart-plot {
+  position: relative;
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.usage-stats__chart-grid {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  /* Centre the rule on its value so it lines up with the tick label, which is
+     centred the same way. */
+  transform: translateY(50%);
+  background: var(--border);
+}
+
+.usage-stats__chart-columns {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+}
+
+/* Columns split the plot evenly; the bar inside keeps a proportional gutter so
+   the gap survives at any bucket count instead of eating the bar. */
+.usage-stats__chart-column {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+}
+
+.usage-stats__chart-column.is-hovered {
+  background: color-mix(in srgb, var(--subtle) 70%, transparent);
+}
+
+.usage-stats__chart-stack {
+  width: 78%;
+  /* Without a cap a seven-day range draws 50px slabs; the cap keeps the bar
+     roughly the width it has when the range is full. */
+  max-width: 26px;
+  min-width: 1px;
+  height: 100%;
+  display: flex;
+  flex-direction: column-reverse;
+}
+
+.usage-stats__chart-segment {
+  flex: 0 0 auto;
+  width: 100%;
+  background: var(--series);
+}
+
+/* The ramp saturates at s7, so the ninth model onward repeats a shade. A hairline
+   along the shared edge keeps those neighbours readable as two segments — the
+   inset draws inside the box, so it never adds height to the stack. */
+.usage-stats__chart-segment + .usage-stats__chart-segment {
+  box-shadow: inset 0 -1px 0 var(--panel);
+}
+
+.usage-stats__chart-days {
+  position: relative;
+  grid-column: 2;
+  grid-row: 2;
+  height: 13px;
+  margin-top: 6px;
+  /* Labels are positioned, not laid out, so a narrow plot would let the outer
+     ones hang past the card edge. */
+  overflow: hidden;
+}
+
+.usage-stats__chart-day {
+  position: absolute;
+  top: 0;
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.usage-stats__chart-day--mid { transform: translateX(-50%); }
+
+.usage-stats__chart-tip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  min-width: min(136px, 100%);
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 6px 18px var(--color-000000-ap13);
+  /* The card sits over the columns it describes; letting it take the pointer
+     would drop the hover that opened it and flicker it away. */
+  pointer-events: none;
+}
+
+.usage-stats__chart-tip--end {
+  left: auto;
+  right: 0;
+}
+
+.usage-stats__chart-tip-title {
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.usage-stats__chart-tip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.usage-stats__chart-tip-row .usage-stats__swatch { border-radius: 999px; }
+
+.usage-stats__chart-tip-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-stats__chart-tip-value {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-stats__chart-tip-rest {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.usage-stats__swatch {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--series);
+}
+
+/* One accent ramp shared by the bars, the legend and the hover card: shade
+   index is model rank, so a colour never has to be mapped anywhere else. */
+.usage-stats__swatch--s0, .usage-stats__chart-segment--s0 { --series: var(--accent); }
+.usage-stats__swatch--s1, .usage-stats__chart-segment--s1 { --series: color-mix(in srgb, var(--accent) 84%, var(--subtle)); }
+.usage-stats__swatch--s2, .usage-stats__chart-segment--s2 { --series: color-mix(in srgb, var(--accent) 70%, var(--subtle)); }
+.usage-stats__swatch--s3, .usage-stats__chart-segment--s3 { --series: color-mix(in srgb, var(--accent) 58%, var(--subtle)); }
+.usage-stats__swatch--s4, .usage-stats__chart-segment--s4 { --series: color-mix(in srgb, var(--accent) 47%, var(--subtle)); }
+.usage-stats__swatch--s5, .usage-stats__chart-segment--s5 { --series: color-mix(in srgb, var(--accent) 38%, var(--subtle)); }
+.usage-stats__swatch--s6, .usage-stats__chart-segment--s6 { --series: color-mix(in srgb, var(--accent) 30%, var(--subtle)); }
+.usage-stats__swatch--s7, .usage-stats__chart-segment--s7 { --series: color-mix(in srgb, var(--accent) 23%, var(--subtle)); }
+
+.usage-stats__legend {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.usage-stats__legend-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 11.5px;
+}
+
+.usage-stats__legend-row + .usage-stats__legend-row { border-top: 1px solid var(--subtle); }
+
+.usage-stats__legend-name {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-stats__legend-tokens {
+  color: var(--faint);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.usage-stats__legend-share {
+  min-width: 42px;
+  color: var(--muted);
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-stats__legend-more {
+  align-self: flex-start;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.usage-stats__legend-more:hover { color: var(--text); }

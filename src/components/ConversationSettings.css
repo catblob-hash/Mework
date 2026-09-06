@@ -1,0 +1,27 @@
+/* Use semantic color tokens. */
+
+/* Applying a preset is a one-time action rather than state, so this row has
+   only a dropdown and entry link, with no "currently following" indicator. */
+.conversation-settings__apply {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 15px;
+  border-bottom: 1px solid var(--border);
+}
+
+.conversation-settings__apply .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.conversation-settings__apply .text-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.conversation-settings__system-prompt {
+  width: 100%;
+  resize: vertical;
+  min-height: 96px;
+}

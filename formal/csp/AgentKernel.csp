@@ -1,0 +1,685 @@
+-- =========================================================================
+-- Mework agent kernel interaction protocol (CSP-M requirements layer).
+--
+-- This is the authoritative kernel interaction protocol. It defines which
+-- process offers each event, in which phase, and with which synchronization.
+-- The TLA+ safety layer (`formal/tla/AgentKernel.tla`) defines forbidden states;
+-- this layer decomposes the same event vocabulary into processes.
+--
+-- Channel names must exactly match TLA+ action names and Rust
+-- `KernelEvent::NAMES`. MAIN must accept exactly the traces accepted by the
+-- safety model. The verifier checks vocabulary parity, exhaustive CSP-TLA
+-- composition without invariant counterexamples, and trace replay in both
+-- oracles. MAIN and NoAdversary must be deadlock-free.
+--
+-- Keep this specification small enough for line-by-line review. The CSP mutation
+-- matrix must make an assertion fail when any protocol constraint is weakened.
+--
+-- All tasks are asynchronous. AgentSpawn is non-blocking; the model waits for
+-- a task result only through task_wait. ContextEdit is offered only by TURN's
+-- idle state. Persisted data is authoritative, runtime state is a cache, and
+-- edited content is opaque to the kernel, so ContextEdit has no state effect.
+--
+-- Providers sequence turns into rounds. RoundStart dispatches one model call;
+-- RoundEnd completes that call's processing. Call pipelines, AgentSpawn, and
+-- TaskWait exist within a round; RoundEnd requires every call slot to settle.
+-- Between rounds, the host may merge steer input and push folds.
+--
+-- `roundDue` is a delivery obligation. TurnStart, SteerJoin, AgentFold, and
+-- in-round deliverables require a later round to deliver content to the model.
+-- RoundStart consumes the obligation. A normal turn cannot end with an obligation;
+-- TurnCancel abandons all obligations. AgentFold is prep-only, applies only to
+-- done results, and creates `roundDue`. Done results during a running round must
+-- be consumed by task_wait or delivered through AgentFold.
+--
+-- SteerEnqueue is available in an active turn, including cancellation. SteerJoin
+-- is prep-only and creates `roundDue`. Pending steer blocks RoundStart and normal
+-- TurnEnd, except cancellation preserves it for the next turn.
+--
+-- task_wait is a timed, result-blocking wait. TaskWait starts a wait within a
+-- round. TaskWaitDeliver is offered only after the task settles; a wait for an
+-- already settled task can deliver immediately. Progress updates never complete
+-- a wait and are delivered only with the final result.
+--
+-- A multi-task task_wait completes only when every selected task delivers or its
+-- timeout expires. Each task slot owns an independent pending wait; a delivery
+-- returns only that slot to ANone. RoundEnd synchronizes with all task slots and
+-- no waiting state offers RoundEnd.
+--
+-- TaskWaitTimeout withdraws an undelivered wait only when its deadline expires
+-- or its own task becomes non-running without an envelope. A sibling delivery or
+-- a progress update never withdraws a wait. Only running tasks may time out;
+-- waits for settled tasks must deliver. Timeout receipts create `roundDue`.
+--
+-- A wait can target only the current task identity in its own slot. At most one
+-- wait is pending per task. Pending waits block RoundEnd and are abandoned by
+-- TurnCancel, after which they cannot deliver.
+--
+-- Synchronous tool calls carry no identity: request, authorization, execution,
+-- receipt, and archival use one host-held call object within one round. The host
+-- holding that object is environmental assumption A3.
+--
+-- Asynchronous tasks carry task identity `r`. AgentSpawn mints an identity that
+-- differs from the previous generation in its slot. Completion, waiting,
+-- delivery, and folding must submit the current identity; mismatches reject late
+-- events from an old generation. This preserves the cross-generation portion of
+-- environmental assumption A2.
+--
+-- The initial identity is 1, so the first task generation uses 2. Identity
+-- persists across turns.
+--
+-- Every host-embedded model or agent loop is a task and must use a task-slot
+-- pipeline. Spawn acknowledgement returns immediately; results are delivered by
+-- TaskWaitDeliver or AgentFold. Such loops must not nest a model loop inside a
+-- synchronous call.
+--
+-- A synchronous call carries a deadline, and expiry does not abandon the work.
+-- ToolBackground hands the still-running host process from an executing call
+-- slot to a free task slot, which mints a fresh identity exactly as AgentSpawn
+-- does. The call is not cut short by the handoff: it stays in the pipeline and
+-- settles normally, its receipt now naming the task instead of carrying output.
+-- This is the only event that crosses the call and task surfaces, so it
+-- synchronizes both slots plus the concurrency cap.
+--
+-- The deadline itself stays outside this clockless protocol. What is modelled is
+-- the consequence: one call may hand off at most once, only while executing, and
+-- only into an empty task slot within capacity. When no task slot is free the
+-- host has no handoff to make and the deadline simply kills the command, which
+-- is an ordinary failed receipt and needs no vocabulary of its own.
+--
+-- bash and powershell accept `run_in_background`. A background leg is an
+-- explicitly requested asynchronous task: it uses a task-slot pipeline, consumes
+-- approval before spawning, returns its spawn acknowledgement immediately, and
+-- delivers results through TaskWaitDeliver or AgentFold. Stopping such a task is
+-- not a separate protocol event: it produces a terminal result like any other.
+-- A handed-off task is indistinguishable from an explicitly backgrounded one
+-- once it is running: same completion, wait, fold, and cross-turn survival.
+--
+-- Tasks outlive turns. ARunning and ARunningCx offer TurnEnd and retain the
+-- current identity through idle. A task completing in idle creates a wake
+-- obligation: AIdleDone can exit only through TurnStart, then the result is
+-- folded before the new turn's first RoundStart. Every task already done at
+-- TurnStart must fold; tasks completing after TurnStart retain ordinary round
+-- semantics. Cancellation may defer these results to the next TurnStart.
+-- The host test suite covers wake timing.
+--
+-- No terminal result is ever silently discarded, and the protocol has no
+-- archival path. AgentComplete is the single exit from running, whatever ended
+-- the task — the model finishing, a host failure, or the user closing it from
+-- the sidebar — and every such result must be taken by a wait or pushed by a
+-- fold. A done task remains across cancellation and is folded in a later turn.
+-- TurnCancel cancels the model turn, its pending waits, and delivery
+-- obligations, but not tasks.
+--
+-- `awaiting_user` uses the cancellation-settlement projection. It does not
+-- interrupt background tasks.
+--
+-- web_search and web_fetch use the call-slot pipeline, not the task surface.
+-- They mint no task identity, cannot be named by task_wait, do not fold or wake,
+-- and return through their own ToolRequest -> authorization -> ToolExecStart ->
+-- ToolExecEnd -> ToolSettle pipeline.
+--
+-- The task surface consists of host-embedded model or agent loops and explicitly
+-- backgrounded host work. Search and fetch are neither: a native search request
+-- is a tool-free external request, not an agent loop, and neither has a model
+-- background option.
+--
+-- Calls in a round may execute concurrently. Their slot processes synchronize
+-- only on turn events, PolicyTighten, and RoundEnd, so either execution may
+-- finish first. RoundEnd is available only after every call settles; results
+-- from concurrently dispatched search calls are therefore delivered together in
+-- the next round. A call that handed its work off still has to settle, so a
+-- handoff postpones nothing about round closure.
+--
+-- SCEN_APPROVE and BAD_ROUNDEND_UNSETTLED_CALL cover this behavior.
+--
+-- Finite abstraction matching KernelConfig::MODEL_SCOPE: call slots 1..2,
+-- task slots 1..2, maximum concurrency 1, and task identities {1..2}. Slots
+-- are reusable containers, not globally unique IDs; `other(r)` ensures adjacent
+-- generations use distinct identities.
+-- =========================================================================
+
+nametype CallSlots = {1..2}
+nametype AgentSlots = {1..2}
+nametype TaskIds = {1..2}
+
+MaxLiveAgents = 1
+
+-- Finite nonce freshness: a new task identity must differ from its predecessor.
+other(r) = 3 - r
+
+channel TurnStart, TurnCancel, TurnEnd, ContextEdit, PolicyTighten
+channel RoundStart, RoundEnd, SteerEnqueue, SteerJoin
+channel ToolRequest : CallSlots.Bool
+channel ToolAllow, ToolApprove, ToolDeny, ToolExecStart, ToolExecEnd, ToolSettle : CallSlots
+channel AgentSpawn, AgentComplete, AgentFold : AgentSlots.TaskIds
+channel TaskWait, TaskWaitDeliver, TaskWaitTimeout : AgentSlots.TaskIds
+channel ToolBackground : CallSlots.AgentSlots.TaskIds
+
+-- ToolBackground is the one event both a call slot and a task slot must agree
+-- on, so each side needs the projection the `{| |}` prefix notation cannot
+-- express: a call slot binds the first field, a task slot the second.
+ToolBackgroundFrom(c) = {| ToolBackground.c |}
+ToolBackgroundInto(a) = { ToolBackground.c.a.r | c <- CallSlots, r <- TaskIds }
+
+-- -------------------------------------------------------------------------
+-- Turn process: outer user-visible loop with pending steer bit `s`, retained
+-- across turns. Context is editable only while idle. SteerEnqueue is available
+-- during an active turn; SteerJoin clears `s` during prep. Pending steer blocks
+-- a normal start or end; TCX preserves it for the next turn.
+-- -------------------------------------------------------------------------
+
+TURN(s) = ContextEdit -> TURN(s)
+       [] TurnStart -> TRUN(s)
+TRUN(s) = (not s) & RoundStart -> TRUN(s)
+       [] SteerEnqueue -> TRUN(true)
+       [] s & SteerJoin -> TRUN(false)
+       [] (not s) & TurnEnd -> TURN(s)
+       [] TurnCancel -> TCX(s)
+TCX(s) = SteerEnqueue -> TCX(true)
+      [] TurnEnd -> TURN(s)
+
+-- -------------------------------------------------------------------------
+-- Round process: WPrep is the inter-round boundary, WRound is in-round, `due`
+-- is the delivery obligation, and `cx` records cancellation. Model actions are
+-- in-round; SteerJoin and AgentFold are prep-only. TurnStart, SteerJoin,
+-- AgentFold, and in-round deliverables create `due`; RoundStart consumes it.
+-- TaskWait starts a wait but delivers no content and creates no due.
+-- -------------------------------------------------------------------------
+
+WPrep(due, cx) = TurnStart -> WPrep(true, false)
+            [] SteerJoin -> WPrep(true, cx)
+            [] AgentFold?a?r -> WPrep(true, cx)
+            [] due & RoundStart -> WRound(false, cx)
+            [] ((not due) or cx) & TurnEnd -> WPrep(false, false)
+            [] TurnCancel -> WPrep(due, true)
+WRound(due, cx) = ToolRequest?c?d -> WRound(due, cx)
+             [] AgentSpawn?a?r -> WRound(true, cx)
+             [] ToolBackground?c?a?r -> WRound(due, cx)
+             [] TaskWait?a?r -> WRound(due, cx)
+             [] TaskWaitDeliver?a?r -> WRound(true, cx)
+             [] TaskWaitTimeout?a?r -> WRound(true, cx)
+             [] ToolSettle?c -> WRound(true, cx)
+             [] RoundEnd -> WPrep(due, cx)
+             [] TurnCancel -> WRound(due, true)
+
+-- -------------------------------------------------------------------------
+-- Call process: one per call slot. The pipeline is request -> allow/approve/deny
+-- -> execute -> receipt -> settle. `fresh` is an unconsumed authorization not
+-- invalidated by PolicyTighten. Synchronous calls carry no identity because the
+-- host holds the call object throughout the pipeline (assumption A3).
+-- PolicyTighten synchronizes every call slot and clears `fresh`. Unsettled slots
+-- do not offer RoundEnd.
+-- -------------------------------------------------------------------------
+
+-- idle between turns: every call slot is empty.
+CIdle(c) = TurnStart -> CUnused(c)
+        [] PolicyTighten -> CIdle(c)
+
+CUnused(c) = ToolRequest.c?d -> CRequested(c, d)
+          [] RoundEnd -> CUnused(c)
+          [] PolicyTighten -> CUnused(c)
+          [] TurnCancel -> CUnusedCx(c)
+          [] TurnEnd -> CIdle(c)
+
+-- S1: safe calls are automatically allowed; dangerous calls require user
+-- approval. Both kinds may be denied.
+CRequested(c, false) = ToolAllow.c -> CAllowed(c, false, true)
+                    [] ToolDeny.c -> CDenied(c)
+                    [] PolicyTighten -> CRequested(c, false)
+                    [] TurnCancel -> CPendingCx(c)
+CRequested(c, true) = ToolApprove.c -> CAllowed(c, true, true)
+                   [] ToolDeny.c -> CDenied(c)
+                   [] PolicyTighten -> CRequested(c, true)
+                   [] TurnCancel -> CPendingCx(c)
+
+-- S2+S3: execution consumes `fresh`. Policy tightening clears it, requiring a
+-- new authorization. Safe calls use ToolAllow and dangerous calls ToolApprove.
+CAllowed(c, false, fresh) = fresh & ToolExecStart.c -> CExecuting(c)
+                         [] ToolAllow.c -> CAllowed(c, false, true)
+                         [] PolicyTighten -> CAllowed(c, false, false)
+                         [] TurnCancel -> CPendingCx(c)
+CAllowed(c, true, fresh) = fresh & ToolExecStart.c -> CExecuting(c)
+                        [] ToolApprove.c -> CAllowed(c, true, true)
+                        [] PolicyTighten -> CAllowed(c, true, false)
+                        [] TurnCancel -> CPendingCx(c)
+
+-- S7: only executing offers exactly one ToolExecEnd receipt. S12: an executing
+-- call may hand its work to a free task slot exactly once; CExecutingBg is
+-- still executing for every other purpose, which is what makes the handoff
+-- unrepeatable without weakening the receipt rule.
+CExecuting(c) = ToolExecEnd.c -> CDone(c)
+             [] ToolBackground.c?a?r -> CExecutingBg(c)
+             [] PolicyTighten -> CExecuting(c)
+             [] TurnCancel -> CExecutingCx(c)
+CExecutingBg(c) = ToolExecEnd.c -> CDone(c)
+               [] PolicyTighten -> CExecutingBg(c)
+               [] TurnCancel -> CExecutingCx(c)
+CDone(c) = ToolSettle.c -> CUnused(c)
+        [] PolicyTighten -> CDone(c)
+        [] TurnCancel -> CSettleableCx(c)
+CDenied(c) = ToolSettle.c -> CUnused(c)
+          [] PolicyTighten -> CDenied(c)
+          [] TurnCancel -> CSettleableCx(c)
+
+-- Cancellation settlement (S4+S5): no new request, authorization, or execution
+-- is accepted. In-flight execution may finish, and only this path discards an
+-- unsettled call. Settlement completes in-round, then CUnusedCx offers RoundEnd.
+CUnusedCx(c) = RoundEnd -> CUnusedCx(c)
+            [] PolicyTighten -> CUnusedCx(c)
+            [] TurnEnd -> CIdle(c)
+CPendingCx(c) = ToolSettle.c -> CUnusedCx(c)
+             [] PolicyTighten -> CPendingCx(c)
+CExecutingCx(c) = ToolExecEnd.c -> CSettleableCx(c)
+              [] PolicyTighten -> CExecutingCx(c)
+CSettleableCx(c) = ToolSettle.c -> CUnusedCx(c)
+               [] PolicyTighten -> CSettleableCx(c)
+
+-- -------------------------------------------------------------------------
+-- Task process: one per task slot, retaining current or prior identity `r` across
+-- turns. Spawn is non-blocking and mints `other(r)`; every subsequent task event
+-- must submit that identity, rejecting late old-generation events. Completion is
+-- environment-driven and may occur across rounds and turns; it is the only exit
+-- from running, whatever ended the task. TaskWait starts one pending wait on a
+-- running or settled task; TaskWaitDeliver is offered only for a settled task.
+-- Waiting blocks RoundEnd. Without a wait, done offers prep-only AgentFold. A
+-- running task survives TurnEnd. Idle completion wakes via AIdleDone and
+-- TurnStart. Cancellation abandons waits and turn actions but lets tasks cross
+-- TurnEnd, retaining done results for later fold.
+-- -------------------------------------------------------------------------
+
+AIdle(a, r) = TurnStart -> ANone(a, r)
+           [] RoundStart -> AIdle(a, r)
+ANone(a, r) = AgentSpawn.a!other(r) -> ARunning(a, other(r))
+           [] ToolBackground?c!a!other(r) -> ARunning(a, other(r))
+           [] RoundEnd -> ANone(a, r)
+           [] TurnCancel -> ANoneCx(a, r)
+           [] TurnEnd -> AIdle(a, r)
+           [] RoundStart -> ANone(a, r)
+ARunning(a, r) = AgentComplete.a.r -> ADone(a, r)
+              [] TaskWait.a.r -> AWaitRunning(a, r)
+              [] RoundEnd -> ARunning(a, r)
+              [] TurnCancel -> ARunningCx(a, r)
+              [] TurnEnd -> AIdleRunning(a, r)
+              [] RoundStart -> ARunning(a, r)
+ADone(a, r) = TaskWait.a.r -> AWaitDone(a, r)
+           [] AgentFold.a.r -> ANone(a, r)
+           [] RoundEnd -> ADone(a, r)
+           [] TurnCancel -> ADoneCx(a, r)
+           [] RoundStart -> ADone(a, r)
+
+-- Waiting states do not offer RoundEnd. A waiting task may settle; a running
+-- wait may time out, while a settled wait must deliver. TurnCancel abandons the
+-- wait: done is retained and running continues.
+AWaitRunning(a, r) = AgentComplete.a.r -> AWaitDone(a, r)
+                  [] TaskWaitTimeout.a.r -> ARunning(a, r)
+                  [] TurnCancel -> ARunningCx(a, r)
+                  [] RoundStart -> AWaitRunning(a, r)
+AWaitDone(a, r) = TaskWaitDeliver.a.r -> ANone(a, r)
+              [] TurnCancel -> ADoneCx(a, r)
+              [] RoundStart -> AWaitDone(a, r)
+
+-- Cancellation settlement (S4+S11) accepts no new wait, delivery, or fold.
+-- Tasks cross TurnEnd and done is retained for the next turn.
+ANoneCx(a, r) = RoundEnd -> ANoneCx(a, r)
+             [] TurnEnd -> AIdle(a, r)
+             [] RoundStart -> ANoneCx(a, r)
+ARunningCx(a, r) = AgentComplete.a.r -> ADoneCx(a, r)
+                [] RoundEnd -> ARunningCx(a, r)
+                [] TurnEnd -> AIdleRunning(a, r)
+                [] RoundStart -> ARunningCx(a, r)
+ADoneCx(a, r) = RoundEnd -> ADoneCx(a, r)
+            [] TurnEnd -> AIdleDone(a, r)
+            [] RoundStart -> ADoneCx(a, r)
+
+-- S11: only tasks already done when TurnStart occurs block the first round.
+-- Other states offer RoundStart without imposing another window/turn guard;
+-- TURN and ROUND retain those independent obligations and their mutation probes.
+AIdleRunning(a, r) = AgentComplete.a.r -> AIdleDone(a, r)
+                  [] TurnStart -> ARunning(a, r)
+                  [] RoundStart -> AIdleRunning(a, r)
+AIdleDone(a, r) = TurnStart -> AWakeDone(a, r)
+               [] RoundStart -> AIdleDone(a, r)
+AWakeDone(a, r) = AgentFold.a.r -> ANone(a, r)
+               [] TurnCancel -> ADoneCx(a, r)
+
+-- S6: the concurrency limit is a cross-slot constraint enforced by synchronizing
+-- the capacity process with every task slot. The running count decrements on
+-- Complete, the sole exit from running; composition keeps `n` non-negative.
+-- A handed-off call occupies a task slot exactly like a spawn, so it is counted
+-- by the same cap rather than a second one.
+CAPACITY(n) = (n < MaxLiveAgents) & AgentSpawn?a?r -> CAPACITY(n + 1)
+           [] (n < MaxLiveAgents) & ToolBackground?c?a?r -> CAPACITY(n + 1)
+           [] AgentComplete?a?r -> CAPACITY(n - 1)
+
+-- -------------------------------------------------------------------------
+-- Composition. Turn events synchronize all processes. TurnEnd requires call
+-- slots to be settled; tasks may remain running, but done results must be folded
+-- or delivered, except done results retained across cancellation. ROUND controls
+-- window events. RoundEnd requires settled calls and no pending task wait.
+-- PolicyTighten synchronizes all call slots; spawn and completion synchronize
+-- matching task slots and capacity. ContextEdit belongs only to TURN.
+-- -------------------------------------------------------------------------
+
+TurnEvents = {TurnStart, TurnCancel, TurnEnd}
+TurnAlpha = union(TurnEvents, {ContextEdit, SteerEnqueue, SteerJoin, RoundStart})
+RoundAlpha = union(union(TurnEvents, {RoundStart, RoundEnd, SteerJoin}),
+                   union({| ToolRequest, ToolSettle, AgentSpawn, TaskWait, TaskWaitDeliver,
+                            TaskWaitTimeout, AgentFold |},
+                         {| ToolBackground |}))
+CallAlpha(c) = union(TurnEvents,
+                     union(union({PolicyTighten, RoundEnd},
+                                 {| ToolRequest.c, ToolAllow.c, ToolApprove.c, ToolDeny.c,
+                                    ToolExecStart.c, ToolExecEnd.c, ToolSettle.c |}),
+                           ToolBackgroundFrom(c)))
+AgentAlpha(a) = union(TurnEvents,
+                      union(union({RoundStart, RoundEnd},
+                                  {| AgentSpawn.a, AgentComplete.a, AgentFold.a,
+                                     TaskWait.a, TaskWaitDeliver.a, TaskWaitTimeout.a |}),
+                            ToolBackgroundInto(a)))
+CapAlpha = union({| AgentSpawn, AgentComplete |}, {| ToolBackground |})
+CallsAlpha = union(CallAlpha(1), CallAlpha(2))
+AgentsAlpha = union(AgentAlpha(1), AgentAlpha(2))
+SlotsAlpha = union(CallsAlpha, union(AgentsAlpha, CapAlpha))
+
+CALLS = CIdle(1) [ CallAlpha(1) || CallAlpha(2) ] CIdle(2)
+AGENTS = AIdle(1, 1) [ AgentAlpha(1) || AgentAlpha(2) ] AIdle(2, 1)
+AGENTS_CAPPED = AGENTS [ AgentsAlpha || CapAlpha ] CAPACITY(0)
+SLOTS = CALLS [ CallsAlpha || union(AgentsAlpha, CapAlpha) ] AGENTS_CAPPED
+GATED = WPrep(false, false) [ RoundAlpha || SlotsAlpha ] SLOTS
+
+MAIN = TURN(false) [ TurnAlpha || union(RoundAlpha, SlotsAlpha) ] GATED
+
+-- Progress check: disabling PolicyTighten and SteerEnqueue must still leave the
+-- protocol deadlock-free.
+NoAdversary = MAIN [| {PolicyTighten, SteerEnqueue} |] STOP
+
+-- =========================================================================
+-- Scenario processes. The verifier checks positive traces with `SCEN_*` and
+-- negative traces with `BAD_*`; each negative trace must be reversed by a CSP
+-- mutation that weakens its constraint. First-generation task identity is 2,
+-- followed by 1 and alternating thereafter.
+-- =========================================================================
+
+-- S1/S2/S7/S9: full dangerous-call approval, execution, receipt, and archival;
+-- the final round delivers the receipt.
+SCEN_APPROVE = TurnStart -> RoundStart -> ToolRequest.1.true -> ToolApprove.1
+            -> ToolExecStart.1 -> ToolExecEnd.1 -> ToolSettle.1 -> RoundEnd
+            -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S3: re-approval after policy tightening may proceed.
+SCEN_REAPPROVE = TurnStart -> RoundStart -> ToolRequest.1.true -> ToolApprove.1
+              -> PolicyTighten -> ToolApprove.1 -> ToolExecStart.1 -> ToolExecEnd.1
+              -> ToolSettle.1 -> RoundEnd -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S4/S5: cancellation settlement finishes in-flight execution, discards unsettled
+-- calls, and closes the round while abandoning delivery obligations. A task
+-- settling during cancellation is retained through ADoneCx for a later fold.
+SCEN_CANCEL = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+           -> ToolExecStart.1 -> ToolRequest.2.true -> AgentSpawn.1.2 -> TurnCancel
+           -> ToolExecEnd.1 -> ToolSettle.1 -> ToolSettle.2 -> AgentComplete.1.2
+           -> RoundEnd -> TurnEnd -> STOP
+-- S8'/S9: context editing between turns; asynchronous spawn does not block
+-- further calls, while waiting for a running task blocks until in-round delivery.
+SCEN_ASYNC_WAIT = ContextEdit -> TurnStart -> RoundStart -> AgentSpawn.1.2
+               -> ToolRequest.1.false -> ToolAllow.1 -> ToolExecStart.1
+               -> TaskWait.1.2 -> ToolExecEnd.1 -> AgentComplete.1.2
+               -> TaskWaitDeliver.1.2 -> ToolSettle.1 -> RoundEnd
+               -> RoundStart -> RoundEnd -> TurnEnd -> ContextEdit -> STOP
+-- S8': a wait for an already settled task delivers immediately.
+SCEN_WAIT_SETTLED = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                 -> TaskWait.1.2 -> TaskWaitDeliver.1.2 -> RoundEnd
+                 -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S8': timeout withdraws a wait while the task continues; the timeout receipt is
+-- delivered in the next round, and the still-running task survives the turn.
+SCEN_WAIT_TIMEOUT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+                 -> TaskWaitTimeout.1.2 -> RoundEnd -> RoundStart -> RoundEnd
+                 -> TurnEnd -> STOP
+-- S9: an unclaimed done result folds in prep and triggers the next round; another
+-- task's result may instead be observed by an in-round wait.
+SCEN_FOLD = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd -> AgentComplete.1.2
+         -> AgentFold.1.2 -> RoundStart -> AgentSpawn.2.2 -> AgentComplete.2.2
+         -> TaskWait.2.2 -> TaskWaitDeliver.2.2 -> RoundEnd -> RoundStart -> RoundEnd
+         -> TurnEnd -> STOP
+-- S9: steer is enqueued in-round, joined in prep, consumed by the next round,
+-- then the turn ends normally.
+SCEN_STEER = TurnStart -> RoundStart -> SteerEnqueue -> RoundEnd -> SteerJoin
+          -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S9: cancellation retains pending steer for joining before the next turn's
+-- first round.
+SCEN_STEER_CARRYOVER = TurnStart -> RoundStart -> SteerEnqueue -> TurnCancel
+                    -> RoundEnd -> TurnEnd -> TurnStart -> SteerJoin -> RoundStart
+                    -> RoundEnd -> TurnEnd -> STOP
+-- S9: a task the user stopped mid-turn still produces a terminal result, so its
+-- fold charges `roundDue` and the turn cannot end without another round.
+SCEN_STOP_RETRIGGERS = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd
+                    -> RoundStart -> RoundEnd -> AgentComplete.1.2 -> AgentFold.1.2
+                    -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S10': reusing a slot rotates task identity; each generation proceeds with its
+-- current identity.
+SCEN_TID_ROTATE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+               -> TaskWait.1.2 -> TaskWaitDeliver.1.2 -> AgentSpawn.1.1
+               -> AgentComplete.1.1 -> TaskWait.1.1 -> TaskWaitDeliver.1.1 -> RoundEnd
+               -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S11: a running task survives normal end. Idle completion wakes a new turn;
+-- prep folds the result and the first round delivers it.
+SCEN_TASK_SURVIVES_END = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd
+                      -> RoundStart -> RoundEnd -> TurnEnd -> AgentComplete.1.2
+                      -> TurnStart -> AgentFold.1.2 -> RoundStart -> RoundEnd
+                      -> TurnEnd -> STOP
+-- S11: the next user turn adopts a surviving task and may wait for its delivery.
+SCEN_ADOPT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd -> RoundStart
+          -> RoundEnd -> TurnEnd -> TurnStart -> RoundStart -> TaskWait.1.2
+          -> AgentComplete.1.2 -> TaskWaitDeliver.1.2 -> RoundEnd -> RoundStart
+          -> RoundEnd -> TurnEnd -> STOP
+-- S11: cancellation does not interrupt a task; a running task survives it and
+-- idle completion still wakes a turn.
+SCEN_CANCEL_RUNNING_SURVIVES = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TurnCancel
+                            -> RoundEnd -> TurnEnd -> AgentComplete.1.2 -> TurnStart
+                            -> AgentFold.1.2 -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S11: cancellation retains an already done result for folding in the next turn.
+SCEN_CANCEL_DONE_CARRYOVER = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                          -> TurnCancel -> RoundEnd -> TurnEnd -> TurnStart
+                          -> AgentFold.1.2 -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S11: a task completing between TurnCancel and TurnEnd is also retained through
+-- ADoneCx and folded in the next turn.
+SCEN_CANCEL_WINDOW_COMPLETE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TurnCancel
+                           -> AgentComplete.1.2 -> RoundEnd -> TurnEnd -> TurnStart
+                           -> AgentFold.1.2 -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- The cap is one live task, not one retained result: completing the first
+-- before spawning the second leaves two done results to inherit on wake.
+WakeTwo(next) = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+              -> AgentSpawn.2.2 -> AgentComplete.2.2 -> TurnCancel -> RoundEnd
+              -> TurnEnd -> TurnStart -> next
+SCEN_WAKE_TWO_FOLDS = WakeTwo(AgentFold.2.2 -> AgentFold.1.2 -> RoundStart
+                            -> RoundEnd -> TurnEnd -> STOP)
+SCEN_WAKE_CANCEL_RETRY = WakeTwo(AgentFold.1.2 -> TurnCancel -> TurnEnd
+                               -> TurnStart -> AgentFold.2.2 -> RoundStart
+                               -> RoundEnd -> TurnEnd -> STOP)
+-- Completion after TurnStart is not an inherited result and imposes no new
+-- pre-first-round obligation. It may be waited on in that first round.
+SCEN_WAKE_LATE_COMPLETE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd
+                        -> RoundStart -> RoundEnd -> TurnEnd -> TurnStart
+                        -> AgentComplete.1.2 -> RoundStart -> TaskWait.1.2
+                        -> TaskWaitDeliver.1.2 -> RoundEnd -> RoundStart
+                        -> RoundEnd -> TurnEnd -> STOP
+BAD_WAKE_FIRST_ROUND = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd
+                     -> RoundStart -> RoundEnd -> TurnEnd -> AgentComplete.1.2
+                     -> TurnStart -> RoundStart -> STOP
+BAD_WAKE_PARTIAL_FOLD = WakeTwo(AgentFold.1.2 -> RoundStart -> STOP)
+BAD_WAKE_CANCEL_RETRY = WakeTwo(AgentFold.1.2 -> TurnCancel -> TurnEnd
+                              -> TurnStart -> RoundStart -> STOP)
+BAD_WAKE_STALE_FOLD = WakeTwo(AgentFold.1.1 -> STOP)
+
+-- S12: an executing call whose deadline expires hands its work to a free task
+-- slot and then settles normally in the same round. The task it left behind is
+-- an ordinary one: it completes later and folds in prep like any other.
+SCEN_BG_TIMEOUT = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+               -> ToolExecStart.1 -> ToolBackground.1.1.2 -> ToolExecEnd.1
+               -> ToolSettle.1 -> RoundEnd -> AgentComplete.1.2 -> AgentFold.1.2
+               -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S12: the handed-off task is addressable the moment the call settles, so the
+-- same round may wait on it and take its result in-round.
+SCEN_BG_WAIT = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+            -> ToolExecStart.1 -> ToolBackground.1.1.2 -> ToolExecEnd.1
+            -> ToolSettle.1 -> TaskWait.1.2 -> AgentComplete.1.2
+            -> TaskWaitDeliver.1.2 -> RoundEnd -> RoundStart -> RoundEnd
+            -> TurnEnd -> STOP
+
+-- S1: no execution without approval; dangerous calls cannot auto-allow, and safe
+-- calls cannot use user approval.
+BAD_EXEC_UNAPPROVED = TurnStart -> RoundStart -> ToolRequest.1.true -> ToolExecStart.1 -> STOP
+BAD_ALLOW_DANGER = TurnStart -> RoundStart -> ToolRequest.1.true -> ToolAllow.1 -> STOP
+BAD_APPROVE_SAFE = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolApprove.1 -> STOP
+-- S3: a stale approval cannot execute after tightening. Both authorization
+-- pipelines independently enforce the `fresh` guard.
+BAD_STALE_EXEC = TurnStart -> RoundStart -> ToolRequest.1.true -> ToolApprove.1
+              -> PolicyTighten -> ToolExecStart.1 -> STOP
+BAD_STALE_EXEC_SAFE = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+                   -> PolicyTighten -> ToolExecStart.1 -> STOP
+-- S2: one approval cannot start execution twice.
+BAD_DOUBLE_EXEC = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+               -> ToolExecStart.1 -> ToolExecEnd.1 -> ToolExecStart.1 -> STOP
+-- S4: cancellation accepts no new request, spawn, wait, or round.
+BAD_REQUEST_AFTER_CANCEL = TurnStart -> RoundStart -> TurnCancel -> ToolRequest.1.false -> STOP
+BAD_SPAWN_AFTER_CANCEL = TurnStart -> RoundStart -> TurnCancel -> AgentSpawn.1.2 -> STOP
+BAD_WAIT_AFTER_CANCEL = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                     -> TurnCancel -> TaskWait.1.2 -> STOP
+BAD_WAIT_AFTER_CANCEL_RUNNING = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TurnCancel
+                             -> TaskWait.1.2 -> STOP
+BAD_FOLD_AFTER_CANCEL = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                     -> TurnCancel -> RoundEnd -> AgentFold.1.2 -> STOP
+BAD_ROUNDSTART_AFTER_CANCEL = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TurnCancel
+                           -> RoundEnd -> RoundStart -> STOP
+-- S5/S11: a normal turn cannot end with an unclaimed done result, although a
+-- running task survives. Turns cannot end in-round, and unsettled calls block
+-- RoundEnd.
+BAD_END_PENDING_DONE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                    -> RoundEnd -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+BAD_END_INROUND = TurnStart -> RoundStart -> TurnEnd -> STOP
+BAD_ROUNDEND_UNSETTLED_CALL = TurnStart -> RoundStart -> ToolRequest.1.false -> RoundEnd -> STOP
+-- S5: a running round cannot discard an unsettled call.
+BAD_DROP_PENDING_RUNNING = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolSettle.1 -> STOP
+-- S8: context is frozen during an active turn, including cancellation settlement.
+BAD_EDIT_RUNNING = TurnStart -> ContextEdit -> STOP
+BAD_EDIT_CANCELLING = TurnStart -> TurnCancel -> ContextEdit -> STOP
+-- S6: concurrency limit.
+BAD_OVERCAP = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentSpawn.2.2 -> STOP
+-- S7: no receipt may appear without execution.
+BAD_RECEIPT_NO_EXEC = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+                   -> ToolExecEnd.1 -> STOP
+-- S9 delivery obligations: a user message, fold, join, or receipt must be
+-- delivered by a round before normal turn end; rounds do not start without `due`.
+BAD_END_NO_ROUND = TurnStart -> TurnEnd -> STOP
+BAD_IDLE_ROUND = TurnStart -> RoundStart -> RoundEnd -> RoundStart -> STOP
+BAD_END_AFTER_FOLD = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd -> RoundStart
+                  -> AgentComplete.1.2 -> RoundEnd -> AgentFold.1.2 -> TurnEnd -> STOP
+BAD_END_AFTER_JOIN = TurnStart -> RoundStart -> SteerEnqueue -> RoundEnd -> SteerJoin
+                  -> TurnEnd -> STOP
+BAD_END_UNDELIVERED = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+                   -> ToolExecStart.1 -> ToolExecEnd.1 -> ToolSettle.1 -> RoundEnd
+                   -> TurnEnd -> STOP
+-- S9: steer is enqueued only in an active turn and joined only in prep. Pending
+-- steer blocks a normal round start and turn end.
+BAD_STEER_IDLE = SteerEnqueue -> STOP
+BAD_STEER_JOIN_INROUND = TurnStart -> RoundStart -> SteerEnqueue -> SteerJoin -> STOP
+-- S9: SteerJoin requires pending steer; TURN's `s` bit is the sole authority.
+BAD_STEER_JOIN_NO_PENDING = TurnStart -> RoundStart -> RoundEnd -> SteerJoin -> STOP
+BAD_ROUNDSTART_PENDING_STEER = TurnStart -> RoundStart -> AgentSpawn.1.2 -> SteerEnqueue
+                            -> RoundEnd -> RoundStart -> STOP
+BAD_END_PENDING_STEER = TurnStart -> RoundStart -> SteerEnqueue -> RoundEnd -> TurnEnd -> STOP
+-- S9: AgentFold is prep-only and done-only. A running task does not fold; done
+-- results cannot be silently discarded in-round, and model actions are not
+-- offered during prep.
+BAD_FOLD_RUNNING = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd
+                -> AgentFold.1.2 -> STOP
+BAD_FOLD_INROUND = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                -> AgentFold.1.2 -> STOP
+BAD_WAIT_IN_PREP = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                -> RoundEnd -> TaskWait.1.2 -> STOP
+BAD_REQUEST_IN_PREP = TurnStart -> ToolRequest.1.false -> STOP
+BAD_SPAWN_IN_PREP = TurnStart -> AgentSpawn.1.2 -> STOP
+-- S8' waiting: empty slots cannot wait; one task has at most one pending wait.
+-- Delivery requires both a settled task and a started wait. Pending waits block
+-- RoundEnd, and cancellation prevents delivery.
+BAD_WAIT_NO_TASK = TurnStart -> RoundStart -> TaskWait.1.2 -> STOP
+BAD_DOUBLE_WAIT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+               -> TaskWait.1.2 -> STOP
+BAD_DELIVER_UNSETTLED = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+                     -> TaskWaitDeliver.1.2 -> STOP
+BAD_DELIVER_NO_WAIT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                   -> TaskWaitDeliver.1.2 -> STOP
+BAD_ROUNDEND_PENDING_WAIT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+                         -> RoundEnd -> STOP
+BAD_ROUNDEND_PENDING_WAIT_SETTLED = TurnStart -> RoundStart -> AgentSpawn.1.2
+                                 -> TaskWait.1.2 -> AgentComplete.1.2 -> RoundEnd -> STOP
+BAD_DELIVER_AFTER_CANCEL = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+                        -> AgentComplete.1.2 -> TurnCancel -> TaskWaitDeliver.1.2 -> STOP
+-- S8': timeout withdraws only an undelivered started wait. A settled wait must
+-- deliver rather than time out, and a timeout receipt requires a delivery round.
+BAD_TIMEOUT_NO_WAIT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWaitTimeout.1.2 -> STOP
+BAD_TIMEOUT_SETTLED = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+                   -> AgentComplete.1.2 -> TaskWaitTimeout.1.2 -> STOP
+BAD_END_AFTER_TIMEOUT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd -> RoundStart
+                     -> TaskWait.1.2 -> TaskWaitTimeout.1.2 -> RoundEnd -> TurnEnd -> STOP
+-- Cross-phase overwrite and duplicate triggers: an unsettled slot accepts no
+-- request; authorization cannot affect executing or settled phases; only an
+-- empty task slot can spawn; and a settled task cannot complete again.
+BAD_REQUEST_OVERWRITE = TurnStart -> RoundStart -> ToolRequest.1.false
+                     -> ToolRequest.1.false -> STOP
+BAD_ALLOW_EXECUTING = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+                   -> ToolExecStart.1 -> ToolAllow.1 -> STOP
+BAD_APPROVE_EXECUTING = TurnStart -> RoundStart -> ToolRequest.1.true -> ToolApprove.1
+                     -> ToolExecStart.1 -> ToolApprove.1 -> STOP
+BAD_DENY_ALLOWED = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+                -> ToolDeny.1 -> STOP
+BAD_SPAWN_OVERWRITE_DONE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                        -> AgentSpawn.1.1 -> STOP
+BAD_DOUBLE_COMPLETE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                   -> AgentComplete.1.2 -> STOP
+-- S10': task-pipeline events must submit the current task identity. Completion,
+-- waiting, delivery, and folding reject old or foreign identities, including in
+-- waiting and cancellation paths.
+BAD_TID_SPAWN_REPEAT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                    -> TaskWait.1.2 -> TaskWaitDeliver.1.2 -> AgentSpawn.1.2 -> STOP
+BAD_TID_COMPLETE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.1 -> STOP
+BAD_TID_WAIT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.1 -> STOP
+BAD_TID_TIMEOUT = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+               -> TaskWaitTimeout.1.1 -> STOP
+BAD_TID_WAIT_DONE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                 -> TaskWait.1.1 -> STOP
+BAD_TID_COMPLETE_WAITING = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+                        -> AgentComplete.1.1 -> STOP
+BAD_TID_DELIVER = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TaskWait.1.2
+               -> AgentComplete.1.2 -> TaskWaitDeliver.1.1 -> STOP
+BAD_TID_FOLD = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd -> AgentComplete.1.2
+            -> AgentFold.1.1 -> STOP
+BAD_TID_COMPLETE_CANCEL = TurnStart -> RoundStart -> AgentSpawn.1.2 -> TurnCancel
+                       -> AgentComplete.1.1 -> STOP
+
+-- S11: an idle done result cannot be folded outside prep.
+BAD_FOLD_IDLE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd -> RoundStart
+             -> RoundEnd -> TurnEnd -> AgentComplete.1.2 -> AgentFold.1.2 -> STOP
+-- S10' x S11: every idle-survival binding point also checks task identity.
+BAD_TID_COMPLETE_IDLE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd
+                     -> RoundStart -> RoundEnd -> TurnEnd -> AgentComplete.1.1 -> STOP
+
+-- S12: only an executing call may hand its work off, and only once. Each of
+-- these has exactly one blocking process, so a single mutation reverses it.
+BAD_BG_BEFORE_EXEC = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+                  -> ToolBackground.1.1.2 -> STOP
+BAD_BG_AFTER_END = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+                -> ToolExecStart.1 -> ToolExecEnd.1 -> ToolBackground.1.1.2 -> STOP
+-- The task the first handoff created is completed first, so capacity is free
+-- again and the executing call slot is the only thing left refusing.
+BAD_BG_TWICE = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+            -> ToolExecStart.1 -> ToolBackground.1.1.2 -> AgentComplete.1.2
+            -> ToolBackground.1.2.2 -> STOP
+-- S12 x S10': a handoff mints the same fresh identity a spawn would.
+BAD_BG_STALE_ID = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
+               -> ToolExecStart.1 -> ToolBackground.1.1.1 -> STOP
+-- S12 x S9: a slot still holding an unclaimed result is not free to receive one.
+BAD_BG_SLOT_DONE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                -> ToolRequest.1.false -> ToolAllow.1 -> ToolExecStart.1
+                -> ToolBackground.1.1.1 -> STOP
+-- S12 x S6: a handoff is counted by the same concurrency cap as a spawn.
+BAD_BG_OVERCAP = TurnStart -> RoundStart -> AgentSpawn.1.2 -> ToolRequest.1.false
+              -> ToolAllow.1 -> ToolExecStart.1 -> ToolBackground.1.2.2 -> STOP

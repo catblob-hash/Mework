@@ -1,0 +1,111 @@
+/* States */
+.empty-state { flex: 1; min-height: 260px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; color: var(--muted); text-align: center; }
+.empty-state__icon { width: 47px; height: 47px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 13px; background: var(--color-ffffff); color: var(--color-5b5b57); }
+.empty-state h3 { margin: 12px 0 0; color: var(--text); font-size: 14px; }
+.empty-state p { max-width: 430px; margin: 5px 0 14px; font-size: 11.5px; line-height: 1.55; }
+.app-loading, .fatal-state { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--app); color: var(--muted); }
+.app-loading > svg { width: 38px; height: 38px; display: block; user-select: none; animation: loading-pulse 1.5s ease-in-out infinite; }
+@keyframes loading-pulse { 50% { transform: scale(.96); opacity: .78; } }
+.app-loading p { font-size: 11px; }
+.fatal-state > div { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 12px; color: var(--danger); background: var(--danger-soft); }
+.fatal-state h1 { margin: 13px 0 0; color: var(--text); font-size: 16px; }
+.fatal-state p { max-width: 520px; margin: 5px 0 15px; font-size: 11.5px; }
+
+/* Fork requests (ForkRequestTray.tsx). The tray floats over everything but stays
+   pointer-transparent so it never blocks the app; only the cards take clicks.
+   The global prefers-reduced-motion rule at the bottom of this file already
+   neutralises the slide-in animation. */
+.fork-request-tray { position: fixed; top: 12px; right: 12px; z-index: 950; display: flex; flex-direction: column; gap: 8px; width: min(360px, calc(100vw - 24px)); pointer-events: none; }
+.fork-request-card {
+  pointer-events: auto; padding: 12px 14px; border: 1px solid var(--border-strong); border-radius: 12px;
+  background: var(--color-ffffff-ap98); box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8);
+  animation: fork-request-in .18s ease-out;
+}
+@keyframes fork-request-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.fork-request-card__title { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 12px; font-weight: 600; }
+.fork-request-card__source { margin-top: 4px; color: var(--muted); font-size: 11px; }
+.fork-request-card__source > .text-button { max-width: 100%; padding: 0; font-size: 11px; text-align: left; }
+.fork-request-card__prompt {
+  margin: 7px 0 0; color: var(--text); font-size: 11.5px; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden;
+}
+.fork-request-card__prompt--expanded { display: block; -webkit-line-clamp: unset; max-height: 40vh; overflow: auto; }
+.fork-request-card__toggle { margin-top: 2px; padding: 0; font-size: 11px; }
+.fork-request-card__meta { margin-top: 7px; color: var(--faint); font-size: 10.5px; }
+.fork-request-card__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+.fork-request-card__actions > .button { min-height: 31px; padding: 0 12px; font-size: 12px; }
+/* The deny button carries no modifier, so give it the secondary surface here. */
+.fork-request-card__actions > .button:not(.button--primary) { background: var(--panel); border-color: var(--border-strong); }
+.fork-request-card__actions > .button:not(.button--primary):hover:not(:disabled) { background: var(--hover); }
+
+@media (max-width: 1150px) {
+  .app-shell--settings-open, .app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 0; }
+  .app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: minmax(0, 1fr) 0 0 0; }
+  .app-shell--tasks-open.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 var(--task-container-width); }
+  .app-shell--tasks-open.app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: minmax(0, 1fr) 0 0 var(--task-container-width); }
+  .conversation-settings { position: fixed; z-index: 800; right: 0; top: 0; box-shadow: -18px 0 55px var(--color-000000-ap15); }
+}
+
+@media (max-width: 860px) {
+  :root { --sidebar-width: 240px; }
+  .sidebar { position: fixed; z-index: 700; left: 0; top: 0; width: var(--sidebar-width); box-shadow: 15px 0 45px var(--color-000000-ap13); }
+  .app-shell,
+  .app-shell--settings-open,
+  .app-shell--sidebar-closed,
+  .app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: minmax(0, 1fr) 0 0 0; }
+  /* The task container floats over the conversation rather than squeezing it. */
+  .app-shell--tasks-open,
+  .app-shell--tasks-open.app-shell--settings-open,
+  .app-shell--tasks-open.app-shell--sidebar-closed { grid-template-columns: minmax(0, 1fr) 0 0 0; }
+  .task-container { position: fixed; z-index: 690; right: 0; top: 0; box-shadow: -15px 0 45px var(--color-000000-ap13); }
+  .topbar__leading > .icon-button { display: inline-flex; }
+  .global-settings-layout:not(.global-settings-layout--page) { grid-template-columns: 154px minmax(0, 1fr); }
+  .model-capability-badges em { display: none; }
+}
+
+@media (max-width: 720px) {
+  body { min-width: 360px; }
+  .tool-call-group__list { max-height: min(45vh, 360px); margin-left: 4px; padding-left: 8px; }
+  .tool-context__copy { gap: 5px; }
+  .tool-context__name { max-width: 56%; }
+  .tool-context__stat { display: none; }
+  .tool-context__details { margin-left: 18px; margin-right: 0; }
+  .agent-timeline-event__detail, .orchestration-event__copy > span { max-width: 42vw; }
+  .composer-wrap { padding-right: 10px; padding-left: 10px; }
+  .composer__footer { gap: 4px; }
+  .composer__tools { gap: 3px; }
+  .composer__options { gap: 3px; }
+  .composer-option { padding: 0 6px; font-size: 9.5px; }
+  .composer-chip, .composer-worktree { font-size: 9.5px; }
+  .composer-chip { max-width: 140px; }
+  .composer__model { max-width: min(180px, 34vw); }
+  .topbar-button { font-size: 0; width: 32px; padding: 0; justify-content: center; }
+  .save-status { display: none; }
+  .conversation-settings { width: min(100vw, 368px); }
+  .modal-backdrop { padding: 8px; align-items: flex-end; }
+  .dialog { max-height: calc(100vh - 16px); }
+  .tool-editor-layout { grid-template-columns: 1fr; }
+  .tool-picker-panel { max-height: 155px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .tool-picker-list { display: grid; grid-template-columns: 1fr 1fr; }
+  .global-settings-layout:not(.global-settings-layout--page) { height: calc(100vh - 160px); grid-template-columns: 1fr; }
+  .settings-nav { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
+  .settings-nav__item { flex: 0 0 auto; }
+  .settings-nav__item svg:last-child { display: none; }
+  .provider-list { display: flex; gap: 3px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+  .provider-list__item { min-width: 158px; }
+  .provider-list__item.drop-target--before::before { left: -2px; right: auto; top: 4px; bottom: 4px; width: 2px; height: auto; }
+  .provider-list__item.drop-target--after::after { left: auto; right: -2px; top: 4px; bottom: 4px; width: 2px; height: auto; }
+  .provider-list__empty { width: 100%; min-height: 90px; }
+  .provider-field-grid { grid-template-columns: 1fr; }
+  .provider-field-grid .field:last-child { grid-column: 1; }
+  .model-actions { width: 100%; padding-left: 21px; }
+  .model-editor-backdrop { padding: 8px; align-items: flex-end; }
+  .model-editor-dialog { max-height: calc(100vh - 16px); }
+  .model-editor-field-grid, .model-editor-switches { grid-template-columns: 1fr; }
+  .context-card--user { max-width: 90%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}

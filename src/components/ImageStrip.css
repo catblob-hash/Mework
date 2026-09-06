@@ -1,0 +1,241 @@
+.image-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.image-strip__item {
+  position: relative;
+  width: 112px;
+  height: 88px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--subtle);
+}
+
+.image-strip__item--compact {
+  width: 64px;
+  height: 52px;
+  border-radius: 8px;
+}
+
+.image-strip__open {
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.image-strip__open:disabled {
+  cursor: wait;
+}
+
+.image-strip__open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.image-strip__image,
+.image-strip__placeholder {
+  width: 100%;
+  height: 100%;
+}
+
+.image-strip__image {
+  display: block;
+  object-fit: cover;
+}
+
+.image-strip__placeholder {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.image-strip__placeholder--failed {
+  grid-template-rows: auto auto;
+  align-content: center;
+  gap: 3px;
+}
+
+.image-strip__placeholder svg {
+  width: 22px;
+  height: 22px;
+}
+
+.image-strip__placeholder--failed {
+  color: var(--danger);
+}
+
+.image-strip__retry-label {
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.image-strip__item--compact .image-strip__placeholder--failed {
+  grid-template-columns: auto auto;
+  grid-template-rows: none;
+  gap: 4px;
+}
+
+.image-strip__item--compact .image-strip__placeholder svg {
+  width: 16px;
+  height: 16px;
+}
+
+.image-strip__item--compact .image-strip__retry-label {
+  font-size: 9px;
+}
+
+.image-strip__short-id {
+  position: absolute;
+  bottom: 3px;
+  left: 3px;
+  padding: 1px 5px;
+  border-radius: 6px;
+  color: var(--color-ffffff);
+  background: var(--color-20201f);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+.image-strip__item--compact .image-strip__short-id {
+  padding: 0 4px;
+  font-size: 9px;
+}
+
+.image-strip__remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  color: var(--color-ffffff);
+  background: var(--color-20201f);
+  cursor: pointer;
+}
+
+.image-strip__remove:hover {
+  background: var(--color-000000);
+}
+
+.image-strip__remove svg {
+  width: 14px;
+  height: 14px;
+}
+
+.image-viewer {
+  position: fixed;
+  z-index: 1400;
+  inset: 0;
+  display: grid;
+  padding: 24px;
+  place-items: center;
+  background: var(--color-20201f);
+  animation: image-viewer-in 120ms ease-out;
+}
+
+@keyframes image-viewer-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.image-viewer__dialog {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  place-items: center;
+  outline: 0;
+}
+
+.image-viewer__image {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: block;
+  object-fit: contain;
+}
+
+.image-viewer__caption {
+  max-width: min(680px, calc(100vw - 120px));
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-ffffff);
+  font-size: 11px;
+}
+
+.image-viewer__caption span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-viewer__caption span:last-child {
+  flex: 0 0 auto;
+  color: var(--color-ffffff-ap64);
+}
+
+.image-viewer__close {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: var(--color-ffffff);
+  background: var(--color-ffffff-ap10);
+  cursor: pointer;
+}
+
+.image-viewer__close:hover,
+.image-viewer__close:focus-visible {
+  background: var(--color-ffffff-ap34);
+}
+
+.image-viewer__close:focus-visible {
+  outline: 2px solid var(--color-ffffff);
+  outline-offset: 2px;
+}
+
+.image-viewer__close svg {
+  width: 19px;
+  height: 19px;
+}
+
+@media (max-width: 640px) {
+  .image-viewer {
+    padding: 12px;
+  }
+
+  .image-viewer__caption {
+    max-width: calc(100vw - 72px);
+  }
+}

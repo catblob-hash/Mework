@@ -1,0 +1,696 @@
+/* Rail-page styles: a narrow left rail and a scrolling detail pane.
+ *
+ * The shared layout is used by model providers, conversation presets, and search
+ * providers. `.settings-rail-page` is the shell; `.provider-rail` and
+ * `.provider-pane` are its columns. The React shell lives in
+ * `src/components/SettingsRail.tsx`.
+ *
+ * These names are independent of the `.provider-list__* / .provider-detail__*`
+ * rules in settings.css, which remain in use by the MCP page.
+ */
+
+/* ---- Page shell ---- */
+/* Attach layout rules to `.settings-rail-page`, not `.api-provider-page`, which is an
+   unstyled legacy marker. */
+.settings-rail-page.settings-editor-page {
+  padding: 0;
+  flex-direction: row;
+  overflow: hidden;
+}
+
+/* Drawers and the add-provider dialog use the shared `.input`, whose blue focus
+   outline is inappropriate for this page. Override it only within rail pages. */
+.settings-rail-page .input:focus {
+  border-color: var(--muted);
+  box-shadow: none;
+}
+/* Error inputs retain a red focus border, matching `.provider-input-group--error`. */
+.settings-rail-page .input--error:focus { border-color: var(--danger); }
+
+/* ---- Left rail ---- */
+.provider-rail {
+  width: 216px;
+  flex: 0 0 216px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--color-f7f7f4);
+}
+.provider-rail__search { flex: 0 0 auto; padding: 9px 9px 0; }
+.provider-search-box, .provider-rail__search-box {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 3px 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--color-ffffff);
+  transition: border .12s, box-shadow .12s;
+}
+/* Focus darkens only the border: in this dense layout, the caret already identifies
+   the focused input without a blue outline. */
+.provider-search-box:focus-within, .provider-rail__search-box:focus-within {
+  border-color: var(--muted);
+}
+.provider-search-box > svg, .provider-rail__search-box > svg { flex: 0 0 auto; color: var(--faint); }
+.provider-search-box > input, .provider-rail__search-box > input {
+  flex: 1;
+  min-width: 0;
+  min-height: 26px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 11px;
+}
+.provider-search-box--compact { width: 158px; flex: 0 0 auto; }
+.provider-rail__search-clear.icon-button,
+.provider-search-box__clear.icon-button {
+  width: 20px; height: 20px; flex-basis: 20px; border-radius: 5px;
+}
+.provider-rail__search-clear--active { color: var(--text); background: var(--active); }
+.provider-rail__filter { position: relative; flex: 0 0 auto; display: inline-flex; }
+
+.provider-rail__scroller {
+  flex: 1;
+  min-height: 0;
+  padding: 8px 9px 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-y: auto;
+}
+.provider-rail__slot { position: relative; }
+.provider-rail__group { display: flex; flex-direction: column; gap: 3px; }
+.provider-rail__group-body {
+  margin-left: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-left: 1px solid var(--border);
+  padding-left: 6px;
+}
+
+.provider-rail__row {
+  position: relative;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 6px 0 5px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+  transition: background .14s;
+}
+.provider-rail__row:hover { background: var(--hover); }
+.provider-rail__row[data-selected="true"] { background: var(--color-e5e5e0); }
+.provider-rail__row[data-selected="true"]:hover { background: var(--color-dcdcd6); }
+.provider-rail__row.drop-target--before::before { top: -2px; }
+.provider-rail__row.drop-target--after::after { bottom: -2px; }
+.provider-rail__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.provider-rail__row[data-selected="true"] .provider-rail__name { font-weight: 640; }
+
+/* At rest, show status; on interaction intent, show the kebab action. Both occupy the
+   same space in the narrow row. */
+.provider-rail__trailing {
+  position: relative;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.provider-rail__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  transition: opacity .14s;
+}
+.provider-rail__kebab.icon-button {
+  position: absolute;
+  inset: 0;
+  width: 20px;
+  height: 20px;
+  flex-basis: 20px;
+  border-radius: 5px;
+  opacity: 0;
+  transition: opacity .14s, background .14s, color .14s;
+}
+.provider-rail__row:hover .provider-rail__dot,
+.provider-rail__row:focus-within .provider-rail__dot { opacity: 0; }
+.provider-rail__row:hover .provider-rail__kebab,
+.provider-rail__row:focus-within .provider-rail__kebab,
+.provider-rail__kebab[aria-expanded="true"] { opacity: 1; }
+
+/* Group headers display both status and expansion state because they convey distinct
+   information. */
+.provider-rail__row--group .provider-rail__trailing { width: auto; gap: 5px; }
+.provider-rail__chevron { flex: 0 0 auto; color: var(--faint); transition: transform .15s; }
+.provider-rail__chevron--open { transform: rotate(90deg); }
+
+.provider-rail__group-add {
+  width: 100%;
+  min-height: 26px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--faint);
+  font-size: 9.5px;
+  transition: color .14s, background .14s, border-color .14s;
+}
+.provider-rail__group-add:hover { color: var(--text); background: var(--hover); border-color: var(--muted); }
+
+.provider-rail__empty {
+  padding: 24px 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: var(--faint);
+  text-align: center;
+}
+.provider-rail__empty strong { margin-top: 6px; color: var(--muted); font-size: 10px; }
+.provider-rail__empty span { margin-top: 3px; font-size: 8.5px; line-height: 1.45; }
+
+.provider-rail__footer { flex: 0 0 auto; padding: 8px 9px 9px; }
+.provider-rail__add {
+  width: 100%;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 10.5px;
+  font-weight: 600;
+  transition: background .14s, border-color .14s;
+}
+.provider-rail__add:hover { background: var(--hover); border-color: var(--muted); }
+
+.provider-rail__menu, .provider-rail__filter-menu {
+  position: absolute;
+  z-index: 60;
+  min-width: 152px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: 0 12px 34px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8);
+  animation: menu-in .1s ease-out;
+}
+.provider-rail__menu { top: calc(100% - 3px); right: 0; }
+.provider-rail__filter-menu { top: 26px; right: 0; }
+.provider-rail__menu-item {
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 10.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+.provider-rail__menu-item:hover:not(:disabled) { background: var(--hover); }
+.provider-rail__menu-item--danger { color: var(--danger); }
+.provider-rail__menu-item--danger:hover:not(:disabled) { background: var(--danger-soft); }
+/* Keep the checkmark slot reserved so changing selection does not shift text. */
+.provider-rail__menu-check--hidden { opacity: 0; }
+
+/* ---- Avatar ---- */
+.provider-avatar {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-dddcd6);
+  border-radius: 6px;
+  background: var(--color-ffffff);
+  color: var(--color-5f6470);
+  font-size: 10px;
+  font-weight: 600;
+}
+.provider-avatar--round { width: 20px; height: 20px; flex-basis: 20px; border-radius: 50%; font-size: 9px; }
+
+/* ---- Detail pane ---- */
+.provider-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+/* The header has no separator. Its content axis aligns the title with the fields below
+   and the toggle with the action buttons. Body content is an 18px-padded, centered
+   640px column plus a scrollbar gutter, so the header includes that gutter in its
+   maximum width and right padding to avoid projecting the toggle past the buttons. */
+.provider-pane__header {
+  flex: 0 0 auto;
+  width: 100%;
+  max-width: calc(640px + 18px + 18px + var(--scrollbar-size));
+  margin: 0 auto;
+  min-height: 48px;
+  padding: 11px calc(18px + var(--scrollbar-size)) 11px 18px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.provider-pane__identity { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; }
+.provider-pane__header h1 {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+}
+.provider-pane__header h1 a { color: inherit; text-decoration: none; }
+.provider-pane__header h1 a:hover { text-decoration: underline; }
+.provider-pane__options.icon-button { width: 26px; height: 26px; flex-basis: 26px; border-radius: 6px; }
+.provider-pane__body {
+  flex: 1;
+  min-height: 0;
+  padding: 14px 18px 24px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.provider-pane__stack {
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.provider-pane--empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--faint);
+  text-align: center;
+}
+.provider-pane--empty strong { margin-top: 8px; color: var(--muted); font-size: 11px; }
+.provider-pane--empty span { margin-top: 3px; max-width: 240px; font-size: 9px; line-height: 1.45; }
+.provider-pane--empty .button { margin-top: 13px; }
+
+/* ---- Field rows ---- */
+.provider-field { display: flex; flex-direction: column; gap: 6px; }
+.provider-field__title { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; font-weight: 600; }
+.provider-field__link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 9.5px;
+  font-weight: 500;
+  text-decoration: none;
+}
+.provider-field__link:hover { text-decoration: underline; }
+.provider-field__row { display: flex; align-items: center; gap: 6px; }
+.provider-field__help { margin: 0; color: var(--faint); font-size: 9px; line-height: 1.45; }
+.provider-field__help--code { font-family: var(--mono); word-break: break-all; }
+.provider-field__error { margin: 0; color: var(--danger); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+
+.codex-login,
+.provider-login {
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.codex-login--signed-in,
+.provider-login--signed-in { border-color: var(--success); }
+.codex-login__summary,
+.provider-login__summary { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); }
+.codex-login--signed-in .codex-login__summary > svg,
+.provider-login--signed-in .provider-login__summary > svg { color: var(--success); }
+.codex-login:not(.codex-login--signed-in) .codex-login__summary > svg,
+.provider-login:not(.provider-login--signed-in) .provider-login__summary > svg { color: var(--danger); }
+.codex-login__summary > div,
+.provider-login__summary > div { min-width: 0; }
+.codex-login__summary code,
+.provider-login__summary code { font-family: var(--mono); }
+
+.provider-input-group {
+  flex: 1;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 4px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--color-ffffff);
+  transition: border .12s, box-shadow .12s;
+}
+.provider-input-group:hover { border-color: var(--color-c0c0ba); }
+.provider-input-group:focus-within { border-color: var(--muted); }
+.provider-input-group--error { border-color: var(--danger); }
+.provider-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.provider-input--code { font-family: var(--mono); font-size: 11px; }
+/* `base.css` applies `:focus-visible { outline: 2px solid var(--focus) }` at the same
+   specificity, but styles.css loads last and would restore a blue inner outline. Raise
+   specificity to suppress it: the outer `.provider-input-group:focus-within` border
+   communicates focus. The search selector already has higher specificity. */
+.provider-input-group .provider-input:focus-visible { outline: 0; }
+/* Suppress Edge's built-in password reveal button to avoid displaying it beside the
+   custom eye icon. */
+.provider-input::-ms-reveal, .provider-input::-ms-clear { display: none; }
+.provider-input__reveal.icon-button { width: 24px; height: 24px; flex-basis: 24px; border-radius: 6px; }
+.provider-square-action.icon-button {
+  width: 34px;
+  height: 34px;
+  flex-basis: 34px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.provider-square-action.icon-button:hover:not(:disabled) { background: var(--hover); }
+
+/* Multiline inputs retain the `.provider-input-group` border but need variable height,
+   so replace single-line centering with all-around padding. */
+.provider-input-group--multiline {
+  min-height: 0;
+  padding: 8px 10px;
+  align-items: stretch;
+}
+.provider-textarea { min-height: 132px; resize: vertical; line-height: 1.5; }
+
+/* Embedded list components bring padding and negative margins designed for sidebars and
+   tab pages. Reset those offsets here to align them with the field inputs. */
+.provider-field .tool-toggle-row { padding-left: 0; padding-right: 0; }
+.provider-field .preset-choice-list .check-row { margin-left: 0; margin-right: 0; }
+
+/* ---- Models ---- */
+.provider-models { display: flex; flex-direction: column; gap: 9px; }
+.provider-models__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.provider-models__title { min-width: 0; display: flex; align-items: center; gap: 3px; }
+.provider-models__title h2 { margin: 0 5px 0 0; font-size: 11.5px; font-weight: 650; }
+.provider-models__tool.icon-button { width: 24px; height: 24px; flex-basis: 24px; border-radius: 6px; }
+.provider-models__tool--active { color: var(--text); background: var(--active); }
+
+/* Fetching models and adding them manually are two paths to the same operation, so
+   they form a joined button group. */
+.provider-button-group { flex: 0 0 auto; display: inline-flex; }
+.provider-button-group__item {
+  min-height: 30px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  transition: background .14s;
+}
+.provider-button-group__item:first-child { border-radius: 8px 0 0 8px; }
+.provider-button-group__item:last-child { margin-left: -1px; border-radius: 0 8px 8px 0; }
+.provider-button-group__item--icon { width: 30px; padding: 0; justify-content: center; }
+.provider-button-group__item:hover:not(:disabled) { background: var(--hover); }
+.provider-button-group__item:focus-visible { z-index: 1; }
+
+.provider-models__list { display: flex; flex-direction: column; gap: 7px; }
+.model-group { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.model-group__head {
+  min-height: 30px;
+  padding: 0 6px 0 9px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--color-fafaf8);
+}
+.model-group--open .model-group__head { border-bottom: 1px solid var(--border); }
+.model-group__chevron { flex: 0 0 auto; color: var(--faint); transition: transform .15s; }
+.model-group__chevron--open { transform: rotate(90deg); }
+.model-group__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.model-group__remove.icon-button {
+  width: 24px;
+  height: 24px;
+  flex-basis: 24px;
+  border-radius: 6px;
+  opacity: 0;
+  transition: opacity .14s, background .14s, color .14s;
+}
+.model-group:hover .model-group__remove,
+.model-group:focus-within .model-group__remove { opacity: 1; }
+.model-group__remove.icon-button:hover:not(:disabled) { color: var(--danger); background: var(--danger-soft); }
+.model-group__body { display: flex; flex-direction: column; background: var(--panel); }
+
+.model-row {
+  min-height: 34px;
+  padding: 3px 6px 3px 9px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.model-row + .model-row { border-top: 1px solid var(--subtle); }
+.model-row__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 10.5px var(--mono);
+}
+.model-row__meta { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; }
+.model-row__action.icon-button { width: 26px; height: 26px; flex-basis: 26px; border-radius: 6px; }
+
+/* Capability chips use icons only so labels do not crowd out model names; `title`
+   preserves the semantics. */
+.model-tags { display: inline-flex; align-items: center; gap: 3px; }
+.model-tag {
+  width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--color-6b6b66);
+  background: var(--color-ecece8);
+}
+
+.provider-empty {
+  min-height: 104px;
+  padding: 18px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--faint);
+  text-align: center;
+}
+.provider-empty--dashed {
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: var(--color-fbfbf9);
+}
+.provider-empty strong { margin-top: 7px; color: var(--muted); font-size: 10.5px; }
+.provider-empty span { margin-top: 3px; max-width: 340px; font-size: 8.5px; line-height: 1.45; }
+
+/* ---- Right drawer ---- */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1250;
+  display: flex;
+  justify-content: flex-end;
+  background: var(--color-1e1e1c-ap24);
+  animation: fade-in .12s ease-out;
+}
+.drawer {
+  width: min(400px, calc(100vw - 24px));
+  margin: 10px 10px 10px 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--color-cecec8);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: 0 24px 80px var(--color-000000-ap22), 0 3px 10px var(--color-000000-ap10);
+  animation: drawer-in .18s cubic-bezier(.16, 1, .3, 1);
+}
+@keyframes drawer-in { from { transform: translateX(102%); } }
+.drawer--wide { width: min(520px, calc(100vw - 24px)); }
+.drawer__header {
+  flex: 0 0 auto;
+  min-height: 54px;
+  padding: 13px 12px 11px 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.drawer__header > div { flex: 1; min-width: 0; }
+.drawer__header h3 { margin: 0; font-size: 12.5px; font-weight: 650; }
+.drawer__header p { margin: 3px 0 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.drawer__body { flex: 1; min-height: 0; padding: 14px 16px; overflow-y: auto; scrollbar-gutter: stable; }
+.drawer__body > .field:last-child { margin-bottom: 0; }
+/* The error hint is the duplicate-or-empty model-ID message. */
+.drawer__body .input--error ~ .field__hint { color: var(--danger); }
+.drawer__footer {
+  flex: 0 0 auto;
+  min-height: 50px;
+  padding: 9px 12px 9px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  border-top: 1px solid var(--border);
+  background: var(--color-fafaf8);
+}
+.drawer__footer-meta { margin-right: auto; color: var(--faint); font-size: 9px; }
+.drawer-section { margin-top: 4px; }
+.drawer-section__title { margin-bottom: 9px; display: flex; flex-direction: column; }
+.drawer-section__title strong { font-size: 11px; }
+.drawer-section__title small { margin-top: 2px; color: var(--faint); font-size: 8.5px; line-height: 1.45; }
+.drawer-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.drawer-switch-row {
+  min-height: 44px;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--color-fafaf8);
+}
+.drawer-switch-row > span { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.drawer-switch-row strong { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; }
+.drawer-switch-row small { margin-top: 2px; color: var(--faint); font-size: 8.5px; line-height: 1.4; }
+
+/* ---- Discover models (drawer) ---- */
+.model-manager__toolbar { display: flex; align-items: center; gap: 6px; }
+.model-manager__toolbar .provider-search-box { flex: 1; min-width: 0; }
+.model-manager__list { margin-top: 9px; }
+.model-manager__error {
+  margin-bottom: 9px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
+  border-radius: 7px;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.model-manager__error > svg { flex: 0 0 auto; margin-top: 1px; }
+.model-manager__error span { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.model-manager__error strong { font-size: 10px; }
+.model-manager__error small {
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.model-manager__group { margin-bottom: 8px; }
+.model-manager__group-head { min-height: 28px; display: flex; align-items: center; gap: 6px; }
+.model-manager__group-toggle {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+}
+.model-manager__group-toggle:hover { background: var(--hover); }
+.model-manager__group-toggle strong { font-size: 10px; }
+.model-manager__group-toggle em {
+  padding: 1px 5px;
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--subtle);
+  font-size: 7.5px;
+  font-style: normal;
+}
+/* The whole row is the install toggle, so it must read as pressable and keep
+   answering hover once installed. */
+.model-manager__row {
+  width: 100%;
+  min-height: 34px;
+  padding: 4px 8px 4px 6px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.model-manager__row:hover { background: var(--hover); }
+.model-manager__row:focus-visible { outline: 2px solid var(--focus); outline-offset: -1px; }
+.model-manager__row--installed {
+  border-color: color-mix(in srgb, var(--success) 34%, transparent);
+  background: var(--success-soft);
+  color: var(--success);
+}
+.model-manager__row--installed:hover { background: color-mix(in srgb, var(--success) 14%, var(--success-soft)); }
+.model-manager__row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.model-manager__row-main strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 9.5px var(--mono);
+}
+.model-manager__row-main small {
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 7.8px;
+}

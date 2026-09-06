@@ -1,0 +1,228 @@
+.question-editor {
+  display: flex;
+  flex-direction: column;
+}
+
+.question-editor__summary {
+  padding: 0 0 14px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.question-editor__summary > span {
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.question-editor__summary > small {
+  color: var(--faint);
+  font-size: 9.5px;
+}
+
+.question-editor__question {
+  padding: 18px 0 4px;
+}
+
+.question-editor__question + .question-editor__question {
+  border-top: 1px solid var(--border);
+}
+
+.question-editor__question-heading {
+  min-height: 29px;
+  margin-bottom: 13px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.question-editor__question-heading h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.question-editor__question-heading span {
+  color: var(--faint);
+  font-size: 9.5px;
+}
+
+.question-editor__field .field {
+  margin-bottom: 13px;
+}
+
+.question-editor__field .input,
+.question-editor__answer .input {
+  padding-right: 2px;
+  padding-left: 2px;
+  border: 0;
+  border-bottom: 1px solid var(--border-strong);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.question-editor__field .input:hover,
+.question-editor__answer .input:hover {
+  border-color: var(--faint);
+}
+
+.question-editor__field .input:focus,
+.question-editor__answer .input:focus {
+  border-color: var(--focus);
+  box-shadow: 0 1px var(--focus);
+}
+
+.question-editor__field--error .field__hint,
+.question-editor__section-error {
+  color: var(--danger);
+}
+
+.question-editor__textarea {
+  min-height: 62px;
+  resize: vertical;
+}
+
+.question-editor__textarea--compact {
+  min-height: 44px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.question-editor__switch-row {
+  min-height: 49px;
+  margin: 1px 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.question-editor__switch-row > div {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.question-editor__switch-row strong {
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.question-editor__switch-row small {
+  margin-top: 2px;
+  color: var(--faint);
+  font-size: 9.5px;
+}
+
+.question-editor__options-heading {
+  min-height: 31px;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.question-editor__options-heading strong {
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.question-editor__options-heading span {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.question-editor__options-heading .icon-button {
+  width: 25px;
+  height: 25px;
+  flex-basis: 25px;
+  margin-left: auto;
+}
+
+.question-editor__section-error {
+  margin: -4px 0 9px;
+  font-size: 9.5px;
+}
+
+.question-editor__options {
+  display: flex;
+  flex-direction: column;
+}
+
+.question-editor__option {
+  padding: 10px 30px 1px 21px;
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(130px, .65fr) minmax(180px, 1fr);
+  gap: 0 14px;
+}
+
+.question-editor__option-remove {
+  position: absolute;
+  top: 11px;
+  right: 0;
+  width: 24px;
+  height: 24px;
+  flex-basis: 24px;
+}
+
+.question-editor__option + .question-editor__option {
+  border-top: 1px solid var(--border);
+}
+
+.question-editor__option-index {
+  position: absolute;
+  top: 19px;
+  left: 0;
+  color: var(--faint);
+  font-size: 8.5px;
+  font-variant-numeric: tabular-nums;
+  writing-mode: vertical-rl;
+}
+
+.question-editor__option-preview {
+  grid-column: 1 / -1;
+}
+
+.question-editor__answer {
+  margin-top: 9px;
+  padding-top: 15px;
+  border-top: 1px solid var(--border);
+}
+
+.question-editor__answer .field {
+  margin-bottom: 9px;
+}
+
+.question-editor__empty,
+.question-editor__alert {
+  margin: 12px 0 0;
+  color: var(--danger);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.question-editor__alert {
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+@media (max-width: 640px) {
+  .question-editor__summary {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .question-editor__option {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .question-editor__option-preview {
+    grid-column: auto;
+  }
+}

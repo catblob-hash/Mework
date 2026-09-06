@@ -1,0 +1,144 @@
+:root {
+  --bg: #fbfbf9;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --line: #d9dde3;
+  --accent: #b5462a;
+  --accent-soft: #fbe9e3;
+  --code-bg: #f1f2f4;
+  --header-bg: #ffffffcc;
+  --width: 1180px;
+  font-size: 16px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a;
+    --fg: #e6e8eb;
+    --muted: #9aa4ae;
+    --line: #2d333b;
+    --accent: #f08a6a;
+    --accent-soft: #3a2721;
+    --code-bg: #1f2429;
+    --header-bg: #15171acc;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.65;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, kbd {
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+  font-size: 0.92em;
+}
+code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+pre {
+  background: var(--code-bg);
+  padding: 0.9rem 1rem;
+  border-radius: 8px;
+  overflow: auto;
+  line-height: 1.5;
+}
+pre code { background: none; padding: 0; }
+blockquote {
+  margin: 1rem 0;
+  padding: 0.6rem 1rem;
+  border-left: 4px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+}
+blockquote p { margin: 0.3rem 0; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.95em; }
+th, td { border: 1px solid var(--line); padding: 0.45rem 0.6rem; vertical-align: top; text-align: left; }
+th { background: var(--code-bg); }
+.table-scroll { overflow-x: auto; }
+.key-table td:first-child { white-space: nowrap; }
+.key-table .key-text {
+  margin: 0;
+  padding: 0.4rem 0.5rem;
+  max-width: 28rem;
+  max-height: 12rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.85em;
+}
+hr { border: 0; border-top: 1px solid var(--line); margin: 2rem 0; }
+img { max-width: 100%; }
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(8px);
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--line);
+}
+.site-header__inner {
+  max-width: var(--width);
+  margin: 0 auto;
+  padding: 0.6rem 1.2rem;
+  display: flex;
+  align-items: center;
+  gap: 1.2rem;
+  flex-wrap: wrap;
+}
+.brand { display: inline-flex; align-items: center; gap: 0.5rem; font-weight: 600; color: var(--fg); }
+.brand img { border-radius: 6px; }
+.site-nav { display: flex; gap: 0.2rem; flex-wrap: wrap; }
+.site-nav a {
+  color: var(--fg);
+  padding: 0.3rem 0.65rem;
+  border-radius: 6px;
+}
+.site-nav a.active, .site-nav a:hover { background: var(--accent-soft); text-decoration: none; }
+.site-header__right { margin-left: auto; display: flex; gap: 1rem; align-items: center; font-size: 0.92em; }
+.languages .active { font-weight: 600; }
+
+.page {
+  max-width: var(--width);
+  margin: 0 auto;
+  padding: 1.5rem 1.2rem 3rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 240px;
+  gap: 2.5rem;
+}
+.content { min-width: 0; }
+.content h1 { font-size: 2rem; line-height: 1.25; margin: 0.5rem 0 1rem; }
+.content h2 { font-size: 1.45rem; margin-top: 2.4rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--line); }
+.content h3 { font-size: 1.15rem; margin-top: 1.8rem; }
+.content h2 .anchor, .content h3 .anchor, .content h1 .anchor, .content h4 .anchor { color: inherit; }
+.content h2 .anchor:hover::after, .content h3 .anchor:hover::after { content: " #"; color: var(--muted); }
+.toc {
+  position: sticky;
+  top: 4.2rem;
+  align-self: start;
+  font-size: 0.9em;
+  max-height: calc(100vh - 5rem);
+  overflow: auto;
+}
+.toc h3 { margin: 0.4rem 0 0.5rem; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.toc ul { list-style: none; padding: 0; margin: 0; }
+.toc li { margin: 0.25rem 0; }
+.toc a { color: var(--muted); }
+.toc a:hover { color: var(--accent); }
+.site-footer {
+  max-width: var(--width);
+  margin: 0 auto;
+  padding: 1.5rem 1.2rem 2.5rem;
+  color: var(--muted);
+  font-size: 0.88em;
+  border-top: 1px solid var(--line);
+}
+.landing { text-align: center; padding: 4rem 1rem; }
+.downloads li { margin: 0.3rem 0; }
+@media (max-width: 900px) {
+  .page { grid-template-columns: 1fr; }
+  .toc { position: static; max-height: none; order: -1; border: 1px solid var(--line); border-radius: 8px; padding: 0.6rem 0.9rem; }
+  .site-header__right { margin-left: 0; }
+}

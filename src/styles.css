@@ -1,0 +1,12 @@
+/* Import in the original styles.css section order. Cascade order must not change:
+   existing noDescendingSpecificity violations mean reordering changes visual output. */
+@import "./palette.css";
+@import "./styles/base.css";
+@import "./styles/sidebar.css";
+@import "./styles/conversation.css";
+@import "./styles/orchestration.css";
+@import "./styles/terminal.css";
+@import "./styles/menus.css";
+@import "./styles/panels.css";
+@import "./styles/settings.css";
+@import "./styles/feedback.css";

@@ -1,0 +1,143 @@
+{
+  "name": "Mework 内置工具上下文重设计基线",
+  "note": "schemaNotes replaces the built-in tool description; usageGuidance is appended after a blank line. Copy this file to .mework/tool-descriptions only when you want Mework to discover it, then explicitly select it in the conversation preset.",
+  "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
+  "toolCount": 27,
+  "tools": [
+    {
+      "toolName": "ls",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "grep",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "powershell",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "bash",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "write",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "edit",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "find",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "read",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "web_search",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "web_fetch",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "playwright",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "agent_spawn",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "send_message",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "followup_task",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "task_wait",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "task_list",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "skill",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "read_global_memory",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "read_project_memory",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "create_global_memory",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "create_project_memory",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "edit_global_memory",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "edit_project_memory",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "workflow",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "todo",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "ask_user",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "fork",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    }
+  ]
+}
