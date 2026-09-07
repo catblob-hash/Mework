@@ -1107,14 +1107,15 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 32768,
-                    "description": "First user message of the forked conversation. State the task and every piece of background it needs, because a child without inherited context sees nothing else."
+                    "description": "First user message of the forked conversation, and the only instruction you will ever give it — there is no channel for a correction afterwards. State the task and every piece of background it needs: unless inherit_context is true, the child sees nothing else."
                 },
                 "inherit_context": {
                     "type": "boolean",
-                    "description": "true copies this conversation's timeline so far and its completed tasks into the child; false starts the child with only the prompt."
+                    "default": false,
+                    "description": "Optional, default false: the child starts with only the prompt. true copies this conversation's timeline so far and its completed tasks into the child as well. Inherit when the job continues this conversation's thread; start clean when it does not, so the child is not steered by history it has no use for."
                 }
             },
-            "required": ["prompt", "inherit_context"],
+            "required": ["prompt"],
             "additionalProperties": false
         }),
         // ------------------------------------------------------------ Task state

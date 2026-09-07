@@ -8,6 +8,7 @@ function model(overrides: Partial<ModelProfile> & { id: string }): ModelProfile 
     group: "",
     capabilities: [],
     reasoningContent: "plaintext",
+    promptCache: true,
     ...overrides
   };
 }
@@ -28,7 +29,10 @@ describe("mergeModelProfiles", () => {
         name: "我的叫法",
         group: "自定义组",
         capabilities: ["image_recognition"],
-        reasoningContent: "encrypted"
+        reasoningContent: "encrypted",
+        // `false` is a curated choice, not an empty value: discovery must not
+        // flip it back to the default it writes for new models.
+        promptCache: false
       })],
       [model({ id: "gpt-4o", name: "GPT-4o", group: "gpt", capabilities: [] })]
     );
@@ -37,6 +41,7 @@ describe("mergeModelProfiles", () => {
     expect(merged[0].group).toBe("自定义组");
     expect(merged[0].capabilities).toEqual(["image_recognition"]);
     expect(merged[0].reasoningContent).toBe("encrypted");
+    expect(merged[0].promptCache).toBe(false);
   });
 
   it("lets an empty curated value yield to discovery", () => {

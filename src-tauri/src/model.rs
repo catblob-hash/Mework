@@ -1394,6 +1394,15 @@ impl ProviderFamily {
         matches!(self, Self::OpenaiResponses | Self::OpenaiCodex | Self::Azure)
     }
 
+    /// Whether this family's dialect places prompt-cache breakpoints, so the
+    /// model's `prompt_cache` attribute reaches the wire. Only the Messages
+    /// protocol takes explicit `cache_control` markers; Bedrock's Converse
+    /// cache points are a different wire and are not driven by this attribute,
+    /// and Claude Agent caches inside the CLI on its own.
+    pub fn prompt_cache_takes_effect(self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
+
     /// Identity fields this family recognizes, including optional fields.
     pub fn known_settings(self) -> &'static [FamilySetting] {
         match self {
@@ -1740,6 +1749,17 @@ pub struct ModelProfile {
     /// is repaired on load by `resolve_reasoning_content`.
     #[serde(default)]
     pub reasoning_content: ReasoningContent,
+    /// Whether requests carry Claude Code's prompt-cache breakpoints. Claude
+    /// models only cache what the client marks, so this defaults on; a record
+    /// that omits it is repaired to `true` on load. Consumed by families where
+    /// `ProviderFamily::prompt_cache_takes_effect` holds; elsewhere the value
+    /// is stored but has no wire effect.
+    #[serde(default = "default_prompt_cache")]
+    pub prompt_cache: bool,
+}
+
+fn default_prompt_cache() -> bool {
+    true
 }
 
 impl ModelProfile {
@@ -3552,6 +3572,7 @@ mod tests {
             max_output_tokens: None,
             capabilities: BTreeSet::new(),
             reasoning_content: Default::default(),
+            prompt_cache: true,
         };
         assert!(!model.supports_vision());
 
@@ -3560,6 +3581,44 @@ mod tests {
 
         model.set_capability(ModelCapability::ImageRecognition, false);
         assert!(!model.supports_vision());
+    }
+
+    /// `prompt_cache` is a concrete, always-written attribute that defaults on:
+    /// a profile written before the key existed loads as enabled, an explicit
+    /// `false` survives the round trip, and the key is never omitted on save.
+    #[test]
+    fn prompt_cache_defaults_on_and_round_trips_false() {
+        let legacy: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "m",
+            "capabilities": [],
+            "reasoningContent": "plaintext"
+        }))
+        .unwrap();
+        assert!(legacy.prompt_cache);
+        assert_eq!(serde_json::to_value(&legacy).unwrap()["promptCache"], serde_json::json!(true));
+
+        let disabled: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "m",
+            "capabilities": [],
+            "reasoningContent": "plaintext",
+            "promptCache": false
+        }))
+        .unwrap();
+        assert!(!disabled.prompt_cache);
+        assert_eq!(serde_json::to_value(&disabled).unwrap()["promptCache"], serde_json::json!(false));
+    }
+
+    /// Only the Messages protocol consumes the attribute; every other family
+    /// stores it without a wire effect.
+    #[test]
+    fn prompt_cache_takes_effect_only_on_the_messages_protocol() {
+        for family in ProviderFamily::CATALOG {
+            assert_eq!(
+                family.prompt_cache_takes_effect(),
+                matches!(family, ProviderFamily::Anthropic),
+                "{family:?}"
+            );
+        }
     }
 
     /// Every literal a provider or the renderer can put in a tool payload,

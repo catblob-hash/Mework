@@ -1,4 +1,3 @@
-import type { ContextItem } from "../types";
 import type { SubagentView } from "./subagents";
 import type { TaskItem, TaskItemState } from "./taskContainer";
 import { taskStateForStatus } from "./taskContainer";
@@ -126,58 +125,6 @@ export interface WorkflowRunView {
   /** Narration lines, live only. A settled run has none to show. */
   logs: string[];
   running: boolean;
-}
-
-export interface WorkflowHistoryStep {
-  index: number;
-  label: string;
-  state: "completed" | "failed" | "cached" | "unrecorded";
-  bodyAvailable: boolean;
-  error: string | null;
-}
-
-export interface WorkflowHistoryRun {
-  runId: string;
-  scriptName: string;
-  status: string;
-  startedAt: string | null;
-  steps: WorkflowHistoryStep[];
-}
-
-/** Only exact run addresses can associate disk history with an existing rendered workflow. */
-export function unrepresentedWorkflowHistory(
-  runs: WorkflowHistoryRun[],
-  contexts: ContextItem[],
-  representedCallIds: string[],
-  liveCallIds: string[] = [],
-  liveRunIds: string[] = []
-): WorkflowHistoryRun[] {
-  const represented = new Set(representedCallIds);
-  const live = new Set(liveCallIds);
-  const existing = new Map<string, Set<number> | null>();
-  for (const context of contexts) {
-    if (context.kind !== "tool" || context.toolName !== "workflow" || !represented.has(context.id)) continue;
-    const runId = typeof context.input.runId === "string" ? context.input.runId
-      : context.result?.output.match(/\bworkflow:([A-Za-z0-9_-]+)/)?.[1];
-    if (!runId) continue;
-    if (live.has(context.id)) { existing.set(runId, null); continue; }
-    const indices = new Set<number>();
-    for (const step of context.subagent?.contexts ?? []) {
-      if (step.kind === "tool" && step.toolName === "workflow_step" && step.input.runId === runId
-        && typeof step.input.stepIndex === "number") indices.add(step.input.stepIndex);
-    }
-    existing.set(runId, indices);
-  }
-  const seen = new Set<string>();
-  return runs.flatMap((run) => {
-    if (seen.has(run.runId) || liveRunIds.includes(run.runId)) return [];
-    seen.add(run.runId);
-    if (!existing.has(run.runId)) return [run];
-    const indices = existing.get(run.runId);
-    if (!indices) return [];
-    const missing = run.steps.filter((step) => !indices.has(step.index));
-    return missing.length ? [{ ...run, steps: missing }] : [];
-  });
 }
 
 /** Steps with no declared phase sort after every declared one. */

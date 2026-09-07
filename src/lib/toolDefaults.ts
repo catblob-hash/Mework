@@ -145,10 +145,10 @@ const englishParameterHelp: Record<string, string> = {
   "任务地址数组：子代理与工作流直接写名称（工作流也可写 workflow:<runId>），后台命令写 shell:<id>，终端写 terminal:<id>，浏览器页面写 browser:<tab>；等待到点名的任务全部给出结果为止，省略时等待本对话全部子代理、工作流与后台命令（不含终端与浏览器）": "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a browser page as browser:<tab>. The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and browser pages excluded).",
   "5–600 秒，默认 60": "5–600 seconds; default: 60.",
   "Claude Code AskUserQuestion 格式：1–4 题；每题含 header、question、2–4 个 label/description 选项及 multiSelect；无需添加 Other": "Claude Code AskUserQuestion format: 1–4 questions, each with header, question, 2–4 label/description options, and multiSelect. Do not add Other.",
-  "分叉会话的第一条用户消息；说清任务与需要的背景":
-    "First user message of the forked conversation; state the task and the background it needs",
-  "true 复制到目前为止的时间线与已完成任务；false 只带这条提示词":
-    "true copies the timeline so far and the completed tasks; false starts with only this prompt",
+  "分叉会话的第一条用户消息，也是你唯一一次下达指令的机会；说清任务与需要的全部背景":
+    "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs",
+  "可选，默认 false：子对话只带这条 prompt 开始；true 时把目前为止的时间线与已完成任务一并复制进去":
+    "Optional, default false: the child starts with only this prompt; true also copies the timeline so far and the completed tasks",
   "选择操作：create、update、get、list": "create, update, get, list.",
   "选择操作：create、update、get": "create, update, get.",
   "用于 update、get；create 返回的不透明 ID": "update, get; the opaque ID returned by create.",

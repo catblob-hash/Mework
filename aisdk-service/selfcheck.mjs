@@ -21,7 +21,7 @@ const OVERRIDE = process.argv.includes("--sea")
 const BUNDLE = resolve(here, "dist/main.mjs");
 // Protocol generation. Keep this literal because packaged artifacts do not export
 // the constant; a mismatch must fail during the ready handshake.
-const V = 9;
+const V = 10;
 
 let failures = 0;
 const results = [];
@@ -121,7 +121,7 @@ function codexSse(res, { failed = false } = {}) {
 
 // Anthropic streams have no OpenAI-style [DONE] sentinel; mixing them would
 // misclassify dialect regressions as malformed upstream responses.
-function anthropicSse(res, stopReason) {
+function anthropicSse(res, stopReason, usage = { input_tokens: 1, output_tokens: 0 }) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -138,7 +138,7 @@ function anthropicSse(res, stopReason) {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 1, output_tokens: 0 },
+        usage,
       },
     },
     { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
@@ -725,11 +725,26 @@ async function handler(req, res) {
     (message) => Array.isArray(message?.content)
       && message.content.some((block) => block?.type === "thinking" || block?.type === "redacted_thinking"),
   );
-  if (model === "claude-selfcheck-replay-keep" || model === "claude-selfcheck-replay-gate" || model === "claude-3-selfcheck-nobeta") {
+  if (model === "claude-selfcheck-replay-keep" || model === "claude-selfcheck-replay-gate" || model === "claude-3-selfcheck-nobeta"
+    || model === "claude-selfcheck-cache-layout" || model === "claude-selfcheck-cache-off") {
     anthropicSse(res, "end_turn");
     return;
   }
-  if (model === "claude-selfcheck-heal-signature") {
+  // A relay that strips `cache_control` and bills everything as fresh input: no
+  // cache counters at all on a large prompt.
+  if (model === "claude-selfcheck-cache-uncovered") {
+    anthropicSse(res, "end_turn", { input_tokens: 30000, output_tokens: 0 });
+    return;
+  }
+  // A relay that honors the markers: the same large prompt comes back as a cache
+  // read, so the detector must stay quiet.
+  if (model === "claude-selfcheck-cache-covered") {
+    anthropicSse(res, "end_turn", {
+      input_tokens: 30000, cache_read_input_tokens: 25000, cache_creation_input_tokens: 4000, output_tokens: 0,
+    });
+    return;
+  }
+  if (model === "claude-selfcheck-heal-signature" || model === "claude-selfcheck-heal-signature-tail") {
     if (hasThinkingBlocks) return reject400("messages.1.content.0: Invalid signature in thinking block");
     anthropicSse(res, "end_turn");
     return;
@@ -1849,6 +1864,100 @@ async function main() {
     String(keepCall?.body?.max_tokens),
   );
 
+  // Check 21 continued: Claude Code's breakpoint layout. The host names the
+  // per-step tail of the system prompt, so the prefix and the tail become two
+  // marked blocks; the message-side marker skips an assistant whose last block is
+  // signed thinking and lands on the previous message; the model attribute turns
+  // the whole thing off without touching the prompt text.
+  const countMarkers = (value) => JSON.stringify(value).split('"cache_control"').length - 1;
+  sc.send(
+    anthropicStep("s-cache-layout", "claude-selfcheck-cache-layout", {
+      system: "稳定前缀",
+      systemDynamic: "本步尾巴",
+      promptCache: true,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "问" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "答" },
+            {
+              type: "reasoning",
+              text: "想",
+              providerOptions: { anthropic: { signature: "sig-tail" }, mework: { model: "claude-selfcheck-cache-layout" } },
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  const cacheLayout = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === "s-cache-layout");
+  const layoutBody = observed.find((o) => o.body?.model === "claude-selfcheck-cache-layout")?.body;
+  check(
+    "21 缓存断点：system 按动态边界拆成前缀与尾巴，各打一个断点",
+    cacheLayout.type === "done"
+      && Array.isArray(layoutBody?.system) && layoutBody.system.length === 2
+      && layoutBody.system[0].text === "稳定前缀" && layoutBody.system[0].cache_control?.type === "ephemeral"
+      && layoutBody.system[1].text === "本步尾巴" && layoutBody.system[1].cache_control?.type === "ephemeral"
+      && layoutBody.system.every((block) => block.cache_control.ttl === undefined && block.cache_control.scope === undefined),
+    cacheLayout.type === "done" ? JSON.stringify(layoutBody?.system) : JSON.stringify(cacheLayout.error),
+  );
+  const layoutMessages = layoutBody?.messages ?? [];
+  const layoutTail = layoutMessages.at(-1);
+  check(
+    "21 缓存断点：末条 assistant 以思考块收尾时跳过它，断点落在前一条消息的末块",
+    layoutTail?.role === "assistant"
+      && layoutTail.content.at(-1)?.type === "thinking"
+      && countMarkers(layoutTail) === 0
+      && layoutMessages[0]?.content?.at(-1)?.cache_control?.type === "ephemeral"
+      && countMarkers(layoutBody) === 3,
+    JSON.stringify(layoutMessages),
+  );
+
+  sc.send(
+    anthropicStep("s-cache-off", "claude-selfcheck-cache-off", {
+      system: "稳定前缀",
+      systemDynamic: "本步尾巴",
+      promptCache: false,
+    }),
+  );
+  const cacheOff = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === "s-cache-off");
+  const offCalls = observed.filter((o) => o.body?.model === "claude-selfcheck-cache-off");
+  check(
+    "21 缓存断点：模型属性关闭时整份请求没有 cache_control，系统提示词仍是拼接后的原文",
+    cacheOff.type === "done"
+      && offCalls.length === 1
+      && countMarkers(offCalls[0].body) === 0
+      && offCalls[0].body.system?.[0]?.text === "稳定前缀\n\n本步尾巴",
+    cacheOff.type === "done" ? JSON.stringify(offCalls[0]?.body?.system) : JSON.stringify(cacheOff.error),
+  );
+
+  // Claude Code's cache-coverage detector: three consecutive large uncached turns
+  // through a custom endpoint with markers on the wire warn exactly once; an
+  // endpoint that reports cache reads never trips it.
+  for (let turn = 0; turn < 3; turn += 1) {
+    sc.send(anthropicStep(`s-cache-covered-${turn}`, "claude-selfcheck-cache-covered", { system: "稳定前缀" }));
+    await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === `s-cache-covered-${turn}`);
+  }
+  check(
+    "21 缓存覆盖：上游报告缓存命中时不告警",
+    !sc.stderr.includes("[cache-coverage]"),
+    sc.stderr.split("\n").filter((line) => line.includes("[cache-coverage]")).join(" | "),
+  );
+  for (let turn = 0; turn < 4; turn += 1) {
+    sc.send(anthropicStep(`s-cache-uncovered-${turn}`, "claude-selfcheck-cache-uncovered", { system: "稳定前缀" }));
+    await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === `s-cache-uncovered-${turn}`);
+  }
+  const coverageWarnings = sc.stderr.split("\n").filter((line) => line.includes("[cache-coverage]"));
+  check(
+    "21 缓存覆盖：连续三轮大额未缓存输入只告警一次，并点名端点可能剥掉了 cache_control",
+    coverageWarnings.length === 1
+      && coverageWarnings[0].includes("claude-selfcheck-cache-uncovered")
+      && coverageWarnings[0].includes('"consecutive_turns":3')
+      && coverageWarnings[0].includes('"input_tokens":30000'),
+    coverageWarnings.join(" | ").slice(0, 300),
+  );
+
   // Check 22: the 400 self-heal chain. Every class is exercised against a relay that
   // rejects exactly that feature, and the repair must be remembered so the next
   // request to the same model skips the wasted round trip.
@@ -1881,6 +1990,41 @@ async function main() {
     "22 自愈：剥思考的决定被记住，下一次直接不带",
     calls("claude-selfcheck-heal-signature").length === 3,
     `${calls("claude-selfcheck-heal-signature").length} 次请求`,
+  );
+  // Claude Code rebuilds the body on every attempt, so once the retry has
+  // stripped the trailing thinking block the assistant tail is markable and the
+  // message-side breakpoint moves onto it instead of staying one turn short.
+  sc.send(
+    anthropicStep("s-heal-signature-tail", "claude-selfcheck-heal-signature-tail", {
+      messages: [
+        { role: "user", content: [{ type: "text", text: "问" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "答" },
+            {
+              type: "reasoning",
+              text: "想",
+              providerOptions: { anthropic: { signature: "sig-tail-heal" }, mework: { model: "claude-selfcheck-heal-signature-tail" } },
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  const healTail = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === "s-heal-signature-tail");
+  const tailCalls = calls("claude-selfcheck-heal-signature-tail");
+  const markerRoles = (call) => call.body.messages
+    .filter((m) => Array.isArray(m.content) && m.content.some((b) => b.cache_control))
+    .map((m) => m.role);
+  check(
+    "22 自愈：剥掉末尾思考块后的重试把消息侧断点挪到新的末块上",
+    healTail.type === "done"
+      && tailCalls.length === 2
+      && JSON.stringify(markerRoles(tailCalls[0])) === '["user"]'
+      && JSON.stringify(markerRoles(tailCalls[1])) === '["assistant"]'
+      && tailCalls[1].body.messages.at(-1).content.at(-1).text === "答",
+    healTail.type === "done" ? JSON.stringify(tailCalls.map(markerRoles)) : JSON.stringify(healTail.error),
   );
 
   sc.send(anthropicStep("s-heal-type", "claude-selfcheck-heal-type", { reasoning: "high" }));

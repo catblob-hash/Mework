@@ -8,6 +8,7 @@ import {
 import type {
   ContextItem,
   ConversationPlan,
+  ForkDecisionRecord,
   PendingForkRequest,
   PendingToolPrompt,
   SecurityLevel
@@ -57,12 +58,13 @@ export type AppPushEvent =
       promptId: string;
       approved: boolean;
     }
-  // The model called `fork` below full access. The tool has already returned; this
-  // card is the whole of what asks the user, so it never rides a run stream.
+  // The model called `fork`. The card is the gate at every access level — a fork
+  // is never created automatically — and the tool has already returned, so this
+  // card is the whole of what asks the user and never rides a run stream.
   | ({ type: "forkRequested" } & PendingForkRequest)
-  // A fork request ended: answered, auto-approved under full access, or retracted
-  // with its source conversation. `childConversationId` is set exactly when a child
-  // exists; the renderer loads it and starts its first run.
+  // A fork request ended: answered by the user, or retracted with its source
+  // conversation. `childConversationId` is set exactly when a child exists; the
+  // renderer loads it and starts its first run.
   | {
       type: "forkResolved";
       forkId: string;
@@ -70,6 +72,12 @@ export type AppPushEvent =
       sourceConversationId: string;
       approved: boolean;
       childConversationId: string | null;
+      /**
+       * What the task bar shows for this request. A retraction decided nothing
+       * and carries none: the host records a decision only when the user made
+       * one.
+       */
+      decision?: ForkDecisionRecord | null;
     }
   // The host changed a conversation's security level on its own — entering plan
   // mode, or leaving it once the plan was approved. The renderer mirrors it into

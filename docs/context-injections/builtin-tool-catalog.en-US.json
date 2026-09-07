@@ -1046,15 +1046,15 @@
           "type": "multiline",
           "required": true,
           "placeholder": "The task to complete in the forked conversation",
-          "help": "First user message of the forked conversation; state the task and the background it needs"
+          "help": "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs"
         },
         {
           "name": "inherit_context",
           "label": "Inherit context",
           "type": "boolean",
-          "required": true,
-          "defaultValue": true,
-          "help": "true copies the timeline so far and the completed tasks; false starts with only this prompt"
+          "required": false,
+          "defaultValue": false,
+          "help": "Optional, default false: the child starts with only this prompt; true also copies the timeline so far and the completed tasks"
         }
       ]
     },

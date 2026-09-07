@@ -41,7 +41,6 @@ import { QuestionDock } from "./components/QuestionDock";
 import { ToolApprovalDock } from "./components/ToolApprovalDock";
 import { QueuedMessageList } from "./components/QueuedMessageList";
 import { QuestionEditorDialog } from "./components/QuestionEditorDialog";
-import { WorkflowHistory } from "./components/WorkflowHistory";
 import { Dialog, EmptyState, IconButton } from "./components/Common";
 import { GlobalSettings } from "./components/GlobalSettings";
 import {
@@ -117,7 +116,7 @@ import {
   fetchUsageStatistics
 } from "./lib/usageStatistics";
 import type { UsageStatistics } from "./lib/usageStatistics";
-import { cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, executeTool, forkConversationContexts, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, prepareImageAttachment, refreshCapabilities, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, runModel, skipWorkflowStep, steerModelRun, workflowStepRecord } from "./lib/runtime";
+import { cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, executeTool, forkConversationContexts, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, prepareImageAttachment, refreshCapabilities, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, runModel, skipWorkflowStep, steerModelRun, workflowStepRecord } from "./lib/runtime";
 import { SECURITY_LEVEL_OPTIONS, securityLevelLabel } from "./lib/securityLevels";
 import {
   answersFromFormattedContent,
@@ -291,6 +290,7 @@ import type {
   ModelStreamEvent,
   ModelUsage,
   PendingForkRequest,
+  ForkDecisionRecord,
   PendingToolPrompt,
   QueuedMessage,
   ReasoningEffort,
@@ -738,6 +738,17 @@ function App() {
   const planPushCountRef = useRef(0);
   /** The model's fork requests awaiting the user, oldest first; drawn by the top-right tray. */
   const [forkRequests, setForkRequests] = useState<PendingForkRequest[]>([]);
+  /** Answered fork requests per source conversation, oldest first. Task-bar rows only: the host
+   * keeps them, the model never sees them. */
+  const [forkDecisions, setForkDecisions] = useState<Record<string, ForkDecisionRecord[]>>({});
+  const appendForkDecision = useCallback((decision: ForkDecisionRecord) => {
+    setForkDecisions((current) => {
+      const existing = current[decision.sourceConversationId] ?? [];
+      // A reload and the live event can both carry the same decision.
+      if (existing.some((record) => record.forkId === decision.forkId)) return current;
+      return { ...current, [decision.sourceConversationId]: [...existing, decision] };
+    });
+  }, []);
   /** Which card of the stack is shown, per conversation. Raw and unclamped —
    * the derivation below clamps against the live queue, so answering a card
    * needs no bookkeeping here. */
@@ -1745,8 +1756,24 @@ function App() {
       dispatchMainPane({ type: "show", conversationId, view: { kind: "plan" } });
       return;
     }
+    if (item.kind === "fork") {
+      // Only an approved row is openable, and the child it points at may since
+      // have been deleted: then the row stays a record and opens nothing.
+      const childId = item.decision.childConversationId;
+      if (!childId) return;
+      const exists = documentStore.current()?.workspaces.some((workspace) => (
+        workspace.id === item.decision.workspaceId
+        && workspace.conversations.some((candidate) => candidate.id === childId)
+      ));
+      if (!exists) return;
+      setConversationSettingsOpen(false);
+      setActiveWorkspaceId(item.decision.workspaceId);
+      setActiveConversationId(childId);
+      backToConversation();
+      return;
+    }
     if (item.kind === "browser") await openBrowserTab(item.sessionId);
-  }, [backToConversation, browserPanelOpen, dispatchMainPane, hideBuiltInBrowser, openBrowserTab]);
+  }, [backToConversation, browserPanelOpen, dispatchMainPane, documentStore, hideBuiltInBrowser, openBrowserTab, setActiveConversationId, setActiveWorkspaceId]);
 
   const openSecondarySurface = useCallback((surface: Exclude<AppSurface, { kind: "workspace" }>) => {
     setAppSurface(surface);
@@ -1912,6 +1939,8 @@ function App() {
     }
     if (event.type === "forkResolved") {
       closeForkRequest(event.forkId);
+      // A retraction carries no decision; an answered card carries the row the task bar shows.
+      if (event.decision) appendForkDecision(event.decision);
       // The child's first run is started from an effect rather than here, so it
       // waits for run adoption exactly as a wake does and cannot race it.
       if (event.childConversationId) {
@@ -2014,7 +2043,7 @@ function App() {
     if (event.type === "documentWriteRecovered") {
       documentStore.reportBackendSaveResult("success");
     }
-  }), [documentStore, openToolPrompt, closeToolPrompt, openForkRequest, closeForkRequest, dispatchMainPane]);
+  }), [documentStore, openToolPrompt, closeToolPrompt, openForkRequest, closeForkRequest, appendForkDecision, dispatchMainPane]);
 
   /** Merge persisted and draft branches into one active workspace/conversation pair; only document writes, sending, and real-workspace panels need to distinguish drafts. */
   const draftActive = isDraftConversationId(activeConversationId) && draftConversation !== null;
@@ -2676,6 +2705,7 @@ function App() {
     browserAutomationStopping: activeBrowserAutomationStopping,
     modelRequestId: activeConversation ? modelRunController.current()[activeConversation.id]?.requestId ?? null : null,
     userAbortedTasks: activeConversation?.userAbortedTasks ?? [],
+    forkDecisions: activeConversation ? forkDecisions[activeConversation.id] ?? [] : [],
     inheritedModelId: activeModelChoice?.model.id ?? null,
     plan: activePlan,
     planAwaitingApproval
@@ -2688,6 +2718,7 @@ function App() {
     activePlaywrightTool,
     activeShellTasks,
     activeTaskTerminals,
+    forkDecisions,
     planAwaitingApproval,
     subagents
   ]);
@@ -4973,6 +5004,20 @@ function App() {
     });
   }, [resumableRunsAdopted, openForkRequest]);
 
+  // Fork decisions are host rows: re-read them whenever a conversation becomes active, so a
+  // card answered while another conversation was open still shows up in this one's task bar.
+  useEffect(() => {
+    if (!activeConversationId || isDraftConversationId(activeConversationId)) return;
+    let cancelled = false;
+    void listForkDecisions(activeConversationId).then((records) => {
+      if (cancelled) return;
+      setForkDecisions((current) => ({ ...current, [activeConversationId]: records }));
+    }).catch(() => {
+      // The rows are advisory; a failed read keeps whatever was already shown.
+    });
+    return () => { cancelled = true; };
+  }, [activeConversationId]);
+
   // The durable intent is authoritative; a successfully delivered push is not an acknowledgement.
   useEffect(() => {
     if (!resumableRunsAdopted) return;
@@ -5614,7 +5659,6 @@ function App() {
                 taskMessages={taskMessages}
                 onOpenWorkflowRun={focusWorkflowRunPanel}
                 beforeTimeline={(
-                  <>
                   <div className="conversation-overview">
                     <div className="conversation-overview__prompt-slot">
                       {/* Show the system prompt directly at remaining width; an empty
@@ -5642,16 +5686,6 @@ function App() {
                       )}
                     </div>
                   </div>
-                  <WorkflowHistory
-                    key={activeConversation.id}
-                    conversationId={activeConversation.id}
-                    contexts={activeConversation.contexts}
-                    representedCallIds={subagents.filter((agent) => agent.workflowRun).flatMap((agent) => agent.callIds)}
-                    liveCallIds={subagents.filter((agent) => agent.workflowRun && agent.status === "running").flatMap((agent) => agent.callIds)}
-                    liveRunIds={subagents.filter((agent) => agent.workflowRun && agent.status === "running").flatMap((agent) => workflowRunIdsByRun[agent.id] ? [workflowRunIdsByRun[agent.id]] : [])}
-                    tools={activeConversationTools}
-                  />
-                  </>
                 )}
                 composer={(
                   <>
@@ -6327,6 +6361,7 @@ function App() {
             browserAutomationStopping={activeBrowserAutomationStopping}
             modelRequestId={taskSources.modelRequestId}
             userAbortedTasks={activeConversation.userAbortedTasks}
+            forkDecisions={forkDecisions[activeConversation.id] ?? []}
             inheritedModelId={taskSources.inheritedModelId}
             plan={activePlan}
             planAwaitingApproval={planAwaitingApproval}

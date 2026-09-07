@@ -5,7 +5,7 @@
   min-height: 260px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  align-items: flex-start;
   gap: 20px;
   padding: 24px 0;
 }
@@ -152,7 +152,7 @@
      pixels wide, and a fixed track there would push the plot out of the card and
      under `.context-scroll`'s horizontal clip. */
   grid-template-columns: minmax(0, auto) minmax(0, 1fr);
-  grid-template-rows: 168px auto;
+  grid-template-rows: 132px auto;
   column-gap: 8px;
   padding-top: 6px;
 }
@@ -206,6 +206,7 @@
   min-width: 0;
   height: 100%;
   display: flex;
+  align-items: flex-end;
   justify-content: center;
 }
 
@@ -219,21 +220,25 @@
      roughly the width it has when the range is full. */
   max-width: 26px;
   min-width: 1px;
-  height: 100%;
   display: flex;
   flex-direction: column-reverse;
+  /* The stack is exactly as tall as the bar, so clipping it rounds the bar's
+     own top edge rather than the top of the plot. */
+  border-radius: 3px 3px 0 0;
+  overflow: hidden;
 }
 
 .usage-stats__chart-segment {
-  flex: 0 0 auto;
+  flex-basis: 0;
   width: 100%;
   background: var(--series);
 }
 
 /* The ramp saturates at s7, so the ninth model onward repeats a shade. A hairline
-   along the shared edge keeps those neighbours readable as two segments — the
-   inset draws inside the box, so it never adds height to the stack. */
-.usage-stats__chart-segment + .usage-stats__chart-segment {
+   along that one shared edge keeps those neighbours readable as two segments —
+   every other pair is already told apart by its colour, and a seam there only
+   breaks the ramp. The inset draws inside the box, so it never adds height. */
+.usage-stats__chart-segment--s7 + .usage-stats__chart-segment--s7 {
   box-shadow: inset 0 -1px 0 var(--panel);
 }
 
@@ -329,15 +334,18 @@
 }
 
 /* One accent ramp shared by the bars, the legend and the hover card: shade
-   index is model rank, so a colour never has to be mapped anywhere else. */
+   index is model rank, so a colour never has to be mapped anywhere else. The
+   steps are even and mixed in oklab, so a stack of them reads as one gradient;
+   evenly spaced sRGB mixes crowd the dark end and leave a visible jump between
+   the first two shades. */
 .usage-stats__swatch--s0, .usage-stats__chart-segment--s0 { --series: var(--accent); }
-.usage-stats__swatch--s1, .usage-stats__chart-segment--s1 { --series: color-mix(in srgb, var(--accent) 84%, var(--subtle)); }
-.usage-stats__swatch--s2, .usage-stats__chart-segment--s2 { --series: color-mix(in srgb, var(--accent) 70%, var(--subtle)); }
-.usage-stats__swatch--s3, .usage-stats__chart-segment--s3 { --series: color-mix(in srgb, var(--accent) 58%, var(--subtle)); }
-.usage-stats__swatch--s4, .usage-stats__chart-segment--s4 { --series: color-mix(in srgb, var(--accent) 47%, var(--subtle)); }
-.usage-stats__swatch--s5, .usage-stats__chart-segment--s5 { --series: color-mix(in srgb, var(--accent) 38%, var(--subtle)); }
-.usage-stats__swatch--s6, .usage-stats__chart-segment--s6 { --series: color-mix(in srgb, var(--accent) 30%, var(--subtle)); }
-.usage-stats__swatch--s7, .usage-stats__chart-segment--s7 { --series: color-mix(in srgb, var(--accent) 23%, var(--subtle)); }
+.usage-stats__swatch--s1, .usage-stats__chart-segment--s1 { --series: color-mix(in oklab, var(--accent) 89%, var(--subtle)); }
+.usage-stats__swatch--s2, .usage-stats__chart-segment--s2 { --series: color-mix(in oklab, var(--accent) 78%, var(--subtle)); }
+.usage-stats__swatch--s3, .usage-stats__chart-segment--s3 { --series: color-mix(in oklab, var(--accent) 67%, var(--subtle)); }
+.usage-stats__swatch--s4, .usage-stats__chart-segment--s4 { --series: color-mix(in oklab, var(--accent) 56%, var(--subtle)); }
+.usage-stats__swatch--s5, .usage-stats__chart-segment--s5 { --series: color-mix(in oklab, var(--accent) 45%, var(--subtle)); }
+.usage-stats__swatch--s6, .usage-stats__chart-segment--s6 { --series: color-mix(in oklab, var(--accent) 34%, var(--subtle)); }
+.usage-stats__swatch--s7, .usage-stats__chart-segment--s7 { --series: color-mix(in oklab, var(--accent) 23%, var(--subtle)); }
 
 .usage-stats__legend {
   margin: 0;

@@ -1,45 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { deriveWorkflowItems } from "./taskContainer";
 import { deriveWorkflowProgress } from "./workflowProgress";
-import { deriveWorkflowRun, formatRunElapsed, formatRunTokens, phaseTone, stepTone, unrepresentedWorkflowHistory } from "./workflowRuns";
-import type { WorkflowHistoryRun } from "./workflowRuns";
-import type { ToolContext } from "../types";
+import { deriveWorkflowRun, formatRunElapsed, formatRunTokens, phaseTone, stepTone } from "./workflowRuns";
 import { subagentViewFixture, taskMessagesFixture } from "../test/fixtures";
 import type { SubagentView } from "./subagents";
-
-describe("workflow history association", () => {
-  const archive = (runId: string): WorkflowHistoryRun => ({ runId, scriptName: "same name", status: "completed", startedAt: null, steps: [] });
-  const call = (input: ToolContext["input"], output = ""): ToolContext => ({
-    id: "workflow-call", kind: "tool", toolName: "workflow", input,
-    result: { output, success: true, executedAt: "2026-09-05T00:00:00Z", durationMs: 1 }, createdAt: "2026-09-05T00:00:00Z"
-  });
-  it("deduplicates only exact run ids already represented by a workflow view", () => {
-    const first = archive("run1");
-    const second = archive("run2");
-    expect(unrepresentedWorkflowHistory([first, first, second], [call({ runId: "run1" })], ["workflow-call"]))
-      .toEqual([second]);
-    expect(unrepresentedWorkflowHistory([first, second], [call({ name: "same name" })], ["workflow-call"]))
-      .toEqual([first, second]);
-  });
-  it("restores only missing step indices and leaves live runs to their live view", () => {
-    const run = archive("run1");
-    run.steps = [0, 2].map((index) => ({ index, label: "same step", state: "completed", bodyAvailable: true, error: null }));
-    const parent = call({ runId: "run1" });
-    parent.subagent = { task: "driver", status: "completed", updates: [], contexts: [
-      { ...call({ runId: "run1", stepIndex: 0 }), id: "step-0", toolName: "workflow_step" }
-    ] };
-    expect(unrepresentedWorkflowHistory([run], [parent], [parent.id])[0].steps.map((step) => step.index)).toEqual([2]);
-    expect(unrepresentedWorkflowHistory([run], [parent], [parent.id], [parent.id])).toEqual([]);
-    expect(unrepresentedWorkflowHistory([run], [], [], [], ["run1"])).toEqual([]);
-  });
-  it("matches old receipt addresses but retains fallback cards with no existing view", () => {
-    const first = archive("run1");
-    const receipt = call({}, "Saved task workflow:run1");
-    expect(unrepresentedWorkflowHistory([first], [receipt], ["workflow-call"])).toEqual([]);
-    expect(unrepresentedWorkflowHistory([first], [receipt], [])).toEqual([first]);
-    expect(unrepresentedWorkflowHistory([first], [], [])).toEqual([first]);
-  });
-});
 
 const NOW = Date.parse("2026-08-01T00:20:12Z");
 

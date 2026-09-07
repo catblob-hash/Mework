@@ -1,5 +1,6 @@
 import { useI18n } from "../../i18n";
 import {
+  promptCacheTakesEffect,
   reasoningContentTakesEffect,
   REASONING_CONTENTS
 } from "../../lib/modelCapabilities";
@@ -60,6 +61,17 @@ export function ModelProfileDrawer({
   };
 
   const visionLabel = capabilityLabel(t, "image_recognition");
+  const promptCacheLabel = t("提示词缓存", "Prompt caching");
+  /** Only the Messages protocol takes client-placed cache breakpoints; elsewhere the value is stored but idle. */
+  const promptCacheHint = promptCacheTakesEffect(family)
+    ? t(
+        "按 Claude Code 的规则在请求里打缓存断点：系统提示词的稳定前缀与本步尾巴各一处，最后一条可打标的消息一处。Claude 只缓存客户端标记过的前缀，关掉就完全没有缓存。",
+        "Places cache breakpoints the way Claude Code does: one on the stable system-prompt prefix, one on its per-step tail, and one on the last markable message. Claude only caches what the client marks, so turning this off means no caching at all."
+      )
+    : t(
+        "这一档今天只对 Anthropic Messages 协议有效；别的协议由上游自行决定缓存，客户端没有可发的标记。",
+        "This setting only takes effect on the Anthropic Messages protocol today; on the others the upstream decides caching on its own and there is no marker to send."
+      );
 
   return (
     <Drawer
@@ -110,6 +122,21 @@ export function ModelProfileDrawer({
           label={t("{name} {capability}", "{name} {capability}", {
             name: draft.id || t("新模型", "New model"),
             capability: visionLabel
+          })}
+        />
+      </div>
+
+      <div className="drawer-switch-row">
+        <span>
+          <strong>{promptCacheLabel}</strong>
+          <small>{promptCacheHint}</small>
+        </span>
+        <Switch
+          checked={draft.promptCache}
+          onChange={(on) => onChange({ ...draft, promptCache: on })}
+          label={t("{name} {capability}", "{name} {capability}", {
+            name: draft.id || t("新模型", "New model"),
+            capability: promptCacheLabel
           })}
         />
       </div>

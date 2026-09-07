@@ -12,14 +12,16 @@ import {
   modelGroup,
   normalizeCapabilities,
   normalizeEndpointTypes,
+  normalizePromptCache,
   normalizeReasoningContent,
+  promptCacheTakesEffect,
   reasoningContentTakesEffect,
   REASONING_CONTENTS,
   repairActiveModelId,
 } from "./modelCapabilities";
 
 function model(id: string, group = ""): ModelProfile {
-  return { id, name: "", group, capabilities: [], reasoningContent: "plaintext" };
+  return { id, name: "", group, capabilities: [], reasoningContent: "plaintext", promptCache: true };
 }
 
 describe("modelGroup", () => {
@@ -258,6 +260,45 @@ describe("reasoning form", () => {
     expect(isEncryptedReasoning({ content: "" })).toBe(true);
     expect(isEncryptedReasoning({})).toBe(true);
     expect(isEncryptedReasoning({ content: "想法" })).toBe(false);
+  });
+});
+
+describe("prompt cache", () => {
+  /**
+   * Rust and TypeScript each define which provider families put the model's
+   * prompt-cache attribute on the wire. Compare every family against `model.rs`
+   * so a family added on one side cannot silently stay idle on the other.
+   */
+  it("mirrors ProviderFamily::prompt_cache_takes_effect for every family", () => {
+    const body = /fn prompt_cache_takes_effect\(self\) -> bool \{([\s\S]*?)\n    \}/u
+      .exec(modelSource);
+    expect(body, "model.rs 里找不到 prompt_cache_takes_effect").toBeTruthy();
+    const rustTrue = new Set(
+      [...(body as RegExpExecArray)[1].matchAll(/Self::(\w+)/gu)].map((match) => match[1])
+    );
+    expect(rustTrue.size).toBeGreaterThan(0);
+    for (const [variant, family] of FAMILY_SLUGS) {
+      expect(promptCacheTakesEffect(family), `ProviderFamily::${variant}`)
+        .toBe(rustTrue.has(variant));
+    }
+    // The Messages protocol is the one consumer today; pin it so the loop above
+    // cannot pass with a constant.
+    expect(promptCacheTakesEffect("anthropic")).toBe(true);
+    expect(promptCacheTakesEffect("bedrock")).toBe(false);
+  });
+
+  /**
+   * The attribute is concrete on every model, so the normalizer is where an
+   * absent key (older documents) or a malformed value acquires Claude Code's
+   * default of enabled. Only a real boolean is the user's own choice.
+   */
+  it("defaults anything but a boolean to enabled", () => {
+    expect(normalizePromptCache(undefined)).toBe(true);
+    expect(normalizePromptCache(null)).toBe(true);
+    expect(normalizePromptCache("false")).toBe(true);
+    expect(normalizePromptCache(0)).toBe(true);
+    expect(normalizePromptCache(true)).toBe(true);
+    expect(normalizePromptCache(false)).toBe(false);
   });
 });
 

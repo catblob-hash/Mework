@@ -178,6 +178,25 @@ export function reasoningContentTakesEffect(family: ProviderFamily): boolean {
 }
 
 /**
+ * Persistence form of the prompt-cache attribute. A boolean has no family-derived
+ * default: anything that is not a boolean, including the absent key of an older
+ * document, resolves to Claude Code's default of enabled.
+ */
+export function normalizePromptCache(value: unknown): boolean {
+  return typeof value === "boolean" ? value : true;
+}
+
+/**
+ * Whether this family's dialect places prompt-cache breakpoints, so the model's
+ * `promptCache` attribute reaches the wire. Mirrors Rust
+ * `ProviderFamily::prompt_cache_takes_effect`: only the Messages protocol takes
+ * explicit `cache_control` markers.
+ */
+export function promptCacheTakesEffect(family: ProviderFamily): boolean {
+  return family === "anthropic";
+}
+
+/**
  * Whether a reasoning card is encrypted and therefore removable but not editable.
  * `form` is authoritative. Its absence falls back to an empty body for legacy cards;
  * all reads must use this function to keep the fallback consistent. Streaming cards

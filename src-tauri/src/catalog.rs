@@ -1203,16 +1203,18 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     true,
                     None,
                     Some("在分叉出的会话里要完成的任务"),
-                    Some("分叉会话的第一条用户消息；说清任务与需要的背景"),
+                    Some("分叉会话的第一条用户消息，也是你唯一一次下达指令的机会；说清任务与需要的全部背景"),
                 ),
                 parameter(
                     "inherit_context",
                     "继承上下文",
                     Boolean,
-                    true,
-                    Some(json!(true)),
+                    false,
+                    Some(json!(false)),
                     None,
-                    Some("true 复制到目前为止的时间线与已完成任务；false 只带这条提示词"),
+                    Some(
+                        "可选，默认 false：子对话只带这条 prompt 开始；true 时把目前为止的时间线与已完成任务一并复制进去",
+                    ),
                 ),
             ],
         ),
@@ -1632,10 +1634,10 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
             "create writes the whole object; update merges keys, and a null value removes that key."
         }
         ("fork", "prompt") => {
-            "First user message of the forked conversation; state the task and the background it needs"
+            "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs"
         }
         ("fork", "inherit_context") => {
-            "true copies the timeline so far and the completed tasks; false starts with only this prompt"
+            "Optional, default false: the child starts with only this prompt; true also copies the timeline so far and the completed tasks"
         }
         ("plan", "action") => {
             "Choose an action: write stores or replaces the plan, read returns the current one."

@@ -8,7 +8,7 @@ Two profiles are compiled into the app and can never be removed:
 
 | Profile | Id | What it is |
 |---|---|---|
-| Mework built-in (English) | `tooldesc_builtin_en_us` | The hard-coded defaults. A conversation that selects nothing uses this one. |
+| Mework built-in (English) | `tooldesc_builtin_en_us` | The defaults, compiled in from `src-tauri/prompt-profiles/en-US.json`. A conversation that selects nothing uses this one. |
 | Mework built-in (Chinese) | `tooldesc_builtin_zh_cn` | The same file format, with every text in Chinese, compiled in from `src-tauri/prompt-profiles/zh-CN.json`. |
 
 Your own files add a third kind. They override any subset of the registry and fall back to a built-in for the rest.
@@ -131,6 +131,6 @@ Tips that follow from how the texts are used:
 
 ## Key reference {#key-reference}
 
-Generated from `src-tauri/src/prompt_profile.rs`. The English column is the hard-coded default; the Chinese column is the built-in Chinese profile.
+Generated from `src-tauri/src/prompt_profile.rs`. The English column is the built-in English profile; the Chinese column is the built-in Chinese profile.
 
 {{PROMPT_KEYS_TABLE}}

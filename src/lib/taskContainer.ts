@@ -2,7 +2,7 @@ import type { SubagentView, SubagentViewStatus } from "./subagents";
 import type { TerminalSessionState } from "./terminal";
 import type { ShellTaskSnapshot } from "./shellTasks";
 import type { BrowserStatus } from "./browser";
-import type { ModelUsage, ConversationPlan, UserAbortedTaskKind, UserAbortedTaskRecord } from "../types";
+import type { ModelUsage, ConversationPlan, ForkDecisionRecord, UserAbortedTaskKind, UserAbortedTaskRecord } from "../types";
 
 /**
  * Whether a task row is still doing work. Terminals and browser pages have no
@@ -51,7 +51,8 @@ export type TaskItemKind =
   | "terminal"
   | "shell"
   | "browser"
-  | "plan";
+  | "plan"
+  | "fork";
 
 interface TaskItemBase {
   /** Source identity captured when the row is derived, never the active selection. */
@@ -105,6 +106,13 @@ export type TaskItem =
    * area has, so it earns a row. Never has children and never stops.
    */
   | (TaskItemBase & { kind: "plan"; plan: ConversationPlan })
+  /**
+   * One answered `fork` request. Not work either: the decision is already made
+   * by the time the row exists, and the row is the user's only trace of it —
+   * the model is never told a fork's outcome, so nothing about this reaches
+   * `task_list` or any receipt.
+   */
+  | (TaskItemBase & { kind: "fork"; decision: ForkDecisionRecord })
   | (TaskItemBase & { kind: "aborted"; sourceKind: UserAbortedTaskKind; sourceIdentity: string });
 
 export interface TaskContainerMessages {
@@ -136,6 +144,9 @@ export interface TaskContainerMessages {
   planRejected: string;
   /** How long ago the plan was last written, from whole minutes. */
   planUpdatedAgo: (minutes: number) => string;
+  /** An approved fork's row, which is also the only way into the child. */
+  forkApproved: string;
+  forkDeclined: string;
   userAborted: string;
 }
 
@@ -490,6 +501,9 @@ export function taskItemSourceIdentity(item: TaskItem, modelRequestId: string | 
   }
   // One plan per conversation, and the rows are already bound to one.
   if (item.kind === "plan") return "plan";
+  // The fork id is minted by the host when the request is raised and outlives
+  // the card, so it identifies the decision without the child having to exist.
+  if (item.kind === "fork") return `fork:${item.decision.forkId}`;
   throw new Error("Unknown task item kind");
 }
 
@@ -501,6 +515,8 @@ export function userAbortedTaskRecord(
 ): UserAbortedTaskRecord {
   // The plan row carries no stop control, so it never reaches this.
   if (item.kind === "plan") throw new Error("A plan row cannot be aborted");
+  // Neither does a fork decision: it is settled the moment it exists.
+  if (item.kind === "fork") throw new Error("A fork decision row cannot be aborted");
   const sourceKind = item.kind === "aborted" ? item.sourceKind : item.kind;
   return {
     id,
@@ -573,6 +589,37 @@ function planItem(
   };
 }
 
+/**
+ * One answered `fork` request. Both outcomes are finished rows: an approval
+ * handed the job to a conversation that now runs on its own, and a decline is
+ * the end of the request — neither is work this conversation is still doing.
+ *
+ * The row exists because the decision would otherwise leave no trace anywhere
+ * the user can see: the model is never told the outcome, so the task bar is the
+ * only place it is recorded.
+ */
+function forkItem(decision: ForkDecisionRecord, messages: TaskContainerMessages): TaskItem {
+  return {
+    kind: "fork",
+    decision,
+    id: `fork:${decision.forkId}`,
+    // The host derives the title from the prompt when it raises the request;
+    // falling back to the prompt's first line covers a record written before it
+    // did, and keeps a row from being titled by nothing.
+    label: decision.title || decision.prompt.split("\n", 1)[0] || "",
+    detail: decision.approved ? messages.forkApproved : messages.forkDeclined,
+    state: "finished",
+    // The only interval a decision has is how long the card waited for an
+    // answer, which measures the user rather than the task; the other three
+    // columns are quantities a fork never had.
+    metrics: { childCount: null, tokens: null, toolCount: null, elapsedMs: null },
+    children: [],
+    error: null,
+    startedAt: decision.requestedAt,
+    endedAt: decision.decidedAt
+  };
+}
+
 export interface TaskSources {
   conversationId?: string;
   agents: SubagentView[];
@@ -613,6 +660,12 @@ export interface TaskSources {
   /** True while the conversation's run is live and the level is plan mode. */
   planDrafting?: boolean;
   /**
+   * Every `fork` request this conversation raised and the user answered, in any
+   * order; the rows are sorted by when each was decided. Model-invisible: the
+   * host records them for the task bar alone.
+   */
+  forkDecisions?: ForkDecisionRecord[];
+  /**
    * Model the conversation itself is on, shown by a child that bound no model
    * of its own. A role-less child runs on exactly this, and the record cannot
    * say so: the host writes a binding only for a named agent or a fork.
@@ -627,6 +680,9 @@ export interface TaskSources {
  * task rows: subagents, workflow runs, terminals, shell commands, and the
  * browser page. Web search and fetch are ordinary in-round tool calls, not tasks,
  * so they have no row here.
+ *
+ * The plan document and answered fork requests are rows too, without ever having
+ * been work: each is an artifact the task bar is the only navigation to.
  *
  * Only depth-0 agents become top-level rows. Their descendants are `children`
  * of those rows rather than siblings, which is what lets the sidebar render one
@@ -650,6 +706,7 @@ export function deriveTaskItems(
     plan = null,
     planAwaitingApproval = false,
     planDrafting = false,
+    forkDecisions = [],
     inheritedModelId = null,
     now = Date.now()
   } = sources;
@@ -706,6 +763,15 @@ export function deriveTaskItems(
   if (plan) {
     items.push(planItem(plan, planAwaitingApproval, planDrafting, messages, now));
   }
+
+  // Sorted here rather than trusted from the caller: the rows only ever appear
+  // in the finish list, where the order is the order they went in, and that list
+  // is meant to read as the sequence in which things ended.
+  [...forkDecisions]
+    .sort((left, right) => left.decidedAt.localeCompare(right.decidedAt))
+    .forEach((decision) => {
+      items.push(forkItem(decision, messages));
+    });
 
   const abortedBySource = new Map(userAbortedTasks.map((record) => [record.sourceIdentity, record]));
   const liveSources = new Set(items.map((item) => taskItemSourceIdentity(item, modelRequestId)));
@@ -807,6 +873,11 @@ export function taskActivitySignature(sources: TaskSources): string {
     // state, so the revision timestamp is what carries it.
     parts.push(`p:${sources.plan.status}:${sources.plan.updatedAt}:${sources.planAwaitingApproval ? 1 : 0}`);
   }
+  sources.forkDecisions?.forEach((decision) => {
+    // A decision is immutable once recorded, so its identity and outcome are the
+    // whole of what can change: one more entry is one more piece of news.
+    parts.push(`f:${decision.forkId}:${decision.approved ? 1 : 0}:${decision.decidedAt}`);
+  });
   return parts.join("|");
 }
 
@@ -818,6 +889,9 @@ export function hasAnyTask(sources: TaskSources): boolean {
   // The plan is the only row plan mode produces before any tool has run, and
   // the task bar is the only way to reach it.
   if (sources.plan) return true;
+  // Likewise a fork decision: the model is never told the outcome, so a task bar
+  // that reported nothing would leave the whole request unrecorded.
+  if ((sources.forkDecisions?.length ?? 0) > 0) return true;
   return (sources.userAbortedTasks?.length ?? 0) > 0;
 }
 

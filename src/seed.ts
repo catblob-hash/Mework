@@ -380,15 +380,15 @@ export const toolCatalog: ToolDescriptor[] = [
         type: "multiline",
         required: true,
         placeholder: "在分叉出的会话里要完成的任务",
-        help: "分叉会话的第一条用户消息；说清任务与需要的背景"
+        help: "分叉会话的第一条用户消息，也是你唯一一次下达指令的机会；说清任务与需要的全部背景"
       },
       {
         name: "inherit_context",
         label: "继承上下文",
         type: "boolean",
-        required: true,
-        defaultValue: true,
-        help: "true 复制到目前为止的时间线与已完成任务；false 只带这条提示词"
+        required: false,
+        defaultValue: false,
+        help: "可选，默认 false：子对话只带这条 prompt 开始；true 时把目前为止的时间线与已完成任务一并复制进去"
       }
     ]
   },
@@ -449,7 +449,8 @@ function claudeAgentSeedModels(): ModelProfile[] {
       contextWindow,
       maxOutputTokens,
       capabilities: ["image_recognition"],
-      reasoningContent: "plaintext"
+      reasoningContent: "plaintext",
+      promptCache: true
     }));
 }
 
@@ -587,7 +588,7 @@ export const createSeedDocument = (): AppDocument => {
   const activeProvider = apiProviders.find((provider) => provider.enabled) ?? null;
 
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     globalSettings: {
       appLanguage: "auto",
       resolvedAppLanguage: "zh-CN",

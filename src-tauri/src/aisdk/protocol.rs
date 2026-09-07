@@ -17,7 +17,7 @@ use serde_json::Value;
 ///
 /// Increment this when a stale sidecar could silently suppress required behavior;
 /// the generation gate turns that condition into an explicit startup failure.
-pub(crate) const PROTOCOL_VERSION: u32 = 9;
+pub(crate) const PROTOCOL_VERSION: u32 = 10;
 
 /// Maximum line size (16 MiB). Both sides enforce it because neither side trusts
 /// the other.
@@ -126,8 +126,17 @@ pub(crate) struct StepRequest {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) settings: BTreeMap<String, String>,
     pub(crate) model_id: String,
+    /// The stable system prompt: everything assembled once at run start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) system: Option<String>,
+    /// The per-step tail of the system prompt (plan-mode and web-safety
+    /// sections, conversation system contexts). The sidecar appends it to
+    /// `system` after a blank line for every family, so the prompt a provider
+    /// sees is unchanged; the Anthropic dialect also reads it as Claude Code's
+    /// dynamic boundary and gives the prefix and the tail separate cache
+    /// breakpoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) system_dynamic: Option<String>,
     /// AI SDK `ModelMessage[]` produced by the host's canonical projection.
     pub(crate) messages: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -152,6 +161,11 @@ pub(crate) struct StepRequest {
     /// Responses modes request encrypted replay data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_content: Option<&'static str>,
+    /// The model's `prompt_cache` attribute, sent only to families whose
+    /// dialect places cache breakpoints. `false` turns Claude Code's markers
+    /// off for this model; absence means this family has no consumer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) provider_options: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -464,7 +478,7 @@ mod tests {
         assert_eq!(parsed.native_search_call_ids, vec!["a", "b"]);
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":-1}"#).is_err());
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":1.5}"#).is_err());
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     /// Provider-executed tool failures use cross-language field names, so pin each
@@ -516,6 +530,7 @@ mod tests {
             settings: BTreeMap::new(),
             model_id: "m".into(),
             system: None,
+            system_dynamic: None,
             messages: vec![],
             tools: vec![],
             tool_choice: None,
@@ -524,13 +539,14 @@ mod tests {
             temperature: None,
             reasoning: None,
             reasoning_content: None,
+            prompt_cache: None,
             provider_options: None,
             native_search: None,
             agent: None,
         };
         let value = serde_json::to_value(&request).unwrap();
         // Upstream options distinguish explicit null from an omitted field.
-        for absent in ["apiKey", "system", "toolChoice", "maxOutputTokens", "temperature", "reasoning", "reasoningContent", "providerOptions", "nativeSearch", "headers", "tools", "agent"] {
+        for absent in ["apiKey", "system", "systemDynamic", "toolChoice", "maxOutputTokens", "temperature", "reasoning", "reasoningContent", "promptCache", "providerOptions", "nativeSearch", "headers", "tools", "agent"] {
             assert!(value.get(absent).is_none(), "{absent} 不该出现");
         }
         assert_eq!(value["maxSteps"], 1);
@@ -547,6 +563,7 @@ mod tests {
             settings: BTreeMap::from([("region".to_owned(), "us-east-1".to_owned())]),
             model_id: "m".into(),
             system: Some("s".into()),
+            system_dynamic: Some("tail".into()),
             messages: vec![Value::Null],
             tools: vec![ToolSpec {
                 name: "t".into(),
@@ -559,12 +576,15 @@ mod tests {
             temperature: Some(0.5),
             reasoning: Some("high"),
             reasoning_content: Some("plaintext"),
+            prompt_cache: Some(false),
             provider_options: Some(Value::Null),
             native_search: Some(NativeSearch { max_uses: 3, previous_call_ids: vec!["old-call".into()] }),
             agent: None,
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["nativeSearch"]["previousCallIds"], serde_json::json!(["old-call"]));
+        assert_eq!(value["promptCache"], serde_json::json!(false));
+        assert_eq!(value["systemDynamic"], serde_json::json!("tail"));
         for expected in [
             "family",
             "baseURL",
@@ -572,6 +592,7 @@ mod tests {
             "headers",
             "modelId",
             "system",
+            "systemDynamic",
             "messages",
             "tools",
             "toolChoice",
@@ -581,6 +602,7 @@ mod tests {
             // Pin this field to catch a spelling drift that would select the provider default.
             "reasoning",
             "reasoningContent",
+            "promptCache",
             "providerOptions",
             "nativeSearch",
         ] {

@@ -17,7 +17,7 @@ describe("seed document", () => {
 
   it("starts with the approval-first security policy", () => {
     const document = createSeedDocument();
-    expect(document.schemaVersion).toBe(2);
+    expect(document.schemaVersion).toBe(3);
     expect(document.globalSettings).toMatchObject({
       appLanguage: "auto",
       resolvedAppLanguage: "zh-CN",

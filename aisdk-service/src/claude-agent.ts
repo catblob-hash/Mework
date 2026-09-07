@@ -59,6 +59,7 @@ import { dropForeignSignedReasoning, stripReplayTags } from "./anthropic-dialect
 import {
   MAX_STREAM_TEXT,
   MAX_TOOL_ARGUMENTS,
+  fullSystemPrompt,
   type AgentSession,
   type StepError,
   type StepEvent,
@@ -1490,7 +1491,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       pathToClaudeCodeExecutable: agent.executable,
       spawnClaudeCodeProcess: cli.spawnHook(),
       env: cliEnv(agent, request.modelId, { maxOutputTokens: request.maxOutputTokens }),
-      systemPrompt: request.system ?? "",
+      systemPrompt: fullSystemPrompt(request) ?? "",
       tools: [],
       settingSources: [],
       strictMcpConfig: true,

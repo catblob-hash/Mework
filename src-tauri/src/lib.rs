@@ -57,6 +57,7 @@ mod powershell_host;
 mod project_import_trust;
 mod project_memory;
 mod prompt_profile;
+mod prompt_profile_files;
 mod push_events;
 mod reveal_path;
 mod run_environment;
@@ -995,7 +996,7 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
         .flush(std::time::Duration::from_secs(30))?;
     storage::purge_conversation_bodies(&path)?;
     let mut document = catalog::default_document(&default_workspace_path());
-    document.capabilities = capabilities::discover(&document, &skills::skills_root(app_data));
+    document.capabilities = capabilities::discover(&document, &skills::skills_root(app_data), app_data);
     // Reset is the recovery path: commit through the store so the in-memory
     // authority is replaced too, and block until the default document is
     // durably on disk before reporting success.
@@ -1079,6 +1080,7 @@ fn discover_capabilities(
     Ok(capabilities::discover(
         &document,
         &skills::skills_root(&app_data),
+        &app_data,
     ))
 }
 
@@ -2825,10 +2827,21 @@ fn list_pending_fork_starts(
     conversations::store(&document_path(&app)?)?.pending_fork_starts()
 }
 
+/// Every answered fork request a conversation raised, oldest first, for the
+/// task bar. The model never sees these: they are not tasks of the run.
+#[cfg(not(test))]
+#[tauri::command]
+fn list_fork_decisions(
+    app: AppHandle,
+    conversation_id: String,
+) -> Result<Vec<fork_requests::ForkDecisionRecord>, String> {
+    conversations::store(&document_path(&app)?)?.fork_decisions(&conversation_id)
+}
+
 /// Answers one fork card. Approval creates the child conversation and returns
 /// it; the `forkResolved` push event goes out on both answers so every surface
 /// takes the card down, and it — not this return value — is what starts the
-/// child's run, because the auto-approved path has no command to return from.
+/// child's run and carries the decision the task bar records.
 #[cfg(not(test))]
 #[tauri::command]
 fn resolve_fork_request(
@@ -2901,14 +2914,6 @@ fn workflow_step_control(
         return Err("工作流运行 ID 无效".into());
     }
     state.workflow_step_control(&request_id, &run_id, step_index, &action)
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn workflow_run_history(app: AppHandle, conversation_id: String) -> Result<Vec<serde_json::Value>, String> {
-    let app_data = app.path().app_data_dir().map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    tauri::async_runtime::spawn_blocking(move || workflow_store::list_run_history(&app_data, &conversation_id))
-        .await.map_err(|error| format!("无法读取工作流历史：{error}"))?
 }
 
 /// Fetches the complete record for an externalized workflow step on demand.
@@ -5125,7 +5130,7 @@ fn trusted_run_request(
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
     // The prompt profile decides every host-authored text in this run: the
     // conversation's selected file, or the built-in English profile.
-    let profile = capabilities::resolve_prompt_profile(&document, conversation);
+    let profile = capabilities::resolve_prompt_profile(&document, conversation, &app_data);
     let runtime = capabilities::runtime_context(
         &document,
         conversation,
@@ -5521,7 +5526,7 @@ fn trusted_conversation_policy_from_document(
         .app_data_dir()
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
     let workspace_path = effective_workspace_path(&app_data, workspace, conversation)?;
-    let prompt_profile = capabilities::resolve_prompt_profile(document, conversation);
+    let prompt_profile = capabilities::resolve_prompt_profile(document, conversation, &app_data);
     let tools = tool_catalog_with_descriptions(&prompt_profile);
     let available_tool_names = tools
         .iter()
@@ -6514,6 +6519,12 @@ pub fn run() {
                 app.state::<AppState>()
                     .install_attestation_key(app_data)
                     .map_err(std::io::Error::other)?;
+                // The two built-in prompt profiles live on disk as editable
+                // files; a damaged one is reported, not fatal, because the
+                // compiled copy still serves every run.
+                if let Err(error) = prompt_profile_files::materialize_builtin_profiles(app_data) {
+                    eprintln!("内置提示词档案未能落盘：{error}");
+                }
             }
             reconcile_image_attachments_on_startup(app.handle()).map_err(std::io::Error::other)?;
             install_background_write_failure_reporting(app.state::<AppState>().inner());

@@ -42,6 +42,10 @@ export interface ProviderTarget {
   /** Model reasoning representation. Omission means no consumer.
    * Only `plaintext` changes behavior by translating Responses reasoning SSE. */
   reasoningContent?: "plaintext" | "encrypted";
+  /** The model's prompt-cache attribute; `false` turns Anthropic breakpoints off. */
+  promptCache?: boolean;
+  /** The per-step system-prompt tail, the Anthropic dialect's cache boundary. */
+  systemDynamic?: string;
 }
 
 /** Provider instance and language model used by this request. `provider` supplies
@@ -105,12 +109,17 @@ export function resolveModel(target: ProviderTarget): ResolvedModel {
     case "anthropic": {
       // Normalize compatible endpoints that wrap server-search error objects in an
       // array, and rewrite adaptive thinking into an explicit budget for endpoints
-      // that silently drop it. Both are no-ops for official Anthropic.
+      // that silently drop it. Both are no-ops for official Anthropic. The cache
+      // directives are per request, which is why the wrapper is built here rather
+      // than shared across requests.
       const provider = createAnthropic({
         baseURL: base,
         apiKey,
         headers,
-        fetch: anthropicDialectFetch(base),
+        fetch: anthropicDialectFetch(base, globalThis.fetch, {
+          enabled: target.promptCache,
+          systemDynamic: target.systemDynamic,
+        }),
       });
       return { model: provider(modelId), provider };
     }

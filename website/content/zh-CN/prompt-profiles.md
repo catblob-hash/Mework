@@ -8,7 +8,7 @@ Mework 本身向模型说出的所有内容——列出你的 MCP 服务器的�
 
 | 档案 | Id | 说明 |
 |---|---|---|
-| Mework 内置（英语） | `tooldesc_builtin_en_us` | 硬编码的默认值。未选择任何档案的对话会使用此档案。 |
+| Mework 内置（英语） | `tooldesc_builtin_en_us` | 默认值，由 `src-tauri/prompt-profiles/en-US.json` 编译而来。未选择任何档案的对话会使用此档案。 |
 | Mework 内置（中文） | `tooldesc_builtin_zh_cn` | 相同的文件格式，但所有文本均为中文，由 `src-tauri/prompt-profiles/zh-CN.json` 编译而来。 |
 
 你自己的文件会添加第三种档案。它们可以覆盖注册表中的任意子集，其余内容则回退到内置档案。
@@ -131,6 +131,6 @@ Mework 会扫描两个目录中的 `*.json` 文件（会忽略符号链接）：
 
 ## 键参考 {#key-reference}
 
-由 `src-tauri/src/prompt_profile.rs` 生成。英语列是硬编码的默认值；中文列是内置中文档案。
+由 `src-tauri/src/prompt_profile.rs` 生成。英语列是内置英语档案；中文列是内置中文档案。
 
 {{PROMPT_KEYS_TABLE}}

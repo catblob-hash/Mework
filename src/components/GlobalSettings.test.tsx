@@ -42,6 +42,7 @@ function model(id: string, overrides: Partial<ModelProfile> = {}): ModelProfile 
     group: "",
     capabilities: [],
     reasoningContent: "encrypted",
+    promptCache: true,
     ...overrides
   };
 }

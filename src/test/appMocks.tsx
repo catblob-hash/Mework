@@ -48,7 +48,8 @@ export const model: ModelProfile = {
   name: "",
   group: "",
   capabilities: [],
-  reasoningContent: "encrypted"
+  reasoningContent: "encrypted",
+  promptCache: true
 };
 
 export function documentWithModel(): AppDocument {
@@ -324,8 +325,8 @@ export function resetAppMocks() {
   runtimeMocks.listPendingToolPrompts.mockReset().mockResolvedValue([]);
   runtimeMocks.listPendingForkRequests.mockReset().mockResolvedValue([]);
   runtimeMocks.listPendingForkStarts.mockReset().mockResolvedValue([]);
+  runtimeMocks.listForkDecisions.mockReset().mockResolvedValue([]);
   runtimeMocks.loadConversationPlan.mockReset().mockResolvedValue(null);
-  runtimeMocks.workflowRunHistory.mockReset().mockResolvedValue([]);
   runtimeMocks.workflowStepRecord.mockReset().mockResolvedValue(null);
   runtimeMocks.resolveForkRequest.mockReset().mockResolvedValue(null);
   runtimeMocks.takeRunSettlement.mockReset().mockResolvedValue(null);

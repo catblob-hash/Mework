@@ -122,9 +122,8 @@ pub enum AppPushEvent {
         prompt_id: String,
         approved: bool,
     },
-    /// The model called `fork` in a conversation whose security level does not
-    /// delegate the decision. The tool call has already returned; this card is
-    /// the whole of what asks the user, so it takes the push channel however
+    /// The model called `fork`. The tool call has already returned; this card
+    /// is the whole of what asks the user, so it takes the push channel however
     /// the run is doing, and `list_pending_fork_requests` re-lists it after a
     /// reload. Flattened for the same reason as `ToolApprovalRequested`: one
     /// card shape on every path.
@@ -132,10 +131,12 @@ pub enum AppPushEvent {
         #[serde(flatten)]
         request: crate::fork_requests::PendingForkRequest,
     },
-    /// A fork request is over: answered by the user, created outright under
-    /// full access, or retracted because its source conversation went away.
+    /// A fork request is over: answered by the user, or retracted because its
+    /// source conversation went away.
     /// `child_conversation_id` is set exactly when a child was created; the
-    /// renderer loads that conversation and starts its first run.
+    /// renderer loads that conversation and starts its first run. `decision`
+    /// carries the durable record the task bar draws, and is absent on a
+    /// retraction, which decides nothing.
     #[serde(rename_all = "camelCase")]
     ForkResolved {
         fork_id: String,
@@ -143,6 +144,8 @@ pub enum AppPushEvent {
         source_conversation_id: String,
         approved: bool,
         child_conversation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<crate::fork_requests::ForkDecisionRecord>,
     },
     /// The host moved a conversation to a different security level — plan
     /// approval is the only source today. The renderer's composer menu shows a
@@ -509,12 +512,37 @@ mod tests {
             source_conversation_id: "conv-1".into(),
             approved: true,
             child_conversation_id: Some("conv-2".into()),
+            decision: None,
         };
         let wire = serde_json::to_value(&resolved).unwrap();
         assert_eq!(wire["type"], "forkResolved");
         assert_eq!(wire["forkId"], "fork-1");
         assert_eq!(wire["approved"], true);
         assert_eq!(wire["childConversationId"], "conv-2");
+        assert!(wire.get("decision").is_none(), "撤回不携带决定：{wire}");
         assert_eq!(resolved.conversation(), Some("conv-1"));
+
+        let decided = AppPushEvent::ForkResolved {
+            fork_id: "fork-1".into(),
+            workspace_id: "ws-1".into(),
+            source_conversation_id: "conv-1".into(),
+            approved: true,
+            child_conversation_id: Some("conv-2".into()),
+            decision: Some(crate::fork_requests::ForkDecisionRecord {
+                fork_id: "fork-1".into(),
+                workspace_id: "ws-1".into(),
+                source_conversation_id: "conv-1".into(),
+                title: "继续做 B".into(),
+                prompt: "继续做 B".into(),
+                inherit_context: false,
+                requested_at: "2026-09-05T00:00:00Z".into(),
+                decided_at: "2026-09-05T00:01:00Z".into(),
+                approved: true,
+                child_conversation_id: Some("conv-2".into()),
+            }),
+        };
+        let wire = serde_json::to_value(&decided).unwrap();
+        assert_eq!(wire["decision"]["inheritContext"], false);
+        assert_eq!(wire["decision"]["childConversationId"], "conv-2");
     }
 }

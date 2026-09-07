@@ -311,7 +311,10 @@ pub fn classify_model_call(
         // mutates nothing that outlives the turn. `skill` belongs here for the
         // same shape of reason: the body it returns was read from disk by the
         // trusted request builder before the turn started, so the call itself
-        // touches nothing — it is a lookup in host memory.
+        // touches nothing — it is a lookup in host memory. `fork` classifies as
+        // low for a third reason: it creates nothing. At every access level,
+        // full access included, it only raises a card, and the user's answer on
+        // that card — not this classification — is what may create a child.
         "ask_user" | "task_wait" | "task_list" | "send_message" | "structured_output" | "skill"
         | "fork" | "read_global_memory" | "read_project_memory" | "exit_plan_mode"
         | "enter_plan_mode" => Some(internal_decision(

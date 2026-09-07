@@ -2,10 +2,11 @@
 //!
 //! `fork` is the one tool whose effect is another conversation. The call
 //! itself never waits: it raises a request and returns a receipt that says so,
-//! and the model is never told what became of it. What happens next depends
-//! on the conversation's security level — full access creates the child at
-//! once; every other level puts a non-blocking card in the renderer's tray,
-//! where the user approves or denies at leisure.
+//! and the model is never told what became of it. The decision is the user's at
+//! every security level, full access included — the request becomes a
+//! non-blocking card in the renderer's tray, where it is approved or denied at
+//! leisure. An answered card leaves a [`ForkDecisionRecord`] the source
+//! conversation's task bar draws; the model never sees that either.
 //!
 //! The child is a full conversation, not a task. It inherits the parent's
 //! `settings` verbatim (so it holds exactly the parent's permissions), its
@@ -15,7 +16,8 @@
 //! concept: the only durable link is `parent_conversation_id`.
 //!
 //! Requests are process-local like approval cards: a restart forgets them, and
-//! a card nobody answers expires after [`REQUEST_TTL`].
+//! a card nobody answers expires after [`REQUEST_TTL`]. The decisions they
+//! produce are not: those live in the conversation store.
 
 use std::{
     collections::HashMap,
@@ -30,7 +32,7 @@ use serde_json::Value;
 
 use crate::{
     conversation_fork::{fork_contexts, ForkRequest},
-    model::{ContextItem, Conversation, JsonObject, RunModelRequest, SecurityLevel},
+    model::{ContextItem, Conversation, JsonObject, RunModelRequest},
     prompt_profile::PromptKey,
     push_events::AppPushEvent,
     state::AppState,
@@ -65,6 +67,31 @@ pub struct PendingForkRequest {
     pub prompt: String,
     pub inherit_context: bool,
     pub requested_at: String,
+}
+
+/// One answered request, as the conversation store keeps it.
+///
+/// Model-invisible by construction: `fork` returns before the user decides, so
+/// no receipt, task list or context can carry this. It exists so the user can
+/// see in the source conversation's task bar what they answered, and so an
+/// approved fork stays clickable after a reload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkDecisionRecord {
+    pub fork_id: String,
+    pub workspace_id: String,
+    pub source_conversation_id: String,
+    /// The title [`fork_title`] gives the child, computed even when the request
+    /// was declined so a refused row reads like the conversation it would have
+    /// been.
+    pub title: String,
+    pub prompt: String,
+    pub inherit_context: bool,
+    pub requested_at: String,
+    pub decided_at: String,
+    pub approved: bool,
+    /// Set exactly when the decision created a child.
+    pub child_conversation_id: Option<String>,
 }
 
 /// The host-side half of a request: what `perform_fork` needs beyond the card
@@ -176,7 +203,9 @@ impl ForkRequestRegistry {
 }
 
 /// The two arguments, validated. Separate from the tool body so the rules are
-/// testable without a run request.
+/// testable without a run request. `inherit_context` is optional: absent means
+/// false, so a child that was not explicitly given history starts with only the
+/// prompt.
 fn parse_fork_arguments(input: &JsonObject) -> Result<(String, bool), String> {
     let prompt = input
         .get("prompt")
@@ -189,17 +218,20 @@ fn parse_fork_arguments(input: &JsonObject) -> Result<(String, bool), String> {
             "fork `prompt` exceeds {MAX_PROMPT_CHARS} characters"
         ));
     }
-    let inherit_context = input
-        .get("inherit_context")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| "fork requires a boolean `inherit_context`".to_owned())?;
+    let inherit_context = match input.get("inherit_context") {
+        None | Some(Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "fork `inherit_context` must be a boolean".to_owned())?,
+    };
     Ok((prompt.to_owned(), inherit_context))
 }
 
-/// The `fork` tool body: validates the arguments, opens the request and either
-/// performs it (full access) or hands the card to the tray. Returns the
-/// receipt text the model reads; both receipts say that nothing further will
-/// be delivered, because nothing will.
+/// The `fork` tool body: validates the arguments, opens the request and hands
+/// the card to the tray. It never creates anything itself — the decision is the
+/// user's at every access level, full access included — so there is one
+/// receipt, and it says that nothing further will be delivered, because nothing
+/// will.
 pub fn run_fork_tool(
     request: &RunModelRequest,
     state: &AppState,
@@ -238,26 +270,6 @@ pub fn run_fork_tool(
         },
     )?;
 
-    if request.effective_security_level() == SecurityLevel::FullAccess {
-        // Full access means the user delegated this class of decision. Take
-        // the entry back out so a stale card can never be answered twice.
-        let Some((card, spec)) = state.fork_requests().take(&card.fork_id) else {
-            return Err("The fork request vanished before it could be performed".into());
-        };
-        let child = perform_fork(state, &anchor, &card, &spec)?;
-        state.push_events.publish(AppPushEvent::ForkResolved {
-            fork_id: card.fork_id,
-            workspace_id: card.workspace_id,
-            source_conversation_id: card.source_conversation_id,
-            approved: true,
-            child_conversation_id: Some(child.id),
-        });
-        return Ok(request
-            .prompt_profile
-            .text(PromptKey::ForkCreatedAutomatically)
-            .to_owned());
-    }
-
     state
         .push_events
         .publish(AppPushEvent::ForkRequested { request: card });
@@ -268,8 +280,9 @@ pub fn run_fork_tool(
 }
 
 /// Answers a request on the user's behalf: performs it when approved, drops it
-/// otherwise, and publishes the outcome either way so every renderer surface
-/// takes the card down. Returns the child when one was created.
+/// otherwise, records the decision either way and publishes the outcome so
+/// every renderer surface takes the card down. Returns the child when one was
+/// created.
 pub fn resolve_fork_request(
     state: &AppState,
     anchor: &Path,
@@ -285,17 +298,45 @@ pub fn resolve_fork_request(
     } else {
         None
     };
+    let record = ForkDecisionRecord {
+        fork_id: card.fork_id.clone(),
+        workspace_id: card.workspace_id.clone(),
+        source_conversation_id: card.source_conversation_id.clone(),
+        title: fork_title(&card.prompt),
+        prompt: card.prompt.clone(),
+        inherit_context: card.inherit_context,
+        requested_at: card.requested_at.clone(),
+        decided_at: Utc::now().to_rfc3339(),
+        approved,
+        child_conversation_id: child.as_ref().map(|child| child.id.clone()),
+    };
+    if let Err(error) =
+        crate::conversations::store(anchor).and_then(|store| store.record_fork_decision(&record))
+    {
+        // An approved fork already committed its child. Failing here would
+        // report the decision as not taken and invite a second request; the
+        // event below still carries the record, so the task bar shows it until
+        // the next reload.
+        state.push_events.publish(AppPushEvent::DocumentWriteFailure {
+            message: format!(
+                "分叉决定未能记录 / Fork decision was not recorded: {error}"
+            ),
+        });
+    }
     state.push_events.publish(AppPushEvent::ForkResolved {
         fork_id: card.fork_id,
         workspace_id: card.workspace_id,
         source_conversation_id: card.source_conversation_id,
         approved,
         child_conversation_id: child.as_ref().map(|child| child.id.clone()),
+        decision: Some(record),
     });
     Ok(child)
 }
 
-/// Retracts every open request of a conversation that is being deleted.
+/// Retracts every open request of a conversation that is being deleted. Nothing
+/// is recorded: the user decided nothing, and the row would name a conversation
+/// that no longer exists.
 pub fn retract_requests_for_conversation(state: &AppState, conversation_id: &str) {
     for card in state
         .fork_requests()
@@ -307,6 +348,7 @@ pub fn retract_requests_for_conversation(state: &AppState, conversation_id: &str
             source_conversation_id: card.source_conversation_id,
             approved: false,
             child_conversation_id: None,
+            decision: None,
         });
     }
 }
@@ -620,21 +662,262 @@ mod tests {
         let error = parse_fork_arguments(&input).unwrap_err();
         assert!(error.contains("prompt"), "{error}");
 
+        // The child starts clean unless the model asked for history.
         input.insert("prompt".into(), json!("do it"));
         input.remove("inherit_context");
-        let error = parse_fork_arguments(&input).unwrap_err();
-        assert!(error.contains("inherit_context"), "{error}");
-
-        input.insert("inherit_context".into(), json!("yes"));
-        assert!(parse_fork_arguments(&input).is_err(), "a string is not a boolean");
-
-        input.insert("inherit_context".into(), json!(false));
         assert_eq!(
             parse_fork_arguments(&input).unwrap(),
             ("do it".to_owned(), false)
         );
 
+        input.insert("inherit_context".into(), json!("yes"));
+        assert!(parse_fork_arguments(&input).is_err(), "a string is not a boolean");
+
+        input.insert("inherit_context".into(), json!(true));
+        assert_eq!(
+            parse_fork_arguments(&input).unwrap(),
+            ("do it".to_owned(), true)
+        );
+
         input.insert("prompt".into(), json!("x".repeat(MAX_PROMPT_CHARS + 1)));
         assert!(parse_fork_arguments(&input).is_err());
+    }
+
+    /// A main-agent run at full access, pointed at a seeded store.
+    fn fork_run_request(
+        directory: &Path,
+        workspace: &crate::model::Workspace,
+        conversation_id: &str,
+    ) -> RunModelRequest {
+        RunModelRequest {
+            provider: crate::model::ApiProvider {
+                id: "p".into(),
+                name: "P".into(),
+                enabled: true,
+                family: crate::model::ProviderFamily::OpenaiResponses,
+                base_url: "http://127.0.0.1:1".into(),
+                family_settings: Default::default(),
+                endpoint_base_urls: Default::default(),
+                notes: String::new(),
+                models: Vec::new(),
+                active_model_id: None,
+            },
+            web_search: Default::default(),
+            native_search_call: false,
+            run_environment: Default::default(),
+            prompt_profile: Default::default(),
+            global_memory_enabled: false,
+            project_memory_enabled: false,
+            skills: Vec::new(),
+            model: crate::model::ModelProfile {
+                id: "m".into(),
+                name: String::new(),
+                group: String::new(),
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: Default::default(),
+                reasoning_content: Default::default(),
+                prompt_cache: true,
+            },
+            reasoning_effort: Default::default(),
+            conversation_id: conversation_id.to_owned(),
+            workspace_id: workspace.id.clone(),
+            memory_context_id: None,
+            project_memory_context_id: None,
+            agent_definition_binding: None,
+            inherits_parent_model_memory: false,
+            fork_model_binding: None,
+            subagent_execution_mode_receipt: None,
+            subagent_reserved_names: Vec::new(),
+            memory_run_id: None,
+            context_load_actor_name: None,
+            workspace_path: workspace.path.clone(),
+            system_prompt: String::new(),
+            enabled_tools: vec![FORK_TOOL.to_owned()],
+            contexts: Vec::new(),
+            ephemeral_contexts: Vec::new(),
+            tools: Vec::new(),
+            active_hooks: Vec::new(),
+            security_level: crate::model::SecurityLevel::FullAccess,
+            live_security_level: None,
+            app_data_path: directory.to_string_lossy().into_owned(),
+            mcp_servers: Vec::new(),
+            mcp_bindings: Vec::new(),
+            subagent_depth: 0,
+            request_id: String::new(),
+            subagent_name: None,
+            subagent_call_id: None,
+            agent_mailbox: Default::default(),
+            steer_mailbox: Default::default(),
+            task_cancel: crate::cancel::CancelSignal::default(),
+            run_cancel: crate::cancel::CancelSignal::default(),
+            output_schema: None,
+        }
+    }
+
+    /// Collects every push event the hub delivers while the test runs.
+    fn collecting_events() -> (
+        tauri::ipc::Channel<AppPushEvent>,
+        std::sync::Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            let value = match body {
+                tauri::ipc::InvokeResponseBody::Json(json) => serde_json::from_str(&json)?,
+                tauri::ipc::InvokeResponseBody::Raw(bytes) => serde_json::to_value(bytes)?,
+            };
+            sink.lock().unwrap().push(value);
+            Ok(())
+        });
+        (channel, received)
+    }
+
+    /// Full access delegates tool execution, not this decision: the card is the
+    /// gate at every level, and the receipt is the same one every level returns.
+    #[test]
+    fn full_access_raises_a_card_instead_of_creating_the_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, source) = seeded(directory.path());
+        let document = default_document(directory.path());
+        let (channel, events) = collecting_events();
+        state.push_events.subscribe(channel);
+
+        let request = fork_run_request(directory.path(), &document.workspaces[0], &source.id);
+        assert_eq!(
+            request.effective_security_level(),
+            crate::model::SecurityLevel::FullAccess
+        );
+        let mut input = JsonObject::new();
+        input.insert("prompt".into(), json!("继续做 B"));
+        let receipt = run_fork_tool(&request, &state, &input).unwrap();
+
+        // The one receipt, read from the profile the run carries rather than
+        // spelled twice.
+        assert_eq!(
+            receipt,
+            crate::prompt_profile::PromptProfile::builtin_english()
+                .text(PromptKey::ForkRequestSubmitted)
+        );
+
+        let pending = state.fork_requests().pending_cards();
+        assert_eq!(pending.len(), 1, "the card is waiting for the user");
+        assert_eq!(pending[0].source_conversation_id, source.id);
+        assert!(!pending[0].inherit_context, "an absent argument is false");
+
+        let published = events.lock().unwrap();
+        assert_eq!(published.len(), 1, "one event: {published:?}");
+        assert_eq!(published[0]["type"], "forkRequested");
+        drop(published);
+
+        // Nothing was created: no child intent, no decision.
+        let store = crate::conversations::store(&anchor).unwrap();
+        assert!(store.pending_fork_starts().unwrap().is_empty());
+        assert!(store.fork_decisions(&source.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn approving_records_the_decision_with_the_child_it_created() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, source) = seeded(directory.path());
+        let document = default_document(directory.path());
+        let opened = state
+            .fork_requests()
+            .open(
+                PendingForkRequest {
+                    workspace_id: document.workspaces[0].id.clone(),
+                    inherit_context: false,
+                    ..card(&source.id)
+                },
+                ForkRequestSpec {
+                    workspace_path: document.workspaces[0].path.clone(),
+                    through_context_id: None,
+                },
+            )
+            .unwrap();
+        let (channel, events) = collecting_events();
+        state.push_events.subscribe(channel);
+
+        let child = resolve_fork_request(&state, &anchor, &opened.fork_id, true)
+            .unwrap()
+            .expect("an approved request creates a child");
+
+        let store = crate::conversations::store(&anchor).unwrap();
+        let recorded = store.fork_decisions(&source.id).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].fork_id, opened.fork_id);
+        assert!(recorded[0].approved);
+        assert_eq!(recorded[0].title, "继续做 B");
+        assert_eq!(recorded[0].prompt, "继续做 B");
+        assert!(!recorded[0].inherit_context);
+        assert_eq!(recorded[0].requested_at, opened.requested_at);
+        assert_eq!(recorded[0].child_conversation_id.as_deref(), Some(child.id.as_str()));
+
+        let published = events.lock().unwrap();
+        let resolved = published
+            .iter()
+            .find(|event| event["type"] == "forkResolved")
+            .expect("the outcome is published");
+        assert_eq!(resolved["decision"]["approved"], true);
+        assert_eq!(resolved["decision"]["childConversationId"], child.id);
+    }
+
+    #[test]
+    fn declining_records_the_refusal_and_creates_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, source) = seeded(directory.path());
+        let document = default_document(directory.path());
+        let opened = state
+            .fork_requests()
+            .open(
+                PendingForkRequest {
+                    workspace_id: document.workspaces[0].id.clone(),
+                    ..card(&source.id)
+                },
+                spec(),
+            )
+            .unwrap();
+
+        assert!(resolve_fork_request(&state, &anchor, &opened.fork_id, false)
+            .unwrap()
+            .is_none());
+
+        let store = crate::conversations::store(&anchor).unwrap();
+        let recorded = store.fork_decisions(&source.id).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].approved);
+        assert_eq!(recorded[0].child_conversation_id, None);
+        assert!(store.pending_fork_starts().unwrap().is_empty());
+    }
+
+    /// A retraction is not an answer: the source conversation is going away, so
+    /// there is nothing for its task bar to show and nothing to record.
+    #[test]
+    fn retracting_records_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, source) = seeded(directory.path());
+        let document = default_document(directory.path());
+        state
+            .fork_requests()
+            .open(
+                PendingForkRequest {
+                    workspace_id: document.workspaces[0].id.clone(),
+                    ..card(&source.id)
+                },
+                spec(),
+            )
+            .unwrap();
+        let (channel, events) = collecting_events();
+        state.push_events.subscribe(channel);
+
+        retract_requests_for_conversation(&state, &source.id);
+
+        let store = crate::conversations::store(&anchor).unwrap();
+        assert!(store.fork_decisions(&source.id).unwrap().is_empty());
+        let published = events.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0]["type"], "forkResolved");
+        assert_eq!(published[0]["approved"], false);
+        assert!(published[0].get("decision").is_none(), "{:?}", published[0]);
     }
 }

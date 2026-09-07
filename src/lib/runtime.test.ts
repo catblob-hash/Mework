@@ -1370,6 +1370,29 @@ describe("document normalization", () => {
     expect(normalized.globalSettings.apiProviders[0].models.map((model) => model.id)).toEqual(["model-a", "model-b"]);
     expect(normalized.globalSettings.apiProviders[0].models[0].capabilities).toEqual(["image_recognition"]);
     expect(normalized.globalSettings.apiProviders[0].activeModelId).toBe("model-a");
+    // The rows above predate `promptCache`; a document from before the key
+    // existed loads with Claude Code's default rather than an undefined hole.
+    expect(normalized.globalSettings.apiProviders[0].models.map((model) => model.promptCache)).toEqual([true, true]);
+  });
+
+  it("keeps a curated promptCache: false through document normalization", () => {
+    const source = createSeedDocument() as unknown as Record<string, unknown>;
+    const settings = { ...(source.globalSettings as Record<string, unknown>) };
+    const providers = settings.apiProviders as Array<Record<string, unknown>>;
+    settings.apiProviders = [
+      {
+        ...providers[0],
+        models: [
+          { id: "off", name: "", group: "", capabilities: [], promptCache: false },
+          { id: "malformed", name: "", group: "", capabilities: [], promptCache: "off" }
+        ],
+        activeModelId: "off"
+      }
+    ];
+    source.globalSettings = settings;
+    const normalized = normalizeDocument(source);
+    expect(normalized.globalSettings.apiProviders[0].models.map((model) => [model.id, model.promptCache]))
+      .toEqual([["off", false], ["malformed", true]]);
   });
 
   it("adds only the built-in providers to document-carried user entries", () => {
@@ -1420,7 +1443,8 @@ describe("document normalization", () => {
       name: "",
       group: "",
       capabilities: [],
-      reasoningContent: "encrypted"
+      reasoningContent: "encrypted",
+      promptCache: true
     };
     const response = {
       contexts: [],
@@ -1474,6 +1498,8 @@ describe("document normalization", () => {
     // Discovery resolves the protocol default rather than leaving it deferred:
     // this seed provider is the Responses family.
     expect(models[0].reasoningContent).toBe("encrypted");
+    // A discovered model starts with prompt caching on, like Claude Code.
+    expect(models[0].promptCache).toBe(true);
     expect(tauriMocks.invoke).toHaveBeenCalledWith("fetch_models", { provider });
   });
 

@@ -1163,7 +1163,7 @@
       "name": "agent_spawn",
       "schema": {
         "additionalProperties": false,
-        "description": "Spawn a background child agent in this workspace and return its name immediately. The child sees only the task (context=conversation attaches a history copy), can use this conversation's file, command and browser tools, and cannot spawn children or ask the user. Children keep running after this turn ends: a child finishing while the conversation is idle starts a fresh turn to deliver its result. Collect updates and results with task_wait; followup_task can continue a finished child.",
+        "description": "Spawn a background child agent in this workspace; the call returns as soon as the child is dispatched and you address it by the `name` you chose. Delegate when the work would fill this conversation with material you will not need again — broad searches, open-ended questions, independent strands you can run side by side — and do it yourself when you already know the file, the symbol or the command. The child sees only the task (context=conversation attaches a history copy), can use this conversation's file, command and browser tools, and cannot spawn children or ask the user. Children keep running after this turn ends: a child finishing while the conversation is idle starts a fresh turn to deliver its result. Collect updates and results with task_wait; followup_task can continue a finished child. Until a result reaches you, you know nothing about what a child found — say it is still running rather than guessing, and do not redo work you have already delegated.",
         "not": {
           "allOf": [
             {
@@ -1521,7 +1521,7 @@
       "name": "workflow",
       "schema": {
         "additionalProperties": false,
-        "description": "Run a JavaScript orchestration script that spawns subagents deterministically, as a background task: the call returns the task address (workflow:<runId>) immediately and the script's return value is collected with task_wait or delivered automatically — starting a fresh turn to wake you if the conversation is idle. The script needs one user approval up front. Workflows keep running after this turn ends; completed steps stay journaled and resume_run_id replays them instantly on the next run.",
+        "description": "Run a JavaScript orchestration script that spawns subagents deterministically, as a background task: the call returns the task address (workflow:<runId>) immediately and the script's return value is collected with task_wait or delivered automatically — starting a fresh turn to wake you if the conversation is idle. Reach for it when the fan-out has a shape you can write down — the same treatment applied over a list, stages that feed one another, a fixed set of independent checks — and use agent_spawn when one delegated job is enough or when what to do next depends on what comes back. Below full access the script needs one user approval up front. Workflows keep running after this turn ends; completed steps stay journaled and resume_run_id replays them instantly on the next run.",
         "properties": {
           "args": {
             "description": "JSON value exposed to the script as the global `args`. Pass arrays and objects directly (at most 4,096 items per array), not as encoded strings."
@@ -1852,22 +1852,22 @@
       "name": "fork",
       "schema": {
         "additionalProperties": false,
-        "description": "Fork this conversation into a separate child conversation that runs on its own with the same permissions as this one. `prompt` becomes the child's first user message; `inherit_context` true copies the timeline so far (and the completed tasks) into the child, false starts it with only the prompt. The call raises a request and returns immediately: under full access the child is created at once, otherwise the user decides on a non-blocking card. You are never told whether it was approved — do not wait for it, and do not repeat the call.",
+        "description": "Fork this conversation into a separate child conversation that runs on its own with the same permissions as this one. `prompt` becomes the child's first user message; by default the child starts with only that prompt, and `inherit_context: true` copies the timeline so far (and the completed tasks) into it as well. Fork to hand a whole job to a conversation the user will follow separately — never to obtain an answer for yourself: nothing the child produces comes back here, and the child is a full conversation of its own that can spawn child agents, run workflows and fork again. When you need the result, use agent_spawn or workflow instead. The call raises a request and returns immediately; at every access level the user decides on a non-blocking card, so a fork is never created automatically and the request never blocks you. You are never told the outcome and the child may never exist: do not wait for it, do not repeat the call, and never describe its work as begun, running or done.",
         "properties": {
           "inherit_context": {
-            "description": "true copies this conversation's timeline so far and its completed tasks into the child; false starts the child with only the prompt.",
+            "default": false,
+            "description": "Optional, default false: the child starts with only the prompt. true copies this conversation's timeline so far and its completed tasks into the child as well. Inherit when the job continues this conversation's thread; start clean when it does not, so the child is not steered by history it has no use for.",
             "type": "boolean"
           },
           "prompt": {
-            "description": "First user message of the forked conversation. State the task and every piece of background it needs, because a child without inherited context sees nothing else.",
+            "description": "First user message of the forked conversation, and the only instruction you will ever give it — there is no channel for a correction afterwards. State the task and every piece of background it needs: unless inherit_context is true, the child sees nothing else.",
             "maxLength": 32768,
             "minLength": 1,
             "type": "string"
           }
         },
         "required": [
-          "prompt",
-          "inherit_context"
+          "prompt"
         ],
         "type": "object"
       }

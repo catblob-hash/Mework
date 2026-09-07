@@ -563,76 +563,6 @@ pub fn read_step_record(
     }
 }
 
-/// Read-only recovery index. It never creates directories, claims notifications or resumes tasks.
-pub fn list_run_history(app_data_path: &Path, conversation_id: &str) -> Result<Vec<Value>, String> {
-    validate_path_component("会话 id", conversation_id)?;
-    let root = app_data_path.join(RUNS_DIRECTORY);
-    let conversation = root.join(conversation_id);
-    if !history_directory(&root) || !history_directory(&conversation) { return Ok(Vec::new()); }
-    let entries = fs::read_dir(&conversation).map_err(|error| format!("无法读取工作流历史：{error}"))?;
-    let mut runs = Vec::new();
-    for entry in entries.flatten() {
-        let run_id = entry.file_name().to_string_lossy().into_owned();
-        if validate_path_component("运行 id", &run_id).is_err() || !history_directory(&entry.path()) { continue; }
-        let directory = entry.path();
-        let manifest = history_json(&directory.join(MANIFEST_FILE)).unwrap_or(Value::Null);
-        if manifest.get("runId").and_then(Value::as_str).is_some_and(|id| id != run_id) { continue; }
-        let mut steps = BTreeMap::<u32, Value>::new();
-        if let Some(rows) = manifest.get("steps").and_then(Value::as_array) {
-            for row in rows {
-                if let Some(index) = row.get("index").and_then(Value::as_u64).and_then(|index| u32::try_from(index).ok()) {
-                    steps.entry(index).or_insert_with(|| row.clone());
-                }
-            }
-        }
-        let step_directory = directory.join(STEPS_DIRECTORY);
-        if history_directory(&step_directory) {
-            if let Ok(entries) = fs::read_dir(&step_directory) {
-                for entry in entries.flatten() {
-                    let filename = entry.file_name().to_string_lossy().into_owned();
-                    if let Some(index) = filename.strip_suffix(".json").and_then(|index| index.parse::<u32>().ok()) {
-                        if filename == format!("{index}.json") { steps.entry(index).or_insert(Value::Null); }
-                    }
-                }
-            }
-        }
-        if manifest.is_null() && steps.is_empty() { continue; }
-        let rows = steps.into_iter().map(|(index, step)| {
-            let record = if history_directory(&step_directory) {
-                history_json(&step_directory.join(format!("{index}.json")))
-                    .filter(|record| serde_json::from_value::<crate::model::SubagentRunRecord>(record.clone()).is_ok())
-            } else { None };
-            let error = step.get("error").and_then(Value::as_str);
-            let status = record.as_ref().and_then(|record| record.get("status")).and_then(Value::as_str);
-            let state = if step.get("cached").and_then(Value::as_bool) == Some(true) { "cached" }
-                else if error.is_some() || matches!(status, Some("failed" | "stopped" | "interrupted" | "roundLimit")) { "failed" }
-                else if status == Some("completed") || step.get("settled").and_then(Value::as_bool) == Some(true) { "completed" }
-                else { "unrecorded" };
-            let label = step.get("label").and_then(Value::as_str)
-                .or_else(|| record.as_ref().and_then(|record| record.get("label")).and_then(Value::as_str))
-                .map(str::to_owned).unwrap_or_else(|| format!("#{}", u64::from(index) + 1));
-            serde_json::json!({"index":index, "label":label, "state":state,
-                "bodyAvailable":record.is_some(), "error":error})
-        }).collect::<Vec<_>>();
-        runs.push(serde_json::json!({"runId":run_id,
-            "scriptName":manifest.get("scriptName").and_then(Value::as_str).unwrap_or(&run_id),
-            "status":manifest.get("status").and_then(Value::as_str).unwrap_or("unknown"),
-            "startedAt":manifest.get("startedAt").and_then(Value::as_str), "steps":rows}));
-    }
-    runs.sort_by(|left, right| left["runId"].as_str().cmp(&right["runId"].as_str()));
-    Ok(runs)
-}
-
-fn history_directory(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-}
-
-fn history_json(path: &Path) -> Option<Value> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 * 1024 { return None; }
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
-}
-
 /// Run records are conversation child data and share the conversation lifecycle.
 ///
 /// Deletes only the complete `workflows/<conversationId>` directory. Never remove individual files:
@@ -1001,60 +931,6 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), expected.repeat(2));
             file.sync_all()
         }).unwrap();
-    }
-
-    #[test]
-    fn cold_history_recovers_sparse_steps_without_context_shells_and_is_read_only() {
-        let directory = tempfile::tempdir().unwrap();
-        let run = store(directory.path());
-        let body = json!({"task":"step", "status":"completed", "contexts":[], "updates":[]});
-        assert!(run.write_step(0, &body));
-        assert!(run.write_step(2, &body));
-        run.write_manifest(&json!({"runId":"run1", "scriptName":"same name", "status":"running", "steps":[
-            {"index":0,"label":"first","settled":true},
-            {"index":1,"label":"cached","cached":true,"settled":true},
-            {"index":2,"label":"third","settled":true},
-            {"index":3,"label":"broken","settled":true,"error":"failed"}
-        ]}));
-        fs::write(run.directory().join("steps/3.json"), b"{").unwrap();
-        let mut document = crate::catalog::default_document(directory.path());
-        document.workspaces[0].conversations[0].id = "conv1".into();
-        assert_eq!(sweep_interrupted_runs(directory.path(), &document).len(), 1);
-        let before = fs::read(run.directory().join(MANIFEST_FILE)).unwrap();
-        let runs = list_run_history(directory.path(), "conv1").unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["status"], "interrupted");
-        assert_eq!(runs[0]["steps"].as_array().unwrap().iter().map(|step| step["index"].as_u64().unwrap()).collect::<Vec<_>>(), vec![0,1,2,3]);
-        assert_eq!(runs[0]["steps"][0]["bodyAvailable"], true);
-        assert_eq!(runs[0]["steps"][1]["state"], "cached");
-        assert_eq!(runs[0]["steps"][1]["bodyAvailable"], false);
-        assert_eq!(runs[0]["steps"][2]["bodyAvailable"], true);
-        assert_eq!(runs[0]["steps"][3]["state"], "failed");
-        assert_eq!(runs[0]["steps"][3]["bodyAvailable"], false);
-        assert_eq!(read_step_record(directory.path(), "conv1", "run1", 2).unwrap(), Some(body));
-        assert_eq!(fs::read(run.directory().join(MANIFEST_FILE)).unwrap(), before, "listing must not claim interruption notices");
-        assert!(list_run_history(directory.path(), "conv_other").unwrap().is_empty());
-        assert!(list_run_history(directory.path(), "../conv1").is_err());
-    }
-
-    #[test]
-    fn history_handles_old_missing_and_corrupt_manifests_without_guessing_indices() {
-        let directory = tempfile::tempdir().unwrap();
-        let run = store(directory.path());
-        let body = json!({"task":"old step", "status":"completed", "contexts":[], "updates":[]});
-        assert!(run.write_step(2, &body));
-        for manifest in [b"{}".as_slice(), b"{"] {
-            fs::write(run.directory().join(MANIFEST_FILE), manifest).unwrap();
-            let runs = list_run_history(directory.path(), "conv1").unwrap();
-            assert_eq!(runs[0]["runId"], "run1");
-            assert_eq!(runs[0]["steps"][0]["index"], 2);
-            assert_eq!(runs[0]["steps"][0]["state"], "completed");
-        }
-        fs::remove_file(run.directory().join(MANIFEST_FILE)).unwrap();
-        assert_eq!(list_run_history(directory.path(), "conv1").unwrap().len(), 1);
-        let other = RunStore::open(directory.path(), "conv1", "run2", b"other").unwrap();
-        other.write_manifest(&json!({"runId":"wrong", "scriptName":"same name", "status":"completed", "steps":[]}));
-        assert_eq!(list_run_history(directory.path(), "conv1").unwrap().len(), 1, "a mismatched manifest cannot claim a directory");
     }
 
     #[test]

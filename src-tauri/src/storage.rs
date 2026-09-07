@@ -29,7 +29,7 @@ use crate::{
 /// newer schema only adds keys with serde defaults, reviewed as such, and naming
 /// its source version as a literal. Fields removed in past schemas must not be
 /// resurrected through serde defaults when this version changes.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 const TEMPORARY_WORKSPACE_ID: &str = "__temporary__";
 const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WEB_SEARCHES_PER_CALL: u32 = 99_999;
@@ -205,9 +205,12 @@ pub fn read_document(path: &Path) -> Result<AppDocument, String> {
             "数据由更新版本写入（schema {original_schema}），当前仅支持 schema {SCHEMA_VERSION}"
         ));
     }
-    // The accepted older format adds only a host-owned SQLite fork-intent table.
-    // Its anchor configuration remains unchanged, so preserve it in place.
-    if original_schema == 1 {
+    // The accepted older formats differ only by additions: schema 1 lacks a
+    // host-owned SQLite fork-intent table, and schema 2 lacks the model
+    // `promptCache` key, which `migrate_persisted_models` fills with its
+    // default below. Their anchor configuration remains unchanged, so preserve
+    // it in place.
+    if original_schema == 1 || original_schema == 2 {
         value["schemaVersion"] = serde_json::json!(SCHEMA_VERSION);
     } else if original_schema < SCHEMA_VERSION {
         return Err(format!(
@@ -567,6 +570,10 @@ fn canonicalize_tool_payload_numbers(document: &mut AppDocument) {
 ///   document rather than skipping the entry — every pre-existing profile would be
 ///   quarantined and rebuilt empty.
 ///
+/// A third key, `promptCache`, is newer than schema 2 and defaults on: an archive
+/// that omits it, or carries a non-boolean, is made concrete here so the saved
+/// document always spells the attribute out.
+///
 /// This runs on the raw JSON because the enums can no longer parse the retired
 /// values, on every load rather than on a schema-version edge, and rewrites
 /// nothing that already holds a surviving value.
@@ -605,14 +612,16 @@ fn migrate_persisted_models(value: &mut serde_json::Value) {
                         .is_ok()
                 });
             }
-            if matches!(
+            if !matches!(
                 model.get("reasoningContent").and_then(serde_json::Value::as_str),
                 Some("plaintext" | "encrypted")
             ) {
-                continue;
+                let resolved = if encrypted { "encrypted" } else { "plaintext" };
+                model.insert("reasoningContent".into(), serde_json::json!(resolved));
             }
-            let resolved = if encrypted { "encrypted" } else { "plaintext" };
-            model.insert("reasoningContent".into(), serde_json::json!(resolved));
+            if !model.get("promptCache").is_some_and(serde_json::Value::is_boolean) {
+                model.insert("promptCache".into(), serde_json::json!(true));
+            }
         }
     }
 }
@@ -3357,6 +3366,24 @@ mod tests {
         provider_id: &str,
         stored: Option<&str>,
     ) -> ModelProfile {
+        load_with_stored_model_key(
+            directory,
+            provider_id,
+            "reasoningContent",
+            stored.map(|value| serde_json::json!(value)),
+            SCHEMA_VERSION,
+        )
+    }
+
+    /// Writes an archive at `schema` whose provider models carry `stored`
+    /// verbatim under `key` (omitting the key entirely for `None`), then loads it.
+    fn load_with_stored_model_key(
+        directory: &Path,
+        provider_id: &str,
+        key: &str,
+        stored: Option<serde_json::Value>,
+        schema: u32,
+    ) -> ModelProfile {
         let mut document = default_document(Path::new("."));
         let provider = document
             .assets
@@ -3373,15 +3400,16 @@ mod tests {
         // the two shapes this migration exists for.
         let mut anchor: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        anchor["schemaVersion"] = serde_json::json!(schema);
         for provider in anchor["assets"]["apiProviders"].as_array_mut().unwrap() {
             for model in provider["models"].as_array_mut().unwrap() {
                 let model = model.as_object_mut().unwrap();
-                match stored {
+                match &stored {
                     Some(value) => {
-                        model.insert("reasoningContent".into(), serde_json::json!(value));
+                        model.insert(key.into(), value.clone());
                     }
                     None => {
-                        model.remove("reasoningContent");
+                        model.remove(key);
                     }
                 }
             }
@@ -3401,6 +3429,32 @@ mod tests {
             .unwrap()
             .models[0]
             .clone()
+    }
+
+    /// `promptCache` is newer than schema 2. A schema-2 archive that never had
+    /// the key, or a hand-edited one carrying a non-boolean, loads as enabled —
+    /// the default Claude Code applies — while an explicit `false` is the user's
+    /// choice and survives. The family plays no part: a boolean has no
+    /// family-derived default.
+    #[test]
+    fn an_archive_without_a_prompt_cache_flag_loads_as_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let cases: [(&str, Option<serde_json::Value>, u32, bool); 5] = [
+            ("missing-2", None, 2, true),
+            ("missing-3", None, SCHEMA_VERSION, true),
+            ("string", Some(serde_json::json!("yes")), SCHEMA_VERSION, true),
+            ("false", Some(serde_json::json!(false)), 2, false),
+            ("true", Some(serde_json::json!(true)), SCHEMA_VERSION, true),
+        ];
+        for (name, stored, schema, expected) in cases {
+            for provider_id in ["anthropic_messages", "openai_chat"] {
+                let case = directory.path().join(format!("{name}-{provider_id}"));
+                std::fs::create_dir_all(&case).unwrap();
+                let model =
+                    load_with_stored_model_key(&case, provider_id, "promptCache", stored.clone(), schema);
+                assert_eq!(model.prompt_cache, expected, "{name} on {provider_id}");
+            }
+        }
     }
 
     /// `reasoningContent` used to be omissible and to have an `auto` variant that
@@ -3589,6 +3643,7 @@ mod tests {
             max_output_tokens: None,
             capabilities: Default::default(),
             reasoning_content: Default::default(),
+            prompt_cache: true,
         }
     }
 
@@ -5102,24 +5157,27 @@ b".to_owned())].into());
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 
-    /// The accepted older anchor shape preserves configuration when the
-    /// host-owned fork-intent table is added.
+    /// The accepted older anchor shapes preserve configuration: schema 1 gains
+    /// only the host-owned fork-intent table, schema 2 only the model
+    /// `promptCache` key with its default.
     #[test]
-    fn released_schema_one_preserves_configuration_for_fork_recovery() {
-        assert_eq!(SCHEMA_VERSION, 2, "抬版本时重新判断要不要就地迁移");
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("document.json");
-        let mut document = default_document(directory.path());
-        document.assets.web_search.max_results = 42;
-        let mut value = serde_json::to_value(&document).unwrap();
-        value["schemaVersion"] = serde_json::json!(1);
-        let original = serde_json::to_vec_pretty(&value).unwrap();
-        fs::write(&path, &original).unwrap();
+    fn released_older_schemas_preserve_configuration_in_place() {
+        assert_eq!(SCHEMA_VERSION, 3, "抬版本时重新判断要不要就地迁移");
+        for older in [1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("document.json");
+            let mut document = default_document(directory.path());
+            document.assets.web_search.max_results = 42;
+            let mut value = serde_json::to_value(&document).unwrap();
+            value["schemaVersion"] = serde_json::json!(older);
+            let original = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&path, &original).unwrap();
 
-        let restored = load_or_initialize(&path, directory.path()).unwrap();
-        assert_eq!(restored.schema_version, 2);
-        assert_eq!(restored.assets.web_search.max_results, 42);
-        assert_eq!(fs::read(&path).unwrap(), original);
+            let restored = load_or_initialize(&path, directory.path()).unwrap();
+            assert_eq!(restored.schema_version, 3, "schema {older}");
+            assert_eq!(restored.assets.web_search.max_results, 42, "schema {older}");
+            assert_eq!(fs::read(&path).unwrap(), original, "schema {older}");
+        }
     }
 
     /// A rejected conversation restores its full prior workspace membership.

@@ -8,8 +8,11 @@
 //!
 //! - Claude Code's betas: `interleaved-thinking-2025-05-14` for every model that
 //!   supports it, so thinking can continue between tool calls.
-//! - Claude Code's prompt-cache breakpoints: one on the last system block and one
-//!   on the last block of the last message.
+//! - Claude Code's prompt-cache breakpoints, gated by the model's `promptCache`
+//!   attribute: the system prompt is split at the host's dynamic boundary and
+//!   each half is a breakpoint, and the last message whose tail block can carry a
+//!   marker gets the third. Its cache-coverage detector warns when a custom
+//!   endpoint keeps billing large uncached input despite the markers.
 //! - Claude Code's 400 self-heal chain: a rejected thinking signature strips every
 //!   thinking block and retries, a rejected `thinking.type` swaps
 //!   `enabled`/`adaptive`, an unsupported `effort` is dropped, an `input +
@@ -295,7 +298,12 @@ export function normalizeAnthropicSseLine(line: string): string | null {
   return `data: ${JSON.stringify(frame)}`;
 }
 
-function makeAnthropicLineRewriter(): SseLineRewrite {
+/**
+ * The per-response line rewriter. `onUsage` receives the `message_start` usage
+ * so the cache-coverage detector can read the endpoint's own billing counters
+ * rather than the SDK's normalized totals.
+ */
+function makeAnthropicLineRewriter(onUsage?: (usage: unknown) => void): SseLineRewrite {
   const thinking = new Map<number, { signature: string; hasSignatureDelta: boolean; text: string; hasThinkingDelta: boolean }>();
   return (line) => {
     const normalized = normalizeAnthropicSseLine(line);
@@ -308,6 +316,7 @@ function makeAnthropicLineRewriter(): SseLineRewrite {
     }
     if (!isObject(frame)) return normalized;
     if (frame.type === "message_stop" || frame.type === "message_start") thinking.clear();
+    if (frame.type === "message_start" && isObject(frame.message)) onUsage?.(frame.message.usage);
     if (typeof frame.index !== "number") return normalized;
     const index = frame.index;
     if (frame.type === "content_block_start") {
@@ -573,7 +582,7 @@ export function dropUnsignedReasoning(messages: unknown[]): void {
   }
 }
 
-// ------------------------------------------------------------ Betas and cache breakpoints
+// ------------------------------------------------------------ Betas
 
 /** Claude Code's interleaved-thinking beta; sent for every model that supports it. */
 export const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
@@ -598,53 +607,164 @@ function setBetas(headers: Headers, betas: string[]): void {
   else headers.set(BETA_HEADER, betas.join(","));
 }
 
-/** Block types Claude Code never marks as a cache breakpoint. */
-function isStampable(block: unknown): boolean {
+// ------------------------------------------------------------ Prompt-cache breakpoints
+
+/**
+ * Per-request prompt-cache directives from the host, for one model.
+ *
+ * Claude Code decides caching per query from `enablePromptCaching` and its
+ * `DISABLE_PROMPT_CACHING*` environment; Mework keeps that decision on the
+ * model profile and sends it here.
+ */
+export interface PromptCacheOptions {
+  /** `false` turns every breakpoint off. Absent means enabled. */
+  enabled?: boolean;
+  /**
+   * The per-step tail of the system prompt, which the host also folded into the
+   * request's `system`. It plays the part of the text after Claude Code's
+   * `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`: the stable prefix before it and the
+   * tail after it each get their own breakpoint, so a change in the tail still
+   * finds the prefix in the cache.
+   */
+  systemDynamic?: string;
+}
+
+/**
+ * Claude Code's `YL()`: a breakpoint with the default five-minute lifetime, which
+ * the API expresses by omitting `ttl`. The one-hour form is reserved there for
+ * subscribers on an allowlist, so it never appears on an API-key request.
+ */
+function cacheMarker(): JsonObject {
+  return { type: "ephemeral" };
+}
+
+/** The separator `combined_system_prompt` puts between the prefix and the tail. */
+const SYSTEM_SECTION_SEPARATOR = "\n\n";
+
+/**
+ * Claude Code's `Akt`: a block that may carry a breakpoint. Thinking blocks are
+ * signed and the API refuses to mark them; `fallback` is a synthetic block that
+ * never reaches the cache; a text block with nothing but whitespace is rejected
+ * as empty.
+ */
+function isStampable(block: unknown): block is JsonObject {
   if (!isObject(block)) return false;
-  if (block.type === "thinking" || block.type === "redacted_thinking") return false;
   if (block.type === "text") return typeof block.text === "string" && block.text.trim().length > 0;
+  return block.type !== "thinking" && block.type !== "redacted_thinking" && block.type !== "fallback";
+}
+
+/**
+ * Claude Code's `kar` eligibility: a message whose tail can hold the marker.
+ * User messages always qualify because their blank text blocks are dropped
+ * before stamping; an assistant message qualifies only when its last block is
+ * stampable, otherwise the search moves to the previous message rather than
+ * marking an earlier block of the same message.
+ */
+function tailStampable(message: unknown): boolean {
+  if (!isObject(message)) return false;
+  if (message.role !== "assistant") return true;
+  const content = message.content;
+  if (typeof content === "string") return true;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  return isStampable(content[content.length - 1]);
+}
+
+/**
+ * Claude Code's `Yis`/`Xis`: mark the chosen message. A string body becomes a
+ * text block; a user array is marked on its last non-blank block, the block
+ * `Uar` would have kept; an assistant array is marked on its last block, which
+ * `tailStampable` already vetted.
+ */
+function stampMessage(message: JsonObject): boolean {
+  const content = message.content;
+  if (typeof content === "string") {
+    if (content.trim().length === 0) return false;
+    message.content = [{ type: "text", text: content, cache_control: cacheMarker() }];
+    return true;
+  }
+  if (!Array.isArray(content) || content.length === 0) return false;
+  if (message.role === "user") {
+    for (let index = content.length - 1; index >= 0; index -= 1) {
+      const block = content[index];
+      if (!isObject(block)) continue;
+      if (block.type === "text" && !isStampable(block)) continue;
+      block.cache_control = cacheMarker();
+      return true;
+    }
+    return false;
+  }
+  const last = content[content.length - 1];
+  if (!isStampable(last)) return false;
+  last.cache_control = cacheMarker();
   return true;
 }
 
 /**
- * Claude Code's prompt-cache breakpoints: the last system block and the last
- * stampable block of the last message. Blocks that already carry a marker are
- * left alone, so caller-supplied markers stay authoritative.
+ * Claude Code's message-side placement: walk back from the end to the last
+ * eligible message and mark it. The API checks every earlier block boundary for
+ * a hit on its own, so one marker at the end suffices; Claude Code's extra pin
+ * on the previous message sits behind a feature flag that defaults off and is
+ * not reproduced here.
  */
-function addCacheBreakpoints(body: JsonObject): boolean {
-  let changed = false;
-  const marker = { type: "ephemeral" };
-  if (typeof body.system === "string" && body.system.length > 0) {
-    body.system = [{ type: "text", text: body.system, cache_control: marker }];
-    changed = true;
-  } else if (Array.isArray(body.system) && body.system.length > 0) {
-    const last = body.system[body.system.length - 1];
-    if (isObject(last) && last.cache_control === undefined && isStampable(last)) {
-      last.cache_control = marker;
-      changed = true;
-    }
-  }
+function addMessageBreakpoint(body: JsonObject): boolean {
   const messages = body.messages;
-  if (!Array.isArray(messages) || messages.length === 0) return changed;
-  const last = messages[messages.length - 1];
-  if (!isObject(last)) return changed;
-  if (typeof last.content === "string") {
-    if (last.content.trim().length > 0) {
-      last.content = [{ type: "text", text: last.content, cache_control: marker }];
-      changed = true;
+  if (!Array.isArray(messages)) return false;
+  let index = messages.length - 1;
+  while (index >= 0 && !tailStampable(messages[index])) index -= 1;
+  if (index < 0) return false;
+  return stampMessage(messages[index] as JsonObject);
+}
+
+/**
+ * Claude Code's `pkt`/`_as`: the system prompt as breakpointed blocks.
+ *
+ * The SDK renders the host's system string as one block. When the host also
+ * named the dynamic tail, the block is split at it and both halves are marked.
+ * That is Claude Code's first-party layout (its boundary marker is only planted
+ * for `api.anthropic.com` and AWS); on other endpoints it still sends two marked
+ * system blocks, split by prompt category instead. Mework keeps the boundary
+ * split everywhere because the host owns both halves directly. Without a tail
+ * the single block is marked; a system array the SDK built from more than one
+ * block keeps only its last block marked.
+ */
+function addSystemBreakpoints(body: JsonObject, dynamic: string | undefined): boolean {
+  if (typeof body.system === "string") {
+    if (body.system.trim().length === 0) return false;
+    body.system = [{ type: "text", text: body.system }];
+  }
+  const system = body.system;
+  if (!Array.isArray(system) || system.length === 0) return false;
+  const only = system[0];
+  if (system.length === 1 && dynamic && dynamic.length > 0 && isObject(only)
+    && only.type === "text" && typeof only.text === "string") {
+    const text = only.text;
+    let prefix: string | null = null;
+    if (text === dynamic) prefix = "";
+    else if (text.endsWith(SYSTEM_SECTION_SEPARATOR + dynamic)) {
+      prefix = text.slice(0, text.length - dynamic.length - SYSTEM_SECTION_SEPARATOR.length);
     }
-  } else if (Array.isArray(last.content)) {
-    for (let index = last.content.length - 1; index >= 0; index -= 1) {
-      const block = last.content[index];
-      if (!isStampable(block)) continue;
-      if ((block as JsonObject).cache_control === undefined) {
-        (block as JsonObject).cache_control = marker;
-        changed = true;
-      }
-      break;
+    if (prefix !== null) {
+      const blocks: JsonObject[] = [];
+      if (prefix.trim().length > 0) blocks.push({ type: "text", text: prefix, cache_control: cacheMarker() });
+      blocks.push({ type: "text", text: dynamic, cache_control: cacheMarker() });
+      body.system = blocks;
+      return true;
     }
   }
-  return changed;
+  for (let index = system.length - 1; index >= 0; index -= 1) {
+    const block = system[index];
+    if (!isStampable(block)) continue;
+    block.cache_control = cacheMarker();
+    return true;
+  }
+  return false;
+}
+
+/** Every breakpoint Claude Code puts on a request; `true` when the body changed. */
+function addCacheBreakpoints(body: JsonObject, options: PromptCacheOptions): boolean {
+  const system = addSystemBreakpoints(body, options.systemDynamic);
+  const message = addMessageBreakpoint(body);
+  return system || message;
 }
 
 function stripCacheControl(value: unknown): boolean {
@@ -660,6 +780,104 @@ function stripCacheControl(value: unknown): boolean {
   }
   for (const entry of Object.values(value)) if (stripCacheControl(entry)) changed = true;
   return changed;
+}
+
+function carriesCacheControl(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(carriesCacheControl);
+  if (!isObject(value)) return false;
+  if (value.cache_control !== undefined && value.cache_control !== null) return true;
+  return Object.values(value).some(carriesCacheControl);
+}
+
+// ------------------------------------------------------------ Cache-coverage detector
+
+/**
+ * Claude Code's `OAt` state, per endpoint and model. The detector only runs on
+ * endpoints that are not Anthropic itself, where a relay may silently drop
+ * `cache_control` and bill every token as fresh input.
+ */
+interface CoverageState {
+  consecutive: number;
+  fired: boolean;
+  okEmitted: boolean;
+}
+
+const coverageStates = new Map<string, CoverageState>();
+
+/** Uncached input this large with no cache write is Claude Code's loss signal. */
+const COVERAGE_INPUT_THRESHOLD = 20_000;
+
+/** Turns of sustained loss before the warning fires. */
+const COVERAGE_TURNS = 3;
+
+type CoverageVerdict =
+  | { kind: "already_fired" }
+  | { kind: "no_usage" }
+  | { kind: "confirm" }
+  | { kind: "healthy" }
+  | { kind: "counted"; consecutive: number }
+  | { kind: "fire"; consecutive: number; inputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
+
+/**
+ * Claude Code's `OAt`: classify one response's usage. Uncached input below the
+ * threshold, or a cache write of at least a tenth of it, is healthy and resets
+ * the count; the first healthy turn that shows any cache traffic confirms the
+ * endpoint honors markers. Three consecutive large uncached turns fire once.
+ */
+export function classifyCacheCoverage(key: string, usage: JsonObject): CoverageVerdict {
+  const existing = coverageStates.get(key);
+  if (existing?.fired) return { kind: "already_fired" };
+  const number = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  const input = number(usage.input_tokens);
+  const read = number(usage.cache_read_input_tokens);
+  const creationField = number(usage.cache_creation_input_tokens);
+  const creation = isObject(usage.cache_creation)
+    ? number(usage.cache_creation.ephemeral_5m_input_tokens) + number(usage.cache_creation.ephemeral_1h_input_tokens)
+    : 0;
+  const written = creationField > 0 ? creationField : creation;
+  if (input + read + written <= 0) return { kind: "no_usage" };
+  const state = existing ?? { consecutive: 0, fired: false, okEmitted: false };
+  if (!existing) coverageStates.set(key, state);
+  if (input < COVERAGE_INPUT_THRESHOLD || written >= 0.1 * input) {
+    state.consecutive = 0;
+    if (!state.okEmitted && read + written > 0) {
+      state.okEmitted = true;
+      return { kind: "confirm" };
+    }
+    return { kind: "healthy" };
+  }
+  state.consecutive += 1;
+  if (state.consecutive >= COVERAGE_TURNS) {
+    state.fired = true;
+    return { kind: "fire", consecutive: state.consecutive, inputTokens: input, cacheReadTokens: read, cacheCreationTokens: written };
+  }
+  return { kind: "counted", consecutive: state.consecutive };
+}
+
+/** What the request layer learned about one round trip, read by the response layer. */
+interface WireContext {
+  key: string;
+  /** A breakpoint went out on this request. */
+  breakpoints: boolean;
+  /** The endpoint is not Anthropic itself, so silent stripping is possible. */
+  customEndpoint: boolean;
+}
+
+function observeCoverage(context: WireContext, usage: unknown): void {
+  if (!context.breakpoints || !context.customEndpoint || !isObject(usage)) return;
+  const verdict = classifyCacheCoverage(context.key, usage);
+  if (verdict.kind !== "fire") return;
+  console.warn(
+    "[cache-coverage] sustained uncovered input with a cache breakpoint on the wire through a custom endpoint"
+    + " — no cache-billing evidence visible at the client (the endpoint may be silently stripping cache_control)",
+    JSON.stringify({
+      endpoint: context.key,
+      consecutive_turns: verdict.consecutive,
+      input_tokens: verdict.inputTokens,
+      cache_read_input_tokens: verdict.cacheReadTokens,
+      cache_creation_input_tokens: verdict.cacheCreationTokens,
+    }),
+  );
 }
 
 // ------------------------------------------------------------ 400 self-heal
@@ -836,7 +1054,12 @@ function clampThinkingBudget(body: JsonObject): void {
 }
 
 /** Apply the endpoint's learned repairs and Claude Code's request-time additions. */
-function prepareRequest(body: JsonObject, headers: Headers, latch: HealLatch): { body: boolean; headers: boolean } {
+function prepareRequest(
+  body: JsonObject,
+  headers: Headers,
+  latch: HealLatch,
+  cache: PromptCacheOptions,
+): { body: boolean; headers: boolean } {
   let bodyChanged = false;
   let headersChanged = false;
   if (latch.stripThinking && stripThinkingBlocks(body)) bodyChanged = true;
@@ -847,10 +1070,10 @@ function prepareRequest(body: JsonObject, headers: Headers, latch: HealLatch): {
     clampThinkingBudget(body);
     bodyChanged = true;
   }
-  if (!latch.noCacheControl) {
-    if (addCacheBreakpoints(body)) bodyChanged = true;
-  } else if (stripCacheControl(body)) {
-    bodyChanged = true;
+  if (latch.noCacheControl) {
+    if (stripCacheControl(body)) bodyChanged = true;
+  } else if (cache.enabled !== false) {
+    if (addCacheBreakpoints(body, cache)) bodyChanged = true;
   }
   const model = typeof body.model === "string" ? body.model : "";
   const betas = betasOf(headers);
@@ -926,8 +1149,15 @@ function heal(body: JsonObject, headers: Headers, latch: HealLatch, message: str
  * de-duplicated recovery tokens; a 400 that matches no class is returned as-is.
  * Bodies are re-read for classification, so the un-healed response is rebuilt
  * from the captured text.
+ *
+ * `onWire` reports what left for the endpoint, so the response layer can judge
+ * cache coverage against it.
  */
-export function anthropicSelfHealFetch(inner: typeof globalThis.fetch = globalThis.fetch): typeof globalThis.fetch {
+export function anthropicSelfHealFetch(
+  inner: typeof globalThis.fetch = globalThis.fetch,
+  cache: PromptCacheOptions = {},
+  onWire?: (context: { key: string; breakpoints: boolean }) => void,
+): typeof globalThis.fetch {
   return async (input, init) => {
     const text = init && typeof init.body === "string" ? init.body : null;
     let body: unknown;
@@ -940,9 +1170,10 @@ export function anthropicSelfHealFetch(inner: typeof globalThis.fetch = globalTh
     const url = requestUrlOf(input);
     const latch = latchFor(url, body.model);
     const headers = new Headers(init?.headers);
-    prepareRequest(body, headers, latch);
+    prepareRequest(body, headers, latch, cache);
     const applied = new Set<HealClass>();
     for (;;) {
+      onWire?.({ key: `${url}|${typeof body.model === "string" ? body.model : ""}`, breakpoints: carriesCacheControl(body) });
       const response = await inner(input, { ...init, body: JSON.stringify(body), headers });
       if (response.status !== 400) return response;
       const errorText = await response.text();
@@ -952,6 +1183,12 @@ export function anthropicSelfHealFetch(inner: typeof globalThis.fetch = globalTh
       const healed = heal(body, headers, latch, message);
       if (healed === null || applied.has(healed)) return replay();
       applied.add(healed);
+      // Claude Code rebuilds the whole body for every attempt, so a repair that
+      // rewrote the messages also moves the message-side marker to the new tail.
+      if (healed !== "cache-control" && cache.enabled !== false && !latch.noCacheControl) {
+        stripCacheControl(body.messages);
+        addMessageBreakpoint(body);
+      }
     }
   };
 }
@@ -963,17 +1200,28 @@ export function anthropicSelfHealFetch(inner: typeof globalThis.fetch = globalTh
  *
  * `baseURL` decides whether the adaptive rewrite applies; official Anthropic
  * implements adaptive thinking and must receive the SDK's thinking form unchanged.
+ * It also decides whether cache coverage is watched: only a custom endpoint can
+ * silently strip markers.
  */
 export function anthropicDialectFetch(
   baseURL: string | undefined,
   inner: typeof globalThis.fetch = globalThis.fetch,
+  cache: PromptCacheOptions = {},
 ): typeof globalThis.fetch {
-  const patchRequest = isOfficialAnthropicEndpoint(baseURL) ? undefined : rewriteAdaptiveThinkingBody;
+  const official = isOfficialAnthropicEndpoint(baseURL);
+  const patchRequest = official ? undefined : rewriteAdaptiveThinkingBody;
+  // One wrapper serves one `streamText` call, whose fetches run one after another,
+  // so the request layer can leave its facts here for the response layer.
+  const context: WireContext = { key: "", breakpoints: false, customEndpoint: !official };
+  const onWire = ({ key, breakpoints }: { key: string; breakpoints: boolean }) => {
+    context.key = key;
+    context.breakpoints = breakpoints;
+  };
   // Innermost first: heal and decorate the request, reshape a non-streamed body
   // into a stream, and only then let the line rewriter see ordinary SSE.
   return sseDialectFetch(
-    makeAnthropicLineRewriter,
+    () => makeAnthropicLineRewriter((usage) => observeCoverage(context, usage)),
     patchRequest,
-    nonStreamingMessageAsSseFetch(anthropicSelfHealFetch(inner)),
+    nonStreamingMessageAsSseFetch(anthropicSelfHealFetch(inner, cache, onWire)),
   );
 }

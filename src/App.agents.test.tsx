@@ -83,29 +83,6 @@ describe("App model run flow — agents", () => {
     expect(taskStop).not.toHaveBeenCalledWith("conversation-B", "same");
   });
 
-  it("browses a cold workflow archive with only a fallback receipt and no subagent shells", async () => {
-    const document = documentWithModel();
-    const conversation = document.workspaces[0].conversations[0];
-    conversation.contexts = [{ id: "cold-workflow-call", kind: "tool", toolName: "workflow", input: {},
-      result: { output: "workflow:cold_run", success: true, executedAt: "2026-09-05T00:00:00Z", durationMs: 1 },
-      createdAt: "2026-09-05T00:00:00Z" }];
-    runtimeMocks.loadDocument.mockResolvedValue(document);
-    runtimeMocks.workflowRunHistory.mockResolvedValue([{ runId: "cold_run", scriptName: "磁盘历史工作流", status: "interrupted", startedAt: null,
-      steps: [{ index: 2, label: "仅存盘的第三步", state: "completed", bodyAvailable: true, error: null }] }]);
-    runtimeMocks.workflowStepRecord.mockResolvedValue({ task: "archived step", status: "completed", updates: [], contexts: [
-      { id: "disk-only-answer", kind: "assistant", content: "冷启动仍可阅读的步骤正文", createdAt: "2026-09-05T00:00:01Z" }
-    ] });
-    const user = userEvent.setup();
-    render(<App />);
-    await user.click(await screen.findByText("磁盘历史工作流"));
-    await user.click(screen.getByRole("button", { name: /仅存盘的第三步/ }));
-    expect(await screen.findByText("冷启动仍可阅读的步骤正文")).toBeInTheDocument();
-    expect(runtimeMocks.workflowStepRecord).toHaveBeenCalledWith(conversation.id, "cold_run", 2);
-    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
-    expect(runtimeMocks.createConversationRemote).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: /跳过步骤|Skip step/ })).not.toBeInTheDocument();
-  });
-
   it("renders hook lifecycle and context-injection state while the run is active", async () => {
     const document = documentWithModel();
     runtimeMocks.loadDocument.mockResolvedValue(document);

@@ -28,13 +28,15 @@ const providers: ApiProvider[] = [{
     name: "",
     group: "",
     capabilities: ["image_recognition"],
-    reasoningContent: "plaintext"
+    reasoningContent: "plaintext",
+    promptCache: true
   }, {
     id: "second-model",
     name: "",
     group: "",
     capabilities: [],
-    reasoningContent: "plaintext"
+    reasoningContent: "plaintext",
+    promptCache: true
   }]
 }, {
   id: "disabled-provider",
@@ -51,7 +53,8 @@ const providers: ApiProvider[] = [{
     name: "",
     group: "",
     capabilities: [],
-    reasoningContent: "plaintext"
+    reasoningContent: "plaintext",
+    promptCache: true
   }]
 }];
 

@@ -1,5 +1,5 @@
 {
-  "keyCount": 202,
+  "keyCount": 201,
   "keys": [
     {
       "description": "Section appended to the system prompt when the conversation exposes the application data directory.",
@@ -768,11 +768,6 @@
     {
       "description": "Tool result of `fork` when the request was raised for the user to decide.",
       "id": "fork.request_submitted",
-      "placeholders": []
-    },
-    {
-      "description": "Tool result of `fork` under full access, where the child is created without asking.",
-      "id": "fork.created_automatically",
       "placeholders": []
     },
     {

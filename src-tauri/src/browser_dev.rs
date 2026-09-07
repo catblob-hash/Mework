@@ -128,6 +128,9 @@ pub(super) fn run() -> i32 {
                 app.state::<AppState>()
                     .install_attestation_key(app_data)
                     .map_err(std::io::Error::other)?;
+                if let Err(error) = super::prompt_profile_files::materialize_builtin_profiles(app_data) {
+                    eprintln!("内置提示词档案未能落盘：{error}");
+                }
             }
             super::install_background_write_failure_reporting(app.state::<AppState>().inner());
             app.state::<AppState>()
@@ -974,9 +977,6 @@ async fn dispatch(
             arg(args, "stepIndex")?,
             arg(args, "action")?,
         )),
-        "workflow_run_history" => result_value(super::workflow_run_history(
-            app.clone(), arg(args, "conversationId")?,
-        ).await),
         "workflow_step_record" => result_value(super::workflow_step_record(
             app.clone(),
             arg(args, "conversationId")?,
@@ -1368,6 +1368,10 @@ async fn dispatch(
             app.state::<AppState>(),
         )),
         "list_pending_fork_starts" => result_value(super::list_pending_fork_starts(app.clone())),
+        "list_fork_decisions" => result_value(super::list_fork_decisions(
+            app.clone(),
+            arg(args, "conversationId")?,
+        )),
         "list_pending_fork_requests" => result_value(super::list_pending_fork_requests(
             app.state::<AppState>(),
         )),

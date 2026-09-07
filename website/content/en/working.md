@@ -23,7 +23,7 @@ Preset fields, which are also the fields of the per-conversation drawer (the sli
 | Field | Meaning |
 |---|---|
 | System prompt | The base of the system prompt, and the only base there is — Mework has no default of its own. Leave it **empty** and the assembled prompt starts at the capability sections (skills, MCP servers, hooks, the app-data line). |
-| Enabled tools | Which of the 26 tools the model may call. Memory tools, `task_wait`, `task_list` and `skill` are derived from switches, not listed here. |
+| Enabled tools | Which of the 27 tools the model may call. Memory tools, `task_wait`, `task_list` and `skill` are derived from switches, not listed here. |
 | Agent roles | Named subagent roles: which model they run on, which tools they get, which search backend they use, and a description the model sees. |
 | Skills, MCP servers, Hooks | Direct selection from what is installed or discovered; a dangling id stays selected but inactive. |
 | Tool descriptions | The prompt profile (tool-description file) for this conversation. The English built-in is the default. See [Prompt profiles](prompt-profiles.html). |
@@ -36,22 +36,22 @@ Preset fields, which are also the fields of the per-conversation drawer (the sli
 
 ## Tools and approvals {#tools-and-approvals}
 
-The 26 built-in tools, by group:
+The 27 built-in tools, by group:
 
 - **Filesystem** — `ls`, `grep`, `read`, `write`, `edit`, `find`. Bounded to the workspace and trusted roots; symlinks, junctions and `..` cannot escape; writes are atomic and return a diff.
 - **Shell** — `powershell`, `bash`. Foreground or background (`run_in_background`); the command text is shown in full on the approval card.
 - **Web** — `web_search`, `web_fetch`, and `playwright` (23 browser actions over the built-in browser).
-- **Orchestration** — `agent_spawn`, `send_message`, `followup_task`, `task_wait`, `task_list`, `workflow`, `skill`, `todo`, `ask_user`.
+- **Orchestration** — `agent_spawn`, `send_message`, `followup_task`, `task_wait`, `task_list`, `workflow`, `fork`, `skill`, `todo`, `ask_user`.
 - **Memory** — `read/create/edit_global_memory`, `read/create/edit_project_memory`.
 
 The **security level** decides which calls ask you first:
 
-| Level | Reads in workspace | Writes in workspace | Reads outside | Writes outside | Subagents | Shell, web, workflow |
-|---|---|---|---|---|---|---|
-| `request_approval` | allowed | ask | ask | ask | ask | ask |
-| `allow_edits` | allowed | allowed | allowed | ask | allowed | ask |
-| `plan` | as Manual | refused | ask | refused | ask | ask |
-| `full_access` | allowed | allowed | allowed | allowed | allowed | allowed |
+| Level | Reads in workspace | Writes in workspace | Reads outside | Writes outside | Subagents | Fork | Shell, web, workflow |
+|---|---|---|---|---|---|---|---|
+| `request_approval` | allowed | ask | ask | ask | ask | ask | ask |
+| `allow_edits` | allowed | allowed | allowed | ask | allowed | ask | ask |
+| `plan` | as Manual | refused | ask | refused | ask | ask | ask |
+| `full_access` | allowed | allowed | allowed | allowed | allowed | ask | allowed |
 
 ### Plan mode
 
@@ -62,6 +62,8 @@ Calling `exit_plan_mode` opens an approval card and takes the message area direc
 Some confirmations cannot be turned off by any level or by a hook: recursive deletes that touch the root, home or system paths; writing global memory; MCP tools that declare `anthropic/requiresUserInteraction`; and taking over a browser page you logged into yourself.
 
 An approval card shows the tool, the final arguments (after any hook rewrite), the risk level and the rule that fired. **Always allow** remembers the decision for that tool in that conversation, capped at the risk level of the card you answered; shell tools and `playwright` never get a standing allowance. Cards raised by background tasks survive the end of the turn and reappear after a reload.
+
+`fork` always raises a non-blocking request card, including at Full access, and never creates a child automatically. The child starts with only its prompt unless the model explicitly passes `inherit_context: true`; approved and declined decisions remain in the task container but are never reported to the model.
 
 ## Run environments
 

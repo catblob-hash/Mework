@@ -12665,6 +12665,7 @@ mod tests {
             max_output_tokens: Some(2048),
             capabilities: BTreeSet::new(),
             reasoning_content: Default::default(),
+            prompt_cache: true,
         }
     }
 
@@ -14307,6 +14308,95 @@ mod tests {
             ReasoningForm::from(ReasoningContent::Encrypted),
             ReasoningForm::Encrypted
         );
+    }
+
+    /// The prompt-cache attribute is a model attribute that only the Messages
+    /// dialect consumes: it reaches the wire verbatim for Anthropic, both values,
+    /// and is absent for every other family so the sidecar knows there is no
+    /// consumer rather than a default.
+    #[test]
+    fn prompt_cache_takes_effect_matches_the_wire() {
+        for family in ProviderFamily::CATALOG.iter().copied() {
+            for enabled in [true, false] {
+                let mut request = run_request(family);
+                for setting in family.required_settings() {
+                    request
+                        .provider
+                        .family_settings
+                        .insert(*setting, "test".into());
+                }
+                request.model.prompt_cache = enabled;
+                let payload = step_json(&request);
+                let on_the_wire = payload.get("promptCache").cloned();
+                if family.prompt_cache_takes_effect() {
+                    assert_eq!(on_the_wire, Some(json!(enabled)), "{family:?} 必须原样带上 promptCache");
+                } else {
+                    assert_eq!(on_the_wire, None, "{family:?} 不该带 promptCache");
+                }
+            }
+        }
+        assert!(ProviderFamily::Anthropic.prompt_cache_takes_effect());
+    }
+
+    /// The system prompt crosses to the sidecar in Claude Code's two halves: the
+    /// run-stable prompt as `system`, the per-step sections as `systemDynamic`.
+    /// Joined with a blank line they are byte-identical to `combined_system_prompt`,
+    /// which is what every provider receives.
+    #[test]
+    fn the_system_prompt_tail_travels_as_its_own_field() {
+        let mut request = run_request(ProviderFamily::Anthropic);
+        request.system_prompt = "Be useful.".into();
+        request.contexts.push(ContextItem::System {
+            id: "ctx_sys_1".into(),
+            content: "Project notes.".into(),
+            local_only: false,
+            hook_execution: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        request.contexts.push(ContextItem::System {
+            id: "ctx_sys_local".into(),
+            content: "Local only.".into(),
+            local_only: true,
+            hook_execution: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        // A context that repeats the stable prompt verbatim is deduplicated
+        // against it, exactly as the single-string assembly did.
+        request.contexts.push(ContextItem::System {
+            id: "ctx_sys_dup".into(),
+            content: "Be useful.".into(),
+            local_only: false,
+            hook_execution: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        let payload = step_json(&request);
+        assert_eq!(payload["system"], json!("Be useful."));
+        assert_eq!(payload["systemDynamic"], json!("Project notes."));
+        assert_eq!(
+            crate::aisdk::step::combined_system_prompt(&request),
+            "Be useful.\n\nProject notes."
+        );
+
+        // Without a tail the field is absent, and a prompt that is only a tail
+        // has no stable half.
+        let mut bare = run_request(ProviderFamily::Anthropic);
+        bare.system_prompt = "Be useful.".into();
+        let bare = step_json(&bare);
+        assert_eq!(bare["system"], json!("Be useful."));
+        assert!(bare.get("systemDynamic").is_none());
+
+        let mut tail_only = run_request(ProviderFamily::Anthropic);
+        tail_only.system_prompt = String::new();
+        tail_only.contexts.push(ContextItem::System {
+            id: "ctx_sys_2".into(),
+            content: "Only notes.".into(),
+            local_only: false,
+            hook_execution: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        let tail_only = step_json(&tail_only);
+        assert!(tail_only.get("system").is_none());
+        assert_eq!(tail_only["systemDynamic"], json!("Only notes."));
     }
 
         /// An image-only user message must not produce an empty text part.

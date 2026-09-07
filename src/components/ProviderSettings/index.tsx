@@ -127,7 +127,8 @@ function keyErrorReason(error: unknown, secret?: string): string {
 
 /**
  * Creates an empty user-defined model. Its reasoning form starts at the
- * protocol's own default, because the stored value is always concrete.
+ * protocol's own default, because the stored value is always concrete, and
+ * prompt caching starts on, as Claude Code has it.
  */
 function createModel(family: ProviderFamily): ModelProfile {
   return {
@@ -135,7 +136,8 @@ function createModel(family: ProviderFamily): ModelProfile {
     name: "",
     group: "",
     capabilities: [],
-    reasoningContent: normalizeReasoningContent(undefined, family)
+    reasoningContent: normalizeReasoningContent(undefined, family),
+    promptCache: true
   };
 }
 

@@ -537,6 +537,9 @@ fn finish(provider: &ApiProvider, fetched: Vec<Fetched>) -> Vec<ModelProfile> {
                 } else {
                     ReasoningContent::Plaintext
                 },
+                // Claude Code caches by default; discovery only establishes the
+                // default, and the settings merge keeps a curated `false`.
+                prompt_cache: true,
             }
         })
         .collect()

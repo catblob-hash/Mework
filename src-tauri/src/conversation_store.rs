@@ -25,7 +25,7 @@ pub const DATABASE_FILE_NAME: &str = "conversations.v1.sqlite3";
 
 /// `PRAGMA user_version`. Every upgrade so far is additive and in place, so a
 /// released user's history survives; only unknown versions are quarantined and rebuilt.
-pub const STORE_VERSION: i32 = 4;
+pub const STORE_VERSION: i32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +49,24 @@ const PLAN_SCHEMA: &str = "CREATE TABLE conversation_plan (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 ) STRICT;";
+
+/// One row per answered fork request, for the source conversation's task bar.
+/// The model never reads this table: `fork` returns before the user decides.
+/// A decision only means anything beside the conversation that raised it, so it
+/// dies with that conversation; the child it created does not.
+const FORK_DECISION_SCHEMA: &str = "CREATE TABLE fork_decision (
+    fork_id                TEXT PRIMARY KEY,
+    source_conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+    workspace_id           TEXT NOT NULL,
+    title                  TEXT NOT NULL,
+    prompt                 TEXT NOT NULL,
+    inherit_context        INTEGER NOT NULL,
+    requested_at           TEXT NOT NULL,
+    decided_at             TEXT NOT NULL,
+    approved               INTEGER NOT NULL,
+    child_conversation_id  TEXT
+) STRICT;
+CREATE INDEX fork_decision_source_idx ON fork_decision (source_conversation_id, decided_at);";
 
 /// Lifecycle status for one context row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,7 +248,7 @@ impl ConversationStore {
             // A current schema already exists. Empty and mismatched stores follow the paths below.
             return Ok(());
         }
-        if version == 1 || version == 2 || version == 3 {
+        if version >= 1 && version < STORE_VERSION {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| format!("无法开启对话库升级事务：{error}"))?;
@@ -241,7 +259,10 @@ impl ConversationStore {
             if version <= 2 {
                 tx.execute_batch(FORK_START_SCHEMA).map_err(|error| error.to_string())?;
             }
-            tx.execute_batch(PLAN_SCHEMA).map_err(|error| error.to_string())?;
+            if version <= 3 {
+                tx.execute_batch(PLAN_SCHEMA).map_err(|error| error.to_string())?;
+            }
+            tx.execute_batch(FORK_DECISION_SCHEMA).map_err(|error| error.to_string())?;
             tx.pragma_update(None, "user_version", STORE_VERSION)
                 .map_err(|error| format!("无法写入对话库版本：{error}"))?;
             tx.commit()
@@ -267,6 +288,7 @@ impl ConversationStore {
             .map_err(|error| format!("无法建立对话库结构：{error}"))?;
         conn.execute_batch(FORK_START_SCHEMA).map_err(|error| error.to_string())?;
         conn.execute_batch(PLAN_SCHEMA).map_err(|error| error.to_string())?;
+        conn.execute_batch(FORK_DECISION_SCHEMA).map_err(|error| error.to_string())?;
         conn.pragma_update(None, "user_version", STORE_VERSION)
             .map_err(|error| format!("无法写入对话库版本：{error}"))?;
         Ok(())
@@ -731,6 +753,76 @@ impl ConversationStore {
             .map_err(|error| format!("无法更新计划文档状态：{error}"))?;
             Ok(())
         })
+    }
+
+    /// Records one answered fork request.
+    ///
+    /// Keyed by `fork_id` and idempotent: a card answers once, but a replay of
+    /// the same decision must not put a second row in the task bar.
+    pub fn record_fork_decision(
+        &self,
+        record: &crate::fork_requests::ForkDecisionRecord,
+    ) -> Result<(), String> {
+        self.with_write_tx(|tx| {
+            tx.execute(
+                "INSERT INTO fork_decision
+                     (fork_id, source_conversation_id, workspace_id, title, prompt,
+                      inherit_context, requested_at, decided_at, approved, child_conversation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(fork_id) DO UPDATE SET
+                     decided_at = excluded.decided_at,
+                     approved = excluded.approved,
+                     child_conversation_id = excluded.child_conversation_id",
+                rusqlite::params![
+                    &record.fork_id,
+                    &record.source_conversation_id,
+                    &record.workspace_id,
+                    &record.title,
+                    &record.prompt,
+                    record.inherit_context,
+                    &record.requested_at,
+                    &record.decided_at,
+                    record.approved,
+                    &record.child_conversation_id,
+                ],
+            )
+            .map_err(|error| format!("无法记录分叉决定：{error}"))?;
+            Ok(())
+        })
+    }
+
+    /// Every fork decision this conversation raised, oldest first.
+    pub fn fork_decisions(
+        &self,
+        source_conversation_id: &str,
+    ) -> Result<Vec<crate::fork_requests::ForkDecisionRecord>, String> {
+        let conn = self.lock()?;
+        let mut query = conn
+            .prepare(
+                "SELECT fork_id, workspace_id, title, prompt, inherit_context,
+                        requested_at, decided_at, approved, child_conversation_id
+                 FROM fork_decision WHERE source_conversation_id = ?1
+                 ORDER BY decided_at, fork_id",
+            )
+            .map_err(|error| format!("无法读取分叉决定：{error}"))?;
+        let rows = query
+            .query_map([source_conversation_id], |row| {
+                Ok(crate::fork_requests::ForkDecisionRecord {
+                    fork_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    source_conversation_id: source_conversation_id.to_owned(),
+                    title: row.get(2)?,
+                    prompt: row.get(3)?,
+                    inherit_context: row.get(4)?,
+                    requested_at: row.get(5)?,
+                    decided_at: row.get(6)?,
+                    approved: row.get(7)?,
+                    child_conversation_id: row.get(8)?,
+                })
+            })
+            .map_err(|error| format!("无法读取分叉决定：{error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("无法读取分叉决定：{error}"))
     }
 
     /// Writes a conversation's own row, queued messages and aborted-task records, leaving every
@@ -1612,7 +1704,7 @@ mod tests {
         let mut child = conversation("history");
         child.contexts.push(user("prompt", "hello"));
         store.put_conversation("ws", &child).unwrap();
-        store.lock().unwrap().execute_batch("DROP TABLE pending_fork_start; DROP TABLE conversation_plan; PRAGMA user_version = 2;").unwrap();
+        store.lock().unwrap().execute_batch("DROP TABLE pending_fork_start; DROP TABLE conversation_plan; DROP TABLE fork_decision; PRAGMA user_version = 2;").unwrap();
         drop(store);
         let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
         assert_eq!(store.conversation(&child.id).unwrap().unwrap().contexts.len(), 1);
@@ -1629,7 +1721,7 @@ mod tests {
         let mut child = conversation("history");
         child.contexts.push(user("prompt", "hello"));
         store.put_conversation("ws", &child).unwrap();
-        store.lock().unwrap().execute_batch("DROP TABLE conversation_plan; PRAGMA user_version = 3;").unwrap();
+        store.lock().unwrap().execute_batch("DROP TABLE conversation_plan; DROP TABLE fork_decision; PRAGMA user_version = 3;").unwrap();
         drop(store);
         let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
         assert_eq!(store.conversation(&child.id).unwrap().unwrap().contexts.len(), 1);
@@ -1701,6 +1793,92 @@ mod tests {
         assert_eq!(store.conversation_plan(&source.id).unwrap(), None);
     }
 
+    fn fork_decision(
+        fork_id: &str,
+        source: &str,
+        decided_at: &str,
+        approved: bool,
+    ) -> crate::fork_requests::ForkDecisionRecord {
+        crate::fork_requests::ForkDecisionRecord {
+            fork_id: fork_id.into(),
+            workspace_id: "ws".into(),
+            source_conversation_id: source.into(),
+            title: "继续做 B".into(),
+            prompt: "继续做 B\n第二行".into(),
+            inherit_context: true,
+            requested_at: "2026-09-05T00:00:00Z".into(),
+            decided_at: decided_at.into(),
+            approved,
+            child_conversation_id: approved.then(|| "child".to_owned()),
+        }
+    }
+
+    /// The task bar reads this table after a reload, so the rows have to be
+    /// there — and they have to go when the conversation that raised them does.
+    #[test]
+    fn fork_decisions_survive_reopen_and_die_with_their_source() {
+        let (dir, store) = temp_store();
+        let source = conversation("forker");
+        let other = conversation("bystander");
+        for row in [&source, &other] {
+            store.put_conversation("ws", row).unwrap();
+        }
+        let approved = fork_decision("fork_b", &source.id, "2026-09-05T00:02:00Z", true);
+        let declined = fork_decision("fork_a", &source.id, "2026-09-05T00:01:00Z", false);
+        store.record_fork_decision(&approved).unwrap();
+        store.record_fork_decision(&declined).unwrap();
+        store
+            .record_fork_decision(&fork_decision(
+                "fork_c",
+                &other.id,
+                "2026-09-05T00:03:00Z",
+                true,
+            ))
+            .unwrap();
+
+        drop(store);
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
+        // Oldest first, and only this conversation's decisions.
+        assert_eq!(
+            store.fork_decisions(&source.id).unwrap(),
+            vec![declined, approved]
+        );
+
+        // Answering the same card twice replaces the row rather than doubling it.
+        let reanswered = fork_decision("fork_a", &source.id, "2026-09-05T01:00:00Z", true);
+        store.record_fork_decision(&reanswered).unwrap();
+        let rows = store.fork_decisions(&source.id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| *row == reanswered));
+
+        store.delete_conversation(&source.id).unwrap();
+        assert!(store.fork_decisions(&source.id).unwrap().is_empty());
+        assert_eq!(store.fork_decisions(&other.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn version_four_keeps_history_and_gains_the_fork_decision_table() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("history");
+        source.contexts.push(user("prompt", "hello"));
+        store.put_conversation("ws", &source).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE fork_decision; PRAGMA user_version = 4;")
+            .unwrap();
+        drop(store);
+
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
+        assert_eq!(store.conversation(&source.id).unwrap().unwrap().contexts.len(), 1);
+        let record = fork_decision("fork_a", &source.id, "2026-09-05T00:01:00Z", true);
+        store.record_fork_decision(&record).unwrap();
+        assert_eq!(store.fork_decisions(&source.id).unwrap(), vec![record]);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().contains("quarantine-")
+        }));
+    }
+
     #[test]
     fn version_one_upgrades_in_place_without_quarantine() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1749,6 +1927,7 @@ mod tests {
         // Every table added after v1 exists after one open, not just the newest.
         assert!(store.pending_fork_starts().expect("fork intents").is_empty());
         assert_eq!(store.conversation_plan(&source.id).expect("plan"), None);
+        assert!(store.fork_decisions(&source.id).expect("fork decisions").is_empty());
         let version: i32 = store.lock().expect("lock")
             .query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
         assert_eq!(version, STORE_VERSION);

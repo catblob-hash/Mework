@@ -114,7 +114,7 @@ describe("UsageStatsCard", () => {
     expect(columns[1]).toHaveAttribute("data-bucket", "2026-08-20");
     expect(columns[0].querySelectorAll(".usage-stats__chart-segment")).toHaveLength(1);
     // 1M rounds up to a 1M axis, so Aug 19 is a full-height bar.
-    expect(columns[0].querySelector(".usage-stats__chart-segment"))
+    expect(columns[0].querySelector(".usage-stats__chart-stack"))
       .toHaveStyle({ height: "100%" });
     expect(screen.getByText("1M")).toBeInTheDocument();
     expect(screen.getByText("500K")).toBeInTheDocument();

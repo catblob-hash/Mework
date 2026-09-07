@@ -425,13 +425,18 @@ function UsageSeriesChart({
               data-index={index}
               data-bucket={entry.key}
             >
-              <span className="usage-stats__chart-stack">
+              {/* The stack carries the bar's own height so it can be clipped to a
+                  rounded top; the segments only divide it in proportion. */}
+              <span
+                className="usage-stats__chart-stack"
+                style={{ height: `${(entry.totalTokens / scale) * 100}%` }}
+              >
                 {entry.byModel.map((tokens, modelIndex) => (
                   tokens > 0 && models[modelIndex] ? (
                     <span
                       className={`usage-stats__chart-segment usage-stats__chart-segment--s${shadeIndex(modelIndex)}`}
                       key={models[modelIndex].key}
-                      style={{ height: `${(tokens / scale) * 100}%` }}
+                      style={{ flexGrow: tokens }}
                     />
                   ) : null
                 ))}

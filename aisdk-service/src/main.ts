@@ -23,6 +23,7 @@ import {
   ProtocolError,
   createLineSplitter,
   decodeHostFrame,
+  fullSystemPrompt,
   type HostFrame,
   type OutboundFrame,
   type StepEvent,
@@ -505,7 +506,7 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
     const searchLimit = request.nativeSearch?.maxUses ?? 0;
     const result = streamText({
       model,
-      system: request.system,
+      system: fullSystemPrompt(request),
       messages: request.messages as ModelMessage[],
       tools,
       // prepareStep runs before tool serialization. Replace the provider tool in

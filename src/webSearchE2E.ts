@@ -248,6 +248,7 @@ function makeProvider(runId: string, family: "openai_responses" | "anthropic"): 
     group: "",
     capabilities: ["image_recognition"],
     reasoningContent: family === "anthropic" ? "plaintext" : "encrypted",
+    promptCache: true,
   };
   return {
     model,

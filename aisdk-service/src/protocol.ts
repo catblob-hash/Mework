@@ -11,7 +11,7 @@
  * failures rather than silent loss of reasoning and pause-turn data. Any
  * wire-shape change bumps this constant and the matching host-side literal.
  */
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 /** Maximum line size (16 MiB); mirrors the host constant `MAX_SSE_LINE`. */
 export const MAX_LINE_BYTES = 16 * 1024 * 1024;
@@ -96,7 +96,15 @@ export interface StepRequest {
   /** Provider-family identity fields: `region`, `project`, `location`, and `apiVersion`. */
   settings?: Record<string, string>;
   modelId: string;
+  /** The stable part of the system prompt: everything assembled once at run start. */
   system?: string;
+  /**
+   * The per-step tail of the system prompt, which the sidecar appends to
+   * `system` after a blank line for every provider. Anthropic's dialect layer
+   * also uses it as Claude Code's dynamic boundary, so the stable prefix and the
+   * tail become separate cache breakpoints.
+   */
+  systemDynamic?: string;
   /** AI SDK `ModelMessage[]` projected from the host canonical context. */
   messages: unknown[];
   tools?: ToolSpec[];
@@ -121,11 +129,32 @@ export interface StepRequest {
    * `responses-dialect.ts` strips encrypted-content includes for `plaintext`.
    */
   reasoningContent?: "plaintext" | "encrypted";
+  /**
+   * The model's prompt-cache attribute, sent only to families whose dialect
+   * places cache breakpoints (today: `anthropic`). `false` turns Claude Code's
+   * breakpoints off for this model; absence means the family has no consumer.
+   */
+  promptCache?: boolean;
   providerOptions?: Record<string, Record<string, JsonValue>>;
   /** Native `web_search` server tool, present only on `native_search_call` requests. */
   nativeSearch?: { maxUses: number; previousCallIds?: string[] };
   /** Present only for the `claude-agent` family; see [`AgentSession`]. */
   agent?: AgentSession;
+}
+
+/** Separator between the stable system prompt and its tail; mirrors the host's. */
+export const SYSTEM_SECTION_SEPARATOR = "\n\n";
+
+/**
+ * The whole system prompt a provider receives: the stable part followed by the
+ * per-step tail. Byte-identical to what the host sent before the split existed,
+ * so every family other than Anthropic sees no change.
+ */
+export function fullSystemPrompt(request: Pick<StepRequest, "system" | "systemDynamic">): string | undefined {
+  const parts = [request.system, request.systemDynamic].filter(
+    (part): part is string => typeof part === "string" && part.length > 0,
+  );
+  return parts.length > 0 ? parts.join(SYSTEM_SECTION_SEPARATOR) : request.system;
 }
 
 // ----------------------------------------------------------------- Sidecar → host

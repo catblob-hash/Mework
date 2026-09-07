@@ -1815,6 +1815,7 @@ mod tests {
                 max_output_tokens: None,
                 capabilities: Default::default(),
                 reasoning_content: Default::default(),
+                prompt_cache: true,
             },
             reasoning_effort: Default::default(),
             conversation_id: "conv".into(),

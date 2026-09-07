@@ -60,7 +60,8 @@ export function imageE2eProviders(
       name: "",
       group: "",
       capabilities: ["image_recognition"],
-      reasoningContent: protocol === "openai_responses" ? "encrypted" : "plaintext"
+      reasoningContent: protocol === "openai_responses" ? "encrypted" : "plaintext",
+      promptCache: true
     }],
     activeModelId: imageE2eModelId(protocol, runId)
   }));

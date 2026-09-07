@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { SubagentView } from "../lib/subagents";
 import type { TerminalSessionState } from "../lib/terminal";
 import type { ShellTaskSnapshot } from "../lib/shellTasks";
+import type { ForkDecisionRecord } from "../types";
 import { TaskContainer } from "./TaskContainer";
 
 function agent(id: string, overrides: Partial<SubagentView> = {}): SubagentView {
@@ -63,6 +64,22 @@ function shellTask(overrides: Partial<ShellTaskSnapshot> = {}): ShellTaskSnapsho
     endedAt: null,
     outcome: null,
     exitCode: null,
+    ...overrides
+  };
+}
+
+function forkDecision(overrides: Partial<ForkDecisionRecord> = {}): ForkDecisionRecord {
+  return {
+    forkId: "fork-1",
+    workspaceId: "workspace-1",
+    sourceConversationId: "conversation-1",
+    title: "迁移升级脚本",
+    prompt: "迁移升级脚本\n把 v4 的迁移拆成两步。",
+    inheritContext: false,
+    requestedAt: "2026-07-20T01:40:00Z",
+    decidedAt: "2026-07-20T01:41:00Z",
+    approved: true,
+    childConversationId: "conversation-2",
     ...overrides
   };
 }
@@ -483,6 +500,61 @@ describe("TaskContainer", () => {
     expect(onOpenItem).toHaveBeenCalledTimes(1);
     expect(onOpenItem.mock.calls[0]![0]).toMatchObject({ kind: "plan", id: "plan" });
     expect(onSelectAgent).not.toHaveBeenCalled();
+  });
+
+  it("opens the child conversation from an approved fork's row", async () => {
+    const user = userEvent.setup();
+    const onOpenItem = vi.fn();
+    const { container, onSelectAgent, onStopItem } = renderContainer({
+      onOpenItem,
+      forkDecisions: [forkDecision()]
+    });
+
+    // A decision is settled by the time it has a row, so it is history: hidden
+    // until the disclosure is opened.
+    expect(within(container).queryByText("已创建子对话 · 点击打开")).not.toBeInTheDocument();
+    await user.click(within(container).getByRole("button", { name: /已完成/ }));
+
+    const row = within(container).getByRole("button", { name: "打开“迁移升级脚本”" });
+    expect(row).toHaveTextContent("已创建子对话 · 点击打开");
+    await user.click(row);
+    expect(onOpenItem).toHaveBeenCalledTimes(1);
+    expect(onOpenItem.mock.calls[0]![0]).toMatchObject({
+      kind: "fork",
+      id: "fork:fork-1",
+      decision: { forkId: "fork-1", childConversationId: "conversation-2" }
+    });
+    // A fork is not an agent and not work in flight: nothing to open a
+    // transcript for and nothing left to stop.
+    expect(onSelectAgent).not.toHaveBeenCalled();
+    expect(onStopItem).not.toHaveBeenCalled();
+    expect(within(container).queryByRole("button", { name: /中止/ })).not.toBeInTheDocument();
+  });
+
+  it("leaves a declined fork's row inert, since it created nothing to open", async () => {
+    const user = userEvent.setup();
+    const onOpenItem = vi.fn();
+    const { container } = renderContainer({
+      onOpenItem,
+      forkDecisions: [forkDecision({
+        forkId: "fork-2",
+        title: "重写导出脚本",
+        approved: false,
+        childConversationId: null
+      })]
+    });
+
+    await user.click(within(container).getByRole("button", { name: /已完成/ }));
+    // The refusal is still recorded — the model is never told the outcome, so
+    // this row is the only trace the request ever existed.
+    const detail = within(container).getByText("用户拒绝了分叉");
+    const row = detail.closest("li") as HTMLElement;
+    expect(row).toHaveTextContent("重写导出脚本");
+    expect(within(container).queryByRole("button", { name: "打开“重写导出脚本”" }))
+      .not.toBeInTheDocument();
+
+    await user.click(detail);
+    expect(onOpenItem).not.toHaveBeenCalled();
   });
 
   it("marks the row whose transcript is showing and hides the panel when closed", async () => {

@@ -1,6 +1,7 @@
 import {
   Bot,
   ChevronRight,
+  GitFork,
   Globe2,
   LoaderCircle,
   NotebookPen,
@@ -24,7 +25,7 @@ import {
 } from "../lib/taskContainer";
 import type { TaskContainerMessages, TaskItem, TaskItemState } from "../lib/taskContainer";
 import type { AgentStatus, TodoItemView } from "../lib/orchestration";
-import type { ConversationPlan, UserAbortedTaskRecord } from "../types";
+import type { ConversationPlan, ForkDecisionRecord, UserAbortedTaskRecord } from "../types";
 import type { SubagentView } from "../lib/subagents";
 import type { TerminalSessionState } from "../lib/terminal";
 import type { ShellTaskSnapshot } from "../lib/shellTasks";
@@ -69,6 +70,11 @@ export interface TaskContainerProps {
   planAwaitingApproval?: boolean;
   /** True while the conversation's run is live and the level is plan mode. */
   planDrafting?: boolean;
+  /**
+   * Fork requests this conversation raised and the user answered. Each is one
+   * finished row; an approved one is the only way into the child conversation.
+   */
+  forkDecisions?: ForkDecisionRecord[];
   /**
    * Model the conversation is on, shown by a child that bound no model of its
    * own. A role-less child runs on exactly this; its record cannot say so.
@@ -119,6 +125,7 @@ function taskItemIcon(item: TaskItem, size = 13) {
   if (kind === "workflow") return <WorkflowIcon size={size} aria-hidden="true" />;
   if (kind === "browser") return <Globe2 size={size} aria-hidden="true" />;
   if (kind === "plan") return <NotebookPen size={size} aria-hidden="true" />;
+  if (kind === "fork") return <GitFork size={size} aria-hidden="true" />;
   return <Bot size={size} aria-hidden="true" />;
 }
 
@@ -237,6 +244,9 @@ function TaskRow({
   const pageRow = (
     item.kind === "terminal" || item.kind === "browser" || item.kind === "shell"
     || item.kind === "plan"
+    // An approved fork opens the child conversation it created. A declined one
+    // created nothing, so its row is a record with nowhere to go.
+    || (item.kind === "fork" && item.decision.approved)
   ) && Boolean(onOpenItem);
   const openable = agentRow || pageRow;
   // An agent row's id *is* its agent id, so one comparison covers both the transcript case and
@@ -439,6 +449,8 @@ export function taskContainerMessages(t: ReturnType<typeof useI18n>["t"]): TaskC
       const days = Math.round(minutes / 1440);
       return t("{count} 天前更新", days === 1 ? "Updated {count} day ago" : "Updated {count} days ago", { count: days });
     },
+    forkApproved: t("已创建子对话 · 点击打开", "Child conversation created · open"),
+    forkDeclined: t("用户拒绝了分叉", "The user declined the fork"),
     userAborted: t("用户中止操作", "Operation aborted by user")
   };
 }
@@ -465,6 +477,7 @@ export function TaskContainer({
   plan = null,
   planAwaitingApproval = false,
   planDrafting = false,
+  forkDecisions,
   status = { todo: null },
   selectedAgentId,
   selectedRowId = null,
@@ -596,6 +609,7 @@ export function TaskContainer({
     plan,
     planAwaitingApproval,
     planDrafting,
+    forkDecisions,
     now
   }, taskContainerMessages(t)), [
     conversationId,
@@ -605,6 +619,7 @@ export function TaskContainer({
     browserAutomationTool,
     browserSessionId,
     browserSessions,
+    forkDecisions,
     modelRequestId,
     now,
     plan,

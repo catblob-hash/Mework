@@ -20,12 +20,22 @@ use super::project::project_messages;
 use super::protocol::{Family, NativeSearch, StepRequest, ToolSpec};
 use super::tools::{enabled_tools, tool_schema};
 
-/// Build the system prompt using host-owned prompt composition rules.
-pub(crate) fn combined_system_prompt(request: &RunModelRequest) -> String {
+/// Separator between the stable system prompt and its per-step tail; the
+/// sidecar joins the two halves with the same bytes.
+const SYSTEM_SECTION_SEPARATOR: &str = "\n\n";
+
+/// The system prompt in Claude Code's two halves: the stable prefix assembled
+/// once at run start, and the tail that can change from one step to the next.
+///
+/// Claude Code marks its `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` so the text before
+/// it keeps its cache entry when the text after it changes. Here the boundary
+/// falls after `request.system_prompt`: the conversation's own prompt with its
+/// capability addendum is fixed for the run, while conversation system
+/// contexts, the plan-mode section and the web-safety section come and go.
+pub(crate) fn system_prompt_parts(request: &RunModelRequest) -> (Option<String>, Option<String>) {
+    let stable = request.system_prompt.trim();
+    let stable = (!stable.is_empty()).then(|| stable.to_owned());
     let mut prompts = Vec::new();
-    if !request.system_prompt.trim().is_empty() {
-        prompts.push(request.system_prompt.trim().to_owned());
-    }
     for context in &request.contexts {
         if let ContextItem::System {
             content,
@@ -34,7 +44,10 @@ pub(crate) fn combined_system_prompt(request: &RunModelRequest) -> String {
         } = context
         {
             let content = content.trim();
-            if !content.is_empty() && !prompts.iter().any(|prompt| prompt == content) {
+            if !content.is_empty()
+                && stable.as_deref() != Some(content)
+                && !prompts.iter().any(|prompt| prompt == content)
+            {
                 prompts.push(content.to_owned());
             }
         }
@@ -65,7 +78,20 @@ pub(crate) fn combined_system_prompt(request: &RunModelRequest) -> String {
             prompts.push(boundary.to_owned());
         }
     }
-    prompts.join("\n\n")
+    let dynamic = (!prompts.is_empty()).then(|| prompts.join(SYSTEM_SECTION_SEPARATOR));
+    (stable, dynamic)
+}
+
+/// Build the system prompt using host-owned prompt composition rules: both
+/// halves of [`system_prompt_parts`] joined, exactly as a provider receives it.
+#[cfg(test)]
+pub(crate) fn combined_system_prompt(request: &RunModelRequest) -> String {
+    let (stable, dynamic) = system_prompt_parts(request);
+    [stable, dynamic]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(SYSTEM_SECTION_SEPARATOR)
 }
 
 /// Project tool exchanges that have not yet entered `contexts` for this round.
@@ -316,6 +342,14 @@ fn wire_reasoning_content(family: Family, reasoning_content: ReasoningContent) -
     })
 }
 
+/// Send the model's prompt-cache attribute to the sidecar.
+///
+/// Only the Messages dialect places breakpoints, so only its family receives
+/// the field; the attribute is concrete on disk and needs no default here.
+fn wire_prompt_cache(family: crate::model::ProviderFamily, prompt_cache: bool) -> Option<bool> {
+    family.prompt_cache_takes_effect().then_some(prompt_cache)
+}
+
 /// Clamp the provider's minimum output budget.
 ///
 /// OpenAI Responses rejects `max_output_tokens` below 16. Clamp by family so
@@ -387,7 +421,7 @@ pub(crate) fn build_step_request(
     let messages = hydrate_images(request, messages)?;
     super::project::enforce_frame_budget(&messages)?;
 
-    let system = combined_system_prompt(request);
+    let (system, system_dynamic) = system_prompt_parts(request);
     Ok(StepRequest {
         family,
         base_url: sidecar_base_url(base_url),
@@ -395,7 +429,8 @@ pub(crate) fn build_step_request(
         headers: BTreeMap::new(),
         settings: family_settings(&request.provider)?,
         model_id: request.model.id.clone(),
-        system: (!system.trim().is_empty()).then_some(system),
+        system,
+        system_dynamic,
         messages,
         tools: tool_specs(request),
         tool_choice: None,
@@ -404,6 +439,7 @@ pub(crate) fn build_step_request(
         temperature: None,
         reasoning: reasoning_level(request.reasoning_effort),
         reasoning_content: wire_reasoning_content(family, request.model.reasoning_content),
+        prompt_cache: wire_prompt_cache(request.provider.family, request.model.prompt_cache),
         provider_options: provider_options(
             family,
             request.model.reasoning_content,

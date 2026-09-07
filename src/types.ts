@@ -583,6 +583,12 @@ export interface ModelProfile {
   capabilities: ModelCapability[];
   /** Reasoning return form. Always concrete: discovery resolves the protocol default. */
   reasoningContent: ReasoningContent;
+  /**
+   * Whether requests carry Claude Code's prompt-cache breakpoints. Always
+   * concrete and on by default; only families where `promptCacheTakesEffect`
+   * holds put it on the wire.
+   */
+  promptCache: boolean;
 }
 
 /** Account facts the host extracted from the Codex OAuth tokens; no token material. */
@@ -1333,6 +1339,30 @@ export interface PendingForkRequest {
   prompt: string;
   inheritContext: boolean;
   requestedAt: string;
+}
+
+/**
+ * How one `fork` request ended. Mirrors `ForkDecisionRecord` in
+ * `src-tauri/src/fork_requests.rs`.
+ *
+ * The record exists for the user alone: it is the task bar's only trace that a
+ * fork was ever asked for. The model is never told the outcome, so this never
+ * reaches `task_list` or any tool receipt.
+ */
+export interface ForkDecisionRecord {
+  forkId: string;
+  workspaceId: string;
+  sourceConversationId: string;
+  /** Display-escaped title derived from the prompt when the request was raised. */
+  title: string;
+  /** The child's first user message, verbatim. */
+  prompt: string;
+  inheritContext: boolean;
+  requestedAt: string;
+  decidedAt: string;
+  approved: boolean;
+  /** Set exactly when a child conversation exists; null on a decline. */
+  childConversationId: string | null;
 }
 
 export interface ToolApprovalGrant {

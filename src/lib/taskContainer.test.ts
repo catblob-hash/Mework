@@ -20,7 +20,7 @@ import type { SubagentView } from "./subagents";
 import type { TerminalSessionState } from "./terminal";
 import type { ShellTaskSnapshot } from "./shellTasks";
 import type { BrowserStatus } from "./browser";
-import type { UserAbortedTaskRecord } from "../types";
+import type { UserAbortedTaskRecord, ForkDecisionRecord } from "../types";
 
 const abortedTask = (overrides: Partial<UserAbortedTaskRecord> = {}): UserAbortedTaskRecord => ({
   id: "abort-1",
@@ -32,6 +32,20 @@ const abortedTask = (overrides: Partial<UserAbortedTaskRecord> = {}): UserAborte
   startedAt: new Date(1_000).toISOString(),
   endedAt: new Date(6_000).toISOString(),
   reason: "userAborted",
+  ...overrides
+});
+
+const forkDecision = (overrides: Partial<ForkDecisionRecord> = {}): ForkDecisionRecord => ({
+  forkId: "fork-1",
+  workspaceId: "workspace-1",
+  sourceConversationId: "conversation-1",
+  title: "迁移升级脚本",
+  prompt: "迁移升级脚本\n把 v4 的迁移拆成两步。",
+  inheritContext: false,
+  requestedAt: "2026-07-20T01:40:00Z",
+  decidedAt: "2026-07-20T01:41:00Z",
+  approved: true,
+  childConversationId: "conversation-2",
   ...overrides
 });
 
@@ -58,7 +72,9 @@ const messages: TaskContainerMessages = {
   planAwaitingApproval: "待批准",
   planApproved: "已批准",
   planRejected: "已退回",
-  planUpdatedAgo: (minutes) => (minutes === 0 ? "刚刚更新" : `${minutes} 分钟前更新`)
+  planUpdatedAgo: (minutes) => (minutes === 0 ? "刚刚更新" : `${minutes} 分钟前更新`),
+  forkApproved: "已创建子对话 · 点击打开",
+  forkDeclined: "用户拒绝了分叉"
 };
 
 /** Pinned clock, one hour after every fixture's start time. */
@@ -788,6 +804,102 @@ describe("deriveTaskItems", () => {
     expect(later[0]!.metrics.elapsedMs).toBe(155_000);
   });
 
+  /**
+   * The model is never told how a fork ended, so the task bar is the only place
+   * the decision is recorded at all. Both outcomes have to land there — a
+   * decline that left no row would be indistinguishable from a request the host
+   * dropped.
+   */
+  it("records an approved fork as a finished row that says the child is there", () => {
+    const items = deriveTaskItems({
+      agents: [],
+      terminals: [],
+      forkDecisions: [forkDecision()],
+      now: NOW
+    }, messages);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "fork",
+      id: "fork:fork-1",
+      label: "迁移升级脚本",
+      detail: "已创建子对话 · 点击打开",
+      state: "finished",
+      error: null,
+      startedAt: "2026-07-20T01:40:00Z",
+      endedAt: "2026-07-20T01:41:00Z"
+    });
+    // A fork is not a run: it spent no tokens, called no tools and spawned no
+    // child agents, and the one interval it has measures how long the user took
+    // to answer rather than any work.
+    expect(items[0]!.metrics)
+      .toEqual({ childCount: null, tokens: null, toolCount: null, elapsedMs: null });
+    // Settled the moment it exists, so it belongs behind the finish disclosure.
+    expect(runningTaskItems(items)).toHaveLength(0);
+    expect(finishedTaskItems(items).map((item) => item.id)).toEqual(["fork:fork-1"]);
+  });
+
+  it("records a declined fork as its own row rather than dropping the request", () => {
+    const items = deriveTaskItems({
+      agents: [],
+      terminals: [],
+      forkDecisions: [forkDecision({
+        forkId: "fork-2",
+        approved: false,
+        childConversationId: null
+      })],
+      now: NOW
+    }, messages);
+
+    expect(items[0]).toMatchObject({
+      kind: "fork",
+      id: "fork:fork-2",
+      detail: "用户拒绝了分叉",
+      // A refusal is the user's answer, not a breakage, so the row is not red.
+      state: "finished",
+      error: null
+    });
+    expect(items[0]!.kind === "fork" && items[0]!.decision.childConversationId).toBeNull();
+    expect(finishedTaskItems(items)).toHaveLength(1);
+  });
+
+  it("titles a fork by its prompt's first line when the record carries no title", () => {
+    const items = deriveTaskItems({
+      agents: [],
+      terminals: [],
+      forkDecisions: [forkDecision({ title: "" })],
+      now: NOW
+    }, messages);
+
+    expect(items[0]!.label).toBe("迁移升级脚本");
+  });
+
+  it("orders fork rows by when each decision was made, not by how they arrived", () => {
+    const items = deriveTaskItems({
+      agents: [],
+      terminals: [],
+      forkDecisions: [
+        forkDecision({ forkId: "late", decidedAt: "2026-07-20T01:50:00Z" }),
+        forkDecision({ forkId: "early", decidedAt: "2026-07-20T01:41:00Z" })
+      ],
+      now: NOW
+    }, messages);
+
+    expect(items.map((item) => item.id)).toEqual(["fork:early", "fork:late"]);
+  });
+
+  it("binds fork rows to the conversation that raised them", () => {
+    const [item] = deriveTaskItems({
+      conversationId: "conversation-1",
+      agents: [],
+      terminals: [],
+      forkDecisions: [forkDecision()],
+      now: NOW
+    }, messages);
+
+    expect(item!.conversationId).toBe("conversation-1");
+  });
+
   it("leaves the shell row's other three columns empty rather than claiming zero", () => {
     // A command spawns no subagents, spends no tokens and calls no tools.
     // Printing 0 would assert it measured them and found none.
@@ -877,6 +989,27 @@ describe("taskActivitySignature", () => {
     // no longer announces itself by the row disappearing from the set.
     expect(running).not.toBe(finished);
   });
+
+  it("notices a fork being answered, and tells the two answers apart", () => {
+    const none = taskActivitySignature({ agents: [], terminals: [] });
+    const approved = taskActivitySignature({
+      agents: [], terminals: [], forkDecisions: [forkDecision()]
+    });
+    const declined = taskActivitySignature({
+      agents: [],
+      terminals: [],
+      forkDecisions: [forkDecision({ approved: false, childConversationId: null })]
+    });
+
+    expect(none).not.toBe(approved);
+    // Approving and declining produce different rows, so the dot has to light up
+    // for whichever one the user has not looked at yet.
+    expect(approved).not.toBe(declined);
+    // The signature reads no clock, so it holds still between renders.
+    expect(approved).toBe(taskActivitySignature({
+      agents: [], terminals: [], forkDecisions: [forkDecision()], now: NOW + 60_000
+    }));
+  });
 });
 
 describe("hasAnyTask", () => {
@@ -891,6 +1024,14 @@ describe("hasAnyTask", () => {
     expect(hasAnyTask({ agents: [], terminals: [], browser: browser() })).toBe(false);
     expect(hasAnyTask({
       agents: [], terminals: [], browser: browser(), browserSessionId: "conversation-1"
+    })).toBe(true);
+    // A fork decision may be the only thing that ever happened in a conversation
+    // whose model did nothing else; the row is the sole record of it.
+    expect(hasAnyTask({ agents: [], terminals: [], forkDecisions: [forkDecision()] })).toBe(true);
+    expect(hasAnyTask({
+      agents: [],
+      terminals: [],
+      forkDecisions: [forkDecision({ approved: false, childConversationId: null })]
     })).toBe(true);
   });
 });

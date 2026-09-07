@@ -41,8 +41,8 @@ Mework is a local-first agent workbench for Windows. It pairs a React 19 interfa
 
 Grab either flavor from [Releases](../../releases):
 
-- **Installer** — `Mework_1.0.1_x64-setup.exe` (NSIS, per-machine).
-- **Portable** — `Mework_1.0.1_x64_portable.zip`: unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
+- **Installer** — `Mework_1.0.2_x64-setup.exe` (NSIS, per-machine).
+- **Portable** — `Mework_1.0.2_x64_portable.zip`: unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
 
 Both require the Microsoft Edge WebView2 Runtime, which is preinstalled on current Windows 10/11; the installer can bootstrap it if missing.
 
@@ -111,7 +111,7 @@ npm run reset:data     # wipe local app data (schema bumps are not migrated)
 
 ## Status
 
-Mework 1.0.1 targets Windows. The codebase carries cross-platform seams (keyring backends, POSIX shell paths), but only the Windows build is released and supported today.
+Mework 1.0.2 targets Windows. The codebase carries cross-platform seams (keyring backends, POSIX shell paths), but only the Windows build is released and supported today.
 
 ## License
 

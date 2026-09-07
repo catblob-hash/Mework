@@ -315,5 +315,7 @@ export const taskMessagesFixture: TaskContainerMessages = {
   planAwaitingApproval: "待批准",
   planApproved: "已批准",
   planRejected: "已退回",
-  planUpdatedAgo: (minutes) => (minutes === 0 ? "刚刚更新" : `${minutes} 分钟前更新`)
+  planUpdatedAgo: (minutes) => (minutes === 0 ? "刚刚更新" : `${minutes} 分钟前更新`),
+  forkApproved: "已创建子对话 · 点击打开",
+  forkDeclined: "用户拒绝了分叉"
 };

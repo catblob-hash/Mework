@@ -81,7 +81,8 @@ export function memoryE2EProviders(config: MemoryE2ESeedConfig): ApiProvider[] {
         name: "",
         group: "",
         capabilities: [],
-        reasoningContent: protocol === "openai_responses" ? "encrypted" : "plaintext"
+        reasoningContent: protocol === "openai_responses" ? "encrypted" : "plaintext",
+        promptCache: true
       })),
       activeModelId: "kimi-k3"
     };

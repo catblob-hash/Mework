@@ -42,6 +42,7 @@ import type {
   EnvironmentToolDefinition,
   EnvironmentToolSnapshot,
   ExecutionEnvironmentAssets,
+  ForkDecisionRecord,
   GlobalSettings,
   ImageAttachment,
   KeyToken,
@@ -83,6 +84,7 @@ import {
   knownFamilySettings,
   normalizeCapabilities,
   normalizeEndpointTypes,
+  normalizePromptCache,
   normalizeReasoningContent,
 } from "./modelCapabilities";
 import {
@@ -434,7 +436,8 @@ function normalizeModel(value: unknown, family: ProviderFamily): ModelProfile | 
     contextWindow: optionalPositiveInteger(input.contextWindow),
     maxOutputTokens: optionalPositiveInteger(input.maxOutputTokens),
     capabilities: normalizeCapabilities(Array.isArray(input.capabilities) ? input.capabilities : []),
-    reasoningContent: normalizeReasoningContent(input.reasoningContent, family)
+    reasoningContent: normalizeReasoningContent(input.reasoningContent, family),
+    promptCache: normalizePromptCache(input.promptCache)
   };
 }
 
@@ -2632,7 +2635,8 @@ export async function fetchModels(provider: ApiProvider): Promise<ModelProfile[]
   // Browser preview lacks host discovery policy and catalog. Its fixture must match
   // the live shape, including `group`, so preview grouping matches desktop behavior.
   const common = {
-    reasoningContent: normalizeReasoningContent(undefined, provider.family)
+    reasoningContent: normalizeReasoningContent(undefined, provider.family),
+    promptCache: true
   };
   if (provider.family === "anthropic") {
     return [
@@ -2911,10 +2915,6 @@ export async function listPendingForkRequests(): Promise<PendingForkRequest[]> {
   return [];
 }
 
-export async function workflowRunHistory(conversationId: string): Promise<import("./workflowRuns").WorkflowHistoryRun[]> {
-  return hasBackendRuntime() ? invoke("workflow_run_history", { conversationId }) : [];
-}
-
 export interface PendingForkStart {
   workspaceId: string;
   conversationId: string;
@@ -2925,9 +2925,17 @@ export async function listPendingForkStarts(): Promise<PendingForkStart[]> {
   return hasBackendRuntime() ? invoke<PendingForkStart[]>("list_pending_fork_starts") : [];
 }
 
+/** Every answered fork request a conversation raised, oldest first. Task-bar rows
+ * only: the model is never shown them. */
+export async function listForkDecisions(conversationId: string): Promise<ForkDecisionRecord[]> {
+  return hasBackendRuntime()
+    ? invoke<ForkDecisionRecord[]>("list_fork_decisions", { conversationId })
+    : [];
+}
+
 /** Answer one fork card. Approval creates the child and returns it; the `forkResolved`
- * push event — not this result — is what starts the child's run, so the auto-approved
- * path and this one share one starter. */
+ * push event — not this result — is what starts the child's run and carries the
+ * decision record the task bar shows. */
 export async function resolveForkRequest(
   forkId: string,
   approved: boolean
