@@ -23,9 +23,9 @@ use crate::model::{
 /// Database file name, stored beside the anchor file.
 pub const DATABASE_FILE_NAME: &str = "conversations.v1.sqlite3";
 
-/// `PRAGMA user_version`. Version 1→2 is an additive in-place upgrade that
-/// preserves released users' histories; only unknown versions are quarantined and rebuilt.
-pub const STORE_VERSION: i32 = 3;
+/// `PRAGMA user_version`. Every upgrade so far is additive and in place, so a
+/// released user's history survives; only unknown versions are quarantined and rebuilt.
+pub const STORE_VERSION: i32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +38,16 @@ pub struct PendingForkStart {
 const FORK_START_SCHEMA: &str = "CREATE TABLE pending_fork_start (
     conversation_id TEXT PRIMARY KEY REFERENCES conversation(id) ON DELETE CASCADE,
     prompt_context_id TEXT NOT NULL
+) STRICT;";
+
+/// One plan document per conversation. A `plan` write replaces the whole
+/// document, so there is no history here; the timeline keeps the calls.
+const PLAN_SCHEMA: &str = "CREATE TABLE conversation_plan (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversation(id) ON DELETE CASCADE,
+    markdown        TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('draft','approved','rejected')),
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
 ) STRICT;";
 
 /// Lifecycle status for one context row.
@@ -220,7 +230,7 @@ impl ConversationStore {
             // A current schema already exists. Empty and mismatched stores follow the paths below.
             return Ok(());
         }
-        if version == 1 || version == 2 {
+        if version == 1 || version == 2 || version == 3 {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| format!("无法开启对话库升级事务：{error}"))?;
@@ -228,7 +238,10 @@ impl ConversationStore {
                 tx.execute_batch("ALTER TABLE conversation ADD COLUMN parent_conversation_id TEXT")
                     .map_err(|error| format!("无法升级对话库结构：{error}"))?;
             }
-            tx.execute_batch(FORK_START_SCHEMA).map_err(|error| error.to_string())?;
+            if version <= 2 {
+                tx.execute_batch(FORK_START_SCHEMA).map_err(|error| error.to_string())?;
+            }
+            tx.execute_batch(PLAN_SCHEMA).map_err(|error| error.to_string())?;
             tx.pragma_update(None, "user_version", STORE_VERSION)
                 .map_err(|error| format!("无法写入对话库版本：{error}"))?;
             tx.commit()
@@ -253,6 +266,7 @@ impl ConversationStore {
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|error| format!("无法建立对话库结构：{error}"))?;
         conn.execute_batch(FORK_START_SCHEMA).map_err(|error| error.to_string())?;
+        conn.execute_batch(PLAN_SCHEMA).map_err(|error| error.to_string())?;
         conn.pragma_update(None, "user_version", STORE_VERSION)
             .map_err(|error| format!("无法写入对话库版本：{error}"))?;
         Ok(())
@@ -636,6 +650,86 @@ impl ConversationStore {
             tx.execute("DELETE FROM pending_fork_start WHERE conversation_id = ?1", [conversation_id])
                 .map_err(|error| error.to_string())?;
             Ok(establish())
+        })
+    }
+
+    /// The conversation's plan document, or `None` when none was ever written.
+    pub fn conversation_plan(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<crate::model::ConversationPlan>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT markdown, status, created_at, updated_at FROM conversation_plan WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("无法读取计划文档：{error}"))?
+        .map(|(markdown, status, created_at, updated_at)| {
+            // The column carries a CHECK constraint, so an unreadable status
+            // means the row was written by something other than this code.
+            let status = crate::model::PlanStatus::from_str(&status)
+                .ok_or_else(|| format!("计划文档状态 {status} 无法识别"))?;
+            Ok(crate::model::ConversationPlan {
+                conversation_id: conversation_id.to_owned(),
+                markdown,
+                status,
+                created_at,
+                updated_at,
+            })
+        })
+        .transpose()
+    }
+
+    /// Replaces the conversation's plan document wholesale.
+    pub fn put_conversation_plan(
+        &self,
+        plan: &crate::model::ConversationPlan,
+    ) -> Result<(), String> {
+        self.with_write_tx(|tx| {
+            tx.execute(
+                "INSERT INTO conversation_plan (conversation_id, markdown, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                     markdown = excluded.markdown,
+                     status = excluded.status,
+                     updated_at = excluded.updated_at",
+                rusqlite::params![
+                    &plan.conversation_id,
+                    &plan.markdown,
+                    plan.status.as_str(),
+                    &plan.created_at,
+                    &plan.updated_at,
+                ],
+            )
+            .map_err(|error| format!("无法写入计划文档：{error}"))?;
+            Ok(())
+        })
+    }
+
+    /// Moves an existing plan between draft, approved and rejected. Absent when
+    /// no plan was written, which the caller has already refused to act on.
+    pub fn set_conversation_plan_status(
+        &self,
+        conversation_id: &str,
+        status: crate::model::PlanStatus,
+        updated_at: &str,
+    ) -> Result<(), String> {
+        self.with_write_tx(|tx| {
+            tx.execute(
+                "UPDATE conversation_plan SET status = ?2, updated_at = ?3 WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id, status.as_str(), updated_at],
+            )
+            .map_err(|error| format!("无法更新计划文档状态：{error}"))?;
+            Ok(())
         })
     }
 
@@ -1518,7 +1612,7 @@ mod tests {
         let mut child = conversation("history");
         child.contexts.push(user("prompt", "hello"));
         store.put_conversation("ws", &child).unwrap();
-        store.lock().unwrap().execute_batch("DROP TABLE pending_fork_start; PRAGMA user_version = 2;").unwrap();
+        store.lock().unwrap().execute_batch("DROP TABLE pending_fork_start; DROP TABLE conversation_plan; PRAGMA user_version = 2;").unwrap();
         drop(store);
         let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
         assert_eq!(store.conversation(&child.id).unwrap().unwrap().contexts.len(), 1);
@@ -1527,6 +1621,84 @@ mod tests {
         store.put_fork_conversation("ws", &child, "prompt").unwrap();
         store.accept_fork_start(&child.id, None, || ()).unwrap();
         assert!(store.pending_fork_starts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_three_keeps_history_and_gains_the_plan_table() {
+        let (dir, store) = temp_store();
+        let mut child = conversation("history");
+        child.contexts.push(user("prompt", "hello"));
+        store.put_conversation("ws", &child).unwrap();
+        store.lock().unwrap().execute_batch("DROP TABLE conversation_plan; PRAGMA user_version = 3;").unwrap();
+        drop(store);
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
+        assert_eq!(store.conversation(&child.id).unwrap().unwrap().contexts.len(), 1);
+        assert_eq!(store.conversation_plan(&child.id).unwrap(), None);
+        let plan = crate::model::ConversationPlan {
+            conversation_id: child.id.clone(),
+            markdown: "# Plan".into(),
+            status: crate::model::PlanStatus::Draft,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store.put_conversation_plan(&plan).unwrap();
+        assert_eq!(store.conversation_plan(&child.id).unwrap(), Some(plan));
+    }
+
+    /// The plan is one row per conversation: rewriting it keeps the moment it
+    /// was first written, approval moves only the status, and deleting the
+    /// conversation takes the plan with it.
+    #[test]
+    fn a_conversation_plan_is_rewritten_in_place_and_dies_with_its_conversation() {
+        let (_dir, store) = temp_store();
+        let source = conversation("planned");
+        store.put_conversation("ws", &source).unwrap();
+        assert_eq!(store.conversation_plan(&source.id).unwrap(), None);
+
+        let mut plan = crate::model::ConversationPlan {
+            conversation_id: source.id.clone(),
+            markdown: "# Draft".into(),
+            status: crate::model::PlanStatus::Draft,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store.put_conversation_plan(&plan).unwrap();
+
+        // A rewrite carries a fresh `created_at`; the stored one does not move.
+        let rewritten = crate::model::ConversationPlan {
+            markdown: "# Revised".into(),
+            created_at: "2026-02-02T00:00:00Z".into(),
+            updated_at: "2026-02-02T00:00:00Z".into(),
+            ..plan.clone()
+        };
+        store.put_conversation_plan(&rewritten).unwrap();
+        plan.markdown = "# Revised".into();
+        plan.updated_at = "2026-02-02T00:00:00Z".into();
+        assert_eq!(store.conversation_plan(&source.id).unwrap(), Some(plan.clone()));
+
+        store
+            .set_conversation_plan_status(
+                &source.id,
+                crate::model::PlanStatus::Approved,
+                "2026-03-03T00:00:00Z",
+            )
+            .unwrap();
+        plan.status = crate::model::PlanStatus::Approved;
+        plan.updated_at = "2026-03-03T00:00:00Z".into();
+        assert_eq!(store.conversation_plan(&source.id).unwrap(), Some(plan));
+
+        // A status the enum cannot produce is refused by the column itself.
+        assert!(store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE conversation_plan SET status = 'whatever' WHERE conversation_id = ?1",
+                [&source.id],
+            )
+            .is_err());
+
+        store.delete_conversation(&source.id).unwrap();
+        assert_eq!(store.conversation_plan(&source.id).unwrap(), None);
     }
 
     #[test]
@@ -1574,6 +1746,9 @@ mod tests {
         let loaded = store.conversation(&source.id).expect("read").expect("preserved row");
         assert_eq!(loaded.parent_conversation_id, None);
         assert_eq!(loaded, source);
+        // Every table added after v1 exists after one open, not just the newest.
+        assert!(store.pending_fork_starts().expect("fork intents").is_empty());
+        assert_eq!(store.conversation_plan(&source.id).expect("plan"), None);
         let version: i32 = store.lock().expect("lock")
             .query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
         assert_eq!(version, STORE_VERSION);

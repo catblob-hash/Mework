@@ -304,7 +304,7 @@ fn run_background_workflow_write_roundtrip(format: ProviderFamily, base_url: &st
             approve: session_task_approval(
                 &state,
                 parent.conversation_id.clone(),
-                parent.security_level,
+                Arc::new(crate::model::LiveSecurityLevel::new(parent.security_level)),
                 parent.app_data_path.clone(),
             ),
         }),
@@ -377,7 +377,7 @@ fn run_background_workflow_write_roundtrip(format: ProviderFamily, base_url: &st
                     }
                     if state
                         .tool_prompts()
-                        .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce)
+                        .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce, None)
                         .is_ok()
                     {
                         answered.fetch_add(1, Ordering::Release);

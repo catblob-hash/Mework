@@ -144,6 +144,22 @@ pub enum AppPushEvent {
         approved: bool,
         child_conversation_id: Option<String>,
     },
+    /// The host moved a conversation to a different security level — plan
+    /// approval is the only source today. The renderer's composer menu shows a
+    /// level the user chose, so it has to hear about the ones it did not.
+    #[serde(rename_all = "camelCase")]
+    ConversationSecurityLevelChanged {
+        conversation_id: String,
+        security_level: crate::model::SecurityLevel,
+    },
+    /// The conversation's plan document changed, or was never written. The plan
+    /// panel is open while the model is writing it, so the document is pushed
+    /// rather than polled; `None` says there is nothing to show.
+    #[serde(rename_all = "camelCase")]
+    ConversationPlanUpdated {
+        conversation_id: String,
+        plan: Option<crate::model::ConversationPlan>,
+    },
 }
 
 impl AppPushEvent {
@@ -162,6 +178,12 @@ impl AppPushEvent {
                 conversation_id, ..
             }
             | AppPushEvent::ToolApprovalResolved {
+                conversation_id, ..
+            }
+            | AppPushEvent::ConversationSecurityLevelChanged {
+                conversation_id, ..
+            }
+            | AppPushEvent::ConversationPlanUpdated {
                 conversation_id, ..
             } => Some(conversation_id),
             AppPushEvent::ForkRequested { request } => Some(&request.source_conversation_id),
@@ -418,6 +440,7 @@ mod tests {
             prompt: crate::tool_prompt::PendingToolPrompt {
                 prompt_id: "prompt-1".into(),
                 tool_name: "write".into(),
+                kind: crate::tool_prompt::PromptKind::Tool,
                 label: "写入文件".into(),
                 summary: "notes.md".into(),
                 risk_level: "中".into(),

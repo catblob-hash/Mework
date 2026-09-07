@@ -55,7 +55,10 @@ const orchestrationToolNames = new Set([
   "task_wait",
   "task_list",
   "workflow",
-  "workflow_step"
+  "workflow_step",
+  "plan",
+  "exit_plan_mode",
+  "enter_plan_mode"
 ]);
 
 /**

@@ -117,7 +117,8 @@ import {
   fetchUsageStatistics
 } from "./lib/usageStatistics";
 import type { UsageStatistics } from "./lib/usageStatistics";
-import { cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, executeTool, forkConversationContexts, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationRemote, loadDocument, prepareImageAttachment, refreshCapabilities, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, runModel, skipWorkflowStep, steerModelRun, workflowStepRecord } from "./lib/runtime";
+import { cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, executeTool, forkConversationContexts, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, prepareImageAttachment, refreshCapabilities, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, runModel, skipWorkflowStep, steerModelRun, workflowStepRecord } from "./lib/runtime";
+import { SECURITY_LEVEL_OPTIONS, securityLevelLabel } from "./lib/securityLevels";
 import {
   answersFromFormattedContent,
   deriveAgentStatus,
@@ -144,6 +145,7 @@ import { BROWSER_PANEL_CHROME_HEIGHT, BrowserPanel } from "./components/BrowserP
 import { GitReviewPanel } from "./components/GitReviewPanel";
 import { ShellTaskPanel } from "./components/ShellTaskPanel";
 import { TaskPage } from "./components/TaskPage";
+import { PlanPage } from "./components/PlanPage";
 import { TerminalPanel, terminalPanelId } from "./components/TerminalPanel";
 import {
   hasBackendRuntime,
@@ -278,6 +280,7 @@ import type {
   AppSurface,
   ContextItem,
   Conversation,
+  ConversationPlan,
   ConversationSettings as ConversationSettingsType,
   GlobalSettings as GlobalSettingsType,
   ImageAttachment,
@@ -419,7 +422,7 @@ function loadTaskContainerWidth(): number {
 
 type AppShellStyle = CSSProperties & {
   "--sidebar-width": string;
-  "--task-container-width": string;
+  "--right-panel-width": string;
 };
 
 type EditorState =
@@ -490,7 +493,6 @@ export function reorderDocumentResources(
 }
 
 const reasoningEffortOptions: ReasoningEffort[] = ["disabled", "low", "medium", "high", "xhigh"];
-const securityLevelOptions: SecurityLevel[] = ["request_approval", "allow_edits", "full_access"];
 
 function failureMessage(reason: unknown, fallback: string): string {
   if (reason instanceof Error && reason.message.trim()) return reason.message;
@@ -541,6 +543,21 @@ function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
   // textarea's previously expanded height.
   textarea.style.height = "0px";
   textarea.style.height = `${Math.min(COMPOSER_TEXTAREA_MAX_HEIGHT, textarea.scrollHeight)}px`;
+}
+
+/**
+ * Trims a preview rectangle at the left edge of the task container.
+ *
+ * The container overlays the message area, and a native child webview paints above all HTML, so a
+ * preview spanning the full width would cover the panel instead of sitting beside it. A collapsed,
+ * unmounted, or unmeasured panel trims nothing.
+ */
+function previewBoundsBesideTaskContainer(
+  bounds: { x: number; y: number; width: number; height: number }
+): { x: number; y: number; width: number; height: number } {
+  const panel = window.document.getElementById(taskContainerId)?.getBoundingClientRect();
+  if (!panel || panel.width < 1 || panel.left <= bounds.x) return bounds;
+  return { ...bounds, width: Math.min(bounds.width, panel.left - bounds.x) };
 }
 
 function ErrorView({ message, onReset }: { message: string; onReset: () => void }) {
@@ -712,6 +729,13 @@ function App() {
    * queue rather than a single slot: a subagent can raise its own card while
    * the main session's is still up. */
   const [toolPrompts, setToolPrompts] = useState<Record<string, PendingToolPrompt[]>>({});
+  /** The plan document each conversation owns, by conversation id. `null` means
+   * "loaded, and there is none"; a missing key means "not loaded yet". Host
+   * state rather than document state, so it is fetched and pushed, never saved. */
+  const [plans, setPlans] = useState<Record<string, ConversationPlan | null>>({});
+  /** Bumped by every plan push. A load answered after a push is stale, however
+   * fresh it looked when it was issued. */
+  const planPushCountRef = useRef(0);
   /** The model's fork requests awaiting the user, oldest first; drawn by the top-right tray. */
   const [forkRequests, setForkRequests] = useState<PendingForkRequest[]>([]);
   /** Which card of the stack is shown, per conversation. Raw and unclamped —
@@ -896,6 +920,7 @@ function App() {
   );
   const gitReviewPanelOpen = mainPaneView.kind === "review";
   const activeGitReviewView = mainPaneView.kind === "review" ? mainPaneView.view : null;
+  const planPageOpen = mainPaneView.kind === "plan";
   const taskContainerVisible = taskContainerOpen
     && appSurface.kind === "workspace"
     && Boolean(activeConversationId);
@@ -920,6 +945,15 @@ function App() {
     const conversationId = activeConversationIdRef.current;
     if (conversationId) dispatchMainPane({ type: "back", conversationId });
   }, [dispatchMainPane]);
+
+  /**
+   * The two right-hand panels overlay the same strip of the message area, so opening one closes the
+   * other. Every open path goes through these two, not through the raw setters.
+   */
+  const openTaskContainer = useCallback(() => {
+    setConversationSettingsOpen(false);
+    setTaskContainerOpen(true);
+  }, []);
 
   const updateSidebarWidth = useCallback((width: number) => {
     const nextWidth = clampSidebarWidth(width);
@@ -1096,11 +1130,13 @@ function App() {
   const decideToolPrompt = useCallback((
     conversationId: string,
     promptId: string,
-    decision: ToolPromptDecision
+    decision: ToolPromptDecision,
+    /** Only a denied plan-exit card carries one: what the model should change. */
+    feedback?: string
   ) => {
     const waiter = manualToolPromptsRef.current.get(promptId);
     manualToolPromptsRef.current.delete(promptId);
-    const answered = resolveToolPrompt(promptId, decision);
+    const answered = resolveToolPrompt(promptId, decision, feedback);
     if (waiter) {
       answered.then(waiter.resolve, waiter.reject);
     } else {
@@ -1413,10 +1449,7 @@ function App() {
       // A page that has not been laid out yet measures zero, which the host would reject.
       if (!rect || rect.width < 1 || rect.height < 1) continue;
       await setBrowserPanelBounds(sessionId, {
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
+        ...previewBoundsBesideTaskContainer(rect),
         visible: true,
         occludedTop: BROWSER_PANEL_CHROME_HEIGHT
       }, epoch).catch(() => undefined);
@@ -1458,7 +1491,7 @@ function App() {
       conversationId,
       view: { kind: "preview", sessionId: targetSessionId }
     });
-    setTaskContainerOpen(true);
+    openTaskContainer();
     if (hasBackendRuntime()) {
       await publishPreviewBounds(targetSessionId, intentEpoch);
       if (
@@ -1507,6 +1540,7 @@ function App() {
     hideBuiltInBrowser,
     issueBrowserIntent,
     openBuiltInBrowser,
+    openTaskContainer,
     publishPreviewBounds,
     t
   ]);
@@ -1562,8 +1596,8 @@ function App() {
       conversationId: activeConversationId,
       view: { kind: "subagent", subagentId }
     });
-    setTaskContainerOpen(true);
-  }, [activeConversationId, browserPanelOpen, dispatchMainPane, hideBuiltInBrowser]);
+    openTaskContainer();
+  }, [activeConversationId, browserPanelOpen, dispatchMainPane, hideBuiltInBrowser, openTaskContainer]);
 
   /** Leaves whatever page is up and returns the message area to the conversation. */
   const backToConversation = useCallback(() => {
@@ -1571,6 +1605,14 @@ function App() {
     if (conversationId) dispatchMainPane({ type: "back", conversationId });
     if (browserPanelOpen) void hideBuiltInBrowser(true);
   }, [browserPanelOpen, dispatchMainPane, hideBuiltInBrowser]);
+
+  /** Counterpart to `openTaskContainer`. Collapsing the container also leaves any task page, because
+   *  the container is the only way back to one. */
+  const openConversationSettings = useCallback(() => {
+    closeTaskContainer();
+    backToConversation();
+    setConversationSettingsOpen(true);
+  }, [backToConversation, closeTaskContainer]);
 
   useEffect(() => {
     if (!browserPanelOpen) return;
@@ -1695,6 +1737,12 @@ function App() {
         conversationId,
         view: { kind: "shell", shellTaskId: item.shell.shellTaskId }
       });
+      return;
+    }
+    if (item.kind === "plan") {
+      setConversationSettingsOpen(false);
+      if (browserPanelOpen) void hideBuiltInBrowser(false);
+      dispatchMainPane({ type: "show", conversationId, view: { kind: "plan" } });
       return;
     }
     if (item.kind === "browser") await openBrowserTab(item.sessionId);
@@ -1829,6 +1877,32 @@ function App() {
       closeToolPrompt(event.conversationId, event.promptId);
       return;
     }
+    // The host moved the conversation into or out of plan mode on its own. It has
+    // already committed the level, so this mirrors it into the read model without
+    // writing back — persisting here would race the host's own write.
+    if (event.type === "conversationSecurityLevelChanged") {
+      documentStore.update((current) => current ? {
+        ...current,
+        workspaces: current.workspaces.map((workspace) => ({
+          ...workspace,
+          conversations: workspace.conversations.map((conversation) => (
+            conversation.id === event.conversationId
+            && conversation.settings.securityLevel !== event.securityLevel
+              ? {
+                ...conversation,
+                settings: { ...conversation.settings, securityLevel: event.securityLevel }
+              }
+              : conversation
+          ))
+        }))
+      } : current);
+      return;
+    }
+    if (event.type === "conversationPlanUpdated") {
+      planPushCountRef.current += 1;
+      setPlans((current) => ({ ...current, [event.conversationId]: event.plan }));
+      return;
+    }
     // Fork cards are global: the tool call that raised one has already returned, so the
     // card belongs to no run and the tray draws it whichever conversation is open.
     if (event.type === "forkRequested") {
@@ -1956,8 +2030,20 @@ function App() {
   const activeWorkspace = draftActive
     ? document?.workspaces.find((workspace) => workspace.id === draftConversation?.workspaceId) ?? null
     : persisted.workspace;
+  /**
+   * The landing card belongs to the moment of arriving at an empty conversation. Once this visit has
+   * had content, an emptied timeline stays a timeline; leaving for another conversation or another
+   * page and coming back is what makes the card eligible again.
+   */
+  const [landingCardSuppressed, setLandingCardSuppressed] = useState(false);
+  useEffect(() => { setLandingCardSuppressed(false); }, [activeConversationId, appSurface.kind]);
+  useEffect(() => {
+    if (activeConversation?.contexts.length) setLandingCardSuppressed(true);
+  }, [activeConversation]);
   /** Read statistics only when the empty timeline card appears, including when a fresh draft is opened. */
-  const usageCardVisible = Boolean(activeConversation && activeConversation.contexts.length === 0);
+  const usageCardVisible = Boolean(
+    activeConversation && activeConversation.contexts.length === 0 && !landingCardSuppressed
+  );
   useEffect(() => {
     if (!usageCardVisible) return;
     let cancelled = false;
@@ -2185,13 +2271,7 @@ function App() {
     const tokens = estimateContextsTokens(contexts);
     return { tokens, estimated: true, ...activeProjectionTarget };
   }, [activeProjectionTarget]);
-  const securityLevelLabel = (level: SecurityLevel): string => (
-    level === "request_approval"
-      ? t("请求批准", "Ask for approval")
-      : level === "allow_edits"
-        ? t("允许编辑", "Allow edits")
-        : t("完全访问", "Full access")
-  );
+  const securityLevelLabelFor = (level: SecurityLevel): string => securityLevelLabel(level, t);
   const reasoningEffortLabel = (effort: ReasoningEffort): string => (
     effort === "disabled" ? t("关闭思考", "Disabled")
       : effort === "low" ? t("低", "Low")
@@ -2245,8 +2325,8 @@ function App() {
   ]);
   const activeComposerStopsRun = !activeComposerQueuesMessage
     && activeModelRunning;
-  const activeSecurityLevelLabel = securityLevelLabel(
-    activeConversation?.settings.securityLevel ?? securityLevelOptions[0]
+  const activeSecurityLevelLabel = securityLevelLabelFor(
+    activeConversation?.settings.securityLevel ?? SECURITY_LEVEL_OPTIONS[0]
   );
   const activeReasoningEffort = activeConversation?.settings.reasoningEffort ?? reasoningEffortOptions[0];
   const activeReasoningEffortLabel = reasoningEffortLabel(activeReasoningEffort);
@@ -2316,6 +2396,16 @@ function App() {
     for (let index = queue.length - 1; index >= 0; index -= 1) {
       const prompt = queue[index];
       if (navigatedToolPromptIdsRef.current.has(prompt.promptId)) continue;
+      // A plan-exit card is answered on the plan page, because the answer is
+      // "is this plan right" and the plan is not in the timeline. It is shown
+      // without opening the task container: the plan is the subject here, not
+      // the roster of running work.
+      if (prompt.kind === "plan_exit") {
+        navigatedToolPromptIdsRef.current.add(prompt.promptId);
+        setToolPromptCursors((current) => ({ ...current, [conversationId]: index }));
+        dispatchMainPane({ type: "show", conversationId, view: { kind: "plan" } });
+        break;
+      }
       if (!prompt.sourceAgent && !prompt.sourceCallId) {
         navigatedToolPromptIdsRef.current.add(prompt.promptId);
         continue;
@@ -2327,7 +2417,7 @@ function App() {
       openSubagentPanel(target.id);
       break;
     }
-  }, [activeConversation?.id, openSubagentPanel, subagents, toolPrompts]);
+  }, [activeConversation?.id, dispatchMainPane, openSubagentPanel, subagents, toolPrompts]);
   /**
    * Sends the panel's Skip to the run that owns the step.
    *
@@ -2408,13 +2498,13 @@ function App() {
    * scroll waits for the frame that mounts it.
    */
   const focusWorkflowRunPanel = useCallback((runId: string) => {
-    setTaskContainerOpen(true);
+    openTaskContainer();
     window.requestAnimationFrame(() => {
       window.document
         .querySelector(`[data-workflow-run="${CSS.escape(runId)}"]`)
         ?.scrollIntoView({ block: "nearest" });
     });
-  }, []);
+  }, [openTaskContainer]);
   const pendingQuestion = useStoreSelector(
     modelRunController.subscribe,
     modelRunController.current,
@@ -2529,6 +2619,27 @@ function App() {
     };
   }, [activeConversation?.id, draftActive]);
 
+  // The plan lives at the host, so it has to be fetched when a conversation
+  // becomes active; `conversationPlanUpdated` keeps it current from then on.
+  useEffect(() => {
+    const conversationId = activeConversation?.id;
+    if (!conversationId || draftActive || !hasBackendRuntime()) return undefined;
+    let cancelled = false;
+    const requestedAt = planPushCountRef.current;
+    loadConversationPlan(conversationId)
+      .then((plan) => {
+        if (cancelled) return;
+        // A push that landed while this was in flight is newer than the answer.
+        if (planPushCountRef.current !== requestedAt) return;
+        setPlans((current) => ({ ...current, [conversationId]: plan }));
+      })
+      .catch((error) => console.error("Failed to load the conversation plan", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeConversation?.id, draftActive]);
+
+  const activePlan = activeConversationId ? plans[activeConversationId] ?? null : null;
   const activeShellTasks = useMemo(() => {
     if (!activeConversation) return [];
     return shellTasks.filter((task) => task.conversationId === activeConversation.id);
@@ -2548,8 +2659,11 @@ function App() {
     if (mainPaneView.kind === "subagent") return mainPaneView.subagentId;
     if (mainPaneView.kind === "preview") return `preview:${mainPaneView.sessionId}`;
     if (mainPaneView.kind === "shell") return mainPaneView.shellTaskId;
+    if (mainPaneView.kind === "plan") return "plan";
     return null;
   }, [mainPaneView]);
+  /** True while a plan-exit card is waiting on this conversation's plan. */
+  const planAwaitingApproval = activeToolPrompt?.kind === "plan_exit";
   /** Everything the conversation currently has running, as one set of inputs. */
   const taskSources = useMemo<TaskSources>(() => ({
     conversationId: activeConversation?.id,
@@ -2562,15 +2676,19 @@ function App() {
     browserAutomationStopping: activeBrowserAutomationStopping,
     modelRequestId: activeConversation ? modelRunController.current()[activeConversation.id]?.requestId ?? null : null,
     userAbortedTasks: activeConversation?.userAbortedTasks ?? [],
-    inheritedModelId: activeModelChoice?.model.id ?? null
+    inheritedModelId: activeModelChoice?.model.id ?? null,
+    plan: activePlan,
+    planAwaitingApproval
   }), [
     activeBrowserAutomationStopping,
     activeBrowserSessions,
     activeConversation,
     activeModelChoice,
+    activePlan,
     activePlaywrightTool,
     activeShellTasks,
     activeTaskTerminals,
+    planAwaitingApproval,
     subagents
   ]);
   const taskUnreadInput = useMemo(() => ({
@@ -2696,8 +2814,9 @@ function App() {
     if (!isTauriRuntime() || !browserPanelOpen || !sessionId) return;
     const intent = browserController.currentIntent(sessionId);
     if (intent?.desired !== "open") return;
+    const visible = previewBoundsBesideTaskContainer(bounds);
     void setBrowserPanelBounds(sessionId, {
-      ...bounds,
+      ...visible,
       visible: true,
       occludedTop: BROWSER_PANEL_CHROME_HEIGHT
     }, intent.epoch).then((status) => {
@@ -2708,6 +2827,25 @@ function App() {
       browserController.updateStatuses((current) => ({ ...current, [sessionId]: status }));
     }).catch(() => undefined);
   }, [browserController, browserIntentIsCurrent, browserPanelOpen]);
+
+  /**
+   * The task container overlays the message area instead of taking width from it, so the preview
+   * page's own `ResizeObserver` never sees the panel open, close, or get dragged. Watching the panel
+   * itself covers all three, and tracks the native page through the collapse transition.
+   */
+  useEffect(() => {
+    const panel = window.document.getElementById(taskContainerId);
+    if (!panel || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      const sessionId = browserController.visibleSession();
+      if (!sessionId) return;
+      const intent = browserController.currentIntent(sessionId);
+      if (intent?.desired !== "open") return;
+      void publishPreviewBounds(sessionId, intent.epoch);
+    });
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [activeConversationId, appSurface.kind, browserController, draftActive, publishPreviewBounds]);
 
   // The main area only shows an agent that still exists. A selection made while
   // the call was streaming follows the agent to its persisted record, whose view
@@ -2728,6 +2866,20 @@ function App() {
       });
     }
   }, [activeConversationId, dispatchMainPane, selectedSubagentId, subagents]);
+
+  // The plan page only stays up while there is a plan. Clearing the plan — the
+  // host discarding it once implementation starts — would otherwise leave an
+  // empty page with no row left in the task bar to explain it. A plan that has
+  // not been fetched yet is unknown, not absent: a card re-opened after a
+  // reload navigates here before the fetch answers.
+  const activePlanKnownAbsent = activeConversationId
+    ? plans[activeConversationId] === null
+    : false;
+  useEffect(() => {
+    const conversationId = activeConversationId;
+    if (!conversationId || !planPageOpen || !activePlanKnownAbsent) return;
+    dispatchMainPane({ type: "back", conversationId });
+  }, [activeConversationId, activePlanKnownAbsent, dispatchMainPane, planPageOpen]);
 
   const updateConversation = useCallback(
     (
@@ -3176,12 +3328,16 @@ function App() {
 
   const updateActiveConversation = useCallback(
     (updater: (conversation: Conversation) => Conversation) => {
-      // Apply the same updater to draft projections so settings surfaces need not special-case drafts.
+      // Apply the same updater to draft projections so settings and timeline surfaces need not
+      // special-case drafts. Settings and content are the draft's own; `worktree` is not, because a
+      // worktree belongs to a persisted conversation id and the draft carries `worktreeRequested`.
       const draft = draftConversationRef.current;
       if (draft && isDraftConversationId(activeConversationIdRef.current)) {
-        setDraftConversation((current) => (current
-          ? { ...current, settings: updater(draftAsConversation(current, "")).settings }
-          : current));
+        setDraftConversation((current) => {
+          if (!current) return current;
+          const updated = updater(draftAsConversation(current, ""));
+          return { ...current, settings: updated.settings, contexts: updated.contexts };
+        });
         return;
       }
       if (!activeWorkspaceId || !activeConversationId) return;
@@ -3657,7 +3813,10 @@ function App() {
     source: NewConversationSource = "global",
     settingsOverride?: ConversationSettingsType,
     runTargetOverride?: RunTargetType | null,
-    parentConversationId: string | null = null
+    parentConversationId: string | null = null,
+    // A materialized draft brings the content the user wrote before sending. Seeding it here rather
+    // than writing it afterwards lets `conversationSync.created` carry it to the host in one piece.
+    initialContexts: ContextItem[] = []
   ): string | null => {
     if (!document) return null;
     const requestedId = workspaceId ?? activeWorkspaceId;
@@ -3682,7 +3841,7 @@ function App() {
         createdAt: now,
         updatedAt: now,
         settings: resolvedSettings,
-        contexts: [],
+        contexts: initialContexts,
         queuedMessages: [],
         branches: [],
         userAbortedTasks: [],
@@ -3753,7 +3912,8 @@ function App() {
       settings,
       createdAt: new Date().toISOString(),
       worktreeRequested: false,
-      runTarget: null
+      runTarget: null,
+      contexts: []
     });
     setActiveWorkspaceId(draftWorkspaceId);
     setActiveConversationId(DRAFT_CONVERSATION_ID);
@@ -3781,7 +3941,7 @@ function App() {
     const draft = draftConversationRef.current;
     if (!draft) return null;
     const workspaceId = draft.workspaceId ?? TEMPORARY_WORKSPACE_ID;
-    const created = createConversation(workspaceId, "global", draft.settings, draft.runTarget);
+    const created = createConversation(workspaceId, "global", draft.settings, draft.runTarget, null, draft.contexts);
     if (!created) return null;
     composerController.updateDrafts((current) => {
       const pending = current[DRAFT_CONVERSATION_ID];
@@ -3875,10 +4035,9 @@ function App() {
     shortcutActionsRef.current = {
       "app.settings.open": () => openGlobalSettings("conversation_presets"),
       "app.conversation_settings.open": () => {
-        backToConversation();
         if (browserPanelOpen) void closeBuiltInBrowser();
         setAppSurface({ kind: "workspace" });
-        setConversationSettingsOpen(true);
+        openConversationSettings();
       },
       "app.zoom.in": () => adjustZoom(ZOOM_STEP),
       "app.zoom.out": () => adjustZoom(-ZOOM_STEP),
@@ -4299,7 +4458,13 @@ function App() {
   };
 
   const deleteContext = (item: ContextItem) => {
-    if (!activeConversation || !activeWorkspaceId || contextMutationIsBlocked(activeConversation.id)) return;
+    const workspaceId = activeWorkspaceId;
+    // A draft has no workspace until it is sent, yet its hand-written content is still deletable.
+    if (
+      !activeConversation
+      || (!workspaceId && !draftActive)
+      || contextMutationIsBlocked(activeConversation.id)
+    ) return;
     if (isConversationBranchFork(activeConversation, item.id)) return;
     // Confirm before computing deletion results; asking after that would perform the deletion first.
     if (
@@ -4328,9 +4493,28 @@ function App() {
           : t("撤销删除上下文", "Undo deleting the context"),
       run: () => {
         if (contextMutationIsBlocked(conversationId)) return;
+        if (draftActive) {
+          // Draft content lives in the renderer, so restore it there — and only while that draft is
+          // still open, because switching conversations discards the draft outright.
+          if (!isDraftConversationId(activeConversationIdRef.current)) return;
+          setDraftConversation((current) => {
+            if (!current || current.contexts.some((context) => context.id === item.id)) return current;
+            const contexts = [...current.contexts];
+            contexts.splice(Math.min(index, contexts.length), 0, item);
+            return { ...current, contexts };
+          });
+          setContextUsage((current) => {
+            const next = { ...current };
+            delete next[conversationId];
+            return next;
+          });
+          setPendingUndo(null);
+          return;
+        }
+        if (!workspaceId) return;
         if (stateDeletion) {
           const currentConversation = documentStore.current()?.workspaces
-            .find((workspace) => workspace.id === activeWorkspaceId)?.conversations
+            .find((workspace) => workspace.id === workspaceId)?.conversations
             .find((conversation) => conversation.id === conversationId);
           const restored = currentConversation
             ? restoreStateToolContexts(
@@ -4341,7 +4525,7 @@ function App() {
             : null;
           // Do not restore the group if task status changed; retain the undo entry instead.
           if (!restored) return;
-          updateConversation(activeWorkspaceId, conversationId, () => restored);
+          updateConversation(workspaceId, conversationId, () => restored);
           setContextUsage((current) => {
             const next = { ...current };
             delete next[conversationId];
@@ -4350,7 +4534,7 @@ function App() {
           setPendingUndo(null);
           return;
         }
-        updateConversation(activeWorkspaceId, conversationId, (conversation) => {
+        updateConversation(workspaceId, conversationId, (conversation) => {
           if (conversation.contexts.some((context) => context.id === item.id)) return conversation;
           const contexts = [...conversation.contexts];
           contexts.splice(Math.min(index, contexts.length), 0, item);
@@ -5228,10 +5412,12 @@ function App() {
   return (
     <CommonErrorBoundary>
       <div
-        className={`app-shell ${sidebarOpen ? "" : "app-shell--sidebar-closed"} ${sidebarResizing || taskContainerResizing ? "app-shell--resizing" : ""} ${appSurface.kind === "workspace" && conversationSettingsOpen && activeConversation ? "app-shell--settings-open" : ""} ${taskContainerVisible ? "app-shell--tasks-open" : ""}`}
+        className={`app-shell ${sidebarOpen ? "" : "app-shell--sidebar-closed"} ${sidebarResizing || taskContainerResizing ? "app-shell--resizing" : ""}`}
         style={{
           "--sidebar-width": `${sidebarWidth}px`,
-          "--task-container-width": `${taskContainerWidth}px`
+          "--right-panel-width": taskContainerVisible ? `${taskContainerWidth}px`
+            : appSurface.kind === "workspace" && conversationSettingsOpen && activeConversation
+              ? "var(--settings-width)" : "0px"
         } as AppShellStyle}
       >
         <Sidebar
@@ -5339,9 +5525,8 @@ function App() {
               {saveStatusChip}
               {activeConversation && (
                 <button type="button" className={`topbar-button ${conversationSettingsOpen ? "topbar-button--active" : ""}`} onClick={() => {
-                   const opening = !conversationSettingsOpen;
-                   if (opening) backToConversation();
-                   setConversationSettingsOpen(opening);
+                   if (conversationSettingsOpen) setConversationSettingsOpen(false);
+                   else openConversationSettings();
                 }}>
                   <SlidersHorizontal size={16} /> {t("本对话设置", "Conversation settings")}
                 </button>
@@ -5355,7 +5540,7 @@ function App() {
                   className={`topbar-sidebar-toggle${taskContainerVisible ? " topbar-sidebar-toggle--active" : ""}`}
                   aria-expanded={taskContainerVisible}
                   aria-controls={taskContainerId}
-                  onClick={() => (taskContainerVisible ? closeTaskContainer() : setTaskContainerOpen(true))}
+                  onClick={() => (taskContainerVisible ? closeTaskContainer() : openTaskContainer())}
                 >
                   <ListChecks size={18} />
                   {/* Unread marker: the tasks moved since the panel was last on
@@ -5384,9 +5569,9 @@ function App() {
                   <ToolApprovalDock
                     pending={activeToolPrompt}
                     stack={activeToolPromptStack}
-                    onDecide={(decision) => {
+                    onDecide={(decision, feedback) => {
                       if (activeToolPrompt) {
-                        decideToolPrompt(activeConversation.id, activeToolPrompt.promptId, decision);
+                        decideToolPrompt(activeConversation.id, activeToolPrompt.promptId, decision, feedback);
                       }
                     }}
                   />
@@ -5409,8 +5594,10 @@ function App() {
                 }
                 tools={activeConversationTools}
                 enabledTools={activeEnabledTools}
+                pathBaseDir={activeWorktree?.path ?? activeGitSnapshot?.worktreeRoot ?? activeWorkspace?.path ?? null}
                 pendingQuestionId={pendingQuestion?.context.id ?? null}
                 emptyState={usageStatsCard}
+                emptyStateVisible={!landingCardSuppressed}
                 timelineMutationLocked={activeTimelineMutationBlocked}
                 onEdit={handleContextEdit}
                 onDelete={deleteContext}
@@ -5439,10 +5626,7 @@ function App() {
                         title={activeConversation.settings.systemPrompt.trim()
                           ? activeConversation.settings.systemPrompt
                           : t("未设置基础系统提示词；点击填写", "No base system prompt is set; click to write one")}
-                        onClick={() => {
-                          backToConversation();
-                          setConversationSettingsOpen(true);
-                        }}
+                        onClick={() => openConversationSettings()}
                       >
                         <span>{activeConversation.settings.systemPrompt.trim()
                           ? activeConversation.settings.systemPrompt
@@ -5472,12 +5656,12 @@ function App() {
                 composer={(
                   <>
                     <ToolApprovalDock
-                      /* The subagent page owns this card while open to prevent duplicate dialogs with the same id from competing for focus. */
-                      pending={selectedSubagentView ? null : activeToolPrompt}
+                      /* The subagent and plan pages own this card while open to prevent duplicate dialogs with the same id from competing for focus. */
+                      pending={selectedSubagentView || planPageOpen ? null : activeToolPrompt}
                       stack={activeToolPromptStack}
-                      onDecide={(decision) => {
+                      onDecide={(decision, feedback) => {
                         if (activeToolPrompt) {
-                          decideToolPrompt(activeConversation.id, activeToolPrompt.promptId, decision);
+                          decideToolPrompt(activeConversation.id, activeToolPrompt.promptId, decision, feedback);
                         }
                       }}
                     />
@@ -5801,9 +5985,9 @@ function App() {
                       menuWidth={256}
                       sections={[{
                         id: "security",
-                        items: securityLevelOptions.map((option) => ({
+                        items: SECURITY_LEVEL_OPTIONS.map((option) => ({
                           id: option,
-                          label: securityLevelLabel(option),
+                          label: securityLevelLabelFor(option),
                           icon: <ShieldCheck size={14} />,
                           checked: activeConversation.settings.securityLevel === option,
                           onSelect: () => {
@@ -5955,10 +6139,7 @@ function App() {
                         }}
                         contextSettingsDisabled={Boolean(modelRunSummaries[activeConversation.id])
                           || activeWorkspaceLifecycleOperationRunning}
-                        onOpenContextSettings={() => {
-                          backToConversation();
-                          setConversationSettingsOpen(true);
-                        }}
+                        onOpenContextSettings={() => openConversationSettings()}
                       />
                     )}
                   </div>
@@ -6104,6 +6285,28 @@ function App() {
                 </TaskPage>
               </div>
             )}
+            {activePlan && (
+              <div className="main-pane__page" hidden={!planPageOpen}>
+                <PlanPage
+                  active={planPageOpen}
+                  domId={mainPanePageDomId(mainPaneViewKey({ kind: "plan" }))}
+                  plan={activePlan}
+                  awaitingApproval={planAwaitingApproval}
+                  attention={pageAttention}
+                  onBack={backToConversation}
+                  dock={activeToolPrompt ? (
+                    /* The exit card is answered here, beside the plan it is about. */
+                    <ToolApprovalDock
+                      pending={activeToolPrompt}
+                      stack={activeToolPromptStack}
+                      onDecide={(decision, feedback) => {
+                        decideToolPrompt(activeConversation.id, activeToolPrompt.promptId, decision, feedback);
+                      }}
+                    />
+                  ) : undefined}
+                />
+              </div>
+            )}
             </>
           ) : null}
             </>
@@ -6125,6 +6328,8 @@ function App() {
             modelRequestId={taskSources.modelRequestId}
             userAbortedTasks={activeConversation.userAbortedTasks}
             inheritedModelId={taskSources.inheritedModelId}
+            plan={activePlan}
+            planAwaitingApproval={planAwaitingApproval}
             status={agentStatus}
             selectedAgentId={selectedSubagentId}
             selectedRowId={selectedTaskRowId}
@@ -6145,8 +6350,9 @@ function App() {
           />
         )}
 
-        {appSurface.kind === "workspace" && conversationSettingsOpen && activeConversation && (
+        {appSurface.kind === "workspace" && activeConversation && (
           <ConversationSettings
+            open={conversationSettingsOpen}
             conversation={activeConversation}
             globalSettings={document.globalSettings}
             tools={activeConversationTools}

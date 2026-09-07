@@ -26,7 +26,7 @@ pub(crate) fn store(path: &Path) -> Result<std::sync::Arc<ConversationStore>, St
 
 /// Writes the database-authoritative conversation into the memory snapshot.
 /// `None` means the conversation was deleted.
-fn sync_snapshot(
+pub(crate) fn sync_snapshot(
     state: &AppState,
     path: &Path,
     workspace_id: &str,
@@ -249,6 +249,13 @@ pub(crate) fn update(
         next.contexts = current.contexts.clone();
         next.branches = current.branches.clone();
     }
+    if run_active {
+        // While a run owns the conversation the host owns its level too: the
+        // composer's level menu is disabled for the duration, so a proposal
+        // carrying a different value is a commit debounced from before a plan
+        // card moved the level, not a choice the user just made.
+        next.settings.security_level = current.settings.security_level;
+    }
     validate_incoming(state, path, workspace_id, &mut next)?;
     let definitions_changed =
         crate::storage::conversation_agent_definitions_differ(Some(&current), &next);
@@ -266,6 +273,16 @@ pub(crate) fn update(
     let stored = store
         .conversation(&next.id)?
         .ok_or_else(|| format!("对话 {} 写入后读不回来", next.id))?;
+    // The conversation's live cell outlives any one run so that workers still
+    // running from an earlier turn follow the level the user chose since. Under
+    // a run the level above was the host's own, so there is nothing to move.
+    if !run_active {
+        if let Some(live) = state.live_security_level(&next.id) {
+            if live.get() != stored.settings.security_level {
+                live.set(stored.settings.security_level);
+            }
+        }
+    }
     sync_snapshot(state, path, workspace_id, &next.id, Some(stored.clone()))?;
     Ok(stored)
 }
@@ -437,6 +454,32 @@ mod tests {
         store.put_conversation(&workspace.id, source).unwrap();
         let stored = store.conversation(&source.id).unwrap().unwrap();
         (state, anchor, workspace.id.clone(), stored)
+    }
+
+    /// While a run owns the conversation the host owns its level: a renderer
+    /// commit debounced from before a plan card moved the level must not revert
+    /// it. Once the run is over, the same write lands and reaches the cell, so
+    /// workers that outlived the turn follow the user's later choice.
+    #[test]
+    fn a_settings_write_moves_the_level_only_between_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, workspace_id, stored) = seeded(directory.path());
+        let cell = state.live_security_level_for_run(&stored.id, crate::model::SecurityLevel::Plan);
+        let (cancel, _) = state.begin_model_run("run-level", &stored.id).unwrap();
+
+        let mut proposal = stored.clone();
+        proposal.settings.security_level = crate::model::SecurityLevel::AllowEdits;
+        let written = update(&state, &anchor, &workspace_id, &proposal, &[]).unwrap();
+        assert_eq!(written.settings.security_level, stored.settings.security_level);
+        assert_eq!(cell.get(), crate::model::SecurityLevel::Plan);
+
+        state.finish_model_run("run-level", &cancel);
+        let written = update(&state, &anchor, &workspace_id, &proposal, &[]).unwrap();
+        assert_eq!(
+            written.settings.security_level,
+            crate::model::SecurityLevel::AllowEdits
+        );
+        assert_eq!(cell.get(), crate::model::SecurityLevel::AllowEdits);
     }
 
     #[test]

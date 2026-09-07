@@ -43,7 +43,7 @@ describe("ToolApprovalDock", () => {
     render(<ToolApprovalDock pending={prompt()} onDecide={onDecide} />);
 
     await user.click(screen.getByRole("button", { name: "允许" }));
-    expect(onDecide).toHaveBeenCalledWith("allow_once");
+    expect(onDecide).toHaveBeenCalledWith("allow_once", undefined);
   });
 
   it("reports a denial and a blanket allowance distinctly", async () => {
@@ -51,13 +51,13 @@ describe("ToolApprovalDock", () => {
     const onDeny = vi.fn();
     const { unmount } = render(<ToolApprovalDock pending={prompt()} onDecide={onDeny} />);
     await user.click(screen.getByRole("button", { name: "拒绝" }));
-    expect(onDeny).toHaveBeenCalledWith("deny");
+    expect(onDeny).toHaveBeenCalledWith("deny", undefined);
     unmount();
 
     const onAlways = vi.fn();
     render(<ToolApprovalDock pending={prompt()} onDecide={onAlways} />);
     await user.click(screen.getByRole("button", { name: "总是允许" }));
-    expect(onAlways).toHaveBeenCalledWith("allow_always");
+    expect(onAlways).toHaveBeenCalledWith("allow_always", undefined);
   });
 
   it("answers once even when the buttons are clicked repeatedly", async () => {
@@ -71,7 +71,7 @@ describe("ToolApprovalDock", () => {
     await user.click(screen.getByRole("button", { name: "拒绝" }));
 
     expect(onDecide).toHaveBeenCalledTimes(1);
-    expect(onDecide).toHaveBeenCalledWith("allow_once");
+    expect(onDecide).toHaveBeenCalledWith("allow_once", undefined);
     expect(screen.getByRole("status")).toHaveTextContent("已允许");
   });
 
@@ -157,7 +157,85 @@ describe("ToolApprovalDock", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "拒绝" }));
 
-    expect(onDecide).toHaveBeenNthCalledWith(1, "allow_once");
-    expect(onDecide).toHaveBeenNthCalledWith(2, "deny");
+    expect(onDecide).toHaveBeenNthCalledWith(1, "allow_once", undefined);
+    expect(onDecide).toHaveBeenNthCalledWith(2, "deny", undefined);
+  });
+
+  it("asks the exit question instead of a tool question, and offers both ways to start", () => {
+    render(
+      <ToolApprovalDock
+        pending={prompt({ toolName: "exit_plan_mode", label: "退出计划模式", kind: "plan_exit", summary: "分三步替换旧的审批闸" })}
+        onDecide={vi.fn()}
+      />
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "计划已就绪，是否开始实施？" });
+    expect(dialog).toHaveAttribute("data-approval-kind", "plan_exit");
+    // The card is about the conversation, not about one call: no risk, no label.
+    expect(dialog).not.toHaveTextContent("风险");
+    expect(dialog).not.toHaveTextContent("退出计划模式");
+
+    const actions = Array.from(dialog.querySelectorAll("footer button"))
+      .map((button) => button.textContent);
+    expect(actions).toEqual(["否，继续规划", "是，手动批准编辑", "是，自动接受编辑"]);
+  });
+
+  it("distinguishes the two ways to start implementing", async () => {
+    const user = userEvent.setup();
+    const manual = vi.fn();
+    const { unmount } = render(
+      <ToolApprovalDock pending={prompt({ kind: "plan_exit" })} onDecide={manual} />
+    );
+    await user.click(screen.getByRole("button", { name: "是，手动批准编辑" }));
+    expect(manual).toHaveBeenCalledWith("allow_once", undefined);
+    unmount();
+
+    const auto = vi.fn();
+    render(<ToolApprovalDock pending={prompt({ kind: "plan_exit" })} onDecide={auto} />);
+    await user.click(screen.getByRole("button", { name: "是，自动接受编辑" }));
+    expect(auto).toHaveBeenCalledWith("allow_always", undefined);
+  });
+
+  it("collects what to change before sending a plan back", async () => {
+    const user = userEvent.setup();
+    const onDecide = vi.fn();
+    render(<ToolApprovalDock pending={prompt({ kind: "plan_exit" })} onDecide={onDecide} />);
+
+    expect(screen.queryByRole("textbox", { name: "修改意见" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "否，继续规划" }));
+    // Revealing the box is not yet an answer; the model is still waiting.
+    expect(onDecide).not.toHaveBeenCalled();
+
+    const send = screen.getByRole("button", { name: "提交反馈" });
+    expect(send).toBeDisabled();
+    await user.type(screen.getByRole("textbox", { name: "修改意见" }), "  先补迁移脚本  ");
+    await user.click(send);
+
+    expect(onDecide).toHaveBeenCalledTimes(1);
+    expect(onDecide).toHaveBeenCalledWith("deny", "先补迁移脚本");
+    expect(screen.getByRole("status")).toHaveTextContent("已退回计划，等待模型修改");
+  });
+
+  it("offers plan mode as a yes/no with no blanket allowance", async () => {
+    const user = userEvent.setup();
+    const onDecide = vi.fn();
+    render(
+      <ToolApprovalDock
+        pending={prompt({ toolName: "enter_plan_mode", kind: "plan_enter" })}
+        onDecide={onDecide}
+      />
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "模型请求进入计划模式" });
+    const actions = Array.from(dialog.querySelectorAll("footer button"))
+      .map((button) => button.textContent);
+    expect(actions).toEqual(["否，直接开始实现", "是，进入计划模式"]);
+    // The summary of a call the model has not made yet would be misleading, so
+    // the card explains the mode instead.
+    expect(dialog).not.toHaveTextContent("src/main.rs");
+
+    await user.click(screen.getByRole("button", { name: "是，进入计划模式" }));
+    expect(onDecide).toHaveBeenCalledWith("allow_once", undefined);
+    expect(screen.getByRole("status")).toHaveTextContent("已进入计划模式");
   });
 });

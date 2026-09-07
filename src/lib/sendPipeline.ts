@@ -378,7 +378,8 @@ export function createSendPipeline(
           sourceAgent: event.sourceAgent,
           sourceCallId: event.sourceCallId,
           allowAlwaysOffered: event.allowAlwaysOffered,
-          mandatory: event.mandatory
+          mandatory: event.mandatory,
+          kind: event.kind
         });
         return;
       }

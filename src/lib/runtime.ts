@@ -33,6 +33,7 @@ import type {
   CapabilityCatalog,
   ContextItem,
   Conversation,
+  ConversationPlan,
   ConversationPreset,
   ConversationPresetSettings,
   ConversationSettings,
@@ -124,7 +125,7 @@ type PreviewRunControl = {
   steers: QueuedMessage[];
 };
 const previewRunCancellations = new Map<string, PreviewRunControl>();
-const SECURITY_LEVELS = new Set<SecurityLevel>(["request_approval", "allow_edits", "full_access"]);
+const SECURITY_LEVELS = new Set<SecurityLevel>(["request_approval", "allow_edits", "plan", "full_access"]);
 const APP_LANGUAGES = new Set<AppLanguage>(["auto", "zh-CN", "en-US"]);
 const RESOLVED_APP_LANGUAGES = new Set<ResolvedAppLanguage>(["zh-CN", "en-US"]);
 const THEME_PREFERENCES = new Set<ThemePreference>(["day", "night", "system"]);
@@ -147,8 +148,7 @@ function normalizeToolDescriptionFileId(value: unknown): string | null {
 function normalizeConversationPresetSettings(
   value: unknown,
   fallback: ConversationPresetSettings,
-  knownToolNames: ReadonlySet<string>,
-  providers: ApiProvider[]
+  knownToolNames: ReadonlySet<string>
 ): ConversationPresetSettings {
   const input = record(value) ?? {};
   const enabledTools = Array.isArray(input.enabledTools)
@@ -162,7 +162,6 @@ function normalizeConversationPresetSettings(
       ?? fallback.toolDescriptionFileId,
     agentDefinitions: normalizeAgentDefinitions(
       input.agentDefinitions,
-      providers,
       fallback.agentDefinitions
     ),
     // Absence means false: a role is required, so a silent preset must not route
@@ -184,8 +183,7 @@ function normalizeConversationPresetSettings(
 function normalizeConversationPreset(
   value: unknown,
   fallbackSettings: ConversationPresetSettings,
-  knownToolNames: ReadonlySet<string>,
-  providers: ApiProvider[]
+  knownToolNames: ReadonlySet<string>
 ): ConversationPreset | null {
   const input = record(value);
   const id = optionalPresetId(input?.id);
@@ -195,7 +193,7 @@ function normalizeConversationPreset(
     name: typeof input.name === "string" ? input.name : "",
     description: typeof input.description === "string" ? input.description : "",
     settings: normalizeConversationPresetSettings(
-      input.settings, fallbackSettings, knownToolNames, providers
+      input.settings, fallbackSettings, knownToolNames
     )
   };
 }
@@ -609,7 +607,6 @@ function normalizeConversationWebSearch(
 
 function normalizeAgentDefinitions(
   value: unknown,
-  providers: ApiProvider[],
   fallback: AgentDefinition[]
 ): AgentDefinition[] {
   const source = Array.isArray(value) ? value : fallback;
@@ -677,19 +674,18 @@ function normalizeAgentDefinitions(
     } else if (modelInput?.kind === "explicit") {
       const providerId = typeof modelInput.providerId === "string" ? modelInput.providerId : "";
       const modelId = typeof modelInput.modelId === "string" ? modelInput.modelId : "";
-      const provider = providers.find((item) => item.id === providerId);
-      // Demote only bindings whose provider or model row is missing. Remove stale
-      // IDs so a future row with the same ID cannot silently regain the binding.
-      // A disabled provider still exists, so its binding is retained for re-enabling.
-      // This must match `storage::demote_dangling_agent_bindings` exactly because both
-      // sides derive the same persisted value.
+      // Only the SHAPE is checked here. A pair that does not currently resolve is
+      // kept verbatim: at rest there is no way to tell "the provider is signed
+      // out and has not fetched its catalog" from "this model is gone forever",
+      // and discarding the user's choice over the first case is the worse
+      // mistake — a seeded role would lose its model before the user ever logs
+      // in. Availability is asked at render and at call time instead, so the
+      // role recovers by itself. Mirrors `storage::validate_agent_definition_list`.
       modelSelection = (
         !providerId
         || providerId.trim() !== providerId
         || !modelId
         || modelId.trim() !== modelId
-        || !provider
-        || !provider.models.some((model) => model.id === modelId)
       ) ? { kind: "unavailable" } : { kind: "explicit", providerId, modelId };
     } else {
       continue;
@@ -982,10 +978,6 @@ function normalizeGlobalSettings(
   knownToolNames: ReadonlySet<string>
 ): GlobalSettings {
   const input = record(value) ?? {};
-  // Providers are resolved BEFORE the presets that reference them: a role's
-  // explicit provider/model pair is validated against this list, so normalizing
-  // presets first would check every role against an empty catalogue and drop
-  // them all.
   const seenProviderIds = new Set<string>();
   // Providers are user-created except the built-in Codex and Claude Agent rows,
   // which `ensureCodexProvider` and `ensureClaudeAgentProvider` keep present.
@@ -1007,13 +999,13 @@ function normalizeGlobalSettings(
   const conversationPresets = (Array.isArray(input.conversationPresets)
     ? input.conversationPresets
         .map((preset) => normalizeConversationPreset(
-          preset, fallbackPresetSettings, knownToolNames, providers
+          preset, fallbackPresetSettings, knownToolNames
         ))
         .filter((preset): preset is ConversationPreset => Boolean(preset))
     : fallback.conversationPresets.map((preset) => ({
         ...preset,
         settings: normalizeConversationPresetSettings(
-          preset.settings, fallbackPresetSettings, knownToolNames, providers
+          preset.settings, fallbackPresetSettings, knownToolNames
         )
       })))
     .filter((preset) => {
@@ -1169,7 +1161,6 @@ export function normalizeDocument(value: unknown): AppDocument {
       toolDescriptionFileId: normalizeToolDescriptionFileId(settingsInput.toolDescriptionFileId),
       agentDefinitions: normalizeAgentDefinitions(
         settingsInput.agentDefinitions,
-        globalSettings.apiProviders,
         []
       ),
       // As for presets, absence means false and requires a role.
@@ -1914,9 +1905,13 @@ export async function requestToolApproval(request: ToolExecutionRequest): Promis
  */
 export async function resolveToolPrompt(
   promptId: string,
-  decision: ToolPromptDecision
+  decision: ToolPromptDecision,
+  /** Only a denied plan-exit card carries one: what the model should change. */
+  feedback?: string
 ): Promise<ToolApprovalGrant> {
-  if (hasBackendRuntime()) return invoke<ToolApprovalGrant>("resolve_tool_prompt", { promptId, decision });
+  if (hasBackendRuntime()) {
+    return invoke<ToolApprovalGrant>("resolve_tool_prompt", { promptId, decision, feedback });
+  }
   if (decision === "deny") throw new Error("用户拒绝了这次工具执行");
   return { nonce: createId("preview-approval"), expiresInMs: 90_000 };
 }
@@ -2896,6 +2891,15 @@ export async function listPendingToolPrompts(): Promise<
     );
   }
   return [];
+}
+
+/** Load the conversation's plan document, or null when it has none. The plan is
+ * host state, not part of the document snapshot, so browser preview has none. */
+export async function loadConversationPlan(conversationId: string): Promise<ConversationPlan | null> {
+  if (hasBackendRuntime()) {
+    return invoke<ConversationPlan | null>("load_conversation_plan", { conversationId });
+  }
+  return null;
 }
 
 /** List the model's fork requests still waiting for the user, oldest first. The card

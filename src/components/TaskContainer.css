@@ -1,11 +1,16 @@
 /* Task container: one row per subagent, workflow and terminal process. */
+/* Shares the reserved right track with settings, but slides independently.
+   Animate right instead of width to preserve row layout throughout the exit. */
 .task-container {
-  grid-column: 4; height: 100%; min-height: 0; position: relative;
+  position: absolute; z-index: 601; top: 0; right: 0; bottom: 0; min-height: 0;
   display: flex; flex-direction: column;
   background: var(--sidebar); border-left: 1px solid var(--border);
+  box-shadow: -15px 0 45px var(--color-000000-ap13);
   overflow: hidden;
+  transition: right var(--right-panel-duration) var(--right-panel-easing), visibility 0s;
 }
-.task-container--closed { width: 0 !important; border-left-width: 0; }
+.task-container--closed { right: calc(-1 * var(--task-panel-width)); z-index: 600; visibility: hidden; pointer-events: none; transition-delay: 0s, var(--right-panel-duration); }
+.app-shell--resizing .task-container { transition: none; }
 
 .task-container-resize-handle { position: absolute; z-index: 24; top: 0; left: 0; width: 8px; height: 100%; cursor: col-resize; touch-action: none; }
 .task-container-resize-handle::after { content: ""; position: absolute; top: 0; left: 0; width: 2px; height: 100%; background: var(--focus); opacity: 0; transition: opacity .14s ease; }

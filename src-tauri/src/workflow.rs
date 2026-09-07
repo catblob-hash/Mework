@@ -374,7 +374,7 @@ pub(crate) fn run_workflow_tool_with_deadline(
         .find(|tool| tool.name == call.name)
         .ok_or_else(|| format!("Workflow tool {} has no trusted descriptor", call.name))?;
     let decision = crate::security::classify_model_call(
-        request.security_level,
+        request.effective_security_level(),
         std::path::Path::new(&request.workspace_path),
         std::path::Path::new(&request.app_data_path),
         &execution_request,

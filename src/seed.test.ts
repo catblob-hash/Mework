@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 // Vite's ?raw import loads Rust source as plain text for cross-language constant alignment.
 // It needs neither Node types nor compilation.
 import storageSource from "../src-tauri/src/storage.rs?raw";
-import { createSeedDocument } from "./seed";
+import { CLAUDE_CODE_PRESET_ID, CODEX_PRESET_ID, createSeedDocument } from "./seed";
 import { implicitConversationPreset, preferredShellToolName } from "./lib/conversationPresets";
 import { toolCatalog } from "./seed";
 import { defaultConversationWebSearchSettings, normalizeDocument } from "./lib/runtime";
@@ -23,8 +23,9 @@ describe("seed document", () => {
       resolvedAppLanguage: "zh-CN",
       theme: "system"
     });
-    expect(document.globalSettings.defaultConversationPresetId).toBe("");
-    expect(document.globalSettings.conversationPresets).toEqual([]);
+    expect(document.globalSettings.defaultConversationPresetId).toBe(CLAUDE_CODE_PRESET_ID);
+    expect(document.globalSettings.conversationPresets.map((preset) => preset.id))
+      .toEqual([CODEX_PRESET_ID, CLAUDE_CODE_PRESET_ID]);
     // Seed conversations always use the most cautious security level.
     expect(document.workspaces.flatMap((workspace) => workspace.conversations)
       .every((conversation) => conversation.settings.securityLevel === "request_approval")).toBe(true);
@@ -53,12 +54,21 @@ describe("seed document", () => {
     });
     expect(settings.apiProviders[1]).toMatchObject({
       family: "claude_agent",
-      enabled: false,
+      enabled: true,
       name: "Claude Agent"
     });
     expect(settings.apiProviders[0].id).toMatch(/^provider_/u);
     expect(settings.apiProviders[1].id).toMatch(/^provider_/u);
-    expect(settings.activeProviderId).toBeNull();
+    // Codex has no catalog until the user completes its OAuth flow.
+    expect(settings.apiProviders[0].models).toEqual([]);
+    // Claude Agent's catalog is a local built-in table, so it ships installed.
+    const claudeModelIds = settings.apiProviders[1].models.map((model) => model.id);
+    expect(claudeModelIds).toContain("claude-opus-5");
+    expect(claudeModelIds).toContain("claude-sonnet-5");
+    expect(claudeModelIds).toContain("claude-haiku-4-5");
+    expect(claudeModelIds.filter((id) => id.includes("[1m]"))).toEqual([]);
+    expect(settings.apiProviders[1].activeModelId).toBe(claudeModelIds[0]);
+    expect(settings.activeProviderId).toBe(settings.apiProviders[1].id);
     // Keep the TypeScript seed catalog aligned with Rust's product default.
     expect(settings.webSearch.providers.map((provider) => provider.kind)).toEqual([
       "zhipu", "tavily", "searxng", "exa", "exa-mcp", "bocha", "querit", "fetch", "jina", "firecrawl"
@@ -74,7 +84,7 @@ describe("seed document", () => {
 
   it("ships workspace, web, and host-run orchestration tools", () => {
     const tools = createSeedDocument().tools;
-    expect(tools).toHaveLength(27);
+    expect(tools).toHaveLength(30);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     const webTools = tools.filter((tool) => tool.category === "web");
     expect(webTools.map((tool) => tool.name)).toEqual(["web_search", "web_fetch", "playwright"]);
@@ -84,7 +94,8 @@ describe("seed document", () => {
     const orchestrationTools = tools.filter((tool) => tool.category === "orchestration");
     expect(orchestrationTools.map((tool) => tool.name)).toEqual([
       "agent_spawn", "send_message", "followup_task", "task_wait", "task_list",
-      "skill", "workflow", "todo", "ask_user", "fork"
+      "skill", "workflow", "todo", "ask_user", "fork",
+      "plan", "exit_plan_mode", "enter_plan_mode"
     ]);
     expect(orchestrationTools.filter((tool) => tool.dangerous).map((tool) => tool.name)).toEqual(["workflow"]);
     expect(tools.find((tool) => tool.name === "agent_spawn")).toMatchObject({ label: "子代理" });
@@ -116,11 +127,46 @@ describe("seed document", () => {
     expect(document.capabilities.skills).toEqual([]);
   });
 
-  it("starts every user-managed preset domain empty", () => {
+  it("ships the two shipped presets and no other user-managed preset domain", () => {
     const document = createSeedDocument();
     const settings = document.globalSettings;
-    expect(settings.conversationPresets).toEqual([]);
-    expect(settings.defaultConversationPresetId).toBe("");
+    const [codex, claudeCode] = settings.conversationPresets;
+    expect([codex.name, claudeCode.name]).toEqual(["Codex", "Claude Code"]);
+    expect(settings.defaultConversationPresetId).toBe(CLAUDE_CODE_PRESET_ID);
+
+    // Each fleet is exactly three named roles bound to explicit models, thinking
+    // on, tools inherited from the preset, and nothing said about itself.
+    expect(codex.settings.agentDefinitions.map((role) => role.name))
+      .toEqual(["sol", "terra", "luna"]);
+    expect(claudeCode.settings.agentDefinitions.map((role) => role.name))
+      .toEqual(["opus", "sonnet", "haiku"]);
+    for (const preset of settings.conversationPresets) {
+      // No anonymous children: every subagent goes through one of the roles.
+      expect(preset.settings.allowRolelessSubagents).toBe(false);
+      // Everything on except the names the host derives for itself. The plan
+      // tools among them: they follow the security level, not a tool toggle.
+      expect(preset.settings.enabledTools).toEqual(
+        document.tools.map((tool) => tool.name).filter((name) => !(
+          document.tools.find((tool) => tool.name === name)!.category === "memory"
+          || ["skill", "task_wait", "task_list"].includes(name)
+          || ["plan", "exit_plan_mode", "enter_plan_mode"].includes(name)
+        ))
+      );
+      for (const role of preset.settings.agentDefinitions) {
+        expect(role).toMatchObject({
+          description: "",
+          effort: "medium",
+          tools: null,
+          source: "user",
+          sourceKey: "",
+          revision: 1,
+          memoryEpoch: 1,
+          memory: "none"
+        });
+        expect(role.modelSelection.kind).toBe("explicit");
+      }
+    }
+
     // Retired preset collections must not reappear, even as empty arrays.
     for (const retired of [
       "hookPresets",

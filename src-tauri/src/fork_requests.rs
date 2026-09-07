@@ -238,7 +238,7 @@ pub fn run_fork_tool(
         },
     )?;
 
-    if request.security_level == SecurityLevel::FullAccess {
+    if request.effective_security_level() == SecurityLevel::FullAccess {
         // Full access means the user delegated this class of decision. Take
         // the entry back out so a stale card can never be answered twice.
         let Some((card, spec)) = state.fork_requests().take(&card.fork_id) else {

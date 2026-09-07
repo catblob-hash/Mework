@@ -556,7 +556,20 @@ export type ReasoningContent = "plaintext" | "encrypted";
  */
 export type ReasoningForm = "plaintext" | "encrypted";
 
-export type SecurityLevel = "request_approval" | "allow_edits" | "full_access";
+export type SecurityLevel = "request_approval" | "allow_edits" | "plan" | "full_access";
+
+/**
+ * The one plan document a conversation owns while it is in plan mode.
+ * Mirrors `ConversationPlan` in the host. There is at most one per
+ * conversation: writing a plan replaces the previous body.
+ */
+export interface ConversationPlan {
+  conversationId: string;
+  markdown: string;
+  status: "draft" | "approved" | "rejected";
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface ModelProfile {
   id: string;
@@ -1294,6 +1307,13 @@ export interface PendingToolPrompt {
    * also declines blanket permission while still being an approval the level
    * decides. Full access clears every prompt except these. */
   mandatory?: boolean;
+  /**
+   * Which card this is. Plain tool approvals omit it. `plan_exit` asks whether
+   * to leave plan mode and start implementing, `plan_enter` asks whether to
+   * enter plan mode; both are answered with the same decisions but draw
+   * different copy and, for `plan_exit`, collect feedback on a denial.
+   */
+  kind?: "tool" | "plan_exit" | "plan_enter";
 }
 
 export type ToolPromptDecision = "deny" | "allow_once" | "allow_always";
@@ -1459,7 +1479,7 @@ export type ModelStreamEvent =
    * above the composer and answers with `resolveToolPrompt`; the backend worker
    * that raised it stays blocked until then. Carries no round: approval is
    * raised from the tool executor, which does not know the surrounding turn. */
-  | { type: "tool_approval_requested"; promptId: string; toolName: string; label: string; summary: string; riskLevel: string; reason: string; requester?: string; sourceAgent?: string; sourceCallId?: string; allowAlwaysOffered: boolean; mandatory?: boolean }
+  | { type: "tool_approval_requested"; promptId: string; toolName: string; label: string; summary: string; riskLevel: string; reason: string; requester?: string; sourceAgent?: string; sourceCallId?: string; allowAlwaysOffered: boolean; mandatory?: boolean; kind?: "tool" | "plan_exit" | "plan_enter" }
   /** The card for `promptId` is over. `approved` is what the host concluded,
    * which is not always what the user clicked — a cancelled run resolves its
    * outstanding cards as denied. */

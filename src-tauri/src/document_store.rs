@@ -199,8 +199,33 @@ fn open_process_lease(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn acquire_exclusive_process_lease(path: &Path) -> Result<ProcessLease, String> {
-    let file = open_process_lease(path)?;
+/// Why the exclusive app-data lease could not be taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessAuthorityError {
+    /// A live Mework process already holds the lease on this app data.
+    Contended,
+    Failed(String),
+}
+
+impl std::fmt::Display for ProcessAuthorityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contended => formatter.write_str(
+                "另一个 Mework 实例正在使用同一应用数据；为保护对话、草稿和图片附件，当前实例已拒绝启动",
+            ),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<ProcessAuthorityError> for String {
+    fn from(error: ProcessAuthorityError) -> Self {
+        error.to_string()
+    }
+}
+
+fn acquire_exclusive_process_lease(path: &Path) -> Result<ProcessLease, ProcessAuthorityError> {
+    let file = open_process_lease(path).map_err(ProcessAuthorityError::Failed)?;
     fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
         let contended = fs2::lock_contended_error();
         let is_contended = match contended.raw_os_error() {
@@ -208,10 +233,9 @@ fn acquire_exclusive_process_lease(path: &Path) -> Result<ProcessLease, String> 
             None => error.kind() == contended.kind(),
         };
         if is_contended {
-            "另一个 Mework 实例正在使用同一应用数据；为保护对话、草稿和图片附件，当前实例已拒绝启动"
-                .to_owned()
+            ProcessAuthorityError::Contended
         } else {
-            format!("无法取得 Mework 独占应用数据租约: {error}")
+            ProcessAuthorityError::Failed(format!("无法取得 Mework 独占应用数据租约: {error}"))
         }
     })?;
     Ok(ProcessLease {
@@ -236,12 +260,17 @@ impl DocumentStore {
     }
 
     /// Acquires the single-instance app-data authority before document load,
-    /// renderer startup, or any attachment command.
-    pub fn acquire_process_authority(&self, path: &Path) -> Result<(), String> {
+    /// renderer startup, or any attachment command. The failure stays typed so
+    /// the desktop launcher can tell a live sibling instance from a broken lease.
+    pub fn acquire_process_authority(&self, path: &Path) -> Result<(), ProcessAuthorityError> {
         let mut state = self.lock();
         match state.process_lease.as_ref() {
             Some(lease) if lease.document_path == path => return Ok(()),
-            Some(_) => return Err("当前独占应用数据租约属于另一应用数据路径".into()),
+            Some(_) => {
+                return Err(ProcessAuthorityError::Failed(
+                    "当前独占应用数据租约属于另一应用数据路径".into(),
+                ))
+            }
             None => {}
         }
         state.process_lease = Some(acquire_exclusive_process_lease(path)?);
@@ -676,7 +705,8 @@ mod tests {
 
         let second = DocumentStore::default();
         let error = second.acquire_process_authority(&path).unwrap_err();
-        assert!(error.contains("另一个 Mework 实例"), "{error}");
+        assert_eq!(error, super::ProcessAuthorityError::Contended);
+        assert!(error.to_string().contains("另一个 Mework 实例"), "{error}");
 
         drop(first);
         second.acquire_process_authority(&path).unwrap();
@@ -716,7 +746,7 @@ mod tests {
 
         let store = DocumentStore::default();
         let error = store.acquire_process_authority(&path).unwrap_err();
-        assert!(error.contains("另一个 Mework 实例"), "{error}");
+        assert_eq!(error, super::ProcessAuthorityError::Contended);
 
         std::fs::write(directory.path().join("authority-child-release"), b"release").unwrap();
         let status = child.wait().unwrap();

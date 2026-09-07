@@ -534,16 +534,16 @@ pub enum AgentModelSelection {
         #[serde(rename = "modelId")]
         model_id: String,
     },
-    /// The role was bound to an exact provider/model pair that no longer
-    /// EXISTS — the provider row was deleted, or the model row was removed from
-    /// under it.
+    /// A binding recorded as broken by an older build, which used to rewrite a
+    /// dangling `Explicit` pair into this and discard both IDs.
     ///
-    /// Disabled definitions do not become unavailable: their persisted binding is
-    /// retained and becomes callable again if re-enabled. Only deleted provider
-    /// or model rows are demoted to this state.
-    ///
-    /// Demotion drops the old provider and model IDs so a later row reusing an ID
-    /// cannot silently take over a binding the user was told was unavailable.
+    /// NOTHING WRITES THIS ANY MORE. An `Explicit` pair is now kept verbatim
+    /// however long it fails to resolve, because "the provider is signed out"
+    /// and "the model row is gone forever" are indistinguishable at rest, and
+    /// only one of them justifies destroying the user's choice. Resolution is
+    /// asked at call time instead, so a role recovers by itself once its model
+    /// is fetched again. The variant survives so archives written before that
+    /// change still deserialize.
     ///
     /// A role in this state is NOT callable: it is absent from the listing the
     /// model sees, and naming it fails with its own wording rather than the
@@ -1595,10 +1595,128 @@ pub enum ReasoningEffort {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityLevel {
+    Plan,
     #[default]
     RequestApproval,
     AllowEdits,
     FullAccess,
+}
+
+impl SecurityLevel {
+    /// Every level, so exhaustiveness can be asserted at run time where the
+    /// compiler cannot (serde names, the `LiveSecurityLevel` byte mapping).
+    #[cfg(test)]
+    pub const ALL: [SecurityLevel; 4] = [
+        SecurityLevel::Plan,
+        SecurityLevel::RequestApproval,
+        SecurityLevel::AllowEdits,
+        SecurityLevel::FullAccess,
+    ];
+
+    const fn as_byte(self) -> u8 {
+        match self {
+            SecurityLevel::Plan => 0,
+            SecurityLevel::RequestApproval => 1,
+            SecurityLevel::AllowEdits => 2,
+            SecurityLevel::FullAccess => 3,
+        }
+    }
+
+    const fn from_byte(byte: u8) -> SecurityLevel {
+        match byte {
+            0 => SecurityLevel::Plan,
+            2 => SecurityLevel::AllowEdits,
+            3 => SecurityLevel::FullAccess,
+            // Only `as_byte` writes the cell, so this is the `RequestApproval`
+            // arm; an impossible byte falls back to the strictest prompting
+            // level rather than widening authority.
+            _ => SecurityLevel::RequestApproval,
+        }
+    }
+}
+
+/// The level a live run is executing under right now, as opposed to the level
+/// it started with. Plan approval switches the level mid-turn, so every gate
+/// that runs after the switch must read this cell rather than the snapshot the
+/// run began with.
+pub struct LiveSecurityLevel(std::sync::atomic::AtomicU8);
+
+impl LiveSecurityLevel {
+    pub fn new(level: SecurityLevel) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(level.as_byte()))
+    }
+
+    pub fn get(&self) -> SecurityLevel {
+        SecurityLevel::from_byte(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub fn set(&self, level: SecurityLevel) {
+        self.0
+            .store(level.as_byte(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for LiveSecurityLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LiveSecurityLevel")
+            .field(&self.get())
+            .finish()
+    }
+}
+
+/// `RunModelRequest` derives `PartialEq`; compare the level the cell holds,
+/// because the atomic itself is not comparable.
+impl PartialEq for LiveSecurityLevel {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+/// Where a plan document stands with the user.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    /// Written by the model, not yet presented for approval.
+    #[default]
+    Draft,
+    Approved,
+    Rejected,
+}
+
+impl PlanStatus {
+    /// The SQLite column is a text CHECK constraint, so the stored spelling is
+    /// part of the schema rather than an implementation detail of serde.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanStatus::Draft => "draft",
+            PlanStatus::Approved => "approved",
+            PlanStatus::Rejected => "rejected",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<PlanStatus> {
+        match value {
+            "draft" => Some(PlanStatus::Draft),
+            "approved" => Some(PlanStatus::Approved),
+            "rejected" => Some(PlanStatus::Rejected),
+            _ => None,
+        }
+    }
+}
+
+/// The plan document one conversation is working from: the markdown the model
+/// writes with the `plan` tool and the user reads before approving
+/// implementation. At most one per conversation — a write replaces the whole
+/// document, so history lives in the timeline rather than here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPlan {
+    pub conversation_id: String,
+    pub markdown: String,
+    pub status: PlanStatus,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2804,8 +2922,15 @@ pub struct RunModelRequest {
     #[serde(default)]
     pub active_hooks: Vec<HookDefinition>,
     /// Trusted execution policy injected from the persisted document by Rust.
+    /// This is the level the run started with; read `effective_security_level`
+    /// for the level in force right now.
     #[serde(default)]
     pub security_level: SecurityLevel,
+    /// Shared with every descendant of this run so a mid-turn switch (plan
+    /// approval) reaches them. Absent outside a registered run, and never on
+    /// the wire — the renderer must not be able to name a level.
+    #[serde(skip)]
+    pub live_security_level: Option<std::sync::Arc<LiveSecurityLevel>>,
     /// Trusted Tauri application-data root injected by Rust. Renderer input is ignored.
     #[serde(default)]
     pub app_data_path: String,
@@ -2905,6 +3030,18 @@ impl RunModelRequest {
         self.global_memory_enabled || self.project_memory_enabled
     }
 
+    /// The security level in force for the next decision.
+    ///
+    /// Plan approval switches the level in the middle of a turn, so every gate
+    /// evaluated during a run reads this rather than `security_level`, which is
+    /// only the value the run started with.
+    pub fn effective_security_level(&self) -> SecurityLevel {
+        match &self.live_security_level {
+            Some(cell) => cell.get(),
+            None => self.security_level,
+        }
+    }
+
     /// Select the cancellation signal by round ownership.
     ///
     /// * Task rounds use only `task_cancel`.
@@ -2969,6 +3106,7 @@ impl std::fmt::Debug for RunModelRequest {
             .field("tool_count", &self.tools.len())
             .field("active_hook_count", &self.active_hooks.len())
             .field("security_level", &self.security_level)
+            .field("effective_security_level", &self.effective_security_level())
             .field("mcp_server_count", &self.mcp_servers.len())
             .field("mcp_tools", &mcp_tool_names)
             .field("subagent_depth", &self.subagent_depth)
@@ -3149,6 +3287,10 @@ pub enum ModelStreamEvent {
         prompt_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
+        /// Which card the renderer draws: an ordinary tool approval, or one of
+        /// the two plan-mode cards, which offer feedback instead of "always".
+        #[serde(default)]
+        kind: crate::tool_prompt::PromptKind,
         /// Human-facing tool label, already localized by the catalog.
         label: String,
         /// A short description of what the model is asking to do, derived from
@@ -4491,5 +4633,48 @@ mod tests {
             serde_json::to_value(with_diff).unwrap()["diff"],
             json!("--- old\n+++ new\n")
         );
+    }
+
+    /// The wire names are read by the renderer, by stored documents and by the
+    /// hook `permission_mode`, so a rename is a data migration rather than a
+    /// refactor. `ALL` is asserted to be complete here because nothing else can.
+    #[test]
+    fn security_level_wire_names_are_stable() {
+        let names: Vec<Value> = SecurityLevel::ALL
+            .iter()
+            .map(|level| serde_json::to_value(level).unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                json!("plan"),
+                json!("request_approval"),
+                json!("allow_edits"),
+                json!("full_access"),
+            ]
+        );
+        for level in SecurityLevel::ALL {
+            let name = serde_json::to_value(level).unwrap();
+            assert_eq!(
+                serde_json::from_value::<SecurityLevel>(name).unwrap(),
+                level
+            );
+        }
+        // A document written before plan mode carries no level at all, and must
+        // keep landing on the prompting level rather than the new one.
+        assert_eq!(SecurityLevel::default(), SecurityLevel::RequestApproval);
+    }
+
+    /// Plan approval switches the level in the middle of a turn, so the cell has
+    /// to survive a round trip through the byte it stores for every level, not
+    /// just the two that plan mode moves between.
+    #[test]
+    fn the_live_cell_round_trips_every_level() {
+        let cell = LiveSecurityLevel::new(SecurityLevel::Plan);
+        assert_eq!(cell.get(), SecurityLevel::Plan);
+        for level in SecurityLevel::ALL {
+            cell.set(level);
+            assert_eq!(cell.get(), level);
+        }
     }
 }

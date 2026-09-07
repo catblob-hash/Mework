@@ -475,7 +475,11 @@ describe("subagent role settings", () => {
 
     // Security policy is a preset field; the conversation drawer uses a conversation-level selector.
     const pane = presetSection(container, "安全策略");
-    expect(within(pane).getByRole("checkbox", { name: /请求批准/ })).toBeChecked();
+    expect(within(pane).getByRole("checkbox", { name: /手动/ })).toBeChecked();
+    // Plan mode is a security level of its own, offered wherever the others are.
+    expect(within(pane).getAllByRole("checkbox").map((box) => box.textContent))
+      .toHaveLength(4);
+    expect(within(pane).getByRole("checkbox", { name: /计划模式/ })).not.toBeChecked();
 
     await user.click(within(pane).getByRole("checkbox", { name: /完全访问/ }));
     expect(getSettings().conversationPresets[0].settings.securityLevel).toBe("full_access");

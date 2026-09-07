@@ -5,6 +5,7 @@ import { createTestDocument as createSeedDocument } from "../test/fixtures";
 import { ASK_USER_PENDING_OUTPUT } from "../types";
 import type { ContextItem, ToolContext } from "../types";
 import type { ConversationTurn } from "../lib/conversationTurns";
+import { applyAppearance, defaultAppearancePreferences } from "../lib/appearance";
 import { deriveWorkflowProgress } from "../lib/workflowProgress";
 import { deriveWorkflowItems } from "../lib/taskContainer";
 import { deriveWorkflowRun } from "../lib/workflowRuns";
@@ -1992,6 +1993,58 @@ describe("ContextStream", () => {
       expect(container.querySelectorAll(".tool-call-group")).toHaveLength(1);
       expect(container.querySelector('.tool-call-group [data-context-id="wf-call"]')).toBeNull();
       expect(container.querySelector('.tool-call-group [data-context-id="read-call"]')).toBeInTheDocument();
+    });
+  });
+
+  describe("path links", () => {
+    const body = "见 `src/App.tsx` 与 C:\\Windows\\notepad.exe";
+    const baseDir = "C:\\work\\mework";
+
+    const assistant = {
+      id: "assistant-paths",
+      kind: "assistant" as const,
+      content: body,
+      createdAt: "2026-09-01T00:00:00Z"
+    };
+    const user = {
+      id: "user-paths",
+      kind: "user" as const,
+      content: body,
+      createdAt: "2026-09-01T00:00:01Z"
+    };
+
+    function pathTargets(container: HTMLElement, contextId: string): string[] {
+      const card = container.querySelector<HTMLElement>(`[data-context-id="${contextId}"]`)!;
+      return [...card.querySelectorAll<HTMLElement>("[data-mework-path]")].map(
+        (node) => node.getAttribute("data-mework-path") ?? ""
+      );
+    }
+
+    afterEach(() => applyAppearance(defaultAppearancePreferences()));
+
+    it("links paths in a model reply and publishes the working directory", () => {
+      const { container } = render(
+        <ContextStream contexts={[assistant]} tools={[]} enabledTools={[]} pathBaseDir={baseDir} />
+      );
+      expect(pathTargets(container, "assistant-paths")).toEqual(["src/App.tsx", "C:\\Windows\\notepad.exe"]);
+      expect(container.querySelector('[data-context-id="assistant-paths"] .markdown-content'))
+        .toHaveAttribute("data-mework-path-base", baseDir);
+    });
+
+    /**
+     * The appearance preference routes user messages through the same Markdown
+     * renderer, so the opt-in has to be decided by the card kind rather than by
+     * the renderer itself.
+     */
+    it("never links paths a user typed, even when user Markdown is enabled", () => {
+      applyAppearance({ ...defaultAppearancePreferences(), renderUserMarkdown: true });
+      const { container } = render(
+        <ContextStream contexts={[assistant, user]} tools={[]} enabledTools={[]} pathBaseDir={baseDir} />
+      );
+      expect(pathTargets(container, "assistant-paths")).toHaveLength(2);
+      expect(pathTargets(container, "user-paths")).toEqual([]);
+      expect(container.querySelector('[data-context-id="user-paths"] .markdown-content'))
+        .not.toHaveAttribute("data-mework-path-base");
     });
   });
 });

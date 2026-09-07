@@ -238,7 +238,7 @@ describe("UpdateSettings", () => {
 
     await user.click(await screen.findByRole("button", { name: "下载更新（34.5 MiB）" }));
     expect(await screen.findByRole("button", { name: "在文件夹中显示" })).toBeInTheDocument();
-    expect(screen.getByText("便携版需要手动替换：关闭 Mework，把压缩包解压到 C:\\Program Files\\Mework 覆盖旧文件，再重新打开。")).toBeInTheDocument();
+    expect(screen.getByText("便携版需要手动替换：在托盘图标菜单选择「关闭 Mework」，把压缩包解压到 C:\\Program Files\\Mework 覆盖旧文件，再重新打开。")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "在文件夹中显示" }));
     await waitFor(() => expect(backend.installAppUpdate).toHaveBeenCalledWith(portableDownload.path));

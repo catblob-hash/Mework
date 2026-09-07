@@ -130,3 +130,44 @@ $$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$
     expect(host).toHaveAttribute("data-markdown-deferred", "true");
   });
 });
+
+describe("MarkdownContent path links", () => {
+  const sample = "见 `src/App.tsx:12` 与 C:\\Windows\\notepad.exe，注意 and/or 与 https://example.com/a/b";
+  const baseDir = "C:\\work";
+
+  function targets(container: HTMLElement): string[] {
+    return [...container.querySelectorAll<HTMLElement>("[data-mework-path]")].map(
+      (node) => node.getAttribute("data-mework-path") ?? ""
+    );
+  }
+
+  it("leaves the content untouched unless the caller opts in", () => {
+    const { container } = render(<MarkdownContent content={sample} />);
+    expect(targets(container)).toEqual([]);
+    expect(container.querySelector(".markdown-content")).not.toHaveAttribute("data-mework-path-base");
+  });
+
+  it("links only what qualifies as a path", () => {
+    const { container } = render(<MarkdownContent content={sample} linkifyPaths pathBaseDir={baseDir} />);
+    expect(targets(container)).toEqual(["src/App.tsx", "C:\\Windows\\notepad.exe"]);
+    // The line reference stays visible even though it is not sent to the host.
+    expect(container.querySelector("[data-mework-path]")).toHaveTextContent("src/App.tsx:12");
+    // The address remains an ordinary anchor for the external-link interceptor.
+    const link = container.querySelector("a");
+    expect(link).toHaveAttribute("href", "https://example.com/a/b");
+    expect(link).not.toHaveAttribute("data-mework-path");
+    expect(container.textContent).toContain("and/or");
+  });
+
+  it("publishes the base directory for the click interceptor to read", () => {
+    const { container } = render(<MarkdownContent content={sample} linkifyPaths pathBaseDir={baseDir} />);
+    expect(container.querySelector(".markdown-content")).toHaveAttribute("data-mework-path-base", baseDir);
+  });
+
+  it("keeps paths inside fenced code blocks as plain code", () => {
+    const { container } = render(
+      <MarkdownContent content={"```\nsrc/App.tsx\n```"} linkifyPaths pathBaseDir={baseDir} />
+    );
+    expect(targets(container)).toEqual([]);
+  });
+});

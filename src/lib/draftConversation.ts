@@ -1,4 +1,4 @@
-import type { Conversation, ConversationSettings, RunTarget } from "../types";
+import type { ContextItem, Conversation, ConversationSettings, RunTarget } from "../types";
 
 /**
  * Fixed ID for the renderer-owned draft conversation. It is never persisted or
@@ -22,6 +22,12 @@ export interface DraftConversationState {
   worktreeRequested: boolean;
   /** The draft's run location, persisted directly in `Conversation.runTarget` when materialized. */
   runTarget: RunTarget | null;
+  /**
+   * Content the user wrote by hand before sending anything, such as a
+   * right-click inserted message. It travels into the conversation at
+   * materialization, ahead of the first sent message.
+   */
+  contexts: ContextItem[];
 }
 
 export function isDraftConversationId(conversationId: string | null | undefined): boolean {
@@ -30,8 +36,9 @@ export function isDraftConversationId(conversationId: string | null | undefined)
 
 /**
  * Project a draft as a `Conversation` so the normal timeline, composer,
- * workspace, model, reasoning, and security controls render unchanged. Drafts
- * always have empty content and must materialize before content exists.
+ * workspace, model, reasoning, and security controls render unchanged. A draft
+ * can already hold hand-written content; it materializes on the first request,
+ * not on the first message.
  */
 export function draftAsConversation(
   draft: DraftConversationState,
@@ -43,7 +50,7 @@ export function draftAsConversation(
     createdAt: draft.createdAt,
     updatedAt: draft.createdAt,
     settings: draft.settings,
-    contexts: [],
+    contexts: draft.contexts,
     queuedMessages: [],
     branches: [],
     userAbortedTasks: [],

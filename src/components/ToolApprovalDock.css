@@ -187,6 +187,32 @@
   font-size: 9.5px;
 }
 
+/* Plan feedback: revealed under the footer once "keep planning" is chosen. */
+.tool-approval-dock__feedback {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.tool-approval-dock__feedback-input {
+  min-height: 54px;
+  padding: 7px 9px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.tool-approval-dock__feedback-input::placeholder {
+  color: var(--faint);
+}
+
 @keyframes tool-approval-dock-slide-in {
   from {
     opacity: 0;

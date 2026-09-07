@@ -3,10 +3,11 @@ import { useI18n, type TranslationFunction } from "../i18n";
 import {
   formatCompactCount,
   formatExactCount,
+  purrDuration,
   summarizeUsage,
-  tokenComparison,
   USAGE_RANGES,
   type ModelUsageRow,
+  type PurrUnit,
   type UsageBucketSize,
   type UsageRange,
   type UsageSeries,
@@ -33,10 +34,7 @@ export function UsageStatsCard({
   const [tab, setTab] = useState<"overview" | "models">("overview");
   const [range, setRange] = useState<UsageRange>("all");
   const summary = useMemo(() => summarizeUsage(statistics, range), [statistics, range]);
-  const comparison = useMemo(
-    () => tokenComparison(summary.totalTokens),
-    [summary.totalTokens]
-  );
+  const purr = useMemo(() => purrDuration(summary.totalTokens), [summary.totalTokens]);
 
   const rangeLabel = (value: UsageRange) => (
     value === "all" ? t("全部", "All") : value === "30d" ? t("30 天", "30d") : t("7 天", "7d")
@@ -188,24 +186,12 @@ export function UsageStatsCard({
               ))}
             </div>
             <p className="usage-stats__note">
-              {comparison
-                ? comparison.fraction
-                  ? t(
-                    "你用掉的 token 大约是{work}的 {percent}%。",
-                    "You've used about {percent}% as many tokens as {work}.",
-                    {
-                      work: resolvedLanguage === "zh-CN" ? comparison.zh : comparison.en,
-                      percent: comparison.multiple
-                    }
-                  )
-                  : t(
-                    "你用掉的 token 大约是{work}的 {multiple} 倍。",
-                    "You've used ~{multiple}× more tokens than {work}.",
-                    {
-                      work: resolvedLanguage === "zh-CN" ? comparison.zh : comparison.en,
-                      multiple: comparison.multiple
-                    }
-                  )
+              {purr
+                ? t(
+                  "相当于一只猫连续呼噜了 {duration}。",
+                  "That's a cat purring nonstop for {duration}.",
+                  { duration: `${purr.value.toFixed(2)} ${purrUnitLabel(purr.unit, t)}` }
+                )
                 : loading
                   ? t("正在读取统计…", "Loading statistics…")
                   : t(
@@ -534,6 +520,13 @@ function bucketNoun(bucket: UsageBucketSize, t: TranslationFunction): string {
   if (bucket === "month") return t("月", "month");
   if (bucket === "week") return t("周", "week");
   return t("天", "day");
+}
+
+function purrUnitLabel(unit: PurrUnit, t: TranslationFunction): string {
+  if (unit === "month") return t("个月", "months");
+  if (unit === "day") return t("天", "days");
+  if (unit === "hour") return t("小时", "hours");
+  return t("分钟", "minutes");
 }
 
 function legendTitle(row: ModelUsageRow, t: TranslationFunction): string {

@@ -366,4 +366,50 @@ describe("App model run flow — layout", () => {
     expect(composer.closest(".conversation-pane")).not.toHaveAttribute("hidden");
   });
 
+  /**
+   * Opening either panel immediately retires the other without unmounting its
+   * exit animation. Only the active panel reserves space beside the timeline.
+   */
+  it("swaps the two right-hand panels instead of opening both", async () => {
+    runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    const shell = window.document.querySelector<HTMLElement>(".app-shell")!;
+    expect(shell.style.getPropertyValue("--right-panel-width")).toBe("0px");
+    await user.click(screen.getByRole("button", { name: /本对话设置/ }));
+    const settings = screen.getByRole("complementary", { name: "本对话设置" });
+    expect(shell.style.getPropertyValue("--right-panel-width")).toBe("var(--settings-width)");
+    expect(screen.queryByRole("complementary", { name: "任务容器" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "打开任务容器" }));
+    const tasks = screen.getByRole("complementary", { name: "任务容器" });
+    expect(shell.style.getPropertyValue("--right-panel-width")).toBe(tasks.style.width);
+    expect(screen.queryByRole("complementary", { name: "本对话设置" })).not.toBeInTheDocument();
+    expect(settings).toBeInTheDocument();
+    expect(settings).toHaveAttribute("inert");
+    expect(settings).toHaveClass("conversation-settings--closed");
+
+    await user.click(screen.getByRole("button", { name: /本对话设置/ }));
+    expect(screen.getByRole("complementary", { name: "本对话设置" })).toBe(settings);
+    expect(settings).not.toHaveAttribute("inert");
+    expect(shell.style.getPropertyValue("--right-panel-width")).toBe("var(--settings-width)");
+    expect(screen.queryByRole("complementary", { name: "任务容器" })).not.toBeInTheDocument();
+    expect(tasks).toBeInTheDocument();
+    expect(tasks).toHaveAttribute("inert");
+    expect(tasks).toHaveClass("task-container--closed");
+
+    await user.click(within(settings).getByRole("button", { name: "关闭本对话设置" }));
+    expect(settings).toBeInTheDocument();
+    expect(settings).toHaveAttribute("inert");
+    expect(shell.style.getPropertyValue("--right-panel-width")).toBe("0px");
+
+    await user.click(screen.getByRole("button", { name: "打开任务容器" }));
+    await user.click(within(tasks).getByRole("button", { name: "收起任务容器" }));
+    expect(tasks).toBeInTheDocument();
+    expect(tasks).toHaveAttribute("inert");
+    expect(shell.style.getPropertyValue("--right-panel-width")).toBe("0px");
+  });
+
 });

@@ -12,7 +12,7 @@ import type { Conversation, ConversationSettings } from "../types";
 // execute the construction path the runners now share, not a test-only replica of it.
 
 describe("the product seed the E2E runners start from", () => {
-  it("really has no conversation and no preset to clone", () => {
+  it("really has no conversation to clone", () => {
     const seed = createSeedDocument();
     // If this ever stops holding, the fixture is no longer load-bearing — but nothing below
     // may quietly start depending on a seeded conversation again.
@@ -24,8 +24,11 @@ describe("the product seed the E2E runners start from", () => {
       expect(workspace.conversations, workspace.kind).toEqual([]);
       expect(workspace.lastConversationSettings, workspace.kind).toBeNull();
     }
-    expect(seed.globalSettings.conversationPresets).toEqual([]);
-    expect(seed.globalSettings.defaultConversationPresetId).toBe("");
+    // The seed does ship conversation presets, and the runners deliberately do
+    // not read them: `e2eConversationSettings` states every field itself so a
+    // change to the shipped presets cannot move what the harness runs.
+    expect(seed.workspaces.every((workspace) => workspace.defaultConversationPresetId === ""))
+      .toBe(true);
   });
 });
 

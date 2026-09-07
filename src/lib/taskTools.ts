@@ -35,17 +35,29 @@ export const TASK_PRODUCING_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_PR
  */
 export const SKILL_TOOL_NAME = "skill";
 
+/**
+ * Catalog names for the plan-mode tools. The host derives them from the
+ * conversation's security level — plan mode offers `plan` and `exit_plan_mode`,
+ * every other level offers `enter_plan_mode` — so none of them is a user
+ * setting. Mirrors the Rust plan tool names.
+ */
+export const PLAN_TOOL_NAMES = ["plan", "exit_plan_mode", "enter_plan_mode"] as const;
+
+export const PLAN_TOOL_NAME_SET: ReadonlySet<string> = new Set(PLAN_TOOL_NAMES);
+
 export function isTaskRuntimeToolName(name: string): boolean {
   return TASK_RUNTIME_TOOL_NAME_SET.has(name);
 }
 
 /**
  * Host-derived tools never enter persisted enabled lists. Memory follows memory
- * layer switches, runtime tools follow producers, and `skill` follows its switch.
+ * layer switches, runtime tools follow producers, `skill` follows its switch,
+ * and the plan tools follow the security level.
  * Normalization and preset application share this rule.
  */
 export function isHostDerivedToolName(name: string): boolean {
   return MEMORY_TOOL_NAME_SET.has(name)
     || TASK_RUNTIME_TOOL_NAME_SET.has(name)
+    || PLAN_TOOL_NAME_SET.has(name)
     || name === SKILL_TOOL_NAME;
 }

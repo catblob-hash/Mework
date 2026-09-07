@@ -5,7 +5,13 @@ import {
   isBrowserDevRuntime,
   onBrowserDevReconnected
 } from "./backend";
-import type { ContextItem, PendingForkRequest, PendingToolPrompt } from "../types";
+import type {
+  ContextItem,
+  ConversationPlan,
+  PendingForkRequest,
+  PendingToolPrompt,
+  SecurityLevel
+} from "../types";
 import type { ShellTaskSnapshot } from "./shellTasks";
 
 /** One tool card the host could not attest and therefore did not persist. */
@@ -64,7 +70,13 @@ export type AppPushEvent =
       sourceConversationId: string;
       approved: boolean;
       childConversationId: string | null;
-    };
+    }
+  // The host changed a conversation's security level on its own — entering plan
+  // mode, or leaving it once the plan was approved. The renderer mirrors it into
+  // the conversation without writing back: the host already committed it.
+  | { type: "conversationSecurityLevelChanged"; conversationId: string; securityLevel: SecurityLevel }
+  // The conversation's plan document was written, approved, sent back, or cleared.
+  | { type: "conversationPlanUpdated"; conversationId: string; plan: ConversationPlan | null };
 
 type AppPushEventListener = (event: AppPushEvent) => void;
 

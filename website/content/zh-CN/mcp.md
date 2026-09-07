@@ -68,7 +68,7 @@ mcp__<server-slug>_<server-digest>__<tool-slug>__<tool-digest>
 
 MCP 工具被视为外部副作用：
 
-- 在 `request_approval` 和 `allow_edits` 层级，每次调用都需要确认，除非 `PermissionRequest` 钩子允许它。在 `full_access` 层级，调用无需询问即可运行。
+- 在 `request_approval`、`allow_edits` 和 `plan`（计划模式）层级，每次调用都需要确认，除非 `PermissionRequest` 钩子允许它。在 `full_access` 层级，调用无需询问即可运行。
 - 声明 `_meta["anthropic/requiresUserInteraction"] = true` 的工具会在**每次调用**、每个层级都要求确认，钩子无法预先批准它。其提供给模型的描述会加上 `mcp.mandatory_description_prefix` 前缀。格式错误的值会保守地按“询问”处理。
 - 你在工具选项卡中关闭其**自动批准**开关的工具也是如此：它会在每个层级都要求确认。
 

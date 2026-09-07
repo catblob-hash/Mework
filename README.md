@@ -35,12 +35,14 @@ Mework is a local-first agent workbench for Windows. It pairs a React 19 interfa
 
 **Durable persistence.** A versioned JSON anchor plus a SQLite conversation store with crash-safe incremental streaming rows; corrupted or future-versioned data is quarantined and rebuilt, never silently migrated over.
 
+**Lives in the tray.** Closing the window only hides it; subagents, workflows, shell tasks and the sidecar keep running. The tray icon's menu reopens the window or quits Mework (quitting still flushes everything to disk first), and launching Mework again while it sits in the tray normally just brings the window back instead of starting a second copy.
+
 ## Install (Windows)
 
 Grab either flavor from [Releases](../../releases):
 
-- **Installer** — `Mework_1.0.0_x64-setup.exe` (NSIS, per-machine).
-- **Portable** — `Mework_1.0.0_x64_portable.zip`: unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
+- **Installer** — `Mework_1.0.1_x64-setup.exe` (NSIS, per-machine).
+- **Portable** — `Mework_1.0.1_x64_portable.zip`: unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
 
 Both require the Microsoft Edge WebView2 Runtime, which is preinstalled on current Windows 10/11; the installer can bootstrap it if missing.
 
@@ -48,7 +50,7 @@ Both require the Microsoft Edge WebView2 Runtime, which is preinstalled on curre
 
 First run: open *Settings → Providers → Model providers*, add a provider and its key (or sign in for the Codex and Claude Agent providers), add a model from the discovery page, and pick it under the composer.
 
-*Settings → Updates* shows the running version and checks GitHub Releases for a newer one. The installer flavor downloads the new `-setup.exe`, verifies it against the release's `SHA256SUMS` when present, and runs it in update mode (settings and data are kept; the app restarts). The portable flavor downloads the new zip to your Downloads folder and shows it in Explorer — close Mework and unzip it over the old files.
+*Settings → Updates* shows the running version and checks GitHub Releases for a newer one. The installer flavor downloads the new `-setup.exe`, verifies it against the release's `SHA256SUMS` when present, and runs it in update mode (settings and data are kept; the app restarts). The portable flavor downloads the new zip to your Downloads folder and shows it in Explorer — quit Mework from the tray icon and unzip it over the old files.
 
 ## Build from source
 
@@ -109,7 +111,7 @@ npm run reset:data     # wipe local app data (schema bumps are not migrated)
 
 ## Status
 
-Mework 1.0.0 targets Windows. The codebase carries cross-platform seams (keyring backends, POSIX shell paths), but only the Windows build is released and supported today.
+Mework 1.0.1 targets Windows. The codebase carries cross-platform seams (keyring backends, POSIX shell paths), but only the Windows build is released and supported today.
 
 ## License
 

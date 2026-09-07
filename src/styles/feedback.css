@@ -39,26 +39,12 @@
 .fork-request-card__actions > .button:not(.button--primary) { background: var(--panel); border-color: var(--border-strong); }
 .fork-request-card__actions > .button:not(.button--primary):hover:not(:disabled) { background: var(--hover); }
 
-@media (max-width: 1150px) {
-  .app-shell--settings-open, .app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 0; }
-  .app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: minmax(0, 1fr) 0 0 0; }
-  .app-shell--tasks-open.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 var(--task-container-width); }
-  .app-shell--tasks-open.app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: minmax(0, 1fr) 0 0 var(--task-container-width); }
-  .conversation-settings { position: fixed; z-index: 800; right: 0; top: 0; box-shadow: -18px 0 55px var(--color-000000-ap15); }
-}
-
 @media (max-width: 860px) {
   :root { --sidebar-width: 240px; }
   .sidebar { position: fixed; z-index: 700; left: 0; top: 0; width: var(--sidebar-width); box-shadow: 15px 0 45px var(--color-000000-ap13); }
-  .app-shell,
-  .app-shell--settings-open,
-  .app-shell--sidebar-closed,
-  .app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: minmax(0, 1fr) 0 0 0; }
-  /* The task container floats over the conversation rather than squeezing it. */
-  .app-shell--tasks-open,
-  .app-shell--tasks-open.app-shell--settings-open,
-  .app-shell--tasks-open.app-shell--sidebar-closed { grid-template-columns: minmax(0, 1fr) 0 0 0; }
-  .task-container { position: fixed; z-index: 690; right: 0; top: 0; box-shadow: -15px 0 45px var(--color-000000-ap13); }
+  /* A fixed sidebar leaves the flow, so `.main-pane` auto-places into the first
+     track. Keep only the conversation and the shared right-panel reservation. */
+  .app-shell, .app-shell--sidebar-closed { grid-template-columns: minmax(0, 1fr) var(--right-panel-width); }
   .topbar__leading > .icon-button { display: inline-flex; }
   .global-settings-layout:not(.global-settings-layout--page) { grid-template-columns: 154px minmax(0, 1fr); }
   .model-capability-badges em { display: none; }
@@ -82,7 +68,9 @@
   .composer__model { max-width: min(180px, 34vw); }
   .topbar-button { font-size: 0; width: 32px; padding: 0; justify-content: center; }
   .save-status { display: none; }
-  .conversation-settings { width: min(100vw, 368px); }
+  :root { --settings-width: min(368px, calc(100vw - 96px)); }
+  .app-shell, .app-shell--sidebar-closed { grid-template-columns: minmax(0, 1fr) min(var(--right-panel-width), calc(100vw - 96px)); }
+  .task-container { max-width: calc(100vw - 96px); }
   .modal-backdrop { padding: 8px; align-items: flex-end; }
   .dialog { max-height: calc(100vh - 16px); }
   .tool-editor-layout { grid-template-columns: 1fr; }
@@ -107,5 +95,6 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .app-shell { --right-panel-duration: .01ms; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }

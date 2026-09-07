@@ -227,8 +227,6 @@ pub fn read_document(path: &Path) -> Result<AppDocument, String> {
     // equal to the one that was saved, which is what the unchanged-card fast
     // path in `validate_tool_results` compares against.
     canonicalize_tool_payload_numbers(&mut document);
-    // Demote dangling role bindings before validation so one reference cannot reject the document.
-    demote_dangling_agent_bindings(&mut document);
     isolate_invalid_loaded_conversations(&mut document);
     validate_shape(&document)?;
     prime_layout_write_cache(path);
@@ -378,8 +376,6 @@ pub(crate) fn prepare_save_transition(
     canonicalize_context_timestamps(&mut canonical);
     // Conversation bodies are host-authoritative; retain only renderer-owned configuration.
     adopt_authoritative_conversations(previous, &mut canonical);
-    // Demote bindings after adopting host bodies and before all validation.
-    demote_dangling_agent_bindings(&mut canonical);
     // Validate the renderer's proposed shapes before replacing every
     // renderer-owned revision/epoch field with host-derived authority.
     validate_agent_definitions(&canonical)?;
@@ -883,7 +879,6 @@ fn isolate_invalid_loaded_conversations(document: &mut AppDocument) {
         for (conversation_index, conversation) in workspace.conversations.iter().enumerate() {
             let result = validate_conversation_shape(conversation, &tool_names).and_then(|()| {
                 validate_agent_definition_list(
-                    document,
                     &format!("对话 {}", conversation.id),
                     &conversation.settings.agent_definitions,
                 )
@@ -1415,78 +1410,6 @@ fn agent_definition_lists(document: &AppDocument) -> Vec<(String, &[AgentDefinit
     lists
 }
 
-/// Demotes explicit bindings to missing provider/model rows without rejecting the document.
-///
-/// Disabled rows remain valid bindings; only removed rows become `Unavailable`. This normalization is idempotent.
-fn demote_dangling_agent_bindings(document: &mut AppDocument) {
-    // Build an owned catalog index before mutably borrowing definition lists.
-    let catalog = provider_model_catalog(document);
-    for preset in &mut document.presets.conversation_presets {
-        demote_dangling_agent_binding_list(&catalog, &mut preset.settings.agent_definitions);
-    }
-    for workspace in &mut document.workspaces {
-        for conversation in &mut workspace.conversations {
-            demote_dangling_agent_binding_list(
-                &catalog,
-                &mut conversation.settings.agent_definitions,
-            );
-        }
-    }
-}
-
-/// Owned provider-to-model index. Membership is the whole fact: a model that is
-/// listed is usable, and a model that is not is what a demotion reacts to.
-fn provider_model_catalog(document: &AppDocument) -> HashMap<String, HashSet<String>> {
-    document
-        .assets
-        .api_providers
-        .iter()
-        .map(|provider| {
-            (
-                provider.id.clone(),
-                provider
-                    .models
-                    .iter()
-                    .map(|model| model.id.clone())
-                    .collect::<HashSet<_>>(),
-            )
-        })
-        .collect()
-}
-
-/// Demotes a role list and returns whether it changed.
-///
-/// A lost binding is a configuration change, so increment `revision`; this infallible normalizer uses `saturating_add`.
-fn demote_dangling_agent_binding_list(
-    catalog: &HashMap<String, HashSet<String>>,
-    definitions: &mut [AgentDefinition],
-) -> bool {
-    let mut changed = false;
-    for definition in definitions.iter_mut() {
-        // Tombstones must remain `Inherit` and cannot be demoted.
-        if definition.deleted {
-            continue;
-        }
-        let AgentModelSelection::Explicit {
-            provider_id,
-            model_id,
-        } = &definition.model_selection
-        else {
-            continue;
-        };
-        if catalog
-            .get(provider_id.as_str())
-            .is_some_and(|models| models.contains(model_id.as_str()))
-        {
-            continue;
-        }
-        definition.model_selection = AgentModelSelection::Unavailable;
-        definition.revision = definition.revision.saturating_add(1);
-        changed = true;
-    }
-    changed
-}
-
 /// Whether any role, anywhere in the document, differs between two snapshots.
 ///
 /// Compares list by list at matching locations, so a preset that gained or lost
@@ -1508,7 +1431,7 @@ pub(crate) fn agent_definitions_differ(previous: &AppDocument, next: &AppDocumen
 
 fn validate_agent_definitions(document: &AppDocument) -> Result<(), String> {
     for (location, definitions) in agent_definition_lists(document) {
-        validate_agent_definition_list(document, &location, definitions)?;
+        validate_agent_definition_list(&location, definitions)?;
     }
     Ok(())
 }
@@ -1516,7 +1439,6 @@ fn validate_agent_definitions(document: &AppDocument) -> Result<(), String> {
 /// `document` is needed only to resolve an explicit provider/model pair; the
 /// roles being checked come from `definitions`, not from the document.
 fn validate_agent_definition_list(
-    document: &AppDocument,
     location: &str,
     definitions: &[AgentDefinition],
 ) -> Result<(), String> {
@@ -1611,7 +1533,15 @@ fn validate_agent_definition_list(
             // it already records the outcome of that check. Validating it would
             // be checking a value against the very fact it encodes.
             //
-            // Check row existence; demotion precedes these manual-edit assertions.
+            // Only the SHAPE of an explicit pair is checked. Whether the pair
+            // currently resolves is not a document-validity question: a role may
+            // legitimately name a model the user has not fetched yet — a seeded
+            // role bound to a provider that is signed out is exactly this — and
+            // rejecting the document would make the whole profile unloadable
+            // over a binding the user can still see and fix. Resolution is
+            // evaluated at call time instead, by
+            // `api::agent_definition_model_is_available`, which hides the role
+            // from the model until the pair resolves again.
             if let AgentModelSelection::Explicit {
                 provider_id,
                 model_id,
@@ -1624,22 +1554,6 @@ fn validate_agent_definition_list(
                 {
                     return Err(format!(
                         "命名子代理 {} 的显式 providerId/modelId 必须是无首尾空白的精确标识",
-                        definition.name
-                    ));
-                }
-                let provider = document
-                    .assets.api_providers
-                    .iter()
-                    .find(|provider| provider.id == *provider_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "命名子代理 {} 引用了不存在的提供商: {provider_id}",
-                            definition.name
-                        )
-                    })?;
-                if !provider.models.iter().any(|model| model.id == *model_id) {
-                    return Err(format!(
-                        "命名子代理 {} 引用了不存在的模型: {provider_id}/{model_id}",
                         definition.name
                     ));
                 }
@@ -2672,9 +2586,7 @@ pub(crate) fn validate_incoming_conversation(
         .map(|candidate| candidate.settings.agent_definitions.as_slice())
         .unwrap_or_default();
     // Renderer definitions cannot assign trusted source or epoch values.
-    let mut proposed = std::mem::take(&mut conversation.settings.agent_definitions);
-    // Demote stale provider bindings instead of making a conversation unwritable.
-    demote_dangling_agent_binding_list(&provider_model_catalog(document), &mut proposed);
+    let proposed = std::mem::take(&mut conversation.settings.agent_definitions);
     conversation.settings.agent_definitions =
         canonicalize_renderer_agent_definition_list(committed, proposed)?;
     validate_agent_definition_list_transition(committed, &conversation.settings.agent_definitions)?;
@@ -2686,7 +2598,6 @@ pub(crate) fn validate_incoming_conversation(
         .collect::<HashSet<_>>();
     validate_conversation_shape(conversation, &tool_names)?;
     validate_agent_definition_list(
-        document,
         &format!("对话 {}", conversation.id),
         &conversation.settings.agent_definitions,
     )?;
@@ -3319,9 +3230,9 @@ mod tests {
         }
     }
 
-    /// Removing a provider row demotes its bindings to `Unavailable` and permits saving.
+    /// Removing a provider row leaves its bindings intact and permits saving.
     #[test]
-    fn deleting_the_bound_provider_demotes_the_binding_instead_of_refusing_the_save() {
+    fn deleting_the_bound_provider_keeps_the_binding_instead_of_refusing_the_save() {
         let previous = document_with_bound_role("openai_responses", "gpt-5");
         let state = AppState::default();
 
@@ -3342,14 +3253,21 @@ mod tests {
         let states = bound_role_states(&canonical, "mew");
         assert!(!states.is_empty(), "预设与对话两处都要被断言到");
         for (selection, revision) in &states {
-            assert_eq!(*selection, AgentModelSelection::Unavailable);
-            assert_eq!(*revision, 2, "可信配置变了，revision 必须涨");
+            assert_eq!(
+                *selection,
+                AgentModelSelection::Explicit {
+                    provider_id: "openai_responses".into(),
+                    model_id: "gpt-5".into(),
+                },
+                "绑定必须原样保留：签出与永久消失在静态数据里分不开"
+            );
+            assert_eq!(*revision, 1, "用户没改配置，revision 不能涨");
         }
-        // Never retain the removed ID, which could be reclaimed by a new provider.
+        // The pair the user chose is still readable, so the UI can name it.
         let serialized = serde_json::to_string(&canonical).unwrap();
-        assert!(!serialized.contains("\"providerId\":\"openai_responses\""));
+        assert!(serialized.contains("\"providerId\":\"openai_responses\""));
 
-        // The normalization is idempotent.
+        // Saving again changes nothing further.
         let again = prepare_save_transition(&canonical, &canonical, &state)
             .unwrap()
             .document;
@@ -3396,9 +3314,9 @@ mod tests {
         );
     }
 
-    /// Conversation writes also demote stale provider bindings rather than being refused.
+    /// Conversation writes accept a binding to a removed provider rather than refusing it.
     #[test]
-    fn a_conversation_write_demotes_a_stale_binding_instead_of_being_refused() {
+    fn a_conversation_write_keeps_a_stale_binding_instead_of_being_refused() {
         let state = AppState::default();
         let mut committed = document_with_bound_role("openai_responses", "gpt-5");
         committed
@@ -3406,7 +3324,6 @@ mod tests {
             .api_providers
             .retain(|provider| provider.id != "openai_responses");
         committed.global_settings.active_provider_id = Some("openai_chat".into());
-        // The host has already demoted its stored conversation.
         committed = prepare_save_transition(&committed.clone(), &committed, &state)
             .unwrap()
             .document;
@@ -3423,7 +3340,13 @@ mod tests {
         validate_incoming_conversation(&committed, &workspace_id, &mut conversation, &state)
             .expect("一条过期的绑定不该挡住整个对话的写入");
         for definition in &conversation.settings.agent_definitions {
-            assert_eq!(definition.model_selection, AgentModelSelection::Unavailable);
+            assert_eq!(
+                definition.model_selection,
+                AgentModelSelection::Explicit {
+                    provider_id: "openai_responses".into(),
+                    model_id: "gpt-5".into(),
+                }
+            );
         }
     }
 
@@ -3589,9 +3512,9 @@ mod tests {
         );
     }
 
-    /// Loading demotes dangling bindings before isolation validation.
+    /// Loading keeps dangling bindings readable instead of rejecting the document.
     #[test]
-    fn loading_demotes_a_dangling_binding_instead_of_dropping_the_conversation() {
+    fn loading_keeps_a_dangling_binding_instead_of_dropping_the_conversation() {
         let directory = tempfile::tempdir().unwrap();
         let mut document = document_with_bound_role("openai_responses", "gpt-5");
         let conversation_id = document.workspaces[0].conversations[0].id.clone();
@@ -3615,7 +3538,45 @@ mod tests {
             "对话不该在装载期被丢掉"
         );
         for (selection, _) in bound_role_states(&loaded, "mew") {
-            assert_eq!(selection, AgentModelSelection::Unavailable);
+            assert_eq!(
+                selection,
+                AgentModelSelection::Explicit {
+                    provider_id: "openai_responses".into(),
+                    model_id: "gpt-5".into(),
+                },
+                "装回这家提供商后角色要能自己恢复，所以两个 id 必须留着"
+            );
+        }
+    }
+
+    /// A role bound to a model the provider has not fetched yet survives a full
+    /// save/load cycle and starts resolving once the model row appears. This is
+    /// the seeded-Codex-role case: signed out at first launch, working later.
+    #[test]
+    fn a_binding_to_an_unfetched_model_survives_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.v1.json");
+        let mut document = document_with_bound_role("openai_responses", "not-fetched-yet");
+        document
+            .assets
+            .api_providers
+            .iter_mut()
+            .find(|provider| provider.id == "openai_responses")
+            .expect("提供商必须在")
+            .models
+            .clear();
+        save_all(&path, &document).unwrap();
+
+        let loaded = read_document(&path).expect("未拉取的模型不该让文档装不起来");
+        for (selection, revision) in bound_role_states(&loaded, "mew") {
+            assert_eq!(
+                selection,
+                AgentModelSelection::Explicit {
+                    provider_id: "openai_responses".into(),
+                    model_id: "not-fetched-yet".into(),
+                }
+            );
+            assert_eq!(revision, 1, "宿主没改配置，revision 不能涨");
         }
     }
 
@@ -4562,6 +4523,118 @@ b".to_owned())].into());
         let serialized = &canonical["workspaces"][0]["conversations"][0];
         assert!(serialized.get("presetId").is_none());
         assert!(serialized.get("localPreset").is_none());
+    }
+
+    /// The two shipped presets survive the real save boundary with their role
+    /// bindings intact — including the Codex ones, whose models cannot exist
+    /// until the user signs in.
+    #[test]
+    fn product_default_document_ships_two_presets_whose_bindings_survive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.seed-presets.json");
+        let document = crate::catalog::product_default_document(directory.path());
+
+        let presets = &document.presets.conversation_presets;
+        assert_eq!(
+            presets.iter().map(|preset| preset.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                crate::catalog::CODEX_PRESET_ID,
+                crate::catalog::CLAUDE_CODE_PRESET_ID
+            ]
+        );
+        assert_eq!(
+            document.presets.default_conversation_preset_id,
+            crate::catalog::CLAUDE_CODE_PRESET_ID
+        );
+
+        validate_and_save(&path, &document, &document, &AppState::default()).unwrap();
+        let restored = read_document(&path).unwrap();
+
+        let codex_provider = restored
+            .assets
+            .api_providers
+            .iter()
+            .find(|provider| provider.family == crate::model::ProviderFamily::OpenaiCodex)
+            .expect("内置 Codex 行必须在种子里");
+        let claude_provider = restored
+            .assets
+            .api_providers
+            .iter()
+            .find(|provider| provider.family == crate::model::ProviderFamily::ClaudeAgent)
+            .expect("内置 Claude Agent 行必须在种子里");
+
+        // Signed out, so it has no catalog yet — and that is exactly the case
+        // the retained binding has to survive.
+        assert!(codex_provider.models.is_empty());
+        assert!(!codex_provider.enabled);
+        assert!(claude_provider.enabled);
+        assert!(
+            !claude_provider.models.is_empty(),
+            "Claude Agent 的模型是本地内置表，种子阶段就该装好"
+        );
+        assert!(
+            claude_provider.models.iter().all(|model| !model.id.contains("[1m]")),
+            "1M 上下文的孪生行不入种子"
+        );
+        assert_eq!(
+            claude_provider.active_model_id.as_deref(),
+            claude_provider.models.first().map(|model| model.id.as_str())
+        );
+
+        // Everything on except the names the host derives for itself.
+        for preset in &restored.presets.conversation_presets {
+            assert!(!preset.settings.allow_roleless_subagents);
+            assert_eq!(preset.settings.agent_definitions.len(), 3);
+            let enabled = &preset.settings.enabled_tools;
+            assert!(enabled.iter().all(|name| {
+                !crate::mework_memory::is_memory_tool(name)
+                    && !crate::agents::is_task_runtime_tool_name(name)
+                    && !crate::plan_mode::is_plan_mode_tool_name(name)
+                    && name != crate::capabilities::SKILL_TOOL
+            }));
+            let host_derived = restored
+                .tools
+                .iter()
+                .filter(|tool| {
+                    crate::mework_memory::is_memory_tool(&tool.name)
+                        || crate::agents::is_task_runtime_tool_name(&tool.name)
+                        || crate::plan_mode::is_plan_mode_tool_name(&tool.name)
+                        || tool.name == crate::capabilities::SKILL_TOOL
+                })
+                .count();
+            assert_eq!(enabled.len(), restored.tools.len() - host_derived);
+        }
+
+        let binding = |preset_id: &str, role: &str| {            restored
+                .presets
+                .conversation_presets
+                .iter()
+                .find(|preset| preset.id == preset_id)
+                .and_then(|preset| {
+                    preset
+                        .settings
+                        .agent_definitions
+                        .iter()
+                        .find(|definition| definition.name == role)
+                })
+                .map(|definition| definition.model_selection.clone())
+                .expect("角色必须在")
+        };
+        assert_eq!(
+            binding(crate::catalog::CODEX_PRESET_ID, "sol"),
+            AgentModelSelection::Explicit {
+                provider_id: codex_provider.id.clone(),
+                model_id: "gpt-5.6-sol".into(),
+            },
+            "未登录的 Codex 绑定必须原样活过一次存取"
+        );
+        assert_eq!(
+            binding(crate::catalog::CLAUDE_CODE_PRESET_ID, "opus"),
+            AgentModelSelection::Explicit {
+                provider_id: claude_provider.id.clone(),
+                model_id: "claude-opus-5".into(),
+            }
+        );
     }
 
     #[test]

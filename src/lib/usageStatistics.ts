@@ -680,47 +680,31 @@ export function formatExactCount(value: number): string {
   return Number.isFinite(value) ? Math.round(value).toLocaleString("en-US") : "0";
 }
 
-/** 参照物按 token 量升序。词数 × 4/3 是常用的英文词→token 粗算。 */
-export const TOKEN_COMPARISONS: Array<{ tokens: number; zh: string; en: string }> = [
-  { tokens: 103_000, zh: "《哈利·波特与魔法石》", en: "Harry Potter and the Philosopher's Stone" },
-  { tokens: 163_000, zh: "《傲慢与偏见》", en: "Pride and Prejudice" },
-  { tokens: 275_000, zh: "《白鲸》", en: "Moby-Dick" },
-  { tokens: 783_000, zh: "《战争与和平》", en: "War and Peace" },
-  { tokens: 1_170_000, zh: "莎士比亚全集", en: "the complete works of Shakespeare" },
-  { tokens: 59_000_000, zh: "《大英百科全书》", en: "the Encyclopædia Britannica" }
+/** 10 万 token ＝ 一只猫连续呼噜 6 分钟。 */
+const PURR_MINUTES_PER_TOKEN = 6 / 100_000;
+
+export type PurrUnit = "minute" | "hour" | "day" | "month";
+
+/** 按分钟数升序；月按 30 天算。 */
+const PURR_UNITS: Array<{ unit: PurrUnit; minutes: number }> = [
+  { unit: "minute", minutes: 1 },
+  { unit: "hour", minutes: 60 },
+  { unit: "day", minutes: 60 * 24 },
+  { unit: "month", minutes: 60 * 24 * 30 }
 ];
 
-export interface TokenComparison {
-  zh: string;
-  en: string;
-  /** 倍数；`fraction` 为真时它是「占参照物的比例」而不是倍数。 */
-  multiple: number;
-  fraction: boolean;
+export interface PurrDuration {
+  value: number;
+  unit: PurrUnit;
 }
 
-/**
- * 选一个能说人话的参照物：优先取「倍数仍 ≥ 2 的最大那本书」，这样既不会出现
- * 「1.0 倍」这种没有信息量的比较，也不会拿一本小书去比出六位数倍率。
- */
-export function tokenComparison(totalTokens: number): TokenComparison | null {
+/** 把 token 总量换算成呼噜时长，进位到数值不小于 1 的最大单位。 */
+export function purrDuration(totalTokens: number): PurrDuration | null {
   if (!Number.isFinite(totalTokens) || totalTokens <= 0) return null;
-  const descending = [...TOKEN_COMPARISONS].sort((left, right) => right.tokens - left.tokens);
-  const atLeastTwice = descending.find((item) => totalTokens / item.tokens >= 2);
-  const target = atLeastTwice ?? descending.find((item) => totalTokens / item.tokens >= 1);
-  if (target) {
-    const multiple = totalTokens / target.tokens;
-    return {
-      zh: target.zh,
-      en: target.en,
-      multiple: multiple >= 100 ? Math.round(multiple) : Number(multiple.toFixed(1)),
-      fraction: false
-    };
+  const minutes = totalTokens * PURR_MINUTES_PER_TOKEN;
+  let chosen = PURR_UNITS[0];
+  for (const candidate of PURR_UNITS) {
+    if (minutes >= candidate.minutes) chosen = candidate;
   }
-  const smallest = descending[descending.length - 1];
-  return {
-    zh: smallest.zh,
-    en: smallest.en,
-    multiple: Math.max(1, Math.round((totalTokens / smallest.tokens) * 100)),
-    fraction: true
-  };
+  return { value: minutes / chosen.minutes, unit: chosen.unit };
 }

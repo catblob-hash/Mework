@@ -12,7 +12,7 @@ members = [
 
 [package]
 name = "mework"
-version = "1.0.0"
+version = "1.0.1"
 description = "Mework — Mew. Work."
 authors = ["Mework contributors"]
 license = "GPL-3.0-or-later"
@@ -71,7 +71,7 @@ serde_json = "1"
 sha2 = "0.10"
 hmac = "0.12"
 similar = "2.7"
-tauri = { version = "2.8", features = ["unstable", "devtools"] }
+tauri = { version = "2.8", features = ["unstable", "devtools", "tray-icon"] }
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 url = "2"
@@ -107,7 +107,10 @@ windows-core = "0.61.2"
 # `external_open` needs it because ShellExecuteW may delegate to a Shell
 # extension, which is a COM object, so the calling thread must have an
 # apartment. It buys no host-control capability and must not grow into one.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# Win32_Security exists only because `CreateEventW` (instance_activation) spells
+# its always-null first argument as `*const SECURITY_ATTRIBUTES`; Mework calls no
+# ACL, token or privilege API and must not start to.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -39,6 +39,20 @@ pub(crate) fn combined_system_prompt(request: &RunModelRequest) -> String {
             }
         }
     }
+    // Wire layer, not `assemble_system_prompt`: the section has to disappear on
+    // the very next step after the user approves the plan, must never enter a
+    // fork snapshot, and a child agent needs its own shorter variant.
+    if request.effective_security_level() == crate::model::SecurityLevel::Plan {
+        let key = if request.subagent_depth == 0 {
+            crate::prompt_profile::PromptKey::SystemPlanMode
+        } else {
+            crate::prompt_profile::PromptKey::SystemPlanModeSubagent
+        };
+        let section = request.prompt_profile.text(key).trim();
+        if !section.is_empty() {
+            prompts.push(section.to_owned());
+        }
+    }
     if enabled_tools(request)
         .iter()
         .any(|tool| tool.name == crate::api::WEB_SEARCH_TOOL)

@@ -68,7 +68,7 @@ A call is translated back to `tools/call` with the tool's original name; the `co
 
 MCP tools are treated as external side effects:
 
-- At `request_approval` and `allow_edits`, every call asks for confirmation unless a `PermissionRequest` hook allows it. At `full_access` calls run without asking.
+- At `request_approval`, `allow_edits` and `plan`, every call asks for confirmation unless a `PermissionRequest` hook allows it. At `full_access` calls run without asking.
 - A tool that declares `_meta["anthropic/requiresUserInteraction"] = true` asks **on every call**, at every level, and a hook cannot pre-approve it. Its description to the model is prefixed with `mcp.mandatory_description_prefix`. A malformed value fails closed to "ask".
 - A tool whose **auto-approve** switch you turned off in the Tools tab behaves the same way: it asks at every level.
 

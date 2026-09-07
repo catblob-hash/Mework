@@ -3,6 +3,7 @@ import {
   ChevronRight,
   Globe2,
   LoaderCircle,
+  NotebookPen,
   PanelRightClose,
   Square,
   SquareTerminal,
@@ -23,7 +24,7 @@ import {
 } from "../lib/taskContainer";
 import type { TaskContainerMessages, TaskItem, TaskItemState } from "../lib/taskContainer";
 import type { AgentStatus, TodoItemView } from "../lib/orchestration";
-import type { UserAbortedTaskRecord } from "../types";
+import type { ConversationPlan, UserAbortedTaskRecord } from "../types";
 import type { SubagentView } from "../lib/subagents";
 import type { TerminalSessionState } from "../lib/terminal";
 import type { ShellTaskSnapshot } from "../lib/shellTasks";
@@ -62,6 +63,12 @@ export interface TaskContainerProps {
   browserAutomationStopping?: boolean;
   modelRequestId?: string | null;
   userAbortedTasks?: UserAbortedTaskRecord[];
+  /** The conversation's plan document; absent or null draws no plan row. */
+  plan?: ConversationPlan | null;
+  /** True while a `plan_exit` card for this conversation is waiting. */
+  planAwaitingApproval?: boolean;
+  /** True while the conversation's run is live and the level is plan mode. */
+  planDrafting?: boolean;
   /**
    * Model the conversation is on, shown by a child that bound no model of its
    * own. A role-less child runs on exactly this; its record cannot say so.
@@ -111,6 +118,7 @@ function taskItemIcon(item: TaskItem, size = 13) {
   if (kind === "webSearch") return <Globe2 size={size} aria-hidden="true" />;
   if (kind === "workflow") return <WorkflowIcon size={size} aria-hidden="true" />;
   if (kind === "browser") return <Globe2 size={size} aria-hidden="true" />;
+  if (kind === "plan") return <NotebookPen size={size} aria-hidden="true" />;
   return <Bot size={size} aria-hidden="true" />;
 }
 
@@ -228,6 +236,7 @@ function TaskRow({
   // transcript, and only when the shell supplied a handler for it.
   const pageRow = (
     item.kind === "terminal" || item.kind === "browser" || item.kind === "shell"
+    || item.kind === "plan"
   ) && Boolean(onOpenItem);
   const openable = agentRow || pageRow;
   // An agent row's id *is* its agent id, so one comparison covers both the transcript case and
@@ -278,7 +287,8 @@ function TaskRow({
           <span className="task-row__detail">{item.detail}</span>
         </span>
         <TaskMetricColumns item={item} />
-        {item.state === "running" && (
+        {/* The plan is a document, not work in flight: there is nothing to stop. */}
+        {item.state === "running" && item.kind !== "plan" && (
           <IconButton
             label={stopping
               ? t("正在中止“{label}”", "Stopping “{label}”", { label: item.label })
@@ -411,6 +421,24 @@ export function taskContainerMessages(t: ReturnType<typeof useI18n>["t"]): TaskC
     browserSuspended: t("已挂起", "Suspended"),
     browserIdle: t("已就绪", "Ready"),
     browserAutomation: (tool) => t("模型正在操作：{tool}", "Model is driving: {tool}", { tool }),
+    // Not just "计划": the todo checklist above the list already owns that word.
+    planLabel: t("实施计划", "Implementation plan"),
+    planDrafting: t("撰写中", "Drafting"),
+    planAwaitingApproval: t("待批准", "Awaiting approval"),
+    planApproved: t("已批准", "Approved"),
+    planRejected: t("已退回", "Sent back"),
+    planUpdatedAgo: (minutes) => {
+      if (minutes < 1) return t("刚刚更新", "Updated just now");
+      if (minutes < 60) {
+        return t("{count} 分钟前更新", minutes === 1 ? "Updated {count} minute ago" : "Updated {count} minutes ago", { count: minutes });
+      }
+      if (minutes < 1440) {
+        const hours = Math.round(minutes / 60);
+        return t("{count} 小时前更新", hours === 1 ? "Updated {count} hour ago" : "Updated {count} hours ago", { count: hours });
+      }
+      const days = Math.round(minutes / 1440);
+      return t("{count} 天前更新", days === 1 ? "Updated {count} day ago" : "Updated {count} days ago", { count: days });
+    },
     userAborted: t("用户中止操作", "Operation aborted by user")
   };
 }
@@ -434,6 +462,9 @@ export function TaskContainer({
   browserAutomationStopping = false,
   modelRequestId = null,
   userAbortedTasks = [],
+  plan = null,
+  planAwaitingApproval = false,
+  planDrafting = false,
   status = { todo: null },
   selectedAgentId,
   selectedRowId = null,
@@ -562,6 +593,9 @@ export function TaskContainer({
     browserAutomationStopping,
     modelRequestId,
     userAbortedTasks,
+    plan,
+    planAwaitingApproval,
+    planDrafting,
     now
   }, taskContainerMessages(t)), [
     conversationId,
@@ -573,6 +607,9 @@ export function TaskContainer({
     browserSessions,
     modelRequestId,
     now,
+    plan,
+    planAwaitingApproval,
+    planDrafting,
     shellTasks,
     terminals,
     t,
@@ -627,7 +664,7 @@ export function TaskContainer({
       aria-label={t("任务容器", "Tasks")}
       aria-hidden={!open || undefined}
       inert={!open || undefined}
-      style={{ width: `${width}px` }}
+      style={{ width: `${width}px`, "--task-panel-width": `${width}px` } as React.CSSProperties}
     >
       {onWidthChange && (
         <div

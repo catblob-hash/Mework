@@ -9,6 +9,11 @@ import { useI18n } from "../i18n";
 import { createId } from "../lib/id";
 import { emptyConversationPresetSettings } from "../lib/conversationPresets";
 import { MAX_SYSTEM_PROMPT_BYTES, utf8ByteLength } from "../lib/textLimits";
+import {
+  SECURITY_LEVEL_OPTIONS,
+  securityLevelDescription,
+  securityLevelLabel
+} from "../lib/securityLevels";
 import { localizeToolDescriptor } from "../lib/toolDefaults";
 import type {
   CapabilityCatalog,
@@ -531,23 +536,15 @@ function ConversationPresetsEditor({
                 <div className="provider-field__title"><span>{t("安全策略", "Security policy")}</span></div>
                 <div className="preset-choice-list">
                   {/* Applying a preset copies its security policy into the conversation. */}
-                  {(["request_approval", "allow_edits", "full_access"] as const).map((level) => (
+                  {SECURITY_LEVEL_OPTIONS.map((level) => (
                     <CheckRow
                       key={level}
                       checked={selected.settings.securityLevel === level}
                       onChange={(checked) => {
                         if (checked) updateSettings({ ...selected.settings, securityLevel: level });
                       }}
-                      title={level === "request_approval"
-                        ? t("请求批准", "Ask for approval")
-                        : level === "allow_edits"
-                          ? t("允许编辑", "Allow edits")
-                          : t("完全访问", "Full access")}
-                      description={level === "request_approval"
-                        ? t("写入与高风险操作先询问", "Writes and risky calls ask first")
-                        : level === "allow_edits"
-                          ? t("可信目录内读写免提示", "Reads and writes inside trusted directories run without prompts")
-                          : t("大多数已验证调用免提示；强制确认仍保留", "Most validated calls run without prompts; mandatory confirmations remain")}
+                      title={securityLevelLabel(level, t)}
+                      description={securityLevelDescription(level, t)}
                     />
                   ))}
                 </div>

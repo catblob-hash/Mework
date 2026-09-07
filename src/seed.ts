@@ -1,6 +1,22 @@
-import type { AppDocument, ToolDescriptor } from "./types";
+import type {
+  AgentDefinition,
+  ApiProvider,
+  AppDocument,
+  ConversationPreset,
+  ModelProfile,
+  ToolDescriptor
+} from "./types";
 import { SEARCH_PROVIDERS } from "./lib/searchProviders";
 import { defaultAppearancePreferences } from "./lib/appearance";
+import { defaultConversationWebSearchSettings } from "./lib/runtime";
+import {
+  CLAUDE_AGENT_PROVIDER_FAMILY,
+  CLAUDE_AGENT_PROVIDER_NAME,
+  CLAUDE_AGENT_REGISTRY
+} from "./lib/claudeAgentProvider";
+import { CODEX_PROVIDER_FAMILY, CODEX_PROVIDER_NAME } from "./lib/codexProvider";
+import { isHostDerivedToolName } from "./lib/taskTools";
+import { createId } from "./lib/id";
 
 export const toolCatalog: ToolDescriptor[] = [
   {
@@ -376,6 +392,33 @@ export const toolCatalog: ToolDescriptor[] = [
       }
     ]
   },
+  {
+    name: "plan",
+    label: "计划文档",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: [
+      { name: "action", label: "动作", type: "string", required: true, placeholder: "write", help: "选择操作：write 写入或覆盖计划、read 读取当前计划" },
+      { name: "content", label: "计划正文", type: "string", required: false, help: "write 必填；计划的 Markdown 正文，整篇覆盖上一版" }
+    ]
+  },
+  {
+    name: "exit_plan_mode",
+    label: "退出计划模式",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: []
+  },
+  {
+    name: "enter_plan_mode",
+    label: "进入计划模式",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: []
+  },
 ];
 
 function freshToolCatalog(): ToolDescriptor[] {
@@ -390,9 +433,158 @@ function freshToolCatalog(): ToolDescriptor[] {
   }));
 }
 
+export const CODEX_PRESET_ID = "preset_codex";
+export const CLAUDE_CODE_PRESET_ID = "preset_claude_code";
+
+/** Mirrors `catalog.rs::builtin_claude_agent_provider`: the whole registry minus
+ * the `[1m]` twins, which are the same models under a CLI-only 1M context
+ * budget and would double the picker for a distinction most users never make. */
+function claudeAgentSeedModels(): ModelProfile[] {
+  return CLAUDE_AGENT_REGISTRY
+    .filter((model) => !model.id.includes("[1m]"))
+    .map(({ id, name, contextWindow, maxOutputTokens }) => ({
+      id,
+      name,
+      group: "claude",
+      contextWindow,
+      maxOutputTokens,
+      capabilities: ["image_recognition"],
+      reasoningContent: "plaintext"
+    }));
+}
+
+/** Keep in sync with `src-tauri/src/catalog.rs::product_default_api_providers`.
+ * IDs stay random per installation because they key credential storage; the
+ * renderer's `ensureCodexProvider` / `ensureClaudeAgentProvider` claim these
+ * rows by family, so the IDs a seeded preset was written against survive. */
+function seedProviders(): ApiProvider[] {
+  const blank = {
+    baseUrl: "",
+    familySettings: {},
+    endpointBaseUrls: {},
+    notes: ""
+  } as const;
+  const claudeAgentModels = claudeAgentSeedModels();
+  return [
+    {
+      id: createId("provider"),
+      name: CODEX_PROVIDER_NAME,
+      // Signed out until the user completes the OAuth flow, and its catalog
+      // lives behind that login, so it ships no models.
+      enabled: false,
+      family: CODEX_PROVIDER_FAMILY,
+      ...blank,
+      models: [],
+      activeModelId: null
+    },
+    {
+      id: createId("provider"),
+      name: CLAUDE_AGENT_PROVIDER_NAME,
+      enabled: true,
+      family: CLAUDE_AGENT_PROVIDER_FAMILY,
+      ...blank,
+      models: claudeAgentModels,
+      activeModelId: claudeAgentModels[0]?.id ?? null
+    }
+  ];
+}
+
+/** One seeded role: everything on, thinking on, nothing said about itself.
+ * `tools: null` rather than an allowlist, so the role tracks whatever its preset
+ * enables instead of freezing today's catalog into six copies. */
+function seedAgentDefinition(
+  name: string,
+  providerId: string,
+  modelId: string
+): AgentDefinition {
+  return {
+    enabled: true,
+    deleted: false,
+    name,
+    description: "",
+    source: "user",
+    sourceKey: "",
+    revision: 1,
+    memoryEpoch: 1,
+    modelSelection: { kind: "explicit", providerId, modelId },
+    memory: "none",
+    effort: "medium",
+    tools: null,
+    disallowedTools: [],
+    searchProvider: null
+  };
+}
+
+function seedPreset(
+  id: string,
+  name: string,
+  tools: readonly ToolDescriptor[],
+  agentDefinitions: AgentDefinition[]
+): ConversationPreset {
+  return {
+    id,
+    name,
+    description: "",
+    settings: {
+      // The host has no default prompt of its own; a fresh conversation sends
+      // only its capability sections until the user writes one.
+      systemPrompt: "",
+      // Everything except the names the host derives for itself: the memory
+      // tools follow the two memory switches, `skill` follows `skillToolEnabled`,
+      // and the task tools appear once something can produce a task.
+      enabledTools: tools
+        .map((tool) => tool.name)
+        .filter((name) => !isHostDerivedToolName(name)),
+      toolDescriptionFileId: null,
+      agentDefinitions,
+      // Every child is one of the three named roles, so the model cannot route
+      // around them by spawning an anonymous one.
+      allowRolelessSubagents: false,
+      hookIds: [],
+      skillIds: [],
+      mcpIds: [],
+      webSearch: defaultConversationWebSearchSettings(),
+      securityLevel: "request_approval",
+      globalMemoryEnabled: false,
+      projectMemoryEnabled: false,
+      skillToolEnabled: false
+    }
+  };
+}
+
+/** Keep in sync with `src-tauri/src/catalog.rs::product_default_presets`. The
+ * Codex roles are bound to models that do not exist until the user signs in and
+ * fetches the catalog; the binding waits rather than being discarded, and the
+ * role starts working the moment its model shows up. */
+function seedPresets(
+  providers: readonly ApiProvider[],
+  tools: readonly ToolDescriptor[]
+): ConversationPreset[] {
+  const providerId = (family: string) =>
+    providers.find((provider) => provider.family === family)?.id ?? "";
+  const codex = providerId(CODEX_PROVIDER_FAMILY);
+  const claudeAgent = providerId(CLAUDE_AGENT_PROVIDER_FAMILY);
+  return [
+    seedPreset(CODEX_PRESET_ID, "Codex", tools, [
+      seedAgentDefinition("sol", codex, "gpt-5.6-sol"),
+      seedAgentDefinition("terra", codex, "gpt-5.6-terra"),
+      seedAgentDefinition("luna", codex, "gpt-5.6-luna")
+    ]),
+    seedPreset(CLAUDE_CODE_PRESET_ID, "Claude Code", tools, [
+      seedAgentDefinition("opus", claudeAgent, "claude-opus-5"),
+      seedAgentDefinition("sonnet", claudeAgent, "claude-sonnet-5"),
+      seedAgentDefinition("haiku", claudeAgent, "claude-haiku-4-5")
+    ])
+  ];
+}
+
 export const createSeedDocument = (): AppDocument => {
   const tools = freshToolCatalog();
   const now = new Date().toISOString();
+  const apiProviders = seedProviders();
+  // The one built-in that works without a sign-in, so it is what a fresh
+  // install talks to.
+  const activeProvider = apiProviders.find((provider) => provider.enabled) ?? null;
 
   return {
     schemaVersion: 2,
@@ -400,11 +592,13 @@ export const createSeedDocument = (): AppDocument => {
       appLanguage: "auto",
       resolvedAppLanguage: "zh-CN",
       theme: "system",
-      conversationPresets: [],
-      defaultConversationPresetId: "",
+      conversationPresets: seedPresets(apiProviders, tools),
+      // Storage refuses an empty default once presets exist, so this is written
+      // explicitly rather than left to the normalizer's first-preset fallback.
+      defaultConversationPresetId: CLAUDE_CODE_PRESET_ID,
       lastReasoningEffort: "disabled",
-      apiProviders: [],
-      activeProviderId: null,
+      apiProviders,
+      activeProviderId: activeProvider?.id ?? null,
       webSearch: {
         // Keep this list synchronized item-by-item with the Rust seed in
         // `src-tauri/src/catalog.rs::product_default_document`. Enable only the

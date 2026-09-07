@@ -992,6 +992,28 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_reaches_the_hook_under_the_official_permission_mode_name() {
+        let host = InstructionsLoadedHostContext::new(
+            "conversation-1",
+            None,
+            &absolute("workspace"),
+            "Kimi-K3",
+            InstructionsLoadedPermissionMode::Plan,
+            "turn-1",
+        )
+        .unwrap();
+        let input = InstructionsLoadedInput::session_start(
+            &host,
+            &absolute("workspace/MEWORK.md"),
+            InstructionsLoadedMemoryType::Project,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&input.to_local_hook_json().unwrap()).unwrap();
+
+        assert_eq!(value["permission_mode"], "plan");
+    }
+
+    #[test]
     fn reason_specific_factories_make_invalid_metadata_states_unrepresentable() {
         let nested = InstructionsLoadedInput::nested_traversal(
             &host(),

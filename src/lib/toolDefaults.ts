@@ -172,7 +172,11 @@ const englishParameterHelp: Record<string, string> = {
   "声明式计划：phases 依序推进，parallel 全并发，pipeline 逐项流水；步骤靠 inputFrom 引用更早 phase 的 label 才能拿到它的产出": "Declarative plan: phases run in order; parallel fans out; pipeline streams per item. A step sees an earlier phase's output only by naming its label in inputFrom.",
   "暴露给计划的 JSON 值；首个 pipeline phase 的 items 数组来自这里": "JSON value exposed to the plan; a leading pipeline phase takes its items array from here.",
   "上一次同计划运行报出的运行 ID；已入日志的步骤即时重放，其余步骤重跑。计划正文必须与获批时逐字一致":
-    "The run ID reported by a previous run of the same plan; journaled steps replay instantly and the rest re-run. The plan body must be byte-identical to the approved one."
+    "The run ID reported by a previous run of the same plan; journaled steps replay instantly and the rest re-run. The plan body must be byte-identical to the approved one.",
+  "选择操作：write 写入或覆盖计划、read 读取当前计划":
+    "Choose an action: write stores or replaces the plan, read returns the current one.",
+  "write 必填；计划的 Markdown 正文，整篇覆盖上一版":
+    "Required for write; the plan's Markdown body, which replaces the previous one in full."
 };
 
 const englishParameterPlaceholders: Record<string, string> = {
@@ -215,7 +219,10 @@ const englishToolLabels: Record<string, string> = {
   ask_user: "Ask user",
   fork: "Fork conversation",
   todo: "Todo",
-  skill: "Skill"
+  skill: "Skill",
+  plan: "Plan document",
+  exit_plan_mode: "Exit plan mode",
+  enter_plan_mode: "Enter plan mode"
 };
 
 function cloneDefaultValue(value: ToolParameter["defaultValue"]): ToolParameter["defaultValue"] {

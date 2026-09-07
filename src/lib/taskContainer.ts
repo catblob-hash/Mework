@@ -2,7 +2,7 @@ import type { SubagentView, SubagentViewStatus } from "./subagents";
 import type { TerminalSessionState } from "./terminal";
 import type { ShellTaskSnapshot } from "./shellTasks";
 import type { BrowserStatus } from "./browser";
-import type { ModelUsage, UserAbortedTaskKind, UserAbortedTaskRecord } from "../types";
+import type { ModelUsage, ConversationPlan, UserAbortedTaskKind, UserAbortedTaskRecord } from "../types";
 
 /**
  * Whether a task row is still doing work. Terminals and browser pages have no
@@ -50,7 +50,8 @@ export type TaskItemKind =
   | "workflow"
   | "terminal"
   | "shell"
-  | "browser";
+  | "browser"
+  | "plan";
 
 interface TaskItemBase {
   /** Source identity captured when the row is derived, never the active selection. */
@@ -98,6 +99,12 @@ export type TaskItem =
        */
       automationTool: string | null;
     })
+  /**
+   * The conversation's plan document. Not a running task at all — it is the one
+   * artifact of plan mode, and the task bar is the only navigation the message
+   * area has, so it earns a row. Never has children and never stops.
+   */
+  | (TaskItemBase & { kind: "plan"; plan: ConversationPlan })
   | (TaskItemBase & { kind: "aborted"; sourceKind: UserAbortedTaskKind; sourceIdentity: string });
 
 export interface TaskContainerMessages {
@@ -122,6 +129,13 @@ export interface TaskContainerMessages {
   browserIdle: string;
   /** What the row says while the model is driving the page with `tool`. */
   browserAutomation: (tool: string) => string;
+  planLabel: string;
+  planDrafting: string;
+  planAwaitingApproval: string;
+  planApproved: string;
+  planRejected: string;
+  /** How long ago the plan was last written, from whole minutes. */
+  planUpdatedAgo: (minutes: number) => string;
   userAborted: string;
 }
 
@@ -474,6 +488,8 @@ export function taskItemSourceIdentity(item: TaskItem, modelRequestId: string | 
       ? `browser-automation:${modelRequestId ?? "unknown"}:${item.sessionId}`
       : `browser-page:${item.sessionId}`;
   }
+  // One plan per conversation, and the rows are already bound to one.
+  if (item.kind === "plan") return "plan";
   throw new Error("Unknown task item kind");
 }
 
@@ -483,6 +499,8 @@ export function userAbortedTaskRecord(
   id: string,
   endedAt: string
 ): UserAbortedTaskRecord {
+  // The plan row carries no stop control, so it never reaches this.
+  if (item.kind === "plan") throw new Error("A plan row cannot be aborted");
   const sourceKind = item.kind === "aborted" ? item.sourceKind : item.kind;
   return {
     id,
@@ -515,6 +533,43 @@ function abortedTaskItem(record: UserAbortedTaskRecord, messages: TaskContainerM
     error: messages.userAborted,
     startedAt: record.startedAt,
     endedAt: record.endedAt
+  };
+}
+
+/**
+ * The plan row. Its state is what the user can still do about it: a plan being
+ * written or waiting for an answer is live, an answered one is history.
+ */
+function planItem(
+  plan: ConversationPlan,
+  awaitingApproval: boolean,
+  drafting: boolean,
+  messages: TaskContainerMessages,
+  now: number
+): TaskItem {
+  const status = awaitingApproval
+    ? messages.planAwaitingApproval
+    : plan.status === "approved"
+      ? messages.planApproved
+      : plan.status === "rejected"
+        ? messages.planRejected
+        : messages.planDrafting;
+  const updated = Date.parse(plan.updatedAt);
+  const minutes = Number.isNaN(updated)
+    ? 0
+    : Math.max(0, Math.round((now - updated) / 60_000));
+  return {
+    kind: "plan",
+    plan,
+    id: "plan",
+    label: messages.planLabel,
+    detail: `${status} · ${messages.planUpdatedAgo(minutes)}`,
+    state: awaitingApproval || drafting ? "running" : "finished",
+    metrics: { childCount: null, tokens: null, toolCount: null, elapsedMs: null },
+    children: [],
+    error: null,
+    startedAt: plan.createdAt,
+    endedAt: null
   };
 }
 
@@ -551,6 +606,12 @@ export interface TaskSources {
   browserAutomationStopping?: boolean;
   modelRequestId?: string | null;
   userAbortedTasks?: UserAbortedTaskRecord[];
+  /** The conversation's plan document; absent or null draws no plan row. */
+  plan?: ConversationPlan | null;
+  /** True while a `plan_exit` card for this conversation is waiting. */
+  planAwaitingApproval?: boolean;
+  /** True while the conversation's run is live and the level is plan mode. */
+  planDrafting?: boolean;
   /**
    * Model the conversation itself is on, shown by a child that bound no model
    * of its own. A role-less child runs on exactly this, and the record cannot
@@ -586,6 +647,9 @@ export function deriveTaskItems(
     browserAutomationStopping = false,
     modelRequestId = null,
     userAbortedTasks = [],
+    plan = null,
+    planAwaitingApproval = false,
+    planDrafting = false,
     inheritedModelId = null,
     now = Date.now()
   } = sources;
@@ -639,6 +703,10 @@ export function deriveTaskItems(
     if (page) items.push(page);
   });
 
+  if (plan) {
+    items.push(planItem(plan, planAwaitingApproval, planDrafting, messages, now));
+  }
+
   const abortedBySource = new Map(userAbortedTasks.map((record) => [record.sourceIdentity, record]));
   const liveSources = new Set(items.map((item) => taskItemSourceIdentity(item, modelRequestId)));
   const merged = items.map((item) => {
@@ -671,11 +739,13 @@ export function deriveTaskItems(
 
 /** Rows the "finish" disclosure hides, in the order they finished. */
 export function finishedTaskItems(items: TaskItem[]): TaskItem[] {
-  return items.filter((item) => item.state !== "running");
+  // The plan is never history: it is the standing artifact of plan mode and the
+  // only way into its page, so it stays in the visible list at every status.
+  return items.filter((item) => item.state !== "running" && item.kind !== "plan");
 }
 
 export function runningTaskItems(items: TaskItem[]): TaskItem[] {
-  return items.filter((item) => item.state === "running");
+  return items.filter((item) => item.state === "running" || item.kind === "plan");
 }
 
 /**
@@ -732,6 +802,11 @@ export function taskActivitySignature(sources: TaskSources): string {
   sources.userAbortedTasks?.forEach((task) => {
     parts.push(`x:${task.id}:${task.sourceKind}:${task.sourceIdentity}:${task.endedAt}`);
   });
+  if (sources.plan) {
+    // A rewritten plan is news even though the row neither appears nor changes
+    // state, so the revision timestamp is what carries it.
+    parts.push(`p:${sources.plan.status}:${sources.plan.updatedAt}:${sources.planAwaitingApproval ? 1 : 0}`);
+  }
   return parts.join("|");
 }
 
@@ -740,6 +815,9 @@ export function hasAnyTask(sources: TaskSources): boolean {
   if (sources.agents.length > 0 || sources.terminals.length > 0) return true;
   if ((sources.shellTasks?.length ?? 0) > 0) return true;
   if (sources.browser?.hasPage && sources.browserSessionId) return true;
+  // The plan is the only row plan mode produces before any tool has run, and
+  // the task bar is the only way to reach it.
+  if (sources.plan) return true;
   return (sources.userAbortedTasks?.length ?? 0) > 0;
 }
 

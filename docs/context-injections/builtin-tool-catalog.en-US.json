@@ -3,7 +3,7 @@
   "language": "en-US",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 27,
+  "toolCount": 30,
   "tools": [
     {
       "name": "ls",
@@ -1057,6 +1057,46 @@
           "help": "true copies the timeline so far and the completed tasks; false starts with only this prompt"
         }
       ]
+    },
+    {
+      "name": "plan",
+      "label": "Plan document",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": true,
+          "placeholder": "write",
+          "help": "Choose an action: write stores or replaces the plan, read returns the current one."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "string",
+          "required": false,
+          "help": "Required for write; the plan's Markdown body, which replaces the previous one in full."
+        }
+      ]
+    },
+    {
+      "name": "exit_plan_mode",
+      "label": "Exit plan mode",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "enter_plan_mode",
+      "label": "Enter plan mode",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
     }
   ]
 }

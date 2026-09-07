@@ -30,7 +30,7 @@ Preset fields, which are also the fields of the per-conversation drawer (the sli
 | Web search | Native provider search or one of the catalog providers, and the per-call search cap. |
 | Memory | Two independent switches: global memory (`~/.mework`) and project memory (`<workspace>/.mework`). |
 | Skill delivery | Off: selected skill bodies are pasted into the system prompt. On: the `skill` tool loads them on demand. |
-| Security policy | `request_approval`, `allow_edits` or `full_access` — see below. |
+| Security policy | `request_approval`, `allow_edits`, `plan` or `full_access` — see below. |
 | Include app data directory | Conversation-only: exposes the absolute app-data path in the system prompt. |
 | Reasoning effort | Conversation-only: passed to the provider when the model supports it. |
 
@@ -50,7 +50,14 @@ The **security level** decides which calls ask you first:
 |---|---|---|---|---|---|---|
 | `request_approval` | allowed | ask | ask | ask | ask | ask |
 | `allow_edits` | allowed | allowed | allowed | ask | allowed | ask |
+| `plan` | as Manual | refused | ask | refused | ask | ask |
 | `full_access` | allowed | allowed | allowed | allowed | allowed | allowed |
+
+### Plan mode
+
+**Plan mode** is a read-only planning phase: workspace reads follow Manual, while every filesystem write or edit is refused rather than shown as an approval. Shell, web search and fetch, browser interaction, workflows, MCP calls and subagent spawning still ask as they do in Manual; screenshots remain available. The host supplies three derived tools automatically, never through the tool picker or presets: in Plan mode, `plan` reads or replaces the host-stored Markdown plan and `exit_plan_mode` submits it for review; outside Plan mode, `enter_plan_mode` asks to switch into it. Subagents inherit Plan mode as read-only and never receive these tools.
+
+Calling `exit_plan_mode` opens an approval card and takes the message area directly to the plan preview without expanding the task container. The card offers **Yes, auto-accept edits**, **Yes, manually approve edits**, or **No, keep planning**; the last choice requires feedback and keeps the model in Plan mode. A saved plan appears as an **Implementation plan** row in the task container, and clicking it opens the Markdown plan page. Either yes choice switches the conversation in the same turn, respectively to Accept edits or Manual, and the composer immediately shows that new level.
 
 Some confirmations cannot be turned off by any level or by a hook: recursive deletes that touch the root, home or system paths; writing global memory; MCP tools that declare `anthropic/requiresUserInteraction`; and taking over a browser page you logged into yourself.
 

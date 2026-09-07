@@ -67,12 +67,12 @@ The command's working directory is the workspace. Stdin is a UTF-8 JSON object; 
   "cwd": "<workspace path>",
   "hook_event_name": "PreToolUse",
   "model": "<model id>",
-  "permission_mode": "default | acceptEdits | bypassPermissions",
+  "permission_mode": "default | acceptEdits | plan | bypassPermissions",
   "turn_id": "<uuid>"
 }
 ```
 
-`permission_mode` maps the conversation's security level: `request_approval` → `default`, `allow_edits` → `acceptEdits`, `full_access` → `bypassPermissions`. Event-specific fields:
+`permission_mode` maps the conversation's security level: `request_approval` → `default`, `allow_edits` → `acceptEdits`, `plan` → `plan`, `full_access` → `bypassPermissions`. Event-specific fields:
 
 | Event | Extra fields |
 |---|---|

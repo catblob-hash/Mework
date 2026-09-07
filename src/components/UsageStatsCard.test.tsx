@@ -285,8 +285,12 @@ describe("UsageStatsCard", () => {
     }
   });
 
-  it("says the ledger is empty instead of inventing a comparison", () => {
-    render(<UsageStatsCard statistics={{ ...statistics, usage: [] }} />);
+  it("reads the total back as a purr duration", () => {
+    render(<UsageStatsCard statistics={statistics} />);
+    expect(screen.getByText("相当于一只猫连续呼噜了 1.00 小时。")).toBeInTheDocument();
+  });
+
+  it("says the ledger is empty instead of inventing a comparison", () => {    render(<UsageStatsCard statistics={{ ...statistics, usage: [] }} />);
     expect(screen.getByText(/还没有记录到任何 token 用量/)).toBeInTheDocument();
     expect(tile("总 token")).toBe("0");
   });

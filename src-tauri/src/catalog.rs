@@ -4,15 +4,16 @@ use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 
 use crate::model::{
-    ApiProvider, AppDocument, AppLanguage, CapabilityCatalog, GlobalSettings, ResolvedLanguage,
+    AgentDefinition, AgentDefinitionMemory, AgentDefinitionSource, AgentModelSelection, ApiProvider,
+    AppDocument, AppLanguage, CapabilityCatalog, ConversationPreset, ConversationPresetSettings,
+    GlobalSettings, PresetLibrary, ProviderFamily, ReasoningEffort, ResolvedLanguage,
     ThemePreference, ToolCategory, ToolDescriptor, ToolParameter, ToolParameterType, Workspace,
     WorkspaceKind,
 };
 
 #[cfg(test)]
 use crate::model::{
-    ProviderFamily, ContextItem, Conversation, ConversationPreset, ConversationPresetSettings,
-    ConversationSettings, SecurityLevel, ToolResult,
+    ContextItem, Conversation, ConversationSettings, SecurityLevel, ToolResult,
 };
 
 #[cfg(test)]
@@ -1215,6 +1216,49 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                 ),
             ],
         ),
+        descriptor(
+            "plan",
+            "计划文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "action",
+                    "动作",
+                    StringType,
+                    true,
+                    None,
+                    Some("write"),
+                    Some("选择操作：write 写入或覆盖计划、read 读取当前计划"),
+                ),
+                parameter(
+                    "content",
+                    "计划正文",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("write 必填；计划的 Markdown 正文，整篇覆盖上一版"),
+                ),
+            ],
+        ),
+        descriptor(
+            "exit_plan_mode",
+            "退出计划模式",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![],
+        ),
+        descriptor(
+            "enter_plan_mode",
+            "进入计划模式",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![],
+        ),
     ]
 }
 
@@ -1317,6 +1361,9 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
         "workflow" => "Workflow",
         "skill" => "Skill",
         "fork" => "Fork conversation",
+        "plan" => "Plan document",
+        "exit_plan_mode" => "Exit plan mode",
+        "enter_plan_mode" => "Enter plan mode",
         _ => return None,
     })
 }
@@ -1590,6 +1637,12 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         ("fork", "inherit_context") => {
             "true copies the timeline so far and the completed tasks; false starts with only this prompt"
         }
+        ("plan", "action") => {
+            "Choose an action: write stores or replaces the plan, read returns the current one."
+        }
+        ("plan", "content") => {
+            "Required for write; the plan's Markdown body, which replaces the previous one in full."
+        }
         _ => return None,
     })
 }
@@ -1635,9 +1688,68 @@ fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static
     })
 }
 
-/// Product default documents contain no API providers.
+/// The two built-in provider rows, freshly identified.
+///
+/// IDs stay random per installation: they key credential storage, so a fixed one
+/// would let two data domains collide on the same secret. Residency — "exactly
+/// one row per built-in family" — is NOT implemented here; it stays the
+/// renderer's `ensureCodexProvider` / `ensureClaudeAgentProvider`, which claim
+/// these rows by FAMILY and therefore keep the IDs a seeded preset was written
+/// against. This function only supplies the first values.
 fn product_default_api_providers() -> Vec<ApiProvider> {
-    Vec::new()
+    vec![builtin_codex_provider(), builtin_claude_agent_provider()]
+}
+
+fn builtin_provider_id() -> String {
+    format!("provider_{}", uuid::Uuid::new_v4())
+}
+
+/// Signed out until the user completes the OAuth flow, so it ships no models:
+/// the Codex catalog lives behind that login and cannot be fetched here.
+fn builtin_codex_provider() -> ApiProvider {
+    ApiProvider {
+        id: builtin_provider_id(),
+        name: "OpenAI Codex".into(),
+        enabled: false,
+        family: ProviderFamily::OpenaiCodex,
+        base_url: String::new(),
+        family_settings: Default::default(),
+        endpoint_base_urls: Default::default(),
+        notes: String::new(),
+        models: Vec::new(),
+        active_model_id: None,
+    }
+}
+
+/// Ships its catalog already installed, because this family's "fetch models" is
+/// a built-in table rather than a request: `model_discovery::fetch_models`
+/// performs no I/O for it, so running the real fetch here is both possible and
+/// the only way to guarantee the seeded rows are identical to what the button
+/// would produce — group, capabilities and reasoning shape included.
+///
+/// The `[1m]` twins are dropped. They are the same model under a CLI-only 1M
+/// context budget, and listing both halves doubles the picker for a distinction
+/// most users never make.
+fn builtin_claude_agent_provider() -> ApiProvider {
+    let mut provider = ApiProvider {
+        id: builtin_provider_id(),
+        name: "Claude Agent".into(),
+        enabled: true,
+        family: ProviderFamily::ClaudeAgent,
+        base_url: String::new(),
+        family_settings: Default::default(),
+        endpoint_base_urls: Default::default(),
+        notes: String::new(),
+        models: Vec::new(),
+        active_model_id: None,
+    };
+    provider.models = crate::model_discovery::fetch_models(&provider)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| !model.id.contains("[1m]"))
+        .collect();
+    provider.active_model_id = provider.models.first().map(|model| model.id.clone());
+    provider
 }
 
 #[cfg(test)]
@@ -1682,6 +1794,135 @@ pub fn default_api_providers() -> Vec<ApiProvider> {
     ]
 }
 
+pub(crate) const CODEX_PRESET_ID: &str = "preset_codex";
+pub(crate) const CLAUDE_CODE_PRESET_ID: &str = "preset_claude_code";
+
+/// One seeded role: everything on, thinking on, and nothing said about itself.
+///
+/// `tools: None` rather than an explicit allowlist, so the role tracks whatever
+/// its preset enables instead of freezing today's catalog into six copies.
+fn seed_agent_definition(name: &str, provider_id: &str, model_id: &str) -> AgentDefinition {
+    AgentDefinition {
+        enabled: true,
+        deleted: false,
+        name: name.into(),
+        description: String::new(),
+        source: AgentDefinitionSource::User,
+        source_key: String::new(),
+        revision: 1,
+        memory_epoch: 1,
+        model_selection: AgentModelSelection::Explicit {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        },
+        memory: AgentDefinitionMemory::None,
+        effort: Some(ReasoningEffort::Medium),
+        tools: None,
+        disallowed_tools: Vec::new(),
+        search_provider: None,
+    }
+}
+
+/// Everything in the catalog except the names the host derives for itself.
+///
+/// The memory tools follow the two memory switches, `skill` follows
+/// `skill_tool_enabled`, the task-runtime tools appear only once something
+/// can produce a task, and the plan tools follow the security level. Listing
+/// any of them here would be inert at best: the renderer strips them again when
+/// the preset is applied. Mirrors the renderer's `isHostDerivedToolName`.
+fn seed_preset_enabled_tools(tools: &[ToolDescriptor]) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|tool| {
+            !crate::mework_memory::is_memory_tool(&tool.name)
+                && !crate::agents::is_task_runtime_tool_name(&tool.name)
+                && !crate::plan_mode::is_plan_mode_tool_name(&tool.name)
+                && tool.name != crate::capabilities::SKILL_TOOL
+        })
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+fn seed_preset(
+    id: &str,
+    name: &str,
+    tools: &[ToolDescriptor],
+    agent_definitions: Vec<AgentDefinition>,
+) -> ConversationPreset {
+    ConversationPreset {
+        id: id.into(),
+        name: name.into(),
+        description: String::new(),
+        settings: ConversationPresetSettings {
+            // The host has no default prompt of its own; a fresh conversation
+            // sends only its capability sections until the user writes one.
+            system_prompt: String::new(),
+            enabled_tools: seed_preset_enabled_tools(tools),
+            tool_description_file_id: None,
+            agent_definitions,
+            // Every child is one of the three named roles, so the model cannot
+            // route around them by spawning an anonymous one.
+            allow_roleless_subagents: false,
+            hook_ids: Vec::new(),
+            skill_ids: Vec::new(),
+            mcp_ids: Vec::new(),
+            web_search: Default::default(),
+            security_level: Default::default(),
+            global_memory_enabled: false,
+            project_memory_enabled: false,
+            skill_tool_enabled: false,
+        },
+    }
+}
+
+/// The two shipped presets, each mirroring the agent fleet of the CLI it is
+/// named after.
+///
+/// The Codex roles are bound to models that do not exist until the user signs
+/// in and fetches the catalog. That is deliberate and is why a dangling
+/// `Explicit` pair is now kept verbatim: the binding waits, and the role starts
+/// working the moment its model shows up.
+fn product_default_presets(providers: &[ApiProvider], tools: &[ToolDescriptor]) -> PresetLibrary {
+    let provider_id = |family: ProviderFamily| {
+        providers
+            .iter()
+            .find(|provider| provider.family == family)
+            .map(|provider| provider.id.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let codex = provider_id(ProviderFamily::OpenaiCodex);
+    let claude_agent = provider_id(ProviderFamily::ClaudeAgent);
+    PresetLibrary {
+        conversation_presets: vec![
+            seed_preset(
+                CODEX_PRESET_ID,
+                "Codex",
+                tools,
+                vec![
+                    seed_agent_definition("sol", &codex, "gpt-5.6-sol"),
+                    seed_agent_definition("terra", &codex, "gpt-5.6-terra"),
+                    seed_agent_definition("luna", &codex, "gpt-5.6-luna"),
+                ],
+            ),
+            seed_preset(
+                CLAUDE_CODE_PRESET_ID,
+                "Claude Code",
+                tools,
+                vec![
+                    seed_agent_definition("opus", &claude_agent, "claude-opus-5"),
+                    seed_agent_definition("sonnet", &claude_agent, "claude-sonnet-5"),
+                    seed_agent_definition("haiku", &claude_agent, "claude-haiku-4-5"),
+                ],
+            ),
+        ],
+        // Claude Agent is the one built-in that is usable without a sign-in, so
+        // it is the default. Storage refuses an empty default once presets
+        // exist, so this cannot be left blank.
+        default_conversation_preset_id: CLAUDE_CODE_PRESET_ID.into(),
+    }
+}
+
 pub(crate) fn product_default_document(workspace_path: &Path) -> AppDocument {
     let tools = tool_catalog();
     let now = Utc::now();
@@ -1692,6 +1933,15 @@ pub(crate) fn product_default_document(workspace_path: &Path) -> AppDocument {
         .filter(|name| !name.is_empty())
         .unwrap_or("Workspace")
         .to_owned();
+    let api_providers = product_default_api_providers();
+    let presets = product_default_presets(&api_providers, &tools);
+    // The one built-in that works without a sign-in, so it is what a fresh
+    // install talks to. Leaving this null would make the renderer pick the first
+    // enabled row anyway and then persist the choice as a change.
+    let active_provider_id = api_providers
+        .iter()
+        .find(|provider| provider.enabled)
+        .map(|provider| provider.id.clone());
     let document = AppDocument {
         schema_version: crate::storage::SCHEMA_VERSION,
         global_settings: GlobalSettings {
@@ -1699,7 +1949,7 @@ pub(crate) fn product_default_document(workspace_path: &Path) -> AppDocument {
             resolved_app_language: ResolvedLanguage::ZhCn,
             theme: ThemePreference::System,
             last_reasoning_effort: Default::default(),
-            active_provider_id: None,
+            active_provider_id,
             // Keep this field-by-field in sync with `src/seed.ts` DEFAULT_APPEARANCE.
             appearance: Default::default(),
             // Empty values use the renderer command catalog's default bindings.
@@ -1707,7 +1957,7 @@ pub(crate) fn product_default_document(workspace_path: &Path) -> AppDocument {
             environment_tools: Vec::new(),
         },
         assets: crate::model::AssetLibrary {
-            api_providers: product_default_api_providers(),
+            api_providers,
             // New installations have no SSH machines or run-environment variables.
             execution_environments: Default::default(),
             // Keep this in sync with `src/seed.ts`: enable the anonymous Exa MCP
@@ -1736,7 +1986,7 @@ pub(crate) fn product_default_document(workspace_path: &Path) -> AppDocument {
             mcp_servers: Vec::new(),
             skills: Vec::new(),
         },
-        presets: Default::default(),
+        presets,
         workspaces: vec![
             Workspace {
                 id: "ws_default".into(),
@@ -1931,7 +2181,7 @@ mod tests {
         let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
         let chinese_after = tool_catalog_for_language(ResolvedLanguage::ZhCn);
 
-        assert_eq!(chinese.len(), 27);
+        assert_eq!(chinese.len(), 30);
         assert_eq!(english.len(), chinese.len());
         assert_eq!(chinese_after, chinese);
         for (localized, canonical) in english.iter().zip(&chinese) {

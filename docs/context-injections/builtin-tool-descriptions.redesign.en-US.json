@@ -2,7 +2,7 @@
   "name": "Mework built-in tool context redesign baseline",
   "note": "schemaNotes replaces the built-in tool description; usageGuidance is appended after a blank line. Copy this file to .mework/tool-descriptions only when you want Mework to discover it, then explicitly select it in the conversation preset.",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
-  "toolCount": 27,
+  "toolCount": 30,
   "tools": [
     {
       "toolName": "ls",
@@ -136,6 +136,21 @@
     },
     {
       "toolName": "fork",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "plan",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "exit_plan_mode",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "enter_plan_mode",
       "schemaNotes": "",
       "usageGuidance": ""
     }

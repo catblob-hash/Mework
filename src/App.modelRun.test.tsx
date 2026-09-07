@@ -1494,7 +1494,7 @@ describe("App model run flow — modelRun", () => {
     expect(within(card).getByRole("button", { name: "总是允许" })).toBeInTheDocument();
 
     await user.click(within(card).getByRole("button", { name: "允许" }));
-    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-model-1", "allow_once");
+    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-model-1", "allow_once", undefined);
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "需要你的确认" })).not.toBeInTheDocument());
 
     await act(async () => resolveRun({
@@ -1539,7 +1539,7 @@ describe("App model run flow — modelRun", () => {
 
     const user = userEvent.setup();
     await user.click(within(card).getByRole("button", { name: "允许" }));
-    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-task-1", "allow_once");
+    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-task-1", "allow_once", undefined);
     await waitFor(() =>
       expect(screen.queryByRole("dialog", { name: "需要你的确认" })).not.toBeInTheDocument());
   });
@@ -1664,7 +1664,7 @@ describe("App model run flow — modelRun", () => {
     expect(screen.getAllByRole("dialog", { name: "需要你的确认" })).toHaveLength(1);
     expect(card.closest(".main-pane__subagent")).not.toBeNull();
     await user.click(within(card).getByRole("button", { name: "允许" }));
-    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-from-child", "allow_once");
+    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-from-child", "allow_once", undefined);
   });
 
   it("stacks concurrent cards behind a pager instead of hiding them", async () => {
@@ -1712,7 +1712,7 @@ describe("App model run flow — modelRun", () => {
     expect(runtimeMocks.resolveToolPrompt).not.toHaveBeenCalled();
 
     await user.click(within(flipped).getByRole("button", { name: "允许" }));
-    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-stack-2", "allow_once");
+    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-stack-2", "allow_once", undefined);
     await waitFor(() => {
       const remaining = screen.getByRole("dialog", { name: "需要你的确认" });
       expect(remaining).toHaveTextContent("first.txt");
@@ -1761,7 +1761,7 @@ describe("App model run flow — modelRun", () => {
     const card = await screen.findByRole("dialog", { name: "需要你的确认" });
     expect(card).toHaveTextContent("bg-step-output.txt");
     await user.click(within(card).getByRole("button", { name: "允许" }));
-    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-task-alive", "allow_once");
+    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-task-alive", "allow_once", undefined);
   });
 
   it("still drops a card the host no longer holds when a run ends", async () => {
@@ -1886,7 +1886,7 @@ describe("App model run flow — modelRun", () => {
     expect(runtimeMocks.executeTool).not.toHaveBeenCalled();
 
     await user.click(within(card).getByRole("button", { name: "允许" }));
-    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-manual-1", "allow_once");
+    expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith("prompt-manual-1", "allow_once", undefined);
     await waitFor(() => expect(runtimeMocks.executeTool).toHaveBeenCalledWith(
       expect.objectContaining({ toolName: "powershell", input: { command: "Get-ChildItem" } }),
       "manual-nonce"

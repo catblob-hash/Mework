@@ -623,6 +623,11 @@ async fn dispatch(
             app.state::<AppState>(),
             arg(args, "conversationId")?,
         )),
+        "load_conversation_plan" => result_value(super::load_conversation_plan(
+            app.clone(),
+            app.state::<AppState>(),
+            arg(args, "conversationId")?,
+        )),
         "token_usage_statistics" => {
             result_value(super::token_usage_statistics(app.clone()).await)
         }
@@ -695,6 +700,13 @@ async fn dispatch(
             .await,
         ),
         "list_wsl_distros" => result_value(super::list_wsl_distros().await),
+        "reveal_path_in_file_manager" => result_value(
+            super::reveal_path_in_file_manager(
+                arg(args, "path")?,
+                optional_arg(args, "baseDir")?,
+            )
+            .await,
+        ),
         "open_external_url" => {
             result_value(super::open_external_url(arg(args, "url")?).await)
         }
@@ -787,6 +799,7 @@ async fn dispatch(
             app.state::<AppState>(),
             arg(args, "promptId")?,
             arg(args, "decision")?,
+            optional_arg(args, "feedback")?,
         )),
         "pick_workspace_directory" => {
             if let Some(fixture) = memory_workspace_fixture.as_ref() {

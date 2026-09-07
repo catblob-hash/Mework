@@ -32,8 +32,8 @@ export type AgentTypeSlugError =
  * model.
  *
  * `inherit` always resolves: it rides the caller's own provider and model.
- * `unavailable` never does — it exists precisely to record a binding that has
- * already been found dead, so it is not re-checked against anything.
+ * `unavailable` never does — an older build wrote it in place of a binding it
+ * had found dead, discarding both IDs, so there is nothing left to re-check.
  *
  * This matters beyond the editor's own validation. The host hides a role whose
  * model does not resolve from the listing it sends the model, so such a role is

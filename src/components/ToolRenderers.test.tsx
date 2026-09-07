@@ -99,6 +99,13 @@ describe("tool view registry", () => {
     ]) {
       expect(toolSurfaceForName(name)).toBe("group");
     }
+    // The plan has a page of its own, so its tools stay ordinary rows and the
+    // `plan` row states which half of the tool ran.
+    for (const name of ["plan", "exit_plan_mode", "enter_plan_mode"]) {
+      expect(toolSurfaceForName(name)).toBe("group");
+    }
+    expect(getToolPresentation(tool("plan", { action: "read" }, "{}")).title).toBe("已读取计划");
+    expect(getToolPresentation(tool("plan", { action: "write", content: "# x" }, "{}")).title).toBe("已更新计划");
     expect(toolSurfaceForName("future_tool")).toBe("group");
   });
 

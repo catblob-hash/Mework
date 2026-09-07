@@ -31,6 +31,7 @@ import { WebSearchBehaviorSettings } from "./WebSearchBehaviorSettings";
 import "./ConversationSettings.css";
 
 interface ConversationSettingsProps {
+  open?: boolean;
   conversation: Conversation;
   globalSettings: GlobalSettings;
   tools: ToolDescriptor[];
@@ -48,6 +49,7 @@ interface ConversationSettingsProps {
 }
 
 export function ConversationSettings({
+  open = true,
   conversation,
   globalSettings,
   tools,
@@ -116,7 +118,12 @@ export function ConversationSettings({
     );
 
   return (
-    <aside className="conversation-settings" aria-label={t("本对话设置", "Conversation settings")}>
+    <aside
+      className={`conversation-settings conversation-settings--${open ? "open" : "closed"}`}
+      aria-label={t("本对话设置", "Conversation settings")}
+      aria-hidden={!open || undefined}
+      inert={!open || undefined}
+    >
       <header className="conversation-settings__header">
         <div>
           <span><SlidersHorizontal size={15} /> {t("仅影响当前对话", "Only affects this conversation")}</span>

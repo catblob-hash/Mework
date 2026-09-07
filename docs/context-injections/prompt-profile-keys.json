@@ -1,5 +1,5 @@
 {
-  "keyCount": 197,
+  "keyCount": 202,
   "keys": [
     {
       "description": "Section appended to the system prompt when the conversation exposes the application data directory.",
@@ -81,6 +81,16 @@
     {
       "description": "Safety boundary appended to the system prompt whenever `web_search` is enabled. Empty by default: the search backend is one the user configured and is therefore trusted. Fill it in to warn the model that web evidence is untrusted.",
       "id": "system.web_safety",
+      "placeholders": []
+    },
+    {
+      "description": "Section appended to the system prompt of the main agent while the conversation is in plan mode: what plan mode forbids, how the plan document works, and the workflow ending in `exit_plan_mode`.",
+      "id": "system.plan_mode",
+      "placeholders": []
+    },
+    {
+      "description": "Section appended to the system prompt of a child agent while the conversation is in plan mode. A child may research but never writes the plan or leaves the mode, so it gets the prohibition without the workflow.",
+      "id": "system.plan_mode_subagent",
       "placeholders": []
     },
     {
@@ -211,6 +221,21 @@
     {
       "description": "Root description of the `workflow` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `workflow` overrides this key.",
       "id": "tool.workflow.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `plan` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `plan` overrides this key.",
+      "id": "tool.plan.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `exit_plan_mode` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `exit_plan_mode` overrides this key.",
+      "id": "tool.exit_plan_mode.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `enter_plan_mode` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `enter_plan_mode` overrides this key.",
+      "id": "tool.enter_plan_mode.description",
       "placeholders": []
     },
     {

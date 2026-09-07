@@ -35,7 +35,6 @@
   --sidebar-width: 264px;
   --settings-width: 368px;
   --right-sidebar-width: 560px;
-  --task-container-width: 340px;
   --topbar-height: 56px;
   /* Reserve the classic scrollbar width so fixed headers align with scrolling content. */
   --scrollbar-size: 10px;
@@ -77,25 +76,21 @@ textarea:not(:disabled),
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
 
+/* Both right panels share one reserved track. They slide independently against
+   the shell's right edge, so a swap never adds their widths together. */
 .app-shell {
+  --right-panel-width: 0px;
+  --right-panel-duration: .24s;
+  --right-panel-easing: cubic-bezier(.2, .75, .25, 1);
   width: 100%; height: 100%; display: grid;
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 0;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--right-panel-width);
   grid-template-rows: minmax(0, 1fr);
+  position: relative;
   background: var(--app); overflow: clip;
-  transition: grid-template-columns .24s cubic-bezier(.2, .75, .25, 1);
+  transition: grid-template-columns var(--right-panel-duration) var(--right-panel-easing);
 }
 .app-shell--resizing { transition: none; }
-/* Keep the third track a length on both ends of the transition. Changing
-   between `0` and `minmax(...)` is discrete, so the drawer would jump. */
-.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(480px, 1fr) var(--settings-width) 0; }
-.app-shell--sidebar-closed { grid-template-columns: 0 minmax(0, 1fr) 0 0; }
-.app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: 0 minmax(480px, 1fr) var(--settings-width) 0; }
-/* The task container is the outermost track, so it stays put while the settings
-   drawer in track 3 opens and closes beside it. */
-.app-shell--tasks-open { grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0 var(--task-container-width); }
-.app-shell--tasks-open.app-shell--settings-open { grid-template-columns: var(--sidebar-width) minmax(360px, 1fr) var(--settings-width) var(--task-container-width); }
-.app-shell--tasks-open.app-shell--sidebar-closed { grid-template-columns: 0 minmax(0, 1fr) 0 var(--task-container-width); }
-.app-shell--tasks-open.app-shell--sidebar-closed.app-shell--settings-open { grid-template-columns: 0 minmax(360px, 1fr) var(--settings-width) var(--task-container-width); }
+.app-shell--sidebar-closed { grid-template-columns: 0 minmax(0, 1fr) var(--right-panel-width); }
 
 .icon-button {
   width: 32px; height: 32px; flex: 0 0 32px; display: inline-flex; align-items: center; justify-content: center;

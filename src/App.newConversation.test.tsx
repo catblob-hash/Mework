@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -85,7 +85,7 @@ describe("new conversation settings source", () => {
     await user.click(screen.getByRole("menuitem", { name: /设置默认对话预设/ }));
     await user.click(screen.getByRole("menuitemradio", { name: "本工作区" }));
     await user.click(screen.getByRole("button", { name: "在 Mework 新建任务" }));
-    await waitFor(() => expect(securityLevel()).toBe("请求批准"));
+    await waitFor(() => expect(securityLevel()).toBe("手动"));
   });
 
   it("remembers a conversation-level change as the workspace's next starting point", async () => {
@@ -223,5 +223,83 @@ describe("draft conversation", () => {
     // Sending without a selected workspace creates the conversation in the temporary workspace.
     await waitFor(() => expect(conversationsIn("__temporary__")).toBe(1));
     expect(conversationsIn("ws_mework")).toBe(0);
+  });
+
+  /** Inserts a message into the timeline through the right-click menu on an empty conversation. */
+  async function insertUserMessage(
+    user: ReturnType<typeof userEvent.setup>,
+    container: HTMLElement,
+    content: string
+  ) {
+    fireEvent.contextMenu(container.querySelector(".usage-stats") ?? container.querySelector(".context-stream")!, {
+      clientX: 40,
+      clientY: 180
+    });
+    await user.click(screen.getByRole("menuitem", { name: /用户输入.*插入一条用户消息/ }));
+    // The editor is a portalled dialog, so it is outside the render container.
+    await user.type(document.querySelector<HTMLTextAreaElement>(".context-text-editor")!, content);
+    await user.click(screen.getByRole("button", { name: "保存" }));
+  }
+
+  it("keeps hand-written content in the draft and carries it into the materialized conversation", async () => {
+    const user = userEvent.setup();
+    runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
+    runtimeMocks.runModel.mockResolvedValue({
+      contexts: [{ id: "ctx_reply", kind: "assistant", content: "好的", createdAt: "2026-08-26T00:00:00Z" }],
+      usage: {},
+      model: "test-model",
+      providerName: "",
+      durationMs: 1
+    });
+
+    const { container } = render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+    await screen.findByRole("region", { name: "使用统计" });
+
+    await insertUserMessage(user, container, "手写的开场白");
+
+    // The message shows on the draft's own timeline, and writing it creates no conversation.
+    expect(await screen.findByText("手写的开场白")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "使用统计" })).not.toBeInTheDocument();
+    const list = screen.getByRole("navigation", { name: "对话列表" });
+    expect(list.querySelectorAll(".conversation-row__main")).toHaveLength(1);
+
+    await user.type(screen.getByLabelText("向 Agent 发送消息"), "第一句话");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(conversationsIn("ws_mework")).toBe(2));
+    // The hand-written message leads the conversation, ahead of the message that materialized it.
+    await waitFor(() => {
+      const materialized = savedWorkspaces()
+        .find((workspace) => workspace.id === "ws_mework")
+        ?.conversations.find((conversation) => conversation.contexts.length > 0);
+      expect(materialized?.contexts.slice(0, 2).map(
+        (item) => ("content" in item ? item.content : item.kind)
+      )).toEqual(["手写的开场白", "第一句话"]);
+    });
+  });
+
+  it("stops showing the usage card once a visit had content, and shows it again on re-entry", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
+
+    const { container } = render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+    await screen.findByRole("region", { name: "使用统计" });
+
+    await insertUserMessage(user, container, "写完又删掉的一句");
+    await user.click(await screen.findByRole("button", { name: "删除上下文" }));
+
+    // An emptied timeline stays a timeline; the card is tied to arriving, not to being empty.
+    await waitFor(() => expect(screen.queryByText("写完又删掉的一句")).not.toBeInTheDocument());
+    expect(screen.queryByRole("region", { name: "使用统计" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "返回" }));
+
+    expect(await screen.findByRole("region", { name: "使用统计" })).toBeInTheDocument();
   });
 });

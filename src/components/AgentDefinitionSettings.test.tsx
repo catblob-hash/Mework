@@ -270,14 +270,14 @@ describe("AgentDefinitionSettings", () => {
     expect(within(screen.getByRole("button", { name: "打开角色 live-role" }))
       .getByText(exactModelId)).toBeInTheDocument();
     expect(within(screen.getByRole("button", { name: "打开角色 gone-role" }))
-      .getByText("removed-model · 模型已不可用，模型看不到这个角色")).toBeInTheDocument();
+      .getByText("removed-model · 模型暂时取不到，模型看不到这个角色")).toBeInTheDocument();
     expect(within(screen.getByRole("button", { name: "打开角色 inheriting" }))
       .getByText("跟随对话模型")).toBeInTheDocument();
   });
 
-  it("renders a persisted unavailable role without naming the model it lost", async () => {
-    // The load-time conversion discards the dead provider/model IDs, so the row
-    // has nothing to print — and must not imply the role still works.
+  it("renders a legacy unavailable role without naming the model it lost", async () => {
+    // An older build discarded the dead provider/model IDs on demotion, so the
+    // row has nothing to print — and must not imply the role still works.
     const user = userEvent.setup();
     renderSettings([
       userDefinition({ name: "gone-role", modelSelection: { kind: "unavailable" } })
@@ -314,9 +314,11 @@ describe("AgentDefinitionSettings", () => {
     const dialog = screen.getByRole("dialog", { name: "角色设置" });
     const select = within(dialog).getByRole("combobox", { name: "执行模型" }) as HTMLSelectElement;
     expect(select).toBeInvalid();
-    expect(within(dialog).getByText("disabled-provider · hidden-model（不可用）")).toBeInTheDocument();
+    // The provider's display name, never its raw ID: that ID is a random
+    // per-installation UUID in the product and reads to the user as a hash.
+    expect(within(dialog).getByText("Disabled Provider · hidden-model（不可用）")).toBeInTheDocument();
     expect(within(dialog).getByText(
-      "绑定的模型已不在该提供商的模型列表里（或该提供商被停用），这个角色暂时不能被调用；把它装回来，绑定就会恢复。"
+      "这个模型现在取不到——提供商还没拉取模型、被停用，或者这一行已经不在了。角色暂时不能被调用，但绑定会一直留着，模型回来就自动恢复。"
     )).toBeInTheDocument();
 
     await user.selectOptions(
@@ -331,6 +333,22 @@ describe("AgentDefinitionSettings", () => {
       providerId: "disabled-provider",
       modelId: "hidden-model"
     });
+  });
+
+  it("names a binding whose provider row is gone by its model id alone", async () => {
+    // With no row left there is no display name to give, and the raw providerId
+    // is a random UUID — printing it would show the user a hash instead of the
+    // one identifier they can still recognize.
+    const user = userEvent.setup();
+    renderSettings([userDefinition({
+      name: "orphan-role",
+      modelSelection: { kind: "explicit", providerId: "provider_a1b2c3", modelId: "gpt-5.6-sol" }
+    })]);
+
+    await user.click(screen.getByRole("button", { name: "设置角色 orphan-role" }));
+    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    expect(within(dialog).getByText("gpt-5.6-sol（不可用）")).toBeInTheDocument();
+    expect(within(dialog).queryByText(/provider_a1b2c3/u)).toBeNull();
   });
 
   it("saves an unavailable role instead of trapping every other edit behind it", async () => {

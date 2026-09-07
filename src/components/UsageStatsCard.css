@@ -22,12 +22,19 @@
 }
 
 .usage-stats__card {
+  /* The heatmap is 26 fixed squares, so it — not the card — sets the interior
+     width; everything else is derived from it and the tile grid lands on the
+     same edges. The gap between two squares is the card's only spacing unit. */
+  --grid-gap: 3px;
+  --heatmap-cell: 14px;
+  --heatmap-width: calc(26 * var(--heatmap-cell) + 25 * var(--grid-gap));
+  --card-padding: 13px;
   width: 100%;
-  max-width: 540px;
+  max-width: calc(var(--heatmap-width) + 2 * var(--card-padding) + 2px);
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 13px;
+  gap: var(--grid-gap);
+  padding: var(--card-padding);
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--panel);
@@ -37,15 +44,14 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--grid-gap);
 }
 
+/* No track behind the buttons: each one is bare text until it is hovered or
+   selected, and then it carries its own rounded patch. */
 .usage-stats__segmented {
   display: inline-flex;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 8px;
-  background: var(--subtle);
+  gap: var(--grid-gap);
 }
 
 .usage-stats__segmented > button {
@@ -61,18 +67,16 @@
 
 .usage-stats__segmented--compact > button { padding: 4px 8px; }
 
-.usage-stats__segmented > button:hover { color: var(--text); }
-
+.usage-stats__segmented > button:hover,
 .usage-stats__segmented > button.is-active {
-  background: var(--panel);
+  background: var(--hover);
   color: var(--text);
-  box-shadow: 0 1px 2px var(--color-000000-ap8);
 }
 
 .usage-stats__tiles {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 6px;
+  gap: var(--grid-gap);
 }
 
 .usage-stats__tile {
@@ -104,7 +108,7 @@
 
 .usage-stats__heatmap {
   display: flex;
-  gap: 3px;
+  gap: var(--grid-gap);
   overflow: hidden;
 }
 
@@ -112,13 +116,13 @@
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: var(--grid-gap);
 }
 
 .usage-stats__heatmap-cell {
-  width: 11px;
-  height: 11px;
-  border-radius: 2px;
+  width: var(--heatmap-cell);
+  height: var(--heatmap-cell);
+  border-radius: 3px;
   background: var(--subtle);
 }
 

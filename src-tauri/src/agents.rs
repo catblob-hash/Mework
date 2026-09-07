@@ -1836,6 +1836,7 @@ mod tests {
             tools: Vec::new(),
             active_hooks: Vec::new(),
             security_level: SecurityLevel::FullAccess,
+            live_security_level: None,
             app_data_path: ".".into(),
             mcp_servers: Vec::new(),
             mcp_bindings: Vec::new(),

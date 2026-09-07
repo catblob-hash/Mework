@@ -1,5 +1,9 @@
 /* Conversation settings */
-.conversation-settings { grid-column: 3; grid-row: 1; width: var(--settings-width); height: 100%; display: flex; flex-direction: column; background: var(--color-ffffff); border-left: 1px solid var(--border); box-shadow: -8px 0 24px var(--color-000000-ap2); animation: panel-slide-in .22s cubic-bezier(.2, .75, .25, 1); }
+/* Keep full content width while sliding; avoid transforms so fixed descendants
+   retain their viewport containing block. The opening panel immediately wins
+   stacking order, while the closing panel stays visible until its exit ends. */
+.conversation-settings { position: absolute; z-index: 601; top: 0; right: 0; bottom: 0; width: var(--settings-width); display: flex; flex-direction: column; background: var(--color-ffffff); border-left: 1px solid var(--border); box-shadow: -18px 0 55px var(--color-000000-ap15); transition: right var(--right-panel-duration) var(--right-panel-easing), visibility 0s; }
+.conversation-settings--closed { right: calc(-1 * var(--settings-width)); z-index: 600; visibility: hidden; pointer-events: none; transition-delay: 0s, var(--right-panel-duration); }
 .conversation-settings__header { height: var(--topbar-height); flex: 0 0 var(--topbar-height); padding: 7px 10px 6px 15px; display: flex; align-items: center; border-bottom: 1px solid var(--border); }
 .conversation-settings__header > div { flex: 1; }
 .conversation-settings__header span { display: flex; align-items: center; gap: 5px; color: var(--faint); font-size: 8.5px; text-transform: uppercase; letter-spacing: .06em; }

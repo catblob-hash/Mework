@@ -1123,6 +1123,42 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "description": profile.text(PromptKey::ToolTodoDescription),
             "oneOf": todo_variants()
         }),
+        // ------------------------------------------------------------ Plan mode
+        // Flat rather than an action `oneOf`: the Claude Agent provider publishes
+        // host tools through MCP, and the plan must be writable there.
+        "plan" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolPlanDescription),
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["write", "read"],
+                    "description": "`write` stores or replaces this conversation's plan document with `content`; `read` returns the document currently stored."
+                },
+                "content": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200000,
+                    "description": "Required for `write`. The plan's Markdown body: context, the recommended approach, the critical files, the utilities to reuse, and how the work will be verified. The whole document is replaced, so send the complete plan every time."
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+        // Both mode tools are a request, not a payload: the plan they act on is
+        // the stored document, and the answer is the user's.
+        "exit_plan_mode" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolExitPlanModeDescription),
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "enter_plan_mode" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolEnterPlanModeDescription),
+            "properties": {},
+            "additionalProperties": false
+        }),
         // ------------------------------------------------------------ Workflow
         // The static baseline is the permissive form used for golden-file and catalog
         // comparisons; host-generated per-run schemas apply any narrowing.

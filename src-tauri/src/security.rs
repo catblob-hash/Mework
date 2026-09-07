@@ -79,6 +79,11 @@ pub fn classify(
     app_data: &Path,
     request: &ToolExecutionRequest,
 ) -> Result<SecurityDecision, String> {
+    // Plan mode refuses filesystem writes outright. A screenshot is the one
+    // write that judgement gets wrong: the PNG is how the browser hands an
+    // observation back, not a change to the user's work, so it drops to an
+    // ordinary approval instead of being refused.
+    let mut filesystem_level = level;
     let (effect, path_mode) = match request.tool_name.as_str() {
         "ls" | "grep" | "find" => (
             OperationEffect::Read,
@@ -119,7 +124,12 @@ pub fn classify(
                     validate_required_string(&request.input, "tab", 256, "tab argument")?;
                     return classify_browser_local(workspace, app_data);
                 }
-                Action::Screenshot => (OperationEffect::Write, Some(PathMode::WriteTarget)),
+                Action::Screenshot => {
+                    if filesystem_level == SecurityLevel::Plan {
+                        filesystem_level = SecurityLevel::RequestApproval;
+                    }
+                    (OperationEffect::Write, Some(PathMode::WriteTarget))
+                }
                 Action::Navigate => {
                     validate_required_string(&request.input, "url", 8_192, "URL argument")?;
                     return Ok(classify_unbounded(level));
@@ -182,7 +192,8 @@ pub fn classify(
         // legacy timeline entries cannot be re-executed either.
         "subagent" | "subagent_update" | "structured_output" | "ask_user" | "todo"
         | "agent_spawn" | "agent_send" | "send_message" | "followup_task" | "task_wait"
-        | "task_list" | "workflow" | "workflow_step" | "skill" | "fork" => {
+        | "task_list" | "workflow" | "workflow_step" | "skill" | "fork" | "plan"
+        | "exit_plan_mode" | "enter_plan_mode" => {
             return Err(format!(
                 "Orchestration tool {} may only be scheduled by the model run loop; it cannot be manually executed or approved separately",
                 request.tool_name
@@ -222,15 +233,16 @@ pub fn classify(
     let protected_app_data =
         effect == OperationEffect::Write && is_protected_app_data_target(&target, &app_data);
 
-    Ok(classify_filesystem(
-        level,
+    classify_filesystem(
+        filesystem_level,
+        &request.tool_name,
         effect,
         target,
         is_trusted,
         protected_app_data,
         restricted,
         unrestricted,
-    ))
+    )
 }
 
 /// Classifies every built-in model-visible Mework tool. Model-only host tools
@@ -301,11 +313,32 @@ pub fn classify_model_call(
         // trusted request builder before the turn started, so the call itself
         // touches nothing — it is a lookup in host memory.
         "ask_user" | "task_wait" | "task_list" | "send_message" | "structured_output" | "skill"
-        | "fork" | "read_global_memory" | "read_project_memory" => Some(internal_decision(
+        | "fork" | "read_global_memory" | "read_project_memory" | "exit_plan_mode"
+        | "enter_plan_mode" => Some(internal_decision(
             RiskLevel::Low,
             "host.read_or_coordinate",
             "只读取本轮宿主状态、等待结果或在同一对话内协调，不触碰文件、Shell 或外部网络",
         )),
+        // The plan document lives in the conversation store, not on disk, so
+        // writing it is a host state change even while plan mode refuses every
+        // filesystem write. An unreadable or unknown action classifies as the
+        // write.
+        "plan" => {
+            let action = request.input.get("action").and_then(Value::as_str);
+            Some(if action == Some("read") {
+                internal_decision(
+                    RiskLevel::Low,
+                    "host.read_or_coordinate",
+                    "只读取本轮宿主状态，不触碰文件、Shell 或外部网络",
+                )
+            } else {
+                internal_decision(
+                    RiskLevel::Medium,
+                    "host.local_state_change",
+                    "会修改当前对话的宿主状态，但不直接触碰文件、Shell 或外部网络",
+                )
+            })
+        }
         // The tier is part of the tool name, so there is no scope argument to
         // validate and no way for a model to talk its way from project into
         // global memory.
@@ -355,8 +388,13 @@ pub fn classify_model_call(
         }
         // Delegation requires approval only in RequestApproval mode; every child tool
         // call re-enters this classifier under the conversation's security level.
+        // Plan mode keeps the prompt: a child inherits plan mode and is read-only,
+        // but the user is still deciding what happens, so spawning is not silent.
         "agent_spawn" => Some(SecurityDecision {
-            requires_approval: level == SecurityLevel::RequestApproval,
+            requires_approval: matches!(
+                level,
+                SecurityLevel::RequestApproval | SecurityLevel::Plan
+            ),
             mandatory_prompt: false,
             risk_level: RiskLevel::Medium,
             rule_id: "agent.delegation",
@@ -1931,16 +1969,21 @@ fn classify_unbounded(level: SecurityLevel) -> SecurityDecision {
             effect: OperationEffect::Unbounded,
             target: None,
         },
-        SecurityLevel::RequestApproval | SecurityLevel::AllowEdits => SecurityDecision {
-            requires_approval: true,
-            mandatory_prompt: false,
-            risk_level: RiskLevel::High,
-            rule_id: "tool.unbounded",
-            reason: "命令执行无法可靠限制为可信目录内的只读或写入操作".into(),
-            scope: ExecutionScope::Unrestricted,
-            effect: OperationEffect::Unbounded,
-            target: None,
-        },
+        // Plan mode refuses filesystem writes outright, but an unbounded action
+        // is not a file it could name a substitute for, so it asks like manual
+        // approval and the user decides.
+        SecurityLevel::Plan | SecurityLevel::RequestApproval | SecurityLevel::AllowEdits => {
+            SecurityDecision {
+                requires_approval: true,
+                mandatory_prompt: false,
+                risk_level: RiskLevel::High,
+                rule_id: "tool.unbounded",
+                reason: "命令执行无法可靠限制为可信目录内的只读或写入操作".into(),
+                scope: ExecutionScope::Unrestricted,
+                effect: OperationEffect::Unbounded,
+                target: None,
+            }
+        }
     }
 }
 
@@ -2047,15 +2090,16 @@ fn validate_upload_paths(input: &JsonObject) -> Result<(), String> {
 
 fn classify_filesystem(
     level: SecurityLevel,
+    tool_name: &str,
     effect: OperationEffect,
     target: PathBuf,
     is_trusted: bool,
     protected_app_data: bool,
     restricted: ExecutionScope,
     unrestricted: ExecutionScope,
-) -> SecurityDecision {
+) -> Result<SecurityDecision, String> {
     if level == SecurityLevel::FullAccess {
-        return SecurityDecision {
+        return Ok(SecurityDecision {
             requires_approval: false,
             mandatory_prompt: false,
             risk_level: match effect {
@@ -2068,7 +2112,19 @@ fn classify_filesystem(
             scope: unrestricted,
             effect,
             target: Some(target),
-        };
+        });
+    }
+
+    // Plan mode refuses rather than prompts, so the user is never asked to
+    // approve a change while the plan they are reading is still a draft. This
+    // is the only decision point, so scope and trust cannot route around it.
+    if level == SecurityLevel::Plan
+        && matches!(effect, OperationEffect::Write | OperationEffect::Unbounded)
+    {
+        return Err(format!(
+            "plan mode is active, so `{tool_name}` may not modify {}; write the plan with the `plan` tool, or call `exit_plan_mode` to ask the user to leave plan mode",
+            target.display()
+        ));
     }
 
     let scope = if is_trusted { restricted } else { unrestricted };
@@ -2077,7 +2133,7 @@ fn classify_filesystem(
         // approval below FullAccess.
         let outside_read_allowed =
             level == SecurityLevel::AllowEdits && effect == OperationEffect::Read;
-        return SecurityDecision {
+        return Ok(SecurityDecision {
             requires_approval: !outside_read_allowed,
             mandatory_prompt: false,
             risk_level: if outside_read_allowed {
@@ -2098,10 +2154,10 @@ fn classify_filesystem(
             scope,
             effect,
             target: Some(target),
-        };
+        });
     }
     if protected_app_data && level == SecurityLevel::AllowEdits {
-        return SecurityDecision {
+        return Ok(SecurityDecision {
             requires_approval: true,
             mandatory_prompt: false,
             risk_level: RiskLevel::High,
@@ -2110,11 +2166,16 @@ fn classify_filesystem(
             scope,
             effect,
             target: Some(target),
-        };
+        });
     }
 
-    match (level, effect) {
-        (SecurityLevel::RequestApproval, OperationEffect::Read) => SecurityDecision {
+    Ok(match (level, effect) {
+        // Plan reads are manual-approval reads: a trusted read passes, and the
+        // outside-workspace branch above already asked.
+        (
+            SecurityLevel::RequestApproval | SecurityLevel::Plan,
+            OperationEffect::Read,
+        ) => SecurityDecision {
             requires_approval: false,
             mandatory_prompt: false,
             risk_level: RiskLevel::Low,
@@ -2150,8 +2211,10 @@ fn classify_filesystem(
                 target: Some(target),
             }
         }
-        _ => unreachable!("full access and unbounded effects are handled earlier"),
-    }
+        _ => unreachable!(
+            "full access, unbounded effects and plan-mode writes are handled earlier"
+        ),
+    })
 }
 
 fn path_argument(input: &JsonObject, default: Option<&str>) -> Result<String, String> {
@@ -2509,6 +2572,114 @@ mod tests {
         assert!(is_restricted(&inside_write));
     }
 
+    /// Plan mode reads like manual approval and refuses every change. The refusal
+    /// is an `Err`, not a prompt: while the user is still reading a draft plan
+    /// there is nothing for them to approve, so the model must be told to write
+    /// the plan or leave the mode instead of asking to edit a file.
+    #[test]
+    fn plan_matrix_reads_like_request_approval_and_refuses_every_change() {
+        let fixture = Fixture::new();
+        let workspace_read = fixture
+            .classify(SecurityLevel::Plan, "read", json!({"path":"inside.txt"}))
+            .unwrap();
+        let app_read = fixture
+            .classify(
+                SecurityLevel::Plan,
+                "read",
+                json!({"path":fixture.app_data.join("app.txt")}),
+            )
+            .unwrap();
+        let outside_read = fixture
+            .classify(
+                SecurityLevel::Plan,
+                "read",
+                json!({"path":fixture.outside.join("outside.txt")}),
+            )
+            .unwrap();
+        assert!(!workspace_read.requires_approval);
+        assert!(is_restricted(&workspace_read));
+        assert!(!app_read.requires_approval);
+        assert!(is_restricted(&app_read));
+        assert!(outside_read.requires_approval);
+        assert!(is_unrestricted(&outside_read));
+
+        // Scope does not route around the refusal: inside, in application data
+        // and outside all fail, and the message names the tool and the target so
+        // the model can tell which call it was.
+        for (tool, input) in [
+            ("write", json!({"path":"new.txt","content":"new"})),
+            (
+                "write",
+                json!({"path":fixture.outside.join("new.txt"),"content":"new"}),
+            ),
+            (
+                "write",
+                json!({"path":fixture.app_data.join("new.txt"),"content":"new"}),
+            ),
+            (
+                "edit",
+                json!({"path":"inside.txt","find":"inside","replace":"changed"}),
+            ),
+        ] {
+            let error = fixture.classify(SecurityLevel::Plan, tool, input).unwrap_err();
+            assert!(error.contains("plan mode is active"), "{tool}: {error}");
+            assert!(error.contains(tool), "{tool}: {error}");
+            assert!(error.contains("exit_plan_mode"), "{tool}: {error}");
+        }
+
+        // An unbounded action is not a file the model could name a substitute
+        // for, so it asks rather than failing.
+        assert!(classify_unbounded(SecurityLevel::Plan).requires_approval);
+        assert_eq!(
+            classify_unbounded(SecurityLevel::Plan),
+            classify_unbounded(SecurityLevel::RequestApproval)
+        );
+        let shell = fixture
+            .classify(SecurityLevel::Plan, "bash", json!({"command":"git status"}))
+            .unwrap();
+        assert!(shell.requires_approval);
+
+        // A child inherits plan mode and is read-only, but spawning it is still
+        // the run acting while the user decides, so it prompts.
+        let spawn = fixture
+            .classify_model_call(SecurityLevel::Plan, "agent_spawn", json!({}))
+            .unwrap();
+        assert!(spawn.requires_approval);
+        assert_eq!(spawn.rule_id, "agent.delegation");
+
+        // The plan tools themselves are host state, not disk, so they run under
+        // plan mode without a prompt; writing the plan is the point of the mode.
+        for (tool, input, risk) in [
+            ("enter_plan_mode", json!({}), RiskLevel::Low),
+            ("exit_plan_mode", json!({}), RiskLevel::Low),
+            ("plan", json!({"action":"read"}), RiskLevel::Low),
+            (
+                "plan",
+                json!({"action":"write","content":"# Plan"}),
+                RiskLevel::Medium,
+            ),
+            // An action the host cannot read is classified as the write.
+            ("plan", json!({}), RiskLevel::Medium),
+        ] {
+            let decision = fixture
+                .classify_model_call(SecurityLevel::Plan, tool, input)
+                .unwrap();
+            assert!(!decision.requires_approval, "{tool}");
+            assert!(!decision.mandatory_prompt, "{tool}");
+            assert_eq!(decision.risk_level, risk, "{tool}");
+            assert!(decision.rule_id.starts_with("host."), "{tool}");
+        }
+
+        // None of the three is reachable from the manual path, where a timeline
+        // entry could otherwise be replayed to move the mode behind the run.
+        for tool in ["plan", "exit_plan_mode", "enter_plan_mode"] {
+            assert!(
+                fixture.classify(SecurityLevel::Plan, tool, json!({})).is_err(),
+                "{tool} must not be manually executable"
+            );
+        }
+    }
+
     #[test]
     fn allow_edits_matrix_allows_trusted_writes_but_asks_outside() {
         let fixture = Fixture::new();
@@ -2578,6 +2749,7 @@ mod tests {
         }
 
         for level in [
+            SecurityLevel::Plan,
             SecurityLevel::RequestApproval,
             SecurityLevel::AllowEdits,
             SecurityLevel::FullAccess,
@@ -2768,15 +2940,17 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawn_asks_only_in_request_approval() {
-        // Delegation prompts only in RequestApproval mode.
+    fn agent_spawn_asks_in_request_approval_and_plan() {
+        // Delegation prompts only where the user is still deciding.
         let fixture = Fixture::new();
-        let ask = fixture
-            .classify_model_call(SecurityLevel::RequestApproval, "agent_spawn", json!({}))
-            .unwrap();
-        assert!(ask.requires_approval);
-        assert!(!ask.mandatory_prompt);
-        assert_eq!(ask.rule_id, "agent.delegation");
+        for level in [SecurityLevel::RequestApproval, SecurityLevel::Plan] {
+            let ask = fixture
+                .classify_model_call(level, "agent_spawn", json!({}))
+                .unwrap();
+            assert!(ask.requires_approval, "{level:?}");
+            assert!(!ask.mandatory_prompt, "{level:?}");
+            assert_eq!(ask.rule_id, "agent.delegation");
+        }
         for level in [SecurityLevel::AllowEdits, SecurityLevel::FullAccess] {
             let auto = fixture
                 .classify_model_call(level, "agent_spawn", json!({}))
@@ -3110,6 +3284,7 @@ mod tests {
     fn global_memory_mutations_require_a_native_confirmation_in_every_mode() {
         let fixture = Fixture::new();
         for level in [
+            SecurityLevel::Plan,
             SecurityLevel::RequestApproval,
             SecurityLevel::AllowEdits,
             SecurityLevel::FullAccess,
@@ -3404,10 +3579,54 @@ mod tests {
         assert!(is_unrestricted(&outside));
     }
 
+    /// A screenshot is how the browser hands an observation back, so plan mode
+    /// asks for it instead of refusing it the way it refuses every other write.
+    /// The rest of the browser's write surface keeps plan mode's answer.
+    #[test]
+    fn plan_mode_asks_for_a_screenshot_rather_than_refusing_it() {
+        let fixture = Fixture::new();
+        for path in [
+            json!("artifacts/page.png"),
+            json!(fixture.outside.join("page.png")),
+        ] {
+            let decision = fixture
+                .classify(
+                    SecurityLevel::Plan,
+                    "playwright",
+                    json!({"action":"screenshot","path":path}),
+                )
+                .unwrap();
+            assert_eq!(
+                decision,
+                fixture
+                    .classify(
+                        SecurityLevel::RequestApproval,
+                        "playwright",
+                        json!({"action":"screenshot","path":path}),
+                    )
+                    .unwrap(),
+                "{path}"
+            );
+            assert!(decision.requires_approval, "{path}");
+        }
+
+        // The carve-out is the screenshot's own arm, so a file write through the
+        // same tool name is still refused.
+        let error = fixture
+            .classify(
+                SecurityLevel::Plan,
+                "write",
+                json!({"path":"artifacts/page.png","content":"x"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("plan mode is active"), "{error}");
+    }
+
     #[test]
     fn task_tools_are_rejected_before_manual_execution_or_approval() {
         let fixture = Fixture::new();
         for level in [
+            SecurityLevel::Plan,
             SecurityLevel::RequestApproval,
             SecurityLevel::AllowEdits,
             SecurityLevel::FullAccess,
@@ -3436,6 +3655,7 @@ mod tests {
     fn merged_state_tools_classify_reads_and_writes_by_action() {
         let fixture = Fixture::new();
         for level in [
+            SecurityLevel::Plan,
             SecurityLevel::RequestApproval,
             SecurityLevel::AllowEdits,
             SecurityLevel::FullAccess,

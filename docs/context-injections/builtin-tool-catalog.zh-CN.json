@@ -3,7 +3,7 @@
   "language": "zh-CN",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 27,
+  "toolCount": 30,
   "tools": [
     {
       "name": "ls",
@@ -1057,6 +1057,46 @@
           "help": "true 复制到目前为止的时间线与已完成任务；false 只带这条提示词"
         }
       ]
+    },
+    {
+      "name": "plan",
+      "label": "计划文档",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "action",
+          "label": "动作",
+          "type": "string",
+          "required": true,
+          "placeholder": "write",
+          "help": "选择操作：write 写入或覆盖计划、read 读取当前计划"
+        },
+        {
+          "name": "content",
+          "label": "计划正文",
+          "type": "string",
+          "required": false,
+          "help": "write 必填；计划的 Markdown 正文，整篇覆盖上一版"
+        }
+      ]
+    },
+    {
+      "name": "exit_plan_mode",
+      "label": "退出计划模式",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "enter_plan_mode",
+      "label": "进入计划模式",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
     }
   ]
 }

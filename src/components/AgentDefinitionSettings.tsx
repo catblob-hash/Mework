@@ -268,6 +268,20 @@ export function AgentDefinitionSettings({
       ? ""
       : "inherit";
 
+  /* Names a bound pair that does not currently resolve, WITHOUT printing the
+   * `providerId` — it is a random per-installation UUID and reads as a hash.
+   * The provider's display name is the actionable half, and it is available
+   * whenever the row still exists, which covers the ordinary cases: signed out,
+   * disabled, or catalog not fetched yet. Only a provider deleted outright has
+   * no name left, and then the model ID stands alone rather than being padded
+   * with an identifier the user cannot use. */
+  const unavailableBindingLabel = (
+    selection: Extract<AgentModelSelection, { kind: "explicit" }>
+  ) => {
+    const provider = providers.find((candidate) => candidate.id === selection.providerId);
+    return provider ? `${provider.name} · ${selection.modelId}` : selection.modelId;
+  };
+
   const slugErrorText = () => {
     if (duplicateName) {
       return t("已有同名的角色。", "A role with this name already exists.");
@@ -368,8 +382,8 @@ export function AgentDefinitionSettings({
   /* The row's second line is the model the role actually runs on. `inherit`
    * has no model ID of its own to print — it rides whatever model the calling
    * conversation is on — so it says so rather than inventing one. An
-   * `unavailable` role has no ID left to print either: the dead one was
-   * deliberately discarded when the binding was found broken. */
+   * `unavailable` role has no ID left to print either: an older build discarded
+   * it when the binding was found broken, and nothing writes that state now. */
   const modelLabel = (definition: AgentDefinition) => {
     const selection = definition.modelSelection;
     if (selection.kind === "inherit") {
@@ -383,8 +397,8 @@ export function AgentDefinitionSettings({
     }
     if (!agentDefinitionModelIsAvailable(selection, providers)) {
       return t(
-        "{model} · 模型已不可用，模型看不到这个角色",
-        "{model} · model unavailable, hidden from the model",
+        "{model} · 模型暂时取不到，模型看不到这个角色",
+        "{model} · model unavailable for now, hidden from the model",
         { model: selection.modelId }
       );
     }
@@ -531,12 +545,12 @@ export function AgentDefinitionSettings({
                 hint={modelSelectionUnavailable
                   ? selectedModelSelection?.kind === "explicit"
                     ? t(
-                        "绑定的模型已不在该提供商的模型列表里（或该提供商被停用），这个角色暂时不能被调用；把它装回来，绑定就会恢复。",
-                        "The bound model is no longer in that provider's model list (or the provider is disabled), so this role cannot be called for now. Put it back and the binding recovers."
+                        "这个模型现在取不到——提供商还没拉取模型、被停用，或者这一行已经不在了。角色暂时不能被调用，但绑定会一直留着，模型回来就自动恢复。",
+                        "This model cannot be resolved right now — the provider has not fetched its models, is disabled, or the row is gone. The role cannot be called for now, but the binding is kept and recovers by itself once the model is back."
                       )
                     : t(
-                        "原模型已不可用，这个角色当前不能被调用；请选择跟随对话或另一个可用模型。原来的模型 ID 不会被记住。",
-                        "The bound model is gone, so this role cannot be called. Choose the conversation's model or another available one. The old model ID is not remembered."
+                        "这条绑定是旧版本记下的「已失效」，模型 ID 当时就被丢掉了，找不回来；请选择跟随对话或另一个可用模型。",
+                        "An older build recorded this binding as broken and discarded the model ID at the time, so it cannot be recovered. Choose the conversation's model or another available one."
                       )
                   : t(
                       "只列出已启用提供商中的模型；保存精确 provider/model ID。",
@@ -572,17 +586,18 @@ export function AgentDefinitionSettings({
                     * not have.
                     *
                     * A binding whose pair is still recorded but no longer offered — its model
-                    * was removed from the provider, or the provider is disabled — shows the
-                    * bound pair and marks it unavailable. Showing "Choose an execution model"
-                    * would falsely imply the binding was dropped, although restoring the model
-                    * brings it back. */}
+                    * has not been fetched, or the provider is disabled — names the model the
+                    * user actually chose. It must never print the raw `providerId`, which is a
+                    * random per-installation UUID and reads as a hash; the provider's own name
+                    * is the part a person can act on, and when its row is gone entirely there
+                    * is no name to give, so the model ID stands alone. */}
                   {modelSelectionUnavailable && (
                     <option value="" disabled hidden>
                       {selectedModelSelection?.kind === "explicit"
                         ? t(
                             "{model}（不可用）",
                             "{model} (unavailable)",
-                            { model: `${selectedModelSelection.providerId} · ${selectedModelSelection.modelId}` }
+                            { model: unavailableBindingLabel(selectedModelSelection) }
                           )
                         : t("请选择执行模型", "Choose an execution model")}
                     </option>

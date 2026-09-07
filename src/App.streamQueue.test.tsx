@@ -639,12 +639,16 @@ describe("App model run flow — streamQueue", () => {
     const firstRetry = await screen.findByRole("button", {
       name: "重试发送排队消息“permanent-failure.png”"
     });
-    await waitFor(() => expect(runtimeMocks.saveDocument).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(promotionAttempts).toBe(1));
     await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 30));
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    });
+    const firstSaveCount = runtimeMocks.saveDocument.mock.calls.length;
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
     });
     expect(promotionAttempts).toBe(1);
-    expect(runtimeMocks.saveDocument).toHaveBeenCalledTimes(3);
+    expect(runtimeMocks.saveDocument).toHaveBeenCalledTimes(firstSaveCount);
     expect(runtimeMocks.runModel).not.toHaveBeenCalled();
 
     await user.click(firstRetry);
@@ -653,16 +657,19 @@ describe("App model run flow — streamQueue", () => {
       name: "重试发送排队消息“permanent-failure.png”"
     });
     expect(secondRetry).toBeEnabled();
-    await waitFor(() => expect(runtimeMocks.saveDocument).toHaveBeenCalledTimes(6));
     await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 30));
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    });
+    const secondSaveCount = runtimeMocks.saveDocument.mock.calls.length;
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
     });
     expect(promotionAttempts).toBe(2);
-    expect(runtimeMocks.saveDocument).toHaveBeenCalledTimes(6);
+    expect(runtimeMocks.saveDocument).toHaveBeenCalledTimes(secondSaveCount);
     expect(runtimeMocks.runModel).not.toHaveBeenCalled();
     expect(within(screen.getByRole("region", { name: "排队消息" }))
       .getByText("permanent-failure.png")).toBeInTheDocument();
-  });
+  }, 10_000);
 
   it("does not hot-loop when both queued promotion and its durable rollback fail", async () => {
     const document = documentWithModel();
@@ -688,7 +695,7 @@ describe("App model run flow — streamQueue", () => {
 
     let promotionAttempts = 0;
     let rollbackAttempts = 0;
-    runtimeMocks.saveDocument.mockImplementation((saved: AppDocument) => {
+    runtimeMocks.saveDocument.mockImplementation((saved: AppDocument, options) => {
       const savedConversation = saved.workspaces[0].conversations[0];
       const promoted = savedConversation.contexts.some(
         (context) => context.id === queuedMessage.id
@@ -699,7 +706,7 @@ describe("App model run flow — streamQueue", () => {
         promotionAttempts += 1;
         return Promise.reject(new Error("promotion persistence failed"));
       }
-      const rolledBack = promotionAttempts > 0
+      const rolledBack = options?.durable && promotionAttempts > 0
         && savedConversation.contexts.every((context) => context.id !== queuedMessage.id)
         && savedConversation.queuedMessages.some((message) => message.id === queuedMessage.id);
       if (rolledBack && rollbackAttempts === 0) {
@@ -719,19 +726,21 @@ describe("App model run flow — streamQueue", () => {
       expect(promotionAttempts).toBe(1);
       expect(rollbackAttempts).toBe(1);
     });
-    expect(runtimeMocks.saveDocument.mock.calls[1][1]).toMatchObject({
-      immutableSnapshot: true,
-      durable: true
-    });
-    expect(runtimeMocks.saveDocument.mock.calls[2][1]).toMatchObject({
-      immutableSnapshot: true,
-      durable: true
-    });
+    // Startup and background saves may interleave; identify the transaction by
+    // its durable flag and payload instead of the global save call index.
+    const durableSaves = runtimeMocks.saveDocument.mock.calls.filter(([, options]) => options?.durable);
+    expect(durableSaves).toHaveLength(2);
+    for (const [, options] of durableSaves) {
+      expect(options).toMatchObject({ immutableSnapshot: true, durable: true });
+    }
+    expect(durableSaves[0][0].workspaces[0].conversations[0].contexts)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: queuedMessage.id })]));
+    expect(durableSaves[1][0].workspaces[0].conversations[0].queuedMessages)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: queuedMessage.id })]));
 
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     });
-    expect(runtimeMocks.saveDocument).toHaveBeenCalledTimes(4);
     const stabilizedSaveCount = runtimeMocks.saveDocument.mock.calls.length;
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 500));

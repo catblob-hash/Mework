@@ -71,6 +71,9 @@ const MANUAL_PROMPT_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_PROMPTS_PER_CONVERSATION: usize = 64;
 /// The card is one or two lines above the composer, not a document viewer.
 const MAX_SUMMARY_CHARS: usize = 240;
+/// Feedback on a plan card is a paragraph of guidance, not a document. It is
+/// quoted into a tool result, so it is bounded like every other model input.
+const MAX_FEEDBACK_CHARS: usize = 4_000;
 
 /// True for the tools whose whole argument is an arbitrary command line. The
 /// user's instruction is explicit: a shell call is never blanket-allowed,
@@ -210,6 +213,54 @@ impl ToolPromptDecision {
     }
 }
 
+/// Which question a card is asking. The three kinds share one registry and one
+/// resolve command, but only `Tool` is about authorizing a side effect, so only
+/// `Tool` participates in blanket allowances.
+///
+/// The renderer draws the plan kinds differently: no "always" button, and a
+/// feedback box on the denial path, because "not yet, because…" is the answer
+/// that keeps a planning turn going.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptKind {
+    #[default]
+    Tool,
+    /// The model finished a plan and wants to start implementing.
+    PlanExit,
+    /// The model wants the conversation to enter plan mode.
+    PlanEnter,
+}
+
+/// One answer to one card. `feedback` is the user's prose, which only the plan
+/// cards collect; it travels with the decision so the blocked worker can put it
+/// in the tool result the model reads next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptAnswer {
+    pub decision: ToolPromptDecision,
+    pub feedback: Option<String>,
+}
+
+impl PromptAnswer {
+    pub fn new(decision: ToolPromptDecision) -> Self {
+        Self {
+            decision,
+            feedback: None,
+        }
+    }
+}
+
+/// Normalizes renderer-supplied card feedback: trimmed, empty treated as
+/// absent, and capped, because this text is quoted verbatim into the tool
+/// result the model reads next.
+pub fn sanitize_prompt_feedback(feedback: Option<String>) -> Option<String> {
+    let feedback = feedback?;
+    let trimmed = feedback.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_FEEDBACK_CHARS).collect())
+}
+
 /// What the renderer needs to draw one card. Serialized straight to the
 /// manual-path command result and mirrored field-for-field by
 /// `ModelStreamEvent::ToolApprovalRequested`.
@@ -218,6 +269,10 @@ impl ToolPromptDecision {
 pub struct PendingToolPrompt {
     pub prompt_id: String,
     pub tool_name: String,
+    /// Absent in cards persisted or sent before plan mode existed, which were
+    /// all ordinary tool approvals.
+    #[serde(default)]
+    pub kind: PromptKind,
     pub label: String,
     pub summary: String,
     pub risk_level: String,
@@ -249,7 +304,7 @@ pub struct PendingToolPrompt {
 /// Why a prompt stopped waiting. Only `Answered` carries the user's intent.
 #[derive(Debug)]
 enum PromptOutcome {
-    Answered(ToolPromptDecision),
+    Answered(PromptAnswer),
     /// A flag the waiter asked to be watched went up: the run was stopped, or
     /// the task that raised the card was stopped from the sidebar.
     Cancelled,
@@ -287,7 +342,7 @@ enum PendingPrompt {
         /// cards verbatim instead of leaving a worker blocked behind a card
         /// nobody can see.
         card: PendingToolPrompt,
-        sender: SyncSender<ToolPromptDecision>,
+        sender: SyncSender<PromptAnswer>,
     },
     /// A renderer-initiated tool-editor call. The classified request is held
     /// here rather than resent with the answer, so the renderer cannot widen
@@ -450,10 +505,14 @@ impl ToolPromptRegistry {
     /// Renderer-side resolution. Unknown ids are an error rather than a silent
     /// success so a double-click or a stale card cannot read as consent for
     /// whatever prompt happens to be open next.
+    ///
+    /// `feedback` is the prose the plan cards collect. The manual path has no
+    /// card that asks for it and drops it.
     pub fn resolve(
         &self,
         prompt_id: &str,
         decision: ToolPromptDecision,
+        feedback: Option<String>,
     ) -> Result<PromptResolution, String> {
         let entry = self
             .pending
@@ -465,7 +524,7 @@ impl ToolPromptRegistry {
             PendingPrompt::Model { sender, .. } => {
                 // The receiver is gone only if the waiter already bailed out;
                 // the prompt is over either way.
-                let _ = sender.try_send(decision);
+                let _ = sender.try_send(PromptAnswer { decision, feedback });
                 Ok(PromptResolution::Model)
             }
             PendingPrompt::Manual {
@@ -514,6 +573,32 @@ impl ToolPromptRegistry {
             .clear();
     }
 
+    /// The boolean projection of [`ask_answer`](Self::ask_answer), for the
+    /// yes/no cards whose prose is never read. Production callers go through
+    /// `api::ask_announced_prompt`, which needs the prose for the plan cards.
+    #[cfg(test)]
+    pub fn ask(
+        &self,
+        conversation_id: &str,
+        owner: PromptOwner,
+        mandatory: bool,
+        risk_level: RiskLevel,
+        cancellations: &[&AtomicBool],
+        card: PendingToolPrompt,
+        announce: impl FnOnce(&PendingToolPrompt) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.ask_answer(
+            conversation_id,
+            owner,
+            mandatory,
+            risk_level,
+            cancellations,
+            card,
+            announce,
+        )
+        .map(|answer| answer.decision.allows())
+    }
+
     /// Opens a model prompt, hands the card to `announce`, and blocks until the
     /// renderer answers, one of `cancellations` goes up, or the prompt times
     /// out.
@@ -531,10 +616,17 @@ impl ToolPromptRegistry {
     /// `announce` is what puts the card on screen. If it fails, the prompt is
     /// closed immediately rather than waiting out a card nobody can see.
     ///
-    /// Only a user's `Deny` returns `Ok(false)`. Stopped, timed out, and
-    /// retracted are `Err`, because callers must not attribute a refusal to the
-    /// user when the user did not answer.
-    pub fn ask(
+    /// Only a user's `Deny` returns an answer that does not allow. Stopped,
+    /// timed out, and retracted are `Err`, because callers must not attribute a
+    /// refusal to the user when the user did not answer. The user's prose comes
+    /// back with the decision; only the plan cards have anything to do with it.
+    ///
+    /// Blanket allowances are a property of authorizing a *tool*, so a card
+    /// whose `kind` is not `Tool` neither consults nor records one — a user who
+    /// once said "always allow" for some tool has not thereby agreed to leave
+    /// plan mode, and agreeing to leave plan mode this once must not silently
+    /// answer a later card.
+    pub fn ask_answer(
         &self,
         conversation_id: &str,
         owner: PromptOwner,
@@ -543,13 +635,12 @@ impl ToolPromptRegistry {
         cancellations: &[&AtomicBool],
         card: PendingToolPrompt,
         announce: impl FnOnce(&PendingToolPrompt) -> Result<(), String>,
-    ) -> Result<bool, String> {
+    ) -> Result<PromptAnswer, String> {
         let tool_name = card.tool_name.clone();
-        if !mandatory
-            && !never_blanket_allowed(&tool_name)
-            && self.is_always_allowed(conversation_id, &tool_name, risk_level)
-        {
-            return Ok(true);
+        let blanket_allowable =
+            card.kind == PromptKind::Tool && !mandatory && !never_blanket_allowed(&tool_name);
+        if blanket_allowable && self.is_always_allowed(conversation_id, &tool_name, risk_level) {
+            return Ok(PromptAnswer::new(ToolPromptDecision::AllowAlways));
         }
         let stopped = || cancellations.iter().any(|flag| flag.load(Ordering::Acquire));
         // Asking at all is pointless once the waiter is already stopped, and it
@@ -585,7 +676,7 @@ impl ToolPromptRegistry {
                 break PromptOutcome::Cancelled;
             }
             match receiver.recv_timeout(CANCELLATION_POLL) {
-                Ok(decision) => break PromptOutcome::Answered(decision),
+                Ok(answer) => break PromptOutcome::Answered(answer),
                 Err(RecvTimeoutError::Disconnected) => break PromptOutcome::Retracted,
                 Err(RecvTimeoutError::Timeout) => {
                     waited += CANCELLATION_POLL;
@@ -598,7 +689,7 @@ impl ToolPromptRegistry {
         self.close(&prompt_id);
 
         match outcome {
-            PromptOutcome::Answered(decision) => {
+            PromptOutcome::Answered(answer) => {
                 // Cancellation wins if it races with an Allow decision. Recheck
                 // after receiving the decision so execution cannot proceed in a
                 // cancelled run.
@@ -607,13 +698,10 @@ impl ToolPromptRegistry {
                 }
                 // An allowance is only ever recorded for a decision the level,
                 // not the tool, was allowed to settle.
-                if !mandatory
-                    && !never_blanket_allowed(&tool_name)
-                    && decision == ToolPromptDecision::AllowAlways
-                {
+                if blanket_allowable && answer.decision == ToolPromptDecision::AllowAlways {
                     self.remember_allowance(conversation_id, &tool_name, risk_level);
                 }
-                Ok(decision.allows())
+                Ok(answer)
             }
             PromptOutcome::Cancelled => Err("This tool call was stopped while awaiting confirmation".into()),
             PromptOutcome::Retracted => {
@@ -654,6 +742,7 @@ mod tests {
         PendingToolPrompt {
             prompt_id: "minted-by-the-registry".into(),
             tool_name: tool.into(),
+            kind: PromptKind::Tool,
             label: tool.into(),
             summary: "notes.md".into(),
             risk_level: "中".into(),
@@ -678,7 +767,7 @@ mod tests {
             let id: String = announced.recv().expect("prompt was never announced");
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
-                if answering.resolve(&id, decision).is_ok() {
+                if answering.resolve(&id, decision, None).is_ok() {
                     return;
                 }
                 thread::sleep(Duration::from_millis(5));
@@ -757,6 +846,136 @@ mod tests {
             )
             .unwrap();
         assert!(allowed);
+    }
+
+    /// The user's prose is part of the answer, not a side channel: a denied
+    /// plan card is only useful if what the user wants changed comes back with
+    /// the refusal.
+    #[test]
+    fn a_plan_card_carries_the_users_prose_back_to_the_waiting_worker() {
+        let registry = registry();
+        let answering = Arc::clone(&registry);
+        let (announce, announced) = sync_channel(1);
+        let responder = thread::spawn(move || {
+            let id: String = announced.recv().expect("prompt was never announced");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                // Padded and over-long prose is normalized on the way in, the
+                // same way the command does it for the renderer.
+                let feedback = sanitize_prompt_feedback(Some(format!(
+                    "  start with the storage layer{}  ",
+                    "!".repeat(MAX_FEEDBACK_CHARS)
+                )));
+                if answering
+                    .resolve(&id, ToolPromptDecision::Deny, feedback.clone())
+                    .is_ok()
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("prompt never became resolvable");
+        });
+        let mut exit = card("exit_plan_mode");
+        exit.kind = PromptKind::PlanExit;
+        exit.mandatory = true;
+        let answer = registry
+            .ask_answer(
+                "conversation-a",
+                PromptOwner::Run("run-1".into()),
+                true,
+                RiskLevel::Low,
+                &[],
+                exit,
+                |prompt| {
+                    assert_eq!(prompt.kind, PromptKind::PlanExit);
+                    announce.send(prompt.prompt_id.clone()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+        assert_eq!(answer.decision, ToolPromptDecision::Deny);
+        let feedback = answer.feedback.expect("the refusal carries its reason");
+        assert!(feedback.starts_with("start with the storage layer"));
+        assert_eq!(feedback.chars().count(), MAX_FEEDBACK_CHARS);
+
+        // Nothing to say is `None`, not an empty string a caller would quote.
+        assert_eq!(sanitize_prompt_feedback(Some("   ".into())), None);
+        assert_eq!(sanitize_prompt_feedback(None), None);
+    }
+
+    /// Blanket allowances authorize a *tool*. Saying "always allow" to some
+    /// tool has not agreed to leave plan mode, and agreeing to leave plan mode
+    /// this once must not answer a later card by itself.
+    #[test]
+    fn a_plan_card_neither_records_nor_consults_an_allowance() {
+        let registry = registry();
+        let plan_card = || {
+            let mut exit = card("exit_plan_mode");
+            exit.kind = PromptKind::PlanExit;
+            exit
+        };
+
+        // `mandatory` is false here so the only thing keeping the allowance
+        // machinery away is the card's kind.
+        let (announce, responder) = answer_next_prompt(&registry, ToolPromptDecision::AllowAlways);
+        registry
+            .ask_answer(
+                "conversation-a",
+                PromptOwner::Run("run-1".into()),
+                false,
+                RiskLevel::Low,
+                &[],
+                plan_card(),
+                |prompt| {
+                    announce.send(prompt.prompt_id.clone()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+        assert!(!registry.is_always_allowed("conversation-a", "exit_plan_mode", RiskLevel::Low));
+
+        // Even with an allowance recorded for that name by an ordinary tool
+        // card, the plan card still goes to the user.
+        let (announce, responder) = answer_next_prompt(&registry, ToolPromptDecision::AllowAlways);
+        let mut ordinary = card("exit_plan_mode");
+        ordinary.kind = PromptKind::Tool;
+        registry
+            .ask(
+                "conversation-a",
+                PromptOwner::Run("run-1".into()),
+                false,
+                RiskLevel::Low,
+                &[],
+                ordinary,
+                |prompt| {
+                    announce.send(prompt.prompt_id.clone()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+        assert!(registry.is_always_allowed("conversation-a", "exit_plan_mode", RiskLevel::Low));
+
+        let (announce, responder) = answer_next_prompt(&registry, ToolPromptDecision::Deny);
+        let answer = registry
+            .ask_answer(
+                "conversation-a",
+                PromptOwner::Run("run-1".into()),
+                false,
+                RiskLevel::Low,
+                &[],
+                plan_card(),
+                |prompt| {
+                    announce.send(prompt.prompt_id.clone()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+        assert_eq!(answer.decision, ToolPromptDecision::Deny);
     }
 
     /// A standing allowance covers a call class, not every use of that tool.
@@ -1001,7 +1220,7 @@ mod tests {
         thread::sleep(Duration::from_millis(40));
         cancellation.store(true, Ordering::Release);
         registry
-            .resolve(&prompt_id, ToolPromptDecision::AllowOnce)
+            .resolve(&prompt_id, ToolPromptDecision::AllowOnce, None)
             .unwrap();
         let outcome = run.join().unwrap();
         assert!(
@@ -1094,19 +1313,19 @@ mod tests {
         // The task's card in the same conversation is untouched and still
         // answerable — this is the regression the scoping exists for.
         assert!(registry
-            .resolve(&task_id, ToolPromptDecision::AllowOnce)
+            .resolve(&task_id, ToolPromptDecision::AllowOnce, None)
             .is_ok());
         assert!(task_run.join().unwrap());
 
         // The other conversation's card is still answerable and still blocking.
         assert!(registry
-            .resolve(&bystander_id, ToolPromptDecision::AllowOnce)
+            .resolve(&bystander_id, ToolPromptDecision::AllowOnce, None)
             .is_ok());
         assert!(bystander_run.join().unwrap());
 
         // The manual prompt survived and still carries its classified request.
         match registry
-            .resolve(&manual, ToolPromptDecision::AllowOnce)
+            .resolve(&manual, ToolPromptDecision::AllowOnce, None)
             .unwrap()
         {
             PromptResolution::Manual { request, decision } => {
@@ -1158,7 +1377,7 @@ mod tests {
         assert_eq!(registry.all_pending_cards().len(), 1);
 
         registry
-            .resolve(&prompt_id, ToolPromptDecision::AllowOnce)
+            .resolve(&prompt_id, ToolPromptDecision::AllowOnce, None)
             .unwrap();
         assert!(waiting.join().unwrap().unwrap());
         assert!(registry.all_pending_cards().is_empty());
@@ -1194,14 +1413,14 @@ mod tests {
     fn a_prompt_id_is_single_use() {
         let registry = registry();
         assert!(registry
-            .resolve("never-opened", ToolPromptDecision::AllowOnce)
+            .resolve("never-opened", ToolPromptDecision::AllowOnce, None)
             .is_err());
 
         let id = registry
             .open_manual(&manual_request("conversation-a", "read"), RiskLevel::Low)
             .unwrap();
-        assert!(registry.resolve(&id, ToolPromptDecision::AllowOnce).is_ok());
-        assert!(registry.resolve(&id, ToolPromptDecision::AllowOnce).is_err());
+        assert!(registry.resolve(&id, ToolPromptDecision::AllowOnce, None).is_ok());
+        assert!(registry.resolve(&id, ToolPromptDecision::AllowOnce, None).is_err());
     }
 
     /// The renderer may not swap the arguments between being asked about a
@@ -1214,7 +1433,7 @@ mod tests {
         original.input = object(json!({"path": "notes.md", "content": "original"}));
         let id = registry.open_manual(&original, RiskLevel::Medium).unwrap();
 
-        match registry.resolve(&id, ToolPromptDecision::AllowOnce).unwrap() {
+        match registry.resolve(&id, ToolPromptDecision::AllowOnce, None).unwrap() {
             PromptResolution::Manual { request, .. } => assert_eq!(*request, original),
             PromptResolution::Model => panic!("manual prompt resolved as a model prompt"),
         }

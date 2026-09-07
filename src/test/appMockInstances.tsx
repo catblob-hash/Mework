@@ -25,6 +25,7 @@ export const runtimeMocks = {
   listPendingToolPrompts: vi.fn(),
   listPendingForkRequests: vi.fn(),
   listPendingForkStarts: vi.fn().mockResolvedValue([]),
+  loadConversationPlan: vi.fn().mockResolvedValue(null),
   workflowRunHistory: vi.fn().mockResolvedValue([]),
   workflowStepRecord: vi.fn().mockResolvedValue(null),
   resolveForkRequest: vi.fn(),

@@ -539,7 +539,7 @@ describe("ConversationSettings", () => {
     const panel = screen.getByRole("complementary", { name: "本对话设置" });
     // Security policy is configured in the composer; the preset editor retains template controls.
     expect(within(panel).queryByText("安全")).toBeNull();
-    for (const label of [/请求批准/, /允许编辑/, /完全访问/]) {
+    for (const label of [/手动/, /允许编辑/, /计划模式/, /完全访问/]) {
       expect(within(panel).queryByRole("checkbox", { name: label })).toBeNull();
     }
     // Memory tools derive from the two tier switches and do not appear in the tool picker.

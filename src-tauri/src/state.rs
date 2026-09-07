@@ -130,6 +130,11 @@ pub struct AppState {
     /// Per-conversation task surface containing sink and approval entry points. Each top-level run
     /// replaces it so detached workers lazily use the latest security level and workspace settings.
     task_surfaces: Arc<Mutex<HashMap<String, Arc<TaskSurface>>>>,
+    /// The security level each live top-level run is executing under. Registered
+    /// at run start and removed when that run finishes, so a renderer settings
+    /// write or a plan approval can move a running turn to a different level
+    /// without waiting for it to end.
+    live_security_levels: Arc<Mutex<HashMap<String, Arc<crate::model::LiveSecurityLevel>>>>,
     /// Interrupted workflow notifications claimed at startup, keyed by conversation. Memory holds
     /// only a delivery queue; the manifest's `crashNoticeDelivered` field remains authoritative.
     workflow_restart_notices: Arc<Mutex<HashMap<String, Vec<crate::workflow_store::InterruptedRun>>>>,
@@ -333,6 +338,7 @@ impl AppState {
             conversation_tasks: Arc::default(),
             retired_conversations: Arc::default(),
             task_surfaces: Arc::default(),
+            live_security_levels: Arc::default(),
             workflow_restart_notices: Arc::default(),
             shell_sessions: Arc::default(),
             app_update: Arc::default(),
@@ -463,6 +469,7 @@ impl AppState {
         let tasks = self.conversation_tasks.lock().unwrap_or_else(|p| p.into_inner())
             .remove(conversation_id);
         self.task_surfaces.lock().unwrap_or_else(|p| p.into_inner()).remove(conversation_id);
+        self.live_security_levels.lock().unwrap_or_else(|p| p.into_inner()).remove(conversation_id);
         self.workflow_restart_notices.lock().unwrap_or_else(|p| p.into_inner()).remove(conversation_id);
         // The map lock is already released. Cancellation only sets owned flags;
         // it never waits for worker completion (which may itself try to publish).
@@ -703,6 +710,42 @@ impl AppState {
             .cloned()
     }
 
+    /// The conversation's live security-level cell, moved to the level a run is
+    /// starting under. One cell per conversation for as long as the conversation
+    /// exists, not one per run: task workers that outlive the turn which spawned
+    /// them hold the same `Arc`, so a settings write or a plan approval made
+    /// after that turn still reaches them.
+    pub fn live_security_level_for_run(
+        &self,
+        conversation_id: &str,
+        level: crate::model::SecurityLevel,
+    ) -> Arc<crate::model::LiveSecurityLevel> {
+        let cell = Arc::clone(
+            self.live_security_levels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(conversation_id.to_owned())
+                .or_insert_with(|| Arc::new(crate::model::LiveSecurityLevel::new(level))),
+        );
+        cell.set(level);
+        cell
+    }
+
+    /// The conversation's live security-level cell, if any run has started in
+    /// it since the conversation was created or the app launched. `None` means
+    /// nothing is executing under a level that could move, and the persisted
+    /// setting is the whole truth.
+    pub fn live_security_level(
+        &self,
+        conversation_id: &str,
+    ) -> Option<Arc<crate::model::LiveSecurityLevel>> {
+        self.live_security_levels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(conversation_id)
+            .cloned()
+    }
+
     pub fn begin_mutation(&self) -> Result<MutationGuard, String> {
         self.operation_gate.begin_mutation()
     }
@@ -768,6 +811,18 @@ impl AppState {
         // belong to background commands, cross-turn tasks, or manually rerun commands.
         cancellation.store(true, Ordering::Release);
         Ok(true)
+    }
+
+    /// This run's own stop flag, for a leg that has to watch it directly rather
+    /// than receive it at dispatch. Absent once the run is unregistered, which
+    /// is not an error: a card raised with no flag is still bounded by the
+    /// prompt timeout.
+    pub fn model_run_cancellation_flag(&self, request_id: &str) -> Option<Arc<AtomicBool>> {
+        self.model_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(request_id)
+            .map(|(cancellation, _, _)| cancellation.clone())
     }
 
     /// Cancels the current run addressed by conversation rather than request ID, so reloads do not

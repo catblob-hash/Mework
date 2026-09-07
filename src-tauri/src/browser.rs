@@ -11869,6 +11869,7 @@ mod tests {
             "http://inner.tauri.localhost/",
         ] {
             for level in [
+                SecurityLevel::Plan,
                 SecurityLevel::RequestApproval,
                 SecurityLevel::AllowEdits,
                 SecurityLevel::FullAccess,
@@ -11894,6 +11895,10 @@ mod tests {
         ] {
             let url = Url::parse(origin).unwrap();
             assert!(
+                !is_navigation_allowed_with(&url, SecurityLevel::Plan, dev_port),
+                "{origin} must stay reserved below full access"
+            );
+            assert!(
                 !is_navigation_allowed_with(&url, SecurityLevel::RequestApproval, dev_port),
                 "{origin} must stay reserved below full access"
             );
@@ -11907,7 +11912,11 @@ mod tests {
             );
         }
         // Any other loopback port was never reserved at any level.
-        for level in [SecurityLevel::RequestApproval, SecurityLevel::FullAccess] {
+        for level in [
+            SecurityLevel::Plan,
+            SecurityLevel::RequestApproval,
+            SecurityLevel::FullAccess,
+        ] {
             assert!(is_navigation_allowed_with(
                 &Url::parse("http://localhost:3000/").unwrap(),
                 level,
@@ -11959,6 +11968,7 @@ mod tests {
             let url = Url::parse(origin).unwrap();
             assert!(!is_app_dev_server_origin(&url, None));
             for level in [
+                SecurityLevel::Plan,
                 SecurityLevel::RequestApproval,
                 SecurityLevel::AllowEdits,
                 SecurityLevel::FullAccess,

@@ -6,6 +6,7 @@ import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { useAppearance } from "../lib/appearance";
+import remarkPathLinks from "../lib/remarkPathLinks";
 
 interface MarkdownContentProps {
   content: string;
@@ -14,6 +15,14 @@ interface MarkdownContentProps {
   deferOffscreen?: boolean;
   /** Keep active streams mounted even when viewport deferral is enabled. */
   streaming?: boolean;
+  /**
+   * Turn file paths into clickable nodes. Callers opt in per surface so that
+   * user-authored text is never parsed this way, including when the appearance
+   * setting renders user messages as Markdown.
+   */
+  linkifyPaths?: boolean;
+  /** Directory relative paths resolve against, read at click time. */
+  pathBaseDir?: string | null;
 }
 
 type VisibilityCallback = (visible: boolean) => void;
@@ -144,7 +153,9 @@ export const MarkdownContent = memo(function MarkdownContent({
   content,
   className,
   deferOffscreen = false,
-  streaming = false
+  streaming = false,
+  linkifyPaths = false,
+  pathBaseDir = null
 }: MarkdownContentProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [nearViewport, setNearViewport] = useState(() => (
@@ -160,8 +171,18 @@ export const MarkdownContent = memo(function MarkdownContent({
   // Obtain the type from ReactMarkdown props rather than importing unified's
   // `PluggableList`; unified is transitive and may change independently.
   const remarkPlugins = useMemo<ComponentProps<typeof ReactMarkdown>["remarkPlugins"]>(
-    () => [remarkGfm, remarkBreaks, [remarkMath, { singleDollarTextMath: singleDollarMath }]],
-    [singleDollarMath]
+    () => {
+      const plugins: NonNullable<ComponentProps<typeof ReactMarkdown>["remarkPlugins"]> = [
+        remarkGfm,
+        remarkBreaks,
+        [remarkMath, { singleDollarTextMath: singleDollarMath }]
+      ];
+      // Last, so autolinked URLs and math are already their own nodes and the
+      // path transform can skip them.
+      if (linkifyPaths) plugins.push(remarkPathLinks);
+      return plugins;
+    },
+    [singleDollarMath, linkifyPaths]
   );
   const normalizedContent = useMemo(
     () => shouldRender ? normalizeMathDelimiters(content) : content,
@@ -232,6 +253,7 @@ export const MarkdownContent = memo(function MarkdownContent({
       ref={hostRef}
       className={`markdown-content${className ? ` ${className}` : ""}`}
       data-markdown-deferred={!shouldRender || undefined}
+      data-mework-path-base={(linkifyPaths && pathBaseDir) || undefined}
       style={!shouldRender ? { minHeight: `${measuredHeight || estimatedHeight}px` } : undefined}
     >
       {shouldRender && (

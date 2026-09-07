@@ -207,6 +207,13 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .markdown-content blockquote > :last-child { margin-bottom: 0; }
 .markdown-content a { color: var(--color-315eae); text-decoration: underline; text-decoration-color: var(--color-315eae-ap35); text-underline-offset: 2px; }
 .markdown-content a:hover { text-decoration-color: currentColor; }
+/* Paths detected in model output. A button rather than an anchor keeps it
+   invisible to the external-link interceptor and gives keyboard activation a
+   real click; the reset makes it sit in the text flow like a link. */
+.markdown-content .md-path-link { display: inline; margin: 0; padding: 0; border: 0; background: none; appearance: none; font: inherit; line-height: inherit; vertical-align: baseline; text-align: left; color: var(--color-315eae); text-decoration: underline; text-decoration-color: var(--color-315eae-ap35); text-underline-offset: 2px; cursor: pointer; }
+.markdown-content .md-path-link:hover { text-decoration-color: currentColor; }
+/* Keep the inline-code chrome, but let the link color win over it. */
+.markdown-content .md-path-link--code > code { color: inherit; }
 .markdown-content code { border-radius: 4px; font: .9em/1.55 var(--mono); }
 .markdown-content :not(pre) > code { padding: .08em .32em; background: var(--color-edede9); color: var(--color-343431); }
 .markdown-content pre { max-width: 100%; margin: .65em 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--color-e0e0db); border-radius: 8px; background: var(--color-f1f1ee); color: var(--color-343431); line-height: 1.55; }

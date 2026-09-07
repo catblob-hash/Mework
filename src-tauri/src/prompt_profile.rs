@@ -62,6 +62,53 @@ Notes:
 - The browser session and web authorization are shared with the whole conversation. Leave pages in a usable state and do not depend on temporary state only you know about.
 - The host caps your rounds and truncates an over-long final reply. Lead with the conclusion, then the evidence and whatever stayed unresolved; give complete paths when you cite a file."#;
 
+const PLAN_MODE_EN: &str = r#"# Plan mode
+
+Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received.
+
+## Plan document
+Your plan is a host-stored document, not a file in the workspace. Build it incrementally with the `plan` tool: `action: "write"` replaces the whole document with the markdown you pass in `content`; `action: "read"` returns the current version. The user reads it live in the plan panel. The plan document is the only thing you are allowed to write — everything else must be read-only.
+
+## Plan workflow
+
+### Phase 1: Initial understanding
+Goal: Gain a comprehensive understanding of the user's request by reading through code and asking them questions.
+1. Focus on understanding the user's request and the code associated with their request. Actively search for existing functions, utilities, and patterns that can be reused — avoid proposing new code when suitable implementations already exist.
+2. Read and explore the relevant files directly to efficiently understand the codebase. Read-only subagents may be used for broad searches when the `agent_spawn` tool is available.
+
+### Phase 2: Design
+Goal: Design an implementation approach based on the user's intent and your exploration results from Phase 1.
+- Provide comprehensive background context from Phase 1 exploration including filenames and code path traces
+- Describe requirements and constraints
+- Produce a detailed implementation plan
+
+### Phase 3: Review
+Goal: Review the plan and ensure alignment with the user's intentions.
+1. Read the critical files you identified during exploration to deepen your understanding
+2. Ensure that the plan aligns with the user's original request
+3. Use `ask_user` to clarify any remaining questions with the user
+
+### Phase 4: Final plan
+Goal: Write your final plan with the `plan` tool (the only thing you can write).
+- Begin with a **Context** section: explain why this change is being made — the problem or need it addresses, what prompted it, and the intended outcome
+- Include only your recommended approach, not all alternatives
+- Ensure that the plan is concise enough to scan quickly, but detailed enough to execute effectively
+- Name the critical files to be modified. For changes that repeat a pattern across many files, describe the pattern once and list a few representative paths — do not enumerate every file or line number
+- Reference existing functions and utilities you found that should be reused, with their file paths
+- Include a verification section describing how to test the changes end-to-end (run the code, use tools, run tests)
+
+### Phase 5: Call exit_plan_mode
+At the very end of your turn, once you have asked the user questions and are happy with your final plan — you should always call `exit_plan_mode` to indicate to the user that you are done planning.
+This is critical — your turn should only end with either using the `ask_user` tool OR calling `exit_plan_mode`. Do not stop unless it's for these 2 reasons.
+
+**Important:** Use `ask_user` ONLY to clarify requirements or choose between approaches. Use `exit_plan_mode` to request plan approval. Do NOT ask about plan approval in any other way — no text questions, no `ask_user`. Phrases like "Is this plan okay?", "Should I proceed?", "How does this plan look?", "Any changes before we start?", or similar MUST use `exit_plan_mode`.
+
+NOTE: At any point in time through this workflow you should feel free to ask the user questions or clarifications using the `ask_user` tool. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins."#;
+
+const PLAN_MODE_SUBAGENT_EN: &str = r#"# Plan mode
+
+Plan mode is active for the conversation you are working in. The user indicated that they do not want anything executed yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received (for example, to make edits). Answer the task you were given comprehensively from read-only research and report your findings to the parent agent. You cannot write the plan document or leave plan mode; the main agent does that."#;
+
 const WEB_EXECUTOR_SYSTEM_EN: &str = "\
 You are answering one isolated web-search query for Mework. You have one capability: your own \
 provider's built-in web search, which you invoke yourself. There are no other tools, and nothing you say is \
@@ -132,6 +179,36 @@ const TOOL_ASK_USER_DESCRIPTION_EN: &str = "Pause this turn and present multiple
 const TOOL_FORK_DESCRIPTION_EN: &str = "Fork this conversation into a separate child conversation that runs on its own with the same permissions as this one. `prompt` becomes the child's first user message; `inherit_context` true copies the timeline so far (and the completed tasks) into the child, false starts it with only the prompt. The call raises a request and returns immediately: under full access the child is created at once, otherwise the user decides on a non-blocking card. You are never told whether it was approved — do not wait for it, and do not repeat the call.";
 const TOOL_TODO_DESCRIPTION_EN: &str = "This conversation's task list. `action` selects the operation.";
 const TOOL_WORKFLOW_DESCRIPTION_EN: &str = "Run a JavaScript orchestration script that spawns subagents deterministically, as a background task: the call returns the task address (workflow:<runId>) immediately and the script's return value is collected with task_wait or delivered automatically — starting a fresh turn to wake you if the conversation is idle. The script needs one user approval up front. Workflows keep running after this turn ends; completed steps stay journaled and resume_run_id replays them instantly on the next run.";
+const TOOL_PLAN_DESCRIPTION_EN: &str = "Reads or replaces this conversation's plan document, the markdown the user reviews in the plan panel before approving implementation. Only available in plan mode. `action: \"write\"` replaces the whole document with `content`; `action: \"read\"` returns the current document. Build the plan incrementally: write early, refine as research answers questions, and keep it scannable (a Context section, the recommended approach, critical files, reusable utilities, and a verification section).";
+const TOOL_EXIT_PLAN_MODE_DESCRIPTION_EN: &str = r#"Use this tool when you are in plan mode and have finished writing your plan with the plan tool and are ready for user approval.
+
+## How This Tool Works
+- You should have already written your plan with the plan tool
+- This tool does NOT take the plan content as a parameter - it presents the plan document you wrote
+- This tool simply signals that you're done planning and ready for the user to review and approve
+- The user sees your plan in the plan panel and chooses to proceed (switching to accept-edits or manual approval) or to keep planning with feedback; the call blocks until they answer
+
+## When to Use This Tool
+IMPORTANT: Only use this tool when the task requires planning the implementation steps of a task that requires writing code. For research tasks where you're gathering information, searching files, reading files or in general trying to understand the codebase - do NOT use this tool.
+
+## Before Using This Tool
+Ensure your plan is complete and unambiguous:
+- If you have unresolved questions about requirements or approach, use ask_user first (in earlier phases)
+- Once your plan is finalized, use THIS tool to request approval
+
+**Important:** Do NOT use ask_user to ask "Is this plan okay?" or "Should I proceed?" - that's exactly what THIS tool does. exit_plan_mode inherently requests user approval of your plan."#;
+const TOOL_ENTER_PLAN_MODE_DESCRIPTION_EN: &str = r#"Use this tool proactively when you're about to start a non-trivial implementation task. Getting user sign-off on your approach before writing code prevents wasted effort and ensures alignment. This tool asks the user to switch the conversation into plan mode, where you explore the codebase, design an implementation approach, write it with the plan tool, and present it with exit_plan_mode for approval.
+
+## When to Use This Tool
+Prefer entering plan mode for implementation tasks unless they're simple: new feature implementation, multiple valid approaches, changes to existing behavior or structure, architectural decisions, multi-file changes, unclear requirements, or when user preferences matter.
+
+## When NOT to Use This Tool
+Only skip it for simple tasks: single-line or few-line fixes (typos, obvious bugs, small tweaks), adding a single function with clear requirements, tasks where the user has given very specific, detailed instructions, or pure research/exploration tasks.
+
+## Important Notes
+- This tool REQUIRES user approval - they must consent to entering plan mode; the call blocks until they answer
+- If unsure whether to use it, err on the side of planning - it's better to get alignment upfront than to redo work
+- Users appreciate being consulted before significant changes are made to their codebase"#;
 
 /// Declares the registry. Each entry is one injection point: the enum variant,
 /// its stable id, the placeholders its text may use, a one-line description for
@@ -217,6 +294,12 @@ prompt_keys! {
     SystemWebSafety => ("system.web_safety", [],
         "Safety boundary appended to the system prompt whenever `web_search` is enabled. Empty by default: the search backend is one the user configured and is therefore trusted. Fill it in to warn the model that web evidence is untrusted.",
         ""),
+    SystemPlanMode => ("system.plan_mode", [],
+        "Section appended to the system prompt of the main agent while the conversation is in plan mode: what plan mode forbids, how the plan document works, and the workflow ending in `exit_plan_mode`.",
+        PLAN_MODE_EN),
+    SystemPlanModeSubagent => ("system.plan_mode_subagent", [],
+        "Section appended to the system prompt of a child agent while the conversation is in plan mode. A child may research but never writes the plan or leaves the mode, so it gets the prohibition without the workflow.",
+        PLAN_MODE_SUBAGENT_EN),
 
 
     // ---- Built-in tool descriptions -------------------------------------
@@ -303,6 +386,15 @@ prompt_keys! {
     ToolWorkflowDescription => ("tool.workflow.description", [],
         "Root description of the `workflow` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `workflow` overrides this key.",
         TOOL_WORKFLOW_DESCRIPTION_EN),
+    ToolPlanDescription => ("tool.plan.description", [],
+        "Root description of the `plan` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `plan` overrides this key.",
+        TOOL_PLAN_DESCRIPTION_EN),
+    ToolExitPlanModeDescription => ("tool.exit_plan_mode.description", [],
+        "Root description of the `exit_plan_mode` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `exit_plan_mode` overrides this key.",
+        TOOL_EXIT_PLAN_MODE_DESCRIPTION_EN),
+    ToolEnterPlanModeDescription => ("tool.enter_plan_mode.description", [],
+        "Root description of the `enter_plan_mode` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `enter_plan_mode` overrides this key.",
+        TOOL_ENTER_PLAN_MODE_DESCRIPTION_EN),
 
     // ---- Child agents --------------------------------------------------
     SubagentAddendum => ("subagent.addendum", [],
@@ -731,6 +823,9 @@ impl PromptKey {
             "fork" => Some(PromptKey::ToolForkDescription),
             "todo" => Some(PromptKey::ToolTodoDescription),
             "workflow" => Some(PromptKey::ToolWorkflowDescription),
+            "plan" => Some(PromptKey::ToolPlanDescription),
+            "exit_plan_mode" => Some(PromptKey::ToolExitPlanModeDescription),
+            "enter_plan_mode" => Some(PromptKey::ToolEnterPlanModeDescription),
             _ => None,
         }
     }

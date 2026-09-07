@@ -17,6 +17,8 @@ interface ReasoningContentProps {
   label?: string;
   actions?: ReactNode;
   deferOffscreen?: boolean;
+  /** Directory relative paths in this card resolve against; enables path links. */
+  pathBaseDir?: string | null;
   /** When this round's reasoning opened. Drives the live clock until `durationMs` lands. */
   startedAt?: string;
   /** The provider's own figure. Wins over the live clock the moment it exists. */
@@ -43,6 +45,7 @@ export function ReasoningContent({
   label,
   actions,
   deferOffscreen = false,
+  pathBaseDir = null,
   startedAt,
   durationMs,
   tokens,
@@ -267,7 +270,13 @@ export function ReasoningContent({
               } : undefined}
             >
               <div ref={bodyRef} className="reasoning-content__body">
-                <MarkdownContent content={content} deferOffscreen={deferOffscreen} streaming={streaming} />
+                <MarkdownContent
+                  content={content}
+                  deferOffscreen={deferOffscreen}
+                  streaming={streaming}
+                  linkifyPaths
+                  pathBaseDir={pathBaseDir}
+                />
               </div>
             </div>
             {previewOverflows && (

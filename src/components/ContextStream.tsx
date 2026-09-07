@@ -73,6 +73,12 @@ export interface ContextStreamProps {
    * subagent transcripts retain the default because global usage is not meaningful there.
    */
   emptyState?: ReactNode;
+  /**
+   * Whether an empty timeline is allowed to show `emptyState` at all. The landing
+   * card belongs to arriving at an empty conversation; once this visit has had
+   * content, emptying it again leaves a bare timeline rather than snapping back.
+   */
+  emptyStateVisible?: boolean;
   onEdit?: (item: ContextItem) => void;
   onDelete?: (item: ContextItem) => void;
   /** Edits the projected ask_user tool and its paired answer as one message. */
@@ -106,6 +112,11 @@ export interface ContextStreamProps {
   retryableTurnRequestId?: string | null;
   /** Retracts the failure notice without sending anything. */
   onDismissTurnError?: () => void;
+  /**
+   * Working directory that relative paths in model output resolve against.
+   * Absolute paths are clickable without it.
+   */
+  pathBaseDir?: string | null;
 }
 
 /**
@@ -351,6 +362,7 @@ const ContextCard = memo(function ContextCard({
   onSelectBranchFor,
   branchSwitchDisabledReason,
   deferOffscreen,
+  pathBaseDir,
   onOpenInsertAt
 }: {
   item: Exclude<ContextItem, ToolContext>;
@@ -365,6 +377,7 @@ const ContextCard = memo(function ContextCard({
   onSelectBranchFor?: (forkContextId: string, branchId: string) => void;
   branchSwitchDisabledReason?: string | null;
   deferOffscreen: boolean;
+  pathBaseDir: string | null;
   onOpenInsertAt: (event: React.MouseEvent | React.KeyboardEvent, index: number) => void;
 }) {
   const { resolvedLanguage, t } = useI18n();
@@ -436,6 +449,7 @@ const ContextCard = memo(function ContextCard({
           tokens={item.tokens}
           encrypted={encryptedReasoning}
           deferOffscreen={deferOffscreen}
+          pathBaseDir={pathBaseDir}
           actions={showMutationActions ? (
             <ContextActions
               item={item}
@@ -454,7 +468,17 @@ const ContextCard = memo(function ContextCard({
       {(item.kind === "system" || item.kind === "assistant" || (item.kind === "user" && Boolean(item.content))) && (
         <div className="context-card__content" aria-live={assistantStreaming || hookStreaming ? "polite" : undefined}>
           {item.kind === "assistant" || (item.kind === "user" && renderUserMarkdown)
-            ? <MarkdownContent content={item.content} deferOffscreen={deferOffscreen} streaming={assistantStreaming} />
+            ? (
+              <MarkdownContent
+                content={item.content}
+                deferOffscreen={deferOffscreen}
+                streaming={assistantStreaming}
+                // Only model output is scanned for paths. User text keeps
+                // rendering exactly what was typed, Markdown preference or not.
+                linkifyPaths={item.kind === "assistant"}
+                pathBaseDir={pathBaseDir}
+              />
+            )
             : item.content}
         </div>
       )}
@@ -552,7 +576,7 @@ interface TurnNodeProjection {
   terminalNode?: ContextRenderNode;
 }
 
-export const ContextStream = memo(function ContextStream({ contexts, turns = [], onToggleTurn, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, ariaLabel, pendingQuestionId, emptyState, onEdit, onDelete, onEditQuestion, onDeleteQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError }: ContextStreamProps) {
+export const ContextStream = memo(function ContextStream({ contexts, turns = [], onToggleTurn, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, ariaLabel, pendingQuestionId, emptyState, emptyStateVisible = true, onEdit, onDelete, onEditQuestion, onDeleteQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
   const { t } = useI18n();
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -896,6 +920,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
           onSelectBranchFor={onSelectBranch}
           branchSwitchDisabledReason={branchSwitchDisabledReason}
           deferOffscreen={node.index < contexts.length - 4}
+          pathBaseDir={pathBaseDir}
           onOpenInsertAt={openMenu}
         />
       </div>
@@ -953,7 +978,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       }}
     >
       <div className="context-stream">
-        {renderNodes.length === 0 && turnProjection.leadingTurns.length === 0 ? (
+        {emptyStateVisible && renderNodes.length === 0 && turnProjection.leadingTurns.length === 0 ? (
           emptyState ?? (
             <EmptyState
               icon={<MessageSquare size={22} />}

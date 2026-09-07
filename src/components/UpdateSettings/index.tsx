@@ -316,8 +316,8 @@ function UpdateCard({
                 "“Install and restart” launches the installer and closes Mework; settings and data are kept, and the app reopens when it finishes."
               )
               : t(
-                "便携版需要手动替换：关闭 Mework，把压缩包解压到 {dir} 覆盖旧文件，再重新打开。",
-                "The portable flavor is replaced by hand: close Mework, unzip the archive over {dir}, then reopen it.",
+                "便携版需要手动替换：在托盘图标菜单选择「关闭 Mework」，把压缩包解压到 {dir} 覆盖旧文件，再重新打开。",
+                "The portable flavor is replaced by hand: choose “Quit Mework” from the tray icon's menu, unzip the archive over {dir}, then reopen it.",
                 { dir: info?.executableDir ?? "" }
               )}
           </p>

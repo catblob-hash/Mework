@@ -6,6 +6,7 @@ mod api;
 // This layer owns the NDJSON protocol, lifecycle, and event translation.
 mod aisdk;
 mod app_exit;
+mod app_tray;
 mod app_update;
 mod approval;
 mod browser;
@@ -39,6 +40,7 @@ mod git;
 mod hooks;
 mod http_util;
 mod image_attachments;
+mod instance_activation;
 mod kernel_shadow;
 mod mcp;
 mod memory_archive_file;
@@ -50,11 +52,13 @@ mod model_registry;
 mod operation_coordinator;
 mod orchestration;
 mod path_guard;
+mod plan_mode;
 mod powershell_host;
 mod project_import_trust;
 mod project_memory;
 mod prompt_profile;
 mod push_events;
+mod reveal_path;
 mod run_environment;
 mod run_stream;
 mod security;
@@ -591,6 +595,23 @@ fn load_conversation(
     conversations::load(&path, &conversation_id)
 }
 
+/// Loads the plan document the plan panel renders. `None` means the
+/// conversation has never had one written.
+#[cfg(not(test))]
+#[tauri::command]
+fn load_conversation_plan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Option<model::ConversationPlan>, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = document_path(&app)?;
+    conversations::store(&path)?.conversation_plan(&conversation_id)
+}
+
 /// Returns built-in gateway usage statistics. Activity is aggregated from the
 /// conversation database and token usage from the ledger, both in UTC-hour bins.
 ///
@@ -806,6 +827,13 @@ fn save_document_blocking(
         None
     };
     drop(definition_authority);
+    // The tray menu is host-rendered chrome, so it follows the language the
+    // renderer just mirrored into the document.
+    if previous.global_settings.resolved_app_language
+        != canonical.global_settings.resolved_app_language
+    {
+        app_tray::apply_language(&app, canonical.global_settings.resolved_app_language);
+    }
     // The snapshot that dropped these cards is now authoritative, so say so.
     // Publishing before the commit would announce a loss that a later failure
     // could still roll back.
@@ -980,6 +1008,7 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
         .document_store
         .flush(std::time::Duration::from_secs(30))?;
     state.clear_receipts();
+    app_tray::apply_language(&app, document.global_settings.resolved_app_language);
     let image_attachment_result =
         image_attachments::ImageAttachmentStore::new(app_data).purge_all();
     let temporary_workspace_result =
@@ -1496,6 +1525,25 @@ async fn open_external_url(url: String) -> Result<(), String> {
         .map_err(|error| format!("打开外部链接的后台任务失败: {error}"))?
 }
 
+/// Shows a path in the operating system's file manager.
+///
+/// Paths detected in model replies reach this command, so `reveal_path`
+/// validates the parameter and proves the target exists. A file is selected in
+/// its containing folder rather than opened, which keeps the command from
+/// starting a program.
+#[cfg(not(test))]
+#[tauri::command]
+async fn reveal_path_in_file_manager(path: String, base_dir: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        reveal_path::reveal(&reveal_path::resolve_reveal_path(
+            &path,
+            base_dir.as_deref(),
+        )?)
+    })
+    .await
+    .map_err(|error| format!("打开文件位置的后台任务失败: {error}"))?
+}
+
 /// Directory holding the running executable: where the NSIS uninstaller would sit and where a
 /// portable copy lives.
 #[cfg(not(test))]
@@ -1933,6 +1981,7 @@ async fn request_tool_approval(
         tool_prompt::PendingToolPrompt {
             prompt_id,
             tool_name: request.tool_name.clone(),
+            kind: tool_prompt::PromptKind::Tool,
             label: descriptor.label.clone(),
             summary: tool_prompt::summarize_tool_input(
                 &request.tool_name,
@@ -1954,6 +2003,10 @@ async fn request_tool_approval(
 /// Answers one approval card. Both prompt shapes land here: a model prompt
 /// wakes its blocked worker, and a manual prompt mints the nonce for the
 /// request that was classified when the card was raised.
+///
+/// `feedback` is the prose the plan cards collect. It is trimmed and capped
+/// here because it is renderer-supplied text that ends up in a tool result the
+/// model reads.
 #[cfg(not(test))]
 #[tauri::command]
 fn resolve_tool_prompt(
@@ -1961,8 +2014,13 @@ fn resolve_tool_prompt(
     state: State<'_, AppState>,
     prompt_id: String,
     decision: tool_prompt::ToolPromptDecision,
+    feedback: Option<String>,
 ) -> Result<approval::ToolApprovalGrant, String> {
-    match state.tool_prompts().resolve(&prompt_id, decision)? {
+    let feedback = tool_prompt::sanitize_prompt_feedback(feedback);
+    match state
+        .tool_prompts()
+        .resolve(&prompt_id, decision, feedback)?
+    {
         tool_prompt::PromptResolution::Model => Ok(approval::ToolApprovalGrant::not_required()),
         tool_prompt::PromptResolution::Manual { request, decision } => {
             if !decision.allows() {
@@ -2041,6 +2099,7 @@ mod approval_prompt_tests {
             prompt: crate::tool_prompt::PendingToolPrompt {
                 prompt_id: "prompt-1".into(),
                 tool_name: "write".into(),
+                kind: crate::tool_prompt::PromptKind::Tool,
                 label: "写入文件".into(),
                 summary: "notes.md".into(),
                 risk_level: "中".into(),
@@ -2461,10 +2520,17 @@ async fn run_model(
     //
     // Keep approval behavior in `api::session_task_approval`, the shared command
     // and test implementation; this function is excluded from test builds.
+
+    // The level this run executes under, from here on. Plan approval and a
+    // renderer settings write both move it; every gate after this point reads
+    // the cell rather than the snapshot `trusted_run_request` took.
+    let live_security_level = state
+        .live_security_level_for_run(&request.conversation_id, request.security_level);
+    request.live_security_level = Some(Arc::clone(&live_security_level));
     let surface_approve = api::session_task_approval(
         &state,
         request.conversation_id.clone(),
-        request.security_level,
+        Arc::clone(&live_security_level),
         request.app_data_path.clone(),
     );
     let surface_sink: Arc<api::OwnedModelEventSink> = {
@@ -2873,6 +2939,10 @@ const BROWSER_RENDERER_MOUNT_CHALLENGE_EVENT: &str = "mework:browser-renderer-mo
 const BROWSER_RENDERER_MOUNT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(12);
 #[cfg(not(test))]
 const BROWSER_RENDERER_MOUNT_WATCHDOG_POLL: Duration = Duration::from_secs(4);
+/// How long a launch that found the app-data lease taken keeps trying to either
+/// wake the holder or take over its lease before reporting the conflict.
+#[cfg(not(test))]
+const PROCESS_LEASE_HANDOVER_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(not(test))]
 fn browser_renderer_mount_error(
@@ -4469,7 +4539,7 @@ renderer 或普通日志。允许后，文件内容会作为不受信任的用�
 
 #[cfg(not(test))]
 async fn confirm_run_hooks(app: &AppHandle, request: &RunModelRequest) -> Result<(), String> {
-    if request.security_level == SecurityLevel::FullAccess {
+    if request.effective_security_level() == SecurityLevel::FullAccess {
         return Ok(());
     }
     let hooks = request
@@ -5174,6 +5244,13 @@ fn trusted_run_request(
     // from the persisted list, always re-derived. See
     // `agents::apply_task_runtime_tools` for the strip-then-derive rule itself.
     agents::apply_task_runtime_tools(&mut request.enabled_tools);
+    // Same rule for the plan tools, except that there is nothing to derive
+    // here: their availability follows the level in force at each step, so
+    // `aisdk::tools::enabled_tools` derives them per step and this list only
+    // has to stop carrying a stale name into a conversation whose level moved.
+    request
+        .enabled_tools
+        .retain(|name| !plan_mode::is_plan_mode_tool_name(name));
     // Same rule again for `skill`, and it must run after the filter above:
     // `skill` IS in the catalog, so a stale persisted name would otherwise
     // survive `available_tool_names` into a conversation that turned the switch
@@ -5311,7 +5388,11 @@ fn git_network_policy_uses_persisted_conversation_and_restricts_workspace_target
     };
     assert_eq!(git_network_policy_for_target(&conversation_target), git::GitNetworkPolicy::FullAccess);
     assert_eq!(git_network_policy_for_target(&workspace_lookup::ResolvedGitTarget::Workspace { workspace }), git::GitNetworkPolicy::Restricted);
-    for level in [crate::model::SecurityLevel::RequestApproval, crate::model::SecurityLevel::AllowEdits] {
+    for level in [
+        crate::model::SecurityLevel::Plan,
+        crate::model::SecurityLevel::RequestApproval,
+        crate::model::SecurityLevel::AllowEdits,
+    ] {
         workspace.conversations[0].settings.security_level = level;
         assert_eq!(git_network_policy_for_target(&workspace_lookup::ResolvedGitTarget::Conversation {
             workspace,
@@ -6270,6 +6351,10 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
 /// on a worker while Tauri's main message pump is still alive, which is what a barrier waiting on
 /// native WebView callbacks needs. It returns the effective process exit code, so a failed release
 /// can replace a code the caller intended to mean "controlled exit" with a failure code.
+///
+/// While the drain runs this process stops answering second-launch activations: a launch that
+/// arrives now must wait for the lease and start on its own rather than wake a process that is
+/// leaving. An abandoned drain resumes them.
 #[cfg(not(test))]
 pub(crate) fn request_deferred_exit_with_barrier(
     app_handle: AppHandle,
@@ -6280,8 +6365,12 @@ pub(crate) fn request_deferred_exit_with_barrier(
     if !coordinator.try_begin_draining() {
         return;
     }
+    if let Some(listener) = app_handle.try_state::<instance_activation::ActivationListener>() {
+        listener.pause();
+    }
 
     let spawn_failure_coordinator = coordinator.clone();
+    let spawn_failure_app = app_handle.clone();
     let spawn_result = std::thread::Builder::new()
         .name("mework-deferred-exit".to_owned())
         .spawn(move || {
@@ -6300,6 +6389,10 @@ pub(crate) fn request_deferred_exit_with_barrier(
                     Err(error) => {
                         use tauri_plugin_dialog::DialogExt;
                         eprintln!("退出持久化失败，已保留应用：{error}");
+                        resume_instance_activation(&app_handle);
+                        // The quit may have come from the tray with the window
+                        // hidden; the retained application must be visible.
+                        app_tray::show_main_window(&app_handle, BROWSER_RENDERER_MOUNT_MAIN_LABEL);
                         app_handle.dialog()
                             .message(format!("退出前保存失败，应用已保留。请解决存储问题后再次关闭。\n\n{error}"))
                             .title("Mework — 保存失败 / Save failed")
@@ -6311,13 +6404,24 @@ pub(crate) fn request_deferred_exit_with_barrier(
 
             if drained.is_err() {
                 coordinator.abort_draining();
+                resume_instance_activation(&app_handle);
                 eprintln!("退出屏障异常，已取消本次退出");
             }
         });
 
     if let Err(error) = spawn_result {
         spawn_failure_coordinator.abort_draining();
+        resume_instance_activation(&spawn_failure_app);
         eprintln!("无法启动退出屏障线程，已保留应用：{error}");
+    }
+}
+
+#[cfg(not(test))]
+fn resume_instance_activation(app_handle: &AppHandle) {
+    if let Some(listener) = app_handle.try_state::<instance_activation::ActivationListener>() {
+        if let Err(error) = listener.resume() {
+            eprintln!("实例激活监听未能恢复，重复启动将只提示已在运行：{error}");
+        }
     }
 }
 
@@ -6348,6 +6452,7 @@ pub fn run() {
     // needed to build it.
     child_environment::restore_dev_application_path();
     let exit_coordinator = app_exit::AppExitCoordinator::default();
+    let tray_exit_coordinator = exit_coordinator.clone();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
@@ -6362,7 +6467,7 @@ pub fn run() {
                 PageLoadEvent::Finished => finish_main_browser_renderer_document_load(webview),
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             if app
                 .get_webview_window(BROWSER_RENDERER_MOUNT_MAIN_LABEL)
                 .is_some()
@@ -6373,20 +6478,33 @@ pub fn run() {
                 .into());
             }
             let path = document_path(app.handle()).map_err(std::io::Error::other)?;
-            if let Err(error) = app
-                .state::<AppState>()
-                .document_store
-                .acquire_process_authority(&path)
-            {
-                // Report an existing instance with a native dialog and exit
-                // cleanly before window creation.
-                use tauri_plugin_dialog::DialogExt;
-                app.dialog()
-                    .message(&error)
-                    .title("无法启动 Mework")
-                    .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-                    .blocking_show();
-                std::process::exit(1);
+            // A taken lease normally means a live Mework whose window was closed
+            // into the tray: hand it this launch and leave quietly. A holder that
+            // is still starting or already leaving is given a few seconds to
+            // either answer or release the lease.
+            let store = app.state::<AppState>().document_store.clone();
+            match instance_activation::negotiate_launch(&path, PROCESS_LEASE_HANDOVER_WAIT, || {
+                store.acquire_process_authority(&path)
+            }) {
+                instance_activation::LaunchHandover::Acquired => {}
+                instance_activation::LaunchHandover::ResidentSignaled => std::process::exit(0),
+                instance_activation::LaunchHandover::Unresolved(error) => {
+                    // Report the conflict with a native dialog and exit cleanly
+                    // before window creation.
+                    use tauri_plugin_dialog::DialogExt;
+                    let mut message = error.to_string();
+                    if error == document_store::ProcessAuthorityError::Contended {
+                        message.push_str(
+                            "\n\nMework 可能仍在系统托盘中运行：请从托盘图标打开窗口，或选择「关闭 Mework」后再启动。",
+                        );
+                    }
+                    app.dialog()
+                        .message(message)
+                        .title("无法启动 Mework")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                        .blocking_show();
+                    std::process::exit(1);
+                }
             }
             migrate_legacy_app_data(app.handle()).map_err(std::io::Error::other)?;
             // Installed before anything can execute a tool, so every card this
@@ -6453,6 +6571,46 @@ pub fn run() {
                 })
                 .build()
                 .map_err(std::io::Error::other)?;
+            // The process outlives its window from here on: closing the window
+            // hides it and the tray is the way back in or out. Without a tray
+            // the close handler keeps quitting, so a failure here is only logged.
+            let language = state
+                .document_store
+                .current_snapshot(&path)
+                .map(|document| document.global_settings.resolved_app_language)
+                .unwrap_or_default();
+            let quit_coordinator = tray_exit_coordinator.clone();
+            if let Err(error) = app_tray::install(
+                app.handle(),
+                BROWSER_RENDERER_MOUNT_MAIN_LABEL,
+                language,
+                move |app_handle| {
+                    request_deferred_exit_with_barrier(
+                        app_handle.clone(),
+                        quit_coordinator.clone(),
+                        0,
+                        |_, code| code,
+                    );
+                },
+            ) {
+                eprintln!("系统托盘不可用，关闭窗口将直接退出应用：{error}");
+            }
+            // A second launch while this instance sits in the tray asks for the
+            // window instead of failing on the app-data lease.
+            let activation_app = app.handle().clone();
+            match instance_activation::listen(&path, move || {
+                let app_handle = activation_app.clone();
+                if let Err(error) = activation_app.run_on_main_thread(move || {
+                    app_tray::show_main_window(&app_handle, BROWSER_RENDERER_MOUNT_MAIN_LABEL);
+                }) {
+                    eprintln!("无法调度实例激活：{error}");
+                }
+            }) {
+                Ok(listener) => {
+                    app.manage(listener);
+                }
+                Err(error) => eprintln!("实例激活监听不可用，重复启动将只提示已在运行：{error}"),
+            }
             Ok(())
         })
         .invoke_handler(move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
@@ -6482,9 +6640,15 @@ pub fn run() {
             } if label == BROWSER_RENDERER_MOUNT_MAIN_LABEL && !exit_coordinator.is_ready() => {
                 // Retain the actual window as well as the process on a failed save.
                 api.prevent_close();
-                request_deferred_exit_with_barrier(
-                    app_handle.clone(), exit_coordinator.clone(), 0, |_, code| code,
-                );
+                if app_tray::is_installed(app_handle) {
+                    // With a tray the window is only a view on the running
+                    // process; quitting is the tray menu's job.
+                    app_tray::hide_main_window(app_handle, BROWSER_RENDERER_MOUNT_MAIN_LABEL);
+                } else {
+                    request_deferred_exit_with_barrier(
+                        app_handle.clone(), exit_coordinator.clone(), 0, |_, code| code,
+                    );
+                }
             }
             tauri::RunEvent::ExitRequested { api, code, .. } if !exit_coordinator.is_ready() => {
                 api.prevent_exit();

@@ -37,7 +37,13 @@ const taskMessages = {
   browserSuspended: "已挂起",
   browserIdle: "已就绪",
   browserAutomation: (tool: string) => `模型正在操作：${tool}`,
-  userAborted: "用户中止操作"
+  userAborted: "用户中止操作",
+  planLabel: "实施计划",
+  planDrafting: "撰写中",
+  planAwaitingApproval: "待批准",
+  planApproved: "已批准",
+  planRejected: "已退回",
+  planUpdatedAgo: (minutes: number) => (minutes === 0 ? "刚刚更新" : `${minutes} 分钟前更新`)
 };
 
 /**

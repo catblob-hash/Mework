@@ -324,6 +324,7 @@ export function resetAppMocks() {
   runtimeMocks.listPendingToolPrompts.mockReset().mockResolvedValue([]);
   runtimeMocks.listPendingForkRequests.mockReset().mockResolvedValue([]);
   runtimeMocks.listPendingForkStarts.mockReset().mockResolvedValue([]);
+  runtimeMocks.loadConversationPlan.mockReset().mockResolvedValue(null);
   runtimeMocks.workflowRunHistory.mockReset().mockResolvedValue([]);
   runtimeMocks.workflowStepRecord.mockReset().mockResolvedValue(null);
   runtimeMocks.resolveForkRequest.mockReset().mockResolvedValue(null);

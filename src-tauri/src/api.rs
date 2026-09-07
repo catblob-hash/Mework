@@ -217,6 +217,12 @@ const SUBAGENT_DISABLED_TOOL_NAMES: &[&str] = &[
     // The merged conversation-state tool. Task state belongs to
     // the main session, so a child neither reads nor writes it.
     "todo",
+    // Plan mode is a property of the conversation the user is talking to. A
+    // child may neither write that conversation's plan nor ask to change its
+    // parent's mode, and the runners refuse these names at any depth anyway.
+    crate::plan_mode::PLAN_TOOL,
+    crate::plan_mode::EXIT_PLAN_MODE_TOOL,
+    crate::plan_mode::ENTER_PLAN_MODE_TOOL,
     // Keep these legacy names to exclude matching historical tool contexts when
     // forking conversations. Active memory tools are governed by the memory-layer
     // switches and named-agent memory bindings, not this list.
@@ -259,6 +265,7 @@ fn host_derived_child_tool(name: &str) -> bool {
         || name == crate::capabilities::SKILL_TOOL
         || is_memory_tool_name(name)
         || crate::agents::is_task_runtime_tool_name(name)
+        || crate::plan_mode::is_plan_mode_tool_name(name)
 }
 
 #[derive(Clone, Debug)]
@@ -409,14 +416,17 @@ pub type OwnedDangerousToolApproval =
 /// When present, `task_cancel` is the only cancellation flag this closure
 /// observes. It prevents an unrelated foreground stop from withdrawing a
 /// background task approval.
+///
+/// `security_level` is the live cell rather than a value: a detached worker may
+/// still be classifying calls after the level moved under it, and it must obey
+/// the level in force now, not the one its run started with.
 pub(crate) fn session_task_approval(
     state: &AppState,
     conversation_id: String,
-    security_level: crate::model::SecurityLevel,
+    security_level: Arc<crate::model::LiveSecurityLevel>,
     app_data_path: String,
 ) -> Arc<OwnedTaskApproval> {
     let approval_state = state.clone();
-    let events_state = state.clone();
     Arc::new(
         move |tool_request: &ToolExecutionRequest,
               descriptor: &ToolDescriptor,
@@ -449,7 +459,7 @@ pub(crate) fn session_task_approval(
                 // on `workspace_path` to distinguish an allowed isolated edit from a
                 // write escaping to the parent checkout; the host constructs this trusted field.
                 let decision = security::classify_model_call(
-                    security_level,
+                    security_level.get(),
                     Path::new(&tool_request.workspace_path),
                     Path::new(&app_data_path),
                     tool_request,
@@ -470,6 +480,7 @@ pub(crate) fn session_task_approval(
                 // Minted by the registry; see `ToolPromptRegistry::ask`.
                 prompt_id: String::new(),
                 tool_name: tool_request.tool_name.clone(),
+                kind: crate::tool_prompt::PromptKind::Tool,
                 label: descriptor.label.clone(),
                 summary: crate::tool_prompt::summarize_tool_input(
                     &tool_request.tool_name,
@@ -496,75 +507,107 @@ pub(crate) fn session_task_approval(
                 }
                 _ => crate::tool_prompt::PromptOwner::Task,
             };
-            let announce_state = events_state.clone();
-            let announce_conversation_id = conversation_id.clone();
-            // The prompt id is minted inside `ask`, but the retraction event has
-            // to name it, so `announce` hands it back out.
-            let mut announced_prompt_id = None;
-            let approved = approval_state.tool_prompts().ask(
+            ask_announced_prompt(
+                &approval_state,
                 &conversation_id,
                 owner,
                 mandatory,
                 risk,
                 &cancellations,
                 card,
-                |prompt| {
-                    announced_prompt_id = Some(prompt.prompt_id.clone());
-                    let published = announce_state.run_streams().publish_live(
-                        &announce_conversation_id,
-                        ModelStreamEvent::ToolApprovalRequested {
-                            prompt_id: prompt.prompt_id.clone(),
-                            tool_name: prompt.tool_name.clone(),
-                            label: prompt.label.clone(),
-                            summary: prompt.summary.clone(),
-                            risk_level: prompt.risk_level.clone(),
-                            reason: prompt.reason.clone(),
-                            requester: prompt.requester.clone(),
-                            source_agent: prompt.source_agent.clone(),
-                            source_call_id: prompt.source_call_id.clone(),
-                            allow_always_offered: prompt.allow_always_offered,
-                            mandatory: prompt.mandatory,
-                        },
-                    );
-                    if !published {
-                        announce_state.push_events.publish(
-                            crate::push_events::AppPushEvent::ToolApprovalRequested {
-                                conversation_id: announce_conversation_id.clone(),
-                                prompt: prompt.clone(),
-                            },
-                        );
-                    }
-                    Ok(())
-                },
-            );
-            // Retract the card for every ending the renderer did not itself
-            // produce — cancelled run, stopped task, timeout, standing allowance
-            // consumed after the card was already up. Both channels are told:
-            // the run stream may have settled between raising the card and
-            // answering it, and a card the renderer drew from the push channel
-            // is only taken down by the push channel.
-            if let Some(prompt_id) = announced_prompt_id {
-                let granted = approved.as_ref().copied().unwrap_or(false);
-                let published = events_state.run_streams().publish_live(
-                    &conversation_id,
-                    ModelStreamEvent::ToolApprovalResolved {
-                        prompt_id: prompt_id.clone(),
-                        approved: granted,
-                    },
-                );
-                if !published {
-                    events_state.push_events.publish(
-                        crate::push_events::AppPushEvent::ToolApprovalResolved {
-                            conversation_id: conversation_id.clone(),
-                            prompt_id,
-                            approved: granted,
-                        },
-                    );
-                }
-            }
-            approved
+            )
+            .map(|answer| answer.decision.allows())
         },
     )
+}
+
+/// The stream mirror of a card. `ModelStreamEvent::ToolApprovalRequested`
+/// repeats `PendingToolPrompt` field for field, so building it anywhere but
+/// here invites the two shapes to drift.
+fn approval_requested_event(prompt: &crate::tool_prompt::PendingToolPrompt) -> ModelStreamEvent {
+    ModelStreamEvent::ToolApprovalRequested {
+        prompt_id: prompt.prompt_id.clone(),
+        tool_name: prompt.tool_name.clone(),
+        kind: prompt.kind,
+        label: prompt.label.clone(),
+        summary: prompt.summary.clone(),
+        risk_level: prompt.risk_level.clone(),
+        reason: prompt.reason.clone(),
+        requester: prompt.requester.clone(),
+        source_agent: prompt.source_agent.clone(),
+        source_call_id: prompt.source_call_id.clone(),
+        allow_always_offered: prompt.allow_always_offered,
+        mandatory: prompt.mandatory,
+    }
+}
+
+/// Raises one approval card, blocks until it is answered, and takes it down
+/// again whichever way it ended.
+///
+/// The card is announced on the live run stream when one is open and on the
+/// push channel otherwise; the resolution follows the same rule, because a card
+/// the renderer drew from one channel is only retracted by that channel. The
+/// retraction covers every ending the renderer did not itself produce —
+/// cancelled run, stopped task, timeout — and is skipped entirely when a
+/// standing allowance answered without a card ever being shown.
+pub(crate) fn ask_announced_prompt(
+    state: &AppState,
+    conversation_id: &str,
+    owner: crate::tool_prompt::PromptOwner,
+    mandatory: bool,
+    risk: security::RiskLevel,
+    cancellations: &[&std::sync::atomic::AtomicBool],
+    card: crate::tool_prompt::PendingToolPrompt,
+) -> Result<crate::tool_prompt::PromptAnswer, String> {
+    // The prompt id is minted inside `ask_answer`, but the retraction event has
+    // to name it, so `announce` hands it back out.
+    let mut announced_prompt_id = None;
+    let answer = state.tool_prompts().ask_answer(
+        conversation_id,
+        owner,
+        mandatory,
+        risk,
+        cancellations,
+        card,
+        |prompt| {
+            announced_prompt_id = Some(prompt.prompt_id.clone());
+            let published = state
+                .run_streams()
+                .publish_live(conversation_id, approval_requested_event(prompt));
+            if !published {
+                state.push_events.publish(
+                    crate::push_events::AppPushEvent::ToolApprovalRequested {
+                        conversation_id: conversation_id.to_owned(),
+                        prompt: prompt.clone(),
+                    },
+                );
+            }
+            Ok(())
+        },
+    );
+    if let Some(prompt_id) = announced_prompt_id {
+        let granted = answer
+            .as_ref()
+            .map(|answer| answer.decision.allows())
+            .unwrap_or(false);
+        let published = state.run_streams().publish_live(
+            conversation_id,
+            ModelStreamEvent::ToolApprovalResolved {
+                prompt_id: prompt_id.clone(),
+                approved: granted,
+            },
+        );
+        if !published {
+            state
+                .push_events
+                .publish(crate::push_events::AppPushEvent::ToolApprovalResolved {
+                    conversation_id: conversation_id.to_owned(),
+                    prompt_id,
+                    approved: granted,
+                });
+        }
+    }
+    answer
 }
 
 /// Terminal outcome of the retrying request wrapper: the final failure plus
@@ -3266,7 +3309,8 @@ fn run_model_inner(
                     let mut denied = hook_block_reason(&pre_tool, &request.prompt_profile);
                     if denied.is_none()
                         && (permission_forces_prompt
-                            || authorization.requires_permission_hook(request.security_level))
+                            || authorization
+                                .requires_permission_hook(request.effective_security_level()))
                     {
                         let input = hook_input(
                             &request,
@@ -3370,7 +3414,7 @@ fn run_model_inner(
                     // The approval predicate includes backend, MCP, and Hook
                     // requirements; attest the approved parameter summary.
                     let shadow_danger = authorization
-                        .requires_permission_hook(request.security_level)
+                        .requires_permission_hook(request.effective_security_level())
                         || authorization.intrinsic_mandatory_prompt()
                         || permission_forces_prompt;
                     kernel_shadow.tool_request(
@@ -3478,6 +3522,12 @@ fn run_model_inner(
                             )?
                         } else if call.name == "ask_user" {
                             pending_question_execution(&request.prompt_profile, call)
+                        } else if call.name == crate::plan_mode::PLAN_TOOL {
+                            crate::plan_mode::run_plan_tool(&request, call, state)
+                        } else if call.name == crate::plan_mode::EXIT_PLAN_MODE_TOOL {
+                            crate::plan_mode::run_exit_plan_mode_tool(&request, call, state)
+                        } else if call.name == crate::plan_mode::ENTER_PLAN_MODE_TOOL {
+                            crate::plan_mode::run_enter_plan_mode_tool(&request, call, state)
                         } else {
                             // A foreground shell call gets a way out of its own
                             // deadline: rather than killing work the model asked
@@ -5162,7 +5212,7 @@ fn run_mcp_tool(
     };
 
     if mcp_requires_native_approval(
-        request.security_level,
+        request.effective_security_level(),
         hook_allows_permission,
         binding.confirmation_required(),
     ) {
@@ -5263,7 +5313,7 @@ fn execute_model_tool_with_scope(
         if let Ok(session_id) = state.browser.agent_tab_session_id(&request.conversation_id) {
             state
                 .browser
-                .set_session_security_level(&session_id, request.security_level);
+                .set_session_security_level(&session_id, request.effective_security_level());
         }
     }
     // The upload_image action names a transcript image, and only the run loop
@@ -5619,7 +5669,7 @@ fn execute_model_tool_with_turn_states(
         result
     } else {
         let decision = security::classify_model_call(
-            request.security_level,
+            request.effective_security_level(),
             Path::new(&request.workspace_path),
             Path::new(&request.app_data_path),
             &execution_request,
@@ -5717,7 +5767,17 @@ fn automatic_tool_rejection_reason(
     }
     // Child requests strip their hard-disabled names from enabled_tools, so
     // this is also the structural guard against nested agents/ask_user calls.
-    if !request.enabled_tools.iter().any(|name| name == &call.name) {
+    //
+    // The plan tools are never in `enabled_tools`: they are derived per step
+    // from the level in force right now, so the same derivation that decided
+    // which schemas this step advertised decides whether the call is allowed.
+    if !request.enabled_tools.iter().any(|name| name == &call.name)
+        && !crate::plan_mode::derived_tools(
+            request.effective_security_level(),
+            request.subagent_depth,
+        )
+        .contains(&call.name.as_str())
+    {
         return Some("The model requested a tool that is not enabled");
     }
     if call.input.contains_key("_raw") {
@@ -5954,8 +6014,10 @@ fn web_search_request_template(
             .cloned()
             .collect(),
         // A scoped grant, not unrestricted access: the capability set is the
-        // host-minted tool list above and nothing else.
+        // host-minted tool list above and nothing else. No live cell either, so
+        // a mid-turn switch cannot narrow a grant this request already relies on.
         security_level: crate::model::SecurityLevel::FullAccess,
+        live_security_level: None,
         app_data_path: parent.app_data_path.clone(),
         mcp_servers: Vec::new(),
         mcp_bindings: Vec::new(),
@@ -6386,7 +6448,7 @@ fn authorize_web_tool(
         .find(|tool| tool.name == call.name)
         .ok_or_else(|| format!("Web tool {} has no trusted description", call.name))?;
     let decision = security::classify_model_call(
-        parent.security_level,
+        parent.effective_security_level(),
         Path::new(&parent.workspace_path),
         Path::new(&parent.app_data_path),
         &execution_request,
@@ -7959,7 +8021,10 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
             })
             .cloned()
             .collect(),
-        security_level: parent.security_level,
+        // Snapshot the level in force now, and share the parent's cell so a
+        // switch during the parent's turn reaches descendants too.
+        security_level: parent.effective_security_level(),
+        live_security_level: parent.live_security_level.clone(),
         app_data_path: parent.app_data_path.clone(),
         mcp_servers: parent.mcp_servers.clone(),
         mcp_bindings: parent.mcp_bindings.clone(),
@@ -9252,7 +9317,7 @@ fn run_agent_spawn(
         input: call.input.clone(),
     };
     let decision = match security::classify_model_call(
-        parent.security_level,
+        parent.effective_security_level(),
         Path::new(&parent.workspace_path),
         Path::new(&parent.app_data_path),
         &execution_request,
@@ -9372,7 +9437,7 @@ fn run_background_shell(
     // Use the synchronous approval discipline: classify first, then request approval
     // when the hook did not allow it or the classifier requires confirmation.
     let decision = match security::classify_model_call(
-        parent.security_level,
+        parent.effective_security_level(),
         Path::new(&parent.workspace_path),
         Path::new(&parent.app_data_path),
         &execution_request,
@@ -9937,7 +10002,8 @@ fn dispatch_async_tool(
             resolved,
             execution: parent.web_search.execution.clone(),
             urls,
-            allow_local_targets: parent.security_level == crate::model::SecurityLevel::FullAccess,
+            allow_local_targets: parent.effective_security_level()
+                == crate::model::SecurityLevel::FullAccess,
         }
     } else {
         return Err(format!("{} is not an asynchronous tool", call.name));
@@ -11372,7 +11438,8 @@ fn hook_injected_context(request_id: &str, execution: &HookExecution, content: S
 }
 
 fn hook_input(request: &RunModelRequest, event: HookEvent, turn_id: &str, fields: Value) -> Value {
-    let permission_mode = match request.security_level {
+    let permission_mode = match request.effective_security_level() {
+        crate::model::SecurityLevel::Plan => "plan",
         crate::model::SecurityLevel::RequestApproval => "default",
         crate::model::SecurityLevel::AllowEdits => "acceptEdits",
         crate::model::SecurityLevel::FullAccess => "bypassPermissions",
@@ -11408,7 +11475,8 @@ fn instructions_loaded_dispatcher(
     let runner = hook_command_runner(request, services.cancellation.clone()).ok()?;
     let cwd = std::fs::canonicalize(workspace).ok()?;
     let paths = InstructionsLoadedPathMode::host();
-    let permission_mode = match request.security_level {
+    let permission_mode = match request.effective_security_level() {
+        crate::model::SecurityLevel::Plan => InstructionsLoadedPermissionMode::Plan,
         crate::model::SecurityLevel::RequestApproval => InstructionsLoadedPermissionMode::Default,
         crate::model::SecurityLevel::AllowEdits => InstructionsLoadedPermissionMode::AcceptEdits,
         crate::model::SecurityLevel::FullAccess => {
@@ -11702,7 +11770,7 @@ fn classify_tool_authorization(
             input: authorization_input,
         };
         Some(security::classify_model_call(
-            request.security_level,
+            request.effective_security_level(),
             Path::new(&request.workspace_path),
             Path::new(&request.app_data_path),
             &execution_request,
@@ -11720,7 +11788,7 @@ fn classify_tool_authorization(
 fn tool_requires_approval(request: &RunModelRequest, call: &ToolCall) -> Result<bool, String> {
     Ok(
         classify_tool_authorization(request, call)?
-            .requires_permission_hook(request.security_level),
+            .requires_permission_hook(request.effective_security_level()),
     )
 }
 
@@ -12718,6 +12786,7 @@ mod tests {
             tools: vec![tool],
             active_hooks: Vec::new(),
             security_level: SecurityLevel::RequestApproval,
+            live_security_level: None,
             app_data_path: ".".into(),
             mcp_servers: Vec::new(),
             mcp_bindings: Vec::new(),
@@ -12843,6 +12912,353 @@ mod tests {
         (directory, state, parent, definition)
     }
 
+    /// Plan approval moves the level in the middle of a turn. The run and every
+    /// descendant read the shared cell, so the switch reaches children spawned
+    /// before it as well as after it, while the snapshot still records where the
+    /// run began.
+    #[test]
+    fn the_live_level_reaches_the_run_and_its_children() {
+        let mut parent = run_request(ProviderFamily::OpenaiResponses);
+        parent.security_level = SecurityLevel::Plan;
+        let cell = Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::Plan));
+        parent.live_security_level = Some(Arc::clone(&cell));
+        assert_eq!(parent.effective_security_level(), SecurityLevel::Plan);
+
+        let before = agent_child_template(&parent);
+        assert_eq!(before.effective_security_level(), SecurityLevel::Plan);
+
+        cell.set(SecurityLevel::AllowEdits);
+        assert_eq!(parent.effective_security_level(), SecurityLevel::AllowEdits);
+        assert_eq!(parent.security_level, SecurityLevel::Plan);
+
+        let after = agent_child_template(&parent);
+        assert_eq!(after.security_level, SecurityLevel::AllowEdits);
+        assert_eq!(after.effective_security_level(), SecurityLevel::AllowEdits);
+        assert_eq!(before.effective_security_level(), SecurityLevel::AllowEdits);
+    }
+
+    /// The section is assembled at the wire layer, so it has to appear and
+    /// disappear with the level in force for this step — not the one the run
+    /// started with — and a child must never receive the workflow that tells it
+    /// to write the plan and leave the mode.
+    #[test]
+    fn the_plan_mode_section_follows_the_live_level_and_the_agent_depth() {
+        let mut request = run_request(ProviderFamily::OpenaiResponses);
+        let main_section = request
+            .prompt_profile
+            .text(crate::prompt_profile::PromptKey::SystemPlanMode);
+        let child_section = request
+            .prompt_profile
+            .text(crate::prompt_profile::PromptKey::SystemPlanModeSubagent);
+
+        for level in [
+            SecurityLevel::RequestApproval,
+            SecurityLevel::AllowEdits,
+            SecurityLevel::FullAccess,
+        ] {
+            request.security_level = level;
+            for depth in [0, 1] {
+                request.subagent_depth = depth;
+                let system = crate::aisdk::step::combined_system_prompt(&request);
+                assert!(
+                    !system.contains("Plan mode is active"),
+                    "{level:?} depth {depth}"
+                );
+            }
+        }
+
+        request.security_level = SecurityLevel::Plan;
+        request.subagent_depth = 0;
+        let system = crate::aisdk::step::combined_system_prompt(&request);
+        assert!(system.contains(main_section.trim()));
+        assert!(!system.contains(child_section.trim()));
+
+        request.subagent_depth = 1;
+        let system = crate::aisdk::step::combined_system_prompt(&request);
+        assert!(system.contains(child_section.trim()));
+        assert!(!system.contains("## Plan workflow"));
+
+        // Approval lands in the cell, and the very next step must go out without
+        // the section even though the run started in plan mode.
+        request.subagent_depth = 0;
+        let cell = Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::Plan));
+        request.live_security_level = Some(Arc::clone(&cell));
+        assert!(crate::aisdk::step::combined_system_prompt(&request).contains("Plan mode is active"));
+        cell.set(SecurityLevel::AllowEdits);
+        assert!(!crate::aisdk::step::combined_system_prompt(&request).contains("Plan mode is active"));
+    }
+
+    /// A run loop pointed at `address` and started in `level`, with the three
+    /// plan tools removed from `enabled_tools`: whatever the model is allowed to
+    /// call here was derived by the host from the level, not enabled by anyone.
+    fn plan_mode_loop_fixture(
+        address: std::net::SocketAddr,
+        directory: &tempfile::TempDir,
+        level: SecurityLevel,
+    ) -> (
+        AppState,
+        RunModelRequest,
+        Arc<crate::model::LiveSecurityLevel>,
+        Arc<crate::conversation_store::ConversationStore>,
+    ) {
+        let state = AppState::default();
+        let mut request = loop_request_for(address, directory.path());
+        request.security_level = level;
+        request
+            .enabled_tools
+            .retain(|name| !crate::plan_mode::is_plan_mode_tool_name(name));
+        let cell = state.live_security_level_for_run(&request.conversation_id, level);
+        request.live_security_level = Some(Arc::clone(&cell));
+
+        let mut document = catalog::default_document(directory.path());
+        document.workspaces[0].id = request.workspace_id.clone();
+        document.workspaces[0].conversations[0].id = request.conversation_id.clone();
+        document.workspaces[0].conversations[0].settings.security_level = level;
+        let anchor = directory.path().join("document.v1.json");
+        state
+            .document_store
+            .acquire_process_authority(&anchor)
+            .unwrap();
+        state.document_store.commit(&anchor, document.clone()).unwrap();
+        let store = crate::conversations::store(&anchor).unwrap();
+        store
+            .put_conversation(
+                &request.workspace_id,
+                &document.workspaces[0].conversations[0],
+            )
+            .unwrap();
+        (state, request, cell, store)
+    }
+
+    /// Answers the first plan card the run raises and hands the card back, so a
+    /// test can assert on what the user was actually shown.
+    fn answer_first_plan_card(
+        state: &AppState,
+        decision: crate::tool_prompt::ToolPromptDecision,
+        feedback: Option<&str>,
+    ) -> thread::JoinHandle<crate::tool_prompt::PendingToolPrompt> {
+        let answering = state.clone();
+        let feedback = feedback.map(str::to_owned);
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if let Some((_, card)) =
+                    answering.tool_prompts().all_pending_cards().into_iter().next()
+                {
+                    if answering
+                        .tool_prompts()
+                        .resolve(&card.prompt_id, decision, feedback.clone())
+                        .is_ok()
+                    {
+                        return card;
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("no plan card was ever announced");
+        })
+    }
+
+    fn function_call_response(call_id: &str, name: &str, arguments: Value) -> Value {
+        json!({
+            "model": "model-test",
+            "status": "completed",
+            "output": [{
+                "type":"function_call",
+                "status":"completed",
+                "call_id": call_id,
+                "name": name,
+                "arguments": serde_json::to_string(&arguments).unwrap()
+            }],
+            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        })
+    }
+
+    fn tool_output<'a>(response: &'a RunModelResponse, tool: &str) -> &'a ToolResult {
+        response
+            .contexts
+            .iter()
+            .find_map(|context| match context {
+                ContextItem::Tool {
+                    tool_name, result, ..
+                } if tool_name == tool => Some(result),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{tool} never produced a result"))
+    }
+
+    /// The whole plan-mode round trip through the run loop: the two tools that
+    /// exist only in plan mode are admitted without being enabled, the card
+    /// carries the plan's own title, and "always" is the accept-edits answer —
+    /// it moves the live cell and the persisted setting, and the approved
+    /// markdown comes back to the model so it can start implementing.
+    #[test]
+    fn an_approved_plan_leaves_plan_mode_and_returns_the_plan_to_the_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_json_sequence(
+            listener,
+            vec![
+                function_call_response(
+                    "call-plan-write",
+                    "plan",
+                    json!({"action":"write","content":"# Ship the parser\n\nRewrite the tokenizer."}),
+                ),
+                function_call_response("call-exit", "exit_plan_mode", json!({})),
+                responses_text_output("done"),
+            ],
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let (state, request, cell, store) =
+            plan_mode_loop_fixture(address, &directory, SecurityLevel::Plan);
+        let conversation_id = request.conversation_id.clone();
+        let answering =
+            answer_first_plan_card(&state, crate::tool_prompt::ToolPromptDecision::AllowAlways, None);
+
+        let response = run_model(request, &state, &discard_event, &|_, _, _| {
+            panic!("a plan tool must not go through the ordinary approval gate")
+        })
+        .unwrap();
+        server.join().unwrap();
+        let card = answering.join().unwrap();
+
+        assert_eq!(card.kind, crate::tool_prompt::PromptKind::PlanExit);
+        assert_eq!(card.tool_name, "exit_plan_mode");
+        assert_eq!(card.summary, "Ship the parser");
+        assert!(!card.allow_always_offered);
+        assert!(card.mandatory);
+
+        let written = tool_output(&response, "plan");
+        assert!(written.success, "{}", written.output);
+        assert!(written.output.starts_with("Plan saved ("), "{}", written.output);
+
+        let exited = tool_output(&response, "exit_plan_mode");
+        assert!(exited.success, "{}", exited.output);
+        assert!(exited.output.contains("Permission mode is now accept edits"));
+        assert!(exited.output.contains("## Approved Plan:\n# Ship the parser"));
+
+        assert_eq!(cell.get(), SecurityLevel::AllowEdits);
+        assert_eq!(
+            store
+                .conversation(&conversation_id)
+                .unwrap()
+                .unwrap()
+                .settings
+                .security_level,
+            SecurityLevel::AllowEdits
+        );
+        let plan = store.conversation_plan(&conversation_id).unwrap().unwrap();
+        assert_eq!(plan.status, crate::model::PlanStatus::Approved);
+        assert!(plan.markdown.starts_with("# Ship the parser"));
+    }
+
+    /// A refusal is not a broken tool: the call succeeded, the answer was "not
+    /// yet", and what the user typed is the only thing that tells the model what
+    /// to change. The conversation stays in plan mode.
+    #[test]
+    fn a_denied_plan_stays_in_plan_mode_and_returns_the_users_words() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_json_sequence(
+            listener,
+            vec![
+                function_call_response(
+                    "call-plan-write",
+                    "plan",
+                    json!({"action":"write","content":"# Ship the parser"}),
+                ),
+                function_call_response("call-exit", "exit_plan_mode", json!({})),
+                responses_text_output("understood"),
+            ],
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let (state, request, cell, store) =
+            plan_mode_loop_fixture(address, &directory, SecurityLevel::Plan);
+        let conversation_id = request.conversation_id.clone();
+        let answering = answer_first_plan_card(
+            &state,
+            crate::tool_prompt::ToolPromptDecision::Deny,
+            Some("cover the migration too"),
+        );
+
+        let response = run_model(request, &state, &discard_event, &|_, _, _| {
+            panic!("a plan tool must not go through the ordinary approval gate")
+        })
+        .unwrap();
+        server.join().unwrap();
+        answering.join().unwrap();
+
+        let exited = tool_output(&response, "exit_plan_mode");
+        assert!(exited.success, "{}", exited.output);
+        assert!(exited.output.contains("cover the migration too"));
+        assert!(exited.output.contains("chose to stay in plan mode"));
+
+        assert_eq!(cell.get(), SecurityLevel::Plan);
+        assert_eq!(
+            store
+                .conversation(&conversation_id)
+                .unwrap()
+                .unwrap()
+                .settings
+                .security_level,
+            SecurityLevel::Plan
+        );
+        assert_eq!(
+            store.conversation_plan(&conversation_id).unwrap().unwrap().status,
+            crate::model::PlanStatus::Rejected
+        );
+    }
+
+    /// Outside plan mode the derived tool is the other one, and a single "allow
+    /// once" is what enters the mode — there is no "always" to accumulate.
+    #[test]
+    fn entering_plan_mode_takes_one_allow_and_moves_the_conversation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_json_sequence(
+            listener,
+            vec![
+                function_call_response("call-enter", "enter_plan_mode", json!({})),
+                responses_text_output("planning"),
+            ],
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let (state, request, cell, store) =
+            plan_mode_loop_fixture(address, &directory, SecurityLevel::RequestApproval);
+        let conversation_id = request.conversation_id.clone();
+        let answering =
+            answer_first_plan_card(&state, crate::tool_prompt::ToolPromptDecision::AllowOnce, None);
+
+        let response = run_model(request, &state, &discard_event, &|_, _, _| {
+            panic!("a plan tool must not go through the ordinary approval gate")
+        })
+        .unwrap();
+        server.join().unwrap();
+        let card = answering.join().unwrap();
+
+        assert_eq!(card.kind, crate::tool_prompt::PromptKind::PlanEnter);
+        assert!(!card.allow_always_offered);
+        assert!(card.mandatory);
+
+        let entered = tool_output(&response, "enter_plan_mode");
+        assert!(entered.success, "{}", entered.output);
+        assert!(entered.output.starts_with("Entered plan mode."));
+
+        assert_eq!(cell.get(), SecurityLevel::Plan);
+        assert_eq!(
+            store
+                .conversation(&conversation_id)
+                .unwrap()
+                .unwrap()
+                .settings
+                .security_level,
+            SecurityLevel::Plan
+        );
+    }
+
     #[test]
     fn agent_spawn_approval_precedes_reservation_and_observation() {
         for (level, hook_allow, answer, prompts, success) in [
@@ -12850,6 +13266,12 @@ mod tests {
             (SecurityLevel::RequestApproval, false, Err("approval channel closed".to_owned()), 1, false),
             (SecurityLevel::RequestApproval, false, Ok(true), 1, true),
             (SecurityLevel::RequestApproval, true, Ok(false), 0, true),
+            // Plan mode prompts for delegation on the same terms: the child is
+            // read-only, but spawning it is still the run acting while the user
+            // is deciding.
+            (SecurityLevel::Plan, false, Ok(false), 1, false),
+            (SecurityLevel::Plan, false, Ok(true), 1, true),
+            (SecurityLevel::Plan, true, Ok(false), 0, true),
             (SecurityLevel::FullAccess, false, Ok(false), 0, true),
         ] {
             let (directory, state, mut parent, _) = named_agent_fixture(AgentDefinitionMemory::None);
@@ -12863,7 +13285,11 @@ mod tests {
                 input: serde_json::from_value(json!({"name":"approval-probe", "prompt":"review", "agent_type":"reviewer"})).unwrap(),
             };
             let digest = crate::kernel_shadow::call_params_digest(&call.input);
-            shadow.tool_request(&call.id, level == SecurityLevel::RequestApproval, digest);
+            shadow.tool_request(
+                &call.id,
+                matches!(level, SecurityLevel::RequestApproval | SecurityLevel::Plan),
+                digest,
+            );
             shadow.tool_dispatched(&call.id);
             let observed = std::sync::atomic::AtomicUsize::new(0);
             let approval = |_: &ToolExecutionRequest, _: &ToolDescriptor, _: ApprovalRequester<'_>| {
@@ -16020,6 +16446,7 @@ mod tests {
         // confirmation in every security level — `full_access` included — and a
         // permission hook must not be able to suppress that circuit breaker.
         for level in [
+            SecurityLevel::Plan,
             SecurityLevel::RequestApproval,
             SecurityLevel::AllowEdits,
             SecurityLevel::FullAccess,
@@ -22474,7 +22901,7 @@ mod tests {
         let approve = session_task_approval(
             &state,
             "conv-idle".into(),
-            SecurityLevel::RequestApproval,
+            Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::RequestApproval)),
             app_data.path().to_string_lossy().into_owned(),
         );
         // This shape has no active model run while its task remains active.
@@ -22502,7 +22929,7 @@ mod tests {
         assert_eq!(card.source_call_id.as_deref(), Some("call-7"));
         asking_state
             .tool_prompts()
-            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce)
+            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce, None)
             .unwrap();
 
         assert!(
@@ -22520,7 +22947,7 @@ mod tests {
         let approve = session_task_approval(
             &state,
             "conv-mixed".into(),
-            SecurityLevel::RequestApproval,
+            Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::RequestApproval)),
             app_data.path().to_string_lossy().into_owned(),
         );
         let (run_cancellation, _) = state.begin_model_run("run-1", "conv-mixed").unwrap();
@@ -22550,7 +22977,7 @@ mod tests {
 
         state
             .tool_prompts()
-            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce)
+            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce, None)
             .unwrap();
         assert!(
             asking.join().unwrap().unwrap(),
@@ -22568,7 +22995,7 @@ mod tests {
         let approve = session_task_approval(
             &state,
             "conv-own".into(),
-            SecurityLevel::RequestApproval,
+            Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::RequestApproval)),
             app_data.path().to_string_lossy().into_owned(),
         );
         let (run_cancellation, _) = state.begin_model_run("run-1", "conv-own").unwrap();
@@ -22615,7 +23042,7 @@ mod tests {
         let approve = session_task_approval(
             &state,
             "conv-forced".into(),
-            SecurityLevel::RequestApproval,
+            Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::RequestApproval)),
             app_data.path().to_string_lossy().into_owned(),
         );
         // Seed a medium-risk permanent allowance for `write`.
@@ -22630,6 +23057,7 @@ mod tests {
                     )
                     .unwrap(),
                 crate::tool_prompt::ToolPromptDecision::AllowAlways,
+                None,
             )
             .unwrap();
         assert!(state.tool_prompts().is_always_allowed(
@@ -22658,6 +23086,7 @@ mod tests {
             .resolve(
                 &card.prompt_id,
                 crate::tool_prompt::ToolPromptDecision::AllowAlways,
+                None,
             )
             .unwrap();
         assert!(asking.join().unwrap().unwrap());
@@ -22667,7 +23096,7 @@ mod tests {
         let approve = session_task_approval(
             &state,
             "conv-forced-2".into(),
-            SecurityLevel::RequestApproval,
+            Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::RequestApproval)),
             app_data.path().to_string_lossy().into_owned(),
         );
         let request = write_request("conv-forced-2", workspace.path(), "notes.md");
@@ -22681,6 +23110,7 @@ mod tests {
             .resolve(
                 &card.prompt_id,
                 crate::tool_prompt::ToolPromptDecision::AllowAlways,
+                None,
             )
             .unwrap();
         assert!(asking.join().unwrap().unwrap());
@@ -22703,7 +23133,7 @@ mod tests {
         let approve = session_task_approval(
             &state,
             "conv-stop".into(),
-            SecurityLevel::RequestApproval,
+            Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::RequestApproval)),
             app_data.path().to_string_lossy().into_owned(),
         );
 
@@ -22733,7 +23163,7 @@ mod tests {
         );
         state
             .tool_prompts()
-            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce)
+            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::AllowOnce, None)
             .unwrap();
         assert!(
             asking.join().unwrap().unwrap(),
@@ -22752,7 +23182,7 @@ mod tests {
         let approve = session_task_approval(
             &state,
             "conv-worktree".into(),
-            SecurityLevel::RequestApproval,
+            Arc::new(crate::model::LiveSecurityLevel::new(SecurityLevel::RequestApproval)),
             app_data.path().to_string_lossy().into_owned(),
         );
 
@@ -22780,7 +23210,7 @@ mod tests {
 
         asking_state
             .tool_prompts()
-            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::Deny)
+            .resolve(&card.prompt_id, crate::tool_prompt::ToolPromptDecision::Deny, None)
             .unwrap();
         assert!(!asking.join().unwrap().unwrap());
     }
@@ -29808,6 +30238,7 @@ mod tests {
     #[test]
     fn mandatory_mcp_interaction_cannot_be_bypassed_by_full_access_or_hook_allow() {
         for level in [
+            SecurityLevel::Plan,
             SecurityLevel::RequestApproval,
             SecurityLevel::AllowEdits,
             SecurityLevel::FullAccess,
@@ -30439,6 +30870,7 @@ mod tests {
             tools: catalog::tool_catalog(),
             active_hooks,
             security_level: SecurityLevel::RequestApproval,
+            live_security_level: None,
             app_data_path: workspace.path().to_string_lossy().into_owned(),
             mcp_servers: Vec::new(),
             mcp_bindings: Vec::new(),

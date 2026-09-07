@@ -4,6 +4,7 @@ import {
   CircleAlert,
   CircleCheck,
   CircleHelp,
+  ClipboardCheck,
   Code2,
   Columns3,
   Compass,
@@ -22,11 +23,14 @@ import {
   ListChecks,
   ListFilter,
   Logs,
+  // Aliased: the icon's export name would shadow the built-in `Map`.
+  Map as MapIcon,
   MessageCircleMore,
   MonitorUp,
   MousePointerClick,
   MoveVertical,
   Network,
+  NotebookPen,
   Rows3,
   ScanSearch,
   Search,
@@ -650,6 +654,42 @@ export const TOOL_VIEW_REGISTRY = {
     target: (item, t) => stateToolView(TODO_ACTION_VIEWS, item).target?.(item, t),
     stat: (item, t) => stateToolView(TODO_ACTION_VIEWS, item).stat?.(item, t),
     summaryKind: "state"
+  },
+  // The plan itself has a page of its own, so these rows only say what happened;
+  // the body is never repeated inline.
+  plan: {
+    surface: "group",
+    family: "raw",
+    icon: NotebookPen,
+    doneTitle: (t) => t("已更新计划", "Updated the plan"),
+    resolveTitle: (item, phase, t) => (
+      phase === "running"
+        ? t("正在撰写计划", "Writing the plan")
+        : phase === "failed"
+          ? t("计划操作失败", "Plan operation failed")
+          : inputString(item, "action") === "read"
+            ? t("已读取计划", "Read the plan")
+            : t("已更新计划", "Updated the plan")
+    ),
+    summaryKind: "other"
+  },
+  exit_plan_mode: {
+    surface: "group",
+    family: "raw",
+    icon: ClipboardCheck,
+    doneTitle: (t) => t("已提交计划", "Submitted the plan"),
+    runningTitle: (t) => t("等待批准计划", "Waiting for plan approval"),
+    failedTitle: (t) => t("提交计划失败", "Failed to submit the plan"),
+    summaryKind: "other"
+  },
+  enter_plan_mode: {
+    surface: "group",
+    family: "raw",
+    icon: MapIcon,
+    doneTitle: (t) => t("请求进入计划模式", "Requested plan mode"),
+    runningTitle: (t) => t("请求进入计划模式", "Requesting plan mode"),
+    failedTitle: (t) => t("请求进入计划模式失败", "Failed to request plan mode"),
+    summaryKind: "other"
   },
   read_global_memory: {
     surface: "group",

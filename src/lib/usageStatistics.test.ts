@@ -3,8 +3,8 @@ import {
   formatCompactCount,
   MAX_SERIES_POINTS,
   niceTicks,
+  purrDuration,
   summarizeUsage,
-  tokenComparison,
   usageBackfillEventsFromTurns,
   USAGE_BACKFILL_STORAGE_KEY,
   type ActivityBucket,
@@ -467,16 +467,14 @@ describe("presentation helpers", () => {
     expect(formatCompactCount(2_500_000_000)).toBe("2.5B");
   });
 
-  it("picks a comparison that still reads as a multiple", () => {
-    const tiny = tokenComparison(40_000);
-    expect(tiny?.fraction).toBe(true);
-    expect(tiny?.multiple).toBe(39);
-    const large = tokenComparison(115_400_000);
-    expect(large?.fraction).toBe(false);
-    expect(large?.en).toContain("Shakespeare");
-    expect(large?.multiple).toBe(98.6);
+  it("carries the purr duration up to the largest unit that still reads as a number", () => {
+    expect(purrDuration(40_000)).toEqual({ value: 2.4, unit: "minute" });
+    expect(purrDuration(1_000_000)).toEqual({ value: 1, unit: "hour" });
+    expect(purrDuration(115_400_000)?.unit).toBe("day");
+    expect(purrDuration(115_400_000)?.value).toBeCloseTo(4.81, 2);
+    expect(purrDuration(720_000_000)).toEqual({ value: 1, unit: "month" });
 
-    expect(tokenComparison(0)).toBeNull();
+    expect(purrDuration(0)).toBeNull();
   });
 });
 

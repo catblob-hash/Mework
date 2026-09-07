@@ -152,9 +152,10 @@ describe("document normalization", () => {
       .toEqual([expect.objectContaining({ name: "valid", deleted: false, memoryEpoch: 1 })]);
   });
 
-  it("marks a role unavailable instead of deleting it when its bound model is gone", () => {
-    // The old behavior dropped the whole role, so disabling a provider silently
-    // deleted every role bound to it with nothing shown to the user.
+  it("keeps a role's binding intact when its bound model is gone", () => {
+    // An older behavior rewrote the pair to `unavailable` and discarded both
+    // IDs. At rest there is no way to tell "signed out, catalog not fetched"
+    // from "gone forever", so the binding waits instead of being destroyed.
     const current = createSeedDocument();
     defaultPresetSettings(current).agentDefinitions = [
       {
@@ -195,27 +196,31 @@ describe("document normalization", () => {
       .conversationPresets[0].settings.agentDefinitions;
 
     expect(roles.map((role) => role.name)).toEqual(["dangling-provider", "survives"]);
-    expect(roles[0].modelSelection).toEqual({ kind: "unavailable" });
+    expect(roles[0].modelSelection).toEqual({
+      kind: "explicit",
+      providerId: "provider_gone",
+      modelId: "gpt-4o"
+    });
     // The host identity is untouched: this is not a reconfiguration, so a
     // revision bump would invalidate bindings for a role nobody edited.
     expect(roles[0]).toMatchObject({ revision: 3, memoryEpoch: 2 });
   });
 
-  it("keeps no trace of the dead provider or model id", () => {
-    // Retaining them would let a provider coming back silently restore a
-    // binding the user was already shown as lost.
+  it("still reads a legacy unavailable binding without resurrecting its ids", () => {
+    // Written by a build that discarded the pair on demotion. There is nothing
+    // to recover, so it stays exactly as stored.
     const current = createSeedDocument();
     defaultPresetSettings(current).agentDefinitions = [
       {
         enabled: true,
         deleted: false,
-        name: "dangling",
+        name: "legacy",
         description: "",
         source: "user",
         sourceKey: "",
         revision: 3,
         memoryEpoch: 2,
-        modelSelection: { kind: "explicit", providerId: "provider_gone", modelId: "secret-model" },
+        modelSelection: { kind: "unavailable" },
         memory: "none",
         effort: null,
         tools: null,
@@ -227,8 +232,8 @@ describe("document normalization", () => {
     const roles = normalizeDocument(current).globalSettings
       .conversationPresets[0].settings.agentDefinitions;
 
-    expect(JSON.stringify(roles[0])).not.toContain("provider_gone");
-    expect(JSON.stringify(roles[0])).not.toContain("secret-model");
+    expect(roles[0].modelSelection).toEqual({ kind: "unavailable" });
+    expect(roles[0]).toMatchObject({ revision: 3, memoryEpoch: 2 });
   });
 
   it("keeps the binding when its provider is merely disabled", () => {

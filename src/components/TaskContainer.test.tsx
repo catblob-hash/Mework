@@ -458,6 +458,33 @@ describe("TaskContainer", () => {
     expect(onSelectAgent).not.toHaveBeenCalled();
   });
 
+  it("gives the plan a row that opens its page and offers nothing to stop", async () => {
+    const user = userEvent.setup();
+    const onOpenItem = vi.fn();
+    const { container, onSelectAgent } = renderContainer({
+      onOpenItem,
+      plan: {
+        conversationId: "conversation-1",
+        markdown: "# 替换审批闸\n\n分三步。",
+        status: "draft",
+        createdAt: "2026-07-20T01:00:00Z",
+        updatedAt: new Date().toISOString()
+      },
+      planAwaitingApproval: true
+    });
+
+    const row = within(container).getByRole("button", { name: "打开“实施计划”" });
+    expect(row).toHaveTextContent("待批准");
+    expect(row).toHaveTextContent("刚刚更新");
+    // A document is not work in flight, so the row carries no abort control.
+    expect(within(container).queryByRole("button", { name: /中止/ })).not.toBeInTheDocument();
+
+    await user.click(row);
+    expect(onOpenItem).toHaveBeenCalledTimes(1);
+    expect(onOpenItem.mock.calls[0]![0]).toMatchObject({ kind: "plan", id: "plan" });
+    expect(onSelectAgent).not.toHaveBeenCalled();
+  });
+
   it("marks the row whose transcript is showing and hides the panel when closed", async () => {
     const user = userEvent.setup();
     const { container, onClose } = renderContainer({

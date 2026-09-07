@@ -13,7 +13,9 @@ export type MainPaneView =
   | { kind: "subagent"; subagentId: string }
   | { kind: "preview"; sessionId: string }
   | { kind: "shell"; shellTaskId: string }
-  | { kind: "review"; view: GitReviewView };
+  | { kind: "review"; view: GitReviewView }
+  /** The conversation's plan document. One plan per conversation, so no payload. */
+  | { kind: "plan" };
 
 export type MainPaneViewKind = MainPaneView["kind"];
 
@@ -127,6 +129,7 @@ export function mainPaneViewKey(view: MainPaneView): string {
   if (view.kind === "shell") return `shell:${view.shellTaskId}`;
   if (view.kind === "subagent") return `subagent:${view.subagentId}`;
   if (view.kind === "review") return "review";
+  if (view.kind === "plan") return "plan";
   return "conversation";
 }
 

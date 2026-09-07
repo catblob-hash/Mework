@@ -67,12 +67,12 @@
   "cwd": "<workspace path>",
   "hook_event_name": "PreToolUse",
   "model": "<model id>",
-  "permission_mode": "default | acceptEdits | bypassPermissions",
+  "permission_mode": "default | acceptEdits | plan | bypassPermissions",
   "turn_id": "<uuid>"
 }
 ```
 
-`permission_mode` 映射对话的安全层级：`request_approval` → `default`，`allow_edits` → `acceptEdits`，`full_access` → `bypassPermissions`。事件专属字段：
+`permission_mode` 映射对话的安全层级：`request_approval` → `default`，`allow_edits` → `acceptEdits`，`plan`（计划模式）→ `plan`，`full_access` → `bypassPermissions`。事件专属字段：
 
 | 事件 | 额外字段 |
 |---|---|
