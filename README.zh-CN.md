@@ -35,12 +35,14 @@ Mework 是一个本地优先的 Windows 桌面 Agent 工作台。界面用 React
 
 **可靠的持久化。** 版本化 JSON 锚点 + SQLite 对话库，流式内容增量落盘、崩溃可恢复；损坏或更高版本的数据会被隔离重建，绝不做静默迁移。
 
+**常驻托盘。** 关闭窗口只是把它隐藏起来，子代理、工作流、shell 任务与侧车都照常继续运行。托盘图标的菜单可以重新打开窗口或退出 Mework（退出前仍会先把所有内容刷写落盘）；程序还在托盘里时再次启动 Mework，通常只是把窗口唤回，而不会启动第二个副本。
+
 ## 安装（Windows）
 
 从 [Releases](../../releases) 任选其一：
 
-- **安装器** —— `Mework_1.0.0_x64-setup.exe`（NSIS，按机器安装）。
-- **便携版** —— `Mework_1.0.0_x64_portable.zip`：解压即用，运行 `mework.exe`（`mework-aisdk.exe` 需与其同目录）。
+- **安装器** —— `Mework_1.0.2_x64-setup.exe`（NSIS，按机器安装）。
+- **便携版** —— `Mework_1.0.2_x64_portable.zip`：解压即用，运行 `mework.exe`（`mework-aisdk.exe` 需与其同目录）。
 
 两者都依赖 Microsoft Edge WebView2 Runtime（当前 Windows 10/11 已预装；安装器可在缺失时自动引导安装）。
 
@@ -48,7 +50,7 @@ Mework 是一个本地优先的 Windows 桌面 Agent 工作台。界面用 React
 
 首次运行：打开「全局设置 → 提供商 → 模型提供商」，添加提供商与 Key（Codex、Claude Agent 两家是登录式，不填 Key），从发现页添加模型，然后在输入框下方选择它。
 
-「设置 → 版本更新」会显示当前运行版本，并检查 GitHub Releases 是否有新版本。安装版会下载新的 `-setup.exe`，在发布附带 `SHA256SUMS` 时进行校验，并以更新模式运行安装程序（保留设置和数据；安装完成后应用会重新打开）。便携版会把新的 zip 下载到「下载」文件夹并在资源管理器中显示——请关闭 Mework，再解压覆盖旧文件。
+「设置 → 版本更新」会显示当前运行版本，并检查 GitHub Releases 是否有新版本。安装版会下载新的 `-setup.exe`，在发布附带 `SHA256SUMS` 时进行校验，并以更新模式运行安装程序（保留设置和数据；安装完成后应用会重新打开）。便携版会把新的 zip 下载到「下载」文件夹并在资源管理器中显示——请从托盘图标退出 Mework，再解压覆盖旧文件。
 
 ## 从源码构建
 
@@ -109,7 +111,7 @@ npm run reset:data     # 清空本机应用数据（schema 升版不做迁移）
 
 ## 状态
 
-Mework 1.0.0 面向 Windows。代码中保留了跨平台接缝（凭据库后端、POSIX shell 路径），但目前只发布并支持 Windows 构建。
+Mework 1.0.2 面向 Windows。代码中保留了跨平台接缝（凭据库后端、POSIX shell 路径），但目前只发布并支持 Windows 构建。
 
 ## 许可证
 
