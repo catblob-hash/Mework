@@ -4,67 +4,60 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-📖 **Documentation:** [catblob-hash.github.io/Mework](https://catblob-hash.github.io/Mework/en/index.html) — how to work with Mework, a page for every built-in tool, the tool-description file (prompt profile) reference, and how to configure skills, MCP servers, code navigation and hooks.
+📖 **Documentation:** [catblob-hash.github.io/Mework](https://catblob-hash.github.io/Mework/en/index.html)
 
-Mework is a local-first agent workbench for Windows. It pairs a React 19 interface with a Rust host built on Tauri 2: the host owns persistence, capability discovery, tool execution, and every safety boundary, while a bundled AI SDK sidecar is the only path to model providers. You bring your own API keys; nothing leaves your machine except the model calls you configure.
+Mework is a desktop coding agent for Windows. It does what you would expect from Claude Code — reads and edits your project, runs commands, searches the web, spawns subagents, checks its own work in a browser — but as a local app where you choose the model, and where nothing the model is told is hidden from you or off limits to edit.
 
-## Highlights
+You bring your own API key or subscription. Everything else runs and stays on your machine.
 
-**A formally specified agent kernel.** The turn/round/tool/subagent lifecycle is specified before it is implemented: a CSP-M interaction protocol ([`formal/csp/AgentKernel.csp`](formal/csp/AgentKernel.csp), the highest authority) and a TLA+ safety model ([`formal/tla/AgentKernel.tla`](formal/tla/AgentKernel.tla)) are checked with ProB — model checking, CSP refinement with 93 scenario assertions (21 accepted, 72 rejected), guard-deletion mutation matrices (63 TLA + 92 CSP), and bidirectional trace replay against the dependency-light Rust kernel crate (`src-tauri/agent-kernel`). At runtime a shadow kernel observes the real host event stream and reports any divergence from the spec.
+## What you get
 
-**Bring your own providers.** OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, Google, Azure OpenAI, Amazon Bedrock, Google Vertex, xAI, and generic OpenAI-compatible endpoints — all through an embedded [Vercel AI SDK](https://sdk.vercel.ai) sidecar compiled to a single executable. Providers are user-defined; there is no built-in vendor list to outgrow. Two families step outside the plain "base URL plus key" shape. **OpenAI Codex**: sign in with your ChatGPT subscription (Plus / Pro / Team) instead of an API key — the OAuth flow runs in the host, tokens stay encrypted on this machine and never reach the UI. **Claude Agent (Claude Code)**: the sidecar drives the Claude Code executable you already have installed through the official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), with every Claude Code behaviour switched off (no built-in tools, CLAUDE.md, hooks, MCP servers, compaction or background tasks) and Mework's own tools published to the model under their own names — so Mework's approvals, hooks, MCP servers and skills apply unchanged. There is no key or address to enter: Mework reuses the Claude Code login already on this machine (`claude auth login`), for your own use and subject to the [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance). For every other provider, API keys live in the OS credential store, never in documents, and requests refuse redirects and embedded credentials.
+**An agent that does the whole job.** Filesystem tools with language-server code navigation, PowerShell and Bash (locally, in WSL, or over SSH), web search and fetch, long-term memory, a to-do list, and a plan mode that makes the model propose before it touches anything. For everyday coding work the feature set is on par with Claude Code; the differences that remain are listed below.
 
-**46 built-in tools** — each documented on its own page at [catblob-hash.github.io/Mework/en/tools.html](https://catblob-hash.github.io/Mework/en/tools.html).
-- *Filesystem* (7): `ls`, `grep`, `read`, `write`, `edit`, `find`, `lsp` — workspace-bounded, traversal- and symlink-safe, atomic writes; `lsp` talks to a language server for definitions, references, hover, symbols and call hierarchy.
-- *Shell* (2): `powershell`, `bash` — foreground or background, with per-call approval and full-argument native dialogs.
-- *Web and preview* (17): `web_search` and `web_fetch` (provider-native server-side search, or host-run backends such as Tavily, Exa, SearXNG, Jina, Firecrawl, Bocha, Zhipu), plus fifteen `preview_*` tools that run your project's dev server and verify the page it serves.
-- *Orchestration* (14): `agent_spawn`, `send_message`, `followup_task`, `task_wait`, `task_list`, `box`, `workflow`, `skill`, `tool_search`, `todo`, `ask_user`, `fork`, `plan`, `exit_plan_mode`.
-- *Memory* (6): two-tier plain-Markdown long-term memory (global `~/.mework` and per-project `<workspace>/.mework`) with independent read/create/edit tools per tier.
+**Background subagents and scripted workflows.** Up to eight subagents run at once, keep going after the turn ends, and survive an app restart. You can define named roles — which model, which tools, which search backend — and let the model pick one. For bigger jobs, a JavaScript workflow script orchestrates many agents with checkpoints and crash recovery.
 
-31 of them are switches in a conversation's tool list; the other 15 (the memory tools, `task_wait`/`task_list`/`box`, `web_search`/`web_fetch`, `skill`, `tool_search`, `plan`/`exit_plan_mode`) are derived by the host from the memory, web-access, skill-delivery and MCP-discovery switches, from whether a task-producing tool is enabled, and from the security level.
+**A browser that verifies the work.** Mework starts your project's dev server, opens the page it serves, and lets the model read the console and network, inspect elements, click, type and take screenshots — then show you the result instead of asking you to check. The same pane is a normal browser you can drive yourself.
 
-**Subagents and scripted workflows.** Spawn up to 8 concurrent background subagents that survive across turns and app restarts; message them, wake them, and block on their results with `task_wait`. The `workflow` tool runs a JavaScript orchestration script (`agent()`, `parallel()`, `pipeline()`, `phase()`, `budget`) with incremental persistence, crash recovery, and optional per-step git-worktree isolation.
+**Approvals you can see.** Every risky call shows a card with the exact command or path and why it was classified that way. Four security levels, from approve-everything to full access, and a few confirmations that no level can turn off — like acting on a site you logged into yourself.
 
-**A dev-server preview, not a general-purpose browser.** Mework reads your project's `.mework/launch.json`, spawns the dev server it names, probes the port until it answers, and ring-buffers the process output — `preview_logs` hands the model the same stdout/stderr the pane's log drawer shows you. From there the model works on one page per conversation: accessibility-tree snapshots, computed styles, console and network reads, clicks, fills, viewport presets and scripted evaluation, driven through trusted CDP with a visible pointer overlay and nothing injected into the page. It has no navigate tool and no tab management — the page comes from the server it started. Every page is an isolated, single-use WebView2 profile: no shared cookies, no imported credentials, destroyed on close; sign in yourself and the model must ask before it can act as you. Remote content can never reach the Tauri IPC surface. The pane you drive keeps its address bar and back/forward/reload, and adds a dev-server picker, the log drawer and a viewport menu.
+**Your models, your keys.** OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, Google Vertex, xAI and any OpenAI-compatible endpoint. Two sign in instead: **OpenAI Codex** with your ChatGPT subscription, and **Claude Agent**, which reuses the Claude Code login already on your machine (subject to the [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance)). Keys live in Windows Credential Manager, never in a settings file.
 
-**Run environments.** Shell tools can execute locally, inside a WSL distribution, or on an SSH machine, with per-environment environment variables and approval fingerprints that invalidate when the environment changes.
+**Stays out of the way.** Closing the window sends Mework to the tray; subagents, workflows and shell tasks keep running. The app updates itself from GitHub Releases.
 
-**Extensible.** Skills (`SKILL.md` directories, discovered in `~/.mework/skills` and each workspace's `.mework/skills`), lifecycle hooks (7 events: `SessionStart`, `InstructionsLoaded`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop`), and MCP servers over stdio or Streamable HTTP, declared in `mcp.json` at the same two levels.
+## You are in control
 
-**Every host prompt is declared.** All fixed text Mework injects into a model request — the default system prompt, capability sections, safety boundaries, subagent addendum, task receipts, tool framing — lives in one registry with an English default compiled in and a Chinese profile shipped alongside. A hand-written [tool-description file](https://catblob-hash.github.io/Mework/en/prompt-profiles.html) can override any of it per conversation.
+Most agent tools decide what the model is told and lock the transcript. Mework does neither.
 
-**Deterministic safety model.** Layered authorization decides per call: conversation allowlists, risk classification, native approval dialogs that show the full command and workspace, single-use nonces for manual high-risk execution, path guards on every file access, and hook-based deny/rewrite. Approvals are consumed before execution, never after.
+- **Skills.** `SKILL.md` folders in the same format Claude Code, Codex and the public registries use. Drop an existing skill in and it works; load skills up front or on demand.
+- **MCP servers.** Any stdio or Streamable HTTP server, declared in an `mcp.json` with the same shape as Claude Code's. Tool schemas can be declared up front or discovered on demand to save context.
+- **Hooks.** Shell commands at seven lifecycle points — session start, prompt submit, before and after each tool, permission requests, stop. They can add context, block or rewrite a call, or send the model back to work. A `hooks` block copied from Claude Code works as it is.
+- **Every host sentence is yours to change.** Mework has no hidden system prompt. Everything it says to the model — tool descriptions, the MCP section, subagent boundaries, task receipts — is declared in one editable file, with English and Chinese profiles shipped and your own overrides layered on top. Project instructions go in `MEWORK.md`; hooks can inject more per turn.
+- **Edit the conversation freely.** Right-click anywhere in the timeline to insert, edit or delete a system prompt, a user message, a model reply, a reasoning field, or a tool call and its result. Branch from any message. The next request is built from what you see, so you can write the model's answer or a tool's output yourself and continue from there.
+- **No silent context management.** Mework never compacts or rewrites the history behind your back. A usage meter shows how much of the context window is used; what to trim and when is your decision.
 
-**Durable persistence.** A versioned JSON anchor plus a SQLite conversation store with crash-safe incremental streaming rows; corrupted or future-versioned data is quarantined and rebuilt, never silently migrated over.
+## What it does not do yet
 
-**Lives in the tray.** Closing the window only hides it; subagents, workflows, shell tasks and the sidecar keep running. The tray icon's menu reopens the window or quits Mework (quitting still flushes everything to disk first), and launching Mework again while it sits in the tray normally just brings the window back instead of starting a second copy.
+- **Windows only.** The code has cross-platform seams, but only the Windows build is released and supported.
+- **No automatic compaction.** Long sessions are your responsibility to trim (see above).
+- **No IDE plugin, CLI or slash commands.** Mework is a desktop app; skills take the place of slash commands.
+- **Hooks are command hooks only**, and only the seven events above.
 
 ## Install (Windows)
 
 Grab either flavor from [Releases](../../releases):
 
-- **Installer** — `Mework_1.0.0_x64-setup.exe` (NSIS, per-machine).
+- **Installer** — `Mework_1.0.0_x64-setup.exe` (per-machine).
 - **Portable** — `Mework_1.0.0_x64_portable.zip`: unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
 
-Both require the Microsoft Edge WebView2 Runtime, which is preinstalled on current Windows 10/11; the installer can bootstrap it if missing.
+Both require the Microsoft Edge WebView2 Runtime, which is preinstalled on current Windows 10/11; the installer can bootstrap it if missing. "Portable" means no installer, not no state: the app still writes to `%APPDATA%\com.mework.app`, `%LOCALAPPDATA%\com.mework.app` and Windows Credential Manager.
 
-"Portable" means no installation, not no state: the app still writes to `%APPDATA%\com.mework.app`, `%LOCALAPPDATA%\com.mework.app`, and Windows Credential Manager.
+**First run:** open *Settings → Providers → Model providers*, add a provider and its key (or sign in for Codex and Claude Agent), add a model from the discovery page, and pick it under the composer.
 
-First run: open *Settings → Providers → Model providers*, add a provider and its key (or sign in for the Codex and Claude Agent providers), add a model from the discovery page, and pick it under the composer.
-
-*Settings → Updates* shows the running version and checks GitHub Releases for a newer one. The installer flavor downloads the new `-setup.exe`, verifies it against the release's `SHA256SUMS` when present, and runs it in update mode (settings and data are kept; the app restarts). The portable flavor downloads the new zip to your Downloads folder and shows it in Explorer — quit Mework from the tray icon and unzip it over the old files.
+**Updates:** *Settings → Updates* checks GitHub Releases. The installer flavor downloads and runs the new setup in update mode, keeping your settings and data; the portable flavor downloads the new zip for you to unzip over the old files.
 
 ## Build from source
 
-Prerequisites: Node.js ≥ 22.12 (22.23.1 pinned in `.node-version`), stable Rust, Windows with WebView2, and Visual Studio Build Tools (MSVC).
-
-The build also needs a native **mingw64** toolchain — `gcc`, `make` and `perl` — because some crates compile C sources. Install [MSYS2](https://www.msys2.org/) and then:
-
-```bash
-pacman -S mingw-w64-x86_64-gcc make perl
-```
-
-The build wrapper looks for MSYS2 in the usual install locations; if yours is elsewhere, point `MSYS2_ROOT` at the directory that contains both `mingw64\bin` and `usr\bin`. `mingw64\bin` must precede `usr\bin` on `PATH`, which the wrapper arranges for you.
+Prerequisites: Node.js ≥ 22.12, stable Rust, Windows with WebView2, Visual Studio Build Tools (MSVC), and an MSYS2 mingw64 toolchain (`gcc`, `make`, `perl`).
 
 ```bash
 npm install
@@ -72,48 +65,7 @@ npm --prefix aisdk-service install
 npm run tauri:build
 ```
 
-`tauri:build` builds the frontend, compiles the sidecar to a single-file executable (Node SEA), and produces the NSIS installer under `src-tauri/target/release/bundle/nsis/`; the bare `mework.exe` and `mework-aisdk.exe` land in `src-tauri/target/release/`.
-
-```bash
-npm run package:portable   # zip the portable flavor from an existing tauri:build output
-```
-
-```bash
-npm run licenses:third-party   # regenerate THIRD-PARTY-LICENSES.md from the lockfiles (run before a release when dependencies changed)
-```
-
-```bash
-npm run release:assets   # copies installer + portable zip and writes SHA256SUMS for the GitHub release
-```
-
-Publish a GitHub release tagged `v<version>` with the three files; the in-app updater relies on the `v` tag prefix, the `-setup.exe` / `_portable.zip` name patterns, and (optionally) `SHA256SUMS`.
-
-## Development
-
-```bash
-npm run dev            # static UI preview, no backend
-npm run dev:browser    # full-stack browser bridge on 127.0.0.1:1420 (real Rust backend, no native window)
-npm test               # lint + frontend checks + vitest
-npm run test:rust      # cargo test
-npm run verify:formal  # full formal pipeline (fetch ProB first: npm run prob:fetch)
-npm run reset:data     # wipe local app data (schema bumps are not migrated)
-```
-
-## Repository layout
-
-| Path | What it is |
-|---|---|
-| `src/` | React 19 + TypeScript UI |
-| `src-tauri/src/` | Rust host: tool executor, conversation store, capability & safety layers, kernel shadow |
-| `src-tauri/agent-kernel/` | Formal-kernel Rust projection + conformance trace exporter |
-| `src-tauri/workflow-core/`, `src-tauri/workflow-script/` | Workflow orchestration engine and its JS runtime |
-| `formal/` | CSP-M protocol spec and TLA+ safety model |
-| `aisdk-service/` | Node sidecar (AI SDK): the only model-provider network path |
-| `scripts/` | Dev, test, and verification pipelines |
-
-## Status
-
-Mework 1.0.0 targets Windows. The codebase carries cross-platform seams (keyring backends, POSIX shell paths), but only the Windows build is released and supported today.
+The installer lands under `src-tauri/target/release/bundle/nsis/`; `npm run package:portable` zips the portable flavor from the same output. `npm test` and `npm run test:rust` run the checks.
 
 ## License
 
