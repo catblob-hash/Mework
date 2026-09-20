@@ -1,0 +1,21 @@
+[package]
+name = "mework-workflow-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+[lib]
+# Plan documents and host-side `pub use workflow_core::schema::*;` import this crate
+# as `workflow_core`; the package name follows the workspace `mework-` prefix convention.
+name = "workflow_core"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# Deliberately closed: decision logic must not depend on the engine, host, or async runtime.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

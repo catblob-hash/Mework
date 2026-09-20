@@ -1,0 +1,328 @@
+/* The conversation's outgoing requests: a row per user-level turn, and inside
+   it a row per part of what that turn sent, with a rule under each request that
+   left. Every row is a single line that opens in place, so the pane reads as one
+   list however deep the reader goes. */
+.history-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 6px 10px;
+}
+
+.history-pane__empty {
+  margin: 0;
+  padding: 14px 12px;
+  color: var(--faint);
+  font-size: 11.5px;
+}
+
+/* Inline retry for a row whose parts could not be read. The rest of the ledger
+   stays on screen behind it: one unreadable request is not a broken pane. */
+.history-pane__retry {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.history-pane__retry:hover,
+.history-pane__retry:focus-visible {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.history-pane__list,
+.history-pane__parts {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.history-pane__row {
+  width: 100%;
+  min-height: 24px;
+  padding: 2px 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  text-align: left;
+  transition: color .14s ease, background .14s ease;
+}
+
+.history-pane__row:hover,
+.history-pane__row:focus-visible {
+  background: var(--color-000000-ap2_6);
+  color: var(--text);
+}
+
+.history-pane__chevron {
+  flex: 0 0 auto;
+  color: var(--faint);
+  transition: transform .14s ease;
+}
+
+.history-pane__chevron[data-open] {
+  transform: rotate(90deg);
+}
+
+.history-pane__kind {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: var(--color-000000-ap2_6);
+  color: var(--muted);
+}
+
+/* A user-level turn: the outermost row, and the only one that stands for
+   something the person did rather than for a payload. */
+.history-pane__kind[data-kind="round"] {
+  color: var(--text);
+}
+
+.history-pane__row--round .history-pane__title {
+  font-weight: 650;
+}
+
+.history-pane__glyph {
+  flex: 0 0 auto;
+  color: var(--faint);
+}
+
+/* Request number. Fixed width so the titles beside it line up down the list. */
+.history-pane__index {
+  flex: 0 0 auto;
+  min-width: 16px;
+  color: var(--faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.history-pane__title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 610;
+}
+
+.history-pane__badge {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--color-000000-ap2_6);
+  color: var(--faint);
+  font-size: 9.5px;
+}
+
+.history-pane__change {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-pane__time {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Whole messages the user added or removed before this payload went out. A
+   count of zero is not drawn at all: the pair reads as a diff stat, and "+0 −0"
+   on every row would bury the ones that have something to say. */
+.history-pane__counts {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-pane__count[data-status="added"] {
+  color: var(--success);
+}
+
+.history-pane__count[data-status="removed"] {
+  color: var(--danger);
+}
+
+/* A turn's parts are quoted inside it: inset and ruled, so a row in here is
+   never read as a row of the ledger itself. */
+.history-pane__body {
+  margin: 1px 0 4px 12px;
+  padding: 2px 0 2px 8px;
+  border-left: 1px solid var(--color-000000-ap10);
+}
+
+.history-pane__row--part {
+  min-height: 22px;
+  font-size: 11px;
+}
+
+/* Replayed history, opened from behind the turn's rule. Held back a step from
+   what the turn itself put on the wire: it is there to be consulted, not to
+   compete with the rows the reader opened the turn for. */
+.history-pane__row--part[data-cached] {
+  opacity: .66;
+}
+
+.history-pane__row--part[data-cached]:hover,
+.history-pane__row--part[data-cached]:focus-visible {
+  opacity: 1;
+}
+
+/* A boundary inside a turn: where one request left, or where the history it
+   replayed ends. It carries a line rather than a preview, because what it
+   stands for is the gap between two rows and not a part of its own. */
+.history-pane__row--rule {
+  min-height: 20px;
+}
+
+.history-pane__rule-label {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.history-pane__rule-line {
+  flex: 1 1 auto;
+  min-width: 12px;
+  height: 0;
+  border-top: 1px dashed var(--border);
+}
+
+/* The line is what takes up the slack on a rule, so the counters beside it sit
+   against the right edge instead of stretching. */
+.history-pane__row--rule .history-pane__change {
+  flex: 0 0 auto;
+}
+
+/* The wire role, which is the one word that says what a part is. */
+.history-pane__role {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--color-000000-ap2_6);
+  color: var(--muted);
+  font-size: 9.5px;
+  font-weight: 620;
+}
+
+/* What the user did to a message is coloured; what the round produced is not.
+   An addition the model made is what the request was for, so colouring it would
+   leave the two or three rows worth looking at indistinguishable from the rest.
+   A removed message has no row in this payload at all — it is drawn from the
+   previous one, struck through, so a deletion is visible where it happened. */
+.history-pane__row--part[data-tone="user-added"] .history-pane__role {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.history-pane__row--part[data-tone="removed"] .history-pane__role {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.history-pane__row--part[data-tone="removed"] .history-pane__preview {
+  text-decoration: line-through;
+}
+
+.history-pane__row--part[data-tone="changed"] .history-pane__role {
+  color: var(--accent);
+}
+
+.history-pane__detail {
+  flex: 0 0 auto;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.history-pane__preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.history-pane__meta {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-pane__stat {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-pane__stat[data-status="added"] {
+  color: var(--success);
+}
+
+.history-pane__stat[data-status="removed"] {
+  color: var(--danger);
+}
+
+.history-pane__stat[data-status="changed"] {
+  color: var(--accent);
+}
+
+/* An opened part is its text, verbatim. It is evidence, so it wraps rather than
+   scrolling sideways, and nothing about it is reformatted. */
+.history-pane__text {
+  margin: 2px 0 6px 18px;
+  padding: 6px 8px;
+  max-height: 420px;
+  overflow: auto;
+  border-radius: 5px;
+  background: var(--color-000000-ap2_6);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.history-pane__text--json {
+  max-height: 520px;
+}
+
+.history-pane__diff {
+  margin: 2px 0 6px 18px;
+  max-height: 420px;
+  overflow: auto;
+}

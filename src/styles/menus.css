@@ -1,0 +1,196 @@
+/* Context menu: single-line labels only — no icons, heading or footer. */
+.context-menu { position: fixed; z-index: 1000; min-width: 132px; padding: 3px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--color-ffffff-ap98); box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8); animation: menu-in .1s ease-out; }
+@keyframes menu-in { from { opacity: 0; transform: translateY(-3px) scale(.985); } }
+.context-menu > button, .context-menu__branch > button, .context-menu__submenu > button { width: 100%; min-height: 24px; display: flex; align-items: center; padding: 2px 7px; background: transparent; border-radius: 5px; color: var(--text); text-align: left; font-size: 12px; white-space: nowrap; }
+.context-menu > button:hover:not(:disabled), .context-menu > button:focus-visible, .context-menu__branch > button:hover:not(:disabled), .context-menu__branch > button:focus-visible, .context-menu__submenu > button:hover:not(:disabled), .context-menu__submenu > button:focus-visible { background: var(--hover); outline: 0; }
+.context-menu > button:disabled, .context-menu__branch > button:disabled { color: var(--faint); cursor: not-allowed; }
+.context-menu__divider { height: 1px; margin: 3px 2px; background: var(--border); }
+/* Choosing a tool is two choices deep, so each step opens beside the one it came
+   from rather than replacing it. Only the last step scrolls: a group's tool list
+   can outrun the viewport, while a panel that holds another panel must not clip
+   it — `overflow-y: auto` alone would make the group list scroll sideways the
+   moment its own submenu opened past its edge. */
+.context-menu__branch { position: relative; }
+.context-menu__submenu { position: absolute; left: 100%; top: -4px; z-index: 1; min-width: 140px; margin-left: 2px; padding: 3px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--color-ffffff-ap98); box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8); }
+.context-menu__submenu--scroll { max-height: min(340px, 60vh); overflow: hidden auto; }
+.context-menu__submenu--flipped { left: auto; right: 100%; margin: 0 2px 0 0; }
+.context-menu > button > svg, .context-menu__branch > button > svg, .context-menu__submenu > button > svg { flex: 0 0 auto; color: var(--faint); }
+.context-menu__more { margin-left: auto; padding-left: 10px; box-sizing: content-box; }
+/* Naming a conversation template happens in the menu, not a dialog, so this
+   panel widens the same shell rather than replacing it. */
+.context-menu__name { min-width: 216px; padding: 4px; display: flex; flex-direction: column; gap: 7px; }
+.context-menu__name label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 10.5px; font-weight: 650; }
+.context-menu__name .input { min-height: 30px; font-size: 12px; }
+.context-menu__name-actions { display: flex; justify-content: flex-end; gap: 4px; }
+
+/* Shared popover menu (PopoverMenu.tsx).
+   The panel is attached directly to document.body, so these rules must not
+   depend on ancestors; inline styles supply all positioning. */
+.popover-menu { position: relative; min-width: 0; display: inline-flex; }
+.popover-menu__panel {
+  position: fixed; z-index: 1000; max-width: min(420px, calc(100vw - 16px)); padding: 5px;
+  display: flex; flex-direction: column;
+  border: 1px solid var(--border-strong); border-radius: 11px; background: var(--panel);
+  box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8);
+  animation: menu-in .1s ease-out;
+}
+.popover-menu__list { min-height: 0; max-height: min(420px, calc(100vh - 32px)); display: flex; flex-direction: column; overflow: auto; overscroll-behavior: contain; }
+.popover-menu__section { display: flex; flex-direction: column; }
+.popover-menu__label { padding: 6px 8px 3px; color: var(--faint); font-size: 10px; font-weight: 650; }
+.popover-menu__divider { height: 1px; margin: 4px 2px; background: var(--border); }
+.popover-menu__row { display: flex; flex-direction: column; }
+.popover-menu__item {
+  width: 100%; min-height: 32px; padding: 5px 8px; display: flex; align-items: center; gap: 9px;
+  border-radius: 7px; background: transparent; color: var(--text); text-align: left; font-size: 12.5px;
+}
+.popover-menu__item:hover:not(:disabled), .popover-menu__item:focus-visible { background: var(--hover); outline: 0; }
+.popover-menu__item:disabled { color: var(--faint); cursor: not-allowed; }
+.popover-menu__icon { flex: 0 0 auto; display: inline-flex; color: var(--muted); }
+.popover-menu__item:disabled .popover-menu__icon { color: var(--faint); }
+.popover-menu__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.popover-menu__copy > strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 500; }
+.popover-menu__copy > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 10px; line-height: 1.35; }
+.popover-menu__check { flex: 0 0 auto; color: var(--text); }
+.popover-menu__hint { flex: 0 0 auto; color: var(--faint); font-size: 10px; }
+.popover-menu__chevron { flex: 0 0 auto; color: var(--faint); transition: transform .18s ease; }
+.popover-menu__chevron--open { transform: rotate(90deg); }
+.popover-menu__submenu { margin: 2px 0 2px 10px; padding-left: 8px; border-left: 1px solid var(--border); display: flex; flex-direction: column; gap: 1px; }
+/* Flyout nesting: the second step opens beside the row it refines rather than
+   under it, so the branch that was chosen stays on screen next to its choices.
+   A panel that holds another panel must not clip it, which is why the list
+   stops scrolling here — `overflow: auto` alone would make the outer list
+   scroll sideways the moment a flyout opened past its edge. Only menus with a
+   list short enough to stand without scrolling may ask for this. */
+.popover-menu__panel--flyout .popover-menu__list { overflow: visible; max-height: none; }
+.popover-menu__row--branch { position: relative; }
+.popover-menu__submenu--flyout { position: absolute; left: 100%; top: -5px; z-index: 1; min-width: 150px; margin: 0 0 0 3px; padding: 5px; border: 1px solid var(--border-strong); border-left: 1px solid var(--border-strong); border-radius: 11px; background: var(--panel); box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8); }
+.popover-menu__submenu--flipped { left: auto; right: 100%; margin: 0 3px 0 0; }
+.popover-menu__empty { margin: 0; padding: 9px 8px; color: var(--faint); font-size: 11px; }
+.popover-menu__search { flex: 0 0 auto; min-height: 30px; margin: 4px 2px 2px; padding: 0 7px; display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); color: var(--faint); }
+.popover-menu__panel:not(.popover-menu__panel--flipped) .popover-menu__search { margin: 2px 2px 4px; border-top: 0; border-bottom: 1px solid var(--border); }
+.popover-menu__search input { flex: 1; min-width: 0; height: 28px; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 12px; }
+.popover-menu__search input::placeholder { color: var(--faint); }
+/* Dense: single-line rows without icons or descriptions, sized to their text. */
+.popover-menu__panel--dense { padding: 3px; border-radius: 8px; }
+.popover-menu__panel--dense .popover-menu__item { min-height: 24px; padding: 2px 7px; gap: 7px; border-radius: 5px; font-size: 12px; }
+.popover-menu__panel--dense .popover-menu__copy > strong { font-size: 12px; }
+.popover-menu__panel--dense .popover-menu__label { padding: 4px 7px 2px; }
+.popover-menu__panel--dense .popover-menu__divider { margin: 3px 2px; }
+.popover-menu__panel--dense .popover-menu__submenu { margin: 1px 0 1px 8px; padding-left: 7px; gap: 0; }
+/* After the inline dense rule so the flyout's own box wins: a flyout is a panel
+   of its own, not an indented branch of the list it came from. */
+.popover-menu__panel--dense .popover-menu__submenu--flyout { margin: 0 0 0 3px; padding: 3px; top: -3px; border-radius: 8px; }
+.popover-menu__panel--dense .popover-menu__submenu--flyout.popover-menu__submenu--flipped { margin: 0 3px 0 0; }
+
+/* Context-usage panel (ContextUsageMeter.tsx). It uses the
+   `.popover-menu__panel` shell but presents a composition table rather than a
+   menu, so its role is dialog. `data-segment` is the sole color switch: keys
+   are defined in contextBreakdown.ts and the styles consume those same keys. */
+.context-usage-panel { padding: 9px 10px 7px; gap: 8px; font-variant-numeric: tabular-nums; }
+.context-usage-panel__head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.context-usage-panel__head > span { color: var(--faint); font-size: 10px; font-weight: 650; }
+.context-usage-panel__head > strong { color: var(--text); font-size: 11.5px; font-weight: 650; }
+.context-usage-panel__bar { height: 6px; display: flex; gap: 1px; border-radius: 99px; overflow: hidden; background: var(--border); }
+.context-usage-panel__bar > span { min-width: 1px; flex-shrink: 1; flex-basis: 0; }
+.context-usage-panel__rows { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+.context-usage-panel__rows > li { min-height: 21px; display: flex; align-items: center; gap: 7px; font-size: 11px; }
+.context-usage-panel__swatch { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 2px; }
+.context-usage-panel__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.context-usage-panel__tokens { flex: 0 0 auto; color: var(--muted); }
+.context-usage-panel__share { width: 44px; flex: 0 0 auto; text-align: right; color: var(--faint); }
+.context-usage-panel__empty { color: var(--faint); font-size: 11px; }
+.context-usage-panel__counts { display: flex; flex-wrap: wrap; gap: 4px 10px; padding-top: 7px; border-top: 1px solid var(--border); color: var(--faint); font-size: 10px; }
+.context-usage-panel__counts > span { display: inline-flex; align-items: baseline; gap: 4px; }
+.context-usage-panel__counts strong { color: var(--muted); font-size: 10.5px; font-weight: 650; }
+.context-usage-panel [data-segment="systemPrompt"] { background: var(--muted); }
+.context-usage-panel [data-segment="user"] { background: var(--color-7c5cd6); }
+.context-usage-panel [data-segment="assistant"] { background: var(--accent); }
+.context-usage-panel [data-segment="reasoning"] { background: var(--warning); }
+.context-usage-panel [data-segment="tool"] { background: var(--success); }
+.context-usage-panel [data-segment="other"] { background: var(--faint); }
+.context-usage-panel [data-segment="free"] { background: var(--border); }
+.context-usage-panel__swatch[data-segment="free"] { box-shadow: inset 0 0 0 1px var(--border-strong); }
+
+/* Dialog and shared form */
+.modal-backdrop { position: fixed; inset: 0; z-index: 1200; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--color-1e1e1c-ap24); backdrop-filter: blur(2px); animation: fade-in .12s ease-out; }
+@keyframes fade-in { from { opacity: 0; } }
+.dialog { width: 100%; max-height: min(760px, calc(100vh - 48px)); display: flex; flex-direction: column; border: 1px solid var(--color-d3d3cd); border-radius: 13px; background: var(--panel); box-shadow: 0 24px 80px var(--color-000000-ap20), 0 3px 10px var(--color-000000-ap9); overflow: hidden; animation: dialog-pop-in .18s cubic-bezier(.2, .75, .25, 1); }
+/* Header, body and footer are one continuous surface: no rules between them and
+   no band behind the buttons. A divider is worth drawing where two regions scroll
+   independently, and here the title is a single line and the footer is a single
+   row — bars that announce themselves as bars, on a window this small, only
+   fence in the little room the body has. */
+.dialog__header { flex: 0 0 auto; min-height: 0; padding: 9px 10px 8px 16px; display: flex; align-items: center; gap: 12px; }
+.dialog__header h2 { flex: 1; min-width: 0; margin: 0; font-size: 13px; line-height: 20px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The sentence the header used to carry, now leading the body it describes. */
+.dialog__lede { margin: 0 0 14px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.dialog__body { flex: 1; min-height: 0; padding: 4px 20px 16px; overflow: auto; }
+/* For a body that is itself a full page — its own padding, dividers and scroll containers.
+   The preferred height lives on the flex basis rather than on the child, so a viewport too
+   short for it shrinks the body and the page inside it instead of clipping the page's foot. */
+.dialog__body--flush { flex: 1 1 620px; padding: 0; overflow: hidden; display: flex; }
+.dialog__footer { min-height: 0; padding: 6px 12px 12px; flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+/* One line tall, like the header: a dialog's own buttons are its last row, not a
+   toolbar, so they take the metrics of the row rather than of a page's call to action. */
+.dialog__footer .button { min-height: 28px; padding: 0 12px; font-size: 12px; }
+/* The template editor's body IS a timeline, so a failed save has nowhere to
+   report inside it and takes the free space in the footer instead. */
+.template-editor__error { flex: 1; min-width: 0; margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--danger); }
+.template-preview__loading { margin: 0; padding: 20px 16px; font-size: 12px; color: var(--muted); }
+
+.field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.field__label { font-size: 11.5px; font-weight: 600; }
+.field__hint { margin-top: -2px; color: var(--faint); font-size: 9.5px; line-height: 1.4; }
+.field__hint--error { color: var(--danger); }
+.workspace-path-picker { display: flex; gap: 8px; }
+.workspace-path-picker .input { flex: 1; min-width: 0; }
+.workspace-path-picker .button { flex: 0 0 auto; }
+.input { width: 100%; min-height: 36px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 7px; outline: 0; background: var(--color-ffffff); font-size: 12px; line-height: 1.5; transition: border .12s, box-shadow .12s; }
+.input:hover { border-color: var(--color-c0c0ba); }
+.input:focus { border-color: var(--focus); box-shadow: 0 0 0 2px var(--color-5f5f5a-ap12); }
+.input--error { border-color: var(--danger); }
+.input--code { font-family: var(--mono); font-size: 11px; }
+/* A settings field whose control is a menu rather than a `<select>`, because
+   the choice has a second step under one of its rows. It borrows `.input` for
+   the box so it sits in a form beside real inputs without reading as a button,
+   and only lays out what goes inside. */
+.popover-select { display: flex; }
+.popover-select__trigger { display: flex; align-items: center; gap: 8px; text-align: left; cursor: pointer; }
+.popover-select__trigger:disabled { color: var(--faint); cursor: not-allowed; }
+.popover-select__value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.popover-select__note { flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: 10.5px; }
+.popover-select__chevron { flex: 0 0 auto; color: var(--faint); }
+.snippet-dialog__note { margin: -4px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.55; }
+.snippet-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.snippet-list__row { display: flex; align-items: center; gap: 6px; }
+.snippet-list__name { flex: 1; min-width: 0; min-height: 31px; padding: 5px 8px; font-size: 11.5px; }
+.snippet-list__count { flex: 0 0 auto; color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+.switch { width: 31px; height: 18px; flex: 0 0 31px; padding: 2px; border-radius: 999px; background: var(--color-c8c8c2); position: relative; transition: background .15s; }
+.switch span { display: block; width: 14px; height: 14px; border-radius: 50%; background: var(--color-ffffff); box-shadow: 0 1px 2px var(--color-000000-ap20); transition: transform .15s; }
+.switch--on { background: var(--color-2d2d2b); }
+.switch--on span { transform: translateX(13px); }
+.switch:disabled { cursor: not-allowed; opacity: .45; }
+.check-row { min-height: 46px; display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 7px; position: relative; cursor: pointer; }
+.check-row:hover { background: var(--subtle); }
+.check-row > input { position: absolute; opacity: 0; pointer-events: none; }
+.check-row__box { width: 16px; height: 16px; flex: 0 0 16px; border: 1px solid var(--color-bdbdb6); border-radius: 4px; background: var(--color-ffffff); position: relative; }
+.check-row > input:checked + .check-row__box { background: var(--color-282827); border-color: var(--color-282827); }
+.check-row > input:checked + .check-row__box::after { content: ""; position: absolute; left: 4px; top: 1px; width: 5px; height: 8px; border: solid var(--color-ffffff); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.check-row > input:focus-visible + .check-row__box { outline: 2px solid var(--focus); outline-offset: 2px; }
+.check-row__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.check-row__copy > span { font-size: 11.5px; font-weight: 600; }
+.check-row__copy small { margin-top: 1px; color: var(--muted); font-size: 9.5px; line-height: 1.35; }
+.check-row__copy em { margin-left: 6px; padding: 1px 5px; border-radius: 99px; background: var(--subtle); color: var(--muted); font-size: 8px; font-style: normal; font-weight: 650; }
+/* A spent selection: still readable, no longer movable. */
+.check-row--disabled { cursor: default; }
+.check-row--disabled:hover { background: transparent; }
+.check-row--disabled .check-row__box { opacity: .55; }
+.check-row--disabled .check-row__copy > span { color: var(--faint); }
+.check-row--disabled .check-row__copy small { color: var(--faint); }
+
+.editor-kind { width: fit-content; height: 29px; margin-bottom: 9px; padding: 0 8px; display: inline-flex; align-items: center; gap: 6px; border-radius: 7px; background: var(--subtle); color: var(--muted); font-size: 10.5px; font-weight: 650; }
+.context-text-editor { font-size: 13px; line-height: 1.6; }
+.confirm-copy { margin: 0; color: var(--muted); font-size: 12.5px; }
+.confirm-list { margin: 9px 0 0; padding: 8px 10px; border-radius: 7px; background: var(--subtle); list-style: none; display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.confirm-list li { padding: 2px 7px; border-radius: 99px; background: var(--panel); color: var(--text); font-size: 10.5px; }
+.safe-boundary-note { display: flex; align-items: flex-start; gap: 8px; padding: 10px; border-radius: 8px; background: var(--subtle); color: var(--muted); font-size: 10.5px; line-height: 1.45; }

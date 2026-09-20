@@ -1,0 +1,71 @@
+.queued-messages {
+  width: min(820px, 100%);
+  margin: 0 auto 5px;
+  padding: 3px 11px;
+  color: var(--muted);
+}
+
+.queued-messages ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.queued-messages li {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--color-1d1d1a-ap7);
+}
+
+.queued-messages li:last-child {
+  border-bottom: 0;
+}
+
+.queued-messages li > span {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.queued-messages li > span > span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queued-messages button {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 24px;
+  border-radius: 50%;
+  color: var(--faint);
+  background: transparent;
+  transition: color .12s ease, background .12s ease;
+}
+
+.queued-messages button:hover:not(:disabled),
+.queued-messages button:focus-visible {
+  outline: 0;
+  color: var(--text);
+  background: var(--hover);
+}
+
+.queued-messages button:disabled {
+  opacity: .38;
+  cursor: default;
+}
+
+.queued-messages .queued-messages__retry {
+  color: var(--warning);
+}

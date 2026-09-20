@@ -1,0 +1,431 @@
+/* Use semantic color tokens. */
+
+/* The conversation-settings pane is the global settings page in miniature: a fixed
+   list of pages down the left edge, the selected page's body on the right. It is a
+   direct child of `.side-pane__body`, which clips rather than scrolls, so the row
+   and the scrolling column are both established here. */
+.conversation-settings {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+  container-type: inline-size;
+}
+
+/* Two classes so the pane's metrics outrank `.settings-nav`'s page-sized ones
+   regardless of which sheet the bundler emits last. The direction and the divider
+   are re-asserted rather than inherited: feedback.css turns `.settings-nav` into a
+   horizontal strip under 720px, which is right for the settings page that fills the
+   window and wrong for a pane that is already only a few hundred pixels wide. */
+.conversation-settings__nav.settings-nav {
+  flex: 0 0 150px;
+  flex-direction: column;
+  width: 150px;
+  min-height: 0;
+  padding: 9px 7px;
+  gap: 8px;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  border-bottom: 0;
+}
+
+.conversation-settings__nav-items {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+}
+
+.conversation-settings__nav .settings-nav__item {
+  height: 30px;
+  padding: 0 7px;
+  gap: 6px;
+  font-size: 10.5px;
+}
+
+.conversation-settings__nav-count {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Applying and editing a preset belong to individual rows on the presets page.
+   Saving is the only preset action that belongs to the whole pane, so it is the
+   one thing that still sits below the list. */
+.conversation-settings__nav-footer {
+  flex: 0 0 auto;
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-top: 1px solid var(--border);
+}
+
+.conversation-settings__preset-actions { display: flex; gap: 4px; }
+
+.conversation-settings__preset-actions .text-button {
+  flex: 1;
+  min-width: 0;
+  min-height: 24px;
+  padding: 0 4px;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--color-fafaf8);
+  color: var(--muted);
+  font-size: 8.5px;
+  white-space: nowrap;
+}
+
+.conversation-settings__preset-actions .text-button:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* ---- The selected page ---- */
+
+.conversation-settings__page {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+
+.conversation-settings__page-header {
+  flex: 0 0 auto;
+  padding: 9px 14px 8px;
+  border-bottom: 1px solid var(--border);
+  /* The body below reserves a scrollbar gutter whether or not it is scrolling.
+     The header is not a scroller and would otherwise centre its blurb over a
+     few more pixels than the column beneath it, leaving the two a hair out of
+     line. Reserving the same gutter here — with nothing to scroll, so no
+     scrollbar ever appears — makes both centre over the same width. */
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.conversation-settings__page-header p {
+  margin: 0 auto;
+  max-width: var(--conversation-settings-measure);
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.conversation-settings__page-body {
+  flex: 1;
+  min-height: 0;
+  padding: 12px 14px 20px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+/* A ceiling on the body's measure, and the same one the blurb above it takes.
+   This pane is drawn at two very different widths — a side pane a few hundred
+   pixels across, and a preset opened in a 1040px window — and a column of
+   switches stretched to that second width puts its label and its control at
+   opposite ends of a line nobody can read across. The cap does nothing at all
+   in the side pane, which never reaches it. */
+.conversation-settings {
+  --conversation-settings-measure: 680px;
+}
+
+.conversation-settings__page-stack {
+  width: 100%;
+  max-width: var(--conversation-settings-measure);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Embedded rows bring the padding and negative margins they were given for the
+   old drawer. Reset those so everything on a page shares one left edge. The tool
+   picker's own rows are exempt: they are not page rows but rows under a group
+   heading, and their indent is what keeps them aligned with it. */
+.conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) { padding-left: 0; padding-right: 0; }
+.conversation-settings__page .web-search-provider-field { padding: 0; }
+
+.conversation-settings__field { display: flex; flex-direction: column; gap: 4px; }
+.conversation-settings__field + .conversation-settings__field {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* A switch or picker row drops its control below the label when the pane is too
+   narrow to seat both, rather than squeezing the label to one character per line.
+   The tool picker's own rows are excluded: they are the control. */
+.conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) { flex-wrap: wrap; }
+.conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) > span:first-child { flex: 1 1 132px; }
+.conversation-settings__page .tool-toggle-row > .switch,
+.conversation-settings__page .tool-toggle-row > .input,
+.conversation-settings__page .tool-toggle-row > .tool-bulk-actions { margin-left: auto; }
+
+/* The pane can be dragged down to the side column's 280px floor, far narrower than
+   the 640px drawer this replaced. There the page list gives up its counts and
+   chevrons and stacks the preset controls, so the body keeps a readable column. */
+@container (max-width: 430px) {
+  .conversation-settings__nav.settings-nav { flex-basis: 108px; width: 108px; padding: 9px 5px; }
+  .conversation-settings__nav .settings-nav__item { padding: 0 5px; gap: 5px; }
+  .conversation-settings__nav-count,
+  .conversation-settings__preset-actions { flex-direction: column; }
+  .conversation-settings__page-header { padding: 10px 10px 9px; }
+  .conversation-settings__page-body { padding: 10px 10px 18px; }
+  .conversation-settings__page .web-search-provider-field .field { grid-template-columns: minmax(0, 1fr); }
+  .conversation-settings__page .web-search-provider-field .field > .input { grid-area: auto; margin-left: auto; }
+  .conversation-settings__page .web-search-provider-field .field > .field__control-pair {
+    grid-area: auto;
+    margin-left: auto;
+  }
+  /* The search field takes a line of its own at this width so the counter and the
+     disk actions share the next one whole, instead of the field shrinking until
+     the cluster breaks wherever it happens to land. */
+  .capability-page__toolbar .capability-page__search { flex-basis: 100%; }
+}
+
+/* ---- Capability pages: skills, MCP, hooks ---- */
+
+/* Search, counter, the disk actions (rescan, open the global / workspace folder)
+   and the docs link, in that order. The row wraps rather than overflows: at the
+   pane's 280px floor there is no line wide enough for all of it, so it takes
+   several — but the actions stay together as one cluster and the docs link keeps
+   its own place at the end, so nothing is ever a lone straggler on a line. */
+.capability-page__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  row-gap: 6px;
+  flex-wrap: wrap;
+}
+
+.capability-page__toolbar-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* The actions are icon buttons, sized to the row rather than to the default
+   32px target — the toolbar is a single line and a taller control would set its
+   height by itself. */
+.capability-page__toolbar-actions .icon-button {
+  width: 24px;
+  height: 24px;
+  flex-basis: 24px;
+  border-radius: 5px;
+}
+
+.capability-page__search {
+  flex: 1 1 130px;
+  min-width: 0;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--color-ffffff);
+  transition: border-color .12s;
+}
+
+.capability-page__search:focus-within { border-color: var(--muted); }
+.capability-page__search > svg { flex: 0 0 auto; color: var(--faint); }
+.capability-page__search > input {
+  flex: 1;
+  min-width: 0;
+  min-height: 26px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 10.5px;
+}
+
+.capability-page__count {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.capability-page__empty {
+  padding: 26px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border: 1px dashed var(--border-strong);
+  border-radius: 9px;
+  background: var(--color-fbfbf9);
+  color: var(--faint);
+  text-align: center;
+}
+
+.capability-page__empty strong { margin-top: 7px; color: var(--muted); font-size: 10.5px; }
+.capability-page__empty span { margin-top: 3px; max-width: 300px; font-size: 8.5px; line-height: 1.45; }
+
+.capability-page__hint { margin: 0; color: var(--faint); font-size: 8.5px; line-height: 1.45; }
+
+
+/* The conversation-template page is a timeline rather than a stack of rows: it
+   brings its own scroller, its own edges and a footer of its own, so the page
+   around it gives up its padding and its scrollbar instead of nesting a second
+   set inside the first. The measure cap goes with them — a timeline is read
+   down, not across, and capping it would leave a gutter of dead window. */
+.conversation-settings__page-body--flush { padding: 0; overflow: hidden; display: flex; }
+.conversation-settings__page-stack--flush { flex: 1; min-width: 0; min-height: 0; gap: 0; max-width: none; }
+
+/* One grid for both surfaces the template editor is mounted on. Without a rail
+   it is a single column, and the save row sits under the timeline; with one it
+   is two columns, and the save row still spans the full width — so the button
+   is in the window's own bottom-left corner rather than the timeline's. */
+.template-editor {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.template-editor--railed { grid-template-columns: 178px minmax(0, 1fr); }
+/* The rail is a column: the list of templates, and under it the one action that
+   belongs to the window rather than to the body on the right. The divider moves
+   here from the nav so it runs past the footer too. */
+.template-editor__aside {
+  grid-row: 1;
+  grid-column: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  background: var(--color-f6f6f3);
+}
+.template-editor--railed .template-preview,
+.template-editor--railed .template-preview__loading { grid-row: 1; grid-column: 2; }
+.template-editor__actions { grid-column: 1 / -1; }
+
+.template-editor__error--strip {
+  grid-column: 1 / -1;
+  padding: 7px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--color-fafaf8);
+}
+
+.template-editor__actions {
+  min-height: 52px;
+  padding: 9px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  background: var(--color-fafaf8);
+}
+
+.template-window__nav { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; border-right: 0; }
+.template-window__nav-divider { margin: 6px 9px; border: 0; border-top: 1px solid var(--border); }
+
+/* Saving under the rail, drawn as the conversation-settings pane draws its own
+   save in the same corner: a bordered text button the width of the rail, not a
+   filled one on a bar of its own. */
+.template-editor__aside .template-editor__actions {
+  flex: 0 0 auto;
+  min-height: 0;
+  padding: 8px 9px 11px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  background: transparent;
+}
+
+.template-editor__actions .text-button {
+  min-height: 24px;
+  padding: 0 4px;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--color-fafaf8);
+  color: var(--muted);
+  font-size: 8.5px;
+  white-space: nowrap;
+}
+
+.template-editor__actions .text-button:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* A refused write has a rail's width to say so in, so it wraps rather than
+   sharing the button's line the way the old bar let it. */
+.template-editor__aside .template-editor__error {
+  flex: 0 0 auto;
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
+
+/* The tools a save would leave uncallable, listed so the user can tell at a
+   glance whether enabling them is what they meant. */
+.template-editor__missing-tools { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.template-editor__missing-tools li { display: flex; flex-direction: column; }
+.template-editor__missing-tools strong { font-size: 11.5px; }
+.template-editor__missing-tools small { color: var(--faint); font-size: 9px; }
+
+/* ---- Domain lists window ---- */
+
+/* The same shape as the template window above — a rail of pages on the left,
+   the body on the right — under its own names rather than a reuse of
+   `.template-editor`: nothing in here is a template, and sharing the class
+   would have made every later change to one land on the other. There are
+   exactly two pages and no save button, because an edit lands on the
+   conversation as it is typed. */
+.domain-rules {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 178px minmax(0, 1fr);
+}
+
+.domain-rules__aside {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  background: var(--color-f6f6f3);
+}
+
+.domain-rules__nav { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; border-right: 0; }
+
+.domain-rules__page {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 14px;
+}
+
+.domain-rules__help { margin: 0; color: var(--faint); font-size: 9px; line-height: 1.45; }
+
+/* One rule per line, so the field neither wraps a long pattern onto a second
+   line nor grows a line of its own: a wrapped rule would read as two rules. */
+.domain-rules__input {
+  flex: 1;
+  min-height: 300px;
+  padding: 9px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: pre;
+  overflow: auto;
+  resize: none;
+}
+

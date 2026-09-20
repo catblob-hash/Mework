@@ -1,0 +1,42 @@
+.plan-page {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-page__body {
+  min-height: 0;
+  flex: 1;
+  padding: 16px 22px 20px;
+  overflow: auto;
+}
+
+.plan-page__empty {
+  margin: 0;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.plan-page__status {
+  padding: 3px 9px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--subtle);
+  font-size: 9.5px;
+  font-weight: 620;
+  white-space: nowrap;
+}
+
+.plan-page__status[data-plan-status="approved"] {
+  color: var(--success);
+}
+
+.plan-page__status[data-plan-status="rejected"] {
+  color: var(--warning);
+}
+
+.plan-page__dock {
+  padding: 0 16px 14px;
+  border-top: 1px solid var(--border);
+}

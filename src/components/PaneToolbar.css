@@ -1,0 +1,17 @@
+/* The topbar's pane controls. The button look comes from `.icon-button` in the barrel, which
+   loads after this file: every rule that changes it is scoped under `.pane-toolbar` so it
+   outranks the barrel's single-class rules instead of tying with them. */
+.pane-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.pane-toolbar__menu { flex: 0 0 auto; }
+
+/* The indicator dot is placed against the 32px button box rather than the icon, so it cannot
+   drift with whatever glyph the caller passes in. */
+.pane-toolbar .pane-toolbar__button { position: relative; }
+.pane-toolbar .pane-toolbar__button:disabled { color: var(--faint); cursor: not-allowed; }
+.pane-toolbar .pane-toolbar__button--pressed { background: var(--hover); color: var(--text); }
+.pane-toolbar .pane-toolbar__button--pressed:hover:not(:disabled) { background: var(--active); color: var(--text); }
+
+.pane-toolbar__indicator {
+  position: absolute; top: 5px; right: 5px; width: 6px; height: 6px;
+  border-radius: 50%; background: var(--accent); pointer-events: none;
+}

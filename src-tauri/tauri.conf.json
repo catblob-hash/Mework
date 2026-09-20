@@ -1,0 +1,82 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Mework",
+  "version": "1.0.0",
+  "identifier": "com.mework.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build && npm run build:sidecar",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "Mework",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 680,
+        "minHeight": 520,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'none'",
+        "script-src": "'self'",
+        "script-src-attr": "'none'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "font-src": "'self'",
+        "img-src": "'self' data:",
+        "style-src": "'self'",
+        "style-src-attr": "'none'",
+        "object-src": "'none'",
+        "worker-src": "'none'",
+        "child-src": "'none'",
+        "frame-src": "'none'",
+        "media-src": "'none'",
+        "manifest-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-ancestors": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'none'",
+        "script-src": "'self'",
+        "script-src-attr": "'none'",
+        "connect-src": "ipc: http://ipc.localhost http://localhost:1420 http://127.0.0.1:1420 ws://localhost:1420 ws://127.0.0.1:1420 ws://localhost:1430 ws://127.0.0.1:1430",
+        "font-src": "'self'",
+        "img-src": "'self' data:",
+        "style-src": "'self'",
+        "style-src-attr": "'none'",
+        "object-src": "'none'",
+        "worker-src": "'none'",
+        "child-src": "'none'",
+        "frame-src": "http: https:",
+        "media-src": "'none'",
+        "manifest-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-ancestors": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Mework",
+    "icon": ["icons/icon.ico"],
+    "resources": [],
+    "externalBin": ["binaries/mework-aisdk"],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    }
+  }
+}

@@ -1,0 +1,109 @@
+/* Use semantic color tokens. */
+
+/* A catalog row has no frame: no border, no fill, no second line. What marks it
+   is the pointer — on hover it takes `--hover`, the same grey wash every other
+   hoverable row in the app uses. Text and controls keep their own colours, so a
+   row's meaning (an applied entry's green name, a warning badge) survives the
+   pointer passing over it.
+
+   The row is laid out the same way in every catalog: the control that says what
+   this entry is to the conversation on the left, the name in the middle, and the
+   actions performed on the entry — ending in delete — on the right. */
+
+.catalog-list { display: flex; flex-direction: column; gap: 1px; }
+
+.catalog-row {
+  position: relative;
+  width: 100%;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  transition: background .12s;
+}
+
+.catalog-row:hover:not(:disabled) { background: var(--hover); }
+.catalog-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* The name fills the line so short and long entries line their controls up in
+   the same two columns. It is text, not a target: the row's own body is the drag
+   handle, and a surface cannot both open an entry and move it. */
+.catalog-row__main {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+}
+
+.catalog-row__main > svg { flex: 0 0 auto; opacity: .7; }
+
+.catalog-row__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.catalog-row__badge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border-radius: 99px;
+  background: var(--subtle);
+  color: var(--muted);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 650;
+}
+
+.catalog-row__badge--warning { background: var(--warning-soft); color: var(--warning); }
+
+.catalog-row__actions { flex: 0 0 auto; display: flex; align-items: center; gap: 1px; }
+/* Both control slots use the same button metrics — the row is one line tall, and
+   a 32px icon button in either slot would set the line's height by itself. */
+.catalog-row > .icon-button,
+.catalog-row__actions .icon-button { width: 24px; height: 24px; flex-basis: 24px; border-radius: 5px; }
+/* Armed, the delete button drops those fixed metrics so the word it now carries
+   has room. The row stays one line tall; only its right edge gives way. */
+.catalog-row__actions .icon-button.confirm-delete--armed {
+  width: auto;
+  flex-basis: auto;
+  padding: 0 6px;
+}
+
+/* The entry this conversation currently carries. A toggle row never asks for it:
+   its switch already says so, and a second marker on every selected skill would
+   be noise rather than news. The lead control is tinted with the name, because
+   on those rows it is the control that put the row in this state. */
+.catalog-row--on .catalog-row__name { color: var(--success); }
+.catalog-row--on > .icon-button { color: var(--success); }
+
+/* The drop line. `.sortable-surface` and `.drop-target--*` come from the sidebar
+   sheet, which sets the line's colour and inset but leaves each list to say which
+   edge of its own row it lands on. */
+.catalog-row.drop-target--before::before { top: 0; }
+.catalog-row.drop-target--after::after { bottom: 0; }
+
+/* A row renaming itself. The field takes the name's place inside the row's
+   middle column, so it starts where the name started and stops short of the
+   actions — nothing in the row moves. It drops the hover wash: a field being
+   typed into should sit on the panel's own ground, not on the tint that means
+   "you are pointing at this". */
+.catalog-row--editing:hover { background: transparent; }
+.catalog-row--editing .input {
+  flex: 1;
+  min-width: 0;
+  min-height: 26px;
+  padding: 0 7px;
+  font-size: 10.5px;
+}

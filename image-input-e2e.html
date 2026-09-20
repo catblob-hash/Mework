@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN" data-e2e-page="image-input">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/e2e.css" />
+    <title>Running · Mework Image Input E2E</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <aside id="image-e2e-status" aria-live="polite">
+      <strong>Mework 图片输入真实 UI E2E</strong>
+      <output id="image-e2e-summary">正在准备隔离文档与真实 Rust 运行时…</output>
+      <ol id="image-e2e-results"></ol>
+      <pre id="image-e2e-failure" hidden></pre>
+    </aside>
+    <script type="module" src="/src/imageInputE2E.tsx"></script>
+  </body>
+</html>

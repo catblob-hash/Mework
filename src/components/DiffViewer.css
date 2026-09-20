@@ -1,0 +1,239 @@
+/* The continuous multi-file diff: a 240px file column beside one scroller that holds every file
+   behind a sticky 32px header. Both columns clip; only the scroller scrolls. */
+.diff-viewer {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: row; overflow: hidden;
+}
+
+/* ---- file column ---- */
+
+.diff-viewer__files {
+  flex: 0 0 auto; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+  border-right: 1px solid var(--border); background: var(--subtle);
+}
+.diff-viewer__files[hidden] { display: none; }
+.diff-viewer__file-list {
+  flex: 1; min-height: 0; padding: 6px 4px;
+  display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden;
+}
+
+.diff-viewer__tree-file { position: relative; display: flex; align-items: center; border-radius: 5px; }
+.diff-viewer__tree-file:hover { background: var(--hover); }
+.diff-viewer__tree-file--selected, .diff-viewer__tree-file--selected:hover { background: var(--active); }
+.diff-viewer__tree-row {
+  flex: 1; min-width: 0; min-height: 24px; padding-right: 8px;
+  display: flex; align-items: center; gap: 4px;
+  border: 0; border-radius: 5px; background: none;
+  color: var(--text); font: inherit; font-size: 11.5px; line-height: 24px;
+  text-align: left; cursor: pointer;
+}
+.diff-viewer__tree-row--directory { color: var(--muted); }
+.diff-viewer__tree-row--directory:hover { background: var(--hover); }
+.diff-viewer__tree-row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.diff-viewer__tree-chevron {
+  flex: 0 0 13px; color: var(--faint); transition: transform .12s;
+}
+.diff-viewer__tree-chevron--collapsed { transform: rotate(-90deg); }
+.diff-viewer__tree-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* No status letter or colour in front of the name: the path is what identifies the
+   file, and a badge before it pushes every path to the right. */
+.diff-viewer__tree-icon { flex: 0 0 13px; color: var(--muted); }
+
+.diff-viewer__tree-menu { flex: 0 0 auto; display: flex; align-items: center; opacity: 0; }
+.diff-viewer__tree-file:hover .diff-viewer__tree-menu,
+.diff-viewer__tree-file:focus-within .diff-viewer__tree-menu { opacity: 1; }
+.diff-viewer__file-list .diff-viewer__tree-menu-trigger {
+  width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px;
+}
+
+.diff-viewer__stats {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
+  font-size: 10px; font-variant-numeric: tabular-nums; font-style: normal;
+}
+.diff-viewer__stats b { color: var(--success); font-weight: 500; }
+.diff-viewer__stats em { color: var(--danger); font-style: normal; }
+
+/* ---- diff body ---- */
+
+.diff-viewer__body {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.diff-viewer__scroll { flex: 1; min-height: 0; overflow-y: auto; }
+.diff-viewer__empty {
+  margin: 0; padding: 32px 16px; color: var(--muted); font-size: 11.5px; text-align: center;
+}
+
+.diff-viewer__file { display: flex; flex-direction: column; }
+.diff-viewer__file-header {
+  position: sticky; top: 0; z-index: 2;
+  height: 32px; flex: 0 0 32px; padding: 0 4px 0 8px;
+  display: flex; align-items: center; gap: 4px;
+  background: var(--subtle); border-bottom: 1px solid var(--border);
+}
+.diff-viewer__file--selected .diff-viewer__file-header { background: var(--hover); }
+.diff-viewer__file-toggle {
+  flex: 1; min-width: 0; height: 100%;
+  display: flex; align-items: center; gap: 4px;
+  border: 0; background: none; color: var(--text); font: inherit; font-size: 11.5px;
+  text-align: left; cursor: pointer;
+}
+.diff-viewer__file-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.diff-viewer__file-chevron { flex: 0 0 14px; color: var(--faint); transition: transform .12s; }
+.diff-viewer__file-chevron--collapsed { transform: rotate(-90deg); }
+.diff-viewer__file-icon { flex: 0 0 13px; color: var(--muted); }
+.diff-viewer__file-path { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The directory is context and the name is the subject, so only the name is at full weight. */
+.diff-viewer__file-directory { color: var(--faint); }
+.diff-viewer__file-name { color: var(--text); font-weight: 500; }
+.diff-viewer__file-old { color: var(--faint); }
+.diff-viewer__file-note { flex: 0 0 auto; color: var(--faint); font-size: 10px; white-space: nowrap; }
+.diff-viewer__file-note--untracked { color: var(--success); }
+.diff-viewer__file-note--conflicted { color: var(--danger); }
+.diff-viewer__file-note--typeChanged { color: var(--warning); }
+.diff-viewer__file-menu { flex: 0 0 auto; display: flex; align-items: center; }
+.diff-viewer__file-header .diff-viewer__file-menu-trigger {
+  width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px;
+}
+.diff-viewer__file-body { display: flex; flex-direction: column; }
+.diff-viewer__file-note-row {
+  margin: 0; padding: 8px 10px; color: var(--muted); font-size: 11px;
+}
+
+/* ---- code ---- */
+
+.diff-viewer__code {
+  --diff-gutter: 3ch;
+  --diff-number-width: calc(var(--diff-gutter) + 2ch + 5px);
+  display: grid; overflow-x: auto;
+  font: 12px/17px var(--mono); tab-size: 2;
+  background: var(--panel);
+  padding-bottom: 8px;
+}
+/* One number column: the new file's line, or the old one where there is no new one. */
+.diff-viewer__code--unified {
+  grid-template-columns: var(--diff-number-width) minmax(max-content, 1fr);
+}
+.diff-viewer__code--split {
+  grid-template-columns:
+    var(--diff-number-width) minmax(max-content, 1fr)
+    var(--diff-number-width) minmax(max-content, 1fr);
+}
+/* Wrapping stops the grid from growing past the pane, so it also stops the scroll. */
+.diff-viewer__code--wrap { overflow-x: hidden; }
+.diff-viewer__code--wrap.diff-viewer__code--unified {
+  grid-template-columns: var(--diff-number-width) minmax(0, 1fr);
+}
+.diff-viewer__code--wrap.diff-viewer__code--split {
+  grid-template-columns:
+    var(--diff-number-width) minmax(0, 1fr)
+    var(--diff-number-width) minmax(0, 1fr);
+}
+
+/* Lines and rows are grid pass-throughs so every cell aligns across the whole file. */
+.diff-viewer__line, .diff-viewer__row { display: contents; }
+
+.diff-viewer__number {
+  position: sticky; left: 0; z-index: 1;
+  padding-left: calc(2ch + 5px); padding-right: 1ch;
+  text-align: right; user-select: none;
+  background: var(--panel); color: color-mix(in srgb, var(--text) 60%, var(--panel));
+}
+.diff-viewer__code--split .diff-viewer__number--right { position: static; }
+
+/* The marker is drawn, not typed: a `+` in the text would be copied with the line. */
+.diff-viewer__text {
+  position: relative; padding-inline: 1ch; white-space: pre; background: var(--panel);
+}
+.diff-viewer__code--wrap .diff-viewer__text {
+  white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;
+}
+.diff-viewer__line--addition > .diff-viewer__text,
+.diff-viewer__line--deletion > .diff-viewer__text,
+.diff-viewer__text--addition, .diff-viewer__text--deletion {
+  padding-inline-start: 2ch;
+}
+.diff-viewer__line--addition > .diff-viewer__text::before,
+.diff-viewer__text--addition::before {
+  content: "+"; position: absolute; left: 0; width: 1ch;
+  color: var(--success); user-select: none;
+}
+.diff-viewer__line--deletion > .diff-viewer__text::before,
+.diff-viewer__text--deletion::before {
+  content: "-"; position: absolute; left: 0; width: 1ch;
+  color: var(--danger); user-select: none;
+}
+
+/* The reference shell mixes the line colour into the surface at 12%, and the gutter
+   at 9%, so a run of changes reads as a band rather than a stack of stripes. */
+.diff-viewer__line--addition > .diff-viewer__text,
+.diff-viewer__text--addition {
+  background: color-mix(in srgb, var(--success) 12%, var(--panel));
+}
+.diff-viewer__line--addition > .diff-viewer__number,
+.diff-viewer__number--addition {
+  background: color-mix(in srgb, var(--success) 9%, var(--panel));
+  color: var(--success);
+}
+.diff-viewer__line--deletion > .diff-viewer__text,
+.diff-viewer__text--deletion {
+  background: color-mix(in srgb, var(--danger) 12%, var(--panel));
+}
+.diff-viewer__line--deletion > .diff-viewer__number,
+.diff-viewer__number--deletion {
+  background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+  color: var(--danger);
+}
+/* A side with no counterpart is not an empty line — it is the absence of one, and the
+   hatch says so rather than leaving a blank that reads as a blank line in the file. */
+.diff-viewer__text--absent {
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      transparent,
+      transparent 4px,
+      color-mix(in srgb, var(--text) 6%, var(--panel)) 4px,
+      color-mix(in srgb, var(--text) 6%, var(--panel)) 8px
+    );
+}
+.diff-viewer__row .diff-viewer__number:empty {
+  background: color-mix(in srgb, var(--text) 3%, var(--panel));
+}
+
+.diff-viewer__word {
+  border-radius: 3px; box-decoration-break: clone;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.diff-viewer__word--addition { background: color-mix(in srgb, var(--success) 18%, transparent); }
+.diff-viewer__word--deletion { background: color-mix(in srgb, var(--danger) 18%, transparent); }
+
+.diff-viewer__no-newline { padding-left: 4px; color: var(--faint); }
+
+/* The break between hunks: how much was left out, and an offer to fetch it. */
+.diff-viewer__hunk-separator {
+  grid-column: 1 / -1;
+  height: 32px;
+  display: flex; align-items: center; gap: 4px; padding: 0 6px;
+  background: color-mix(in srgb, var(--text) 4%, var(--panel));
+  color: var(--muted); font-size: 10.5px; line-height: 17px;
+}
+.diff-viewer__hunk-separator + .diff-viewer__hunk-separator { margin-top: 0; }
+.diff-viewer__hunk-label {
+  flex: 0 0 auto; padding: 0;
+  border: 0; background: none; color: inherit; font: inherit;
+}
+.diff-viewer__hunk-label--clickable { cursor: pointer; }
+.diff-viewer__hunk-label--clickable:hover:not(:disabled) { color: var(--text); text-decoration: underline; }
+.diff-viewer__hunk-label--clickable:disabled { opacity: .6; cursor: default; }
+.diff-viewer__hunk-heading {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--faint); font-family: var(--mono);
+}
+.diff-viewer__expand {
+  flex: 0 0 auto; width: 16px; height: 16px;
+  display: grid; place-items: center;
+  border: 0; border-radius: 3px; background: none; color: var(--faint); cursor: pointer;
+}
+.diff-viewer__expand:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.diff-viewer__expand:disabled { opacity: .4; cursor: default; }

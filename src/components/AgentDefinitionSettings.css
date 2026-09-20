@@ -1,0 +1,93 @@
+/* The roles pane of the conversation-preset editor. It fills its tab body
+ * rather than sitting as a bordered card inside another page. */
+.agent-definitions {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.agent-definitions__empty {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.agent-definitions__list {
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Always the last row of the list, one row below the final role. */
+.agent-definition-add {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  margin-top: 8px;
+  color: var(--muted);
+  background: transparent;
+}
+
+.agent-definition-add:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.agent-definition-add:disabled {
+  opacity: .5;
+}
+
+.agent-definition-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Only the fields the editor stacks itself. The rows below are a `.field-row`
+   column and set their own spacing; matching on any descendant `.field` would
+   put a stacked field's margin back under every one of them. */
+.agent-definition-editor > .field {
+  margin-bottom: 12px;
+}
+
+/* The rows share one left edge with the tool picker under them, so the whole
+   dialog reads as a single column rather than as panels with their own insets. */
+.agent-definition-editor__rows {
+  padding: 0;
+  margin-bottom: 4px;
+}
+
+.agent-definition-editor__tools {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* No scroller of its own. The dialog body already scrolls, and a second one
+   nested inside it means the picker can be scrolled to a place the page cannot
+   follow — a group heading stranded above its own rows. */
+.agent-definition-editor__tools .tool-settings-groups {
+  margin-top: 8px;
+}
+
+.agent-definition-editor__warning,
+.agent-definition-editor__error {
+  margin: 0;
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.agent-definition-editor__warning {
+  color: var(--warning);
+}
+
+.agent-definition-editor__error {
+  color: var(--danger);
+}

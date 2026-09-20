@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN" data-e2e-page="web-search">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/e2e.css" />
+    <title>Running · Mework Web Search E2E</title>
+  </head>
+  <body>
+    <main>
+      <h1>Mework 联网搜索真实 E2E</h1>
+      <p>仅使用隔离的 browser-dev 应用数据、回环夹具和确定性假凭据；不会读取日常浏览器资料或真实密钥。</p>
+      <output id="summary">正在连接真实 Rust / WebView2 运行时…</output>
+      <ol id="results"></ol>
+      <pre id="failure" hidden></pre>
+    </main>
+    <script type="module" src="/src/webSearchE2E.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,364 @@
+
+
+.browser-panel-content {
+  --browser-address-bg: var(--color-000000-ap5);
+  --browser-address-focus-bg: var(--color-000000-ap10);
+  --browser-menu-bg: var(--color-ffffff);
+  --browser-menu-border: var(--color-d7d7d1);
+  --browser-menu-divider: var(--border);
+  --browser-menu-hover: var(--hover);
+  --browser-menu-text: var(--text);
+  --browser-menu-muted: var(--faint);
+  --browser-menu-shadow: 0 16px 48px var(--color-252520-ap18), 0 2px 8px var(--color-252520-ap9);
+  --browser-surface-bg: var(--color-ffffff);
+  --browser-welcome-bg: var(--color-f7f7f4);
+  --browser-welcome-fg: var(--color-66665f);
+  --browser-welcome-heading: var(--color-282827);
+  width: 100%; min-width: 0; height: 100%; position: relative; display: flex; flex-direction: column; overflow: hidden;
+  container: browser-panel / inline-size;
+  background: var(--browser-surface-bg);
+}
+/* The browser's chrome *is* the pane title bar, so it inherits that row's 32px and 4px gutters and
+   brings only the layout: a leading menu, the address bar, and the tool cluster. */
+.browser-panel__toolbar { min-width: 0; flex: 1; display: flex; align-items: center; gap: 8px; }
+.browser-panel__toolbar .icon-button { width: 24px; height: 24px; flex-basis: 24px; border-radius: 6px; }
+.browser-panel__tools { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+/* Its own container so the address bar collapses on its own width, the way the source measures it. */
+.browser-panel__address-slot { min-width: 0; flex: 1; display: flex; align-items: center; container: browser-address / inline-size; }
+.browser-panel__address { min-width: 0; height: 24px; flex: 1; margin-right: 24px; display: flex; align-items: center; gap: 6px; padding: 0 6px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; text-align: left; }
+.browser-panel__address:hover:not(.is-editing) { background: var(--browser-address-bg); }
+.browser-panel__address:focus-within { background: var(--browser-address-focus-bg); box-shadow: inset 0 0 0 1px var(--color-000000-ap10); }
+.browser-panel__address.is-editing { background: var(--browser-address-focus-bg); box-shadow: inset 0 0 0 1px var(--accent); }
+.browser-panel__address input { width: 100%; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 11.5px; caret-color: var(--accent); }
+.browser-panel__address-text { min-width: 0; flex: 1; overflow: hidden; font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
+.browser-panel__address-text.is-empty { color: var(--faint); }
+.browser-panel__address-host { color: var(--muted); }
+.browser-panel__address-path { color: var(--faint); }
+.browser-panel__error { position: absolute; z-index: 9; top: 4px; right: 4px; left: 4px; min-height: 34px; display: flex; align-items: center; padding: 6px 9px; overflow: hidden; border: 1px solid var(--color-edc7c7); border-radius: 8px; color: var(--color-a23737); background: var(--color-fff5f5); box-shadow: 0 4px 14px var(--color-501818-ap10); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.browser-panel__menu-trigger[aria-expanded="true"] { color: var(--text); background: var(--browser-menu-hover); }
+/* Anchored to the top of the body: the trigger sits in the title bar above it, so the popup opens
+   directly under it, start-aligned. */
+/* The drawing layer covers the whole page box, which is what makes the host withdraw the
+   native page from under it: a fully covered rectangle is handed back whole. */
+.browser-panel__sketch { position: absolute; z-index: 7; inset: 0; }
+/* The two armed-state toolbar toggles read as pressed the way the reference accents them. */
+.browser-panel__toolbar .icon-button.is-pressed { color: var(--accent); background: var(--browser-menu-hover); }
+
+.browser-panel__menu { position: absolute; z-index: 8; top: 4px; left: 4px; width: min(270px, calc(100% - 8px)); max-height: min(352px, calc(100% - 8px)); padding: 6px; overflow: auto; border: 1px solid var(--browser-menu-border); border-radius: 12px; color: var(--browser-menu-text); background: var(--browser-menu-bg); box-shadow: var(--browser-menu-shadow); animation: menu-pop-in .14s cubic-bezier(.2,.75,.25,1); }
+.browser-panel__menu > button { width: 100%; min-height: 30px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 5px 7px; border-radius: 7px; color: var(--browser-menu-text); background: transparent; font-size: 11.5px; text-align: left; }
+.browser-panel__menu > button:hover:not(:disabled), .browser-panel__menu > button:focus-visible { background: var(--browser-menu-hover); }
+.browser-panel__menu > button:disabled { color: var(--browser-menu-muted); opacity: .62; }
+.browser-panel__menu kbd { color: var(--browser-menu-muted); font: 9.5px var(--mono); }
+.browser-panel__menu hr { height: 1px; margin: 4px 2px; border: 0; background: var(--browser-menu-divider); }
+.browser-panel__submenu-chevron { transition: transform .14s ease; }
+.browser-panel__submenu-chevron.is-open { transform: rotate(90deg); }
+.browser-panel__clear-data { margin: 2px 3px 5px; padding: 8px; border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 5%, var(--color-ffffff)); }
+.browser-panel__clear-data p { margin: 0 0 7px; color: var(--muted); font-size: 9.5px; line-height: 1.45; }
+.browser-panel__clear-data > button { width: 100%; min-height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 5px 7px; border-radius: 7px; color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, var(--color-ffffff)); font-size: 10.5px; font-weight: 650; text-align: center; }
+.browser-panel__clear-data > button:hover:not(:disabled), .browser-panel__clear-data > button:focus-visible { background: color-mix(in srgb, var(--danger) 15%, var(--color-ffffff)); }
+.browser-panel__frame { width: 100%; flex: 1; min-height: 0; border: 0; background: var(--browser-surface-bg); }
+/* The page area and the docked log drawer share the column below the chrome. The native page is a
+   child window above the renderer, so the drawer only becomes visible once its rectangle has been
+   cut out of that window — see browserTrustedRegion. */
+.browser-panel__body { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+/* The still that stands in for the native page while a trusted surface covers it. It is a picture
+   of a page the user cannot currently reach, so it takes no pointer input and no selection: a
+   click on it must fall through to whatever is drawn over it, never to the frozen frame. Cropped
+   from the top-left rather than stretched, so a pane resized mid-cover still reads as a page. */
+.browser-panel__still { position: absolute; z-index: 1; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: left top; pointer-events: none; user-select: none; }
+.browser-panel__body-slot { flex: 1; min-height: 0; position: relative; z-index: 2; display: flex; flex-direction: column; overflow: hidden; background: var(--browser-surface-bg); }
+.browser-panel__body-card { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow-y: auto; padding: 18px; color: var(--muted); background: var(--browser-welcome-bg); }
+.browser-panel__body-card-inner { width: 100%; max-width: 400px; display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+.browser-panel__body-card-title { margin: 0; color: var(--text); font-size: 12px; }
+.browser-panel__body-card-footnote { margin: 0; max-width: 48ch; color: var(--faint); font-size: 9.5px; line-height: 1.5; }
+.browser-panel__body-card svg { color: var(--faint); }
+.browser-panel__card-action { min-height: 27px; display: inline-flex; align-items: center; gap: 5px; padding: 0 11px; border: 1px solid var(--border); border-radius: 7px; color: var(--text); background: var(--color-fafaf8); font-size: 10.5px; }
+.browser-panel__card-action:hover:not(:disabled) { background: var(--hover); }
+.browser-panel__start-page-inner { max-width: none; align-items: stretch; }
+.browser-panel__server-list { min-width: min(400px, 75%); max-height: min(60vh, 480px); margin: 0 auto; padding: 0; overflow-y: auto; list-style: none; border: 1px solid var(--border); border-radius: 8px; }
+.browser-panel__server-list > li { display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-bottom: 1px solid var(--border); }
+.browser-panel__server-list > li:last-child { border-bottom: 0; }
+.browser-panel__server-list > li:hover { background: var(--hover); }
+.browser-panel__server-open { min-width: 0; flex: 1; display: flex; align-items: center; gap: 7px; padding: 0; background: transparent; text-align: left; }
+.browser-panel__server-open:disabled { cursor: default; }
+.browser-panel__server-open > svg { flex: 0 0 auto; color: var(--muted); }
+.browser-panel__server-name { min-width: 0; flex: 1; overflow: hidden; color: var(--text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.browser-panel__server-detail { flex: 0 0 auto; color: var(--faint); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+.browser-panel__server-action { min-width: 34px; min-height: 22px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 7px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--color-fafaf8); font-size: 9.5px; }
+.browser-panel__server-action:hover:not(:disabled) { background: var(--hover); }
+.browser-panel__server-action.is-stop { border-color: color-mix(in srgb, var(--danger) 32%, var(--border)); color: var(--danger); }
+.browser-panel__server-action:disabled { opacity: .55; }
+.browser-panel__see-all { align-self: center; min-height: 22px; padding: 0 8px; border-radius: 6px; background: transparent; color: var(--faint); font-size: 9.5px; }
+.browser-panel__see-all:hover { color: var(--text); background: var(--hover); }
+.browser-panel__start-failed-log { width: 100%; display: flex; align-items: center; gap: 5px; padding: 5px 5px 5px 10px; border-radius: 7px; background: var(--subtle); text-align: left; }
+.browser-panel__start-failed-log > span { min-width: 0; flex: 1; overflow: hidden; color: var(--muted); font: 9px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.browser-panel__start-failed-log em { color: var(--faint); font: 9.5px system-ui, sans-serif; font-style: normal; }
+.browser-panel__stopped-inner { max-width: 400px; align-items: stretch; }
+.browser-panel__stopped-row { display: flex; align-items: center; gap: 7px; padding: 8px 10px 8px 9px; border-radius: 7px; background: var(--subtle); }
+.browser-panel__stopped-row > svg { flex: 0 0 auto; color: var(--muted); }
+.browser-panel__log-drawer { position: relative; z-index: 3; flex: 0 0 auto; height: 200px; min-height: 80px; max-height: 60%; border-top: 1px solid var(--browser-menu-divider); background: var(--browser-menu-bg); }
+.browser-panel__log-grip { position: absolute; z-index: 1; top: 0; right: 0; left: 0; height: 8px; cursor: ns-resize; }
+.browser-panel__log-close { position: absolute; z-index: 1; top: 4px; right: 4px; width: 22px; height: 22px; flex-basis: 22px; }
+.browser-panel__log-body { height: 100%; overflow: auto; contain: strict; padding: 12px; color: var(--muted); font: 9.5px/1.5 var(--mono); user-select: text; }
+.browser-panel__log-empty { color: var(--faint); text-align: center; }
+.browser-panel__log-line { white-space: pre-wrap; word-break: break-all; }
+.browser-panel__log-line.is-error { color: var(--danger); }
+.browser-panel__log-line.is-warn { color: var(--warning); }
+.browser-panel__menu-group { margin: 4px 7px 3px; color: var(--browser-menu-muted); font-size: 8.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+.browser-panel__menu-empty { margin: 2px 7px 6px; color: var(--browser-menu-muted); font-size: 10px; }
+/* One row, one hit target: the strip highlights as a whole and the trailing `Run` is a label the
+   row's own button carries. A running row is the only one with a second control in it. */
+.browser-panel__menu-server { display: flex; align-items: center; gap: 4px; padding: 0 3px; border-radius: 7px; }
+.browser-panel__menu-server:hover, .browser-panel__menu-server:focus-within { background: var(--browser-menu-hover); }
+.browser-panel__menu-server > button[role="menuitemradio"] { min-width: 0; min-height: 32px; flex: 1; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 4px; border-radius: 7px; color: var(--browser-menu-text); background: transparent; font-size: 11.5px; text-align: left; }
+.browser-panel__menu-server > button[role="menuitemradio"]:disabled { color: var(--browser-menu-muted); opacity: .62; }
+.browser-panel__menu-server-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 620; }
+/* An identification, not a control: `Run` says what pressing the row does. */
+.browser-panel__menu-server-tag { min-width: 34px; min-height: 21px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; padding: 0 7px; border: 1px solid var(--browser-menu-divider); border-radius: 6px; color: var(--browser-menu-muted); font-size: 9.5px; }
+.browser-panel__menu-server .browser-panel__server-action { margin-right: 3px; background: transparent; }
+.browser-panel__menu > button.is-danger { color: var(--danger); }
+.browser-panel__welcome { flex: 1; min-height: 0; display: grid; place-items: center; padding: 24px; color: var(--browser-welcome-fg); background: var(--browser-welcome-bg); }
+.browser-panel__welcome-line { margin: 0 0 5vh; color: var(--browser-welcome-heading); font-size: 21px; font-weight: 620; letter-spacing: -.01em; text-align: center; user-select: none; }
+
+:root[data-theme="night"] .browser-panel-content {
+  --browser-address-bg: var(--color-ffffff-ap10);
+  --browser-address-focus-bg: var(--color-ffffff-ap10);
+  --browser-menu-bg: var(--color-d3d3cd);
+  --browser-menu-border: var(--color-c8c8c2);
+  --browser-menu-divider: var(--color-bdbdb6);
+  --browser-menu-hover: var(--color-c8c8c2);
+  --browser-menu-text: var(--text);
+  --browser-menu-muted: var(--color-4e4e4a);
+  --browser-menu-shadow: 0 18px 48px var(--color-ffffff-ap34), 0 2px 8px var(--color-ffffff-ap34);
+  --browser-surface-bg: var(--color-e7e7e2);
+}
+:root[data-theme="night"] .browser-panel__address { color: var(--color-4e4e4a); }
+:root[data-theme="night"] .browser-panel__address:focus-within { box-shadow: inset 0 0 0 1px var(--color-ffffff-ap10); }
+:root[data-theme="night"] .browser-panel__address input { color: var(--text); }
+
+/* The source hides the path below 280px and the whole address below 196px, measuring the address
+   bar's own box rather than the toolbar's. */
+@container browser-address (max-width: 280px) {
+  .browser-panel__address-path { display: none; }
+}
+@container browser-address (max-width: 196px) {
+  .browser-panel__address { display: none; }
+}
+@container browser-panel (max-width: 320px) {
+  .browser-panel__menu { right: 4px; left: 4px; width: auto; }
+}
+@keyframes menu-pop-in { from { opacity: 0; transform: translateY(-5px) scale(.985); } }
+.settings-section { padding: 16px 15px; border-bottom: 1px solid var(--border); }
+.settings-section__heading { margin-bottom: 11px; }
+.settings-section__heading--split { display: flex; align-items: flex-start; justify-content: space-between; }
+.settings-section__heading--split > div:first-child, .settings-section__heading--split > div:first-child > span { min-width: 0; }
+.settings-section__heading--split > .text-button { flex: 0 0 auto; white-space: nowrap; }
+.settings-section__heading > div { display: flex; align-items: flex-start; gap: 8px; }
+.settings-section__heading > div > svg { margin-top: 1px; color: var(--muted); }
+.settings-section__heading > div > span { display: flex; flex-direction: column; }
+.settings-section__heading strong { font-size: 11.5px; }
+.settings-section__heading small { margin-top: 1px; color: var(--faint); font-size: 9px; }
+/* Collapsible sections with built-in title rows do not need an inner heading. */
+.collapsible-section { border-bottom: 1px solid var(--border); }
+.collapsible-section__heading { display: flex; align-items: center; gap: 6px; padding: 0 15px 0 11px; }
+.collapsible-section__toggle { flex: 1; min-width: 0; min-height: 42px; padding: 0 4px; display: flex; align-items: center; gap: 7px; background: transparent; text-align: left; }
+.collapsible-section__toggle:hover { background: var(--hover); }
+.collapsible-section__toggle > svg { flex: 0 0 auto; color: var(--muted); }
+.collapsible-section__toggle strong { flex: 0 0 auto; color: var(--text); font-size: 11.5px; }
+.collapsible-section__toggle small { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 9px; }
+.collapsible-section__body { padding: 0 15px 14px; }
+.tool-bulk-actions { display: inline-flex !important; align-items: center !important; gap: 4px !important; }
+.tool-bulk-actions .text-button { min-height: 25px; padding: 0 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--color-fafaf8); font-size: 8.5px; }
+.tool-bulk-actions .text-button:hover:not(:disabled) { background: var(--hover); }
+.tool-bulk-actions--borderless .text-button { border: 0; }
+/* The one-line documentation link the capability and feature pages end their
+   heading row with. It is bare text, not a button: nothing on those pages is
+   changed by following it. */
+.docs-link { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--faint); font-size: 8.5px; white-space: nowrap; }
+.docs-link:hover { color: var(--text); text-decoration: underline; }
+.docs-link > svg { flex: 0 0 auto; }
+.context-retention-input > span { color: var(--text); font-size: 10.5px; font-weight: 650; }
+.context-retention-controls { display: grid; grid-template-columns: minmax(0, 1fr); align-items: end; gap: 6px; }
+.context-retention-input { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.context-retention-input input { width: 100%; min-width: 0; height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); font: 9px var(--mono); }
+.context-retention-input small { color: var(--faint); font-size: 8.5px; line-height: 1.35; }
+.system-prompt-dialog__input { min-height: 250px; resize: vertical; font-size: 12px; }
+.prompt-actions { min-height: 28px; display: flex; align-items: center; gap: 6px; }
+.prompt-actions > span { margin-left: auto; color: var(--faint); font-size: 8.5px; }
+.scope-note { margin: 8px 0 0; padding: 7px 8px; border-radius: 6px; background: var(--subtle); color: var(--faint); font-size: 8.8px; line-height: 1.4; }
+.scope-note--error { background: var(--danger-soft); color: var(--danger); }
+.tool-settings-group { border-top: 1px solid var(--color-eeeeea); }
+.tool-settings-group:last-child { border-bottom: 1px solid var(--color-eeeeea); }
+.tool-settings-group__heading { width: 100%; min-height: 35px; display: flex; align-items: center; gap: 7px; padding: 0 4px; color: var(--muted); }
+/* `padding: 0` on purpose: the base button padding would inset this one's icon
+   by 6px, and that icon is the top of the column the tool rows' documentation
+   links read down. The heading's own 4px is the whole indent. */
+.tool-settings-group__disclosure { min-width: 0; min-height: 35px; flex: 1; display: flex; align-items: center; gap: 6px; padding: 0; background: transparent; color: inherit; text-align: left; }
+.tool-settings-group__label { flex: 1; font-size: 9.5px; font-weight: 650; }
+.tool-settings-group__disclosure > small { color: var(--faint); font-size: 8px; }
+/* The group's select-all / clear-all pair, held just left of the chevron so the
+   chevron keeps the right edge the tool rows' own signs read down from. */
+.tool-settings-group__bulk { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 1px; }
+.tool-settings-group__bulk-button {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--faint);
+}
+.tool-settings-group__bulk-button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.tool-settings-group__bulk-button:disabled { opacity: .4; }
+/* The chevron is a second grip on the same disclosure, sized to the column the
+   tool rows' signs sit in. It is aria-hidden and unfocusable: the labelled
+   button beside it is the control assistive technology announces, and this is
+   only the part of the heading a pointer aims at. */
+.tool-settings-group__chevron {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+/* One left edge for the whole picker: a tool row's documentation link starts
+   where its group's icon starts, so the two labels read as one column rather
+   than two a few pixels apart. Nested rows keep their own indent below. */
+.tool-pick-row { display: flex; align-items: center; gap: 6px; padding-left: 4px; }
+.tool-pick-row > .tool-toggle-row { flex: 1; min-width: 0; padding-left: 0; }
+.tool-pick-row--nested { padding-left: 26px; }
+/* The way in to one tool's page, in the group icon's slot and at its size. */
+.tool-docs-link {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: var(--color-c8c8c2);
+}
+.tool-docs-link:hover { color: var(--accent); }
+.tool-toggle-row { min-height: 48px; display: flex; align-items: center; gap: 7px; padding: 5px 4px; }
+.tool-toggle-row > span:first-child { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.tool-toggle-row strong { font-size: 10.5px; }
+.tool-toggle-row small { margin-top: 1px; color: var(--faint); font-size: 8.5px; line-height: 1.3; }
+.tool-toggle-row em { padding: 2px 4px; border-radius: 4px; color: var(--warning); background: var(--warning-soft); font-size: 7.5px; font-style: normal; }
+/* A row whose control is a picker rather than a switch. The compact metrics are
+   shared with .tool-bulk-actions buttons so a row carrying both lines up. */
+.tool-toggle-row > .input, .tool-toggle-row .tool-bulk-actions .input {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 118px;
+  max-width: 168px;
+  min-height: 25px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+/* A selector row is its own band in the panel, like a collapsed section, but
+   with the label/hint-left, control-right shape of the switch rows. */
+.settings-row { padding: 0 15px; border-bottom: 1px solid var(--border); }
+.settings-row .field__hint--error { display: block; margin: 0 0 8px 9px; }
+.tool-toggle-row--nested { min-height: 40px; }
+.tool-toggle-row--nested strong { font-size: 10px; color: var(--muted); }
+/* A pickable tool row is itself the control, so it resets the button defaults
+   while keeping the metrics of the switch rows it sits beside. It carries no
+   description, so it is one line wherever it is drawn — the switch-row height it
+   inherits from `.tool-toggle-row` is for rows that have a second line to seat. */
+.tool-toggle-row--pick { width: 100%; min-height: 26px; border: 0; border-radius: 7px; background: transparent; color: inherit; text-align: left; }
+.tool-toggle-row--pick:hover { background: var(--hover); }
+.tool-toggle-row--on { background: var(--success-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--success) 40%, transparent); }
+.tool-toggle-row--on:hover { background: color-mix(in srgb, var(--success) 15%, var(--success-soft)); }
+.tool-toggle-row--on strong { color: var(--success); }
+.tool-toggle-row--locked strong { color: var(--faint); font-weight: 550; }
+/* Every row's trailing sign occupies the same 14px the group chevron does, so
+   the signs and the chevrons read down one column whatever a row carries. */
+.tool-toggle-row__mark { flex: 0 0 auto; width: 14px; height: 14px; color: var(--faint); }
+.tool-toggle-row--on .tool-toggle-row__mark { color: var(--success); }
+.tool-settings-group--locked .tool-settings-group__disclosure { color: var(--faint); }
+.tool-lock-note { margin: 3px 4px 5px; color: var(--faint); font-size: 8.5px; line-height: 1.35; }
+/* The search-provider selector shares the unheaded section with the tool rows.
+   Align its horizontal padding with .tool-toggle-row so adjacent labels line up.
+   Each selector is drawn as a row rather than a stacked form field: label and
+   hint on the left, a compact picker on the right, matching the switch rows it
+   sits between. The Field markup is label/control/hint in source order, so the
+   two columns are assigned by grid placement rather than by reordering it.
+
+   `.field-row` is the same recipe under a name that does not say "web search",
+   for any surface that wants a stack of fields to read as that kind of row — the
+   subagent-role editor asks for exactly this shape. The two are one rule rather
+   than a copy so the shapes cannot drift apart. */
+.web-search-provider-field, .field-row { padding: 0 4px; }
+.web-search-provider-field .field, .field-row .field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1px 7px;
+  min-height: 48px;
+  margin-bottom: 0;
+  padding: 5px 0;
+}
+.web-search-provider-field .field__label, .field-row .field__label { grid-area: 1 / 1; font-size: 10.5px; }
+.web-search-provider-field .field__hint, .field-row .field__hint { grid-area: 2 / 1; margin-top: 0; font-size: 8.5px; line-height: 1.3; }
+.web-search-provider-field .field > .input, .field-row .field > .input {
+  grid-area: 1 / 2 / span 2 / auto;
+  width: auto;
+  min-width: 118px;
+  max-width: 168px;
+  min-height: 25px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+/* A row whose control is a way in rather than a picker. It takes the picker's
+   slot so a column of rows keeps one right edge regardless of what sits in it. */
+.field-row .field > .button {
+  grid-area: 1 / 2 / span 2 / auto;
+  min-height: 25px;
+  padding: 0 10px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+/* A row that carries a way in NEXT TO its picker: the picker still decides what
+   the row does, and the link beside it is where the thing being picked between
+   is written. The pair occupies the picker's slot as one unit so the right edge
+   does not move, and the link is drawn as small type rather than as a second
+   button so it cannot be mistaken for the control. */
+.web-search-provider-field .field > .field__control-pair,
+.field-row .field > .field__control-pair {
+  grid-area: 1 / 2 / span 2 / auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.web-search-provider-field .field__control-pair > .input,
+.field-row .field__control-pair > .input {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 118px;
+  max-width: 168px;
+  min-height: 25px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+.web-search-provider-field .field__control-pair > .text-button,
+.field-row .field__control-pair > .text-button {
+  flex: 0 0 auto;
+  padding: 0;
+  font-size: 9px;
+  white-space: nowrap;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.web-search-provider-field .field__control-pair > .text-button:hover,
+.field-row .field__control-pair > .text-button:hover { background: transparent; }
+/* A template row is a selection plus its own buttons, so the choice half takes
+   the row's width and the actions sit beside it. */

@@ -1,0 +1,142 @@
+import { MEMORY_TOOL_NAME_SET } from "./memoryTools";
+
+/**
+ * Catalog names for task-runtime tools. They are host-derived, not user settings:
+ * conversations that produce tasks must also be able to list and await them, and
+ * `box` is the carrier the host folds an unawaited task's result into.
+ * Keep descriptors for timeline rendering, but exclude them from selection and
+ * persisted enabled lists. Mirrors Rust `agents::TASK_RUNTIME_TOOL_NAMES`.
+ */
+export const TASK_RUNTIME_TOOL_NAMES = ["task_wait", "task_list", "box"] as const;
+
+export const TASK_RUNTIME_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_RUNTIME_TOOL_NAMES);
+
+/**
+ * The preview tools that bring the conversation's page into existence.
+ *
+ * `preview_start` points the page at the server it just started; the eleven page
+ * tools act on that page and mint it when it does not exist yet. `preview_stop`,
+ * `preview_list` and `preview_logs` only read or kill a process, so they never
+ * produce a page and are deliberately absent.
+ *
+ * This is a page roster, not a task roster: a page is a view of the dev server
+ * and has no task address of its own. Only `preview_start` appears in
+ * {@link TASK_PRODUCING_TOOL_NAMES}, because only it starts the process a
+ * `preview:<serverId>` row stands for.
+ */
+export const PREVIEW_PAGE_TOOL_NAMES = [
+  "preview_start",
+  "preview_console_logs",
+  "preview_screenshot",
+  "preview_snapshot",
+  "preview_inspect",
+  "preview_click",
+  "preview_fill",
+  "preview_eval",
+  "preview_network",
+  "preview_resize",
+  "preview_upload_image",
+  "preview_dialog"
+] as const;
+
+export const PREVIEW_PAGE_TOOL_NAME_SET: ReadonlySet<string> = new Set(PREVIEW_PAGE_TOOL_NAMES);
+
+export function isPreviewPageToolName(name: string): boolean {
+  return PREVIEW_PAGE_TOOL_NAME_SET.has(name);
+}
+
+/**
+ * Every catalog tool that acts on the conversation's preview, page tools and
+ * server tools alike.
+ *
+ * The prefix is the whole test rather than a list, so a tool added to the
+ * catalog is covered the day it lands: the settings show one `preview` switch
+ * over all of them, and none of them is a call the timeline offers to place.
+ */
+export function isPreviewToolName(name: string): boolean {
+  return name.startsWith("preview_");
+}
+
+/**
+ * Enabling any producer can create a task-list row, making the runtime tools reachable.
+ *
+ * Mirrors Rust `agents::TASK_PRODUCING_TOOL_NAMES`, which maps onto
+ * `orchestration::TaskRef`: agents and workflows use the agent pool,
+ * `preview_start` starts the dev-server process behind a `preview:<serverId>`
+ * row, and shells register shell tasks. The fourth `TaskRef` address,
+ * `Terminal`, is deliberately absent: terminals are opened manually, never
+ * produced by a tool. The preview page tools are absent for the opposite
+ * reason — a page is a view of the server, not a task — and `web_search` /
+ * `web_fetch` are ordinary asynchronous tools whose results stay on their calls.
+ */
+export const TASK_PRODUCING_TOOL_NAMES = [
+  "agent_spawn",
+  "workflow",
+  "bash",
+  "powershell",
+  "preview_start"
+] as const;
+
+export const TASK_PRODUCING_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_PRODUCING_TOOL_NAMES);
+
+/**
+ * Catalog name for the on-demand skill tool. It is host-derived from
+ * `skillToolEnabled` and the number of resolved skills.
+ */
+export const SKILL_TOOL_NAME = "skill";
+
+/**
+ * Catalog name for on-demand MCP tool loading. Host-derived from
+ * `mcpToolDiscoveryEnabled` and the number of tools a run actually withheld.
+ * Mirrors Rust `capabilities::TOOL_SEARCH_TOOL`.
+ */
+export const TOOL_SEARCH_TOOL_NAME = "tool_search";
+
+/**
+ * Catalog names for the plan-mode tools. The host derives them from the
+ * conversation's security level — plan mode offers `plan` and `exit_plan_mode`,
+ * every other level offers neither — so neither is a user setting. Entering
+ * plan mode is the user's own choice in the composer, never a tool call.
+ * Mirrors the Rust plan tool names.
+ */
+export const PLAN_TOOL_NAMES = ["plan", "exit_plan_mode"] as const;
+
+export const PLAN_TOOL_NAME_SET: ReadonlySet<string> = new Set(PLAN_TOOL_NAMES);
+
+/**
+ * Catalog names for the two web tools. They follow the conversation's single
+ * web-access switch, not two checkboxes, because upstreams do not agree on how
+ * many web tools there are: DeepSeek and OpenAI expose search alone and keep
+ * page retrieval inside it, while Anthropic exposes search and fetch separately.
+ * The host decides which of the pair a run gets from the resolved backend, so
+ * the picker offering them individually would promise a shape the upstream may
+ * not have. Mirrors Rust `web_search::WEB_TOOL_NAMES`.
+ */
+export const WEB_TOOL_NAMES = ["web_search", "web_fetch"] as const;
+
+export const WEB_TOOL_NAME_SET: ReadonlySet<string> = new Set(WEB_TOOL_NAMES);
+
+export function isWebToolName(name: string): boolean {
+  return WEB_TOOL_NAME_SET.has(name);
+}
+
+export function isTaskRuntimeToolName(name: string): boolean {
+  return TASK_RUNTIME_TOOL_NAME_SET.has(name);
+}
+
+/**
+ * Host-derived tools never enter persisted enabled lists. Memory follows memory
+ * layer switches, runtime tools follow producers, `skill` follows its switch,
+ * `tool_search` follows the MCP tool-discovery switch, the plan tools follow the
+ * security level, and the two web tools follow the conversation's web-access
+ * switch.
+ * Normalization and preset application share this rule.
+ */
+export function isHostDerivedToolName(name: string): boolean {
+  return MEMORY_TOOL_NAME_SET.has(name)
+    || TASK_RUNTIME_TOOL_NAME_SET.has(name)
+    || PLAN_TOOL_NAME_SET.has(name)
+    || WEB_TOOL_NAME_SET.has(name)
+    || name === SKILL_TOOL_NAME
+    || name === TOOL_SEARCH_TOOL_NAME;
+}

@@ -1,0 +1,90 @@
+/* The terminal pane's tab strip. It fills the pane's 32px title bar, so its metrics are the
+   title bar's: 24px controls, 2px between them. */
+.terminal-tabs {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Tabs shrink to an ellipsis before the strip scrolls, and the strip never shows a scrollbar:
+   the overflow selector is how a tab out of reach is reached. */
+.terminal-tabs__strip {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.terminal-tabs__strip::-webkit-scrollbar { display: none; }
+
+.terminal-tab {
+  flex: 0 1 auto;
+  /* Tabs give up width to their neighbours, but only down to a name worth reading. Past that
+     the strip overflows and the selector below is how the rest are reached — without the floor
+     they would shrink to slivers forever and the selector would never appear. */
+  min-width: 78px;
+  height: 24px;
+  padding: 0 2px 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 6px;
+  color: var(--muted);
+  transition: background .14s, color .14s;
+}
+.terminal-tab:hover { background: var(--hover); }
+.terminal-tab--active { background: var(--active); color: var(--text); }
+
+.terminal-tab__label {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 160px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+
+/* Two classes to outrank `.icon-button`'s 32px in the barrel, which loads last. */
+.terminal-tab .terminal-tab__close {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  /* Pinned to the tab's right edge: min-width leaves slack on short names, and the cross
+     should sit at the far side regardless of how much text there is. */
+  margin-left: auto;
+  border-radius: 5px;
+  /* Present but unlit until the tab is the one under the pointer or in use, so a row of tabs
+     reads as names rather than as a row of crosses. */
+  opacity: 0;
+}
+.terminal-tab:hover .terminal-tab__close,
+.terminal-tab--active .terminal-tab__close,
+.terminal-tab .terminal-tab__close:focus-visible { opacity: 1; }
+.terminal-tab .terminal-tab__close:disabled { opacity: .35; }
+
+.terminal-tab__rename {
+  flex: 0 1 auto;
+  min-width: 72px;
+  max-width: 160px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.terminal-tabs .terminal-tabs__overflow { flex: 0 0 auto; display: flex; align-items: center; }
+.terminal-tabs .terminal-tabs__overflow-trigger,
+.terminal-tabs .terminal-tabs__add { width: 24px; height: 24px; flex: 0 0 24px; }

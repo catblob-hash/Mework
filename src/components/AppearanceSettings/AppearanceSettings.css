@@ -1,0 +1,295 @@
+/* Dynamic accent and font previews come from React CSSOM; do not copy data values into the palette. */
+.appearance-settings-page {
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.appearance-settings-page .settings-card:first-of-type { margin-top: 0; }
+
+.appearance-settings-page .settings-card__heading {
+  min-height: 32px;
+}
+
+.appearance-settings-page__card-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.appearance-settings-page__row {
+  min-height: 48px;
+  padding: 9px 0;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  border-top: 1px solid var(--subtle);
+}
+
+.appearance-settings-page__row:first-child { border-top: 0; }
+
+.appearance-settings-page__row--vertical {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.appearance-settings-page__row-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.appearance-settings-page__row-copy strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.appearance-settings-page__row-copy small {
+  margin-top: 3px;
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.appearance-settings-page__row-control {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.appearance-settings-page__row--vertical .appearance-settings-page__row-control {
+  width: 100%;
+  justify-content: stretch;
+}
+
+.appearance-settings-page .input {
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 10.5px;
+}
+
+.appearance-settings-page .input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.appearance-settings-page__theme-grid {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.appearance-settings-page__theme-preview {
+  min-height: 106px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  transition: border-color .14s, box-shadow .14s, color .14s, background .14s;
+}
+
+.appearance-settings-page__theme-preview:hover {
+  border-color: var(--border-strong);
+  background: var(--hover);
+  color: var(--text);
+}
+
+.appearance-settings-page__theme-preview[aria-pressed="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+  color: var(--accent);
+}
+
+.appearance-settings-page__theme-preview-surface {
+  flex: 1;
+  min-height: 62px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--subtle);
+}
+
+.appearance-settings-page__theme-preview strong {
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.appearance-settings-page__color-controls {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.appearance-settings-page__color-swatch,
+.appearance-settings-page__native-color {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: inline-grid;
+  place-items: center;
+  overflow: hidden;
+  border: 2px solid var(--panel);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+
+.appearance-settings-page__color-swatch:hover,
+.appearance-settings-page__native-color:hover {
+  box-shadow: 0 0 0 2px var(--border-strong);
+}
+
+.appearance-settings-page__color-swatch[aria-pressed="true"] {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.appearance-settings-page__color-swatch--default {
+  background: var(--subtle);
+  color: var(--muted);
+}
+
+.appearance-settings-page__native-color {
+  position: relative;
+  background: var(--subtle);
+  cursor: pointer;
+}
+
+.appearance-settings-page__native-color input {
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.appearance-settings-page__hex-input.input {
+  width: 106px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+}
+
+.appearance-settings-page__zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.appearance-settings-page__zoom-controls .icon-button {
+  width: 28px;
+  height: 28px;
+  flex-basis: 28px;
+}
+
+.appearance-settings-page__zoom-value {
+  width: 52px;
+  color: var(--muted);
+  font: 10.5px var(--mono);
+  text-align: center;
+}
+
+.appearance-settings-page__font-combobox {
+  width: min(390px, 100%);
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(150px, 1fr);
+  gap: 7px;
+}
+
+.appearance-settings-page__font-combobox > .input:only-child {
+  grid-column: 2;
+}
+
+.appearance-settings-page__font-size-control {
+  width: 100%;
+}
+
+.appearance-settings-page__font-size-control input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.appearance-settings-page__font-size-ticks {
+  margin-top: 2px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.appearance-settings-page__font-size-ticks span:first-child { font-size: 9px; }
+.appearance-settings-page__font-size-ticks span:last-child { font-size: 14px; }
+
+.appearance-settings-page__shortcut-control {
+  min-width: min(320px, 100%);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.appearance-settings-page__shortcut-control > .input {
+  min-width: 142px;
+}
+
+.appearance-settings-page__keycaps {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.appearance-settings-page__keycaps kbd {
+  min-width: 24px;
+  min-height: 22px;
+  padding: 2px 6px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--subtle);
+  box-shadow: 0 1px 0 var(--border-strong);
+  color: var(--muted);
+  font: 9px var(--mono);
+}
+
+.appearance-settings-page__custom-css.input {
+  width: 100%;
+  min-height: 204px;
+  padding: 10px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+@media (max-width: 760px) {
+  .appearance-settings-page__theme-grid { grid-template-columns: 1fr; }
+
+  .appearance-settings-page__row:not(.appearance-settings-page__row--vertical) {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .appearance-settings-page__row:not(.appearance-settings-page__row--vertical) .appearance-settings-page__row-control {
+    justify-content: flex-start;
+  }
+
+  .appearance-settings-page__font-combobox {
+    width: 100%;
+    grid-template-columns: 1fr;
+  }
+
+  .appearance-settings-page__font-combobox > .input:only-child { grid-column: 1; }
+}

@@ -1,0 +1,52 @@
+/* One `bash` / `powershell` command's output, read-only.
+   Wears the interactive terminal's surface on purpose: it is the same kind of artifact, and
+   a build log that changed colour depending on who started it would read as a different thing. */
+.shell-task-panel {
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--color-e8e7e8); color: var(--color-272227);
+}
+.shell-task-panel__header {
+  min-height: 34px; flex: 0 0 auto; padding: 6px 10px 6px 13px;
+  display: flex; align-items: center; gap: 9px;
+  border-bottom: 1px solid var(--color-cfccd0); background: var(--color-dfdddf);
+}
+.shell-task-panel__command {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--color-342e34); font: 10px var(--mono);
+}
+.shell-task-panel__status {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  white-space: nowrap; color: var(--color-776f77); font-size: 9px;
+}
+/* Semantic aliases, not raw palette tokens: `--accent` and `--danger` are what every other
+   in-progress and failed state in the app uses, so this panel moves with them rather than
+   pinning its own literal pair of hues. */
+.shell-task-panel__status--running { color: var(--accent); }
+.shell-task-panel__status--failed { color: var(--danger); }
+.shell-task-panel__stop.icon-button,
+.shell-task-panel__copy.icon-button {
+  width: 25px; height: 25px; min-width: 25px; flex-basis: 25px; color: var(--color-6a636a);
+}
+.shell-task-panel__stop.icon-button:hover:not(:disabled),
+.shell-task-panel__copy.icon-button:hover:not(:disabled) {
+  background: var(--color-cbc8cb); color: var(--color-000000);
+}
+.shell-task-panel__copy--success.icon-button { color: var(--success); }
+.shell-task-panel__copy--error.icon-button { color: var(--danger); }
+.shell-task-panel__stop.icon-button:disabled { cursor: wait; opacity: .58; }
+
+/* The page keeps the tail; the model's copy of the same command keeps the head. Saying so is the
+   whole point — a suffix presented as the whole output would be a quiet lie. */
+.shell-task-panel__truncation,
+.shell-task-panel__error {
+  flex: 0 0 auto; margin: 0; padding: 6px 13px;
+  border-bottom: 1px solid var(--color-cfccd0); font-size: 9.5px; line-height: 14px;
+}
+.shell-task-panel__truncation { color: var(--color-776f77); }
+.shell-task-panel__error { color: var(--danger); }
+
+.shell-task-panel__viewport {
+  flex: 1; min-height: 0; padding: 7px 10px 5px; overflow: hidden; background: var(--color-e8e7e8);
+}
+.shell-task-panel__viewport .xterm { height: 100%; }

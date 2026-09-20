@@ -1,0 +1,177 @@
+:root {
+  font-family: var(--app-font-family);
+  color: var(--color-1b1b1a);
+  background: var(--color-f7f7f5);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  /* Appearance settings override these variables through CSSOM at runtime.
+     Variables provide a single override point. */
+  --app-font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+  --message-font-family: var(--app-font-family);
+  --message-font-size: 14px;
+  --app: var(--color-f7f7f5);
+  --sidebar: var(--color-efefeb);
+  --panel: var(--color-ffffff);
+  --subtle: var(--color-f3f3f0);
+  --hover: var(--color-e9e9e5);
+  --active: var(--color-e4e4df);
+  --text: var(--color-1b1b1a);
+  --muted: var(--color-6b6b67);
+  --faint: var(--color-989892);
+  --border: var(--color-dfdfda);
+  --border-strong: var(--color-d1d1cb);
+  /* The field the chat and the side panes are tiled onto. Deeper than either of
+     them so the tiles read as sitting on it; the night value is named rather
+     than mirrored, because mirroring the day lightness would lift the gutter
+     above the surfaces and invert the depth cue. */
+  --gutter: var(--color-e7e7e2);
+  --accent: var(--color-4d4d48);
+  --accent-soft: var(--color-ebebe7);
+  --focus: var(--color-5f5f5a);
+  --success: var(--color-218a62);
+  --success-soft: var(--color-eaf7f1);
+  --warning: var(--color-a56312);
+  --warning-soft: var(--color-fff5e5);
+  --danger: var(--color-c43d3d);
+  --danger-soft: var(--color-fff0f0);
+  /* Keep task backgrounds ordered: base < nested < hover < active. */
+  --task-block: color-mix(in srgb, var(--hover) 55%, transparent);
+  --task-block-nested: color-mix(in srgb, var(--hover) 30%, transparent);
+  --sidebar-width: 264px;
+  --right-sidebar-width: 560px;
+  --topbar-height: 56px;
+  /* Reserve the classic scrollbar width so fixed headers align with scrolling content. */
+  --scrollbar-size: 10px;
+  --mono: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+:root[data-theme="night"] {
+  --gutter: var(--color-fbfbf9);
+}
+
+
+* {
+  box-sizing: border-box;
+}
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+body { min-width: 680px; min-height: 520px; background: var(--app); }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { border: 0; }
+button, [role="button"] { -webkit-tap-highlight-color: transparent; }
+button:not(:disabled) { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .48; }
+textarea { resize: vertical; }
+::selection { background: var(--color-cfdcff); }
+::-webkit-scrollbar { width: var(--scrollbar-size); height: var(--scrollbar-size); }
+::-webkit-scrollbar-thumb { background: var(--color-c8c8c1); border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-aaaaaa); border: 2px solid transparent; background-clip: padding-box; }
+
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
+
+.app-shell {
+  --shell-collapse-duration: .24s;
+  --shell-collapse-easing: cubic-bezier(.2, .75, .25, 1);
+  width: 100%; height: 100%; display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  position: relative;
+  background: var(--app); overflow: clip;
+  transition: grid-template-columns var(--shell-collapse-duration) var(--shell-collapse-easing);
+}
+/* Dragging sets the width every frame; an animation would lag the pointer. */
+.app-shell--resizing { transition: none; }
+.app-shell--sidebar-closed { grid-template-columns: 0 minmax(0, 1fr); }
+
+.icon-button {
+  width: 32px; height: 32px; flex: 0 0 32px; display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border-radius: 7px; color: var(--muted); transition: background .14s, color .14s;
+}
+.icon-button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.icon-button--danger:hover:not(:disabled) { color: var(--danger); background: var(--danger-soft); }
+
+/* The armed half of `ConfirmDeleteButton`. It keeps the icon button's box so the
+   row does not reflow between the two presses, and fills it so the change is not
+   something the reader has to notice. */
+.confirm-delete--armed:not(:disabled) { opacity: 1; background: var(--danger); color: var(--color-ffffff); }
+/* Whatever metrics the surrounding list gives its icon buttons, the armed one
+   never shrinks below the word it carries. */
+.confirm-delete--armed { flex-shrink: 0; }
+.confirm-delete--armed:hover:not(:disabled), .confirm-delete--armed:focus-visible { background: var(--color-ab3030); color: var(--color-ffffff); }
+.confirm-delete__label { font-size: 9px; line-height: 1; font-weight: 700; white-space: nowrap; }
+
+.button {
+  min-height: 36px; padding: 0 14px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
+  gap: 7px; font-size: 13px; font-weight: 600; border: 1px solid transparent; transition: .14s ease;
+}
+.button--small { min-height: 31px; padding: 0 10px; font-size: 12px; }
+.button--primary { background: var(--color-20201f); color: var(--color-ffffff); border-color: var(--color-20201f); }
+.button--primary:hover:not(:disabled) { background: var(--color-343432); transform: translateY(-1px); }
+.button--secondary { background: var(--panel); border-color: var(--border-strong); }
+.button--secondary:hover:not(:disabled), .button--ghost:hover:not(:disabled) { background: var(--hover); }
+.button--ghost { background: transparent; color: var(--muted); }
+.button--danger { background: var(--danger); color: var(--color-ffffff); }
+.button--danger:hover:not(:disabled) { background: var(--color-ab3030); }
+.text-button { background: transparent; color: var(--accent); padding: 3px 4px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; border-radius: 5px; }
+.text-button:hover { background: var(--accent-soft); }
+.text-button--danger { color: var(--danger); }
+
+/*
+ * A field with no frame of its own. The wrapper's `::after` carries a hidden
+ * copy of the value under identical metrics, so the grid cell is always as tall
+ * as the wrapped text and the textarea never scrolls inside a fixed box.
+ * `data-value` must stay in sync with the textarea's value or the two diverge.
+ */
+.plain-field { display: grid; min-width: 0; border-radius: 5px; transition: background .12s; }
+.plain-field > textarea, .plain-field::after {
+  grid-area: 1 / 1; min-width: 0; margin: 0; padding: 3px 5px; border: 0; background: transparent;
+  font: inherit; letter-spacing: inherit; line-height: inherit; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.plain-field::after { content: attr(data-value) " "; visibility: hidden; }
+.plain-field > textarea { resize: none; overflow: hidden; outline: 0; color: inherit; }
+.plain-field:hover { background: var(--hover); }
+.plain-field:focus-within { background: var(--subtle); box-shadow: inset 0 0 0 1px var(--focus); }
+.plain-field--error { box-shadow: inset 0 0 0 1px var(--danger); }
+.plain-field--failed > textarea { color: var(--danger); }
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/*
+ * Copy that describes work still in flight: the text sits at half its own
+ * colour and a full-strength band sweeps across it, left to right, forever.
+ *
+ * The sweep is a gradient clipped to the glyphs, so the text underneath has to
+ * be transparent — which is why the host must name the colour in
+ * `--pulse-color` instead of the rule reading `currentColor`, and why anything
+ * that paints with `currentColor` (the waiting dots, an icon) has to sit
+ * outside the pulsing element rather than inside it.
+ *
+ * Wrapped in @supports because without `background-clip: text` the transparent
+ * text would simply vanish; browsers that lack it get plain copy.
+ */
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .pulse-text {
+    --pulse-dim: color-mix(in srgb, var(--pulse-color, currentColor) 50%, transparent);
+    background-image: linear-gradient(
+      90deg,
+      var(--pulse-dim) 0%, var(--pulse-dim) 36%,
+      var(--pulse-color, currentColor) 50%,
+      var(--pulse-dim) 64%, var(--pulse-dim) 100%
+    );
+    background-size: 320% 100%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: pulse-text-sweep 1.9s cubic-bezier(.42, 0, .58, 1) infinite;
+  }
+}
+/* The gradient is three times the box, so the highlight at its centre crosses
+   from the right edge to the left as the position runs 100% → 0%. */
+@keyframes pulse-text-sweep { from { background-position: 100% 0; } to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  /* The global kill switch only freezes the animation, which would strand the
+     copy at half strength. Drop the sweep entirely and paint the plain colour. */
+  .pulse-text { background-image: none; color: var(--pulse-color, inherit); }
+}

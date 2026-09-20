@@ -1,0 +1,77 @@
+/* One pseudo-window in the right-hand column: a card with a 32px title bar and a body whose
+   rectangle the native browser child window is positioned from. */
+.side-pane {
+  min-width: 0; min-height: 0; position: relative; isolation: isolate;
+  display: flex; flex-direction: column; overflow: hidden;
+  /* A single flat stroke rather than a top-lit bevel: the edge carries the same weight all the
+     way round, at what used to be the middle of the gradient it replaced. */
+  border: 1px solid var(--color-d0d0d0-ap60); border-radius: 10px; color: var(--text);
+  background: var(--color-efefeb);
+  box-shadow:
+    0 1px 1px var(--color-000000-ap8),
+    0 6px 16px var(--color-000000-ap13);
+}
+/* The shadow tokens are black at day, and every palette token mirrors its lightness with the
+   theme, so the day rule would glow white underneath the pane. Night takes the dark-side tokens
+   to keep the shadow behind it. */
+:root[data-theme="night"] .side-pane {
+  box-shadow:
+    0 1px 1px var(--color-ffffff-ap10),
+    0 6px 16px var(--color-ffffff-ap34);
+}
+
+.side-pane__header {
+  height: 32px; flex: 0 0 32px; padding: 0 4px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.side-pane__title {
+  flex: 1; min-width: 0; padding-left: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: none;
+  color: var(--muted); font-size: 12.5px; font-weight: 500;
+}
+/* The title's alternative: a pane whose chrome is its own title bar fills the same box. */
+.side-pane__header-slot { flex: 1; min-width: 0; display: flex; align-items: center; }
+.side-pane__controls { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+/* Two classes so it outranks `.icon-button`'s 32px in the barrel, which loads last. */
+.side-pane__controls .side-pane__close,
+.side-pane__controls .side-pane__expand,
+.side-pane__controls .side-pane__ledger,
+.side-pane__controls .side-pane__menu-trigger { width: 24px; height: 24px; flex: 0 0 24px; }
+/* Pressed reads as "the thing this opens is on screen", not as a toggle state. */
+.side-pane__controls .side-pane__ledger[aria-pressed="true"] { color: var(--accent); }
+.side-pane__controls .side-pane__menu { flex: 0 0 auto; display: flex; align-items: center; }
+
+/* A second row of the pane's own chrome, under the title bar and outside the body, so the
+   rectangle published for a native child window still describes only the content. */
+.side-pane__subheader {
+  min-height: 32px; flex: 0 0 auto; padding: 0 8px;
+  display: flex; align-items: center; gap: 4px;
+  background: var(--subtle); border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 11px;
+}
+
+.side-pane__body {
+  flex: 1; min-width: 0; min-height: 0;
+  position: relative; display: flex; flex-direction: column; overflow: hidden;
+  border-bottom-left-radius: inherit; border-bottom-right-radius: inherit;
+}
+.side-pane__body > * { flex: 1; min-width: 0; min-height: 0; }
+
+/* The terminal was a drawer with its own height and lift; inside a pane it is the whole body.
+   xterm reports its intrinsic width as the panel's min-content size, so every level of the
+   drawer's wrapper needs `min-width: 0` or the panel grows past the pane instead of refitting.
+   The pane holds one region per tab, stacked: only the selected tab is visible, and the rest
+   keep a full-size box rather than collapsing, so their xterm stays measured and coming back to
+   one is a repaint instead of a reflow and a refit. */
+.side-pane--terminal .terminal-panel-region {
+  position: absolute; inset: 0; min-width: 0; min-height: 0; display: flex;
+}
+/* The drawer slid as it opened. A tab switch is not an opening, so it does not. */
+.side-pane--terminal .terminal-panel-region.collapse-region--closed > .terminal-panel-region__inner {
+  transform: none;
+}
+.side-pane--terminal .terminal-panel-region__inner { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.side-pane--terminal .terminal-panel { width: 100%; height: 100%; flex: 1; min-width: 0; border-top: 0; box-shadow: none; }
+.side-pane--terminal .terminal-panel__viewport { min-width: 0; }
+
+.side-pane--shell .shell-task-panel { height: 100%; flex: 1; min-height: 0; }

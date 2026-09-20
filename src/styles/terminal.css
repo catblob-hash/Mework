@@ -1,0 +1,99 @@
+/* Per-conversation terminal, styled after the reference shell's pane body: no
+   header of its own — the SidePane title bar is the only chrome — the terminal
+   fills the pane, and state surfaces as overlays rather than a status bar. */
+.terminal-panel-region {
+  flex: 0 0 auto;
+  position: relative;
+  z-index: 3;
+}
+.terminal-panel-region__inner {
+  min-height: 0;
+}
+.terminal-panel-region.collapse-region--closed > .terminal-panel-region__inner {
+  transform: translateY(8px);
+}
+.terminal-panel {
+  height: clamp(210px, 31vh, 340px);
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-e8e7e8);
+  color: var(--color-272227);
+}
+.terminal-panel__viewport {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  padding: 8px;
+  overflow: hidden;
+  background: transparent;
+}
+.terminal-panel__viewport .xterm {
+  height: 100%;
+}
+/* The reference shell defeats xterm's own viewport paint so the pane surface shows through. */
+.terminal-panel__viewport .xterm .xterm-viewport {
+  background: transparent;
+}
+
+/* While connecting or terminating the body dims behind a centered spinner. */
+.terminal-panel__veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-ffffff-ap64);
+  color: var(--color-776f77);
+  pointer-events: none;
+}
+.terminal-panel--closing .terminal-panel__veil {
+  background: var(--color-e8e7e8);
+}
+
+/* A settled session (exited or failed) replaces the body with a centered card:
+   the verdict, then the only way back. */
+.terminal-panel__overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: var(--color-e8e7e8);
+  color: var(--color-776f77);
+}
+.terminal-panel__overlay-message {
+  margin: 0;
+  max-width: 320px;
+  padding: 0 16px;
+  text-align: center;
+  overflow-wrap: anywhere;
+  color: var(--color-514a51);
+  font-size: 12.5px;
+}
+.terminal-panel__overlay--error .terminal-panel__overlay-message {
+  color: var(--color-8e3630);
+}
+.terminal-panel__retry {
+  height: 26px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--color-d2cfd2);
+  color: var(--color-2f2a2f);
+  font-size: 11.5px;
+}
+.terminal-panel__retry:hover {
+  background: var(--color-c7c3c7);
+  color: var(--color-000000);
+}
+
+.terminal-panel--input-disabled .terminal-panel__viewport {
+  opacity: 0.72;
+}

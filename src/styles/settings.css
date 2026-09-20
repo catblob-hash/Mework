@@ -1,0 +1,40 @@
+/* Global settings */
+.global-settings-layout { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-columns: 190px minmax(0, 1fr); }
+.settings-nav { padding: 11px 9px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--border); background: var(--color-f6f6f3); }
+/* Group titles are non-interactive and non-collapsible, with no separators between groups. The first title has no top padding so it aligns with subsequent groups. */
+.settings-nav__group-title { padding: 9px 9px 2px; color: var(--faint); font-size: 9.5px; }
+.settings-nav__group-title:first-child { padding-top: 0; }
+.settings-nav__item { height: 36px; padding: 0 9px; display: flex; align-items: center; gap: 8px; border-radius: 7px; background: transparent; color: var(--muted); text-align: left; font-size: 11.5px; }
+.settings-nav__item span { flex: 1; }
+.settings-nav__item:hover { background: var(--hover); }
+.settings-nav__item--active { background: var(--color-e5e5e0); color: var(--text); font-weight: 600; }
+.global-settings-content { min-width: 0; min-height: 0; overflow: auto; }
+.settings-page { min-height: 100%; padding: 21px 22px 30px; }
+.settings-editor-page { height: 100%; min-height: 0; padding-bottom: 0; display: flex; flex-direction: column; overflow: hidden; }
+.settings-editor-page > .settings-page-heading { flex: 0 0 auto; }
+.settings-page-heading { min-height: 54px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.settings-page-heading h3 { margin: 0; font-size: 14px; }
+.settings-page-heading p { margin: 3px 0 0; color: var(--muted); font-size: 10.5px; }
+.settings-page-heading__actions { display: flex; align-items: center; gap: 6px; }
+.settings-card { margin-top: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
+.settings-card__heading { min-height: 39px; display: flex; align-items: flex-start; justify-content: space-between; }
+.settings-card__heading > div { display: flex; gap: 8px; }
+.settings-card__heading span { display: flex; flex-direction: column; }
+.settings-card__heading strong { font-size: 11.5px; }
+.settings-card__heading small { color: var(--faint); font-size: 9px; }
+/* API providers */
+.provider-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.provider-field-grid .field { margin-bottom: 9px; }
+.provider-field-grid .field:last-child { grid-column: 1 / -1; margin-bottom: 0; }
+
+.model-editor-backdrop { position: fixed; inset: 0; z-index: 1300; padding: 24px; display: flex; align-items: center; justify-content: center; background: var(--color-1e1e1c-ap30); backdrop-filter: blur(2px); animation: fade-in .12s ease-out; }
+.model-editor-dialog { width: min(560px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--color-cecec8); border-radius: 12px; background: var(--panel); box-shadow: 0 24px 80px var(--color-000000-ap22), 0 3px 10px var(--color-000000-ap10); }
+/* Same chrome as `.dialog`: a one-line title, a way out in the corner, a one-line
+   button row, and no rules fencing the body off from either. */
+.model-editor-dialog__header { min-height: 0; padding: 9px 10px 8px 16px; display: flex; align-items: center; gap: 12px; }
+.model-editor-dialog__header h3 { flex: 1; min-width: 0; margin: 0; font-size: 13px; line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-editor-dialog__lede { margin: 0 0 12px; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
+.model-editor-dialog__body { padding: 4px 18px 8px; overflow: auto; }
+.model-editor-dialog__body .field { margin-bottom: 12px; }
+.model-editor-dialog__footer { min-height: 0; padding: 6px 12px 12px; display: flex; justify-content: flex-end; align-items: center; gap: 7px; }
+.model-editor-dialog__footer .button { min-height: 28px; padding: 0 12px; font-size: 12px; }

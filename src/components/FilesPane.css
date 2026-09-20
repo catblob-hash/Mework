@@ -1,0 +1,239 @@
+/* The workspace file browser: a 240px tree column beside the open file, with the open files as
+   tabs in the pane's own title bar. Both columns fill the pane body and scroll inside themselves,
+   so a long path or a long line can never widen the pane. */
+.files-pane {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: row; overflow: hidden;
+  color: var(--text);
+}
+
+/* ---- title bar ---- */
+
+.files-pane__header {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 4px;
+}
+.files-pane__pane-title {
+  flex: 1; min-width: 0; padding-left: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: none;
+  color: var(--muted); font-size: 12.5px; font-weight: 500;
+}
+/* Two classes so the compact control outranks `.icon-button` in the barrel, which loads last. */
+.files-pane__header .files-pane__tree-toggle {
+  width: 24px; height: 24px; flex: 0 0 24px; border-radius: 5px; color: var(--muted);
+}
+.files-pane__header .files-pane__tree-toggle[aria-pressed="true"] {
+  background: var(--active); color: var(--text);
+}
+
+/* The strip never scrolls: tabs share the bar and the rest move into the overflow menu. */
+.files-pane__tabs {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 4px;
+}
+/* A tab wants 192px, settles for 104, and never grows past its own label. */
+.files-pane__tab {
+  position: relative; flex: 0 1 192px; min-width: 104px; max-width: max-content;
+  display: flex; align-items: center; gap: 4px;
+  height: 24px; padding: 2px; border-radius: 5px; color: var(--muted);
+}
+.files-pane__tab:hover { background: var(--hover); }
+.files-pane__tab--active { background: var(--active); color: var(--text); }
+.files-pane__tab-button {
+  flex: 1; min-width: 0; max-width: 140px;
+  display: flex; align-items: center; gap: 4px;
+  height: 100%; padding: 0 2px 0 4px;
+  border: 0; background: none; color: inherit; font: inherit; font-size: 11.5px;
+  text-align: left; cursor: pointer;
+}
+.files-pane__tab-button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; border-radius: 5px; }
+.files-pane__tab-icon { flex: 0 0 13px; width: 13px; height: 13px; opacity: .75; }
+.files-pane__tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A preview tab is the one slot every single click reuses; italics say it is on loan. */
+.files-pane__tab--preview .files-pane__tab-name { font-style: italic; }
+/* Row actions stay out of the way until the tab is pointed at or holds focus. */
+.files-pane__tab-menu, .files-pane__tab .files-pane__tab-close {
+  opacity: 0; flex: 0 0 auto;
+}
+.files-pane__tab:hover .files-pane__tab-menu,
+.files-pane__tab:hover .files-pane__tab-close,
+.files-pane__tab:focus-within .files-pane__tab-menu,
+.files-pane__tab:focus-within .files-pane__tab-close,
+.files-pane__tab--active .files-pane__tab-close { opacity: 1; }
+.files-pane__tabs .files-pane__tab-menu-trigger,
+.files-pane__tabs .files-pane__tab-close,
+.files-pane__tabs .files-pane__tab-overflow-trigger {
+  width: 20px; height: 20px; flex: 0 0 20px; border-radius: 4px;
+}
+.files-pane__tab-menu { display: flex; align-items: center; }
+.files-pane__tab-overflow { flex: 0 0 auto; display: flex; align-items: center; }
+
+/* ---- tree column ---- */
+
+.files-pane__tree-column {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.files-pane__tree-column[hidden] { display: none; }
+/* Beside an open file the tree is a fixed column with a rule between the two. */
+.files-pane__tree-column--aside {
+  flex: 0 0 auto; border-right: 1px solid var(--border);
+}
+
+.files-pane__filter {
+  height: 32px; flex: 0 0 32px; padding: 0 8px;
+  display: flex; align-items: center; gap: 6px;
+}
+.files-pane__filter-icon {
+  flex: 0 0 16px; width: 16px; height: 16px;
+  display: grid; place-items: center; color: var(--faint);
+}
+.files-pane__filter-input {
+  flex: 1; min-width: 0;
+  border: 0; background: none; color: var(--text); font-size: 11.5px;
+  text-overflow: ellipsis;
+}
+.files-pane__filter-input:focus { outline: none; }
+.files-pane__filter-input::placeholder { color: var(--faint); }
+.files-pane__filter .files-pane__filter-clear {
+  width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px;
+}
+
+.files-pane__tree {
+  flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 5px 4px;
+  list-style: none; overflow-y: auto; overflow-x: hidden;
+}
+.files-pane__row {
+  position: relative; min-height: 24px; padding-right: 8px;
+  display: flex; align-items: center; gap: 4px;
+  border-radius: 5px; color: var(--text); font-size: 12px; line-height: 24px;
+  user-select: none; cursor: pointer;
+}
+.files-pane__row:hover { background: var(--hover); }
+.files-pane__row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.files-pane__row--current { background: var(--active); }
+.files-pane__row--current:hover { background: var(--active); }
+/* A revealed row is lit long enough to be found, then released. The transition is on
+   the release so the jump lands instantly and the glow is what fades. */
+.files-pane__row--revealed { background: var(--accent-soft); }
+.files-pane__row { transition: background-color .3s; }
+.files-pane__row--message { color: var(--faint); cursor: default; }
+.files-pane__row--message:hover { background: transparent; }
+.files-pane__row--failed { color: var(--danger); }
+
+.files-pane__chevron {
+  width: 14px; height: 14px; flex: 0 0 14px;
+  color: var(--faint); transition: transform .12s;
+}
+.files-pane__chevron--open { transform: rotate(90deg); }
+.files-pane__icon { flex: 0 0 14px; color: var(--muted); }
+.files-pane__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The directory a match lives in, after the name it matched. */
+.files-pane__detail {
+  min-width: 0; flex: 0 1 auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--faint); font-size: 10.5px;
+}
+.files-pane__match { color: var(--text); font-weight: 600; }
+
+.files-pane__row-menu { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; opacity: 0; }
+.files-pane__row:hover .files-pane__row-menu,
+.files-pane__row:focus-within .files-pane__row-menu { opacity: 1; }
+.files-pane__tree .files-pane__row-menu-trigger {
+  width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px;
+}
+
+/* ---- viewer ---- */
+
+.files-pane__viewer {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+/* The open file's own row: what it is, and the actions that belong to it. */
+.files-pane__viewer-bar {
+  height: 32px; flex: 0 0 32px; padding: 0 4px 0 8px;
+  display: flex; align-items: center; gap: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.files-pane__viewer-path {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px;
+}
+.files-pane__viewer-directory { color: var(--faint); }
+.files-pane__viewer-name { color: var(--text); font-weight: 500; }
+.files-pane__viewer-bar .files-pane__viewer-button {
+  width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px;
+}
+.files-pane__viewer-bar .files-pane__viewer-button[aria-pressed="true"] {
+  background: var(--active); color: var(--text);
+}
+.files-pane__notice {
+  flex: 0 0 auto; margin: 0; padding: 6px 10px;
+  color: var(--muted); font-size: 11px;
+}
+.files-pane__error {
+  flex: 0 0 auto; margin: 0; padding: 6px 10px;
+  color: var(--danger); font-size: 11px;
+}
+.files-pane__code {
+  flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 4px 0;
+  display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden;
+  font: 11.5px/18px var(--mono); tab-size: 2; user-select: text;
+}
+.files-pane__line { display: flex; align-items: flex-start; min-height: 18px; }
+/* A line jumped to is lit long enough to be found, then released — the same
+   gesture the tree makes when it reveals a row. */
+.files-pane__line { transition: background-color .3s; }
+.files-pane__line--lit { background: var(--accent-soft); }
+/* The gutter is pinned so it survives the horizontal scroll a long line forces. */
+.files-pane__line-number {
+  position: sticky; left: 0; z-index: 1;
+  min-width: 40px; padding: 0 8px 0 6px; flex: 0 0 auto;
+  background: var(--panel); color: var(--faint); text-align: right;
+  user-select: none;
+}
+/* Wrapping is not a setting here, so the line box always owns its own height. */
+.files-pane__line-text {
+  flex: 1 1 auto; min-width: 0; padding-right: 10px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+/* Four token kinds, because a colourer that only marks lexical shapes is the
+   only kind that is never subtly wrong about what it is looking at. */
+.files-pane__token--comment { color: var(--color-777771); font-style: italic; }
+.files-pane__token--string { color: var(--color-246b4e); }
+.files-pane__token--keyword { color: var(--color-6254aa); }
+.files-pane__token--number { color: var(--color-8b611d); }
+
+/* ---- rendered document ---- */
+
+.files-pane__document {
+  flex: 1; min-width: 0; min-height: 0;
+  padding: 10px 14px 28px; overflow-y: auto; overflow-x: hidden;
+  font-size: 12.5px; line-height: 1.6; user-select: text;
+}
+.files-pane__document img { max-width: 100%; height: auto; border-radius: 6px; }
+
+/* ---- picture ---- */
+
+.files-pane__image {
+  flex: 1; min-width: 0; min-height: 0; padding: 12px;
+  display: grid; place-items: center; overflow: auto;
+}
+/* A picture is shown whole rather than filled to the pane: the file pane is a
+   reader, and a cropped screenshot answers a question nobody asked. */
+.files-pane__image img { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+/* ---- empty state ---- */
+
+.files-pane__placeholder {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; padding: 24px; color: var(--muted); text-align: center;
+}
+.files-pane__placeholder-icon {
+  width: 40px; height: 40px; display: grid; place-items: center;
+  border: 1px solid var(--border); border-radius: 11px; color: var(--faint);
+}
+.files-pane__placeholder h3 { margin: 8px 0 0; color: var(--text); font-size: 12.5px; font-weight: 500; }
+.files-pane__placeholder p { max-width: 260px; margin: 0; font-size: 11px; line-height: 1.5; }

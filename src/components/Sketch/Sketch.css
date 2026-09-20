@@ -1,0 +1,74 @@
+/* The freehand annotation surface: a captured page under a drawing canvas, with a floating
+   toolbar pill at the bottom. Ported from Claude Desktop's sketch kit; every Tailwind utility
+   in the source is rewritten here so the layer works under the production CSP. */
+
+.sketch-overlay {
+  position: absolute; inset: 0; outline: none;
+}
+.sketch-overlay__backdrop {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; object-position: left top;
+  user-select: none; pointer-events: none;
+}
+.sketch-overlay__backdrop--blank { background: var(--subtle); }
+.sketch-overlay__canvas { width: 100%; height: 100%; }
+
+.sketch-canvas__surface { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* Transparent by design: the glyphs are the ink, and the caret sits on the page itself. */
+.sketch-canvas__text {
+  position: absolute; min-width: 40px; padding: 0;
+  border: 0; outline: none; background: transparent;
+  resize: none; overflow: hidden;
+}
+
+.sketch-toolbar {
+  position: absolute; right: 10px; bottom: 10px; left: 10px;
+  display: flex; justify-content: center; pointer-events: none;
+}
+.sketch-toolbar__pill {
+  max-width: 100%; display: flex; align-items: center; gap: 4px;
+  padding: 4px 8px; border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); background: var(--panel); pointer-events: auto;
+  box-shadow: 0 1px 1px var(--color-000000-ap8), 0 6px 16px var(--color-000000-ap13);
+}
+/* The shadow token is black at day and mirrors to white with the theme, so the day rule would
+   glow underneath the pill. Night takes the dark-side token instead. */
+:root[data-theme="night"] .sketch-toolbar__pill {
+  box-shadow: 0 1px 1px var(--color-ffffff-ap10), 0 6px 16px var(--color-ffffff-ap34);
+}
+.sketch-toolbar__pill[data-layout="full"] { flex: 0 0 auto; }
+
+.sketch-toolbar__group { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+.sketch-toolbar__group--colors { padding: 0 4px; }
+.sketch-toolbar__divider { flex: 0 0 auto; width: 1px; height: 16px; background: var(--border); }
+.sketch-toolbar__menu { flex: 0 0 auto; display: flex; }
+
+.sketch-toolbar__tool {
+  width: 28px; height: 28px; flex: 0 0 28px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px; color: var(--muted); background: transparent; transition: background .14s, color .14s;
+}
+.sketch-toolbar__tool:hover:not(:disabled) { background: var(--hover); }
+.sketch-toolbar__tool[aria-pressed="true"], .sketch-toolbar__tool[aria-expanded="true"] {
+  color: var(--text); background: var(--active);
+}
+
+.sketch-toolbar__swatch-button {
+  width: 20px; height: 20px; flex: 0 0 20px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; background: transparent;
+}
+.sketch-toolbar__swatch {
+  display: block; width: 14px; height: 14px; border-radius: 999px;
+  box-shadow: 0 0 0 1px var(--border); transition: box-shadow .14s;
+}
+.sketch-toolbar__swatch.is-active { box-shadow: 0 0 0 2px var(--text); }
+.sketch-toolbar__swatch-button:hover .sketch-toolbar__swatch:not(.is-active) { box-shadow: 0 0 0 1px var(--muted); }
+
+/* Two classes so these outrank `.icon-button`'s 32px in the barrel, which loads last. */
+.sketch-toolbar__group .sketch-toolbar__action,
+.sketch-toolbar__pill > .sketch-toolbar__action {
+  width: 28px; height: 28px; flex: 0 0 28px; border-radius: 6px;
+}
+.sketch-toolbar__pill > .sketch-toolbar__close { flex: 0 0 auto; min-height: 28px; padding: 0 8px; font-size: 12px; }
+.sketch-toolbar__pill > .sketch-toolbar__attach { flex: 0 0 auto; min-height: 28px; padding: 0 10px; font-size: 12px; }
