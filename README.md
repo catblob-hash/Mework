@@ -67,6 +67,8 @@ npm run tauri:build
 
 The installer lands under `src-tauri/target/release/bundle/nsis/`; `npm run package:portable` zips the portable flavor from the same output. `npm test` and `npm run test:rust` run the checks.
 
+Developing on Linux (a container, WSL, or a CI worker): `bash scripts/setup-linux-dev.sh` provisions the toolchain and the three artifacts the Rust build script needs but only Windows gets for free. The checks above work afterwards; `npm run tauri:build`, which bundles for WebView2 and NSIS, and `npm run prob:fetch`, whose pinned ProB artifacts are Windows-only, do not.
+
 ## License
 
 [GNU General Public License v3.0 or later](LICENSE).

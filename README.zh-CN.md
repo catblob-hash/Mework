@@ -67,6 +67,8 @@ npm run tauri:build
 
 安装器产出在 `src-tauri/target/release/bundle/nsis/`；`npm run package:portable` 从同一产物打出便携版。`npm test` 与 `npm run test:rust` 运行检查。
 
+在 Linux 上开发（容器、WSL 或 CI worker）：`bash scripts/setup-linux-dev.sh` 会装好工具链，并补齐 Rust 构建脚本需要、而只有 Windows 天然具备的三件产物。之后上面的检查都可用；只有两个例外：`npm run tauri:build` 面向 WebView2 与 NSIS 打包，`npm run prob:fetch` 钉的是 Windows 版 ProB 制品。
+
 ## 许可证
 
 [GNU 通用公共许可证 v3.0 或更高版本](LICENSE)。
