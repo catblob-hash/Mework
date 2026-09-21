@@ -568,16 +568,16 @@ const GIT_EXECUTABLE: &str = "git.exe";
 /// Bash interpreters for a Local run, in preference order.
 ///
 /// A bare `bash` is not good enough on Windows, and it fails in two opposite
-/// directions. `%SystemRoot%\System32\bash.exe` is the WSL launcher: it would
-/// run the command inside the default distribution, whose filesystem and
-/// loopback namespace are not the ones this conversation targets, and it would
-/// report success for a command that never touched the host — so the wrong
-/// machine stays invisible in the transcript. Meanwhile a normal Git for Windows
+/// directions. A `bash.exe` belonging to WSL is a launcher: it would run the
+/// command inside the default distribution, whose filesystem and loopback
+/// namespace are not the ones this conversation targets, and it would report
+/// success for a command that never touched the host — so the wrong machine
+/// stays invisible in the transcript. Meanwhile a normal Git for Windows
 /// install advertises only its `cmd` directory on `PATH`, which carries
 /// `git.exe` but no `bash.exe`, so the bare name resolves to nothing at all and
 /// the tool looks like it has no backend.
 ///
-/// Local means this Windows host: the launcher is excluded and a native Bash is
+/// Local means this Windows host: launchers are excluded and a native Bash is
 /// resolved to an absolute path. WSL stays reachable by selecting it as the
 /// conversation's run target, which is the only place its semantics are honest.
 pub fn local_bash_candidates() -> Vec<String> {
@@ -585,7 +585,7 @@ pub fn local_bash_candidates() -> Vec<String> {
     {
         select_local_bash(
             std::env::var_os("PATH").as_deref(),
-            &windows_system_directories(),
+            &launcher_only_directories(),
             &well_known_bash_paths(),
             &|path: &Path| path.is_file(),
         )
@@ -599,15 +599,15 @@ pub fn local_bash_candidates() -> Vec<String> {
 }
 
 /// Picks the first native Bash from `PATH`, then from a Git installation named
-/// by `PATH`, then from well-known install locations. Directories inside a
-/// Windows system directory are skipped, so the WSL launcher can never win.
+/// by `PATH`, then from well-known install locations. Directories that can only
+/// hold a WSL launcher are skipped, so the launcher can never win.
 ///
 /// Compiled on every platform so the rule stays unit-testable; only the Windows
 /// branch above calls it.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn select_local_bash(
     path_var: Option<&OsStr>,
-    system_directories: &[PathBuf],
+    launcher_only: &[PathBuf],
     well_known: &[PathBuf],
     is_file: &dyn Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
@@ -618,9 +618,9 @@ fn select_local_bash(
         .iter()
         .filter(|directory| !directory.as_os_str().is_empty())
         .filter(|directory| {
-            !system_directories
+            !launcher_only
                 .iter()
-                .any(|system| path_is_inside(directory, system))
+                .any(|excluded| path_is_inside(directory, excluded))
         })
         .collect();
 
@@ -668,11 +668,23 @@ fn path_is_inside(directory: &Path, root: &Path) -> bool {
     !root.is_empty() && (directory == root || directory.starts_with(&format!("{root}\\")))
 }
 
-/// The whole Windows directory is excluded rather than just `System32`: no
-/// native Bash installs there, and the launcher has appeared under more than one
+/// Directories that can only ever yield a WSL launcher, never a native Bash.
+///
+/// `%SystemRoot%` is excluded whole rather than just `System32`: no native Bash
+/// installs anywhere under it, and the launcher has appeared under more than one
 /// of its subdirectories across Windows releases.
+///
+/// `%LocalAppData%\Microsoft\WindowsApps` is the app execution alias directory,
+/// and it sits on the default user `PATH`. WSL 2.x — the MSI as much as the
+/// Store package — registers a `bash.exe` alias there pointing at the MSIX
+/// package's `wsl.exe`. On the normal Git for Windows shape, where `PATH` names
+/// Git only through its `cmd` directory, that alias is the *only* `bash.exe` on
+/// `PATH`: without this exclusion it wins the first pass outright, the
+/// Git-derived pass never runs, and every local `bash` call silently executes
+/// inside the default distribution. Nothing but aliases lives in that
+/// directory, so excluding it forfeits no real interpreter.
 #[cfg(windows)]
-fn windows_system_directories() -> Vec<PathBuf> {
+fn launcher_only_directories() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = ["SystemRoot", "windir"]
         .into_iter()
         .filter_map(std::env::var_os)
@@ -680,6 +692,9 @@ fn windows_system_directories() -> Vec<PathBuf> {
         .collect();
     if roots.is_empty() {
         roots.push(PathBuf::from(r"C:\Windows"));
+    }
+    if let Some(value) = std::env::var_os("LocalAppData") {
+        roots.push(PathBuf::from(value).join("Microsoft").join("WindowsApps"));
     }
     roots
 }
@@ -978,6 +993,73 @@ mod tests {
             &present(&["/win/system32/bash.exe"]),
         );
         assert_eq!(chosen, None);
+    }
+
+    /// Installing WSL 2.x registers a `bash.exe` app execution alias under
+    /// `%LocalAppData%\Microsoft\WindowsApps`, which is on the default user
+    /// `PATH`. On the normal Git for Windows shape only `Git\cmd` is advertised
+    /// and it carries no `bash.exe`, so that alias is the only `bash.exe` on
+    /// `PATH` — it must still lose to the Bash derived from `git.exe`, or every
+    /// local `bash` call runs inside the default distribution instead.
+    #[test]
+    fn local_bash_never_selects_the_windows_apps_alias() {
+        let path = path_var(&["/users/me/appdata/local/microsoft/windowsapps", "/git/cmd"]);
+        let chosen = select_local_bash(
+            Some(path.as_os_str()),
+            &[
+                PathBuf::from("/win"),
+                PathBuf::from("/users/me/appdata/local/microsoft/windowsapps"),
+            ],
+            &[],
+            &present(&[
+                "/users/me/appdata/local/microsoft/windowsapps/bash.exe",
+                "/git/cmd/git.exe",
+                "/git/bin/bash.exe",
+            ]),
+        );
+        assert_eq!(
+            chosen.as_deref().map(normalized).as_deref(),
+            Some("/git/bin/bash.exe")
+        );
+    }
+
+    #[test]
+    fn local_bash_reports_nothing_when_only_the_windows_apps_alias_exists() {
+        let path = path_var(&["/users/me/appdata/local/microsoft/windowsapps"]);
+        let chosen = select_local_bash(
+            Some(path.as_os_str()),
+            &[PathBuf::from("/users/me/appdata/local/microsoft/windowsapps")],
+            &[],
+            &present(&["/users/me/appdata/local/microsoft/windowsapps/bash.exe"]),
+        );
+        // Same refusal as the System32 launcher: an actionable error beats a
+        // command that silently lands on another machine.
+        assert_eq!(chosen, None);
+    }
+
+    /// The exclusions only help if the real list names those directories, and
+    /// the selector tests above inject their own list, so they cannot show it.
+    /// This is the regression that shipped: the list covered `%SystemRoot%`
+    /// alone, and installing WSL put a `bash.exe` alias outside it.
+    #[cfg(windows)]
+    #[test]
+    fn launcher_only_directories_cover_both_launcher_homes() {
+        let excluded = launcher_only_directories();
+        let local_app_data =
+            std::env::var_os("LocalAppData").expect("Windows always sets LocalAppData");
+        let alias = PathBuf::from(local_app_data)
+            .join("Microsoft")
+            .join("WindowsApps");
+        assert!(
+            excluded.iter().any(|root| path_is_inside(&alias, root)),
+            "the WSL bash.exe alias directory must be excluded: {excluded:?}"
+        );
+        let system_root = std::env::var_os("SystemRoot").expect("Windows always sets SystemRoot");
+        let system32 = PathBuf::from(system_root).join("System32");
+        assert!(
+            excluded.iter().any(|root| path_is_inside(&system32, root)),
+            "the System32 launcher must stay excluded: {excluded:?}"
+        );
     }
 
     #[test]
