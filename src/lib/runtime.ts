@@ -1481,11 +1481,15 @@ export function normalizeDocument(value: unknown): AppDocument {
       }
       continue;
     }
+    const workspaceMachine = normalizeRunTarget(
+      (workspace as unknown as { machine?: unknown }).machine
+    );
     regularWorkspaces.push({
       id: workspace.id,
       name: workspace.name,
       kind: "directory",
       path: workspace.path,
+      ...(workspaceMachine ? { machine: workspaceMachine } : {}),
       createdAt: workspace.createdAt,
       defaultConversationPresetId: workspacePresetId(workspace),
       lastConversationSettings: workspaceLastSettings(workspace),
