@@ -32,7 +32,23 @@ pub(crate) fn enabled_tools(request: &RunModelRequest) -> Vec<&ToolDescriptor> {
         // host-side executor (Task*); subagent runs exclude them from this list.
         .filter(|tool| enabled.contains(&tool.name) || plan_tools.contains(&tool.name.as_str()))
         .filter(|tool| supports_vision || is_usable_without_vision(&tool.name))
+        // A conversation whose every workspace is on a POSIX machine has nowhere
+        // to run PowerShell. Withdrawing the tool is the honest form: the user
+        // may well have it enabled, and advertising it would buy one wasted call
+        // and one error per turn until the model stopped trying.
+        .filter(|tool| tool.name != "powershell" || runs_powershell(&request.workspaces))
         .collect()
+}
+
+/// Whether a run's workspaces include one PowerShell could run in.
+///
+/// A run that resolved no workspace set predates machine-bound workspaces, so it
+/// is on the host machine and the host's own platform answers.
+fn runs_powershell(workspaces: &crate::workspace_set::WorkspaceSet) -> bool {
+    if workspaces.is_empty() {
+        return cfg!(windows);
+    }
+    workspaces.runs_powershell()
 }
 
 /// Whether a tool means anything to a model that cannot see images.
@@ -46,18 +62,31 @@ pub(crate) fn is_usable_without_vision(tool_name: &str) -> bool {
         .is_none_or(|tool| !tool.requires_image_capability())
 }
 
-pub(crate) fn tool_schema(tool: &ToolDescriptor, profile: &PromptProfile) -> Value {
+pub(crate) fn tool_schema(
+    tool: &ToolDescriptor,
+    profile: &PromptProfile,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+) -> Value {
     // Schema-source precedence:
     // 1. Pass descriptor-provided `input_schema` through verbatim.
     // 2. Built-in catalog tools use authoritative hand-written schemas, whose
     //    root description is the run profile's text for that tool.
     // 3. Legacy `memory_*` aliases retain their original schemas.
     // 4. Derive schemas from typed parameters for remaining internal descriptors.
+    //
+    // The `workspace` parameter is applied on top of whichever rung answered: a
+    // conversation's workspaces are a property of the run, not of the rung the
+    // schema came from, and a descriptor injected with roles must still be able
+    // to say which directory it acts in.
     if let Some(schema) = &tool.input_schema {
-        return schema.clone();
+        return crate::builtin_schemas::with_workspace_parameter(
+            schema.clone(),
+            &tool.name,
+            workspaces,
+        );
     }
     if let Some(schema) = crate::builtin_schemas::builtin_tool_schema(&tool.name, profile) {
-        return schema;
+        return crate::builtin_schemas::with_workspace_parameter(schema, &tool.name, workspaces);
     }
     if let Some(schema) = memory_tool_schema(&tool.name) {
         return schema;
@@ -201,5 +230,44 @@ mod tests {
             )
             .is_some());
         }
+    }
+
+    /// A conversation whose every workspace is POSIX has nowhere to run
+    /// PowerShell, and advertising it there buys one wasted call and one error
+    /// per turn until the model stops trying. The catalog stays complete either
+    /// way: withdrawal is a property of the run, not of the tool.
+    #[test]
+    fn powershell_is_offered_only_where_a_workspace_could_run_it() {
+        use crate::model::{AttachedWorkspace, RunTarget, SshMachineConfig};
+        use crate::workspace_set::WorkspaceSet;
+
+        let assets = crate::model::ExecutionEnvironmentAssets {
+            ssh_machines: vec![SshMachineConfig {
+                id: "m1".into(),
+                name: "devbox".into(),
+                host: "user@devbox".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let remote = AttachedWorkspace {
+            machine: Some(RunTarget::Ssh {
+                machine_id: "m1".into(),
+            }),
+            path: "~/app".into(),
+        };
+
+        // Every workspace on a POSIX machine: nowhere to run it.
+        assert!(!runs_powershell(
+            &WorkspaceSet::resolve(&assets, &remote, &[]).unwrap()
+        ));
+        // A host workspace brings it back exactly where PowerShell exists.
+        assert_eq!(
+            runs_powershell(&WorkspaceSet::local_root("C:/work/app")),
+            cfg!(windows)
+        );
+        // A run that resolved no set predates machine-bound workspaces, so the
+        // host's own platform answers rather than a silent withdrawal.
+        assert_eq!(runs_powershell(&WorkspaceSet::default()), cfg!(windows));
     }
 }

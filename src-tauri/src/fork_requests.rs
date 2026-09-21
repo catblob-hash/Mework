@@ -361,6 +361,7 @@ pub fn perform_fork(
         worktree: source.worktree.clone(),
         run_target: source.run_target.clone(),
         // The child holds exactly the parent's grants, extra directories included.
+        attached_workspaces: source.attached_workspaces.clone(),
         additional_directories: source.additional_directories.clone(),
         // The sidebar is two levels deep, so a fork of a child becomes that
         // child's sibling. The source's own pointer is already a root, so
@@ -659,6 +660,7 @@ mod tests {
             task_cancel: crate::cancel::CancelSignal::default(),
             run_cancel: crate::cancel::CancelSignal::default(),
             output_schema: None,
+            workspaces: Default::default(),
         }
     }
 

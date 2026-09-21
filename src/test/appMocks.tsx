@@ -408,6 +408,9 @@ export function resetAppMocks() {
   terminalMocks.closeTerminal.mockReset().mockResolvedValue(undefined);
   workspacePickerMocks.hasNativeWorkspacePicker.mockReset().mockReturnValue(true);
   workspacePickerMocks.pickWorkspaceDirectory.mockReset().mockResolvedValue(null);
+  workspacePickerMocks.listRemoteDirectory.mockReset()
+    .mockResolvedValue({ path: "/home/dev", directories: [], hasParent: true });
+  workspacePickerMocks.authorizeRemoteWorkspace.mockReset().mockResolvedValue("/home/dev");
   browserMocks.openBrowser.mockReset().mockResolvedValue({
     hasPage: true,
     open: true,

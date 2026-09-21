@@ -9,6 +9,11 @@ use sha2::{Digest, Sha256};
 use crate::model::{AppDocument, WorkspaceKind};
 
 const TEMPORARY_WORKSPACE_ROOT: &str = "temporary-workspaces";
+/// Host-side scratch directories for conversations whose primary workspace is
+/// on another machine. The host's own subsystems — preview, LSP, the shell's
+/// cwd file, image staging — need a real local directory whatever machine the
+/// model is addressing, and a remote root is not one.
+const REMOTE_ANCHOR_ROOT: &str = "remote-workspace-anchors";
 
 pub(crate) fn ensure_temporary_workspace(
     app_data: &Path,
@@ -20,6 +25,14 @@ pub(crate) fn ensure_temporary_workspace(
         conversation_id,
         "临时工作区",
     )
+}
+
+/// The local anchor of a conversation whose primary workspace is remote.
+pub(crate) fn ensure_remote_workspace_anchor(
+    app_data: &Path,
+    conversation_id: &str,
+) -> Result<PathBuf, String> {
+    ensure_conversation_workspace(app_data, REMOTE_ANCHOR_ROOT, conversation_id, "远端工作区锚点")
 }
 
 /// Makes the App-Data-backed temporary workspace tree match the persisted
@@ -45,7 +58,26 @@ pub(crate) fn reconcile_temporary_workspaces(
         validate_direct_child_directory(&root, &directory, "临时工作区")?;
     }
 
-    remove_orphan_workspace_entries(&root, &expected, "临时工作区")
+    remove_orphan_workspace_entries(&root, &expected, "临时工作区")?;
+    reconcile_remote_workspace_anchors(app_data, document)
+}
+
+/// Drops the anchors of conversations that no longer exist or whose workspace
+/// is back on this machine. Anchors are created on demand, so nothing is made
+/// here; a missing one is recreated by the next run that needs it.
+fn reconcile_remote_workspace_anchors(
+    app_data: &Path,
+    document: &AppDocument,
+) -> Result<(), String> {
+    let expected = document
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.kind == WorkspaceKind::Directory && workspace.machine.is_some())
+        .flat_map(|workspace| workspace.conversations.iter())
+        .map(|conversation| workspace_directory_name(&conversation.id))
+        .collect::<Result<HashSet<_>, _>>()?;
+    let root = ensure_workspace_root(app_data, REMOTE_ANCHOR_ROOT, "远端工作区锚点")?;
+    remove_orphan_workspace_entries(&root, &expected, "远端工作区锚点")
 }
 
 fn remove_orphan_workspace_entries(
@@ -188,5 +220,30 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with(&canonical_app_data));
         assert!(second.starts_with(&canonical_app_data));
+    }
+
+    #[test]
+    fn remote_anchors_are_dropped_once_their_workspace_is_back_on_this_machine() {
+        let app_data = tempfile::tempdir().unwrap();
+        let mut document = crate::catalog::default_document();
+        let workspace = &mut document.workspaces[0];
+        workspace.machine = Some(crate::model::RunTarget::Ssh {
+            machine_id: "m1".into(),
+        });
+        let conversation_id = workspace.conversations[0].id.clone();
+        let anchor = ensure_remote_workspace_anchor(app_data.path(), &conversation_id).unwrap();
+        assert!(anchor.is_dir());
+        assert_ne!(
+            anchor,
+            ensure_temporary_workspace(app_data.path(), &conversation_id).unwrap(),
+            "the anchor is not the temporary workspace: that tree is reconciled by other rules"
+        );
+
+        reconcile_temporary_workspaces(app_data.path(), &document).unwrap();
+        assert!(anchor.is_dir(), "a remote workspace keeps its anchor");
+
+        document.workspaces[0].machine = None;
+        reconcile_temporary_workspaces(app_data.path(), &document).unwrap();
+        assert!(!anchor.exists(), "a workspace back on this machine needs no anchor");
     }
 }

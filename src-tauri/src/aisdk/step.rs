@@ -223,7 +223,7 @@ fn tool_specs(request: &RunModelRequest) -> Vec<ToolSpec> {
             // the schema's root description, which the profile also owns.
             description: tool.description.clone(),
             input_schema: with_read_first_rule(
-                tool_schema(tool, &request.prompt_profile),
+                tool_schema(tool, &request.prompt_profile, &request.workspaces),
                 &tool.name,
                 request,
             ),

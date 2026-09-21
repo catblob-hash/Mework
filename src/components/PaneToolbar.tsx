@@ -27,6 +27,8 @@ export interface PaneToolbarMenuItem {
   /** Omit for an action that opens something of its own rather than toggling a pane. */
   checked?: boolean;
   disabled?: boolean;
+  /** Explains a disabled row in its hover text. */
+  title?: string;
   onSelect: () => void;
 }
 
@@ -88,6 +90,7 @@ export function PaneToolbar({ buttons, menuItems, menuLabel }: PaneToolbarProps)
             icon: item.icon,
             checked: item.checked,
             disabled: item.disabled,
+            title: item.title,
             onSelect: item.onSelect
           }))
         }]}

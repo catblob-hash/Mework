@@ -486,6 +486,7 @@ pub(crate) fn session_task_approval(
     security_level: Arc<crate::model::LiveSecurityLevel>,
     app_data_path: String,
     additional_directories: Vec<String>,
+    workspaces: crate::workspace_set::WorkspaceSet,
 ) -> Arc<OwnedTaskApproval> {
     let approval_state = state.clone();
     Arc::new(
@@ -519,8 +520,9 @@ pub(crate) fn session_task_approval(
                 // Classify using this call's workspace. Isolated workflow steps rely
                 // on `workspace_path` to distinguish an allowed isolated edit from a
                 // write escaping to the parent checkout; the host constructs this trusted field.
-                let decision = security::classify_model_call(
+                let decision = security::classify_model_call_in_workspaces(
                     security_level.get(),
+                    &workspaces,
                     Path::new(&tool_request.workspace_path),
                     Path::new(&app_data_path),
                     &additional_directories,
@@ -3847,7 +3849,12 @@ fn run_model_inner(
                     // A file this call wrote is news for whichever language
                     // server holds it; its answer arrives at a later round
                     // boundary, through `inject_lsp_diagnostics`.
-                    note_lsp_file_change(&request, &execution, state);
+                    note_lsp_file_change(
+                        &request,
+                        &execution,
+                        file_identities.file_touch.as_ref(),
+                        state,
+                    );
                     // Number surviving images before hooks, receipts, and
                     // events run, so every downstream consumer sees the final
                     // receipt with its `imageId` announcement.
@@ -5817,7 +5824,7 @@ fn execute_model_tool_with_scope(
         // Shell polling and pre-dispatch cancellation follow ownership: task rounds
         // use their task signal and top-level rounds use this run's signal.
         &request.round_cancellation(),
-        &request.run_environment,
+        &request.workspaces,
         handoff,
         &request.prompt_profile,
         Some(file_guard_context(request, state)),
@@ -6164,8 +6171,9 @@ fn execute_model_tool_with_turn_states(
         }
         result
     } else {
-        let decision = security::classify_model_call(
+        let decision = security::classify_model_call_in_workspaces(
             request.effective_security_level(),
+            &request.workspaces,
             Path::new(&request.workspace_path),
             Path::new(&request.app_data_path),
             &request.additional_directories,
@@ -6477,6 +6485,7 @@ fn web_search_request_template(
         web_search_enabled: false,
         // Search proxy calls do not enable shell tools, so a run environment has no effect.
         run_environment: Default::default(),
+        workspaces: Default::default(),
         prompt_profile: parent.prompt_profile.clone(),
         // An isolated search request has no reason to read or write the
         // user's memory, and must not be able to exfiltrate it to a page.
@@ -8081,7 +8090,11 @@ fn render_tool_functions_block(request: &RunModelRequest, names: &[String]) -> S
         let entry = json!({
             "description": descriptor.description,
             "name": descriptor.name,
-            "parameters": crate::aisdk::tools::tool_schema(descriptor, &request.prompt_profile),
+            "parameters": crate::aisdk::tools::tool_schema(
+                descriptor,
+                &request.prompt_profile,
+                &request.workspaces,
+            ),
         });
         lines.push(format!("<function>{entry}</function>"));
     }
@@ -9161,6 +9174,10 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         // Children share the conversation-level run environment; synchronous shell
         // execution location does not vary by derivation depth.
         run_environment: parent.run_environment.clone(),
+        // Children address the same numbered workspaces as their parent. A child
+        // that could reach a directory or a machine its parent could not would
+        // make derivation depth a way to widen the boundary.
+        workspaces: parent.workspaces.clone(),
         prompt_profile: parent.prompt_profile.clone(),
         // An ordinary subagent works inside the same conversation's boundary,
         // so it follows that conversation's two memory switches.
@@ -10830,16 +10847,40 @@ fn run_background_shell(
     // for foreground calls, because a background `cd` finishing at an arbitrary
     // later moment would silently relocate whatever the model ran next. The
     // context is still built so the snapshot is sourced and the argv matches.
+    //
+    // The workspace the call named decides the machine, exactly as it does for a
+    // synchronous shell: backgrounding changes when a command is waited for, not
+    // where it runs.
+    let workspaces = if parent.workspaces.is_empty() {
+        crate::workspace_set::WorkspaceSet::local_root(&parent.workspace_path)
+    } else {
+        parent.workspaces.clone()
+    };
+    let selected = match tool_executor::workspace_argument(&call.input)
+        .and_then(|index| workspaces.select(index).cloned())
+    {
+        Ok(selected) => selected,
+        Err(error) => return Ok(failed_tool_execution(call, error)),
+    };
     let shell_context = tool_executor::shell_call_context(
         kind,
-        &parent.run_environment,
+        &selected.runner,
         &parent.conversation_id,
         Some(Path::new(&parent.app_data_path)),
         state,
     );
-    let start_dir = state
-        .shell_cwd(&parent.conversation_id)
-        .unwrap_or_else(|| PathBuf::from(&parent.workspace_path));
+    let local_anchor = if selected.is_local() {
+        PathBuf::from(&selected.root)
+    } else {
+        PathBuf::from(&parent.workspace_path)
+    };
+    let start_dir = if selected.is_local() {
+        state
+            .shell_cwd(&parent.conversation_id)
+            .unwrap_or_else(|| local_anchor.clone())
+    } else {
+        local_anchor.clone()
+    };
     // The durable task address must exist before launching an independent process.
     let mut guard = match state.shell_tasks.try_register(
         &parent.conversation_id,
@@ -10851,11 +10892,12 @@ fn run_background_shell(
         Err(error) => return Ok(failed_tool_execution(call, error)),
     };
     let spawned = match tool_executor::spawn_shell_process(
-        Path::new(&parent.workspace_path),
+        &local_anchor,
+        &selected.root,
         &start_dir,
         kind,
         &command,
-        &parent.run_environment,
+        &selected.runner,
         shell_context.session(),
         &parent.prompt_profile,
     ) {
@@ -12528,6 +12570,13 @@ fn scan_changed_files(
     let mut budget = FILE_CHANGE_SNIPPET_BUDGET;
     let mut notices = Vec::new();
     for (path, record) in guard.registry.full_records(guard.scope) {
+        // A file on another machine cannot be stat'ed from here, and a failed
+        // stat must not read as "deleted": the record is what lets the next
+        // remote edit go through, and only that machine can say whether the
+        // file moved on.
+        if crate::file_read_state::is_remote_key(&path) {
+            continue;
+        }
         let Some(disk_ms) = crate::file_read_state::modified_ms(&path) else {
             guard.registry.forget(guard.scope, &path);
             continue;
@@ -12720,17 +12769,61 @@ fn resync_written_file(
 /// `rust-analyzer` start, and reading two configuration files off disk for
 /// every `write` would be a cost every conversation pays whether or not it uses
 /// code navigation at all.
-fn note_lsp_file_change(request: &RunModelRequest, execution: &ToolExecution, state: &AppState) {
+///
+/// A file on another machine is recognized by the record the remote leg took
+/// for it — its key carries the machine and the canonical path there — and the
+/// registry is asked whether a live server on that machine holds it before
+/// anything crosses the transport again.
+fn note_lsp_file_change(
+    request: &RunModelRequest,
+    execution: &ToolExecution,
+    touch: Option<&tool_executor::FileGuardTouch>,
+    state: &AppState,
+) {
     if !execution.result.success
         || !matches!(execution.call.name.as_str(), "write" | "edit")
         || !state.lsp_servers.has_running_servers()
     {
         return;
     }
+    if let Some((machine_key, canonical)) =
+        touch.and_then(|touch| crate::file_read_state::remote_key_parts(&touch.path))
+    {
+        // The workspace the call named is the machine whose shell can read the
+        // file back; the record's machine key is checked against it so a stale
+        // touch can never send one machine's path to another's shell.
+        let workspace = tool_executor::workspace_argument(&execution.call.input)
+            .ok()
+            .and_then(|index| request.workspaces.select(index).ok())
+            .filter(|workspace| {
+                crate::run_environment::env_key(workspace.machine.as_ref()) == machine_key
+            });
+        let Some(workspace) = workspace else {
+            return;
+        };
+        let runner = workspace.runner.clone();
+        let canonical = canonical.to_owned();
+        state.lsp_servers.notify_remote_file_changed(
+            machine_key,
+            Path::new(&canonical),
+            &request.conversation_id,
+            &|| crate::remote_lsp::read_text(&runner, &canonical),
+        );
+        return;
+    }
     let Some(path) = execution.call.input.get("path").and_then(Value::as_str) else {
         return;
     };
-    let workspace = Path::new(&request.workspace_path);
+    // The workspace the call named, when it is a second local checkout: the
+    // file was resolved in it, and its `.mework/lsp.json` is the one that
+    // names the server holding the file.
+    let selected = tool_executor::workspace_argument(&execution.call.input)
+        .ok()
+        .and_then(|index| request.workspaces.select(index).ok())
+        .filter(|workspace| workspace.is_local())
+        .map(|workspace| workspace.root.clone())
+        .unwrap_or_else(|| request.workspace_path.clone());
+    let workspace = Path::new(&selected);
     let configs =
         crate::lsp_config::servers_for_workspace(workspace, request.prompt_profile.language);
     let resolved = crate::lsp::resolved_workspace_path(workspace, path);
@@ -13646,8 +13739,9 @@ fn classify_tool_authorization(
             tool_name: call.name.clone(),
             input: authorization_input,
         };
-        Some(security::classify_model_call(
+        Some(security::classify_model_call_in_workspaces(
             request.effective_security_level(),
+            &request.workspaces,
             Path::new(&request.workspace_path),
             Path::new(&request.app_data_path),
             &request.additional_directories,
@@ -14687,6 +14781,7 @@ mod tests {
             web_search_enabled: false,
             native_fetch_call: None,
             run_environment: Default::default(),
+            workspaces: Default::default(),
             prompt_profile: Default::default(),
             global_memory_enabled: false,
             project_memory_enabled: false,
@@ -19360,6 +19455,7 @@ mod tests {
                     parent_conversation_id: None,
                     preset_id: String::new(),
                     template_id: String::new(),
+                    attached_workspaces: Vec::new(),
                 },
             )
             .unwrap();
@@ -19541,6 +19637,7 @@ mod tests {
                     parent_conversation_id: None,
                     preset_id: String::new(),
                     template_id: String::new(),
+                    attached_workspaces: Vec::new(),
                 },
             )
             .unwrap();
@@ -20966,6 +21063,7 @@ mod tests {
         let schema = tool_schema(
             &descriptor,
             &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::workspace_set::WorkspaceSet::default(),
         );
         assert_eq!(schema["properties"]["questions"]["minItems"], 1);
         assert_eq!(schema["properties"]["questions"]["maxItems"], 4);
@@ -20983,6 +21081,7 @@ mod tests {
             tool_schema(
                 descriptor,
                 &crate::prompt_profile::PromptProfile::builtin_english(),
+                &crate::workspace_set::WorkspaceSet::default(),
             )
         };
         fn variant_for<'a>(schema: &'a Value, action: &str) -> &'a Value {
@@ -21039,6 +21138,7 @@ mod tests {
             let schema = tool_schema(
                 descriptor,
                 &crate::prompt_profile::PromptProfile::builtin_english(),
+                &crate::workspace_set::WorkspaceSet::default(),
             );
             let properties = schema["properties"].as_object().unwrap();
             assert_eq!(schema["additionalProperties"], false, "{name}");
@@ -21075,6 +21175,7 @@ mod tests {
                     tool_schema(
                         tool,
                         &crate::prompt_profile::PromptProfile::builtin_english(),
+                        &crate::workspace_set::WorkspaceSet::default(),
                     )
                 })
                 .unwrap()["required"]
@@ -21358,6 +21459,7 @@ mod tests {
                     parent_conversation_id: None,
                     preset_id: String::new(),
                     template_id: String::new(),
+                    attached_workspaces: Vec::new(),
                 },
             )
             .unwrap();
@@ -26121,6 +26223,7 @@ mod tests {
             )),
             app_data.path().to_string_lossy().into_owned(),
             Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
         );
         // This shape has no active model run while its task remains active.
         assert!(!state.conversation_model_run_active("conv-idle"));
@@ -26182,6 +26285,7 @@ mod tests {
             )),
             app_data.path().to_string_lossy().into_owned(),
             Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
         );
         let (run_cancellation, _) = state.begin_model_run("run-1", "conv-mixed").unwrap();
 
@@ -26245,6 +26349,7 @@ mod tests {
             )),
             app_data.path().to_string_lossy().into_owned(),
             Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
         );
         let (run_cancellation, _) = state.begin_model_run("run-1", "conv-own").unwrap();
         // A card is run-owned only when it travels on an unsettled run stream.
@@ -26297,6 +26402,7 @@ mod tests {
             )),
             app_data.path().to_string_lossy().into_owned(),
             Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
         );
         // Seed a medium-risk permanent allowance for `write`.
         state
@@ -26359,6 +26465,7 @@ mod tests {
             )),
             app_data.path().to_string_lossy().into_owned(),
             Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
         );
         let request = write_request("conv-forced-2", workspace.path(), "notes.md");
         let mut descriptor = write_descriptor();
@@ -26401,6 +26508,7 @@ mod tests {
             )),
             app_data.path().to_string_lossy().into_owned(),
             Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
         );
 
         let (foreground, _) = state.begin_model_run("run-later", "conv-stop").unwrap();
@@ -26465,6 +26573,7 @@ mod tests {
             )),
             app_data.path().to_string_lossy().into_owned(),
             Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
         );
 
         // The request uses the worktree, but its target escapes to the parent checkout.
@@ -29265,6 +29374,7 @@ mod tests {
         let schema = tool_schema(
             update,
             &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::workspace_set::WorkspaceSet::default(),
         );
         assert_eq!(
             schema["description"],
@@ -31479,6 +31589,7 @@ mod tests {
         let wire = tool_schema(
             &descriptor,
             &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::workspace_set::WorkspaceSet::default(),
         );
         let mut expected = schema.as_value().clone();
         expected["description"] = json!(format!(
@@ -31562,7 +31673,11 @@ mod tests {
         }))
         .unwrap();
         let profile = PromptProfile::builtin_english();
-        let wire = tool_schema(&structured_output_descriptor(&profile, &schema), &profile);
+        let wire = tool_schema(
+            &structured_output_descriptor(&profile, &schema),
+            &profile,
+            &crate::workspace_set::WorkspaceSet::default(),
+        );
         let root = wire
             .get("description")
             .and_then(Value::as_str)
@@ -33614,6 +33729,7 @@ mod tests {
         let entry_schema = tool_schema(
             entry,
             &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::workspace_set::WorkspaceSet::default(),
         );
         assert!(entry_schema.pointer("/properties/query").is_some());
         assert!(entry_schema.pointer("/properties/objective").is_none());
@@ -35356,6 +35472,7 @@ mod tests {
             web_search_enabled: false,
             native_fetch_call: None,
             run_environment: Default::default(),
+            workspaces: Default::default(),
             prompt_profile: Default::default(),
             global_memory_enabled: false,
             project_memory_enabled: false,

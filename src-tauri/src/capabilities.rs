@@ -154,6 +154,16 @@ pub fn config_path_for(base: &Path, kind: CapabilityKind) -> PathBuf {
     preferred_config_path(base, Path::new(kind.relative_path()))
 }
 
+/// The spellings of one kind's file relative to a base directory, preferred
+/// first, for a caller that has to test them on a machine whose filesystem it
+/// cannot join paths on — the same fallback [`config_path_for`] applies here.
+pub(crate) fn relative_config_paths(kind: CapabilityKind) -> [String; 2] {
+    [
+        format!("{CONFIG_DIRECTORY}/{}", kind.relative_path()),
+        format!("{LEGACY_CONFIG_DIRECTORY}/{}", kind.relative_path()),
+    ]
+}
+
 /// The global level plus every workspace of the document — what the catalog
 /// shows, so a preset can select from any of them.
 pub fn all_levels(document: &AppDocument) -> Vec<ConfigLevel> {

@@ -37,12 +37,12 @@ use crate::{
 
 const MAX_TOOL_OUTPUT: usize = 64 * 1024;
 const MAX_DIFF_OUTPUT: usize = 64 * 1024;
-const MAX_TEXT_FILE: u64 = 2 * 1024 * 1024;
-const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_PATH_CHARS: usize = 4096;
+pub(crate) const MAX_TEXT_FILE: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_PATH_CHARS: usize = 4096;
 const MAX_COMMAND_CHARS: usize = 64 * 1024;
-const MAX_LIST_ENTRIES: usize = 2_000;
-const MAX_SEARCH_MATCHES: usize = 1_000;
+pub(crate) const MAX_LIST_ENTRIES: usize = 2_000;
+pub(crate) const MAX_SEARCH_MATCHES: usize = 1_000;
 /// How often a running command checks whether someone asked it to stop. This is what bounds the
 /// delay between pressing the stop button and the process tree dying, and — since a command has no
 /// deadline of its own — it is the only thing standing between a runaway build and the user.
@@ -51,8 +51,8 @@ const SHELL_STOP_POLL: Duration = Duration::from_millis(100);
 /// Claude Code's two read-gate refusals, byte for byte. Deliberately not
 /// prompt-profile keys: like every other tool error here they are structural,
 /// and the model's recovery ("read it, then retry") is the same in any language.
-const FILE_NOT_READ: &str = "File has not been read yet. Read it first before writing to it.";
-const FILE_MODIFIED_SINCE_READ: &str =
+pub(crate) const FILE_NOT_READ: &str = "File has not been read yet. Read it first before writing to it.";
+pub(crate) const FILE_MODIFIED_SINCE_READ: &str =
     "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.";
 
 /// The read record one call's file write guards consult. All five guards are
@@ -177,7 +177,7 @@ pub fn execute_with_scope(
         state,
         scope,
         None,
-        &crate::run_environment::ShellRunner::default(),
+        &crate::workspace_set::WorkspaceSet::default(),
         &PromptProfile::default(),
     )
 }
@@ -198,7 +198,7 @@ pub fn execute_with_scope_and_attachments(
     state: &AppState,
     scope: ExecutionScope,
     app_data: Option<&Path>,
-    runner: &crate::run_environment::ShellRunner,
+    workspaces: &crate::workspace_set::WorkspaceSet,
     profile: &PromptProfile,
 ) -> ToolExecutionResponse {
     // Direct IPC and test calls do not belong to a model turn, so they receive an
@@ -210,7 +210,7 @@ pub fn execute_with_scope_and_attachments(
         scope,
         app_data,
         &CancelSignal::default(),
-        runner,
+        workspaces,
         None,
         profile,
     )
@@ -231,12 +231,12 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
     scope: ExecutionScope,
     app_data: Option<&Path>,
     cancel: &CancelSignal,
-    runner: &crate::run_environment::ShellRunner,
+    workspaces: &crate::workspace_set::WorkspaceSet,
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
 ) -> VerifiedToolExecutionResponse {
     execute_with_scope_and_attachments_guarded(
-        request, state, scope, app_data, cancel, runner, handoff, profile, None,
+        request, state, scope, app_data, cancel, workspaces, handoff, profile, None,
     )
 }
 
@@ -251,7 +251,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
     scope: ExecutionScope,
     app_data: Option<&Path>,
     cancel: &CancelSignal,
-    runner: &crate::run_environment::ShellRunner,
+    workspaces: &crate::workspace_set::WorkspaceSet,
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
@@ -264,7 +264,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
         state,
         attachment_store.as_ref(),
         cancel,
-        runner,
+        workspaces,
         app_data,
         handoff,
         profile,
@@ -316,6 +316,73 @@ fn finish_verified_execution(
     }
 }
 
+/// Reads the `workspace` argument a multi-workspace conversation's tools carry.
+///
+/// Absent is workspace 1. The value is a number rather than a path because a
+/// path could name a directory on any machine, and the set of machines a
+/// conversation may reach is not something a tool argument gets to widen.
+/// A non-integer is refused rather than coerced: the schema states an enum of
+/// integers, and silently reading `"2"` or `2.5` as workspace 2 would make the
+/// boundary depend on how a provider happened to serialize the call.
+pub(crate) fn workspace_argument(input: &JsonObject) -> Result<Option<u32>, String> {    match input.get("workspace") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .filter(|value| *value >= 1 && *value <= u32::MAX as u64)
+            .map(|value| Some(value as u32))
+            .ok_or_else(|| {
+                "The workspace parameter must be one of the workspace numbers listed in the Environment section".to_owned()
+            }),
+        Some(_) => Err(
+            "The workspace parameter must be a number naming one of this conversation's workspaces"
+                .to_owned(),
+        ),
+    }
+}
+
+/// The remote leg's view of the selected workspace.
+///
+/// The scope the classifier chose is folded to the one bit that means anything
+/// on another machine: whether the call is confined to its workspace. Denied
+/// roots are host paths, and a restricted scope's roots are host paths too —
+/// none of them exist where this call runs.
+fn remote_workspace<'a>(
+    workspace: &'a crate::workspace_set::ResolvedWorkspace,
+    scope: &ExecutionScope,
+    profile: &'a PromptProfile,
+    cancel: &'a CancelSignal,
+) -> crate::remote_files::RemoteWorkspace<'a> {
+    crate::remote_files::RemoteWorkspace {
+        workspace,
+        machine_key: crate::run_environment::env_key(workspace.machine.as_ref()),
+        confinement: match scope {
+            ExecutionScope::Restricted { .. } | ExecutionScope::RestrictedExcept { .. } => {
+                crate::remote_files::Confinement::Workspace
+            }
+            ExecutionScope::Unrestricted | ExecutionScope::UnrestrictedExcept { .. } => {
+                crate::remote_files::Confinement::Machine
+            }
+        },
+        profile,
+        cancel,
+    }
+}
+
+impl From<crate::remote_files::RemoteOutcome> for Outcome {
+    fn from(outcome: crate::remote_files::RemoteOutcome) -> Self {
+        Self {
+            success: true,
+            output: outcome.output,
+            images: outcome.images,
+            diff: outcome.diff,
+            // No handle was opened in this process, so there is no local
+            // identity to hand the run loop.
+            opened_file: None,
+            file_touch: outcome.file_touch,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tool(
     request: &ToolExecutionRequest,
@@ -323,37 +390,107 @@ fn run_tool(
     state: &AppState,
     attachment_store: Option<&ImageAttachmentStore>,
     cancel: &CancelSignal,
-    runner: &crate::run_environment::ShellRunner,
+    workspaces: &crate::workspace_set::WorkspaceSet,
     app_data: Option<&Path>,
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
 ) -> Result<Outcome, String> {
-    let workspace = Path::new(&request.workspace_path);
+    // A caller that resolved no set is a caller with one workspace: its own
+    // request path. Direct IPC, replayed timeline entries and tests all arrive
+    // this way, and every one of them means "act where this conversation acts".
+    let fallback;
+    let workspaces = if workspaces.is_empty() {
+        fallback = crate::workspace_set::WorkspaceSet::local_root(&request.workspace_path);
+        &fallback
+    } else {
+        workspaces
+    };
+    // Which workspace this call acts in. A conversation with one workspace never
+    // sees the parameter and every call lands on workspace 1; a conversation with
+    // several has been told their numbers, and the number is the only thing that
+    // selects a machine — a path never does.
+    let selected = workspaces.select(workspace_argument(&request.input)?)?;
+    // The host-side anchor. It is the primary workspace when that is local, and
+    // the conversation's local scratch root when it is not: the preview and
+    // browser tools are host-machine subsystems and need a real local directory
+    // whatever machine the model is addressing.
+    let anchor = Path::new(&request.workspace_path);
+    // Filesystem tools act inside the selected workspace, so relative arguments
+    // resolve against its root rather than against the anchor.
+    let workspace = if selected.is_local() {
+        Path::new(&selected.root)
+    } else {
+        anchor
+    };
+    // Filesystem tools on another machine go through that machine's shell; the
+    // path never touches this filesystem, and a language server for such a
+    // workspace is started there too. Everything after this match is a
+    // host-side tool, or one whose workspace is here.
+    if !selected.is_local() {
+        let remote = remote_workspace(selected, scope, profile, cancel);
+        match request.tool_name.as_str() {
+            "ls" => return crate::remote_files::run_ls(&remote, &request.input).map(Outcome::success),
+            "grep" => {
+                return crate::remote_files::run_grep(&remote, &request.input).map(Outcome::success)
+            }
+            "find" => {
+                return crate::remote_files::run_find(&remote, &request.input).map(Outcome::success)
+            }
+            "read" => {
+                return crate::remote_files::run_read(
+                    &remote,
+                    &request.input,
+                    attachment_store,
+                    file_guard,
+                )
+                .map(Outcome::from)
+            }
+            "write" => {
+                return crate::remote_files::run_write(&remote, &request.input, file_guard)
+                    .map(Outcome::from)
+            }
+            "edit" => {
+                return crate::remote_files::run_edit(&remote, &request.input, file_guard)
+                    .map(Outcome::from)
+            }
+            "lsp" => {
+                return crate::remote_lsp::run(
+                    &remote,
+                    &state.lsp_servers,
+                    &request.input,
+                    profile.language,
+                    &request.conversation_id,
+                )
+                .map(Outcome::success)
+            }
+            _ => {}
+        }
+    }
     match request.tool_name.as_str() {
         "ls" => run_ls(workspace, &request.input, scope, profile).map(Outcome::success),
         "grep" => run_grep(workspace, &request.input, scope, profile).map(Outcome::success),
         "powershell" => run_shell(
-            workspace,
+            selected,
+            anchor,
             &request.input,
             ShellKind::PowerShell,
             &request.conversation_id,
             state,
             cancel,
-            runner,
             app_data,
             handoff,
             profile,
             file_guard,
         ),
         "bash" => run_shell(
-            workspace,
+            selected,
+            anchor,
             &request.input,
             ShellKind::Bash,
             &request.conversation_id,
             state,
             cancel,
-            runner,
             app_data,
             handoff,
             profile,
@@ -1197,23 +1334,22 @@ fn run_lsp(
     let configs = crate::lsp_config::servers_for_workspace(workspace, profile.language);
     crate::lsp::execute(
         &state.lsp_servers,
+        &crate::lsp_servers::ServerHost::Local,
         &configs,
         workspace,
         &path,
         &call,
         &request.conversation_id,
+        &crate::lsp::LocalFiles {
+            path: &path,
+            requested: &requested,
+        },
     )
 }
 
-fn run_read(
-    workspace: &Path,
-    input: &JsonObject,
-    scope: &ExecutionScope,
-    attachment_store: Option<&ImageAttachmentStore>,
-    profile: &PromptProfile,
-    file_guard: Option<FileGuardContext<'_>>,
-) -> Result<Outcome, String> {
-    let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
+/// The line range a `read` asked for, validated. `end_line` is `u64::MAX` when
+/// the call did not bound it.
+pub(crate) fn parse_read_range(input: &JsonObject) -> Result<(u64, u64), String> {
     let start_line = optional_u64(input, "start_line", 1)?;
     let end_line = optional_u64_value(input, "end_line")?;
     if start_line == 0 {
@@ -1226,6 +1362,61 @@ fn run_read(
     if end_line != u64::MAX && end_line.saturating_sub(start_line) > 5_000 {
         return Err("A single read cannot exceed 5001 lines".into());
     }
+    Ok((start_line, end_line))
+}
+
+/// What a text `read` shows for its range.
+pub(crate) struct TextSlice {
+    pub output: String,
+    /// Whether the whole file was in front of the model: no range, and the
+    /// line cap did not cut it. Only such a read can vouch for the file.
+    pub whole_file: bool,
+}
+
+/// Slices `content` to the validated range, applying the 5001-line cap and
+/// the out-of-range wording. Shared by the host and remote legs so a file
+/// reads the same whichever machine it is on.
+pub(crate) fn slice_text_lines(
+    content: &str,
+    start_line: u64,
+    end_line: u64,
+    profile: &PromptProfile,
+) -> TextSlice {
+    let lines = content.lines().collect::<Vec<_>>();
+    let start_index = (start_line - 1).min(usize::MAX as u64) as usize;
+    if start_index >= lines.len() {
+        // Only an empty file reaches here from line 1, and that is a full read
+        // of it; any other start is a slice that saw nothing.
+        return TextSlice {
+            output: profile.text(PromptKey::ToolReadRangeOutOfBounds).to_owned(),
+            whole_file: start_line == 1 && end_line == u64::MAX,
+        };
+    }
+    let end_index = if end_line == u64::MAX {
+        lines.len().min(start_index.saturating_add(5_001))
+    } else {
+        (end_line.min(lines.len() as u64)) as usize
+    };
+    let mut output = lines[start_index..end_index].join("\n");
+    if end_line == u64::MAX && end_index < lines.len() {
+        output.push_str(&profile.render(PromptKey::ToolReadLimit, &[("limit", "5001")]));
+    }
+    TextSlice {
+        output,
+        whole_file: start_line == 1 && end_line == u64::MAX && end_index >= lines.len(),
+    }
+}
+
+fn run_read(
+    workspace: &Path,
+    input: &JsonObject,
+    scope: &ExecutionScope,
+    attachment_store: Option<&ImageAttachmentStore>,
+    profile: &PromptProfile,
+    file_guard: Option<FileGuardContext<'_>>,
+) -> Result<Outcome, String> {
+    let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
+    let (start_line, end_line) = parse_read_range(input)?;
 
     let (mut file, file_path) = secure_open_existing_file_with_scope(workspace, &path, scope)?;
     let metadata = file
@@ -1290,41 +1481,15 @@ fn run_read(
     // bytes were read. If the file changes between the two, the record is
     // older than the disk and the next edit reads as stale — the safe side.
     let modified_ms = file_read_state::modified_ms_of(&metadata);
-    let lines = content.lines().collect::<Vec<_>>();
-    let start_index = (start_line - 1).min(usize::MAX as u64) as usize;
-    if start_index >= lines.len() {
-        // Only an empty file reaches here from line 1, and that is a full read
-        // of it; any other start is a slice that saw nothing.
-        let record = if start_line == 1 && end_line == u64::MAX {
-            FileReadRecord::full_read(modified_ms, file_read_state::normalize_text(&content))
-        } else {
-            FileReadRecord::partial_read(modified_ms)
-        };
-        return Ok(
-            Outcome::success(profile.text(PromptKey::ToolReadRangeOutOfBounds).to_owned())
-                .with_file_touch(read_touch(file_guard, &file_path, record))
-                .with_opened_file(file_path),
-        );
-    }
-    let end_index = if end_line == u64::MAX {
-        lines.len().min(start_index.saturating_add(5_001))
-    } else {
-        (end_line.min(lines.len() as u64)) as usize
-    };
-    let mut output = lines[start_index..end_index].join("\n");
-    if end_line == u64::MAX && end_index < lines.len() {
-        output.push_str(&profile.render(PromptKey::ToolReadLimit, &[("limit", "5001")]));
-    }
-    // A full record needs the whole file in front of the model: no range, and
-    // the line cap did not cut it. Anything less is remembered, but vouches
-    // for nothing about the parts it did not show.
-    let whole_file = start_line == 1 && end_line == u64::MAX && end_index >= lines.len();
-    let record = if whole_file {
+    let slice = slice_text_lines(&content, start_line, end_line, profile);
+    // A full record needs the whole file in front of the model. Anything less
+    // is remembered, but vouches for nothing about the parts it did not show.
+    let record = if slice.whole_file {
         FileReadRecord::full_read(modified_ms, file_read_state::normalize_text(&content))
     } else {
         FileReadRecord::partial_read(modified_ms)
     };
-    Ok(Outcome::success(output)
+    Ok(Outcome::success(slice.output)
         .with_file_touch(read_touch(file_guard, &file_path, record))
         .with_opened_file(file_path))
 }
@@ -1391,7 +1556,7 @@ fn check_write_gate(
 /// current in your context — no need to Read it back)" after every write so
 /// the model does not re-read what it just wrote; the stale-recovery variant
 /// instead warns that the file holds changes the model has not seen.
-fn write_receipt_note(profile: &PromptProfile, stale_recovered: bool) -> String {
+pub(crate) fn write_receipt_note(profile: &PromptProfile, stale_recovered: bool) -> String {
     if stale_recovered {
         profile.text(PromptKey::ToolEditStaleRecovered).to_owned()
     } else {
@@ -1552,7 +1717,7 @@ fn run_edit(
 /// 4096 characters, a byte-order mark when the file had one. Without that
 /// fallback a CRLF file could only be edited with find text spelled in CRLF,
 /// which is not how a model that saw it through `read` would spell it.
-fn apply_edit(content: &str, find: &str, replace: &str) -> Result<String, String> {
+pub(crate) fn apply_edit(content: &str, find: &str, replace: &str) -> Result<String, String> {
     let raw_occurrences = content.matches(find).count();
     if raw_occurrences == 1 {
         return Ok(content.replacen(find, replace, 1));
@@ -1596,14 +1761,14 @@ fn apply_edit(content: &str, find: &str, replace: &str) -> Result<String, String
 
 /// Claude Code's line-ending vote: CRLF when the first 4096 characters hold
 /// more CRLF than bare LF line ends.
-fn crlf_dominant(content: &str) -> bool {
+pub(crate) fn crlf_dominant(content: &str) -> bool {
     let sample: String = content.chars().take(4096).collect();
     let crlf = sample.matches("\r\n").count();
     let lf = sample.matches('\n').count() - crlf;
     crlf > lf
 }
 
-fn unified_diff(path: &str, before: &str, after: &str, created: bool) -> Option<String> {
+pub(crate) fn unified_diff(path: &str, before: &str, after: &str, created: bool) -> Option<String> {
     if before == after {
         return None;
     }
@@ -1984,7 +2149,7 @@ struct ShellLaunchPlan {
 /// PowerShell is unavailable in remote environments because WSL and SSH provide
 /// POSIX user spaces; silently passing PowerShell syntax to Bash would be misleading.
 fn shell_launch_plan(
-    workspace: &Path,
+    workspace_root: &str,
     kind: ShellKind,
     command: &str,
     runner: &crate::run_environment::ShellRunner,
@@ -2050,7 +2215,7 @@ fn shell_launch_plan(
             run_environment::validate_wsl_distro_name(distro)?;
             Ok(ShellLaunchPlan {
                 candidates: vec!["wsl.exe".into()],
-                args: run_environment::wsl_shell_args(distro, workspace, env, command),
+                args: run_environment::wsl_shell_args(distro, workspace_root, env, command),
                 // Keep discovery and execution aligned. New WSL emits UTF-8, while
                 // older versions use this variable as a switch; command output bypasses it.
                 env: vec![("WSL_UTF8".into(), "1".into())],
@@ -2061,7 +2226,6 @@ fn shell_launch_plan(
             host,
             port,
             identity_file,
-            remote_cwd,
             ..
         } => {
             if matches!(kind, ShellKind::PowerShell) {
@@ -2076,7 +2240,7 @@ fn shell_launch_plan(
                     host,
                     *port,
                     identity_file,
-                    remote_cwd,
+                    workspace_root,
                     env,
                     command,
                 ),
@@ -2100,7 +2264,8 @@ fn shell_launch_plan(
 /// of a conversation and the directory the previous call reported afterwards,
 /// which is the whole of how `cd` persists — the shell itself does not.
 pub(crate) fn spawn_shell_process(
-    workspace: &Path,
+    anchor: &Path,
+    workspace_root: &str,
     start_dir: &Path,
     kind: ShellKind,
     command: &str,
@@ -2108,15 +2273,15 @@ pub(crate) fn spawn_shell_process(
     session: ShellSession<'_>,
     profile: &PromptProfile,
 ) -> Result<SpawnedShell, String> {
-    let workspace = canonical_workspace(workspace)?;
+    let anchor = canonical_workspace(anchor)?;
     // A start directory that has gone away must not fail the call: fall back to
     // the workspace, exactly as a fresh conversation would begin.
     let start_dir = if start_dir.is_dir() {
         start_dir.to_path_buf()
     } else {
-        workspace.clone()
+        anchor.clone()
     };
-    let plan = shell_launch_plan(&workspace, kind, command, runner, session)?;
+    let plan = shell_launch_plan(workspace_root, kind, command, runner, session)?;
 
     let mut last_not_found = None;
     for executable in &plan.candidates {
@@ -2372,18 +2537,19 @@ pub(crate) fn trim_incomplete_utf8_tail(bytes: &mut Vec<u8>) {
 }
 
 fn run_shell(
-    workspace: &Path,
+    workspace: &crate::workspace_set::ResolvedWorkspace,
+    anchor: &Path,
     input: &JsonObject,
     kind: ShellKind,
     conversation_id: &str,
     state: &AppState,
     cancel: &CancelSignal,
-    runner: &crate::run_environment::ShellRunner,
     app_data: Option<&Path>,
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
 ) -> Result<Outcome, String> {
+    let runner = &workspace.runner;
     let command = parse_shell_command(input)?;
     // The background leg lives in the model run loop (it needs the turn's
     // agent pool). A `run_in_background` that reaches this executor came from
@@ -2400,14 +2566,26 @@ fn run_shell(
         return Err("The run or task was stopped, so the command did not start; do not retry directly, and first confirm the user's intent".into());
     }
     let context = shell_call_context(kind, runner, conversation_id, app_data, state);
-    let start_dir = state
-        .shell_cwd(conversation_id)
-        .unwrap_or_else(|| workspace.to_path_buf());
+    // `cd` only persists for local calls, and only inside the workspace that
+    // recorded it. A remote call begins at its workspace root every time.
+    let start_dir = if workspace.is_local() {
+        state
+            .shell_cwd(conversation_id)
+            .unwrap_or_else(|| PathBuf::from(&workspace.root))
+    } else {
+        anchor.to_path_buf()
+    };
+    let local_anchor = if workspace.is_local() {
+        Path::new(&workspace.root)
+    } else {
+        anchor
+    };
     // Taken before the spawn: a file whose time moved past this is one the
     // command could have touched.
     let command_started_ms = file_read_state::now_ms();
     let mut spawned = spawn_shell_process(
-        workspace,
+        local_anchor,
+        &workspace.root,
         &start_dir,
         kind,
         &command,
@@ -2448,13 +2626,13 @@ fn run_shell(
             // interpreter only reaches its `pwd` clause when everything before it
             // succeeded, so a failed command leaves no file and cannot move the
             // session.
-            if let Some(cwd) = adopt_reported_cwd(context.cwd_file(), workspace) {
+            if let Some(cwd) = adopt_reported_cwd(context.cwd_file(), local_anchor) {
                 state.set_shell_cwd(conversation_id, cwd);
             }
             let mut output = result.output;
             if let Some(hint) = stale_read_hint(
                 file_guard,
-                workspace,
+                local_anchor,
                 &command,
                 command_started_ms,
                 profile,
@@ -3200,7 +3378,7 @@ fn read_text_file_handle(file: &mut File) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|error| format!("Failed to read text file as UTF-8: {error}"))
 }
 
-fn required_string(
+pub(crate) fn required_string(
     input: &Map<String, Value>,
     key: &str,
     max_chars: usize,
@@ -3222,7 +3400,7 @@ fn required_string(
     Ok(value.to_owned())
 }
 
-fn optional_string(
+pub(crate) fn optional_string(
     input: &Map<String, Value>,
     key: &str,
     default: &str,
@@ -3246,11 +3424,11 @@ fn optional_owned_string(
     required_string(input, key, max_chars, false).map(Some)
 }
 
-fn optional_u64(input: &Map<String, Value>, key: &str, default: u64) -> Result<u64, String> {
+pub(crate) fn optional_u64(input: &Map<String, Value>, key: &str, default: u64) -> Result<u64, String> {
     optional_u64_value(input, key).map(|value| value.unwrap_or(default))
 }
 
-fn optional_u64_value(input: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+pub(crate) fn optional_u64_value(input: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
     let Some(value) = input.get(key) else {
         return Ok(None);
     };
@@ -3263,7 +3441,7 @@ fn optional_u64_value(input: &Map<String, Value>, key: &str) -> Result<Option<u6
         .ok_or_else(|| format!("Parameter {key} must be a non-negative integer"))
 }
 
-fn optional_bool(input: &Map<String, Value>, key: &str, default: bool) -> Result<bool, String> {
+pub(crate) fn optional_bool(input: &Map<String, Value>, key: &str, default: bool) -> Result<bool, String> {
     let Some(value) = input.get(key) else {
         return Ok(default);
     };
@@ -3302,7 +3480,7 @@ fn truncate_diff(value: &str, profile: &PromptProfile) -> String {
     format!("{}{marker}", &value[..end])
 }
 
-fn truncate_chars(value: &str, limit: usize) -> String {
+pub(crate) fn truncate_chars(value: &str, limit: usize) -> String {
     let mut chars = value.chars();
     let result = chars.by_ref().take(limit).collect::<String>();
     if chars.next().is_some() {
@@ -3491,7 +3669,7 @@ mod tests {
                 &state,
                 ExecutionScope::workspace_only(directory.path()),
                 Some(app_data.as_path()),
-                &crate::run_environment::ShellRunner::default(),
+                &crate::workspace_set::WorkspaceSet::default(),
                 &PromptProfile::builtin_english(),
             )
         };
@@ -3600,7 +3778,7 @@ mod tests {
             ExecutionScope::workspace_only(directory.path()),
             None,
             &CancelSignal::default(),
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             None,
             &PromptProfile::builtin_english(),
         )
@@ -4428,7 +4606,7 @@ mod tests {
         // nothing — so the selection rule is pinned by its own unit tests in
         // `run_environment`.
         match shell_launch_plan(
-            workspace.path(),
+            &workspace.path().to_string_lossy(),
             ShellKind::Bash,
             "echo hi",
             &runner,
@@ -4463,9 +4641,14 @@ mod tests {
                     cwd_file: &cwd_file,
                     temp_dir: None,
                 };
-                let fallback =
-                    shell_launch_plan(workspace.path(), ShellKind::Bash, "echo hi", &runner, bare)
-                        .unwrap();
+                let fallback = shell_launch_plan(
+                    &workspace.path().to_string_lossy(),
+                    ShellKind::Bash,
+                    "echo hi",
+                    &runner,
+                    bare,
+                )
+                .unwrap();
                 assert_eq!(fallback.args[..2], ["-c", "-l"]);
                 assert_eq!(fallback.args.len(), 3);
             }
@@ -4478,7 +4661,7 @@ mod tests {
         }
 
         match shell_launch_plan(
-            workspace.path(),
+            &workspace.path().to_string_lossy(),
             ShellKind::PowerShell,
             "echo hi",
             &runner,
@@ -4716,7 +4899,7 @@ mod tests {
                 &AppState::default(),
                 ExecutionScope::workspace_only(&workspace),
                 None,
-                &crate::run_environment::ShellRunner::default(),
+                &crate::workspace_set::WorkspaceSet::default(),
                 &PromptProfile::builtin_english(),
             );
             assert!(!result.success);
@@ -4755,13 +4938,18 @@ mod tests {
                 host: "user@host".into(),
                 port: 22,
                 identity_file: String::new(),
-                remote_cwd: String::new(),
                 env,
             },
         ];
         for (index, runner) in runners.iter().enumerate() {
-            let plan =
-                shell_launch_plan(directory.path(), ShellKind::Bash, "true", runner, bare).unwrap();
+            let plan = shell_launch_plan(
+                &directory.path().to_string_lossy(),
+                ShellKind::Bash,
+                "true",
+                runner,
+                bare,
+            )
+            .unwrap();
             if index == 0 {
                 assert!(plan
                     .env
@@ -4793,8 +4981,14 @@ mod tests {
             cwd_file: &cwd_file,
             temp_dir: None,
         };
-        let plan =
-            shell_launch_plan(workspace.path(), ShellKind::Bash, "echo hi", &runner, bare).unwrap();
+        let plan = shell_launch_plan(
+            &workspace.path().to_string_lossy(),
+            ShellKind::Bash,
+            "echo hi",
+            &runner,
+            bare,
+        )
+        .unwrap();
         assert_eq!(plan.candidates, vec!["wsl.exe"]);
         let workspace_arg = workspace.path().to_string_lossy().into_owned();
         assert_eq!(
@@ -4818,7 +5012,7 @@ mod tests {
         assert!(!plan.local_hardening);
 
         let error = shell_launch_plan(
-            workspace.path(),
+            &workspace.path().to_string_lossy(),
             ShellKind::PowerShell,
             "echo hi",
             &runner,
@@ -4836,7 +5030,6 @@ mod tests {
             host: "user@devbox".into(),
             port: 0,
             identity_file: String::new(),
-            remote_cwd: String::new(),
             env: Default::default(),
         };
 
@@ -4846,8 +5039,14 @@ mod tests {
             cwd_file: &cwd_file,
             temp_dir: None,
         };
-        let plan =
-            shell_launch_plan(workspace.path(), ShellKind::Bash, "pwd", &runner, bare).unwrap();
+        let plan = shell_launch_plan(
+            &workspace.path().to_string_lossy(),
+            ShellKind::Bash,
+            "pwd",
+            &runner,
+            bare,
+        )
+        .unwrap();
         assert!(plan.candidates.contains(&"ssh".to_owned()));
         assert_eq!(
             plan.args[..4],
@@ -4857,7 +5056,7 @@ mod tests {
         assert!(!plan.local_hardening);
 
         assert!(shell_launch_plan(
-            workspace.path(),
+            &workspace.path().to_string_lossy(),
             ShellKind::PowerShell,
             "pwd",
             &runner,
@@ -4894,7 +5093,10 @@ mod tests {
             &state,
             ExecutionScope::workspace_only(directory.path()),
             None,
-            &runner,
+            &crate::workspace_set::WorkspaceSet::single(
+                directory.path().to_string_lossy().into_owned(),
+                runner,
+            ),
             &PromptProfile::builtin_english(),
         );
         assert!(result.success, "{}", result.output);
@@ -5004,7 +5206,7 @@ mod tests {
             ExecutionScope::workspace_only(directory.path()),
             None,
             &signal,
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             None,
             &PromptProfile::builtin_english(),
         )
@@ -5076,7 +5278,7 @@ mod tests {
             ExecutionScope::workspace_only(directory.path()),
             None,
             &signal,
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             None,
             &PromptProfile::builtin_english(),
         )
@@ -5132,7 +5334,7 @@ mod tests {
             ExecutionScope::workspace_only(directory.path()),
             None,
             &signal,
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             None,
             &PromptProfile::builtin_english(),
         )
@@ -5192,7 +5394,7 @@ mod tests {
                 ExecutionScope::workspace_only(directory.path()),
                 None,
                 &CancelSignal::default(),
-                &crate::run_environment::ShellRunner::default(),
+                &crate::workspace_set::WorkspaceSet::default(),
                 None,
                 &PromptProfile::builtin_english(),
             )
@@ -5258,7 +5460,7 @@ mod tests {
             ExecutionScope::workspace_only(directory.path()),
             None,
             &signal,
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             None,
             &PromptProfile::builtin_english(),
         )
@@ -5350,7 +5552,7 @@ mod tests {
             &state,
             scope,
             Some(app_data.path()),
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             &PromptProfile::builtin_english(),
         );
         assert!(result.success, "{}", result.output);
@@ -5387,7 +5589,7 @@ mod tests {
             &AppState::default(),
             scope,
             Some(app_data.path()),
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             &PromptProfile::builtin_english(),
         );
         assert!(!result.success);

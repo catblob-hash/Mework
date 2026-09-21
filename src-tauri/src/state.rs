@@ -1195,6 +1195,19 @@ impl AppState {
         self.approvals.require_workspace_authorization(path)
     }
 
+    pub fn authorize_remote_workspace(&self, machine_key: &str, path: &str) {
+        self.approvals.authorize_remote_workspace(machine_key, path);
+    }
+
+    pub fn require_remote_workspace_authorization(
+        &self,
+        machine_key: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        self.approvals
+            .require_remote_workspace_authorization(machine_key, path)
+    }
+
     pub fn workspace_key(path: &Path) -> Option<String> {
         ApprovalRegistry::workspace_key(path)
     }

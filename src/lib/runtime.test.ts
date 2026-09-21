@@ -67,33 +67,57 @@ describe("document normalization", () => {
   });
 
   /**
-   * An extra working directory widens a conversation's filesystem boundary, so a
-   * malformed entry is dropped rather than repaired: the host re-checks every one
-   * against its own authorization record and would refuse the save anyway.
+   * A workspace widens a conversation's filesystem boundary, so a malformed
+   * entry is dropped rather than repaired: the host re-checks every one against
+   * its own authorization record and would refuse the save anyway.
    */
-  it("keeps only well-formed, deduplicated extra working directories", () => {
+  it("keeps only well-formed, deduplicated attached workspaces", () => {
     const document = createSeedDocument();
     const conversation = document.workspaces[0].conversations[0] as unknown as Record<string, unknown>;
-    conversation.additionalDirectories = [
-      "D:/shared/lib",
-      "  D:/docs  ",
-      "D:/shared/lib",
-      "",
-      42,
-      "D:/".padEnd(5000, "x")
+    conversation.attachedWorkspaces = [
+      { path: "D:/shared/lib" },
+      { path: "  D:/docs  " },
+      { path: "D:/shared/lib" },
+      { path: "" },
+      { path: 42 },
+      { path: "D:/".padEnd(5000, "x") },
+      // The same spelling on another machine is another directory, so it stays.
+      { machine: { kind: "ssh", machineId: "m1" }, path: "D:/shared/lib" },
+      { machine: { kind: "nonsense" }, path: "D:/kept-as-local" }
     ];
 
     const normalized = normalizeDocument(document).workspaces[0].conversations[0];
 
-    expect(normalized.additionalDirectories).toEqual(["D:/shared/lib", "D:/docs"]);
+    expect(normalized.attachedWorkspaces).toEqual([
+      { path: "D:/shared/lib" },
+      { path: "D:/docs" },
+      { machine: { kind: "ssh", machineId: "m1" }, path: "D:/shared/lib" },
+      { path: "D:/kept-as-local" }
+    ]);
   });
 
-  it("defaults a conversation without extra working directories to none", () => {
+  /**
+   * A document written before workspaces carried a machine is the only record
+   * those grants have until it is next saved, so the legacy list is read as
+   * host-machine entries rather than dropped.
+   */
+  it("folds pre-multi-machine extra directories into host-machine workspaces", () => {
     const document = createSeedDocument();
     const conversation = document.workspaces[0].conversations[0] as unknown as Record<string, unknown>;
+    delete conversation.attachedWorkspaces;
+    conversation.additionalDirectories = ["D:/shared/lib", "D:/docs"];
+
+    expect(normalizeDocument(document).workspaces[0].conversations[0].attachedWorkspaces)
+      .toEqual([{ path: "D:/shared/lib" }, { path: "D:/docs" }]);
+  });
+
+  it("defaults a conversation without attached workspaces to none", () => {
+    const document = createSeedDocument();
+    const conversation = document.workspaces[0].conversations[0] as unknown as Record<string, unknown>;
+    delete conversation.attachedWorkspaces;
     delete conversation.additionalDirectories;
 
-    expect(normalizeDocument(document).workspaces[0].conversations[0].additionalDirectories)
+    expect(normalizeDocument(document).workspaces[0].conversations[0].attachedWorkspaces)
       .toEqual([]);
   });
 

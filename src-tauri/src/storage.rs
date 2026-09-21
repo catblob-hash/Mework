@@ -377,6 +377,7 @@ fn canonicalize_temporary_workspace(document: &mut AppDocument) {
             name: "临时工作区".into(),
             kind: WorkspaceKind::Temporary,
             path: String::new(),
+            machine: None,
             created_at: Utc::now().to_rfc3339(),
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
@@ -806,16 +807,26 @@ fn validate_workspace_authorizations(
     document: &AppDocument,
     state: &AppState,
 ) -> Result<(), String> {
+    // A workspace's identity is its machine and its path: one machine's
+    // `/srv/app` is not another's, and a remote path spelled like a local one
+    // must not be read as the local grant.
     let previous_exact = previous
         .workspaces
         .iter()
         .filter(|workspace| workspace.kind == WorkspaceKind::Directory)
-        .map(|workspace| workspace.path.as_str())
+        .map(|workspace| {
+            (
+                crate::run_environment::env_key(workspace.machine.as_ref()),
+                workspace.path.as_str(),
+            )
+        })
         .collect::<HashSet<_>>();
     let previous_canonical = previous
         .workspaces
         .iter()
-        .filter(|workspace| workspace.kind == WorkspaceKind::Directory)
+        .filter(|workspace| {
+            workspace.kind == WorkspaceKind::Directory && workspace.machine.is_none()
+        })
         .filter_map(|workspace| AppState::workspace_key(Path::new(&workspace.path)))
         .collect::<HashSet<_>>();
 
@@ -823,7 +834,20 @@ fn validate_workspace_authorizations(
         if workspace.kind != WorkspaceKind::Directory {
             continue;
         }
-        if previous_exact.contains(workspace.path.as_str()) {
+        let machine_key = crate::run_environment::env_key(workspace.machine.as_ref());
+        if previous_exact.contains(&(machine_key.clone(), workspace.path.as_str())) {
+            continue;
+        }
+        // A directory on another machine has no canonical form this host can
+        // compute, so its grant is the machine plus the exact text the remote
+        // browser returned — the same rule attached workspaces follow.
+        if let Some(machine) = &workspace.machine {
+            state
+                .require_remote_workspace_authorization(
+                    &crate::run_environment::env_key(Some(machine)),
+                    &workspace.path,
+                )
+                .map_err(|error| format!("工作区 {} 未获授权: {error}", workspace.id))?;
             continue;
         }
         if AppState::workspace_key(Path::new(&workspace.path))
@@ -866,50 +890,68 @@ fn validate_additional_directory_authorizations(
     Ok(())
 }
 
-/// The number of extra working directories one conversation may hold. It exists
-/// so a malfunctioning renderer cannot grow the list without bound; the
-/// composer's own chip row stops being readable long before this.
+/// The number of workspaces one conversation may attach. It exists so a
+/// malfunctioning renderer cannot grow the list without bound; the composer's
+/// own chip row stops being readable long before this, and the number is also
+/// the address space the model is given, which has to stay readable at a glance.
 const MAX_ADDITIONAL_DIRECTORIES: usize = 32;
 
-/// Holds one conversation's extra working directories to the workspace rule.
+/// Holds one conversation's attached workspaces to the workspace rule.
 ///
-/// They widen that conversation's filesystem boundary exactly as its workspace
-/// does, so they are held to the same standard: a path the renderer proposes is
-/// accepted only if the conversation already had it, or if the host's own
-/// directory picker returned it in this session. Comparison is by canonical key
-/// as well as by literal text, so re-proposing a directory spelled differently
-/// is not read as a new grant.
+/// They widen that conversation's reach exactly as its own workspace does, so
+/// they are held to the same standard: an entry the renderer proposes is
+/// accepted only if the conversation already had it, or if a picker of the
+/// host's own returned it in this session — the native dialog for a directory
+/// on this machine, the remote browser for one on another.
+///
+/// A local entry is compared by canonical key as well as by literal text, so
+/// re-proposing a directory spelled differently is not read as a new grant. A
+/// remote entry has no canonical form the host can compute — only that machine
+/// can resolve its own paths — so its identity is the machine and the exact
+/// text the browser returned.
 pub(crate) fn validate_additional_directories(
     conversation: &Conversation,
     previous: Option<&Conversation>,
     state: &AppState,
 ) -> Result<(), String> {
-    if conversation.additional_directories.len() > MAX_ADDITIONAL_DIRECTORIES {
+    let proposed = conversation.effective_attached_workspaces();
+    if proposed.len() > MAX_ADDITIONAL_DIRECTORIES {
         return Err(format!(
-            "对话 {} 的额外工作目录超过 {MAX_ADDITIONAL_DIRECTORIES} 个",
+            "对话 {} 的工作区超过 {MAX_ADDITIONAL_DIRECTORIES} 个",
             conversation.id
         ));
     }
-    let held = previous.map(|previous| previous.additional_directories.as_slice());
+    let held = previous
+        .map(Conversation::effective_attached_workspaces)
+        .unwrap_or_default();
     let held_keys = held
-        .unwrap_or_default()
         .iter()
-        .filter_map(|directory| AppState::workspace_key(Path::new(directory)))
+        .filter(|workspace| workspace.machine.is_none())
+        .filter_map(|workspace| AppState::workspace_key(Path::new(&workspace.path)))
         .collect::<HashSet<_>>();
-    for directory in &conversation.additional_directories {
-        if held.is_some_and(|held| held.iter().any(|existing| existing == directory)) {
+    for workspace in &proposed {
+        if held.iter().any(|existing| existing == workspace) {
             continue;
         }
-        if AppState::workspace_key(Path::new(directory))
-            .is_some_and(|key| held_keys.contains(&key))
-        {
+        let Some(machine) = &workspace.machine else {
+            if AppState::workspace_key(Path::new(&workspace.path))
+                .is_some_and(|key| held_keys.contains(&key))
+            {
+                continue;
+            }
+            state
+                .require_workspace_authorization(Path::new(&workspace.path))
+                .map_err(|error| {
+                    format!("对话 {} 的工作区未获授权: {error}", conversation.id)
+                })?;
             continue;
-        }
+        };
         state
-            .require_workspace_authorization(Path::new(directory))
-            .map_err(|error| {
-                format!("对话 {} 的额外工作目录未获授权: {error}", conversation.id)
-            })?;
+            .require_remote_workspace_authorization(
+                &crate::run_environment::env_key(Some(machine)),
+                &workspace.path,
+            )
+            .map_err(|error| format!("对话 {} 的工作区未获授权: {error}", conversation.id))?;
     }
     Ok(())
 }
@@ -925,6 +967,10 @@ struct PersistedWorkspaceShell {
     #[serde(default)]
     kind: WorkspaceKind,
     path: String,
+    /// Machine the directory lives on; absent is the host machine, which is what
+    /// every anchor written before workspaces could be remote means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine: Option<crate::model::RunTarget>,
     created_at: String,
     #[serde(default)]
     default_conversation_preset_id: String,
@@ -990,6 +1036,7 @@ fn assemble_layout(path: &Path, value: serde_json::Value) -> Result<AppDocument,
             name: shell.name,
             kind: shell.kind,
             path: shell.path,
+            machine: shell.machine,
             created_at: shell.created_at,
             default_conversation_preset_id: shell.default_conversation_preset_id,
             last_conversation_settings: shell.last_conversation_settings,
@@ -1230,6 +1277,7 @@ pub fn save_unchecked(path: &Path, document: &AppDocument) -> Result<(), String>
                 name: workspace.name.clone(),
                 kind: workspace.kind,
                 path: workspace.path.clone(),
+                machine: workspace.machine.clone(),
                 created_at: workspace.created_at.clone(),
                 default_conversation_preset_id: workspace.default_conversation_preset_id.clone(),
                 last_conversation_settings: workspace.last_conversation_settings.clone(),
@@ -2204,10 +2252,7 @@ fn validate_execution_environments(
         if host.starts_with('-') {
             return Err(format!("SSH 机器 {name} 的主机地址不能以 - 开头"));
         }
-        for (label, value) in [
-            ("身份文件路径", &machine.identity_file),
-            ("远端工作目录", &machine.remote_cwd),
-        ] {
+        for (label, value) in [("身份文件路径", &machine.identity_file)] {
             if value.chars().count() > MAX_PATH_FIELD_CHARS {
                 return Err(format!("SSH 机器 {name} 的{label}过长"));
             }
@@ -5830,6 +5875,7 @@ b"
             created_at: "2026-01-01T00:00:00Z".into(),
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
+            machine: None,
             conversations: Vec::new(),
         });
         assert!(validate_shape(&unsupported)
@@ -7326,7 +7372,7 @@ b"
     }
 
     #[test]
-    fn extra_working_directories_are_bounded_and_survive_an_unchanged_save() {
+    fn attached_workspaces_are_bounded_and_survive_an_unchanged_save() {
         let directory = tempfile::tempdir().unwrap();
         let picked = directory.path().join("shared-library");
         fs::create_dir(&picked).unwrap();
@@ -7334,13 +7380,83 @@ b"
         state.authorize_workspace(&picked).unwrap();
 
         let mut conversation = default_document().workspaces[0].conversations[0].clone();
-        conversation.additional_directories =
-            vec![picked.to_string_lossy().into_owned(); MAX_ADDITIONAL_DIRECTORIES + 1];
+        conversation.attached_workspaces = vec![
+            crate::model::AttachedWorkspace {
+                machine: None,
+                path: picked.to_string_lossy().into_owned(),
+            };
+            MAX_ADDITIONAL_DIRECTORIES + 1
+        ];
         let error = validate_additional_directories(&conversation, None, &state)
             .expect_err("an unbounded list must be refused");
-        assert!(error.contains("额外工作目录超过"), "{error}");
+        assert!(error.contains("工作区超过"), "{error}");
 
-        conversation.additional_directories.truncate(1);
+        conversation.attached_workspaces.truncate(1);
         assert!(validate_additional_directories(&conversation, None, &state).is_ok());
+    }
+
+    /// A directory on another machine has no canonical form this host can
+    /// compute, so its grant is the machine plus the exact text the remote
+    /// browser returned — and nothing else may stand in for it.
+    #[test]
+    fn a_remote_workspace_needs_a_grant_from_the_remote_browser() {
+        let state = AppState::default();
+        let machine = crate::model::RunTarget::Ssh {
+            machine_id: "m1".into(),
+        };
+        let mut conversation = default_document().workspaces[0].conversations[0].clone();
+        conversation.attached_workspaces = vec![crate::model::AttachedWorkspace {
+            machine: Some(machine.clone()),
+            path: "/srv/app".into(),
+        }];
+
+        assert!(validate_additional_directories(&conversation, None, &state).is_err());
+        // A grant for the same path on this machine is not a grant for that one.
+        state.authorize_remote_workspace("local", "/srv/app");
+        assert!(validate_additional_directories(&conversation, None, &state).is_err());
+        state.authorize_remote_workspace("ssh:m1", "/srv/app");
+        assert!(validate_additional_directories(&conversation, None, &state).is_ok());
+
+        // Once held it survives a session that never opened the browser.
+        let fresh = AppState::default();
+        assert!(
+            validate_additional_directories(&conversation, Some(&conversation), &fresh).is_ok()
+        );
+    }
+
+    /// The workspace library follows the same rule as a conversation's attached
+    /// list: a top-level workspace on another machine is authorized by the
+    /// remote browser's grant, keyed by machine and exact path, and neither a
+    /// local grant for the same spelling nor a previous workspace at that path
+    /// on another machine stands in for it.
+    #[test]
+    fn a_remote_primary_workspace_needs_the_remote_grant() {
+        let previous = default_document();
+        let mut changed = previous.clone();
+        let mut workspace = changed.workspaces[0].clone();
+        workspace.id = "ws_remote".into();
+        workspace.path = "/srv/app".into();
+        workspace.machine = Some(crate::model::RunTarget::Ssh {
+            machine_id: "m1".into(),
+        });
+        workspace.conversations.clear();
+        changed.workspaces.push(workspace);
+
+        let state = AppState::default();
+        assert!(validate_workspace_authorizations(&previous, &changed, &state).is_err());
+        state.authorize_remote_workspace("wsl:Ubuntu", "/srv/app");
+        assert!(validate_workspace_authorizations(&previous, &changed, &state).is_err());
+        state.authorize_remote_workspace("ssh:m1", "/srv/app");
+        assert!(validate_workspace_authorizations(&previous, &changed, &state).is_ok());
+
+        // A workspace the previous document already held keeps its standing
+        // without any grant in this session — by machine and path together.
+        let fresh = AppState::default();
+        assert!(validate_workspace_authorizations(&changed, &changed, &fresh).is_ok());
+        let mut relocated = changed.clone();
+        relocated.workspaces.last_mut().unwrap().machine = Some(crate::model::RunTarget::Wsl {
+            distro: "Ubuntu".into(),
+        });
+        assert!(validate_workspace_authorizations(&changed, &relocated, &fresh).is_err());
     }
 }

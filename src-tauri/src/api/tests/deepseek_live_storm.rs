@@ -345,6 +345,7 @@ fn seed_conversation_row(app_data: &std::path::Path, workspace_id: &str, convers
                 parent_conversation_id: None,
                 preset_id: String::new(),
                 template_id: String::new(),
+                attached_workspaces: Vec::new(),
             },
         )
         .expect("seed conversation row");

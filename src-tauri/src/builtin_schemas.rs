@@ -19,6 +19,7 @@ use crate::agents::{
     WAIT_MIN_TIMEOUT_SECONDS,
 };
 use crate::prompt_profile::{PromptKey, PromptProfile};
+use crate::workspace_set::WorkspaceSet;
 use workflow_core::MAX_SCRIPT_BYTES;
 
 /// The `description` parameter text shared by the shell tools.
@@ -946,6 +947,77 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
     Some(schema)
 }
 
+/// Whether a tool's arguments name a place — a path to act on, or a command
+/// whose working directory and machine follow from where it runs.
+///
+/// The preview, browser and memory tools are absent on purpose. They are host
+/// subsystems rather than things that happen in a directory: a dev server, a
+/// page, and a Markdown store the host owns. Giving them a workspace number
+/// would advertise a choice that changes nothing.
+pub(crate) fn takes_a_workspace(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "ls" | "grep" | "find" | "read" | "write" | "edit" | "lsp" | "bash" | "powershell"
+    )
+}
+
+/// Adds the `workspace` parameter naming which workspace a call acts in.
+///
+/// The parameter appears only when the conversation has more than one workspace.
+/// With a single workspace there is nothing to choose: every call lands there,
+/// and an enum of one value would be a question whose answer is already known —
+/// tokens spent, and one more thing for a model to get wrong.
+///
+/// `enum` rather than a free integer because the allowed set is per tool. A
+/// workspace on a WSL distribution or an SSH machine is reached through `bash`,
+/// so `powershell` lists only the Windows ones; a `powershell` call naming a
+/// POSIX workspace is not a call the host could honour, and refusing it in the
+/// schema is cheaper than refusing it in a tool result.
+pub(crate) fn with_workspace_parameter(
+    mut schema: Value,
+    tool_name: &str,
+    workspaces: &WorkspaceSet,
+) -> Value {
+    if workspaces.len() < 2 || !takes_a_workspace(tool_name) {
+        return schema;
+    }
+    let addresses = if tool_name == "powershell" {
+        workspaces.powershell_addresses()
+    } else {
+        workspaces.addresses()
+    };
+    // No address means the tool has nowhere to run at all, which withdraws it
+    // from the request entirely; an empty enum here would be an unsatisfiable
+    // schema on a tool the model can still see.
+    let Some(default) = addresses.first().copied() else {
+        return schema;
+    };
+    let mut description = format!(
+        "Which of this conversation's workspaces this call acts in, named by the number the Environment section gives it. Defaults to {default}."
+    );
+    if tool_name == "powershell" && addresses.len() < workspaces.len() {
+        description.push_str(
+            " Only workspaces on Windows machines are listed; use the bash tool for the others.",
+        );
+    }
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return schema;
+    };
+    properties.insert(
+        "workspace".to_owned(),
+        json!({
+            "type": "integer",
+            "enum": addresses,
+            "default": default,
+            "description": description
+        }),
+    );
+    schema
+}
+
 fn memory_document_name(description: &str) -> Value {
     json!({
         "type": "string",
@@ -1396,7 +1468,108 @@ fn tool_search_schema(profile: &PromptProfile) -> Value {
 mod tests {
     use super::*;
     use crate::catalog::tool_catalog;
+    use crate::model::{AttachedWorkspace, ExecutionEnvironmentAssets, RunTarget, SshMachineConfig};
     use std::collections::BTreeSet;
+
+    /// A set with the host workspace first and an SSH one second, which is the
+    /// shape every rule about the parameter turns on.
+    fn mixed_workspaces() -> WorkspaceSet {
+        let assets = ExecutionEnvironmentAssets {
+            ssh_machines: vec![SshMachineConfig {
+                id: "m1".into(),
+                name: "devbox".into(),
+                host: "user@devbox".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        WorkspaceSet::resolve(
+            &assets,
+            &AttachedWorkspace {
+                machine: None,
+                path: "C:/work/app".into(),
+            },
+            &[AttachedWorkspace {
+                machine: Some(RunTarget::Ssh {
+                    machine_id: "m1".into(),
+                }),
+                path: "~/services".into(),
+            }],
+        )
+        .unwrap()
+    }
+
+    fn schema_with_workspaces(name: &str, workspaces: &WorkspaceSet) -> Value {
+        let schema = builtin_tool_schema(name, &PromptProfile::builtin_english())
+            .unwrap_or_else(|| panic!("no schema for {name}"));
+        with_workspace_parameter(schema, name, workspaces)
+    }
+
+    /// One workspace is not a choice, so the parameter is not a question worth
+    /// asking — and an enum of one value is a token cost with no answer in it.
+    #[test]
+    fn a_single_workspace_adds_no_parameter() {
+        let single = WorkspaceSet::local_root("C:/work/app");
+        for name in ["read", "bash", "powershell", "grep"] {
+            assert!(
+                !properties(&schema_with_workspaces(name, &single)).contains("workspace"),
+                "{name} should carry no workspace parameter"
+            );
+        }
+    }
+
+    #[test]
+    fn every_path_and_shell_tool_gains_the_parameter_once_there_is_a_choice() {
+        let workspaces = mixed_workspaces();
+        for name in ["ls", "grep", "find", "read", "write", "edit", "lsp", "bash"] {
+            let schema = schema_with_workspaces(name, &workspaces);
+            assert!(
+                properties(&schema).contains("workspace"),
+                "{name} should address a workspace"
+            );
+            assert_eq!(schema["properties"]["workspace"]["enum"], json!([1, 2]));
+            assert_eq!(schema["properties"]["workspace"]["default"], json!(1));
+        }
+    }
+
+    /// The preview, memory and orchestration tools are host subsystems rather
+    /// than things that happen in a directory, so a number would advertise a
+    /// choice that changes nothing.
+    #[test]
+    fn tools_that_do_not_act_in_a_directory_are_left_alone() {
+        let workspaces = mixed_workspaces();
+        for name in ["preview_start", "preview_screenshot", "ask_user", "todo"] {
+            let schema = schema_with_workspaces(name, &workspaces);
+            // `todo` is a `oneOf` with no root properties at all, which is also
+            // the shape the injector has to leave untouched rather than crash on.
+            assert!(
+                schema["properties"]["workspace"].is_null(),
+                "{name} should not address a workspace: {schema}"
+            );
+        }
+    }
+
+    /// WSL and SSH legs both invoke `bash`, so a remote workspace is POSIX and a
+    /// `powershell` call naming it is one the host could not honour.
+    #[test]
+    fn powershell_lists_only_the_workspaces_it_could_run_in() {
+        let workspaces = mixed_workspaces();
+        let schema = schema_with_workspaces("powershell", &workspaces);
+        if cfg!(windows) {
+            assert_eq!(schema["properties"]["workspace"]["enum"], json!([1]));
+            let description = schema["properties"]["workspace"]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                description.contains("Windows") && description.contains("bash"),
+                "a narrowed list has to say why and where to go instead: {description}"
+            );
+        } else {
+            // A POSIX host has no Windows workspace at all, so the tool is
+            // withdrawn from the request and never reaches this function.
+            assert!(!properties(&schema).contains("workspace"));
+        }
+    }
 
     fn properties(schema: &Value) -> BTreeSet<String> {
         schema["properties"]

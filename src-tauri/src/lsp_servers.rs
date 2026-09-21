@@ -9,8 +9,17 @@
 //! written fresh rather than borrowed from [`crate::mcp`].
 //!
 //! Servers start lazily, on the first request for a file whose extension they
-//! claim, and are keyed by `(root, name)` so every conversation in a workspace
-//! shares one `rust-analyzer` rather than paying its index cost again.
+//! claim, and are keyed by `(machine, root, name)` so every conversation in a
+//! workspace shares one `rust-analyzer` rather than paying its index cost again.
+//!
+//! A workspace on another machine gets its server *there*: the process is
+//! started through that machine's shell transport — the same `wsl.exe` or
+//! `ssh` invocation the remote file tools use — and speaks the base protocol
+//! over the wrapper's pipes. That is how Claude Code has it when it runs on a
+//! remote: the language server is a child of whatever runs where the code is,
+//! never a host-side process guessing at files it cannot open. Only the
+//! wrapper lives in this process; the paths, the `rootUri` and every
+//! `file://` URI are the remote machine's.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -30,8 +39,74 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     lsp_config::LspServerConfig,
+    run_environment::ShellRunner,
     tool_executor::{kill_process_tree_or_child, ShellJob},
 };
+
+/// Where a language server runs: in this process, or on the machine a
+/// workspace lives on.
+#[derive(Clone, Debug)]
+pub enum ServerHost {
+    Local,
+    Remote {
+        /// The transport to that machine, with its variable table.
+        runner: ShellRunner,
+        /// `run_environment::env_key` of the machine — its identity everywhere
+        /// else in the host, and the first component of every key here.
+        machine_key: String,
+        /// Human-readable machine name for the settings row and error text.
+        machine_label: String,
+    },
+}
+
+impl ServerHost {
+    /// The machine component of a [`ServerRoot`]: `local` for this process,
+    /// the machine's environment key otherwise.
+    pub fn machine_key(&self) -> String {
+        match self {
+            Self::Local => crate::run_environment::env_key(None),
+            Self::Remote { machine_key, .. } => machine_key.clone(),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    fn machine_label(&self) -> &str {
+        match self {
+            Self::Local => "",
+            Self::Remote { machine_label, .. } => machine_label,
+        }
+    }
+}
+
+/// The directory one server indexes, on the machine it indexes it.
+///
+/// Two machines can each have a `/srv/app`; a diagnostics fan-out or a registry
+/// lookup that compared paths alone would hand one machine's compile errors to
+/// a conversation working on the other.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServerRoot {
+    pub machine: String,
+    pub path: PathBuf,
+}
+
+impl ServerRoot {
+    pub fn local(path: impl Into<PathBuf>) -> Self {
+        Self {
+            machine: crate::run_environment::env_key(None),
+            path: path.into(),
+        }
+    }
+
+    pub fn new(host: &ServerHost, path: impl Into<PathBuf>) -> Self {
+        Self {
+            machine: host.machine_key(),
+            path: path.into(),
+        }
+    }
+}
 
 /// Largest message body accepted from a server, matching the source's 32 MiB
 /// cap. A server that declares more has desynchronized from the protocol.
@@ -195,7 +270,7 @@ struct ConversationLedger {
     /// The roots this conversation has reached a language server in. A publish
     /// from any other root is not its business — without this, a conversation
     /// in one project would be handed another project's compile errors.
-    roots: BTreeSet<PathBuf>,
+    roots: BTreeSet<ServerRoot>,
     pending: BTreeSet<String>,
     delivered: VecDeque<u64>,
 }
@@ -222,7 +297,7 @@ const MAX_TRACKED_FILES: usize = 512;
 const MAX_TRACKED_CONVERSATIONS: usize = 64;
 
 impl DiagnosticsLedger {
-    fn register(&mut self, conversation_id: &str, root: &Path) {
+    fn register(&mut self, conversation_id: &str, root: &ServerRoot) {
         if !self.conversations.contains_key(conversation_id) {
             self.conversation_order.push_back(conversation_id.to_owned());
             while self.conversation_order.len() > MAX_TRACKED_CONVERSATIONS {
@@ -235,10 +310,10 @@ impl DiagnosticsLedger {
             .entry(conversation_id.to_owned())
             .or_default()
             .roots
-            .insert(root.to_path_buf());
+            .insert(root.clone());
     }
 
-    fn publish(&mut self, root: &Path, uri: String, diagnostics: Vec<Diagnostic>) {
+    fn publish(&mut self, root: &ServerRoot, uri: String, diagnostics: Vec<Diagnostic>) {
         let empty = diagnostics.is_empty();
         if !self.current.contains_key(&uri) {
             self.order.push_back(uri.clone());
@@ -401,6 +476,11 @@ pub struct Connection {
     /// Why the reader stopped, when it stopped for a reason worth reporting.
     failure: Arc<Mutex<Option<String>>>,
     shutdown_timeout: Duration,
+    /// The machine the server runs on, for the settings row. Empty here.
+    machine_label: String,
+    /// Fires once the stderr drain reaches end of file, so a failure report
+    /// can wait for the server's last words rather than race the drain.
+    stderr_done: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl Connection {
@@ -574,12 +654,12 @@ fn strip_marker(error: String) -> String {
 // Registry
 // ---------------------------------------------------------------------------
 
-/// Identity of one server instance: the root it indexes and the name it was
-/// configured under. Two workspaces get two `rust-analyzer` processes; two
-/// conversations in one workspace share one.
+/// Identity of one server instance: the root it indexes — machine included —
+/// and the name it was configured under. Two workspaces get two
+/// `rust-analyzer` processes; two conversations in one workspace share one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ServerKey {
-    root: PathBuf,
+    root: ServerRoot,
     name: String,
 }
 
@@ -609,6 +689,7 @@ pub struct LspRegistry {
 #[derive(Clone, Debug)]
 pub struct LspServerSnapshot {
     pub name: String,
+    /// The root it indexes, qualified by the machine when that is not this one.
     pub root: String,
     pub running: bool,
     pub detail: String,
@@ -624,7 +705,7 @@ impl LspRegistry {
     /// Notes that `conversation_id` is now owed diagnostics. Called the first
     /// time a conversation reaches a language server, so a conversation that
     /// never uses one is never handed a backlog.
-    pub fn register_conversation(&self, conversation_id: &str, root: &Path) {
+    pub fn register_conversation(&self, conversation_id: &str, root: &ServerRoot) {
         self.lock().diagnostics.register(conversation_id, root);
     }
 
@@ -656,7 +737,17 @@ impl LspRegistry {
             .iter()
             .map(|(key, entry)| LspServerSnapshot {
                 name: key.name.clone(),
-                root: key.root.to_string_lossy().into_owned(),
+                root: if key.root.machine == crate::run_environment::env_key(None) {
+                    key.root.path.to_string_lossy().into_owned()
+                } else {
+                    let label = entry
+                        .connection
+                        .as_ref()
+                        .map(|connection| connection.machine_label.clone())
+                        .filter(|label| !label.is_empty())
+                        .unwrap_or_else(|| key.root.machine.clone());
+                    format!("{} ({label})", key.root.path.to_string_lossy())
+                },
                 running: entry
                     .connection
                     .as_ref()
@@ -687,7 +778,8 @@ impl LspRegistry {
     /// Returns a live server for `path`, starting it if this is the first call
     /// that needs it, together with the language id its configuration gives the
     /// file and the root that server indexes. `workspace` is the root a server
-    /// with no `workspaceFolder` of its own is started in.
+    /// with no `workspaceFolder` of its own is started in, and `host` is the
+    /// machine both of them are on.
     ///
     /// The root is handed back rather than left implicit because the diagnostics
     /// ledger fans out by it: a caller that registers under `workspace` while
@@ -695,15 +787,16 @@ impl LspRegistry {
     /// for a root nothing ever publishes to.
     pub fn connection_for(
         &self,
+        host: &ServerHost,
         configs: &[LspServerConfig],
         workspace: &Path,
         path: &Path,
-    ) -> Result<(Arc<Connection>, String, PathBuf), String> {
+    ) -> Result<(Arc<Connection>, String, ServerRoot), String> {
         let Some((config, language_id)) = Self::config_for_path(configs, path) else {
             return Err(no_server_for(path));
         };
-        let root = server_root(config, workspace);
-        let connection = self.ensure_started(config, &root)?;
+        let root = ServerRoot::new(host, server_root(config, workspace));
+        let connection = self.ensure_started(host, config, &root)?;
         Ok((connection, language_id, root))
     }
 
@@ -711,10 +804,10 @@ impl LspRegistry {
     /// restarting as needed.
     fn ensure_started(
         &self,
+        host: &ServerHost,
         config: &LspServerConfig,
-        root: &Path,
+        root: &ServerRoot,
     ) -> Result<Arc<Connection>, String> {
-        let root = root.to_path_buf();
         let key = ServerKey {
             root: root.clone(),
             name: config.name.clone(),
@@ -768,7 +861,7 @@ impl LspRegistry {
         // Spawning and the initialize handshake happen outside the registry
         // lock: a cold server takes seconds, and holding the lock would stall
         // every other conversation's language server too.
-        let started = start_server(config, &root, Arc::downgrade(&self.inner));
+        let started = start_server(host, config, root, Arc::downgrade(&self.inner));
         let mut registry = self.lock();
         let entry = registry
             .servers
@@ -838,7 +931,7 @@ impl LspRegistry {
         let Some((config, language_id)) = Self::config_for_path(configs, path) else {
             return;
         };
-        let root = server_root(config, workspace);
+        let root = ServerRoot::local(server_root(config, workspace));
         // `diagnostics: false` suppresses only the reporting half. The document
         // still has to be re-synced, or the server keeps answering navigation
         // from the text as it was before this edit.
@@ -867,11 +960,55 @@ impl LspRegistry {
         let Ok(text) = std::fs::read_to_string(path) else {
             return;
         };
-        let _ = connection.sync_document(path, language_id.as_str(), &text);
-        let _ = connection.notify(
-            "textDocument/didSave",
-            json!({ "textDocument": { "uri": path_to_uri(path) } }),
-        );
+        resync(&connection, path, &language_id, &text);
+    }
+
+    /// The remote counterpart of [`Self::notify_file_changed`]: a file on
+    /// `machine_key` changed, and whichever live server there holds it is told.
+    ///
+    /// No configuration is resolved for this. A server that is up already knows
+    /// which extensions it claims, and the document map says whether it holds
+    /// this one; reading two `lsp.json` files off another machine to learn what
+    /// the registry can answer from memory would be a round trip per `write`.
+    /// `read_text` is asked for the new contents only once a holder is found,
+    /// so a write on a machine with no live server costs nothing extra.
+    pub fn notify_remote_file_changed(
+        &self,
+        machine_key: &str,
+        path: &Path,
+        conversation_id: &str,
+        read_text: &dyn Fn() -> Option<String>,
+    ) {
+        let holders: Vec<(Arc<Connection>, String, ServerRoot, bool)> = {
+            let registry = self.lock();
+            registry
+                .servers
+                .iter()
+                .filter(|(key, _)| key.root.machine == machine_key)
+                .filter_map(|(key, entry)| {
+                    let connection = entry.connection.clone()?;
+                    let (_, language_id) =
+                        Self::config_for_path(std::slice::from_ref(&entry.config), path)?;
+                    Some((connection, language_id, key.root.clone(), entry.config.diagnostics))
+                })
+                .collect()
+        };
+        let mut text: Option<String> = None;
+        for (connection, language_id, root, diagnostics) in holders {
+            if !connection.is_alive() || !connection.has_document(path) {
+                continue;
+            }
+            if diagnostics {
+                self.register_conversation(conversation_id, &root);
+            }
+            if text.is_none() {
+                text = read_text();
+            }
+            let Some(text) = text.as_deref() else {
+                return;
+            };
+            resync(&connection, path, &language_id, text);
+        }
     }
 
     /// Stops every server. Called on app exit and on document reset.
@@ -905,6 +1042,16 @@ fn server_root(config: &LspServerConfig, workspace: &Path) -> PathBuf {
     } else {
         PathBuf::from(config.workspace_folder.trim())
     }
+}
+
+/// Re-sends a document the server already holds, then tells it the file was
+/// saved. Failures are the server's problem, not the edit's.
+fn resync(connection: &Connection, path: &Path, language_id: &str, text: &str) {
+    let _ = connection.sync_document(path, language_id, text);
+    let _ = connection.notify(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": path_to_uri(path) } }),
+    );
 }
 
 /// The sentence a call gets when nothing is configured for the file it named.
@@ -1015,59 +1162,28 @@ fn percent_decode(text: &str) -> String {
 
 /// Spawns one server and completes the `initialize`/`initialized` handshake.
 fn start_server(
+    host: &ServerHost,
     config: &LspServerConfig,
-    root: &Path,
+    root: &ServerRoot,
     sink: std::sync::Weak<Mutex<Registry>>,
 ) -> Result<Arc<Connection>, String> {
-    let resolved = crate::environment_tools::resolve_on_path(&config.command)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| config.command.clone());
-    let mut process = Command::new(&resolved);
-    process
-        .args(&config.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if root.is_dir() {
-        process.current_dir(root);
-    }
-    for (name, value) in &config.env {
-        process.env(name, value);
-    }
-    // A language server needs the developer's toolchain environment, so this
-    // inherits rather than using the MCP allowlist — but the harness secrets
-    // every child spawn strips are still stripped.
-    for name in crate::child_environment::private_child_environment_names() {
-        process.env_remove(&name);
-    }
-    process.env_remove(crate::child_environment::DEV_APPLICATION_PATH_ENVIRONMENT_NAME);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        process.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Its own session, so the negative-pid group kill reaches the
-        // proc-macro and build-script children a server starts.
-        unsafe {
-            process.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    let child = match host {
+        ServerHost::Local => spawn_local(config, &root.path)?,
+        ServerHost::Remote { runner, .. } => spawn_remote(runner, config, &root.path)?,
+    };
+    attach_server(child, host, config, root, sink)
+}
 
-    let mut child = process.spawn().map_err(|error| {
-        format!(
-            "Could not start the language server '{}' ({}): {error}",
-            config.name, config.command
-        )
-    })?;
+/// Takes a freshly spawned server (or the wrapper relaying one), wires its
+/// pipes, and completes the handshake. Separate from the spawn so the remote
+/// leg's script can be driven through any shell in a test.
+fn attach_server(
+    mut child: Child,
+    host: &ServerHost,
+    config: &LspServerConfig,
+    root: &ServerRoot,
+    sink: std::sync::Weak<Mutex<Registry>>,
+) -> Result<Arc<Connection>, String> {
     // Before it can spawn grandchildren of its own.
     let job = ShellJob::create();
     job.assign(&child);
@@ -1112,9 +1228,19 @@ fn start_server(
         stderr: Arc::new(Mutex::new(String::new())),
         failure: Arc::new(Mutex::new(None)),
         shutdown_timeout: Duration::from_millis(config.shutdown_timeout_millis),
+        machine_label: host.machine_label().to_owned(),
+        stderr_done: Mutex::new(None),
     });
 
-    spawn_stderr_drain(stderr, Arc::clone(&connection.stderr));
+    let stderr_done = spawn_stderr_drain(
+        stderr,
+        Arc::clone(&connection.stderr),
+        matches!(host, ServerHost::Remote { runner: ShellRunner::Wsl { .. }, .. }),
+    );
+    *connection
+        .stderr_done
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stderr_done);
     spawn_reader(
         stdout,
         Arc::clone(&connection.alive),
@@ -1122,27 +1248,222 @@ fn start_server(
         Arc::clone(&connection.failure),
         Arc::downgrade(&connection),
         config.clone(),
-        root.to_path_buf(),
+        root.clone(),
         sink,
     );
 
-    match handshake(&connection, config, root) {
+    match handshake(&connection, host, config, &root.path) {
         Ok(()) => Ok(connection),
         Err(error) => {
             stop_connection(&connection);
-            Err(error)
+            // Whatever the server (or the wrapper that could not reach it)
+            // said on stderr is the reason more often than the timeout is: a
+            // command not on the remote PATH, an SSH key the machine refused.
+            // The process is gone, so its stderr is at end of file; give the
+            // drain a moment to have read it.
+            let done = connection
+                .stderr_done
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(done) = done {
+                let _ = done.recv_timeout(STDERR_SETTLE);
+            }
+            let tail = last_stderr_line(&connection.diagnostics_log());
+            Err(if tail.is_empty() {
+                error
+            } else {
+                format!("{error} ({tail})")
+            })
         }
     }
 }
 
-fn handshake(connection: &Connection, config: &LspServerConfig, root: &Path) -> Result<(), String> {
+/// How long a failed start waits for the stderr drain to finish after the
+/// process is gone.
+const STDERR_SETTLE: Duration = Duration::from_millis(500);
+
+/// The last non-empty line a server wrote to stderr, cut to a length that fits
+/// in an error sentence.
+fn last_stderr_line(log: &str) -> String {
+    const MAX_TAIL_CHARS: usize = 240;
+    let line = log
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() > MAX_TAIL_CHARS {
+        let kept: String = line.chars().take(MAX_TAIL_CHARS).collect();
+        format!("{kept}…")
+    } else {
+        line.to_owned()
+    }
+}
+
+/// Starts the server as a child of this process, in `root` when it exists.
+fn spawn_local(config: &LspServerConfig, root: &Path) -> Result<Child, String> {
+    let resolved = crate::environment_tools::resolve_on_path(&config.command)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| config.command.clone());
+    let mut process = Command::new(&resolved);
+    process
+        .args(&config.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if root.is_dir() {
+        process.current_dir(root);
+    }
+    for (name, value) in &config.env {
+        process.env(name, value);
+    }
+    // A language server needs the developer's toolchain environment, so this
+    // inherits rather than using the MCP allowlist — but the harness secrets
+    // every child spawn strips are still stripped.
+    for name in crate::child_environment::private_child_environment_names() {
+        process.env_remove(&name);
+    }
+    process.env_remove(crate::child_environment::DEV_APPLICATION_PATH_ENVIRONMENT_NAME);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        process.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own session, so the negative-pid group kill reaches the
+        // proc-macro and build-script children a server starts.
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    process.spawn().map_err(|error| {
+        format!(
+            "Could not start the language server '{}' ({}): {error}",
+            config.name, config.command
+        )
+    })
+}
+
+/// Starts the server on the machine `runner` reaches, in `root` there.
+///
+/// What this process holds is the `wsl.exe` or `ssh` wrapper; the server is its
+/// grandchild on the other side, and the wrapper relays both pipes verbatim, so
+/// the base protocol is spoken through it unchanged. The wrapper's own
+/// environment table is applied by the transport ([`ShellRunner`]), the entry's
+/// `env` by the script — and `exec` makes the server the process the wrapper
+/// is talking to, so `shutdown`/`exit` reach it and its end of the pipe closes
+/// when it goes.
+fn spawn_remote(
+    runner: &ShellRunner,
+    config: &LspServerConfig,
+    root: &Path,
+) -> Result<Child, String> {
+    let script = remote_launch_script(config, root)?;
+    crate::run_environment::spawn_remote_script(runner, &script, true).map_err(|error| {
+        format!(
+            "Could not start the language server '{}' ({}) on the remote machine: {error}",
+            config.name, config.command
+        )
+    })
+}
+
+/// The script that starts one configured server on a remote machine.
+///
+/// Every fragment is single-quoted: the command, its arguments and the entry's
+/// environment all come from an `lsp.json` a repository may have shipped, and
+/// none of them may rewrite the script. A command that is not on the remote
+/// PATH is reported by name before anything is executed, because the wrapper
+/// exiting with `127` would otherwise read as "the language server exited".
+pub fn remote_launch_script(config: &LspServerConfig, root: &Path) -> Result<String, String> {
+    use crate::run_environment::{quote_remote_path, sh_single_quote};
+
+    fn check(text: &str, label: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err(format!("The language server's {label} is empty"));
+        }
+        if text.chars().any(char::is_control) {
+            return Err(format!(
+                "The language server's {label} contains control characters"
+            ));
+        }
+        Ok(())
+    }
+
+    let root = root.to_string_lossy();
+    check(&root, "workspace root")?;
+    check(&config.command, "command")?;
+    let mut script = String::with_capacity(512);
+    script.push_str(&format!(
+        "cd -- {} || exit 64\n",
+        quote_remote_path(root.trim())
+    ));
+    script.push_str(&format!(
+        "command -v {cmd} >/dev/null 2>&1 || {{ printf '%s\\n' {message} >&2; exit 127; }}\n",
+        cmd = sh_single_quote(&config.command),
+        message = sh_single_quote(&format!(
+            "{}: command not found on the remote machine's PATH",
+            config.command
+        )),
+    ));
+    script.push_str("exec ");
+    if !config.env.is_empty() {
+        script.push_str("env ");
+        for (name, value) in &config.env {
+            crate::run_environment::validate_env_var_name(name)?;
+            // Empty is a legal value (`RUST_LOG=`); only control characters
+            // cannot be quoted into safety.
+            if value.chars().any(char::is_control) {
+                return Err(
+                    "The language server's environment values contain control characters".into(),
+                );
+            }
+            script.push_str(&sh_single_quote(&format!("{name}={value}")));
+            script.push(' ');
+        }
+    }
+    script.push_str(&sh_single_quote(&config.command));
+    for argument in &config.args {
+        if argument.chars().any(char::is_control) {
+            return Err("The language server's arguments contain control characters".into());
+        }
+        script.push(' ');
+        script.push_str(&sh_single_quote(argument));
+    }
+    script.push('\n');
+    Ok(script)
+}
+
+fn handshake(
+    connection: &Connection,
+    host: &ServerHost,
+    config: &LspServerConfig,
+    root: &Path,
+) -> Result<(), String> {
     let root_uri = path_to_uri(root);
     let name = root
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    // `processId` is the parent a server may watch and exit with. This
+    // process is that parent only when the server runs here; on another
+    // machine the number would name whatever happens to hold that pid there.
+    let process_id = if host.is_local() {
+        json!(std::process::id())
+    } else {
+        Value::Null
+    };
     let params = json!({
-        "processId": std::process::id(),
+        "processId": process_id,
         "clientInfo": { "name": "Mework", "version": env!("CARGO_PKG_VERSION") },
         "initializationOptions": config
             .initialization_options
@@ -1219,16 +1540,43 @@ fn client_capabilities(config: &LspServerConfig) -> Value {
     })
 }
 
-fn spawn_stderr_drain(stderr: std::process::ChildStderr, sink: Arc<Mutex<String>>) {
+/// Drains stderr into the settings-row log. `wsl` marks a `wsl.exe` wrapper,
+/// whose own complaints (a distribution that is not there) arrive as UTF-16LE
+/// even though everything the server itself writes is UTF-8. The returned
+/// receiver fires when the pipe reaches end of file.
+fn spawn_stderr_drain(
+    stderr: std::process::ChildStderr,
+    sink: Arc<Mutex<String>>,
+    wsl: bool,
+) -> mpsc::Receiver<()> {
+    let (done, finished) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
+        // A `wsl.exe` complaint is UTF-16LE, and a `\n` byte falls in the
+        // middle of its code units: decoding line by line would leave every
+        // line after the first misaligned. Its stream is kept raw and decoded
+        // whole each time instead, cut at an even offset so the alignment
+        // survives the trim.
+        let mut raw: Vec<u8> = Vec::new();
         loop {
             let mut line = Vec::new();
             match reader.read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => {
+                    let _ = done.send(());
+                    return;
+                }
                 Ok(_) => {}
             }
             let mut log = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if wsl {
+                raw.extend_from_slice(&line);
+                if raw.len() > MAX_STDERR_BYTES {
+                    let cut = (raw.len() - MAX_STDERR_BYTES) & !1;
+                    raw.drain(..cut);
+                }
+                *log = crate::run_environment::decode_wsl_output(&raw);
+                continue;
+            }
             log.push_str(&String::from_utf8_lossy(&line));
             if log.len() > MAX_STDERR_BYTES {
                 let cut = log.len() - MAX_STDERR_BYTES;
@@ -1239,6 +1587,7 @@ fn spawn_stderr_drain(stderr: std::process::ChildStderr, sink: Arc<Mutex<String>
             }
         }
     });
+    finished
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1249,7 +1598,7 @@ fn spawn_reader(
     failure: Arc<Mutex<Option<String>>>,
     connection: std::sync::Weak<Connection>,
     config: LspServerConfig,
-    root: PathBuf,
+    root: ServerRoot,
     sink: std::sync::Weak<Mutex<Registry>>,
 ) {
     thread::spawn(move || {
@@ -1336,7 +1685,7 @@ fn spawn_reader(
                     let Some(connection) = connection.upgrade() else {
                         return;
                     };
-                    let reply = answer_server_request(method, object.get("params"), &config, &root);
+                    let reply = answer_server_request(method, object.get("params"), &config, &root.path);
                     let payload = match reply {
                         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                         Err(message) => json!({
@@ -1723,6 +2072,10 @@ mod tests {
         PathBuf::from("/work/other")
     }
 
+    fn local(path: PathBuf) -> ServerRoot {
+        ServerRoot::local(path)
+    }
+
     fn diagnostic(message: &str, line: u64) -> Diagnostic {
         Diagnostic {
             severity: "Error".into(),
@@ -1737,23 +2090,23 @@ mod tests {
     #[test]
     fn a_conversation_is_owed_nothing_until_it_registers() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.publish(&project_root(), "file:///a.rs".into(), vec![diagnostic("before", 1)]);
-        ledger.register("c1", &project_root());
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), vec![diagnostic("before", 1)]);
+        ledger.register("c1", &local(project_root()));
         assert!(
             ledger.take_new("c1").is_empty(),
             "a conversation must not open with somebody else's backlog"
         );
-        ledger.publish(&project_root(), "file:///a.rs".into(), vec![diagnostic("after", 2)]);
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), vec![diagnostic("after", 2)]);
         assert_eq!(ledger.take_new("c1").len(), 1);
     }
 
     #[test]
     fn the_same_problem_is_reported_once() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("c1", &project_root());
-        ledger.publish(&project_root(), "file:///a.rs".into(), vec![diagnostic("same", 1)]);
+        ledger.register("c1", &local(project_root()));
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), vec![diagnostic("same", 1)]);
         assert_eq!(ledger.take_new("c1").len(), 1);
-        ledger.publish(&project_root(), "file:///a.rs".into(), vec![diagnostic("same", 1)]);
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), vec![diagnostic("same", 1)]);
         assert!(
             ledger.take_new("c1").is_empty(),
             "an unchanged republish is not news"
@@ -1763,9 +2116,9 @@ mod tests {
     #[test]
     fn an_empty_publish_clears_the_file_without_becoming_news() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("c1", &project_root());
-        ledger.publish(&project_root(), "file:///a.rs".into(), vec![diagnostic("broken", 1)]);
-        ledger.publish(&project_root(), "file:///a.rs".into(), Vec::new());
+        ledger.register("c1", &local(project_root()));
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), vec![diagnostic("broken", 1)]);
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), Vec::new());
         assert!(
             ledger.take_new("c1").is_empty(),
             "a file that became clean has nothing to report"
@@ -1775,12 +2128,12 @@ mod tests {
     #[test]
     fn volume_limits_cap_one_injection() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("c1", &project_root());
+        ledger.register("c1", &local(project_root()));
         for file in 0..5 {
             let diagnostics = (0..20)
                 .map(|index| diagnostic(&format!("problem {file}-{index}"), index))
                 .collect();
-            ledger.publish(&project_root(), format!("file:///f{file}.rs"), diagnostics);
+            ledger.publish(&local(project_root()), format!("file:///f{file}.rs"), diagnostics);
         }
         let taken = ledger.take_new("c1");
         let total: usize = taken.iter().map(|(_, items)| items.len()).sum();
@@ -1796,9 +2149,9 @@ mod tests {
     #[test]
     fn two_conversations_are_owed_independently() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("c1", &project_root());
-        ledger.register("c2", &project_root());
-        ledger.publish(&project_root(), "file:///a.rs".into(), vec![diagnostic("shared", 1)]);
+        ledger.register("c1", &local(project_root()));
+        ledger.register("c2", &local(project_root()));
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), vec![diagnostic("shared", 1)]);
         assert_eq!(ledger.take_new("c1").len(), 1);
         assert_eq!(
             ledger.take_new("c2").len(),
@@ -1810,10 +2163,10 @@ mod tests {
     #[test]
     fn a_conversation_is_not_told_about_another_projects_problems() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("here", &project_root());
-        ledger.register("there", &other_root());
+        ledger.register("here", &local(project_root()));
+        ledger.register("there", &local(other_root()));
         ledger.publish(
-            &other_root(),
+            &local(other_root()),
             "file:///work/other/src/main.rs".into(),
             vec![diagnostic("broken over there", 1)],
         );
@@ -1837,8 +2190,8 @@ mod tests {
         assert_eq!(root, other_root(), "the entry's own folder wins");
 
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("c1", &root);
-        ledger.publish(&root, "file:///work/other/src/main.rs".into(), vec![diagnostic("broken", 1)]);
+        ledger.register("c1", &local(root.clone()));
+        ledger.publish(&local(root.clone()), "file:///work/other/src/main.rs".into(), vec![diagnostic("broken", 1)]);
         assert_eq!(
             ledger.take_new("c1").len(),
             1,
@@ -1855,20 +2208,20 @@ mod tests {
     #[test]
     fn a_conversation_that_works_in_two_projects_is_owed_both() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("both", &project_root());
-        ledger.register("both", &other_root());
-        ledger.publish(&project_root(), "file:///a.rs".into(), vec![diagnostic("a", 1)]);
-        ledger.publish(&other_root(), "file:///b.rs".into(), vec![diagnostic("b", 1)]);
+        ledger.register("both", &local(project_root()));
+        ledger.register("both", &local(other_root()));
+        ledger.publish(&local(project_root()), "file:///a.rs".into(), vec![diagnostic("a", 1)]);
+        ledger.publish(&local(other_root()), "file:///b.rs".into(), vec![diagnostic("b", 1)]);
         assert_eq!(ledger.take_new("both").len(), 2);
     }
 
     #[test]
     fn tracked_files_and_conversations_are_evicted_rather_than_growing_forever() {
         let mut ledger = DiagnosticsLedger::default();
-        ledger.register("c1", &project_root());
+        ledger.register("c1", &local(project_root()));
         for index in 0..(MAX_TRACKED_FILES + 50) {
             ledger.publish(
-                &project_root(),
+                &local(project_root()),
                 format!("file:///f{index}.rs"),
                 vec![diagnostic("problem", 1)],
             );
@@ -1880,7 +2233,7 @@ mod tests {
         );
 
         for index in 0..(MAX_TRACKED_CONVERSATIONS + 10) {
-            ledger.register(&format!("conversation-{index}"), &project_root());
+            ledger.register(&format!("conversation-{index}"), &local(project_root()));
         }
         assert!(
             ledger.conversations.len() <= MAX_TRACKED_CONVERSATIONS,
@@ -1927,6 +2280,247 @@ mod tests {
             severity_name(None),
             "Error",
             "an absent severity defaults to Error, as in the source"
+        );
+    }
+
+    /// `/srv/app` on a WSL distribution and `/srv/app` on an SSH machine are
+    /// two projects. A ledger keyed by path alone would hand the conversation
+    /// working on one the other's compile errors.
+    #[test]
+    fn the_same_path_on_two_machines_is_two_roots() {
+        let wsl = ServerRoot {
+            machine: "wsl:Ubuntu".into(),
+            path: PathBuf::from("/srv/app"),
+        };
+        let ssh = ServerRoot {
+            machine: "ssh:m1".into(),
+            path: PathBuf::from("/srv/app"),
+        };
+        let mut ledger = DiagnosticsLedger::default();
+        ledger.register("on-wsl", &wsl);
+        ledger.register("on-ssh", &ssh);
+        ledger.publish(&ssh, "file:///srv/app/main.rs".into(), vec![diagnostic("there", 1)]);
+        assert!(
+            ledger.take_new("on-wsl").is_empty(),
+            "a publish from one machine is not news on another"
+        );
+        assert_eq!(ledger.take_new("on-ssh").len(), 1);
+    }
+
+    /// The remote launch script is the one place a repository-shipped
+    /// `lsp.json` reaches a shell: every fragment of it is single-quoted, the
+    /// server is `exec`ed so the wrapper's pipes are its pipes, and a command
+    /// that is not there is named before anything runs.
+    #[test]
+    fn the_remote_launch_script_quotes_everything_and_execs_the_server() {
+        let mut config = test_config();
+        config.command = "rust-analyzer".into();
+        config.args = vec!["--log-file".into(), "/tmp/it's here.log".into()];
+        config.env = [("RA_LOG".to_owned(), "error".to_owned())].into_iter().collect();
+        let script = remote_launch_script(&config, Path::new("/home/dev/app")).unwrap();
+        assert_eq!(
+            script,
+            "cd -- '/home/dev/app' || exit 64\n\
+             command -v 'rust-analyzer' >/dev/null 2>&1 || { printf '%s\\n' 'rust-analyzer: command not found on the remote machine'\\''s PATH' >&2; exit 127; }\n\
+             exec env 'RA_LOG=error' 'rust-analyzer' '--log-file' '/tmp/it'\\''s here.log'\n"
+        );
+
+        // A `~`-spelled root stays expandable, as the file tools spell it.
+        let script = remote_launch_script(&config, Path::new("~/app")).unwrap();
+        assert!(script.starts_with("cd -- ~/'app' || exit 64\n"), "{script}");
+
+        // Control characters cannot be quoted into safety and are refused.
+        config.args = vec!["--x\n; rm -rf /".into()];
+        assert!(remote_launch_script(&config, Path::new("/home/dev/app")).is_err());
+        config.args.clear();
+        config.env = [("BAD NAME".to_owned(), "x".to_owned())].into_iter().collect();
+        assert!(remote_launch_script(&config, Path::new("/home/dev/app")).is_err());
+    }
+
+    #[test]
+    fn the_stderr_tail_is_the_last_non_empty_line_cut_short() {
+        assert_eq!(last_stderr_line("a\nb\n\n  \n"), "b");
+        assert_eq!(last_stderr_line(""), "");
+        let long = "x".repeat(300);
+        let tail = last_stderr_line(&long);
+        assert_eq!(tail.chars().count(), 241);
+        assert!(tail.ends_with('…'));
+    }
+
+    /// A language server that speaks the base protocol over stdio, written in
+    /// Node so the test needs nothing this repository does not already need.
+    /// It answers `initialize`, `hover` (with its working directory and one
+    /// environment variable, so the launch script's `cd` and `env` are
+    /// observable), `shutdown` and `exit`, and writes one line to stderr.
+    const FAKE_SERVER: &str = r#"
+let buffer = Buffer.alloc(0);
+function send(payload) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
+  process.stdout.write(body);
+}
+function handle(message) {
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {}, serverInfo: { name: "fake" } } });
+  } else if (message.method === "textDocument/hover") {
+    const value = `cwd=${process.cwd()} env=${process.env.FAKE_LSP || ""}`;
+    send({ jsonrpc: "2.0", id: message.id, result: { contents: { kind: "plaintext", value } } });
+  } else if (message.method === "shutdown") {
+    send({ jsonrpc: "2.0", id: message.id, result: null });
+  } else if (message.method === "exit") {
+    process.exit(0);
+  }
+}
+process.stdin.on("data", (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const headerEnd = buffer.indexOf("\r\n\r\n");
+    if (headerEnd < 0) return;
+    const match = /Content-Length:\s*(\d+)/i.exec(buffer.slice(0, headerEnd).toString("utf8"));
+    if (!match) process.exit(3);
+    const start = headerEnd + 4;
+    const length = Number(match[1]);
+    if (buffer.length < start + length) return;
+    const body = JSON.parse(buffer.slice(start, start + length).toString("utf8"));
+    buffer = buffer.slice(start + length);
+    handle(body);
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+process.stderr.write("fake server up\n");
+"#;
+
+    /// A local Bash running the remote launch script, standing in for the
+    /// `wsl.exe`/`ssh` wrapper exactly as the remote file tools' tests do.
+    fn spawn_through_local_bash(script: &str) -> Option<Child> {
+        let bash = crate::run_environment::local_bash_candidates().into_iter().next()?;
+        Command::new(bash)
+            .args(["--noprofile", "--norc", "-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()
+    }
+
+    fn fake_host() -> ServerHost {
+        ServerHost::Remote {
+            runner: ShellRunner::Ssh {
+                host: "fake".into(),
+                port: 0,
+                identity_file: String::new(),
+                env: BTreeMap::new(),
+            },
+            machine_key: "ssh:fake".into(),
+            machine_label: "SSH: fake".into(),
+        }
+    }
+
+    /// The whole remote leg short of the machine: the launch script starts the
+    /// server through a shell, the wrapper's pipes carry the protocol, the
+    /// entry's `env` and the root's `cd` reach the server, the handshake
+    /// completes with a `null` `processId`, documents sync, requests are
+    /// answered, stderr is kept, and `shutdown`/`exit` end the process.
+    #[test]
+    fn a_remote_launch_script_drives_a_server_through_a_shell() {
+        let Some(node) = crate::environment_tools::resolve_on_path("node") else {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        };
+        let temp = tempfile::tempdir().expect("temp dir");
+        let server = temp.path().join("fake-lsp.js");
+        std::fs::write(&server, FAKE_SERVER).expect("fake server written");
+        let root = temp.path().to_string_lossy().replace('\\', "/");
+
+        let mut config = test_config();
+        config.command = node.to_string_lossy().replace('\\', "/");
+        config.args = vec![server.to_string_lossy().replace('\\', "/")];
+        config.env = [("FAKE_LSP".to_owned(), "yes".to_owned())].into_iter().collect();
+        let script = remote_launch_script(&config, Path::new(&root)).expect("launch script");
+        let Some(child) = spawn_through_local_bash(&script) else {
+            eprintln!("skipped: no local bash");
+            return;
+        };
+
+        let host = fake_host();
+        let server_root = ServerRoot::new(&host, PathBuf::from(&root));
+        let connection = attach_server(child, &host, &config, &server_root, std::sync::Weak::new())
+            .expect("the handshake completes through the shell");
+        assert!(connection.is_alive());
+
+        let document = PathBuf::from(format!("{root}/main.rs"));
+        connection
+            .sync_document(&document, "rust", "fn main() {}\n")
+            .expect("didOpen reaches the server");
+        assert!(connection.has_document(&document));
+        let answer = connection
+            .request_with_retry(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": path_to_uri(&document) },
+                    "position": { "line": 0, "character": 3 },
+                }),
+            )
+            .expect("hover is answered");
+        let value = answer["contents"]["value"].as_str().unwrap_or_default();
+        assert!(value.contains("env=yes"), "the entry's env reached the server: {value}");
+        let cwd = value
+            .split_once("cwd=")
+            .and_then(|(_, rest)| rest.split_once(" env="))
+            .map(|(cwd, _)| cwd.replace('\\', "/"))
+            .unwrap_or_default();
+        let leaf = Path::new(&root)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(
+            cwd.to_ascii_lowercase()
+                .ends_with(&leaf.to_ascii_lowercase()),
+            "the script's cd put the server in the root: {cwd} vs {root}"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !connection.diagnostics_log().contains("fake server up") {
+            assert!(std::time::Instant::now() < deadline, "stderr is drained");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        stop_connection(&connection);
+        assert!(!connection.is_alive());
+        let mut child = connection.child.lock().unwrap();
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "shutdown/exit ended the process behind the shell"
+        );
+    }
+
+    /// A command the machine does not have is the most likely remote failure,
+    /// and the script names it on stderr before exiting — which is what the
+    /// handshake failure hands back, instead of "the language server exited".
+    #[test]
+    fn a_missing_remote_command_is_named_in_the_failure() {
+        let mut config = test_config();
+        config.command = "definitely-not-a-language-server-xyz".into();
+        config.args.clear();
+        config.startup_timeout_millis = 5_000;
+        let script = remote_launch_script(&config, Path::new("/")).expect("launch script");
+        let Some(child) = spawn_through_local_bash(&script) else {
+            eprintln!("skipped: no local bash");
+            return;
+        };
+        let host = fake_host();
+        let Err(error) = attach_server(
+            child,
+            &host,
+            &config,
+            &ServerRoot::new(&host, PathBuf::from("/")),
+            std::sync::Weak::new(),
+        ) else {
+            panic!("a missing command cannot complete the handshake");
+        };
+        assert!(
+            error.contains("command not found on the remote machine's PATH"),
+            "{error}"
         );
     }
 }

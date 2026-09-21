@@ -104,6 +104,11 @@ pub struct TerminalOpenResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellControl {
     PowerShell,
+    /// A shell on another machine, reached through `wsl.exe` or `ssh`. It has no
+    /// command-state frames, and needs none: the frames exist to hold the host
+    /// checkout's Git mutex while a command runs, and a remote workspace has no
+    /// host checkout to protect.
+    Remote,
     Unsupported,
 }
 
@@ -129,6 +134,104 @@ impl TerminalLaunch {
             shell,
             "host",
             control,
+        ))
+    }
+
+    /// An interactive shell in `remote_cwd` on the machine `runner` dispatches
+    /// to. `local_cwd` is only where the client process starts; it is the
+    /// conversation's host-side anchor, never the directory the user sees.
+    ///
+    /// WSL is entered with `--cd` so the distribution applies its own path
+    /// rules. SSH asks for a terminal (`-t`) and runs the user's login shell in
+    /// the directory; unlike the tool leg it does not set `BatchMode`, because a
+    /// person is sitting in front of this one and may answer a prompt. The
+    /// machine's variable table is applied the way the tool leg applies it.
+    pub fn remote(
+        runner: &crate::run_environment::ShellRunner,
+        remote_cwd: &str,
+        local_cwd: &Path,
+    ) -> Result<Self, String> {
+        use crate::run_environment::{self as run_env, ShellRunner};
+        let local_cwd = canonical_directory(local_cwd)?;
+        let env = runner.normalized_env()?;
+        let injected: Vec<String> = env
+            .iter()
+            .filter(|(key, _)| !run_env::is_shell_startup_env_name(key))
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        let (program, args, shell, scope) = match runner {
+            ShellRunner::Local { .. } => {
+                return Err("本机工作区的终端不经远端启动".into());
+            }
+            ShellRunner::Wsl { distro, .. } => {
+                run_env::validate_wsl_distro_name(distro)?;
+                let mut args = vec![
+                    OsString::from("-d"),
+                    OsString::from(distro),
+                    OsString::from("--cd"),
+                    OsString::from(remote_cwd),
+                ];
+                if !injected.is_empty() {
+                    args.extend([OsString::from("--exec"), OsString::from("/usr/bin/env")]);
+                    args.extend(injected.iter().map(OsString::from));
+                    args.extend([OsString::from("bash"), OsString::from("-l")]);
+                }
+                (
+                    OsString::from("wsl.exe"),
+                    args,
+                    format!("WSL: {distro}"),
+                    "wsl",
+                )
+            }
+            ShellRunner::Ssh {
+                host,
+                port,
+                identity_file,
+                ..
+            } => {
+                let mut args = vec![
+                    OsString::from("-t"),
+                    OsString::from("-o"),
+                    OsString::from("ConnectTimeout=10"),
+                ];
+                if *port != 0 {
+                    args.extend([OsString::from("-p"), OsString::from(port.to_string())]);
+                }
+                if !identity_file.is_empty() {
+                    args.extend([OsString::from("-i"), OsString::from(identity_file)]);
+                }
+                args.extend([OsString::from("--"), OsString::from(host)]);
+                let mut remote = format!("cd {} && ", run_env::quote_remote_path(remote_cwd));
+                if !injected.is_empty() {
+                    remote.push_str("export ");
+                    for pair in &injected {
+                        remote.push_str(&run_env::sh_single_quote(pair));
+                        remote.push(' ');
+                    }
+                    remote.push_str("&& ");
+                }
+                remote.push_str(r#"exec "${SHELL:-/bin/sh}" -l"#);
+                args.push(OsString::from(remote));
+                let program = run_env::ssh_client_candidates()
+                    .into_iter()
+                    .find(|candidate| candidate == "ssh" || Path::new(candidate).is_file())
+                    .unwrap_or_else(|| "ssh".into());
+                (
+                    OsString::from(program),
+                    args,
+                    format!("SSH: {host}"),
+                    "ssh",
+                )
+            }
+        };
+        Ok(Self::new(
+            program,
+            args,
+            local_cwd,
+            remote_cwd.to_owned(),
+            shell,
+            scope,
+            ShellControl::Remote,
         ))
     }
 
@@ -588,17 +691,20 @@ impl TerminalManager {
             .master
             .take_writer()
             .map_err(|error| format!("无法写入伪终端：{error}"))?;
-        if launch.control != ShellControl::PowerShell {
+        if launch.control == ShellControl::Unsupported {
             return Err(
                 "当前系统没有可用的 PowerShell；为保证 Git 与终端命令严格互斥，未启动不受支持的 shell"
                     .into(),
             );
         }
+        let remote = launch.control == ShellControl::Remote;
         let control_nonce = Uuid::new_v4().simple().to_string();
         let control_ack_event = format!("MeworkTerminalAck_{}", Uuid::new_v4().simple());
         let control_reject_event = format!("MeworkTerminalReject_{}", Uuid::new_v4().simple());
         let mut launch_args = launch.args.clone();
-        configure_powershell_control(&mut launch_args);
+        if !remote {
+            configure_powershell_control(&mut launch_args);
+        }
         let mut command = CommandBuilder::new(&launch.program);
         command.args(&launch_args);
         command.cwd(&launch.cwd);
@@ -632,14 +738,24 @@ impl TerminalManager {
         drop(pair.slave);
 
         let session_id = Uuid::new_v4().to_string();
-        let control_handshake = Arc::new((Mutex::new(ControlHandshake::Pending), Condvar::new()));
+        // A remote shell sends no frames, so it is ready the moment it starts:
+        // there is no handshake for the watchdog to wait on and no startup
+        // lease to hold, because nothing on this machine is being edited.
+        let control_handshake = Arc::new((
+            Mutex::new(if remote {
+                ControlHandshake::Ready
+            } else {
+                ControlHandshake::Pending
+            }),
+            Condvar::new(),
+        ));
         let output = Arc::new(Mutex::new(TerminalOutputState {
             buffer: VecDeque::new(),
             sink: Some(sink),
             running: true,
             closed: false,
-            control: Some(TerminalControlParser::new(&control_nonce)),
-            control_ready: false,
+            control: (!remote).then(|| TerminalControlParser::new(&control_nonce)),
+            control_ready: remote,
             last_control_generation: 0,
             active_control_generation: None,
             command_state: TerminalCommandState::default(),
@@ -649,6 +765,9 @@ impl TerminalManager {
             control_ack_event,
             control_reject_event,
         }));
+        if remote {
+            lock(&output).startup_lease = None;
+        }
         let process_id = child.process_id();
         #[cfg(unix)]
         let process_group_id = pair.master.process_group_leader();

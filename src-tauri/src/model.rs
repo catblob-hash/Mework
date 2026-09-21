@@ -58,6 +58,10 @@ pub struct ExecutionEnvironmentAssets {
 ///
 /// Authentication material is not persisted. OpenSSH resolves identities and
 /// agents at connection time; BatchMode fails explicitly when none are usable.
+///
+/// The machine carries no working directory. A directory on this machine is a
+/// workspace like any other — picked through the remote directory browser and
+/// recorded on the conversation, where it gets a number the model can address.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SshMachineConfig {
@@ -70,9 +74,6 @@ pub struct SshMachineConfig {
     /// Empty delegates identity selection to OpenSSH defaults.
     #[serde(default)]
     pub identity_file: String,
-    /// Empty uses the remote user's home directory. A leading `~` is supported.
-    #[serde(default)]
-    pub remote_cwd: String,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -2309,6 +2310,10 @@ pub struct Workspace {
     #[serde(default)]
     pub kind: WorkspaceKind,
     pub path: String,
+    /// Machine this workspace's directory lives on. `None` is the host machine,
+    /// which is what every workspace registered before machines existed is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<RunTarget>,
     pub created_at: String,
     /// Preset forced for workspace-created conversations. Empty or dangling IDs
     /// use `last_conversation_settings`.
@@ -2400,17 +2405,54 @@ pub struct Conversation {
     /// templates has to ask first.
     #[serde(default)]
     pub template_id: String,
-    /// Directories outside the workspace this conversation may also work in.
+    /// Directories outside the primary workspace this conversation may also work
+    /// in, each on the machine it names. Together with the primary workspace they
+    /// form the numbered list the model addresses: the primary is workspace 1 and
+    /// these follow in order.
     ///
     /// On the conversation rather than in `settings` for the same reason as
     /// `worktree`: presets and workspace snapshots copy settings wholesale, and a
     /// path that one conversation was granted is not a path another may have.
-    /// Each entry passed through the host's directory picker, which is what
-    /// `storage::validate_workspace_authorizations` re-checks on every save — the
-    /// renderer cannot widen a conversation's filesystem reach by writing a path
-    /// into the document.
+    /// Each entry passed through the host's directory picker — native for the
+    /// host machine, the remote browser for a WSL or SSH machine — which is what
+    /// `storage::validate_workspace_authorizations` re-checks on every save, so
+    /// the renderer cannot widen a conversation's reach by writing a path into
+    /// the document.
     #[serde(default)]
+    pub attached_workspaces: Vec<AttachedWorkspace>,
+    /// Superseded by `attached_workspaces`, which carries a machine alongside
+    /// each path. Read from archives written before workspaces could be remote
+    /// and folded into host-machine entries by
+    /// [`Conversation::adopt_legacy_additional_directories`]; never written back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<String>,
+}
+
+impl Conversation {
+    /// The attached workspaces, with pre-multi-machine grants folded in.
+    ///
+    /// An archive written before workspaces carried a machine names host-machine
+    /// directories, so every legacy entry reads as an entry with no machine. The
+    /// fold is a read rather than a migration on load: the legacy field is the
+    /// only record those grants have until the conversation is next saved, and a
+    /// reader that skipped it would silently narrow what the conversation could
+    /// reach.
+    ///
+    /// The legacy field is ignored once `attached_workspaces` holds anything —
+    /// that document has been through the new path, and a stale legacy entry must
+    /// not resurrect a grant the user has since removed.
+    pub fn effective_attached_workspaces(&self) -> Vec<AttachedWorkspace> {
+        if !self.attached_workspaces.is_empty() || self.additional_directories.is_empty() {
+            return self.attached_workspaces.clone();
+        }
+        self.additional_directories
+            .iter()
+            .map(|path| AttachedWorkspace {
+                machine: None,
+                path: path.clone(),
+            })
+            .collect()
+    }
 }
 
 /// Shell execution location selected by a conversation. SSH stores only a stable
@@ -2424,6 +2466,23 @@ pub enum RunTarget {
     /// Execute on a user-configured SSH machine.
     #[serde(rename_all = "camelCase")]
     Ssh { machine_id: String },
+}
+
+/// One directory a conversation may work in, together with the machine it is on.
+///
+/// `machine` absent is the host machine, matching [`RunTarget`]'s own "local is
+/// the absent variant" convention. The model never sees these paths as its own
+/// addressing scheme: it names a workspace by its 1-based position in the
+/// conversation's workspace list, which is what the `workspace` parameter on
+/// every path-taking tool carries.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedWorkspace {
+    /// Machine this directory lives on. `None` is the host machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<RunTarget>,
+    /// Absolute path on that machine. A remote path is POSIX and may begin `~`.
+    pub path: String,
 }
 
 /// Isolated conversation worktree. Branch and baseline are both required for
@@ -3634,6 +3693,13 @@ pub struct RunModelRequest {
     /// machine or inject variables. Child agents inherit it unchanged.
     #[serde(skip)]
     pub run_environment: crate::run_environment::ShellRunner,
+    /// The numbered workspaces this run may act in, resolved from the persisted
+    /// conversation. Host-only for the same reason as `run_environment`, and for
+    /// a stronger one: it names both the directories and the machines a call can
+    /// reach, so a renderer able to assert it could widen either. Child agents
+    /// inherit the parent's set unchanged.
+    #[serde(skip)]
+    pub workspaces: crate::workspace_set::WorkspaceSet,
     /// The prompt profile this run renders every host-authored text with:
     /// tool-description overrides plus the wording of every fixed injection
     /// point. Resolved by `trusted_run_request` from the conversation's

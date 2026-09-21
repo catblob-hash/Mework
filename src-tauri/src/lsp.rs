@@ -28,16 +28,69 @@ use serde_json::{json, Value};
 
 use crate::{
     lsp_config::LspServerConfig,
-    lsp_servers::{uri_to_path, LspRegistry},
+    lsp_servers::{uri_to_path, LspRegistry, ServerHost},
 };
 
 /// Largest file handed to a language server, matching the source's limit.
-const MAX_FILE_BYTES: u64 = 10_000_000;
+pub const MAX_FILE_BYTES: u64 = 10_000_000;
 
 /// How long the gitignore filter waits on `git check-ignore`, and how many
 /// paths one invocation carries. Both from the source.
-const CHECK_IGNORE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CHECK_IGNORE_TIMEOUT: Duration = Duration::from_secs(5);
 const CHECK_IGNORE_BATCH: usize = 50;
+
+/// How a call reaches the file it names and the repository around it.
+///
+/// The navigation logic is the same wherever the workspace is; what differs is
+/// whether the text comes off this disk or over a shell transport, and whether
+/// `git check-ignore` runs here or there. Both legs implement this.
+pub trait LspFiles {
+    /// The full text of the file the call names, read only when the server
+    /// does not hold it yet.
+    fn read_text(&self) -> Result<String, String>;
+
+    /// `git check-ignore` over `paths`, all of them inside `root`: its stdout
+    /// when it reported matches, `None` for any other outcome — git missing,
+    /// not a repository, timeout — which keeps every result.
+    fn check_ignore(&self, root: &Path, paths: &[String]) -> Option<String>;
+}
+
+/// The host leg: the file is on this disk and git runs here.
+pub struct LocalFiles<'a> {
+    /// The canonical path the path guard handed back.
+    pub path: &'a Path,
+    /// The path as the model wrote it, for messages.
+    pub requested: &'a str,
+}
+
+impl LspFiles for LocalFiles<'_> {
+    fn read_text(&self) -> Result<String, String> {
+        let size = std::fs::metadata(self.path)
+            .map_err(|error| format!("Cannot access file: {}. {error}", self.requested))?
+            .len();
+        if size > MAX_FILE_BYTES {
+            return Err(too_large(size));
+        }
+        std::fs::read_to_string(self.path)
+            .map_err(|error| format!("Cannot read file: {}. {error}", self.requested))
+    }
+
+    fn check_ignore(&self, root: &Path, paths: &[String]) -> Option<String> {
+        let git = crate::environment_tools::resolve_on_path("git")?;
+        if !root.is_dir() {
+            return None;
+        }
+        check_ignore(&git, root, paths)
+    }
+}
+
+/// The sentence for a file over the limit, sized as the source prints it.
+pub fn too_large(size: u64) -> String {
+    format!(
+        "File too large for LSP analysis ({}MB exceeds 10MB limit)",
+        size.div_ceil(1_000_000)
+    )
+}
 
 /// The nine operations, in the order the schema lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,16 +188,21 @@ pub fn parse_call(
 /// Runs one call against the server that claims the file.
 ///
 /// `path` is already resolved and guarded by the caller; `workspace` is the
-/// root a server is started in when its configuration names none.
+/// root a server is started in when its configuration names none, and `host`
+/// is the machine both are on. `files` is how the text and the repository are
+/// reached there.
 pub fn execute(
     registry: &LspRegistry,
+    host: &ServerHost,
     configs: &[LspServerConfig],
     workspace: &Path,
     path: &Path,
     call: &LspCall,
     conversation_id: &str,
+    files: &dyn LspFiles,
 ) -> Result<String, String> {
-    let (connection, language_id, root) = registry.connection_for(configs, workspace, path)?;
+    let (connection, language_id, root) =
+        registry.connection_for(host, configs, workspace, path)?;
     // A conversation that reached a language server is owed its diagnostics
     // from here on — for the root that server actually publishes under, so one
     // project's problems never land in another project's conversation, and so a
@@ -153,17 +211,7 @@ pub fn execute(
     registry.register_conversation(conversation_id, &root);
 
     if !connection.has_document(path) {
-        let size = std::fs::metadata(path)
-            .map_err(|error| format!("Cannot access file: {}. {error}", call.requested_path))?
-            .len();
-        if size > MAX_FILE_BYTES {
-            return Err(format!(
-                "File too large for LSP analysis ({}MB exceeds 10MB limit)",
-                size.div_ceil(1_000_000)
-            ));
-        }
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("Cannot read file: {}. {error}", call.requested_path))?;
+        let text = files.read_text()?;
         connection.sync_document(path, &language_id, &text)?;
     }
 
@@ -189,7 +237,7 @@ pub fn execute(
         result = connection.request_with_retry(method, json!({ "item": item }))?;
     }
 
-    let result = filter_ignored(result, call.operation, workspace);
+    let result = filter_ignored(result, call.operation, workspace, files);
     Ok(format_result(call.operation, &result, workspace))
 }
 
@@ -246,7 +294,7 @@ fn request_for(call: &LspCall, uri: &str) -> (&'static str, Value) {
 /// the question was about, and listing it crowds out the one that is. A path
 /// outside the repository is never asked about, which is how a hit in a
 /// toolchain source directory survives.
-fn filter_ignored(result: Value, operation: Operation, root: &Path) -> Value {
+fn filter_ignored(result: Value, operation: Operation, root: &Path, files: &dyn LspFiles) -> Value {
     if !matches!(
         operation,
         Operation::GoToDefinition
@@ -266,7 +314,7 @@ fn filter_ignored(result: Value, operation: Operation, root: &Path) -> Value {
     if uris.is_empty() {
         return result;
     }
-    let ignored = ignored_uris(&uris, root);
+    let ignored = ignored_uris(&uris, root, files);
     if ignored.is_empty() {
         return result;
     }
@@ -288,14 +336,12 @@ fn uri_of(item: &Value) -> Option<String> {
     direct.and_then(Value::as_str).map(str::to_owned)
 }
 
-fn ignored_uris(uris: &[String], root: &Path) -> std::collections::HashSet<String> {
+fn ignored_uris(
+    uris: &[String],
+    root: &Path,
+    files: &dyn LspFiles,
+) -> std::collections::HashSet<String> {
     let mut ignored = std::collections::HashSet::new();
-    let Some(git) = crate::environment_tools::resolve_on_path("git") else {
-        return ignored;
-    };
-    if !root.is_dir() {
-        return ignored;
-    }
     // One path may appear many times over; ask about each only once.
     let mut by_path: BTreeMap<String, Vec<&String>> = BTreeMap::new();
     for uri in uris {
@@ -313,7 +359,7 @@ fn ignored_uris(uris: &[String], root: &Path) -> std::collections::HashSet<Strin
         .cloned()
         .collect();
     for batch in paths.chunks(CHECK_IGNORE_BATCH) {
-        let Some(output) = check_ignore(&git, root, batch) else {
+        let Some(output) = files.check_ignore(root, batch) else {
             continue;
         };
         for line in output.lines() {
@@ -332,23 +378,47 @@ fn ignored_uris(uris: &[String], root: &Path) -> std::collections::HashSet<Strin
 }
 
 /// Whether `path` is inside `root`, comparing components the way
-/// [`pathdiff`] does — case-insensitively on Windows, where a server's answer
-/// routinely spells the drive letter differently from the workspace.
+/// [`pathdiff`] does — case-insensitively under a Windows root, where a
+/// server's answer routinely spells the drive letter differently from the
+/// workspace.
 fn is_inside(path: &Path, root: &Path) -> bool {
+    let fold = folds_case(root);
     let root: Vec<_> = root.components().collect();
     let path: Vec<_> = path.components().collect();
     if path.len() < root.len() {
         return false;
     }
-    root.iter().zip(path.iter()).all(|(left, right)| {
-        if cfg!(windows) {
-            left.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-        } else {
-            left == right
-        }
-    })
+    root.iter()
+        .zip(path.iter())
+        .all(|(left, right)| same_component(left, right, fold))
+}
+
+/// Whether paths under `root` compare case-insensitively.
+///
+/// Decided by the root's own shape rather than by the host: a drive or UNC
+/// prefix is a Windows filesystem, a bare `/` is a POSIX one. The root of a
+/// workspace on a Linux machine is `/srv/app` whichever host is looking at it,
+/// and folding its case would put `/srv/App/x.rs` inside it — a path the
+/// remote `git check-ignore` then refuses along with the whole batch.
+fn folds_case(root: &Path) -> bool {
+    matches!(
+        root.components().next(),
+        Some(std::path::Component::Prefix(_))
+    )
+}
+
+fn same_component(
+    left: &std::path::Component<'_>,
+    right: &std::path::Component<'_>,
+    fold: bool,
+) -> bool {
+    if fold {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    } else {
+        left == right
+    }
 }
 
 /// Runs one `git check-ignore` batch, returning its stdout when it reported
@@ -460,19 +530,16 @@ fn format_uri(uri: &str, root: &Path) -> String {
 /// `path` expressed against `base`, in the spelling Node's `path.relative`
 /// produces. Empty when the two share no root, which keeps the absolute form.
 ///
-/// Component comparison is case-insensitive on Windows, as `path.relative` is
-/// there: a server that answers `C:\Users\...` for a workspace spelled
-/// `C:\users\...` would otherwise never produce a relative path.
+/// Component comparison is case-insensitive under a Windows base, as
+/// `path.relative` is there: a server that answers `C:\Users\...` for a
+/// workspace spelled `C:\users\...` would otherwise never produce a relative
+/// path. A POSIX base — a workspace on a Linux machine, whichever host is
+/// looking — compares exactly.
 fn pathdiff(path: &Path, base: &Path) -> String {
-    fn same(left: &std::path::Component<'_>, right: &std::path::Component<'_>) -> bool {
-        if cfg!(windows) {
-            left.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-        } else {
-            left == right
-        }
-    }
+    let fold = folds_case(base);
+    let same = |left: &std::path::Component<'_>, right: &std::path::Component<'_>| {
+        same_component(left, right, fold)
+    };
 
     let path: Vec<_> = path.components().collect();
     let base: Vec<_> = base.components().collect();
@@ -1185,16 +1252,92 @@ mod tests {
 
     #[test]
     fn only_location_bearing_operations_are_gitignore_filtered() {
+        struct NoGit;
+        impl LspFiles for NoGit {
+            fn read_text(&self) -> Result<String, String> {
+                unreachable!("nothing is read by the filter")
+            }
+            fn check_ignore(&self, _root: &Path, _paths: &[String]) -> Option<String> {
+                unreachable!("nothing is asked about when no result has a URI")
+            }
+        }
         let value = json!([{ "name": "x" }]);
         // No URIs, so nothing to ask git about and nothing removed.
         for operation in Operation::ALL {
             assert_eq!(
-                filter_ignored(value.clone(), operation, &root()),
+                filter_ignored(value.clone(), operation, &root(), &NoGit),
                 value,
                 "{} must not drop results it cannot address",
                 operation.name()
             );
         }
+    }
+
+    /// Case folds under a Windows root and nowhere else: a POSIX workspace on
+    /// a Linux machine is spelled the same from a Windows host, and folding it
+    /// would put `/srv/App/x.rs` inside `/srv/app`.
+    #[test]
+    fn case_folding_follows_the_root_not_the_host() {
+        let posix = Path::new("/srv/app");
+        assert!(!folds_case(posix));
+        assert!(is_inside(Path::new("/srv/app/src/x.rs"), posix));
+        assert!(!is_inside(Path::new("/srv/App/src/x.rs"), posix));
+        assert_eq!(pathdiff(Path::new("/srv/app/src/x.rs"), posix), "src/x.rs");
+        assert_eq!(pathdiff(Path::new("/srv/App/src/x.rs"), posix), "../App/src/x.rs");
+
+        if cfg!(windows) {
+            let windows = Path::new("C:/work/project");
+            assert!(folds_case(windows));
+            assert!(is_inside(Path::new("c:/Work/project/x.rs"), windows));
+            assert_eq!(pathdiff(Path::new("c:/Work/project/x.rs"), windows), "x.rs");
+        }
+    }
+
+    /// The filter asks about in-tree paths only, in the order they were seen,
+    /// and drops exactly the ones the answer names — through whichever machine's
+    /// git the seam runs.
+    #[test]
+    fn ignored_results_are_dropped_through_the_files_seam() {
+        struct IgnoresTarget(std::cell::RefCell<Vec<Vec<String>>>);
+        impl LspFiles for IgnoresTarget {
+            fn read_text(&self) -> Result<String, String> {
+                unreachable!()
+            }
+            fn check_ignore(&self, _root: &Path, paths: &[String]) -> Option<String> {
+                self.0.borrow_mut().push(paths.to_vec());
+                let ignored: Vec<&String> = paths
+                    .iter()
+                    .filter(|path| path.contains("/target/"))
+                    .collect();
+                (!ignored.is_empty()).then(|| {
+                    ignored
+                        .into_iter()
+                        .map(|path| format!("{path}\n"))
+                        .collect::<String>()
+                })
+            }
+        }
+        let files = IgnoresTarget(std::cell::RefCell::new(Vec::new()));
+        let value = json!([
+            { "uri": uri("src/a.rs"), "range": { "start": { "line": 0, "character": 0 } } },
+            { "uri": uri("target/debug/b.rs"), "range": { "start": { "line": 0, "character": 0 } } },
+            { "uri": "file:///elsewhere/c.rs", "range": { "start": { "line": 0, "character": 0 } } },
+        ]);
+        let kept = filter_ignored(value, Operation::FindReferences, &root(), &files);
+        let uris: Vec<String> = kept
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(uri_of)
+            .collect();
+        assert_eq!(uris, [uri("src/a.rs"), "file:///elsewhere/c.rs".to_owned()]);
+        let asked = files.0.borrow();
+        assert_eq!(asked.len(), 1, "one batch");
+        assert!(
+            asked[0].iter().all(|path| !path.contains("elsewhere")),
+            "out-of-tree paths are never asked about: {:?}",
+            asked[0]
+        );
     }
 
     /// The document map is keyed by URI, and two legs reach it: navigation
@@ -1325,11 +1468,16 @@ mod tests {
         let last = loop {
             let answer = execute(
                 &registry,
+                &ServerHost::Local,
                 &configs,
                 &workspace,
                 &source,
                 &call,
                 "probe-conversation",
+                &LocalFiles {
+                    path: &source,
+                    requested: "src/main.rs",
+                },
             )
             .expect("the request reaches the server");
             if answer.starts_with("Defined in") || std::time::Instant::now() >= deadline {

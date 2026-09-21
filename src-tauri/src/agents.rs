@@ -1993,6 +1993,7 @@ mod tests {
             task_cancel: crate::cancel::CancelSignal::default(),
             run_cancel: crate::cancel::CancelSignal::default(),
             output_schema: None,
+            workspaces: Default::default(),
         }
     }
 

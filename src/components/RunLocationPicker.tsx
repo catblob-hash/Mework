@@ -7,15 +7,10 @@ import { usePopoverAnchor } from "./usePopoverAnchor";
 import { useI18n } from "../i18n";
 import { listWslDistros } from "../lib/runtime";
 import { createId } from "../lib/id";
+import { runEnvKey } from "../lib/workspaces";
 import type { RunTarget, SshMachineConfig, WslDistro } from "../types";
 
 const PANEL_WIDTH = 268;
-
-/** Address key for an environment-variable table. Matches host `run_environment::env_key` exactly. */
-export function runEnvKey(target: RunTarget | null): string {
-  if (!target) return "local";
-  return target.kind === "wsl" ? `wsl:${target.distro}` : `ssh:${target.machineId}`;
-}
 
 /** Mirrors the host `validate_env_var_name` predicate for field-level validation. */
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -467,7 +462,6 @@ function SshMachineDialog({
   const [host, setHost] = useState(machine?.host ?? "");
   const [port, setPort] = useState(machine && machine.port !== 0 ? String(machine.port) : "");
   const [identityFile, setIdentityFile] = useState(machine?.identityFile ?? "");
-  const [remoteCwd, setRemoteCwd] = useState(machine?.remoteCwd ?? "");
   const [envText, setEnvText] = useState(() => formatEnvText(vars));
   const [error, setError] = useState<string | null>(null);
 
@@ -498,8 +492,8 @@ function SshMachineDialog({
         ? t("配置 SSH 机器", "Configure SSH machine")
         : t("添加 SSH 机器", "Add SSH machine")}
       description={t(
-        "认证材料不落盘：连接时由 OpenSSH 按身份文件、~/.ssh/config 与 agent 解析。",
-        "No credentials are stored: OpenSSH resolves the identity file, ~/.ssh/config and the agent at connect time."
+        "认证材料不落盘：连接时由 OpenSSH 按身份文件、~/.ssh/config 与 agent 解析。工作目录不在这里设——用工作区按钮在这台机器上选一个目录。",
+        "No credentials are stored: OpenSSH resolves the identity file, ~/.ssh/config and the agent at connect time. The working directory is not set here — pick a directory on this machine with the workspace button."
       )}
       width="460px"
       onClose={onClose}
@@ -551,13 +545,10 @@ function SshMachineDialog({
               return;
             }
             const trimmedIdentity = identityFile.trim();
-            const trimmedCwd = remoteCwd.trim();
-            if ([trimmedIdentity, trimmedCwd].some((value) => (
-              value.length > MAX_PATH_FIELD_CHARS || CONTROL_CHARS.test(value)
-            ))) {
+            if (trimmedIdentity.length > MAX_PATH_FIELD_CHARS || CONTROL_CHARS.test(trimmedIdentity)) {
               setError(t(
-                "身份文件或远端目录过长或含控制字符（最长 {max}）",
-                "The identity file or remote directory is too long or contains control characters (max {max})",
+                "身份文件路径过长或含控制字符（最长 {max}）",
+                "The identity file path is too long or contains control characters (max {max})",
                 { max: String(MAX_PATH_FIELD_CHARS) }
               ));
               return;
@@ -588,7 +579,6 @@ function SshMachineDialog({
               host: trimmedHost,
               port: parsedPort,
               identityFile: trimmedIdentity,
-              remoteCwd: trimmedCwd,
               createdAt: machine?.createdAt ?? now,
               updatedAt: now
             }, parsedEnv.vars);
@@ -603,7 +593,6 @@ function SshMachineDialog({
         {field(t("主机", "Host"), host, setHost, "user@hostname")}
         {field(t("端口（空 = 22）", "Port (empty = 22)"), port, setPort, "22")}
         {field(t("身份文件（可选）", "Identity file (optional)"), identityFile, setIdentityFile, "~/.ssh/id_ed25519")}
-        {field(t("远端目录（空 = home）", "Remote directory (empty = home)"), remoteCwd, setRemoteCwd, "~/projects/app")}
         <label className="run-location__field">
           <span>{t("环境变量（每行一条 KEY=value）", "Environment variables (one KEY=value per line)")}</span>
           <textarea

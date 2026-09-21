@@ -42,7 +42,7 @@ function conversation(contexts: ContextItem[]): Conversation {
     userAbortedTasks: [],
     worktree: null,
   runTarget: null,
-  additionalDirectories: [],
+  attachedWorkspaces: [],
     parentConversationId: null,
   presetId: "",
   templateId: ""

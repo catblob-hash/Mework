@@ -142,6 +142,38 @@ pub fn now_ms() -> i64 {
     system_time_ms(SystemTime::now()).unwrap_or(0)
 }
 
+/// Leading segment of the key a file on another machine is remembered under.
+///
+/// A NUL can appear in no real path on any platform, so a key starting with one
+/// can never collide with a host file, and a stat of it fails at once rather
+/// than reaching the network the way a UNC-shaped spelling would.
+const REMOTE_KEY_PREFIX: &str = "\u{0}mework-remote\u{0}";
+
+/// The registry key for `path` on the machine addressed by `machine_key`
+/// (`run_environment::env_key`), which is the machine's identity everywhere
+/// else in the host: one machine's `/srv/app` is not another's.
+///
+/// `path` is the path the remote shell resolved, not the one the model typed,
+/// so `~/app/x` and `/home/dev/app/x` share one record.
+pub fn remote_key(machine_key: &str, path: &str) -> PathBuf {
+    PathBuf::from(format!("{REMOTE_KEY_PREFIX}{machine_key}\u{0}{path}"))
+}
+
+/// Whether a registry key names a file on another machine. Everything that
+/// stats its keys on this host — the external-change scan, the shell hint —
+/// has to skip these: a stat here says nothing about the file there.
+pub fn is_remote_key(path: &Path) -> bool {
+    path.to_str()
+        .is_some_and(|text| text.starts_with(REMOTE_KEY_PREFIX))
+}
+
+/// The machine key and remote path a remote registry key was minted from.
+pub fn remote_key_parts(path: &Path) -> Option<(&str, &str)> {
+    path.to_str()?
+        .strip_prefix(REMOTE_KEY_PREFIX)?
+        .split_once('\u{0}')
+}
+
 /// Which scope a call consults, and where to seed it from on first use.
 #[derive(Clone, Copy, Debug)]
 pub struct ScopeRef<'a> {
@@ -540,5 +572,17 @@ mod tests {
                 |_| ()
             )
             .is_none());
+    }
+
+    #[test]
+    fn remote_keys_collide_with_no_host_path_and_are_told_apart_by_machine() {
+        let key = remote_key("ssh:m1", "/srv/app/main.rs");
+        assert!(is_remote_key(&key));
+        assert_eq!(remote_key_parts(&key), Some(("ssh:m1", "/srv/app/main.rs")));
+        assert_ne!(key, remote_key("wsl:Ubuntu", "/srv/app/main.rs"));
+        assert!(!is_remote_key(Path::new("/srv/app/main.rs")));
+        assert!(!is_remote_key(Path::new("C:/srv/app/main.rs")));
+        // A stat of the key fails at once: nothing on this host can be named by it.
+        assert!(modified_ms(&key).is_none());
     }
 }

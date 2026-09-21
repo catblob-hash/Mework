@@ -1,4 +1,10 @@
-import type { ContextItem, Conversation, ConversationSettings, RunTarget } from "../types";
+import type {
+  AttachedWorkspace,
+  ContextItem,
+  Conversation,
+  ConversationSettings,
+  RunTarget
+} from "../types";
 
 /**
  * Fixed ID for the renderer-owned draft conversation. It is never persisted or
@@ -23,13 +29,13 @@ export interface DraftConversationState {
   /** The draft's run location, persisted directly in `Conversation.runTarget` when materialized. */
   runTarget: RunTarget | null;
   /**
-   * Extra directories the draft may work in, persisted directly in
-   * `Conversation.additionalDirectories` when materialized.
+   * Workspaces the draft may work in besides its primary one, persisted directly
+   * in `Conversation.attachedWorkspaces` when materialized.
    *
    * Unlike `worktreeRequested` this is not just intent: the host authorized each
-   * path when its picker returned it, so the list is already the real grant.
+   * one when its picker returned it, so the list is already the real grant.
    */
-  additionalDirectories: string[];
+  attachedWorkspaces: AttachedWorkspace[];
   /** Preset the draft's settings came from; empty means an unnamed draft. */
   presetId: string;
   /** Conversation template whose message queue this draft is showing; empty
@@ -102,7 +108,7 @@ export function draftAsConversation(
     userAbortedTasks: [],
     worktree: null,
     runTarget: draft.runTarget,
-    additionalDirectories: draft.additionalDirectories,
+    attachedWorkspaces: draft.attachedWorkspaces,
     parentConversationId: null,
     presetId: draft.presetId,
     templateId: draft.templateId

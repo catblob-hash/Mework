@@ -57,6 +57,8 @@
     "allow-execute-tool",
     "allow-request-tool-approval",
     "allow-pick-workspace-directory",
+    "allow-list-remote-directory",
+    "allow-authorize-remote-workspace",
     "allow-save-api-key",
     "allow-reveal-api-key",
     "allow-delete-api-key",

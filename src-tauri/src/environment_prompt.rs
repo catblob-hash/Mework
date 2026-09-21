@@ -2,9 +2,15 @@
 //!
 //! One block naming the facts a model cannot discover without spending a tool
 //! call: where it is running, whether that directory is a Git checkout, which
-//! other directories it may touch, and what host it is on. Claude Code publishes
-//! the same block, and the wording follows it so a model trained against that
-//! phrasing reads ours the same way.
+//! other workspaces it may act in and on which machines, and what host it is on.
+//! Claude Code publishes a similar block, and the wording follows it so a model
+//! trained against that phrasing reads ours the same way.
+//!
+//! The workspace list is the one part that is Mework's own. A conversation can
+//! work in directories on more than one machine, and the number in front of each
+//! is the address a tool call uses: it is the only thing that selects a machine,
+//! so the list has to be stated before the first call, not discovered from an
+//! error afterwards.
 //!
 //! What is deliberately absent: the shell, the model's own name and id, and the
 //! knowledge cutoff. Mework exposes `bash` and `powershell` as separate tools, so
@@ -23,21 +29,57 @@ use std::sync::OnceLock;
 
 use crate::prompt_profile::{PromptKey, PromptProfile};
 
+/// One workspace as the section states it.
+///
+/// The number is the address a tool call uses, so it is carried rather than
+/// derived from position here: the list the model reads and the list the host
+/// selects against have to agree, and a renumbering that happened in only one of
+/// them would point a call at the wrong directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvironmentWorkspace {
+    /// Value the `workspace` parameter takes for this entry.
+    pub number: u32,
+    /// Root directory on its machine.
+    pub path: String,
+    /// Machine this workspace is on.
+    pub machine: EnvironmentMachine,
+}
+
+/// Where a workspace lives, in the terms the section words it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum EnvironmentMachine {
+    /// The machine Mework itself runs on.
+    #[default]
+    Host,
+    Wsl(String),
+    Ssh(String),
+}
+
 /// The facts the section reports, already resolved.
 ///
 /// Collected once per run by the trusted request builder. The renderer never
-/// supplies any of it: `working_directory` and `additional_directories` come from
-/// the host's own conversation record, and the rest is read from this machine.
+/// supplies any of it: `working_directory` and `workspaces` come from the host's
+/// own conversation record, and the rest is read from this machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnvironmentFacts {
     /// The directory the conversation's tools resolve relative paths against.
     pub working_directory: String,
+    /// The machine that directory is on. Stated on the working-directory line
+    /// when it is not this one, because with a single workspace the numbered
+    /// list below is not shown and nothing else would say so.
+    pub working_machine: EnvironmentMachine,
     /// Whether that directory is an isolated worktree this conversation owns.
     pub is_worktree: bool,
-    /// Whether that directory is inside a Git checkout.
-    pub is_git_repository: bool,
-    /// Directories outside the workspace that the user granted this conversation.
-    pub additional_directories: Vec<String>,
+    /// Whether that directory is inside a Git checkout. `None` when the host
+    /// cannot tell — the directory is on another machine — and the line is
+    /// dropped rather than guessed: a wrong `false` would have the model skip
+    /// `git` where it applies.
+    pub is_git_repository: Option<bool>,
+    /// Every workspace this conversation can address, in address order, starting
+    /// with the primary one. Stated only when there is more than one: with a
+    /// single workspace the number is not a choice, and the working-directory
+    /// line has already named it.
+    pub workspaces: Vec<EnvironmentWorkspace>,
     /// Host operating system, as `std::env::consts::OS` names it.
     pub platform: String,
     /// Host operating system version, or empty when it could not be read.
@@ -52,20 +94,55 @@ impl EnvironmentFacts {
     /// `workspace` is the conversation's effective directory — the worktree when
     /// it has one, the workspace root otherwise — so `is_git_repository` answers
     /// for the directory the tools will actually run in.
-    pub fn collect(workspace: &Path, is_worktree: bool, additional_directories: &[String]) -> Self {
+    pub fn collect(
+        workspace: &Path,
+        is_worktree: bool,
+        workspaces: Vec<EnvironmentWorkspace>,
+    ) -> Self {
         Self {
             working_directory: display_path(&workspace.to_string_lossy()),
+            working_machine: EnvironmentMachine::Host,
             is_worktree,
-            is_git_repository: is_git_repository(workspace),
-            additional_directories: additional_directories
-                .iter()
-                .map(|directory| display_path(directory))
-                .collect(),
+            is_git_repository: Some(is_git_repository(workspace)),
+            workspaces: displayed_workspaces(workspaces),
             platform: std::env::consts::OS.to_owned(),
             os_version: os_version().to_owned(),
             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
         }
     }
+
+    /// The facts for a run whose primary workspace is on another machine.
+    ///
+    /// The host reads nothing about `root`: it cannot stat a remote directory,
+    /// and asking the machine on every turn would cost a round trip for a fact
+    /// the model can establish once with `bash`. The platform lines still
+    /// describe this host, which is where the preview and browser tools run.
+    pub fn collect_remote(
+        root: &str,
+        machine: EnvironmentMachine,
+        workspaces: Vec<EnvironmentWorkspace>,
+    ) -> Self {
+        Self {
+            working_directory: root.to_owned(),
+            working_machine: machine,
+            is_worktree: false,
+            is_git_repository: None,
+            workspaces: displayed_workspaces(workspaces),
+            platform: std::env::consts::OS.to_owned(),
+            os_version: os_version().to_owned(),
+            date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
+fn displayed_workspaces(workspaces: Vec<EnvironmentWorkspace>) -> Vec<EnvironmentWorkspace> {
+    workspaces
+        .into_iter()
+        .map(|workspace| EnvironmentWorkspace {
+            path: display_path(&workspace.path),
+            ..workspace
+        })
+        .collect()
 }
 
 /// Drops the Windows extended-length prefix from a path before it is stated.
@@ -92,11 +169,21 @@ pub fn environment_section(profile: &PromptProfile, facts: &EnvironmentFacts) ->
         return String::new();
     }
     let mut lines = Vec::new();
+    // A remote working directory carries its machine on the same line, in the
+    // phrasing the numbered list uses, so a conversation with one remote
+    // workspace is told where it is even though no list follows.
+    let working_directory = match machine_location(profile, &facts.working_machine) {
+        Some(location) => format!(
+            "{} ({location})",
+            sanitize_path(&facts.working_directory)
+        ),
+        None => sanitize_path(&facts.working_directory),
+    };
     push_fact(
         &mut lines,
         profile.render(
             PromptKey::SystemEnvironmentWorkingDirectory,
-            &[("path", &sanitize_path(&facts.working_directory))],
+            &[("path", &working_directory)],
         ),
     );
     if facts.is_worktree {
@@ -113,35 +200,47 @@ pub fn environment_section(profile: &PromptProfile, facts: &EnvironmentFacts) ->
                 .to_owned(),
         );
     }
-    push_fact(
-        &mut lines,
-        profile.render(
-            PromptKey::SystemEnvironmentGitRepository,
-            &[(
-                "value",
-                if facts.is_git_repository {
-                    "true"
-                } else {
-                    "false"
-                },
-            )],
-        ),
-    );
-    if !facts.additional_directories.is_empty() {
+    if let Some(is_git_repository) = facts.is_git_repository {
+        push_fact(
+            &mut lines,
+            profile.render(
+                PromptKey::SystemEnvironmentGitRepository,
+                &[("value", if is_git_repository { "true" } else { "false" })],
+            ),
+        );
+    }
+    // Numbers are worth stating only when there is a choice between them. One
+    // workspace means every call lands there whatever it says, and the
+    // working-directory line above has already named the directory.
+    if facts.workspaces.len() > 1 {
         let heading = lines.len();
         push_fact(
             &mut lines,
-            profile
-                .text(PromptKey::SystemEnvironmentAdditionalDirectories)
-                .to_owned(),
+            profile.text(PromptKey::SystemEnvironmentWorkspaces).to_owned(),
         );
         // A profile that emptied the heading removed the list with it: nested
         // items under no heading would read as belonging to the line above.
         if lines.len() > heading {
-            for directory in &facts.additional_directories {
-                let directory = sanitize_path(directory);
-                if !directory.is_empty() {
-                    lines.push(format!("  - {directory}"));
+            for workspace in &facts.workspaces {
+                let path = sanitize_path(&workspace.path);
+                if path.is_empty() {
+                    continue;
+                }
+                let location = machine_location(profile, &workspace.machine).unwrap_or_else(|| {
+                    profile
+                        .text(PromptKey::SystemEnvironmentWorkspaceOnHost)
+                        .to_owned()
+                });
+                let entry = profile.render(
+                    PromptKey::SystemEnvironmentWorkspaceEntry,
+                    &[
+                        ("number", &workspace.number.to_string()),
+                        ("path", &path),
+                        ("location", &location),
+                    ],
+                );
+                if !entry.trim().is_empty() {
+                    lines.push(format!("  - {entry}"));
                 }
             }
         }
@@ -173,6 +272,21 @@ pub fn environment_section(profile: &PromptProfile, facts: &EnvironmentFacts) ->
         PromptKey::SystemEnvironmentSection,
         &[("facts", &lines.join("\n"))],
     )
+}
+
+/// The phrase naming a machine that is not this one, or `None` for the host.
+fn machine_location(profile: &PromptProfile, machine: &EnvironmentMachine) -> Option<String> {
+    match machine {
+        EnvironmentMachine::Host => None,
+        EnvironmentMachine::Wsl(name) => Some(profile.render(
+            PromptKey::SystemEnvironmentWorkspaceOnWsl,
+            &[("name", &sanitize_path(name))],
+        )),
+        EnvironmentMachine::Ssh(name) => Some(profile.render(
+            PromptKey::SystemEnvironmentWorkspaceOnSsh,
+            &[("name", &sanitize_path(name))],
+        )),
+    }
 }
 
 /// Appends one top-level fact as a list item, skipping a line the profile emptied.
@@ -288,12 +402,21 @@ mod tests {
     fn facts() -> EnvironmentFacts {
         EnvironmentFacts {
             working_directory: "C:/work/app".into(),
+            working_machine: EnvironmentMachine::Host,
             is_worktree: false,
-            is_git_repository: true,
-            additional_directories: Vec::new(),
+            is_git_repository: Some(true),
+            workspaces: Vec::new(),
             platform: "windows".into(),
             os_version: "Windows 10.0.26100".into(),
             date: "2026-01-02".into(),
+        }
+    }
+
+    fn workspace(number: u32, path: &str, machine: EnvironmentMachine) -> EnvironmentWorkspace {
+        EnvironmentWorkspace {
+            number,
+            path: path.into(),
+            machine,
         }
     }
 
@@ -312,21 +435,44 @@ mod tests {
     }
 
     #[test]
-    fn additional_directories_are_nested_under_their_own_heading() {
+    fn workspaces_are_numbered_under_their_own_heading() {
         let profile = PromptProfile::builtin_english();
         let section = environment_section(
             &profile,
             &EnvironmentFacts {
-                additional_directories: vec!["D:/shared/lib".into(), "D:/docs".into()],
+                workspaces: vec![
+                    workspace(1, "C:/work/app", EnvironmentMachine::Host),
+                    workspace(2, "~/services", EnvironmentMachine::Ssh("devbox".into())),
+                    workspace(3, "/srv/data", EnvironmentMachine::Wsl("Ubuntu".into())),
+                ],
                 ..facts()
             },
         );
         assert!(
             section.contains(
-                " - Additional working directories:\n  - D:/shared/lib\n  - D:/docs\n - Platform:"
+                " - Workspaces — name one by its number in a tool's `workspace` parameter:\n\
+                 \x20 - 1: C:/work/app (this machine)\n\
+                 \x20 - 2: ~/services (SSH: devbox)\n\
+                 \x20 - 3: /srv/data (WSL: Ubuntu)\n - Platform:"
             ),
             "{section}"
         );
+    }
+
+    #[test]
+    fn a_single_workspace_states_no_numbers() {
+        // With one workspace the number is not a choice, and the working-directory
+        // line has already said where the conversation is.
+        let profile = PromptProfile::builtin_english();
+        let section = environment_section(
+            &profile,
+            &EnvironmentFacts {
+                workspaces: vec![workspace(1, "C:/work/app", EnvironmentMachine::Host)],
+                ..facts()
+            },
+        );
+        assert!(!section.contains("Workspaces"), "{section}");
+        assert_eq!(section, environment_section(&profile, &facts()));
     }
 
     #[test]
@@ -368,7 +514,14 @@ mod tests {
             &profile,
             &EnvironmentFacts {
                 working_directory: "C:/work\u{202e}/app\u{0007}".into(),
-                additional_directories: vec!["D:/lib\n - Platform: linux".into()],
+                workspaces: vec![
+                    workspace(1, "C:/work/app", EnvironmentMachine::Host),
+                    workspace(
+                        2,
+                        "D:/lib\n - Platform: linux",
+                        EnvironmentMachine::Ssh("box\n - Platform: linux".into()),
+                    ),
+                ],
                 ..facts()
             },
         );
@@ -416,25 +569,55 @@ mod tests {
     #[test]
     fn collecting_reads_the_workspace_and_this_machine() {
         let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("checkout");
+        let workspace_root = root.path().join("checkout");
         let extra = root.path().join("library");
-        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&workspace_root).unwrap();
         std::fs::create_dir_all(&extra).unwrap();
         let extra = extra.to_string_lossy().into_owned();
 
-        let facts = EnvironmentFacts::collect(&workspace, false, std::slice::from_ref(&extra));
-        assert_eq!(facts.working_directory, workspace.to_string_lossy());
+        let facts = EnvironmentFacts::collect(
+            &workspace_root,
+            false,
+            vec![
+                workspace(
+                    1,
+                    &workspace_root.to_string_lossy(),
+                    EnvironmentMachine::Host,
+                ),
+                workspace(2, &extra, EnvironmentMachine::Host),
+            ],
+        );
+        assert_eq!(facts.working_directory, workspace_root.to_string_lossy());
         assert!(!facts.is_worktree);
-        assert!(!facts.is_git_repository);
-        assert_eq!(facts.additional_directories, vec![extra.clone()]);
+        assert_eq!(facts.is_git_repository, Some(false));
+        assert_eq!(facts.workspaces.len(), 2);
+        assert_eq!(facts.workspaces[1].path, extra);
         assert_eq!(facts.platform, std::env::consts::OS);
         assert_eq!(facts.date.len(), "2026-01-02".len());
 
-        std::fs::create_dir(workspace.join(".git")).unwrap();
-        let facts = EnvironmentFacts::collect(&workspace, true, &[]);
+        std::fs::create_dir(workspace_root.join(".git")).unwrap();
+        let facts = EnvironmentFacts::collect(&workspace_root, true, Vec::new());
         assert!(facts.is_worktree);
-        assert!(facts.is_git_repository);
-        assert!(facts.additional_directories.is_empty());
+        assert_eq!(facts.is_git_repository, Some(true));
+        assert!(facts.workspaces.is_empty());
+    }
+
+    #[test]
+    fn a_remote_working_directory_names_its_machine_and_claims_nothing_about_git() {
+        let profile = PromptProfile::builtin_english();
+        let facts = EnvironmentFacts::collect_remote(
+            "/home/dev/app",
+            EnvironmentMachine::Ssh("devbox".into()),
+            vec![workspace(1, "/home/dev/app", EnvironmentMachine::Ssh("devbox".into()))],
+        );
+        assert_eq!(facts.is_git_repository, None);
+        let section = environment_section(&profile, &facts);
+        assert!(
+            section.contains(" - Primary working directory: /home/dev/app (SSH: devbox)\n - Platform:"),
+            "{section}"
+        );
+        assert!(!section.contains("git repository"), "{section}");
+        assert!(!section.contains("Workspaces"), "{section}");
     }
 
     #[test]

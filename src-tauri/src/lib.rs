@@ -84,6 +84,9 @@ mod project_memory;
 mod prompt_profile;
 mod prompt_profile_files;
 mod push_events;
+mod remote_directory;
+mod remote_files;
+mod remote_lsp;
 mod reveal_path;
 mod run_environment;
 mod run_stream;
@@ -111,6 +114,7 @@ mod workflow_store;
 mod workspace_dirs;
 mod workspace_files;
 mod workspace_lookup;
+mod workspace_set;
 
 #[cfg(not(test))]
 include!("../app_commands.rs");
@@ -2250,8 +2254,9 @@ fn execute_tool_blocking(
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    let decision = security::classify(
+    let decision = security::classify_in_workspaces(
         policy.security_level,
+        &policy.workspaces,
         Path::new(&request.workspace_path),
         app_data.as_path(),
         &policy.additional_directories,
@@ -2268,7 +2273,7 @@ fn execute_tool_blocking(
         &state,
         decision.scope,
         Some(&app_data),
-        &policy.run_environment,
+        &policy.workspaces,
         &policy.prompt_profile,
     ))
 }
@@ -2295,8 +2300,9 @@ async fn request_tool_approval(
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    let decision = security::classify(
+    let decision = security::classify_in_workspaces(
         policy.security_level,
+        &policy.workspaces,
         Path::new(&request.workspace_path),
         app_data.as_path(),
         &policy.additional_directories,
@@ -2408,6 +2414,79 @@ async fn pick_workspace_directory(
         .into_path()
         .map_err(|error| format!("系统目录选择结果无效: {error}"))?;
     state.authorize_workspace(&path).map(Some)
+}
+
+/// Reads one level of a machine that is not this one, for the remote workspace
+/// browser.
+///
+/// Read-only and unprivileged by construction: the command is fixed, the only
+/// thing the renderer supplies is the directory being looked at, and looking
+/// grants nothing — [`authorize_remote_workspace`] is what records a grant.
+#[cfg(not(test))]
+#[tauri::command]
+async fn list_remote_directory(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    machine: model::RunTarget,
+    path: String,
+) -> Result<remote_directory::RemoteDirectoryListing, String> {
+    let assets = execution_environment_assets(&app, state.inner())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        remote_directory::list_directory(&assets, &machine, &path)
+    })
+    .await
+    .map_err(|error| format!("读取远端目录失败: {error}"))?
+}
+
+/// Confirms a directory on another machine and records it as granted this
+/// session, returning the path that machine's shell resolved.
+///
+/// The remote half of `pick_workspace_directory`: the renderer may name a
+/// workspace in a saved document only when a picker of the host's own returned
+/// it, and this is the picker for a machine with no native dialog.
+#[cfg(not(test))]
+#[tauri::command]
+async fn authorize_remote_workspace(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    machine: model::RunTarget,
+    path: String,
+) -> Result<String, String> {
+    let assets = execution_environment_assets(&app, state.inner())?;
+    let machine_key = run_environment::env_key(Some(&machine));
+    let resolved = {
+        let machine = machine.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            remote_directory::resolve_directory(&assets, &machine, &path)
+        })
+        .await
+        .map_err(|error| format!("解析远端目录失败: {error}"))??
+    };
+    state.authorize_remote_workspace(&machine_key, &resolved);
+    Ok(resolved)
+}
+
+/// The machine catalog, read from the persisted document under its lock.
+///
+/// Read here rather than taken from the renderer for the same reason the run
+/// environment is: an endpoint the renderer could assert is an endpoint it could
+/// invent.
+#[cfg(not(test))]
+fn execution_environment_assets(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<model::ExecutionEnvironmentAssets, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = document_path(app)?;
+    Ok(state
+        .document_store
+        .read(&path)?
+        .assets
+        .execution_environments
+        .clone())
 }
 
 /// The card's verbatim display fields (requester, label) go through the same
@@ -2881,6 +2960,7 @@ async fn run_model(
         Arc::clone(&live_security_level),
         request.app_data_path.clone(),
         request.additional_directories.clone(),
+        request.workspaces.clone(),
     );
     let surface_sink: Arc<api::OwnedModelEventSink> = {
         let sink_state = state.clone();
@@ -5114,6 +5194,22 @@ fn open_terminal(
     rows: u16,
     on_event: Channel<terminal::TerminalEvent>,
 ) -> Result<terminal::TerminalOpenResponse, String> {
+    // A conversation whose workspace is on another machine gets a shell on that
+    // machine. There is no host checkout under it, so no workspace lease is
+    // taken and the command lease is a no-op: the mutex those guard exists for
+    // Git operations on this filesystem.
+    if let Some(launch) = remote_terminal_launch(&app, state.inner(), &conversation_id)? {
+        return state.terminals.open(
+            &conversation_id,
+            &terminal_id,
+            launch,
+            cols,
+            rows,
+            on_event,
+            Box::new(()),
+            Arc::new(|| Ok(Box::new(()) as terminal::TerminalCommandLease)),
+        );
+    }
     let operation = trusted_workspace_operation(
         &app,
         state.inner(),
@@ -5141,6 +5237,40 @@ fn open_terminal(
         startup_lease,
         command_lease_factory,
     )
+}
+
+/// The terminal launch for a conversation whose workspace is on another
+/// machine, or `None` when the workspace is on this one.
+#[cfg(not(test))]
+fn remote_terminal_launch(
+    app: &AppHandle,
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<Option<terminal::TerminalLaunch>, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let document = state.document_store.read(&document_path(app)?)?;
+    let (workspace, conversation) =
+        trusted_workspace_and_conversation(&document, conversation_id, "终端请求")?;
+    let Some(machine) = workspace
+        .machine
+        .as_ref()
+        .filter(|_| workspace.kind == WorkspaceKind::Directory)
+    else {
+        return Ok(None);
+    };
+    let runner = crate::run_environment::resolve_shell_runner(
+        &document.assets.execution_environments,
+        Some(machine),
+    )?;
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    let anchor = effective_workspace_path(&app_data, workspace, conversation)?;
+    terminal::TerminalLaunch::remote(&runner, &workspace.path, Path::new(&anchor)).map(Some)
 }
 
 #[cfg(not(test))]
@@ -5682,7 +5812,7 @@ mod prompt_tests {
     fn wire_description(profile: &PromptProfile, name: &str) -> String {
         let tools = tool_catalog_with_descriptions(profile);
         let descriptor = tools.iter().find(|tool| tool.name == name).unwrap();
-        crate::aisdk::tools::tool_schema(descriptor, profile)["description"]
+        crate::aisdk::tools::tool_schema(descriptor, profile, &Default::default())["description"]
             .as_str()
             .unwrap_or_default()
             .to_owned()
@@ -5878,6 +6008,7 @@ mod authoritative_contexts_tests {
             parent_conversation_id: None,
             preset_id: String::new(),
             template_id: String::new(),
+            attached_workspaces: Vec::new(),
         }
     }
 
@@ -5929,6 +6060,77 @@ mod authoritative_contexts_tests {
         let stored = conversation("other", vec![user("x")]);
         let snapshot = conversation("c1", vec![user("a")]);
         assert_eq!(ids(&authoritative_contexts(Some(stored), &snapshot)), ["a"]);
+    }
+}
+
+/// Renders a resolved workspace set as the `# Environment` block states it.
+///
+/// The block and the selector read the same list, so the numbers a model is
+/// shown are the numbers [`workspace_set::WorkspaceSet::select`] resolves. The
+/// machine is carried as a named variant rather than a rendered phrase because
+/// the wording belongs to the prompt profile, which is what translates it.
+#[cfg(not(test))]
+fn environment_workspaces(
+    workspaces: &workspace_set::WorkspaceSet,
+) -> Vec<environment_prompt::EnvironmentWorkspace> {
+    workspaces
+        .entries()
+        .iter()
+        .map(|workspace| environment_prompt::EnvironmentWorkspace {
+            number: workspace.index,
+            path: workspace.root.clone(),
+            machine: environment_machine(workspace),
+        })
+        .collect()
+}
+
+fn environment_machine(
+    workspace: &workspace_set::ResolvedWorkspace,
+) -> environment_prompt::EnvironmentMachine {
+    match &workspace.machine {
+        None => environment_prompt::EnvironmentMachine::Host,
+        Some(model::RunTarget::Wsl { distro }) => {
+            environment_prompt::EnvironmentMachine::Wsl(distro.clone())
+        }
+        // The catalog name when the machine is still registered; the host
+        // address is not a substitute, because a machine the user renamed
+        // is the one they recognize by its name.
+        Some(model::RunTarget::Ssh { .. }) => {
+            environment_prompt::EnvironmentMachine::Ssh(workspace.machine_label.clone())
+        }
+    }
+}
+
+/// The `# Environment` facts for one run.
+///
+/// A primary workspace on this machine is read from disk. One on another
+/// machine is stated from the record alone: `request.workspace_path` is then
+/// only the host-side anchor, and nothing about it — its Git status least of
+/// all — describes where the model is working.
+#[cfg(not(test))]
+fn environment_facts(
+    request: &RunModelRequest,
+    conversation: &Conversation,
+) -> environment_prompt::EnvironmentFacts {
+    let workspaces = environment_workspaces(&request.workspaces);
+    match request.workspaces.primary() {
+        Some(primary) if !primary.is_local() => environment_prompt::EnvironmentFacts::collect_remote(
+            &primary.root,
+            environment_machine(primary),
+            workspaces,
+        ),
+        _ => environment_prompt::EnvironmentFacts::collect(
+            Path::new(&request.workspace_path),
+            // `effective_workspace_path` returns the worktree path verbatim
+            // when it used one, so equality is the honest test: a recorded
+            // worktree whose directory is gone fell back to the workspace
+            // root, and the block must not claim otherwise.
+            conversation
+                .worktree
+                .as_ref()
+                .is_some_and(|worktree| worktree.path == request.workspace_path),
+            workspaces,
+        ),
     }
 }
 
@@ -6021,13 +6223,25 @@ fn trusted_run_request(
     // from the persisted conversation rather than from the request the renderer
     // sent. Every entry was authorized through the host's directory picker, and
     // `storage::validate_workspace_authorizations` re-checks that on each save.
-    request.additional_directories = conversation.additional_directories.clone();
+    //
     // Resolve shell run locations from the persisted `run_target`. A deleted SSH
     // machine must fail explicitly rather than silently running locally.
     request.run_environment = crate::run_environment::resolve_shell_runner(
         &document.assets.execution_environments,
         conversation.run_target.as_ref(),
     )?;
+    // The numbered workspaces this run addresses. Resolved here, from the same
+    // atomic read of the document, so the machine catalog a call dispatches to
+    // cannot change between this snapshot and the calls the turn makes.
+    request.workspaces = crate::workspace_set::WorkspaceSet::resolve(
+        &document.assets.execution_environments,
+        &primary_workspace(workspace, &request.workspace_path),
+        &conversation.effective_attached_workspaces(),
+    )?;
+    // The local path guard trusts every workspace on this machine. A workspace on
+    // another machine is not a path in this filesystem, so it never widens the
+    // local boundary — the tool that reaches it goes through that machine's shell.
+    request.additional_directories = request.workspaces.local_roots();
     request.ephemeral_contexts.clear();
     request.enabled_tools = conversation
         .settings
@@ -6044,18 +6258,7 @@ fn trusted_run_request(
         &profile,
         &environment_prompt::environment_section(
             &profile,
-            &environment_prompt::EnvironmentFacts::collect(
-                Path::new(&request.workspace_path),
-                // `effective_workspace_path` returns the worktree path verbatim
-                // when it used one, so equality is the honest test: a recorded
-                // worktree whose directory is gone fell back to the workspace
-                // root, and the block must not claim otherwise.
-                conversation
-                    .worktree
-                    .as_ref()
-                    .is_some_and(|worktree| worktree.path == request.workspace_path),
-                &conversation.additional_directories,
-            ),
+            &environment_facts(&request, conversation),
         ),
         &runtime.addendum,
         conversation
@@ -6249,6 +6452,11 @@ struct TrustedConversationPolicy {
     /// Trusted shell environment resolved from the persisted `run_target`; it is
     /// never supplied in the renderer request body.
     run_environment: crate::run_environment::ShellRunner,
+    /// The numbered workspaces this conversation addresses, resolved from the
+    /// same persisted record a model run reads. A manually executed tool card
+    /// carries a `workspace` argument like any other call, and it must select
+    /// from exactly the set the model was offered.
+    workspaces: crate::workspace_set::WorkspaceSet,
     /// The conversation's selected profile. A manually executed tool card writes
     /// its result into the same conversation a model run would, so it has to be
     /// worded by the same profile; resolving it here keeps the IPC path from
@@ -6362,6 +6570,19 @@ fn trusted_target_workspace_operation(
         .app_data_dir()
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
     let resolved_target = workspace_lookup::resolve_git_target(&document, target, request_label)?;
+    // Git, worktrees and the file pane act on a checkout in this filesystem. A
+    // workspace on another machine has none here, and resolving its path
+    // locally would act on whatever sits at the same spelling on this host.
+    let target_workspace = match &resolved_target {
+        workspace_lookup::ResolvedGitTarget::Conversation { workspace, .. }
+        | workspace_lookup::ResolvedGitTarget::Workspace { workspace } => *workspace,
+    };
+    if let Some(machine) = &target_workspace.machine {
+        return Err(format!(
+            "{request_label}的工作区在另一台机器上（{}），本机的 Git 与文件操作无法作用于它",
+            workspace_machine_label(&document.assets.execution_environments, machine)
+        ));
+    }
     let git_network_policy = git_network_policy_for_target(&resolved_target);
     // Workspace-addressed writes have no conversation to inspect, so they collect the
     // conversations running against the same root checkout; isolated-worktree
@@ -6414,6 +6635,27 @@ fn trusted_target_workspace_operation(
         workspace_key,
         lease,
     })
+}
+
+/// The name a message shows for a machine: the distribution, or the SSH
+/// machine's catalog name — its id when the catalog no longer has it.
+#[cfg(not(test))]
+fn workspace_machine_label(
+    assets: &model::ExecutionEnvironmentAssets,
+    machine: &model::RunTarget,
+) -> String {
+    match machine {
+        model::RunTarget::Wsl { distro } => format!("WSL: {distro}"),
+        model::RunTarget::Ssh { machine_id } => format!(
+            "SSH: {}",
+            assets
+                .ssh_machines
+                .iter()
+                .find(|candidate| candidate.id == *machine_id)
+                .map(|candidate| candidate.name.as_str())
+                .unwrap_or(machine_id)
+        ),
+    }
 }
 
 /// Match `effective_workspace_path` exactly: a conversation runs in its worktree
@@ -6472,13 +6714,19 @@ fn trusted_conversation_policy_from_document(
         &document.assets.execution_environments,
         conversation.run_target.as_ref(),
     )?;
+    let workspaces = crate::workspace_set::WorkspaceSet::resolve(
+        &document.assets.execution_environments,
+        &primary_workspace(workspace, &workspace_path),
+        &conversation.effective_attached_workspaces(),
+    )?;
     Ok(TrustedConversationPolicy {
         workspace_path,
-        additional_directories: conversation.additional_directories.clone(),
+        additional_directories: workspaces.local_roots(),
         security_level: conversation.settings.security_level,
         enabled_tools,
         tools,
         run_environment,
+        workspaces,
         prompt_profile,
     })
 }
@@ -6503,6 +6751,17 @@ fn effective_workspace_path(
             if workspace.path.trim().is_empty() {
                 return Err(format!("工作区 {} 的路径为空", workspace.id));
             }
+            // A directory on another machine is not a path in this filesystem.
+            // The host still needs a local directory for its own subsystems —
+            // preview, LSP, image staging, the shell's cwd file — so such a
+            // conversation anchors in its own scratch directory, and the
+            // remote root reaches the tools through the workspace set instead.
+            // A recorded worktree cannot exist for it: worktrees are Git
+            // checkouts the host makes on this machine.
+            if workspace.machine.is_some() {
+                return workspace_dirs::ensure_remote_workspace_anchor(app_data, &conversation.id)
+                    .map(|path| path.to_string_lossy().into_owned());
+            }
             // An isolated worktree is this conversation's trusted directory; all
             // of its tool calls must resolve there.
             //
@@ -6524,6 +6783,28 @@ fn effective_workspace_path(
                 .map(|path| path.to_string_lossy().into_owned())
         }
         WorkspaceKind::Unsupported => Err(format!("工作区 {} 的类型不受支持", workspace.id)),
+    }
+}
+
+/// The primary workspace as the numbered set records it: entry 1, on the
+/// machine the workspace is registered on.
+///
+/// `anchor` is what [`effective_workspace_path`] returned. For a workspace on
+/// this machine it is the directory the calls act in — the worktree when the
+/// conversation has one — and it is entry 1 verbatim. For a workspace on
+/// another machine it is only the host-side scratch directory, and entry 1 is
+/// the recorded remote root instead.
+#[cfg(not(test))]
+fn primary_workspace(workspace: &Workspace, anchor: &str) -> model::AttachedWorkspace {
+    match &workspace.machine {
+        Some(machine) if workspace.kind == WorkspaceKind::Directory => model::AttachedWorkspace {
+            machine: Some(machine.clone()),
+            path: workspace.path.clone(),
+        },
+        _ => model::AttachedWorkspace {
+            machine: None,
+            path: anchor.to_owned(),
+        },
     }
 }
 

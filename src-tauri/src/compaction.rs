@@ -387,6 +387,7 @@ pub fn compacted_conversation(
         user_aborted_tasks: Vec::new(),
         worktree: source.worktree.clone(),
         run_target: source.run_target.clone(),
+        attached_workspaces: source.attached_workspaces.clone(),
         additional_directories: source.additional_directories.clone(),
         parent_conversation_id: source
             .parent_conversation_id
