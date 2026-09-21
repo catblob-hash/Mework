@@ -188,6 +188,37 @@ impl ApprovalRegistry {
         canonical_workspace(path).ok().map(|(key, _)| key)
     }
 
+    /// Records a directory on another machine as granted this session.
+    ///
+    /// Remote grants share the local set because they answer the same question —
+    /// "did a picker of ours return this?" — and keeping two sets would mean two
+    /// places for a check to be forgotten. They cannot collide: a local key is a
+    /// canonicalized path from this filesystem, and [`remote_workspace_key`]
+    /// builds its key around a NUL, which no path may contain.
+    pub fn authorize_remote_workspace(&self, machine_key: &str, path: &str) {
+        self.workspace_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(remote_workspace_key(machine_key, path));
+    }
+
+    pub fn require_remote_workspace_authorization(
+        &self,
+        machine_key: &str,
+        path: &str,
+    ) -> Result<(), String> {
+        if self
+            .workspace_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&remote_workspace_key(machine_key, path))
+        {
+            Ok(())
+        } else {
+            Err("新增或更改远端工作区必须先通过远端目录浏览器授权".into())
+        }
+    }
+
     pub fn clear(&self) {
         self.tool_approvals
             .lock()
@@ -220,6 +251,17 @@ fn tool_binding(
         input,
         run_environment: run_environment.to_owned(),
     })
+}
+
+/// Identity of a directory on another machine: the machine's environment key
+/// and the path the remote shell resolved, joined by a NUL.
+///
+/// The NUL is what keeps remote keys out of the local key space — no path on
+/// any supported filesystem may contain one — and what keeps two machines'
+/// identically spelled directories apart, which is the whole point: one
+/// machine's `/srv/app` is not another's.
+pub fn remote_workspace_key(machine_key: &str, path: &str) -> String {
+    format!("{machine_key}\u{0}{path}")
 }
 
 fn canonical_workspace(path: &Path) -> Result<(String, String), String> {

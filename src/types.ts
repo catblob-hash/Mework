@@ -524,6 +524,20 @@ export type RunTarget =
   | { kind: "wsl"; distro: string }
   | { kind: "ssh"; machineId: string };
 
+/**
+ * One directory a conversation may work in, together with the machine it is on.
+ *
+ * `machine` absent (or `null`) is the host machine, matching {@link RunTarget}'s
+ * "local is the absent variant" convention. The model never addresses these by
+ * path: it names a workspace by its 1-based position in the conversation's list,
+ * which is what the `workspace` parameter on every path-taking tool carries.
+ */
+export interface AttachedWorkspace {
+  machine?: RunTarget | null;
+  /** Absolute path on that machine. A remote path is POSIX and may begin `~`. */
+  path: string;
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -539,17 +553,27 @@ export interface Conversation {
   /** Execution target, or `null` for local execution. See {@link RunTarget}. */
   runTarget: RunTarget | null;
   /**
-   * Absolute directories outside the workspace that this conversation may also
-   * work in — the composer's extra-directory chips.
+   * Directories outside the primary workspace that this conversation may also
+   * work in, each on the machine it names — the composer's workspace chips.
+   * Together with the primary workspace they form the numbered list the model
+   * addresses: the primary is workspace 1 and these follow in order.
    *
    * On the conversation rather than in {@link ConversationSettings} for the same
    * reason as `worktree`: presets and workspace snapshots copy settings
    * wholesale, and one conversation's granted path is not another's. Each entry
-   * came back from the host's directory picker, which is the only thing that
-   * authorizes it; writing a path here that the picker never returned makes the
+   * came back from a host directory picker — native for the host machine, the
+   * remote browser for a WSL or SSH machine — which is the only thing that
+   * authorizes it; writing a path here that no picker returned makes the
    * document unsavable.
    */
-  additionalDirectories: string[];
+  attachedWorkspaces: AttachedWorkspace[];
+  /**
+   * Superseded by {@link Conversation.attachedWorkspaces}, which carries a
+   * machine alongside each path. Present only on documents written before
+   * workspaces could be remote; the host folds it into host-machine entries and
+   * never writes it back.
+   */
+  additionalDirectories?: string[];
   /**
    * The conversation this one was forked from, or `null` for a top-level
    * conversation. Nesting is a renderer concept only: a child has exactly the
@@ -588,6 +612,11 @@ export interface Workspace {
   name: string;
   kind: WorkspaceKind;
   path: string;
+  /**
+   * Machine this workspace's directory lives on. Absent (or `null`) is the host
+   * machine, which is what every workspace registered before machines existed is.
+   */
+  machine?: RunTarget | null;
   createdAt: string;
   /**
    * Preset ID automatically applied when the workspace's plus button creates a
@@ -1376,6 +1405,10 @@ export interface GlobalSettings {
  * User-registered SSH execution machine. `host` accepts `user@hostname`, a
  * hostname, or an `~/.ssh/config` host alias. Authentication material is not
  * persisted; OpenSSH resolves it from identity files and the agent.
+ *
+ * The machine carries no working directory. A directory on it is a workspace
+ * like any other — picked through the remote directory browser and recorded on
+ * the conversation, where it gets the number the model addresses it by.
  */
 export interface SshMachineConfig {
   id: string;
@@ -1385,8 +1418,6 @@ export interface SshMachineConfig {
   port: number;
   /** Private key path; empty uses OpenSSH's default resolution. */
   identityFile: string;
-  /** Remote working directory; empty uses the remote home and accepts a `~` prefix. */
-  remoteCwd: string;
   createdAt: string;
   updatedAt: string;
 }

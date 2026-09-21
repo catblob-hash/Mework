@@ -17,6 +17,7 @@ import {
   RotateCcw,
   Settings,
   ShieldCheck,
+  Server,
   SlidersHorizontal,
   Square,
   SquareTerminal,
@@ -53,6 +54,7 @@ import {
   Sidebar,
   SIDEBAR_DEFAULT_WIDTH
 } from "./components/Sidebar";
+import { RemoteDirectoryPicker } from "./components/RemoteDirectoryPicker";
 import { WorkspaceSelector } from "./components/WorkspaceSelector";
 import { ForkRequestTray } from "./components/ForkRequestTray";
 import { detachAbsentParents, reparentChildren } from "./lib/conversationTree";
@@ -103,7 +105,13 @@ import {
   type SendPipelineHost,
   type ToolExposureMode
 } from "./lib/sendPipeline";
-import { isReservedWorkspace, TEMPORARY_WORKSPACE_ID } from "./lib/workspaces";
+import {
+  isReservedWorkspace,
+  runEnvKey,
+  sameMachine,
+  TEMPORARY_WORKSPACE_ID,
+  workspaceLocationTitle
+} from "./lib/workspaces";
 import {
   settingsAtToolLockFloor,
   toolLockOf,
@@ -118,6 +126,7 @@ import {
   isDraftConversationId
 } from "./lib/draftConversation";
 import type { DraftConversationState } from "./lib/draftConversation";
+import { listWslDistros } from "./lib/runtime";
 import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, prepareImageAttachment, previewConversationTemplate, probeMcpServer, refreshCapabilities, revealCapabilityLocation, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, runModel, skipWorkflowStep, steerModelRun, workflowStepRecord } from "./lib/runtime";
 import { SECURITY_LEVEL_OPTIONS, securityLevelLabel } from "./lib/securityLevels";
 import {
@@ -311,6 +320,7 @@ import type {
   ProviderFamily,
   ApiProvider,
   AppDocument,
+  AttachedWorkspace,
   ConversationTemplateSummary,
   ContextItem,
   Conversation,
@@ -346,7 +356,8 @@ import type {
   ToolPromptDecision,
   UserContext,
   WorkflowProgressEntry,
-  Workspace
+  Workspace,
+  WslDistro
 } from "./types";
 
 /** Stable identity for the empty projection so selectors return the same array without an active conversation. */
@@ -554,6 +565,26 @@ function directoryLabel(path: string): string {
   const trimmed = path.trim().replace(/[\\/]+$/, "");
   const separator = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   return trimmed.slice(separator + 1) || trimmed;
+}
+
+/**
+ * The icon that says which machine a workspace is on.
+ *
+ * Machine and directory are one fact on a chip this small, so the icon carries
+ * the machine and the label carries the directory; the full pair is in the
+ * chip's `title`, where a user who needs both can read them.
+ */
+function WorkspaceMachineIcon({ machine }: { machine?: RunTargetType | null }) {
+  if (!machine) return <Folder size={13} />;
+  return machine.kind === "wsl" ? <SquareTerminal size={13} /> : <Server size={13} />;
+}
+
+/** The chip's hover text: the path and, when it is not this machine, where it is. */
+function workspaceChipTitle(
+  workspace: AttachedWorkspace,
+  sshMachines: SshMachineConfigType[]
+): string {
+  return workspaceLocationTitle(workspace.path, workspace.machine, sshMachines);
 }
 
 function allowsNativeContextMenu(target: EventTarget | null): boolean {
@@ -2125,12 +2156,19 @@ function App() {
   const activeGitConversationId = activeConversation?.id ?? null;
   const activeGitWorkspaceId = activeWorkspace?.id ?? null;
   const activeGitWorkspaceKind = activeWorkspace?.kind ?? null;
+  /**
+   * Whether the active workspace's directory is on another machine. The Git
+   * surface, the worktree toggle and the file pane act on a checkout in this
+   * filesystem; a remote workspace has none here, and the host refuses to
+   * resolve its path locally.
+   */
+  const activeWorkspaceIsRemote = Boolean(activeWorkspace?.machine);
   const activeGitTarget = useMemo((): GitTarget | null => {
-    if (!activeGitConversationId) return null;
+    if (!activeGitConversationId || activeWorkspaceIsRemote) return null;
     if (!draftActive) return gitConversationTarget(activeGitConversationId);
     if (!activeGitWorkspaceId || activeGitWorkspaceKind !== "directory") return null;
     return gitWorkspaceTarget(activeGitWorkspaceId);
-  }, [activeGitConversationId, activeGitWorkspaceId, activeGitWorkspaceKind, draftActive]);
+  }, [activeGitConversationId, activeGitWorkspaceId, activeGitWorkspaceKind, activeWorkspaceIsRemote, draftActive]);
   useEffect(() => {
     const conversationId = activeConversation?.id;
     const workspaceId = activeWorkspace?.id;
@@ -2180,6 +2218,13 @@ function App() {
     if (!paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, activeConversation.id), "review")) return;
     dispatchSidePanes({ type: "close", conversationId: activeConversation.id, pane: "review" });
   }, [activeConversation, activeGitSnapshotState, dispatchSidePanes]);
+  // The file pane reads this machine's filesystem; a conversation moved to a
+  // remote workspace has nothing for it to show.
+  useEffect(() => {
+    if (!activeConversation || !activeWorkspaceIsRemote) return;
+    if (!paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, activeConversation.id), "files")) return;
+    dispatchSidePanes({ type: "close", conversationId: activeConversation.id, pane: "files" });
+  }, [activeConversation, activeWorkspaceIsRemote, dispatchSidePanes]);
   /**
    * Shows the review pane.
    *
@@ -2421,7 +2466,8 @@ function App() {
     ?? activeWorkspace?.path
     ?? null;
   /** The checkout the file pane browses, which is what the pane can show a file from. */
-  const filesPaneRoot = activeWorktree?.path ?? activeWorkspace?.path ?? null;
+  // A remote workspace has no host directory for the file pane or a timeline path click to open.
+  const filesPaneRoot = activeWorkspaceIsRemote ? null : activeWorktree?.path ?? activeWorkspace?.path ?? null;
   const [filesPaneRequest, setFilesPaneRequest] = useState<
     (FilesPaneOpenRequest & { conversationId: string }) | null
   >(null);
@@ -3647,51 +3693,90 @@ function App() {
   }, [activeWorkspaceId, activeConversationId, updateConversation]);
 
   /**
-   * Replace the conversation's extra working directories, on the same terms as
-   * the run target: a draft keeps them in its own state until materialization.
+   * WSL distributions offered by the attach-workspace menu, or `null` before the
+   * menu has been opened. Enumerated on each open rather than cached: a
+   * distribution can be installed or removed while the app is running, and the
+   * menu is the moment the answer matters.
    */
-  const setConversationAdditionalDirectories = useCallback((
-    next: (current: string[]) => string[]
+  const [machineMenuDistros, setMachineMenuDistros] = useState<WslDistro[] | null>(null);
+  /**
+   * The machine whose remote directory browser is open, with its display name
+   * and what the chosen directory becomes: another numbered workspace of this
+   * conversation, or the workspace the conversation moves to.
+   */
+  const [remoteWorkspacePicker, setRemoteWorkspacePicker] = useState<
+    { machine: RunTargetType; name: string; purpose: "attach" | "primary" } | null
+  >(null);
+
+  /** The name the picker's title uses for a machine: the distribution, or the SSH catalog name. */
+  const machineDisplayName = useCallback((machine: RunTargetType): string => (
+    machine.kind === "wsl"
+      ? machine.distro
+      : documentStore.current()?.globalSettings.executionEnvironments.sshMachines
+        .find((entry) => entry.id === machine.machineId)?.name ?? machine.machineId
+  ), [documentStore]);
+
+  const loadMachineMenu = useCallback(() => {
+    void listWslDistros().then(setMachineMenuDistros).catch(() => setMachineMenuDistros([]));
+  }, []);
+
+  /**
+   * Replace the conversation's attached workspaces, on the same terms as the
+   * run target: a draft keeps them in its own state until materialization.
+   */
+  const setConversationAttachedWorkspaces = useCallback((
+    next: (current: AttachedWorkspace[]) => AttachedWorkspace[]
   ) => {
     if (isDraftConversationId(activeConversationIdRef.current)) {
       setDraftConversation((current) => (
-        current ? { ...current, additionalDirectories: next(current.additionalDirectories) } : current
+        current ? { ...current, attachedWorkspaces: next(current.attachedWorkspaces) } : current
       ));
       return;
     }
     if (!activeWorkspaceId || !activeConversationId) return;
     updateConversation(activeWorkspaceId, activeConversationId, (conversation) => ({
       ...conversation,
-      additionalDirectories: next(conversation.additionalDirectories),
+      attachedWorkspaces: next(conversation.attachedWorkspaces),
       updatedAt: new Date().toISOString()
     }));
   }, [activeWorkspaceId, activeConversationId, updateConversation]);
 
+  /** Append one workspace, ignoring a machine-and-path pair already attached. */
+  const attachWorkspace = useCallback((machine: RunTargetType | null, path: string) => {
+    setConversationAttachedWorkspaces((current) => (
+      current.some((entry) => (
+        sameMachine(entry.machine, machine) && entry.path === path
+      ))
+        ? current
+        : [...current, machine ? { machine, path } : { path }]
+    ));
+  }, [setConversationAttachedWorkspaces]);
+
   /**
-   * Add one extra working directory through the host's picker.
+   * Attach one workspace on the host machine through the native picker.
    *
    * The picker is what authorizes the path — the host will refuse to save a
    * document naming a directory it never returned — so there is no text-entry
-   * path here, and nothing to do when the user cancels.
+   * path here, and nothing to do when the user cancels. A workspace on another
+   * machine goes through {@link RemoteDirectoryPicker} instead, which is the
+   * same rule served by a different dialog.
    */
-  const addAdditionalDirectory = useCallback(async () => {
+  const attachLocalWorkspace = useCallback(async () => {
     if (!hasNativeWorkspacePicker()) return;
     try {
       const path = await pickWorkspaceDirectory();
       if (!path) return;
-      setConversationAdditionalDirectories((current) => (
-        current.includes(path) ? current : [...current, path]
-      ));
+      attachWorkspace(null, path);
     } catch {
       // Cancelling or failing to pick a directory is not an error worth reporting; the button retries.
     }
-  }, [setConversationAdditionalDirectories]);
+  }, [attachWorkspace]);
 
-  const removeAdditionalDirectory = useCallback((path: string) => {
-    setConversationAdditionalDirectories((current) => (
-      current.filter((directory) => directory !== path)
-    ));
-  }, [setConversationAdditionalDirectories]);
+  const detachWorkspace = useCallback((workspace: AttachedWorkspace) => {
+    setConversationAttachedWorkspaces((current) => current.filter((entry) => !(
+      sameMachine(entry.machine, workspace.machine) && entry.path === workspace.path
+    )));
+  }, [setConversationAttachedWorkspaces]);
 
   const saveRunEnvironmentVars = useCallback((envKey: string, vars: Record<string, string>) => {
     documentStore.update((current) => {
@@ -4062,9 +4147,14 @@ function App() {
     presetIdOverride = "",
     /** Template whose queue the draft was showing; only a materialized draft supplies it. */
     templateIdOverride = "",
-    /** Extra directories the draft was granted; only a materialized draft supplies them. */
-    additionalDirectoriesOverride: string[] = []
+    /** Workspaces the draft was granted; only a materialized draft supplies them. */
+    attachedWorkspacesOverride: AttachedWorkspace[] = []
   ): string | null => {
+    // The store, not the rendered snapshot: a workspace registered in this same
+    // event — the directory the user just picked — is in the store already and
+    // in the snapshot only after the next render, and a conversation created
+    // against the stale snapshot would land in whatever workspace came first.
+    const document = documentStore.current();
     if (!document) return null;
     const requestedId = workspaceId ?? activeWorkspaceId;
     const target = document.workspaces.find((workspace) => workspace.id === requestedId) ?? document.workspaces[0];
@@ -4095,7 +4185,7 @@ function App() {
         userAbortedTasks: [],
         worktree: null,
         runTarget: runTargetOverride ?? null,
-        additionalDirectories: additionalDirectoriesOverride,
+        attachedWorkspaces: attachedWorkspacesOverride,
         parentConversationId,
         presetId: resolved.presetId,
         // Only a materialized draft carries one: every other creation path has
@@ -4128,7 +4218,7 @@ function App() {
     dispatchSidePanes({ type: "remove_conversation", conversationId });
     dispatchTerminalTabs({ type: "remove_conversation", conversationId });
     return conversationId;
-  }, [activeWorkspaceId, dispatchSidePanes, dispatchTerminalTabs, document, resolveNewConversationSettings, t]);
+  }, [activeWorkspaceId, dispatchSidePanes, dispatchTerminalTabs, documentStore, resolveNewConversationSettings, t]);
 
   const discardDraftConversation = useCallback(() => {
     if (!draftConversationRef.current) return;
@@ -4185,7 +4275,7 @@ function App() {
       createdAt: new Date().toISOString(),
       worktreeRequested: false,
       runTarget: null,
-      additionalDirectories: [],
+      attachedWorkspaces: [],
       contexts: [],
       presetId: resolved.presetId,
       templateId: ""
@@ -4250,7 +4340,7 @@ function App() {
     const draft = draftConversationRef.current;
     if (!draft) return null;
     const workspaceId = draft.workspaceId ?? TEMPORARY_WORKSPACE_ID;
-    const created = createConversation(workspaceId, "global", draft.settings, draft.runTarget, null, draft.contexts, draft.presetId, draft.templateId, draft.additionalDirectories);
+    const created = createConversation(workspaceId, "global", draft.settings, draft.runTarget, null, draft.contexts, draft.presetId, draft.templateId, draft.attachedWorkspaces);
     if (!created) return null;
     const worktreeRequested = draft.worktreeRequested
       && documentStore.current()?.workspaces.find(
@@ -4588,9 +4678,9 @@ function App() {
         ...conversation,
         settings: draft.settings,
         runTarget: draft.runTarget,
-        additionalDirectories: draft.additionalDirectories.length
-          ? draft.additionalDirectories
-          : conversation.additionalDirectories,
+        attachedWorkspaces: draft.attachedWorkspaces.length
+          ? draft.attachedWorkspaces
+          : conversation.attachedWorkspaces,
         presetId: draft.presetId,
         templateId: draft.templateId,
         contexts: draft.contexts.length ? draft.contexts : conversation.contexts
@@ -4605,7 +4695,7 @@ function App() {
         draft.contexts,
         draft.presetId,
         draft.templateId,
-        draft.additionalDirectories
+        draft.attachedWorkspaces
       );
     }
     if (!conversationId) return;
@@ -4739,10 +4829,18 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [shortcutBindings]);
 
+  /**
+   * Registers a directory as a workspace, or reuses the workspace already
+   * registered for it. `machine` is where the directory lives; `null` is this
+   * machine. Identity is the machine and the path together — one machine's
+   * `/srv/app` is not another's — and a POSIX path keeps its case, since
+   * `normalizedWorkspacePath` folds only Windows spellings.
+   */
   const addWorkspace = async (
     name: string,
     path: string,
-    assignConversation = assignWorkspaceAfterAdd
+    assignConversation = assignWorkspaceAfterAdd,
+    machine: RunTargetType | null = null
   ) => {
     const current = documentStore.current();
     if (!current) return;
@@ -4756,6 +4854,7 @@ function App() {
     ));
     const existing = current.workspaces.find((workspace) => (
       workspace.kind === "directory"
+      && sameMachine(workspace.machine, machine)
       && normalizedWorkspacePath(workspace.path) === normalized
     ));
     // Drafts have no stored ownership; assign their workspace id directly when it exists, or after creation.
@@ -4790,6 +4889,7 @@ function App() {
         || t("新工作区", "New workspace"),
       kind: "directory",
       path: path.trim(),
+      ...(machine ? { machine } : {}),
       createdAt: new Date().toISOString(),
       // A new workspace has no history, so leave its default preset empty until first creation records a snapshot.
       defaultConversationPresetId: "",
@@ -4800,8 +4900,10 @@ function App() {
     documentStore.update(() => next);
     /* A new directory workspace adds a whole configuration level: its `.mework`
      * may already hold skills, MCP servers and hooks that nothing has scanned
-     * yet. A failure here only leaves the catalog as stale as it already was. */
-    void rescanCapabilities().catch(() => {});
+     * yet. A failure here only leaves the catalog as stale as it already was.
+     * A directory on another machine is not scanned: the host reads capability
+     * files from its own filesystem only. */
+    if (!machine) void rescanCapabilities().catch(() => {});
     if (assigningDraft) {
       setDraftWorkspace(workspace.id);
       setWorkspaceDialogOpen(false);
@@ -4826,7 +4928,17 @@ function App() {
   };
 
 
-  const chooseWorkspaceDirectory = async () => {
+  /**
+   * Picks the conversation's workspace on `machine` (`null` is this one). The
+   * host's own picker is what authorizes the directory — the native dialog for
+   * this machine, the remote browser for another — so the remote case only
+   * opens that browser here; its confirmation lands in `addWorkspace`.
+   */
+  const chooseWorkspaceDirectory = async (machine: RunTargetType | null) => {
+    if (machine) {
+      setRemoteWorkspacePicker({ machine, name: machineDisplayName(machine), purpose: "primary" });
+      return;
+    }
     if (!hasNativeWorkspacePicker()) {
       setAssignWorkspaceAfterAdd(true);
       setWorkspaceDialogOpen(true);
@@ -6678,6 +6790,7 @@ function App() {
       >
         <Sidebar
             workspaces={document.workspaces}
+            sshMachines={document.globalSettings.executionEnvironments.sshMachines}
             activeWorkspaceId={activeWorkspaceId}
             activeConversationId={activeConversationId}
             onSelectConversation={selectConversation}
@@ -6772,9 +6885,11 @@ function App() {
                       activity: Boolean(activeGitSnapshot && activeGitSnapshot.files.length > 0),
                       // Without a snapshot and a target there is no repository to review.
                       disabled: !(activeGitSnapshot && activeGitTarget),
-                      title: !(activeGitSnapshot && activeGitTarget)
-                        ? t("当前工作区不是 Git 仓库", "This workspace is not a Git repository")
-                        : undefined,
+                      title: activeWorkspaceIsRemote
+                        ? t("工作区在另一台机器上，本机的 Git 面板不可用", "This workspace is on another machine; the host's Git pane is unavailable")
+                        : !(activeGitSnapshot && activeGitTarget)
+                          ? t("当前工作区不是 Git 仓库", "This workspace is not a Git repository")
+                          : undefined,
                       onToggle: () => (gitReviewPanelOpen
                         ? closePane("review")
                         : openGitReview())
@@ -6801,7 +6916,10 @@ function App() {
                       label: t("文件", "Files"),
                       icon: <Folder size={14} aria-hidden="true" />,
                       checked: paneIsOpen(activeLayout, "files"),
-                      disabled: draftActive,
+                      disabled: draftActive || activeWorkspaceIsRemote,
+                      title: activeWorkspaceIsRemote
+                        ? t("工作区在另一台机器上，本机的文件面板不可用", "This workspace is on another machine; the host's file pane is unavailable")
+                        : undefined,
                       onSelect: () => togglePane("files")
                     },
                     {
@@ -6998,12 +7116,18 @@ function App() {
                     <WorkspaceSelector
                       workspaces={document.workspaces}
                       activeWorkspace={activeWorkspace}
+                      machines={{
+                        wslDistros: machineMenuDistros,
+                        sshMachines: document.globalSettings.executionEnvironments.sshMachines
+                      }}
+                      remoteMachines={hasNativeWorkspacePicker()}
+                      onOpen={loadMachineMenu}
                       onSelect={(workspaceId) => {
                         // Drafts change one field; persisted conversations must relocate.
                         if (draftActive) setDraftWorkspace(workspaceId);
                         else void moveActiveConversation(workspaceId);
                       }}
-                      onChooseDirectory={() => void chooseWorkspaceDirectory()}
+                      onChooseDirectory={(machine) => void chooseWorkspaceDirectory(machine)}
                       movementDisabled={deletingConversationIds.has(activeConversation.id)
                         || activeConversation.contexts.length > 0}
                       movementDisabledReason={t(
@@ -7078,49 +7202,80 @@ function App() {
                         </label>
                       </div>
                     )}
-                    {/* Extra working directories sit with the other "where this runs" chips, and the
+                    {/* Attached workspaces sit with the other "where this runs" chips, and the
                         picker button trails them so a new one lands where the button was.
                         Both are frozen while a turn runs: the host snapshots the granted set when it
                         builds the request, so a grant given or taken back mid-run would show here
-                        without reaching the calls that turn is still making. */}
-                    {activeConversation.additionalDirectories.map((directory) => (
+                        without reaching the calls that turn is still making.
+
+                        The number is shown only when there is more than one workspace, which is
+                        exactly when the host states the numbers to the model — a lone chip with a
+                        "2" on it would be an address for something the model never sees. */}
+                    {activeConversation.attachedWorkspaces.map((workspace, position) => (
                       <span
-                        key={directory}
+                        key={`${runEnvKey(workspace.machine)} ${workspace.path}`}
                         className="composer-chip composer-chip--static"
-                        title={directory}
+                        title={workspaceChipTitle(
+                          workspace,
+                          document.globalSettings.executionEnvironments.sshMachines
+                        )}
                       >
-                        <Folder size={13} />
-                        <span className="composer-chip__label">{directoryLabel(directory)}</span>
+                        <WorkspaceMachineIcon machine={workspace.machine} />
+                        <span className="composer-chip__index" aria-hidden="true">{position + 2}</span>
+                        <span className="composer-chip__label">{directoryLabel(workspace.path)}</span>
                         <button
                           type="button"
                           className="composer-chip__remove"
-                          aria-label={t("移除额外工作目录：{path}", "Remove additional working directory: {path}", { path: directory })}
+                          aria-label={t("移除工作区：{path}", "Remove workspace: {path}", { path: workspace.path })}
                           disabled={activeModelRunning}
-                          onClick={() => removeAdditionalDirectory(directory)}
+                          onClick={() => detachWorkspace(workspace)}
                         >
                           <X size={11} />
                         </button>
                       </span>
                     ))}
                     {hasNativeWorkspacePicker() && (
-                      <button
-                        type="button"
-                        className="composer-chip composer-chip--icon"
-                        aria-label={t("添加额外工作目录", "Add an additional working directory")}
-                        title={activeModelRunning
-                          ? t(
-                            "本回合结束后才能更改额外工作目录",
-                            "Extra working directories can be changed once this turn has finished"
-                          )
-                          : t(
-                            "让本对话也能读写工作区之外的一个目录",
-                            "Let this conversation also work in one directory outside the workspace"
-                          )}
+                      <PopoverMenu
+                        triggerClassName="composer-chip composer-chip--icon"
+                        trigger={<FolderPlus size={13} />}
+                        triggerLabel={t("附加工作区", "Attach a workspace")}
                         disabled={activeModelRunning}
-                        onClick={() => void addAdditionalDirectory()}
-                      >
-                        <FolderPlus size={13} />
-                      </button>
+                        menuLabel={t("在哪台机器上选目录", "Which machine to pick a directory on")}
+                        menuWidth={244}
+                        emptyLabel={t("没有可选的机器", "No machines to choose from")}
+                        onOpen={loadMachineMenu}
+                        sections={[{
+                          id: "machines",
+                          items: [
+                            {
+                              id: "local",
+                              label: t("本机", "This machine"),
+                              icon: <Monitor size={14} />,
+                              onSelect: () => void attachLocalWorkspace()
+                            },
+                            ...(machineMenuDistros ?? []).map((distro) => ({
+                              id: `wsl:${distro.name}`,
+                              label: distro.name,
+                              icon: <SquareTerminal size={14} />,
+                              onSelect: () => setRemoteWorkspacePicker({
+                                machine: { kind: "wsl", distro: distro.name },
+                                name: distro.name,
+                                purpose: "attach"
+                              })
+                            })),
+                            ...document.globalSettings.executionEnvironments.sshMachines.map((machine) => ({
+                              id: `ssh:${machine.id}`,
+                              label: machine.name,
+                              icon: <Server size={14} />,
+                              onSelect: () => setRemoteWorkspacePicker({
+                                machine: { kind: "ssh", machineId: machine.id },
+                                name: machine.name,
+                                purpose: "attach"
+                              })
+                            }))
+                          ]
+                        }]}
+                      />
                     )}
                     {activeGitSnapshot && (
                       <GitStatusCard
@@ -7600,6 +7755,18 @@ function App() {
         {workspaceDialogOpen && <WorkspaceDialog
           onClose={() => { setWorkspaceDialogOpen(false); setAssignWorkspaceAfterAdd(false); }}
           onSubmit={(name, path) => void addWorkspace(name, path)}
+        />}
+
+        {remoteWorkspacePicker && <RemoteDirectoryPicker
+          machine={remoteWorkspacePicker.machine}
+          machineName={remoteWorkspacePicker.name}
+          onPick={(path) => {
+            const { machine, purpose } = remoteWorkspacePicker;
+            setRemoteWorkspacePicker(null);
+            if (purpose === "attach") attachWorkspace(machine, path);
+            else void addWorkspace("", path, true, machine);
+          }}
+          onClose={() => setRemoteWorkspacePicker(null)}
         />}
       </div>
     </CommonErrorBoundary>

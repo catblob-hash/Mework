@@ -129,6 +129,10 @@ button.subagent-chip:hover { border-color: var(--border-strong); background: var
 .composer-chip:hover:not(:disabled), .composer-chip.popover-menu__trigger--open { border-color: var(--border-strong); background: var(--subtle); color: var(--text); }
 .composer-chip:disabled { color: var(--faint); cursor: not-allowed; }
 .composer-chip__label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The address the model uses for this workspace. It reads as a badge rather than
+   as part of the name, because the number is what a tool call carries and the
+   name is only how a person recognizes the directory. */
+.composer-chip__index { flex: 0 0 auto; min-width: 13px; padding: 0 3px; border-radius: 4px; background: var(--subtle); color: var(--muted); font-size: 9px; font-weight: 650; font-variant-numeric: tabular-nums; text-align: center; }
 .composer-chip__caret { flex: 0 0 auto; color: var(--faint); }
 /* Branch and worktree form one chip because they describe the same run location. */
 .composer-chip-group { height: 25px; display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 7px; }
@@ -176,6 +180,15 @@ button.subagent-chip:hover { border-color: var(--border-strong); background: var
 .run-location__env-input:focus-visible { border-color: var(--border-strong); outline: 0; }
 .run-location__error { margin: 7px 0 0; color: var(--danger); font-size: 10.5px; line-height: 1.4; }
 .run-location__delete { margin-right: auto; color: var(--danger); }
+
+.remote-picker { display: flex; flex-direction: column; gap: 9px; }.remote-picker__list { height: 208px; overflow-y: auto; padding: 3px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); border-radius: 8px; }
+.remote-picker__entry { min-height: 27px; padding: 4px 7px; display: flex; align-items: center; gap: 8px; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 12px; }
+.remote-picker__entry:hover:not(:disabled), .remote-picker__entry:focus-visible { background: var(--hover); outline: 0; }
+.remote-picker__entry:disabled { color: var(--faint); cursor: default; }
+.remote-picker__entry > svg { flex: 0 0 auto; color: var(--muted); }
+.remote-picker__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11.5px; }
+.remote-picker__empty { margin: 0; padding: 8px; display: flex; align-items: center; gap: 7px; color: var(--faint); font-size: 10.5px; }
+.remote-picker__spinner { animation: spin 1s linear infinite; }
 
 .composer__input { display: flex; align-items: flex-end; gap: 8px; }
 .composer__send { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }

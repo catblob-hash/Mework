@@ -38,8 +38,6 @@ pub enum ShellRunner {
         port: u16,
         /// Empty delegates to OpenSSH's default resolution.
         identity_file: String,
-        /// Empty uses the remote user's home directory; `~` prefixes are supported.
-        remote_cwd: String,
         env: BTreeMap<String, String>,
     },
 }
@@ -75,6 +73,10 @@ impl ShellRunner {
     /// Approval fingerprint over environment identity and variables. A manual-execution
     /// nonce must expire when either changes, preventing local approval from running
     /// the command on a different target.
+    ///
+    /// The working directory is deliberately absent: it is no longer a property of
+    /// the machine but of the workspace the call names, so the policy fingerprint
+    /// that guards a nonce folds the workspace in alongside this.
     pub fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         match self {
@@ -87,7 +89,6 @@ impl ShellRunner {
                 host,
                 port,
                 identity_file,
-                remote_cwd,
                 ..
             } => {
                 hasher.update(b"ssh:");
@@ -95,8 +96,6 @@ impl ShellRunner {
                 hasher.update([0]);
                 hasher.update(port.to_le_bytes());
                 hasher.update(identity_file.as_bytes());
-                hasher.update([0]);
-                hasher.update(remote_cwd.as_bytes());
             }
         }
         for (key, value) in self.env() {
@@ -159,7 +158,6 @@ pub fn resolve_shell_runner(
                 host: machine.host.clone(),
                 port: machine.port,
                 identity_file: machine.identity_file.clone(),
-                remote_cwd: machine.remote_cwd.clone(),
                 env,
             })
         }
@@ -229,8 +227,8 @@ pub fn sh_single_quote(text: &str) -> String {
     quoted
 }
 
-/// Quotes a remote working directory while leaving a `~` prefix unquoted for expansion.
-fn quote_remote_cwd(cwd: &str) -> String {
+/// Quotes a remote path while leaving a `~` prefix unquoted for expansion.
+pub fn quote_remote_path(cwd: &str) -> String {
     if cwd == "~" {
         return "~".into();
     }
@@ -240,12 +238,14 @@ fn quote_remote_cwd(cwd: &str) -> String {
     sh_single_quote(cwd)
 }
 
-/// Builds `wsl.exe` arguments. `--cd` accepts an absolute Windows path and applies
-/// distribution automount rules; environment variables are argv entries and the
-/// command is the single `bash -c` argument passed unchanged through `--exec`.
+/// Builds `wsl.exe` arguments. `--cd` applies distribution automount rules to an
+/// absolute Windows path and takes a Linux path as-is, which is what a workspace
+/// attached on the distribution itself carries; environment variables are argv
+/// entries and the command is the single `bash -c` argument passed unchanged
+/// through `--exec`.
 pub fn wsl_shell_args(
     distro: &str,
-    workspace: &Path,
+    workspace_root: &str,
     env: &BTreeMap<String, String>,
     command: &str,
 ) -> Vec<String> {
@@ -253,7 +253,7 @@ pub fn wsl_shell_args(
         "-d".into(),
         distro.to_owned(),
         "--cd".into(),
-        workspace.to_string_lossy().into_owned(),
+        workspace_root.to_owned(),
         "--exec".into(),
         "/usr/bin/env".into(),
     ];
@@ -275,6 +275,11 @@ pub fn wsl_shell_args(
 /// Builds OpenSSH arguments. The remote login shell parses one command string, so all
 /// host-supplied fragments use [`sh_single_quote`]. `BatchMode=yes` fails explicitly
 /// when credentials or host-key confirmation are unavailable.
+///
+/// `remote_cwd` is the root of the workspace the call named, not a property of the
+/// machine: the same machine serves as many working directories as the
+/// conversation has attached on it. Empty leaves the remote login shell wherever
+/// it starts, which is the remote user's home.
 pub fn ssh_shell_args(
     host: &str,
     port: u16,
@@ -300,7 +305,7 @@ pub fn ssh_shell_args(
 
     let mut remote = String::new();
     if !remote_cwd.is_empty() {
-        remote.push_str(&format!("cd {} || exit 1; ", quote_remote_cwd(remote_cwd)));
+        remote.push_str(&format!("cd {} || exit 1; ", quote_remote_path(remote_cwd)));
     }
     remote.push_str("exec ");
     let injected: Vec<_> = env
@@ -333,6 +338,226 @@ pub fn ssh_client_candidates() -> Vec<String> {
     {
         vec!["ssh".into()]
     }
+}
+
+/// What one remote invocation left behind.
+///
+/// `stdout` stays raw. A remote `read` carries file bytes through it, and
+/// `--exec … bash` hands the child's own stdout back verbatim, so decoding it
+/// here would corrupt any payload that is not text. Only `stderr` is decoded,
+/// because that is where `wsl.exe` itself may answer in UTF-16LE.
+pub struct RemoteCommandOutput {
+    /// Exit code, or `None` when a signal ended the child.
+    pub status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
+/// How often a running remote script is asked whether someone stopped it. The
+/// same interval the shell leg polls at, and the bound on how long a cancelled
+/// call keeps a child alive.
+const REMOTE_POLL: Duration = Duration::from_millis(100);
+
+/// Runs one host-authored `bash -c` script on the machine `runner` dispatches to,
+/// feeding `stdin` if given.
+///
+/// The script is the only variable in the invocation and it is authored here, not
+/// by the model: every fragment a caller folds into it goes through
+/// [`sh_single_quote`] first. A `Local` runner is refused — this host's own
+/// filesystem is reached directly, and silently running a POSIX script through
+/// some local Bash would act on paths that mean something else here.
+pub fn run_remote_script(
+    runner: &ShellRunner,
+    script: &str,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    cancel: &crate::cancel::CancelSignal,
+) -> Result<RemoteCommandOutput, String> {
+    let child = spawn_remote_script(runner, script, stdin.is_some())?;
+    pump_remote_child(child, runner, stdin, timeout, cancel)
+}
+
+/// The host program and arguments that run `script` on the machine `runner`
+/// dispatches to: `wsl.exe` for a distribution, one of the SSH client
+/// candidates for a machine. Pure, so the invocation shape is testable without
+/// a machine to reach.
+pub fn remote_script_invocation(
+    runner: &ShellRunner,
+    script: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let env = runner.normalized_env()?;
+    match runner {
+        ShellRunner::Local { .. } => {
+            Err("This machine's own filesystem is not reached through a remote shell".into())
+        }
+        ShellRunner::Wsl { distro, .. } => {
+            validate_wsl_distro_name(distro)?;
+            Ok((
+                vec!["wsl.exe".to_owned()],
+                // `--cd /` keeps the invocation independent of wherever the
+                // distribution would otherwise start; the script does its own
+                // `cd` to the workspace root it was built for.
+                wsl_shell_args(distro, "/", &env, script),
+            ))
+        }
+        ShellRunner::Ssh {
+            host,
+            port,
+            identity_file,
+            ..
+        } => Ok((
+            ssh_client_candidates(),
+            ssh_shell_args(host, *port, identity_file, "", &env, script),
+        )),
+    }
+}
+
+/// Starts `script` on the machine `runner` dispatches to, with stdout and
+/// stderr piped and stdin piped only when the caller has something to feed it.
+///
+/// The child is handed back unwaited: [`run_remote_script`] pumps it to
+/// completion, while a language server started this way stays up and speaks
+/// its protocol over the same pipes for as long as the workspace needs it.
+pub fn spawn_remote_script(
+    runner: &ShellRunner,
+    script: &str,
+    pipe_stdin: bool,
+) -> Result<std::process::Child, String> {
+    let (candidates, args) = remote_script_invocation(runner, script)?;
+    let mut last_error = None;
+    for executable in &candidates {
+        let mut process = Command::new(executable);
+        process
+            .args(&args)
+            .stdin(if pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if matches!(runner, ShellRunner::Wsl { .. }) {
+            process.env("WSL_UTF8", "1");
+        }
+        // A tool call is not a user-initiated console session; a window flashing
+        // up for every remote `ls` would read as the app doing something else.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            process.creation_flags(CREATE_NO_WINDOW);
+        }
+        match process.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{executable} was not found"));
+                continue;
+            }
+            Err(error) => return Err(format!("Failed to start {executable}: {error}")),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "No remote execution program is available".into()))
+}
+
+/// Feeds the child its input and drains both of its pipes while waiting.
+///
+/// All three run on their own threads: a script that fills the stdout pipe while
+/// the host is still writing stdin deadlocks otherwise, and so does one that
+/// writes more to stderr than the pipe holds.
+fn pump_remote_child(
+    mut child: std::process::Child,
+    runner: &ShellRunner,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    cancel: &crate::cancel::CancelSignal,
+) -> Result<RemoteCommandOutput, String> {
+    let writer = match (child.stdin.take(), stdin) {
+        (Some(mut pipe), Some(bytes)) => {
+            let bytes = bytes.to_vec();
+            Some(std::thread::spawn(move || {
+                use std::io::Write as _;
+                // A broken pipe means the script stopped reading; the exit code
+                // it leaves behind is the answer, not this write's error.
+                let _ = pipe.write_all(&bytes);
+                let _ = pipe.flush();
+            }))
+        }
+        (pipe, _) => {
+            drop(pipe);
+            None
+        }
+    };
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                bytes
+            })
+        })
+    }
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let mut ended = None;
+    let mut failure = None;
+    loop {
+        match child.wait_timeout(REMOTE_POLL) {
+            Ok(Some(status)) => {
+                ended = Some(status);
+                break;
+            }
+            Ok(None) => {
+                if cancel.cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    failure = Some("The remote command was cancelled".to_owned());
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    failure = Some(format!(
+                        "The remote command did not finish within {} seconds",
+                        timeout.as_secs()
+                    ));
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                failure = Some(format!("Failed to wait for the remote command: {error}"));
+                break;
+            }
+        }
+    }
+    // Joined after the child is gone, so every pipe is at end of file and no
+    // thread outlives the call that started it — including on the error paths.
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    let stdout = out_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = err_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    Ok(RemoteCommandOutput {
+        status: ended.and_then(|status| status.code()),
+        stdout,
+        stderr: if matches!(runner, ShellRunner::Wsl { .. }) {
+            decode_wsl_output(&stderr)
+        } else {
+            String::from_utf8_lossy(&stderr).into_owned()
+        },
+    })
 }
 
 /// The Windows-shaped file names this resolver looks for. A Local run always
@@ -880,7 +1105,6 @@ mod tests {
             host: "user@devbox.local".into(),
             port: 2222,
             identity_file: "C:/keys/id_ed25519".into(),
-            remote_cwd: "~/work".into(),
             ..Default::default()
         };
         let assets = assets_with(vec![machine], &[("ssh:m1", &[("K", "v")])]);
@@ -895,7 +1119,6 @@ mod tests {
             host,
             port,
             identity_file,
-            remote_cwd,
             env,
         } = runner
         else {
@@ -904,7 +1127,6 @@ mod tests {
         assert_eq!(host, "user@devbox.local");
         assert_eq!(port, 2222);
         assert_eq!(identity_file, "C:/keys/id_ed25519");
-        assert_eq!(remote_cwd, "~/work");
         assert_eq!(env.get("K").map(String::as_str), Some("v"));
     }
 
@@ -944,7 +1166,7 @@ mod tests {
         .collect();
         let args = wsl_shell_args(
             "Ubuntu",
-            Path::new(r"C:\proj"),
+            &r"C:\proj",
             &env,
             "echo \"hello world\"",
         );
@@ -1080,7 +1302,7 @@ mod tests {
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect();
 
-        let wsl = wsl_shell_args("Ubuntu", Path::new(r"C:\proj"), &env, "pwd").join(" ");
+        let wsl = wsl_shell_args("Ubuntu", r"C:\proj", &env, "pwd").join(" ");
         assert!(wsl.contains("FOO=kept"), "{wsl}");
         for name in ["BASH_ENV", "ENV=", "SHELLOPTS"] {
             assert!(!wsl.contains(name), "{name} 不得进入 WSL argv: {wsl}");
@@ -1101,5 +1323,43 @@ mod tests {
         for name in ["", "1ABC", "A-B", "A B", "A=B", "名字"] {
             assert!(validate_env_var_name(name).is_err(), "{name}");
         }
+    }
+
+    /// One invocation shape serves both the one-shot scripts and the language
+    /// servers that stay up: the script is the only variable, the root is the
+    /// script's own business, and a local runner is refused outright.
+    #[test]
+    fn a_remote_script_invocation_is_the_shell_legs_argv() {
+        let (programs, args) = remote_script_invocation(
+            &ShellRunner::Wsl {
+                distro: "Ubuntu".into(),
+                env: BTreeMap::new(),
+            },
+            "exec 'rust-analyzer'",
+        )
+        .unwrap();
+        assert_eq!(programs, ["wsl.exe"]);
+        assert_eq!(
+            args,
+            wsl_shell_args("Ubuntu", "/", &BTreeMap::new(), "exec 'rust-analyzer'")
+        );
+
+        let (programs, args) = remote_script_invocation(
+            &ShellRunner::Ssh {
+                host: "devbox".into(),
+                port: 2222,
+                identity_file: String::new(),
+                env: BTreeMap::new(),
+            },
+            "exec 'gopls'",
+        )
+        .unwrap();
+        assert_eq!(programs, ssh_client_candidates());
+        assert_eq!(
+            args,
+            ssh_shell_args("devbox", 2222, "", "", &BTreeMap::new(), "exec 'gopls'")
+        );
+
+        assert!(remote_script_invocation(&ShellRunner::default(), "pwd").is_err());
     }
 }

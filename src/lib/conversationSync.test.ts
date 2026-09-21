@@ -52,7 +52,7 @@ function conversation(id: string, contextIds: string[], title = "t"): Conversati
     userAbortedTasks: [],
     worktree: null,
   runTarget: null,
-  additionalDirectories: [],
+  attachedWorkspaces: [],
     parentConversationId: null,
   presetId: "",
   templateId: ""

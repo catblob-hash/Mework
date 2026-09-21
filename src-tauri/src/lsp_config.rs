@@ -17,7 +17,6 @@
 
 use std::{
     collections::BTreeMap,
-    fs::File,
     path::{Path, PathBuf},
 };
 
@@ -305,37 +304,47 @@ pub fn servers_for_workspace(
     workspace: &Path,
     language: ResolvedLanguage,
 ) -> Vec<LspServerConfig> {
-    let mut configs: Vec<LspServerConfig> = Vec::new();
-    let mut claimed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    let mut take = |entries: Vec<LspEntry>| {
-        for entry in entries {
-            let Some(config) = entry.config else { continue };
-            // A name already taken by a more specific level is an override, not
-            // a second server: `lsp.json` naming `rust-analyzer` replaces the
-            // preset rather than racing it for `.rs`.
-            if claimed_names.insert(config.name.clone()) {
-                configs.push(config);
-            }
-        }
-    };
-
+    let mut levels: Vec<Vec<LspEntry>> = Vec::with_capacity(3);
     if !workspace.as_os_str().is_empty() {
-        take(read_file(
+        levels.push(read_file(
             &crate::capabilities::config_path_for(workspace, crate::capabilities::CapabilityKind::Lsp),
             ResourceSource::Workspace,
             None,
         ));
     }
     if let Some(home) = dirs::home_dir() {
-        take(read_file(
+        levels.push(read_file(
             &crate::capabilities::config_path_for(&home, crate::capabilities::CapabilityKind::Lsp),
             ResourceSource::User,
             None,
         ));
     }
-    take(builtin_entries(language));
+    levels.push(builtin_entries(language));
+    merge_servers(levels)
+}
+
+/// Folds the levels of configuration — most specific first — into the list a
+/// call routes on. Only *available* entries survive, and a name already taken
+/// by a more specific level is an override, not a second server: `lsp.json`
+/// naming `rust-analyzer` replaces the preset rather than racing it for `.rs`.
+pub fn merge_servers(levels: impl IntoIterator<Item = Vec<LspEntry>>) -> Vec<LspServerConfig> {
+    let mut configs: Vec<LspServerConfig> = Vec::new();
+    let mut claimed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entries in levels {
+        for entry in entries {
+            let Some(config) = entry.config else { continue };
+            if claimed_names.insert(config.name.clone()) {
+                configs.push(config);
+            }
+        }
+    }
     configs
+}
+
+/// The commands the built-in presets launch, for a caller that has to ask
+/// another machine which of them are installed.
+pub fn preset_commands() -> impl Iterator<Item = &'static str> {
+    LSP_SERVER_PRESETS.iter().map(|preset| preset.command)
 }
 
 // ---------------------------------------------------------------------------
@@ -357,11 +366,24 @@ pub fn read_file_with_env(
     workspace_id: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<LspEntry> {
-    let Ok(file) = File::open(path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
     };
+    parse_contents(&bytes, path, source, workspace_id, env)
+}
+
+/// Every entry of one `lsp.json` whose bytes the caller already holds — a file
+/// read off another machine, where `path` is its spelling there and is used
+/// only for the entries' locations and the messages.
+pub fn parse_contents(
+    bytes: &[u8],
+    path: &Path,
+    source: ResourceSource,
+    workspace_id: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<LspEntry> {
     let display = path.display();
-    let value: Value = match serde_json::from_reader(file) {
+    let value: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{display} is not valid JSON and was skipped: {error}");

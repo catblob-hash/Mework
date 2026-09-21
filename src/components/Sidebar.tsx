@@ -7,7 +7,9 @@ import {
   PanelLeftClose,
   Pencil,
   Plus,
-  Settings
+  Server,
+  Settings,
+  SquareTerminal
 } from "lucide-react";
 import { Fragment, useEffect, useRef, useState } from "react";
 import type {
@@ -16,13 +18,13 @@ import type {
   ReactNode
 } from "react";
 import { useI18n } from "../i18n";
-import type { Conversation, Workspace } from "../types";
+import type { Conversation, SshMachineConfig, Workspace } from "../types";
 import { ConfirmDeleteButton, IconButton } from "./Common";
 import { WorkspaceOptionsMenu } from "./WorkspaceOptionsMenu";
 import type { WorkspacePresetOption } from "./WorkspaceOptionsMenu";
 import { buildConversationTree, conversationAncestorIds } from "../lib/conversationTree";
 import { visibleConversations } from "../lib/draftConversation";
-import { isReservedWorkspace, isTemporaryWorkspace } from "../lib/workspaces";
+import { isReservedWorkspace, isTemporaryWorkspace, workspaceLocationTitle } from "../lib/workspaces";
 import type { NewConversationSource } from "../lib/workspaces";
 import { isBrowserDevRuntime } from "../lib/backend";
 import { usePointerDrag } from "./usePointerDrag";
@@ -72,6 +74,8 @@ function saveCollapsedParents(ids: Set<string>): void {
 
 interface SidebarProps {
   workspaces: Workspace[];
+  /** The SSH catalog, so a workspace on one of those machines can be titled by the machine's name. */
+  sshMachines?: SshMachineConfig[];
   activeWorkspaceId: string | null;
   activeConversationId: string | null;
   onSelectConversation: (workspaceId: string, conversationId: string) => void;
@@ -218,6 +222,7 @@ function relativeTime(iso: string, t: ReturnType<typeof useI18n>["t"]): string {
 
 export function Sidebar({
   workspaces,
+  sshMachines = [],
   activeWorkspaceId,
   activeConversationId,
   onSelectConversation,
@@ -618,7 +623,7 @@ export function Sidebar({
                 <button
                   type="button"
                   onClick={() => toggleWorkspace(workspace.id)}
-                  title={workspace.path}
+                  title={workspaceLocationTitle(workspace.path, workspace.machine, sshMachines)}
                   aria-expanded={!isCollapsed}
                   aria-controls={`workspace-conversations-${workspace.id}`}
                   aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
@@ -629,7 +634,13 @@ export function Sidebar({
                   }}
                 >
                   <ChevronRight className={`disclosure-chevron${isCollapsed ? "" : " disclosure-chevron--open"}`} size={15} />
-                  {temporary ? <FolderClock size={15} /> : <Folder size={15} />}
+                  {temporary
+                    ? <FolderClock size={15} />
+                    : !workspace.machine
+                      ? <Folder size={15} />
+                      : workspace.machine.kind === "wsl"
+                        ? <SquareTerminal size={15} />
+                        : <Server size={15} />}
                   <span className="workspace-heading__name">{workspaceDisplayName}</span>
                 </button>
                 <WorkspaceOptionsMenu

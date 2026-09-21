@@ -2,6 +2,7 @@ import { Channel, hasBackendRuntime, invoke, isBrowserDevRuntime } from "./backe
 import { createId } from "./id";
 import {
   createTemporaryWorkspace,
+  runEnvKey,
   TEMPORARY_WORKSPACE_ID
 } from "./workspaces";
 import { createSeedDocument } from "../seed";
@@ -16,6 +17,7 @@ import {
 import type {
   AgentDefinition,
   AppLanguage,
+  AttachedWorkspace,
   AppReleaseAsset,
   AppUpdateCheck,
   AppUpdateDownload,
@@ -340,26 +342,45 @@ function normalizeRunTarget(value: unknown): RunTarget | null {
 }
 
 /**
- * Keep only entries that could have come from the host's directory picker: a
- * non-empty absolute-looking string, deduplicated, and capped.
+ * Keep only entries that could have come from a host directory picker: a
+ * non-empty path with a machine the host can name, deduplicated, and capped.
  *
- * Dropping a malformed entry is the safe direction — an extra directory widens
- * the conversation's filesystem boundary, and the host re-checks every entry
- * against its own authorization record on save, so a guess here would only
- * produce a document that loads and then refuses to save.
+ * `legacy` is the pre-multi-machine `additionalDirectories` array, folded in as
+ * host-machine entries when the new list is absent. Reading it is not optional:
+ * until the conversation is next saved it is the only record those grants have,
+ * and a reader that ignored it would silently narrow what the conversation can
+ * reach.
+ *
+ * Dropping a malformed entry is the safe direction — a workspace widens the
+ * conversation's boundary, and the host re-checks every entry against its own
+ * authorization record on save, so a guess here would only produce a document
+ * that loads and then refuses to save.
  */
-function normalizeAdditionalDirectories(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const directories: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== "string") continue;
-    const path = entry.trim();
-    if (!path || path.length > 4096) continue;
-    if (directories.includes(path)) continue;
-    directories.push(path);
-    if (directories.length === 32) break;
+function normalizeAttachedWorkspaces(value: unknown, legacy: unknown): AttachedWorkspace[] {
+  const entries: AttachedWorkspace[] = [];
+  const seen = new Set<string>();
+  const push = (machine: RunTarget | null, rawPath: unknown) => {
+    if (entries.length >= 32) return;
+    if (typeof rawPath !== "string") return;
+    const path = rawPath.trim();
+    if (!path || path.length > 4096) return;
+    // One machine's `/srv/app` is not another's, so identity is the pair.
+    const key = `${machine ? runEnvKey(machine) : "local"} ${path}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    entries.push(machine ? { machine, path } : { path });
+  };
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const workspace = record(entry);
+      if (!workspace) continue;
+      push(normalizeRunTarget(workspace.machine), workspace.path);
+    }
   }
-  return directories;
+  if (entries.length === 0 && Array.isArray(legacy)) {
+    for (const entry of legacy) push(null, entry);
+  }
+  return entries;
 }
 
 /** Host validation of execution environments is authoritative; discard malformed entries here. */
@@ -397,10 +418,7 @@ function normalizeExecutionEnvironments(
         return [];
       }
       const identityFile = typeof machine.identityFile === "string" ? machine.identityFile : "";
-      const remoteCwd = typeof machine.remoteCwd === "string" ? machine.remoteCwd : "";
-      if ([identityFile, remoteCwd].some((value) => (
-        value.length > 4096 || controlChars.test(value)
-      ))) return [];
+      if (identityFile.length > 4096 || controlChars.test(identityFile)) return [];
       seen.add(machine.id);
       const port = typeof machine.port === "number" && Number.isInteger(machine.port)
         && machine.port >= 0 && machine.port <= 65535 ? machine.port : 0;
@@ -410,7 +428,6 @@ function normalizeExecutionEnvironments(
         host,
         port,
         identityFile,
-        remoteCwd,
         createdAt: typeof machine.createdAt === "string" && machine.createdAt ? machine.createdAt : now,
         updatedAt: typeof machine.updatedAt === "string" && machine.updatedAt ? machine.updatedAt : now
       }];
@@ -1404,7 +1421,8 @@ export function normalizeDocument(value: unknown): AppDocument {
           settings: baseSettings,
           worktree: normalizeConversationWorktree(conversationInput?.worktree),
           runTarget: normalizeRunTarget(conversationInput?.runTarget),
-          additionalDirectories: normalizeAdditionalDirectories(
+          attachedWorkspaces: normalizeAttachedWorkspaces(
+            conversationInput?.attachedWorkspaces,
             conversationInput?.additionalDirectories
           ),
           // A parent that turns out not to exist is resolved at render time,

@@ -298,6 +298,7 @@ fn run_background_workflow_write_roundtrip(format: ProviderFamily, base_url: &st
                 Arc::new(crate::model::LiveSecurityLevel::new(parent.security_level)),
                 parent.app_data_path.clone(),
                 Vec::new(),
+                crate::workspace_set::WorkspaceSet::default(),
             ),
         }),
     );

@@ -65,10 +65,14 @@ export const terminalMocks = {
   closeTerminal: vi.fn()
 };
 
-/** Stands in for the host's native folder picker, which rejects outside Tauri. */
+/** Stands in for the host's directory pickers, which reject outside Tauri: the
+ * native folder dialog for this machine, and the shell-backed browser and grant
+ * for a workspace on another one. */
 export const workspacePickerMocks = {
   hasNativeWorkspacePicker: vi.fn(() => true),
-  pickWorkspaceDirectory: vi.fn()
+  pickWorkspaceDirectory: vi.fn(),
+  listRemoteDirectory: vi.fn(),
+  authorizeRemoteWorkspace: vi.fn()
 };
 
 /** Host-push-channel test substitute. `onAppPushEvent` registers local

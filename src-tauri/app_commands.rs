@@ -54,6 +54,8 @@ macro_rules! mework_app_commands {
             request_tool_approval,
             resolve_tool_prompt,
             pick_workspace_directory,
+            list_remote_directory,
+            authorize_remote_workspace,
             save_api_key,
             reveal_api_key,
             delete_api_key,

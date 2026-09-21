@@ -2292,6 +2292,7 @@ pub(crate) fn product_default_document() -> AppDocument {
             name: "临时工作区".into(),
             kind: WorkspaceKind::Temporary,
             path: String::new(),
+            machine: None,
             created_at: timestamp(0),
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
@@ -2366,6 +2367,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
             created_at: Utc::now().to_rfc3339(),
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
+            machine: None,
             conversations: vec![Conversation {
                 id: "conv_welcome".into(),
                 title: String::new(),
@@ -2400,6 +2402,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                 parent_conversation_id: None,
                 preset_id: String::new(),
                 template_id: String::new(),
+                attached_workspaces: Vec::new(),
             }],
         },
     );

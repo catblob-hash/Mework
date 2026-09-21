@@ -283,6 +283,264 @@ fn trusted_roots(workspace: &Path, app_data: &Path, additional: &[String]) -> Ve
     roots
 }
 
+/// The tools whose target is a path in the workspace a call names.
+fn is_filesystem_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "ls" | "grep" | "find" | "read" | "write" | "edit" | "lsp"
+    )
+}
+
+/// [`classify`] for a call that may name a workspace on another machine.
+///
+/// The `workspace` argument selects which of the conversation's numbered
+/// workspaces a filesystem tool acts in. When that workspace is on this
+/// machine, or the call is not a filesystem tool, the decision is exactly
+/// [`classify`]'s. When it is on a WSL or SSH machine the local path guard has
+/// nothing to say — the path is not in this filesystem — and the call is judged
+/// against that workspace's own root instead. An empty set means the caller has
+/// one local workspace, which is the plain rule.
+pub fn classify_in_workspaces(
+    level: SecurityLevel,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    workspace: &Path,
+    app_data: &Path,
+    additional_directories: &[String],
+    request: &ToolExecutionRequest,
+) -> Result<SecurityDecision, String> {
+    if let Some(decision) = classify_remote_filesystem_call(level, workspaces, request)? {
+        return Ok(decision);
+    }
+    let workspace = selected_local_lsp_root(workspaces, request)?.unwrap_or(workspace);
+    classify(level, workspace, app_data, additional_directories, request)
+}
+
+/// [`classify_model_call`] for a call that may name a workspace on another
+/// machine. See [`classify_in_workspaces`].
+pub fn classify_model_call_in_workspaces(
+    level: SecurityLevel,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    workspace: &Path,
+    app_data: &Path,
+    additional_directories: &[String],
+    request: &ToolExecutionRequest,
+) -> Result<SecurityDecision, String> {
+    if let Some(decision) = classify_remote_filesystem_call(level, workspaces, request)? {
+        return Ok(decision);
+    }
+    let workspace = selected_local_lsp_root(workspaces, request)?.unwrap_or(workspace);
+    classify_model_call(level, workspace, app_data, additional_directories, request)
+}
+
+/// The root an `lsp` call on a host-machine workspace is judged against: the
+/// workspace it named, which the executor resolves the file in and whose
+/// `.mework/lsp.json` names the server. Judging it against the primary root
+/// would test the wrong project's configuration for a second local checkout.
+/// `None` for every other call, and for a set with nothing to select.
+fn selected_local_lsp_root<'a>(
+    workspaces: &'a crate::workspace_set::WorkspaceSet,
+    request: &ToolExecutionRequest,
+) -> Result<Option<&'a Path>, String> {
+    if workspaces.is_empty() || request.tool_name != "lsp" {
+        return Ok(None);
+    }
+    let selected =
+        workspaces.select(crate::tool_executor::workspace_argument(&request.input)?)?;
+    Ok(selected.is_local().then(|| Path::new(selected.root.as_str())))
+}
+
+/// The remote decision when the call is a filesystem tool aimed at a workspace
+/// on another machine; `None` hands the call to the local classifier.
+///
+/// A malformed or out-of-range `workspace` argument is an error here rather
+/// than a fallback to the local rule: the executor would refuse the same call,
+/// and classifying it against the wrong machine first would only put a
+/// misleading card in front of the user.
+fn classify_remote_filesystem_call(
+    level: SecurityLevel,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    request: &ToolExecutionRequest,
+) -> Result<Option<SecurityDecision>, String> {
+    classify_remote_filesystem_call_with(level, workspaces, request, &|workspace| {
+        crate::remote_lsp::workspace_declares_language_servers(&workspace.runner, &workspace.root)
+    })
+}
+
+/// Whether a remote workspace ships its own language-server configuration —
+/// a round trip to the machine in production, a stub in tests. `None` when the
+/// machine could not be asked.
+type DeclaresLanguageServers<'a> =
+    dyn Fn(&crate::workspace_set::ResolvedWorkspace) -> Option<bool> + 'a;
+
+fn classify_remote_filesystem_call_with(
+    level: SecurityLevel,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    request: &ToolExecutionRequest,
+    declares_language_servers: &DeclaresLanguageServers<'_>,
+) -> Result<Option<SecurityDecision>, String> {
+    if workspaces.is_empty() || !is_filesystem_tool(&request.tool_name) {
+        return Ok(None);
+    }
+    let selected =
+        workspaces.select(crate::tool_executor::workspace_argument(&request.input)?)?;
+    if selected.is_local() {
+        return Ok(None);
+    }
+    if request.tool_name == "lsp" {
+        validate_required_string(&request.input, "operation", 64, "operation argument")?;
+    }
+    // The arguments are validated and the lexical answer settled before any
+    // machine is consulted: a malformed call costs no round trip.
+    let decision = classify_remote_filesystem(level, &selected.root, request)?;
+    if request.tool_name != "lsp" || level == SecurityLevel::FullAccess {
+        // Full access asks nothing, and the answer would not change the
+        // decision, so the machine is not consulted for it.
+        return Ok(Some(decision));
+    }
+    // The same rule as the host leg: a project that ships `lsp.json` names
+    // the command the language server is started with — on that machine,
+    // through its shell — so the project's configuration raises the unbounded
+    // card. Two things differ from the host leg, and both exist so that the
+    // executor can rely on one fact: for a remote `lsp` call an unrestricted
+    // scope means "approved for that card, or full access", nothing else.
+    //
+    // * A machine that cannot be asked counts as declaring one. Failing open
+    //   would let a slow link turn into a repository-named command starting
+    //   with no card; the price of failing closed is a card on a call that
+    //   is about to fail on the same transport anyway.
+    // * A file outside the workspace raises this card rather than the plain
+    //   out-of-workspace read. The read card's approval is about reaching the
+    //   file; it says nothing about starting the project's server, and the
+    //   executor could not tell the two approvals apart.
+    if decision.scope == ExecutionScope::Unrestricted
+        || declares_language_servers(selected).unwrap_or(true)
+    {
+        return Ok(Some(classify_unbounded(level)));
+    }
+    Ok(Some(decision))
+}
+
+/// Classifies a filesystem tool acting in a workspace on another machine.
+///
+/// The host cannot canonicalize a path it cannot stat, so trust is decided
+/// lexically: a relative path that never climbs above the root, or an absolute
+/// one under it, is inside the workspace. The remote leg re-checks the
+/// canonical target under a confined scope, so a symlink that points out of
+/// the root is refused there rather than admitted here — the fail-closed side
+/// of not being able to look. The application data directory is not a
+/// consideration on that machine, and `lsp` is judged like a read: the file
+/// it names is what the language server on that machine is told to open.
+///
+/// The decision's scope is a marker, not a set of local roots: `Restricted`
+/// with no roots tells the remote leg to confine the call to the workspace,
+/// `Unrestricted` lets it reach the whole machine.
+fn classify_remote_filesystem(
+    level: SecurityLevel,
+    root: &str,
+    request: &ToolExecutionRequest,
+) -> Result<SecurityDecision, String> {
+    let (effect, path_mode) = match request.tool_name.as_str() {
+        "ls" | "grep" | "find" => (
+            OperationEffect::Read,
+            PathMode::Existing { default: Some(".") },
+        ),
+        "read" | "lsp" => (
+            OperationEffect::Read,
+            PathMode::Existing { default: None },
+        ),
+        "write" => (OperationEffect::Write, PathMode::WriteTarget),
+        "edit" => (OperationEffect::Write, PathMode::Existing { default: None }),
+        other => return Err(format!("Security classifier does not support unknown tool: {other}")),
+    };
+    let path_key = path_key_for(&request.tool_name);
+    let requested = match path_mode {
+        PathMode::Existing { default } => path_argument(&request.input, path_key, default)?,
+        PathMode::WriteTarget => path_argument(&request.input, path_key, None)?,
+    };
+    if requested.chars().any(char::is_control) {
+        return Err(format!("{path_key} argument contains an invalid character"));
+    }
+    let is_trusted = remote_path_is_inside_root(root, &requested);
+    let target = PathBuf::from(if is_trusted {
+        remote_display_target(root, &requested)
+    } else {
+        requested
+    });
+    classify_filesystem(
+        level,
+        &request.tool_name,
+        effect,
+        target,
+        is_trusted,
+        false,
+        ExecutionScope::Restricted { roots: Vec::new() },
+        ExecutionScope::Unrestricted,
+    )
+}
+
+/// Whether `requested`, resolved against `root` the way the remote shell will,
+/// stays inside the root before symlinks are considered.
+///
+/// `~` is the remote user's home, which is known only to that machine, so a
+/// `~`-spelled request is comparable only with a `~`-spelled root and an
+/// absolute one only with an absolute root. Anything the host cannot place is
+/// outside.
+fn remote_path_is_inside_root(root: &str, requested: &str) -> bool {
+    let root = root.trim().trim_end_matches('/');
+    let requested = requested.trim();
+    let resolved = if requested.starts_with('/') || requested.starts_with('~') {
+        (requested.starts_with('~') == root.starts_with('~'))
+            .then(|| normalize_remote_path(requested))
+            .flatten()
+    } else {
+        // Relative: resolved under the root, so only climbing out can escape.
+        normalize_remote_path(&format!("{root}/{requested}"))
+    };
+    resolved.is_some_and(|path| path == root || path.starts_with(&format!("{root}/")))
+}
+
+/// Applies `.` and `..` to a POSIX path lexically. `None` when `..` climbs
+/// above the leading `/` or `~`, which is a path the host will not vouch for.
+fn normalize_remote_path(path: &str) -> Option<String> {
+    let (prefix, rest) = if let Some(rest) = path.strip_prefix('~') {
+        ("~", rest)
+    } else if let Some(rest) = path.strip_prefix('/') {
+        ("/", rest)
+    } else {
+        ("", path)
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    let joined = segments.join("/");
+    Some(match prefix {
+        "~" if joined.is_empty() => "~".to_owned(),
+        "~" => format!("~/{joined}"),
+        "/" => format!("/{joined}"),
+        _ => joined,
+    })
+}
+
+/// The path an approval card shows for a trusted remote target: the request
+/// spelled under its root, so the card names where on that machine the call
+/// lands rather than a relative fragment.
+fn remote_display_target(root: &str, requested: &str) -> String {
+    let requested = requested.trim();
+    if requested.starts_with('/') || requested.starts_with('~') {
+        normalize_remote_path(requested).unwrap_or_else(|| requested.to_owned())
+    } else {
+        normalize_remote_path(&format!("{}/{requested}", root.trim_end_matches('/')))
+            .unwrap_or_else(|| requested.to_owned())
+    }
+}
+
 /// Classifies every built-in model-visible Mework tool. Model-only host tools
 /// are included here so the catalog has one auditable safety matrix, while
 /// `classify` continues to reject attempts to execute those tools manually.
@@ -3796,5 +4054,348 @@ mod tests {
                 assert!(!decision.requires_approval, "{tool} {input}");
             }
         }
+    }
+
+    /// The numbered set of a conversation whose workspace 1 is on this machine
+    /// and workspace 2 is `/home/dev/app` on an SSH machine.
+    fn remote_workspaces(fixture: &Fixture) -> crate::workspace_set::WorkspaceSet {
+        let assets = crate::model::ExecutionEnvironmentAssets {
+            ssh_machines: vec![crate::model::SshMachineConfig {
+                id: "m1".into(),
+                name: "devbox".into(),
+                host: "user@devbox".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::workspace_set::WorkspaceSet::resolve(
+            &assets,
+            &crate::model::AttachedWorkspace {
+                machine: None,
+                path: fixture.workspace.to_string_lossy().into_owned(),
+            },
+            &[crate::model::AttachedWorkspace {
+                machine: Some(crate::model::RunTarget::Ssh {
+                    machine_id: "m1".into(),
+                }),
+                path: "/home/dev/app".into(),
+            }],
+        )
+        .unwrap()
+    }
+
+    fn classify_remote(
+        fixture: &Fixture,
+        level: SecurityLevel,
+        tool_name: &str,
+        input: Value,
+    ) -> Result<SecurityDecision, String> {
+        classify_model_call_in_workspaces(
+            level,
+            &remote_workspaces(fixture),
+            &fixture.workspace,
+            &fixture.app_data,
+            &fixture.additional,
+            &request(&fixture.workspace, tool_name, input),
+        )
+    }
+
+    #[test]
+    fn a_remote_workspace_is_judged_by_its_own_root_not_the_local_guard() {
+        let fixture = Fixture::new();
+        // Inside the remote root: trusted, confined, no approval for a read.
+        let decision = classify_remote(
+            &fixture,
+            SecurityLevel::RequestApproval,
+            "read",
+            json!({"path": "src/main.rs", "workspace": 2}),
+        )
+        .unwrap();
+        assert!(!decision.requires_approval);
+        assert_eq!(decision.rule_id, "filesystem.trusted_read");
+        assert_eq!(
+            decision.scope,
+            ExecutionScope::Restricted { roots: Vec::new() },
+            "a confined remote call carries the empty-roots marker"
+        );
+        assert_eq!(
+            decision.target,
+            Some(PathBuf::from("/home/dev/app/src/main.rs")),
+            "the card names where on that machine the call lands"
+        );
+
+        // Absolute under the root is inside too; climbing out is not.
+        for (path, inside) in [
+            ("/home/dev/app/x", true),
+            ("/home/dev/app", true),
+            ("./a/../b", true),
+            ("../secrets", false),
+            ("/etc/passwd", false),
+            ("/home/dev/app2/x", false),
+            ("~/app/x", false),
+            ("a/../../x", false),
+        ] {
+            let decision = classify_remote(
+                &fixture,
+                SecurityLevel::RequestApproval,
+                "read",
+                json!({"path": path, "workspace": 2}),
+            )
+            .unwrap();
+            assert_eq!(
+                decision.requires_approval, !inside,
+                "{path} inside={inside}: {}",
+                decision.rule_id
+            );
+            if !inside {
+                assert_eq!(decision.scope, ExecutionScope::Unrestricted, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_writes_follow_the_same_level_matrix_as_local_ones() {
+        let fixture = Fixture::new();
+        let write = json!({"path": "notes.md", "content": "x", "workspace": 2});
+        let manual = classify_remote(&fixture, SecurityLevel::RequestApproval, "write", write.clone())
+            .unwrap();
+        assert!(manual.requires_approval);
+        assert_eq!(manual.rule_id, "filesystem.trusted_write_manual");
+        let allowed = classify_remote(&fixture, SecurityLevel::AllowEdits, "write", write.clone())
+            .unwrap();
+        assert!(!allowed.requires_approval);
+        assert_eq!(
+            allowed.scope,
+            ExecutionScope::Restricted { roots: Vec::new() }
+        );
+        let full = classify_remote(&fixture, SecurityLevel::FullAccess, "write", write).unwrap();
+        assert!(!full.requires_approval);
+        assert_eq!(full.scope, ExecutionScope::Unrestricted);
+        assert!(
+            classify_remote(
+                &fixture,
+                SecurityLevel::Plan,
+                "edit",
+                json!({"path": "notes.md", "find": "a", "replace": "b", "workspace": 2})
+            )
+            .is_err(),
+            "plan mode refuses remote writes exactly as local ones"
+        );
+    }
+
+    #[test]
+    fn workspace_one_and_non_filesystem_tools_keep_the_local_rule() {
+        let fixture = Fixture::new();
+        let local = classify_remote(
+            &fixture,
+            SecurityLevel::RequestApproval,
+            "read",
+            json!({"path": "inside.txt", "workspace": 1}),
+        )
+        .unwrap();
+        assert_eq!(
+            local,
+            fixture
+                .classify_model_call(
+                    SecurityLevel::RequestApproval,
+                    "read",
+                    json!({"path": "inside.txt", "workspace": 1})
+                )
+                .unwrap()
+        );
+        // An out-of-range address is refused before any machine is consulted.
+        let error = classify_remote(
+            &fixture,
+            SecurityLevel::RequestApproval,
+            "read",
+            json!({"path": "inside.txt", "workspace": 9}),
+        )
+        .unwrap_err();
+        assert!(error.contains("no workspace 9"), "{error}");
+        // A shell call is never routed through the remote filesystem rule.
+        let shell = classify_remote(
+            &fixture,
+            SecurityLevel::RequestApproval,
+            "bash",
+            json!({"command": "ls", "workspace": 2}),
+        )
+        .unwrap();
+        assert!(shell.requires_approval);
+        assert!(shell.rule_id.starts_with("shell."), "{}", shell.rule_id);
+    }
+
+    /// `lsp` on a remote workspace follows the host leg's rule: a read inside
+    /// the workspace when the project ships no configuration, the unbounded
+    /// card when it does — because that configuration names the command the
+    /// language server is started with on that machine.
+    #[test]
+    fn a_remote_lsp_call_raises_the_unbounded_card_only_for_a_project_configuration() {
+        let fixture = Fixture::new();
+        let workspaces = remote_workspaces(&fixture);
+        let call = |declares: Option<bool>, level: SecurityLevel| {
+            classify_remote_filesystem_call_with(
+                level,
+                &workspaces,
+                &request(
+                    &fixture.workspace,
+                    "lsp",
+                    json!({
+                        "operation": "hover",
+                        "filePath": "src/main.rs",
+                        "line": 1,
+                        "character": 1,
+                        "workspace": 2
+                    }),
+                ),
+                &|_| declares,
+            )
+            .unwrap()
+            .expect("a remote workspace is classified remotely")
+        };
+        let plain = call(Some(false), SecurityLevel::RequestApproval);
+        assert!(!plain.requires_approval);
+        assert_eq!(plain.rule_id, "filesystem.trusted_read");
+        assert_eq!(plain.scope, ExecutionScope::Restricted { roots: Vec::new() });
+
+        let declared = call(Some(true), SecurityLevel::RequestApproval);
+        assert!(declared.requires_approval);
+        assert_eq!(declared.rule_id, "tool.unbounded");
+        assert_eq!(declared.scope, ExecutionScope::Unrestricted);
+
+        // A machine that cannot be asked is treated as declaring one: the
+        // card is the safe default, and the call fails on the same transport
+        // anyway.
+        let unreachable = call(None, SecurityLevel::RequestApproval);
+        assert!(unreachable.requires_approval);
+        assert_eq!(unreachable.rule_id, "tool.unbounded");
+
+        // A file outside the workspace raises the same card, not the plain
+        // out-of-workspace read: the executor reads an unrestricted scope as
+        // "approved to start whatever the project configured".
+        let outside = classify_remote_filesystem_call_with(
+            SecurityLevel::AllowEdits,
+            &workspaces,
+            &request(
+                &fixture.workspace,
+                "lsp",
+                json!({
+                    "operation": "hover",
+                    "filePath": "../sibling/x.rs",
+                    "line": 1,
+                    "character": 1,
+                    "workspace": 2
+                }),
+            ),
+            &|_| panic!("the machine is not consulted for a path the card covers anyway"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(outside.requires_approval);
+        assert_eq!(outside.rule_id, "tool.unbounded");
+
+        // Full access never asks, so the machine is not consulted at all.
+        let asked = std::cell::Cell::new(false);
+        let full = classify_remote_filesystem_call_with(
+            SecurityLevel::FullAccess,
+            &workspaces,
+            &request(
+                &fixture.workspace,
+                "lsp",
+                json!({
+                    "operation": "hover",
+                    "filePath": "src/main.rs",
+                    "line": 1,
+                    "character": 1,
+                    "workspace": 2
+                }),
+            ),
+            &|_| {
+                asked.set(true);
+                Some(true)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!full.requires_approval);
+        assert_eq!(full.scope, ExecutionScope::Unrestricted);
+        assert!(!asked.get(), "full access does not pay a round trip for an answer it ignores");
+
+        // A local secondary workspace's `lsp` is judged against that workspace,
+        // not the primary root, so it is its own `.mework/lsp.json` that
+        // decides on the card.
+        let local_second = std::env::temp_dir().join(format!(
+            "mework-lsp-second-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(local_second.join(".mework")).unwrap();
+        std::fs::write(local_second.join(".mework").join("lsp.json"), "{}").unwrap();
+        std::fs::write(local_second.join("x.rs"), "fn x() {}").unwrap();
+        let two_local = crate::workspace_set::WorkspaceSet::resolve(
+            &crate::model::ExecutionEnvironmentAssets::default(),
+            &crate::model::AttachedWorkspace {
+                machine: None,
+                path: fixture.workspace.to_string_lossy().into_owned(),
+            },
+            &[crate::model::AttachedWorkspace {
+                machine: None,
+                path: local_second.to_string_lossy().into_owned(),
+            }],
+        )
+        .unwrap();
+        let additional = two_local.local_roots();
+        let judged = classify_model_call_in_workspaces(
+            SecurityLevel::RequestApproval,
+            &two_local,
+            &fixture.workspace,
+            &fixture.app_data,
+            &additional,
+            &request(
+                &fixture.workspace,
+                "lsp",
+                json!({
+                    "operation": "hover",
+                    "filePath": "x.rs",
+                    "line": 1,
+                    "character": 1,
+                    "workspace": 2
+                }),
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&local_second);
+        assert_eq!(
+            judged.rule_id, "tool.unbounded",
+            "the second workspace's own configuration raises the card"
+        );
+
+        // A missing operation is malformed before any machine is consulted.
+        assert!(classify_remote_filesystem_call_with(
+            SecurityLevel::RequestApproval,
+            &workspaces,
+            &request(
+                &fixture.workspace,
+                "lsp",
+                json!({"filePath": "src/main.rs", "line": 1, "character": 1, "workspace": 2}),
+            ),
+            &|_| panic!("not consulted for a malformed call"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn remote_paths_are_normalized_lexically() {
+        assert_eq!(normalize_remote_path("/a/./b/../c"), Some("/a/c".into()));
+        assert_eq!(normalize_remote_path("~/x/../y"), Some("~/y".into()));
+        assert_eq!(normalize_remote_path("~/.."), None);
+        assert_eq!(normalize_remote_path("/.."), None);
+        assert_eq!(normalize_remote_path("a//b/"), Some("a/b".into()));
+        assert!(remote_path_is_inside_root("~/app", "~/app/src"));
+        assert!(remote_path_is_inside_root("~/app", "src"));
+        assert!(!remote_path_is_inside_root("~/app", "/home/dev/app/src"));
+        assert!(!remote_path_is_inside_root("/home/dev/app", "~/app/src"));
+        assert!(remote_path_is_inside_root("/home/dev/app/", "/home/dev/app"));
     }
 }

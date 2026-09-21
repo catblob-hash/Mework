@@ -1,5 +1,5 @@
 {
-  "keyCount": 251,
+  "keyCount": 255,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -33,9 +33,37 @@
       ]
     },
     {
-      "description": "Heading of the environment block's list of additional working directories. Each directory follows as its own nested item; the heading is omitted when there are none.",
-      "id": "system.environment.additional_directories",
+      "description": "Heading of the environment block's numbered workspace list. It appears only when the conversation has more than one workspace, because the number is how a tool call names which one it acts in; each workspace follows as its own nested item.",
+      "id": "system.environment.workspaces",
       "placeholders": []
+    },
+    {
+      "description": "One item of the numbered workspace list. `{number}` is the value a tool's `workspace` parameter takes, `{path}` is the root on that machine, and `{location}` is the rendered machine phrase from the `system.environment.workspace_on_*` keys.",
+      "id": "system.environment.workspace_entry",
+      "placeholders": [
+        "number",
+        "path",
+        "location"
+      ]
+    },
+    {
+      "description": "Machine phrase for a workspace on the machine Mework itself runs on. It is what `{location}` becomes for a local workspace.",
+      "id": "system.environment.workspace_on_host",
+      "placeholders": []
+    },
+    {
+      "description": "Machine phrase for a workspace inside a WSL distribution. `{name}` is the distribution name.",
+      "id": "system.environment.workspace_on_wsl",
+      "placeholders": [
+        "name"
+      ]
+    },
+    {
+      "description": "Machine phrase for a workspace on a registered SSH machine. `{name}` is the machine's name in the catalog.",
+      "id": "system.environment.workspace_on_ssh",
+      "placeholders": [
+        "name"
+      ]
     },
     {
       "description": "Environment fact naming the host operating system, as Rust's `std::env::consts::OS` spells it (`windows`, `macos`, `linux`).",

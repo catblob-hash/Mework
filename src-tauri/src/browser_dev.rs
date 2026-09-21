@@ -867,6 +867,24 @@ async fn dispatch(
                 )
             }
         }
+        "list_remote_directory" => result_value(
+            super::list_remote_directory(
+                app.clone(),
+                app.state::<AppState>(),
+                arg(args, "machine")?,
+                arg(args, "path")?,
+            )
+            .await,
+        ),
+        "authorize_remote_workspace" => result_value(
+            super::authorize_remote_workspace(
+                app.clone(),
+                app.state::<AppState>(),
+                arg(args, "machine")?,
+                arg(args, "path")?,
+            )
+            .await,
+        ),
         "save_api_key" => result_value(
             super::save_api_key(
                 app.clone(),

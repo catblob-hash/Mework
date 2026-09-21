@@ -20,13 +20,25 @@ use crate::model::{
     ContextItem, Conversation, ConversationBranch, ConversationSettings, ConversationWorktree,
     ImageAttachment, QueuedMessage, RunTarget, UserAbortedTaskRecord,
 };
+use crate::model::AttachedWorkspace;
 
 /// Database file name, stored beside the anchor file.
 pub const DATABASE_FILE_NAME: &str = "conversations.v1.sqlite3";
 
 /// `PRAGMA user_version`. Every upgrade so far is additive and in place, so a
-/// released user's history survives; only unknown versions are quarantined and rebuilt.
-pub const STORE_VERSION: i32 = 13;
+/// released user's history survives; only a version from the future is quarantined
+/// and rebuilt.
+///
+/// The stamp records what a store was last reconciled against and nothing more.
+/// [`ConversationStore::ensure_schema`] repairs by comparing the tables and columns
+/// the store actually holds against the shape this build compiles against, on every
+/// open. A stamp is not evidence: a store carrying this number can still be missing
+/// a column, because a build whose upgrade steps differed, an upgrade that died
+/// between two `ALTER`s, and a hand-edited database all leave the number claiming
+/// more than the schema delivers. Trusting it is what let a `wire_request` without
+/// `owner` sit behind a current stamp and fail every ledger read and write for the
+/// remaining life of the store.
+pub const STORE_VERSION: i32 = 14;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,14 +48,14 @@ pub struct PendingForkStart {
     pub prompt_context_id: String,
 }
 
-const FORK_START_SCHEMA: &str = "CREATE TABLE pending_fork_start (
+const FORK_START_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pending_fork_start (
     conversation_id TEXT PRIMARY KEY REFERENCES conversation(id) ON DELETE CASCADE,
     prompt_context_id TEXT NOT NULL
 ) STRICT;";
 
 /// One plan document per conversation. A `plan` write replaces the whole
 /// document, so there is no history here; the timeline keeps the calls.
-const PLAN_SCHEMA: &str = "CREATE TABLE conversation_plan (
+const PLAN_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversation_plan (
     conversation_id TEXT PRIMARY KEY REFERENCES conversation(id) ON DELETE CASCADE,
     markdown        TEXT NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('draft','approved','rejected')),
@@ -55,7 +67,7 @@ const PLAN_SCHEMA: &str = "CREATE TABLE conversation_plan (
 /// The model never reads this table: `fork` returns before the user decides.
 /// A decision only means anything beside the conversation that raised it, so it
 /// dies with that conversation; the child it created does not.
-const FORK_DECISION_SCHEMA: &str = "CREATE TABLE fork_decision (
+const FORK_DECISION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS fork_decision (
     fork_id                TEXT PRIMARY KEY,
     source_conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     workspace_id           TEXT NOT NULL,
@@ -66,7 +78,7 @@ const FORK_DECISION_SCHEMA: &str = "CREATE TABLE fork_decision (
     approved               INTEGER NOT NULL,
     child_conversation_id  TEXT
 ) STRICT;
-CREATE INDEX fork_decision_source_idx ON fork_decision (source_conversation_id, decided_at);";
+CREATE INDEX IF NOT EXISTS fork_decision_source_idx ON fork_decision (source_conversation_id, decided_at);";
 
 /// Append-only history of the trunk timeline, kept as a delta chain rather than a
 /// copy of the prefix per event: a snapshot per backend request would grow with the
@@ -76,7 +88,7 @@ CREATE INDEX fork_decision_source_idx ON fork_decision (source_conversation_id, 
 /// has to diff against one table instead of replaying the whole chain. It holds each
 /// row's body verbatim instead of a hash: a digest would have to stay stable across
 /// toolchain versions to avoid inventing a replacement for every row at once.
-const TIMELINE_HISTORY_SCHEMA: &str = "CREATE TABLE timeline_event (
+const TIMELINE_HISTORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS timeline_event (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL,
     kind            TEXT NOT NULL CHECK (kind IN ('baseline', 'run', 'edit')),
@@ -91,7 +103,7 @@ const TIMELINE_HISTORY_SCHEMA: &str = "CREATE TABLE timeline_event (
     PRIMARY KEY (conversation_id, seq)
 ) STRICT;
 
-CREATE TABLE timeline_op (
+CREATE TABLE IF NOT EXISTS timeline_op (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL,
     ordinal         INTEGER NOT NULL,
@@ -104,7 +116,7 @@ CREATE TABLE timeline_op (
     PRIMARY KEY (conversation_id, seq, ordinal)
 ) STRICT;
 
-CREATE TABLE timeline_head (
+CREATE TABLE IF NOT EXISTS timeline_head (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     position        INTEGER NOT NULL,
     context_id      TEXT NOT NULL,
@@ -123,7 +135,7 @@ CREATE TABLE timeline_head (
 /// application really executed it. Storing template bodies in the
 /// renderer-submitted document would let a forged result enter a conversation
 /// through the apply path. Here the renderer only ever names a template.
-const TEMPLATE_SCHEMA: &str = "CREATE TABLE conversation_template (
+const TEMPLATE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversation_template (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -131,7 +143,7 @@ const TEMPLATE_SCHEMA: &str = "CREATE TABLE conversation_template (
     order_key  REAL NOT NULL
 ) STRICT;
 
-CREATE TABLE template_context (
+CREATE TABLE IF NOT EXISTS template_context (
     template_id TEXT NOT NULL REFERENCES conversation_template (id) ON DELETE CASCADE,
     id          TEXT NOT NULL,
     order_key   REAL NOT NULL,
@@ -139,7 +151,7 @@ CREATE TABLE template_context (
     PRIMARY KEY (template_id, id)
 ) STRICT;
 
-CREATE INDEX template_context_order_idx ON template_context (template_id, order_key);";
+CREATE INDEX IF NOT EXISTS template_context_order_idx ON template_context (template_id, order_key);";
 
 /// Forensic ledger of what actually left this process, one `wire_request` row per
 /// request that went on the wire, with the request's own parts named in wire order.
@@ -163,7 +175,7 @@ CREATE INDEX template_context_order_idx ON template_context (template_id, order_
 /// traffic apart. Bodies are shared across all of them, which is what a child's
 /// replayed system prompt and tool surface cost: one row, however many agents
 /// carried them.
-const WIRE_LEDGER_SCHEMA: &str = "CREATE TABLE wire_request (
+const WIRE_LEDGER_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS wire_request (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
@@ -203,7 +215,7 @@ const WIRE_LEDGER_SCHEMA: &str = "CREATE TABLE wire_request (
     PRIMARY KEY (conversation_id, seq)
 ) STRICT;
 
-CREATE TABLE wire_blob (
+CREATE TABLE IF NOT EXISTS wire_blob (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     hash            TEXT NOT NULL,
     body            TEXT NOT NULL,
@@ -211,7 +223,7 @@ CREATE TABLE wire_blob (
     PRIMARY KEY (conversation_id, hash)
 ) STRICT;
 
-CREATE TABLE wire_request_part (
+CREATE TABLE IF NOT EXISTS wire_request_part (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL,
     ordinal         INTEGER NOT NULL,
@@ -462,7 +474,7 @@ pub struct ActivityBucket {
 }
 
 const SCHEMA_SQL: &str = r#"
-CREATE TABLE conversation (
+CREATE TABLE IF NOT EXISTS conversation (
     id           TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
     title        TEXT NOT NULL DEFAULT '',
@@ -489,12 +501,16 @@ CREATE TABLE conversation (
     template_id  TEXT,
     -- JSON array of extra working directories; NULL = none. Its own column for
     -- the same reason as worktree: one grant must not be copied to another chat.
-    additional_directories TEXT
+    additional_directories TEXT,
+    -- JSON array of `{machine?, path}` — the same grants, each naming the machine
+    -- its directory is on. Supersedes additional_directories, which is kept so a
+    -- store written by an older build still reports what it granted.
+    attached_workspaces TEXT
 ) STRICT;
 
-CREATE INDEX conversation_workspace_order_idx ON conversation (workspace_id, order_key);
+CREATE INDEX IF NOT EXISTS conversation_workspace_order_idx ON conversation (workspace_id, order_key);
 
-CREATE TABLE branch (
+CREATE TABLE IF NOT EXISTS branch (
     conversation_id TEXT NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
     id              TEXT NOT NULL,
     fork_context_id TEXT NOT NULL,
@@ -505,7 +521,7 @@ CREATE TABLE branch (
     PRIMARY KEY (conversation_id, id)
 ) STRICT;
 
-CREATE TABLE context (
+CREATE TABLE IF NOT EXISTS context (
     conversation_id TEXT NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
     id              TEXT NOT NULL,
     branch_id       TEXT,
@@ -522,10 +538,10 @@ CREATE TABLE context (
     CHECK (status IN ('streaming', 'settled'))
 ) STRICT;
 
-CREATE INDEX context_order_idx ON context (conversation_id, branch_id, order_key);
-CREATE INDEX context_status_idx ON context (status);
+CREATE INDEX IF NOT EXISTS context_order_idx ON context (conversation_id, branch_id, order_key);
+CREATE INDEX IF NOT EXISTS context_status_idx ON context (status);
 
-CREATE TABLE queued_message (
+CREATE TABLE IF NOT EXISTS queued_message (
     conversation_id TEXT NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
     id              TEXT NOT NULL,
     order_key       REAL NOT NULL,
@@ -535,7 +551,7 @@ CREATE TABLE queued_message (
     PRIMARY KEY (conversation_id, id)
 ) STRICT;
 
-CREATE TABLE aborted_task (
+CREATE TABLE IF NOT EXISTS aborted_task (
     conversation_id TEXT NOT NULL REFERENCES conversation (id) ON DELETE CASCADE,
     id              TEXT NOT NULL,
     order_key       REAL NOT NULL,
@@ -543,6 +559,47 @@ CREATE TABLE aborted_task (
     PRIMARY KEY (conversation_id, id)
 ) STRICT;
 "#;
+
+/// Every creation statement the store is built from, in the order a fresh store
+/// runs them. Repair walks the same list, so "what a new store gets" and "what an
+/// old store is brought up to" cannot drift apart.
+const SCHEMAS: [&str; 7] = [
+    SCHEMA_SQL,
+    FORK_START_SCHEMA,
+    PLAN_SCHEMA,
+    FORK_DECISION_SCHEMA,
+    TIMELINE_HISTORY_SCHEMA,
+    TEMPLATE_SCHEMA,
+    WIRE_LEDGER_SCHEMA,
+];
+
+/// Columns bolted onto a table after that table had already shipped, as
+/// `(table, column, declaration)`.
+///
+/// The creation statements above carry these columns too, so a store built today
+/// already has them and this list adds nothing; it exists for a store built by an
+/// older release, where the table is present but the column is not. Listing them
+/// separately is what makes repair idempotent: each one is added only when the
+/// store is actually missing it, so the same pass is safe to run against every
+/// store on every open, whatever its version stamp claims.
+///
+/// Order matters only in that a column must not be named before its table is
+/// created — [`ConversationStore::ensure_schema`] runs every creation statement
+/// first, so every table here exists by the time the list is walked.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("conversation", "parent_conversation_id", "TEXT"),
+    ("conversation", "preset_id", "TEXT"),
+    ("conversation", "template_id", "TEXT"),
+    ("conversation", "additional_directories", "TEXT"),
+    ("conversation", "attached_workspaces", "TEXT"),
+    ("wire_request", "input_tokens", "INTEGER"),
+    ("wire_request", "cached_input_tokens", "INTEGER"),
+    ("wire_request", "output_tokens", "INTEGER"),
+    ("wire_request", "messages_added", "INTEGER"),
+    ("wire_request", "messages_removed", "INTEGER"),
+    ("wire_request", "owner", "TEXT"),
+    ("wire_request_part", "role", "TEXT"),
+];
 
 /// Process-local connections cached by database path. Storage operations receive only the anchor path,
 /// so reuse by path preserves WAL and `busy_timeout` semantics.
@@ -587,168 +644,124 @@ pub struct ConversationStore {
 }
 
 impl ConversationStore {
+    /// Opens the store, setting aside and rebuilding a database this build cannot
+    /// use rather than failing startup with it.
+    ///
+    /// The quarantine covers connecting as well as reconciling. A file damaged
+    /// past the header fails at `PRAGMA journal_mode`, before any schema is read,
+    /// so a recovery that only guarded the schema step would let that file refuse
+    /// every open for as long as it stayed in place — and every caller of
+    /// [`store_for`] would keep getting the same error with nothing able to clear
+    /// it. Whichever step refuses, the file is set aside intact and replaced.
     pub fn open(db_path: &Path) -> Result<Self, String> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("无法创建对话库目录：{error}"))?;
         }
-        let conn = open_configured(db_path)?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
-        match store.ensure_schema() {
-            Ok(()) => Ok(store),
+        match Self::connect(db_path) {
+            Ok(store) => Ok(store),
             Err(error) => {
-                // Quarantine and rebuild an incompatible or corrupt database without blocking startup.
-                drop(store);
                 quarantine_database(db_path, &error);
-                let conn = open_configured(db_path)?;
-                let store = Self {
-                    conn: Mutex::new(conn),
-                };
-                store.ensure_schema()?;
-                Ok(store)
+                Self::connect(db_path)
             }
         }
     }
 
+    /// Connects to the database at `db_path` and brings it up to date, leaving the
+    /// file untouched on refusal. Both attempts in [`Self::open`] go through here,
+    /// so the retry after a quarantine is the same code path as the first try.
+    fn connect(db_path: &Path) -> Result<Self, String> {
+        let store = Self {
+            conn: Mutex::new(open_configured(db_path)?),
+        };
+        store.ensure_schema()?;
+        Ok(store)
+    }
+
+    /// Brings the store to the shape this build compiles against and stamps it.
+    ///
+    /// What gets repaired is decided by what the database actually holds, not by
+    /// what its version stamp claims: every table is created when missing and
+    /// every column in [`ADDED_COLUMNS`] is added when missing, so the pass is
+    /// idempotent and runs on every open — including one whose stamp already reads
+    /// current. A ladder keyed on the stamp cannot do this. It repairs only what
+    /// the stamp says is outstanding, so a store whose stamp overstates its schema
+    /// is never examined again: the read and write paths go on naming a column that
+    /// is not there and the store stays broken for good. That is not hypothetical —
+    /// it is how a `wire_request` missing `owner` survived behind a stamp already
+    /// reading `STORE_VERSION`, failing every ledger read and every ledger write.
+    ///
+    /// The whole pass is one `BEGIN IMMEDIATE`, so a store is reconciled and stamped
+    /// together or left exactly as it was: a process that dies midway leaves nothing
+    /// half-upgraded, and the next open repairs from a shape it can still read.
     fn ensure_schema(&self) -> Result<(), String> {
         let mut conn = self.lock()?;
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| format!("无法读取对话库版本：{error}"))?;
-        if version == STORE_VERSION {
-            // A current schema already exists. Empty and mismatched stores follow the paths below.
-            return Ok(());
-        }
-        if version >= 1 && version < STORE_VERSION {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("无法开启对话库升级事务：{error}"))?;
-            if version == 1 {
-                tx.execute_batch("ALTER TABLE conversation ADD COLUMN parent_conversation_id TEXT")
-                    .map_err(|error| format!("无法升级对话库结构：{error}"))?;
-            }
-            if version <= 2 {
-                tx.execute_batch(FORK_START_SCHEMA)
-                    .map_err(|error| error.to_string())?;
-            }
-            if version <= 3 {
-                tx.execute_batch(PLAN_SCHEMA)
-                    .map_err(|error| error.to_string())?;
-            }
-            if version <= 4 {
-                tx.execute_batch(FORK_DECISION_SCHEMA)
-                    .map_err(|error| error.to_string())?;
-            }
-            if version <= 5 {
-                tx.execute_batch("ALTER TABLE conversation ADD COLUMN preset_id TEXT")
-                    .map_err(|error| format!("无法升级对话库结构：{error}"))?;
-            }
-            if version <= 6 {
-                tx.execute_batch(TIMELINE_HISTORY_SCHEMA)
-                    .map_err(|error| error.to_string())?;
-            }
-            if version <= 7 {
-                tx.execute_batch(TEMPLATE_SCHEMA)
-                    .map_err(|error| error.to_string())?;
-                tx.execute_batch("ALTER TABLE conversation ADD COLUMN template_id TEXT")
-                    .map_err(|error| format!("无法升级对话库结构：{error}"))?;
-            }
-            if (5..=8).contains(&version) {
-                // `fork` lost its inherit-context option, so the recorded answer to
-                // it is meaningless. Dropping the column in place keeps the rest of
-                // each decision, so the task bar still draws old rows. Stores older
-                // than 5 skip this: the branch above builds `fork_decision` from the
-                // current schema, which never had the column. The upper bound is the
-                // version this step produced and must stay there: a 9 store already
-                // ran it, and running it again would fail on a column that is gone.
-                // The column's presence is checked rather than assumed because a
-                // 5..=8 store whose `fork_decision` predates the option is a legal
-                // shape on disk, and refusing it would quarantine a readable store.
-                let has_inherit_context = tx
-                    .prepare("SELECT 1 FROM pragma_table_info('fork_decision') WHERE name = 'inherit_context'")
-                    .and_then(|mut statement| statement.exists([]))
-                    .map_err(|error| format!("无法检查对话库结构：{error}"))?;
-                if has_inherit_context {
-                    tx.execute_batch("ALTER TABLE fork_decision DROP COLUMN inherit_context")
-                        .map_err(|error| format!("无法升级对话库结构：{error}"))?;
-                }
-            }
-            if version <= 9 {
-                tx.execute_batch(WIRE_LEDGER_SCHEMA)
-                    .map_err(|error| error.to_string())?;
-            }
-            if version == 10 {
-                // Only a store that already carries the released version of the
-                // ledger needs the columns bolted on. Anything older took the
-                // branch above, which builds the tables from the current
-                // `WIRE_LEDGER_SCHEMA` and already has them; running this there
-                // would fail on columns that exist.
-                tx.execute_batch(
-                    "ALTER TABLE wire_request ADD COLUMN input_tokens INTEGER;
-                     ALTER TABLE wire_request ADD COLUMN cached_input_tokens INTEGER;
-                     ALTER TABLE wire_request ADD COLUMN output_tokens INTEGER;
-                     ALTER TABLE wire_request ADD COLUMN messages_added INTEGER;
-                     ALTER TABLE wire_request ADD COLUMN messages_removed INTEGER;
-                     ALTER TABLE wire_request_part ADD COLUMN role TEXT;",
-                )
-                .map_err(|error| format!("无法升级对话库结构：{error}"))?;
-            }
-            if version <= 11 {
-                tx.execute_batch(
-                    "ALTER TABLE conversation ADD COLUMN additional_directories TEXT",
-                )
-                .map_err(|error| format!("无法升级对话库结构：{error}"))?;
-            }
-            if (10..=12).contains(&version) {
-                // Same rule as the step above it: only a store that already
-                // carries the ledger needs the column bolted on. Anything older
-                // took the `version <= 9` branch, which builds the tables from
-                // the current `WIRE_LEDGER_SCHEMA` and already has it. Every
-                // row that predates this column is trunk traffic — subagent
-                // requests were not recorded at all until it existed — so NULL
-                // is the right value for all of them and no backfill is needed.
-                tx.execute_batch("ALTER TABLE wire_request ADD COLUMN owner TEXT")
-                    .map_err(|error| format!("无法升级对话库结构：{error}"))?;
-            }
-            tx.pragma_update(None, "user_version", STORE_VERSION)
-                .map_err(|error| format!("无法写入对话库版本：{error}"))?;
-            tx.commit()
-                .map_err(|error| format!("无法提交对话库升级事务：{error}"))?;
-            return Ok(());
-        }
-        if version != 0 {
+        if version > STORE_VERSION {
+            // A store written by a later build may carry columns and checks this one
+            // cannot honour, and meeting it would be a downgrade rather than the
+            // additive repair below. Quarantine and rebuild instead.
             return Err(format!(
                 "对话库版本 {version} 与当前实现的 {STORE_VERSION} 不一致"
             ));
         }
-        let has_tables: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'conversation'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("无法检查对话库结构：{error}"))?;
-        if has_tables > 0 {
-            return Err("对话库缺少版本标记但已有数据表".into());
+        if version == 0 {
+            let has_tables: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'conversation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("无法检查对话库结构：{error}"))?;
+            if has_tables > 0 {
+                // Tables but no stamp: not a database this application wrote.
+                // Repairing it would `ALTER` a stranger's data, so it is set aside
+                // untouched rather than reconciled.
+                return Err("对话库缺少版本标记但已有数据表".into());
+            }
         }
-        conn.execute_batch(SCHEMA_SQL)
-            .map_err(|error| format!("无法建立对话库结构：{error}"))?;
-        conn.execute_batch(FORK_START_SCHEMA)
-            .map_err(|error| error.to_string())?;
-        conn.execute_batch(PLAN_SCHEMA)
-            .map_err(|error| error.to_string())?;
-        conn.execute_batch(FORK_DECISION_SCHEMA)
-            .map_err(|error| error.to_string())?;
-        conn.execute_batch(TIMELINE_HISTORY_SCHEMA)
-            .map_err(|error| error.to_string())?;
-        conn.execute_batch(TEMPLATE_SCHEMA)
-            .map_err(|error| error.to_string())?;
-        conn.execute_batch(WIRE_LEDGER_SCHEMA)
-            .map_err(|error| error.to_string())?;
-        conn.pragma_update(None, "user_version", STORE_VERSION)
+        if version == STORE_VERSION && shape_is_current(&conn)? {
+            // Stamp and schema agree, so there is nothing to repair and no reason
+            // to take a write lock: the overwhelmingly common open stays a few
+            // reads. The stamp alone would not be enough to skip the pass — it is
+            // the schema behind it that is being trusted here, not the number.
+            return Ok(());
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("无法开启对话库升级事务：{error}"))?;
+        // Every statement in these is `IF NOT EXISTS`: this builds what a store is
+        // missing and leaves what it already has untouched. A fresh store gets all
+        // of it, a store already current gets nothing, and a store that lost one
+        // table to a failed upgrade gets exactly that table back.
+        for schema in SCHEMAS {
+            tx.execute_batch(schema)
+                .map_err(|error| format!("无法建立对话库结构：{error}"))?;
+        }
+        for &(table, column, declaration) in ADDED_COLUMNS {
+            if has_column(&tx, table, column)? {
+                continue;
+            }
+            tx.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            ))
+            .map_err(|error| format!("无法升级对话库结构：{error}"))?;
+        }
+        if has_column(&tx, "fork_decision", "inherit_context")? {
+            // `fork` lost its inherit-context option, so the recorded answer to it is
+            // meaningless. Dropping the column in place keeps the rest of each
+            // decision, so the task bar still draws old rows. Its presence is checked
+            // rather than assumed because a `fork_decision` predating the option is a
+            // legal shape on disk, and refusing it would quarantine a readable store.
+            tx.execute_batch("ALTER TABLE fork_decision DROP COLUMN inherit_context")
+                .map_err(|error| format!("无法升级对话库结构：{error}"))?;
+        }
+        tx.pragma_update(None, "user_version", STORE_VERSION)
             .map_err(|error| format!("无法写入对话库版本：{error}"))?;
+        tx.commit()
+            .map_err(|error| format!("无法提交对话库升级事务：{error}"))?;
         Ok(())
     }
 
@@ -902,7 +915,7 @@ impl ConversationStore {
         let conn = self.lock()?;
         let shell = conn
             .query_row(
-                "SELECT title, created_at, updated_at, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories FROM conversation WHERE id = ?1",
+                "SELECT title, created_at, updated_at, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories, attached_workspaces FROM conversation WHERE id = ?1",
                 [conversation_id],
                 |row| {
                     Ok((
@@ -916,6 +929,7 @@ impl ConversationStore {
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
                     ))
                 },
             )
@@ -932,6 +946,7 @@ impl ConversationStore {
             preset_id,
             template_id,
             additional_directories_json,
+            attached_workspaces_json,
         )) = shell
         else {
             return Ok(None);
@@ -954,6 +969,10 @@ impl ConversationStore {
         let additional_directories = additional_directories_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+            .unwrap_or_default();
+        let attached_workspaces = attached_workspaces_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Vec<AttachedWorkspace>>(value).ok())
             .unwrap_or_default();
 
         let contexts = read_contexts(&conn, conversation_id, None)?;
@@ -1057,6 +1076,7 @@ impl ConversationStore {
             parent_conversation_id,
             preset_id: preset_id.unwrap_or_default(),
             template_id: template_id.unwrap_or_default(),
+            attached_workspaces,
             additional_directories,
         }))
     }
@@ -2135,15 +2155,85 @@ fn open_configured(db_path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Table names as the creation statements themselves declare them, so the list and
+/// the statements cannot drift: a table added to a schema constant is a table this
+/// reports, with nothing to keep in step by hand.
+fn declared_tables() -> impl Iterator<Item = &'static str> {
+    const PREFIX: &str = "CREATE TABLE IF NOT EXISTS ";
+    SCHEMAS.into_iter().flat_map(|schema| {
+        schema
+            .split(PREFIX)
+            .skip(1)
+            .filter_map(|rest| rest.split_whitespace().next())
+    })
+}
+
+/// Whether the store already holds everything this build expects of it: every
+/// declared table, every column added after its table shipped, and none of the
+/// retired ones.
+///
+/// This is what lets a healthy open stay read-only. It asks the schema and not the
+/// version stamp, so answering "yes" is a statement about the database rather than
+/// about a number written into it.
+fn shape_is_current(conn: &Connection) -> Result<bool, String> {
+    for table in declared_tables() {
+        if !has_table(conn, table)? {
+            return Ok(false);
+        }
+    }
+    for &(table, column, _) in ADDED_COLUMNS {
+        if !has_column(conn, table, column)? {
+            return Ok(false);
+        }
+    }
+    Ok(!has_column(conn, "fork_decision", "inherit_context")?)
+}
+
+fn has_table(conn: &Connection, table: &str) -> Result<bool, String> {
+    conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .and_then(|mut statement| statement.exists([table]))
+        .map_err(|error| format!("无法检查对话库结构：{error}"))
+}
+
+/// Whether a table already carries a column, read from the store itself.
+///
+/// Repair asks this and never the version stamp: the stamp says what a store was
+/// last reconciled against, the schema says what it actually holds, and only the
+/// second one can decide an `ALTER`. The table name is a constant from this file
+/// rather than anything a caller supplies, so it is written into the statement;
+/// only the column name is bound.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    conn.prepare(&format!(
+        "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+    ))
+    .and_then(|mut statement| statement.exists([column]))
+    .map_err(|error| format!("无法检查对话库结构：{error}"))
+}
+
 fn quarantine_database(db_path: &Path, reason: &str) {
+    let aux = |base: &Path, suffix: &str| {
+        let mut path = base.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
     let quarantined = db_path.with_extension(format!("quarantine-{stamp}.sqlite3"));
-    let _ = std::fs::rename(db_path, &quarantined);
-    for suffix in ["-wal", "-shm"] {
-        let mut aux = db_path.as_os_str().to_owned();
-        aux.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(aux));
+    if let Err(error) = std::fs::rename(db_path, &quarantined) {
+        // Nothing was set aside, so nothing beside it may be removed either:
+        // deleting the log of a database still sitting at `db_path` would throw
+        // away the history this call exists to keep. The caller reopens the same
+        // file, meets the same refusal, and reports it instead of losing it.
+        eprintln!("对话库无法封存（{reason}）：{error}");
+        return;
     }
+    // The write-ahead log travels with the file it belongs to. A store in WAL mode
+    // that has never been checkpointed holds nearly everything in the log and
+    // almost nothing in the main file, so leaving the log behind would set aside an
+    // empty shell and destroy exactly the history the rename was meant to preserve.
+    // SQLite finds a log by name, so it has to be renamed to match. The shared
+    // memory file is rebuilt from the log on the next open and is simply dropped.
+    let _ = std::fs::rename(aux(db_path, "-wal"), aux(&quarantined, "-wal"));
+    let _ = std::fs::remove_file(aux(db_path, "-shm"));
     eprintln!("对话库已封存（{reason}）：{}", quarantined.display());
 }
 
@@ -3071,6 +3161,14 @@ fn put_conversation_row_tx(
                 .map_err(|error| format!("对话额外工作目录无法序列化：{error}"))?,
         )
     };
+    let attached_workspaces = if conversation.attached_workspaces.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&conversation.attached_workspaces)
+                .map_err(|error| format!("对话工作区列表无法序列化：{error}"))?,
+        )
+    };
     let order_key: Option<f64> = tx
         .query_row(
             "SELECT order_key FROM conversation WHERE id = ?1",
@@ -3095,15 +3193,16 @@ fn put_conversation_row_tx(
         }
     };
     tx.execute(
-        "INSERT INTO conversation (id, workspace_id, title, created_at, updated_at, order_key, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "INSERT INTO conversation (id, workspace_id, title, created_at, updated_at, order_key, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories, attached_workspaces)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT (id) DO UPDATE SET workspace_id = excluded.workspace_id,
            title = excluded.title, created_at = excluded.created_at,
            updated_at = excluded.updated_at, settings = excluded.settings,
            worktree = excluded.worktree, run_target = excluded.run_target,
            parent_conversation_id = excluded.parent_conversation_id,
            preset_id = excluded.preset_id, template_id = excluded.template_id,
-           additional_directories = excluded.additional_directories",
+           additional_directories = excluded.additional_directories,
+           attached_workspaces = excluded.attached_workspaces",
         rusqlite::params![
             conversation.id,
             workspace_id,
@@ -3118,6 +3217,7 @@ fn put_conversation_row_tx(
             conversation.preset_id,
             conversation.template_id,
             additional_directories,
+            attached_workspaces,
         ],
     )
     .map_err(|error| format!("无法写入对话：{error}"))?;
@@ -3263,6 +3363,7 @@ mod tests {
             parent_conversation_id: None,
             preset_id: String::new(),
             template_id: String::new(),
+            attached_workspaces: Vec::new(),
             additional_directories: Vec::new(),
         }
     }
@@ -4514,6 +4615,276 @@ mod tests {
             "升级后主干账本不得被子代理的行污染"
         );
     }
+
+    /// A store can carry a current stamp and still be missing a column: a build
+    /// whose upgrade steps differed, an upgrade that died between two `ALTER`s, a
+    /// database edited by hand. The stamp is not evidence of shape, so the open
+    /// path repairs from the schema it can read rather than the number it is told.
+    #[test]
+    fn a_store_stamped_current_but_missing_owner_is_repaired_on_open() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("stamped_current");
+        source.contexts.push(user("history", "保留的历史"));
+        store.put_conversation("ws", &source).expect("seed history");
+        store
+            .record_wire_request(&wire_record(
+                &source.id,
+                &[("message", "{\"role\":\"user\",\"content\":\"旧的\"}")],
+            ))
+            .expect("seed ledger");
+        // The column goes and the stamp stays — the one shape a version ladder can
+        // never see, because it only repairs what the stamp admits is outstanding.
+        store
+            .lock()
+            .expect("lock")
+            .execute_batch("ALTER TABLE wire_request DROP COLUMN owner")
+            .expect("drop owner behind a current stamp");
+        let stamped: i32 = store
+            .lock()
+            .expect("lock")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(stamped, STORE_VERSION, "前提是版本号仍然自称当前");
+        drop(store);
+
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("repair");
+        assert_eq!(
+            store
+                .conversation(&source.id)
+                .expect("read history")
+                .expect("preserved row")
+                .contexts,
+            source.contexts,
+            "补列不得动到既有对话历史"
+        );
+        let carried = trunk_requests(&store, &source.id);
+        assert_eq!(carried.len(), 1, "补列前写下的行必须留在主干账本里");
+        assert_eq!(carried[0].owner, None);
+        store
+            .record_wire_request(&wire_child_record(
+                &source.id,
+                "late-agent",
+                &[("message", "{\"role\":\"user\",\"content\":\"子的\"}")],
+            ))
+            .expect("write child ledger after repair");
+        let owners = ["late-agent".to_owned()];
+        assert_eq!(
+            store
+                .wire_requests(&source.id, Some(&owners))
+                .expect("child ledger")
+                .len(),
+            1,
+            "补列后必须能按归属写入与读取"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).expect("directory").all(|entry| {
+                !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("quarantine-")
+            }),
+            "缺一列是可就地修复的，不该封存整个对话库"
+        );
+    }
+
+    /// The same rule for a whole table: repair is driven by the shape on disk, so a
+    /// table lost behind a current stamp comes back without touching the rest.
+    #[test]
+    fn a_store_stamped_current_but_missing_a_table_is_rebuilt_on_open() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("stamped_current_table");
+        source.contexts.push(user("history", "保留的历史"));
+        store.put_conversation("ws", &source).expect("seed history");
+        store
+            .lock()
+            .expect("lock")
+            .execute_batch("DROP TABLE conversation_plan")
+            .expect("drop a table behind a current stamp");
+        drop(store);
+
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("repair");
+        assert_eq!(
+            store.conversation_plan(&source.id).expect("plan"),
+            None,
+            "丢掉的表必须重新建起来，而不是让每次读计划都失败"
+        );
+        assert_eq!(
+            store
+                .conversation(&source.id)
+                .expect("read history")
+                .expect("preserved row")
+                .contexts,
+            source.contexts,
+            "重建一张表不得动到既有对话历史"
+        );
+    }
+
+    /// Quarantine sets a store aside; it must not empty it on the way. A store in
+    /// WAL mode that was never checkpointed keeps its rows in the log and only a
+    /// header in the main file, so the log has to travel with the file it belongs
+    /// to — SQLite finds a log by name — or what gets filed away is an empty shell.
+    #[test]
+    fn quarantine_carries_the_write_ahead_log_with_the_file_it_sets_aside() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(DATABASE_FILE_NAME);
+        std::fs::write(&path, b"main").expect("main file");
+        std::fs::write(
+            dir.path().join(format!("{DATABASE_FILE_NAME}-wal")),
+            b"log",
+        )
+        .expect("log file");
+        std::fs::write(
+            dir.path().join(format!("{DATABASE_FILE_NAME}-shm")),
+            b"shared",
+        )
+        .expect("shared memory file");
+
+        quarantine_database(&path, "测试");
+
+        assert!(!path.exists(), "原路径必须腾空给重建");
+        let mut filed: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        filed.sort();
+        assert_eq!(
+            filed.len(),
+            2,
+            "封存的是库与日志两份，共享内存文件可重建、不留：{filed:?}"
+        );
+        let main = filed
+            .iter()
+            .find(|name| name.ends_with(".sqlite3"))
+            .expect("封存的库");
+        let log = filed
+            .iter()
+            .find(|name| name.ends_with(".sqlite3-wal"))
+            .expect("封存的日志");
+        assert_eq!(
+            log,
+            &format!("{main}-wal"),
+            "SQLite 按名字找日志：日志必须跟着改名，否则封存下来的只是个空壳"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(log)).expect("read log"),
+            b"log",
+            "日志内容必须原样搬过去"
+        );
+    }
+
+    /// A file this build cannot read is set aside and replaced, however current its
+    /// stamp reads. The stamp lives in page one and survives damage to everything
+    /// after it, so a corrupt store can still present itself as up to date; what
+    /// decides is whether the schema can actually be read back. Trusting the stamp
+    /// here would leave every read failing with `database disk image is malformed`
+    /// for as long as the file stayed in place.
+    #[test]
+    fn a_corrupt_store_behind_a_current_stamp_is_quarantined_and_rebuilt() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("corrupted");
+        source.contexts.push(user("history", "损坏前的历史"));
+        store.put_conversation("ws", &source).expect("seed history");
+        drop(store);
+
+        let path = dir.path().join(DATABASE_FILE_NAME);
+        let mut bytes = std::fs::read(&path).expect("read store");
+        assert!(bytes.len() > 4096 * 2, "夹具至少要有几页才谈得上损坏");
+        // Page one carries the header and the version stamp; everything after it,
+        // the schema page included, is wiped.
+        for byte in bytes.iter_mut().skip(4096) {
+            *byte = 0;
+        }
+        std::fs::write(&path, &bytes).expect("corrupt store");
+
+        let store = ConversationStore::open(&path).expect("rebuild after quarantine");
+        assert_eq!(
+            store.conversation(&source.id).expect("read"),
+            None,
+            "重建出来的必须是一个空库"
+        );
+        store
+            .put_conversation("ws", &conversation("after"))
+            .expect("重建后必须能正常写入");
+        let quarantined: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.contains("quarantine-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "损坏的库必须原样留一份在旁边，而不是当场丢掉：{quarantined:?}"
+        );
+    }
+
+
+    /// Repair leans on two things at once: every creation statement being safe to
+    /// re-run, and the table names being readable out of those same statements. A
+    /// `CREATE TABLE` written without `IF NOT EXISTS` breaks both — it fails the
+    /// pass on any store that already has the table, and it drops out of the shape
+    /// check that decides whether a store needs repairing at all, which is exactly
+    /// how a missing piece goes unnoticed behind a current stamp.
+    #[test]
+    fn every_creation_statement_is_idempotent_and_names_itself() {
+        for schema in SCHEMAS {
+            assert_eq!(
+                schema.matches("CREATE TABLE ").count(),
+                schema.matches("CREATE TABLE IF NOT EXISTS ").count(),
+                "建表语句必须写成 IF NOT EXISTS，否则修复会在已有该表的库上失败：{schema}"
+            );
+            assert_eq!(
+                schema.matches("CREATE INDEX ").count(),
+                schema.matches("CREATE INDEX IF NOT EXISTS ").count(),
+                "建索引语句同理：{schema}"
+            );
+        }
+        let declared: Vec<&str> = declared_tables().collect();
+        for expected in [
+            "conversation",
+            "branch",
+            "context",
+            "queued_message",
+            "aborted_task",
+            "pending_fork_start",
+            "conversation_plan",
+            "fork_decision",
+            "timeline_event",
+            "timeline_op",
+            "timeline_head",
+            "conversation_template",
+            "template_context",
+            "wire_request",
+            "wire_blob",
+            "wire_request_part",
+        ] {
+            assert!(
+                declared.contains(&expected),
+                "{expected} 必须能从建表语句里读出来：{declared:?}"
+            );
+        }
+        assert_eq!(declared.len(), 16, "读出的表名与实际建的表不符：{declared:?}");
+        for &(table, _, _) in ADDED_COLUMNS {
+            assert!(
+                declared.contains(&table),
+                "{table} 不在建表语句里，补列会打在一张不存在的表上"
+            );
+        }
+    }
+
+
 
     /// A body past the cap is stored cut, and the address is the address of what
     /// was stored: a reader can hash the text they were given and get the hash the

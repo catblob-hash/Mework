@@ -95,7 +95,7 @@ export function createE2eConversation({
     userAbortedTasks: [],
     worktree: null,
     runTarget: null,
-    additionalDirectories: [],
+    attachedWorkspaces: [],
     parentConversationId: null,
     presetId: "",
     templateId: ""
