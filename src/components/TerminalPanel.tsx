@@ -10,6 +10,7 @@ import { mirrorLightnessHex } from "../lib/themeMirror";
 import type {
   TerminalCommandState,
   TerminalEvent,
+  TerminalLaunchChoice,
   TerminalPhase,
   TerminalSessionState,
 } from "../lib/terminal";
@@ -65,6 +66,12 @@ export interface TerminalPanelProps {
   terminalId: string;
   label: string;
   open: boolean;
+  /**
+   * Which workspace the shell starts in and which shell it is. Read when the
+   * panel opens its session; a tab keeps one choice for its whole life, so a
+   * change here does not restart a running shell.
+   */
+  launch?: TerminalLaunchChoice;
   initialState?: TerminalSessionState;
   inputDisabledReason?: string | null;
   onCommandStart?: () => boolean;
@@ -112,6 +119,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
       terminalId,
       label,
       open,
+      launch,
       initialState,
       inputDisabledReason = null,
       onCommandStart = () => true,
@@ -130,6 +138,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
     const openRef = useRef(open);
     const conversationIdRef = useRef(conversationId);
     const terminalIdRef = useRef(terminalId);
+    const launchRef = useRef(launch);
+    launchRef.current = launch;
     const sessionIdRef = useRef<string | null>(null);
     const attemptRef = useRef(0);
     /** The open still in flight, so a close can wait for the host to have a session to kill. */
@@ -407,6 +417,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
           Math.max(2, terminal.cols),
           Math.max(1, terminal.rows),
           onEvent,
+          launchRef.current,
         );
         if (
           attemptRef.current !== attempt ||

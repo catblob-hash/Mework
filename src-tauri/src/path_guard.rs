@@ -410,8 +410,13 @@ pub fn prepare_secure_write_with_scope(
     requested: &str,
     scope: &ExecutionScope,
 ) -> Result<SecureWriteAuthority, String> {
+    let recorded_workspace = workspace;
     let workspace = canonical_workspace(workspace)?;
-    let candidate = candidate_path(&workspace, requested)?;
+    let candidate = respell_under_canonical_workspace(
+        candidate_path(&workspace, requested)?,
+        recorded_workspace,
+        &workspace,
+    );
     reject_reparse_components(&candidate)?;
 
     let prospective_target = resolve_for_write_with_scope(&workspace, requested, scope)?;
@@ -1071,7 +1076,10 @@ fn create_new_no_follow_at(parent: &File, path: &Path) -> io::Result<File> {
             parent.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::mode_t,
+            // `openat` is variadic, so the mode travels through C default
+            // argument promotion: `mode_t` is `u16` on macOS, which Rust will
+            // not pass through `...`. `c_uint` is the promoted type everywhere.
+            0o600 as libc::c_uint,
         )
     };
     if descriptor == -1 {
@@ -1404,6 +1412,29 @@ fn candidate_path(workspace: &Path, requested: &str) -> Result<PathBuf, String> 
     };
     normalize_absolute(&joined)
         .map_err(|error| format!("Invalid path {}: {error}", joined.display()))
+}
+
+/// Respells an absolute request made under the workspace as it was recorded so
+/// that it sits under the workspace's canonical root instead.
+///
+/// A recorded root can reach its directory through a symlink nobody in the
+/// workspace controls — on macOS `/tmp`, `/var` and `/etc` are links into
+/// `/private` — and the component check would otherwise reject every absolute
+/// path the host builds from that root. Only the recorded prefix changes: the
+/// canonical root was resolved for this very call, and every component beneath
+/// it is still checked.
+fn respell_under_canonical_workspace(
+    candidate: PathBuf,
+    recorded_workspace: &Path,
+    canonical_workspace: &Path,
+) -> PathBuf {
+    let Ok(recorded) = normalize_absolute(recorded_workspace) else {
+        return candidate;
+    };
+    match candidate.strip_prefix(&recorded) {
+        Ok(rest) if recorded != canonical_workspace => canonical_workspace.join(rest),
+        _ => candidate,
+    }
 }
 
 fn normalize_absolute(path: &Path) -> io::Result<PathBuf> {
@@ -1898,7 +1929,9 @@ mod tests {
     #[test]
     fn unix_temporary_creation_and_failed_verification_use_the_held_parent() {
         let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
+        // Handle-level helpers take canonical paths from their callers; the
+        // temporary directory itself is behind `/var -> /private/var` on macOS.
+        let workspace = fs::canonicalize(root.path()).unwrap().join("workspace");
         let parent = workspace.join("shots");
         let moved_parent = workspace.join("shots-authorized");
         fs::create_dir_all(&parent).unwrap();
@@ -1923,7 +1956,7 @@ mod tests {
     #[test]
     fn unix_new_target_install_and_cleanup_stay_bound_to_the_held_parent() {
         let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
+        let workspace = fs::canonicalize(root.path()).unwrap().join("workspace");
         let parent = workspace.join("shots");
         let moved_parent = workspace.join("shots-authorized");
         let temporary = parent.join(".mework-secure-write-test.tmp");
@@ -2096,7 +2129,7 @@ mod tests {
                     .install(b"new")
                     .expect_err("a moved existing target must fail closed");
                 assert!(
-                    error.contains("outside trusted roots")
+                    error.contains("outside the trusted roots")
                         || error.contains("replacement")
                         || error.contains("while authority was held"),
                     "{error}"

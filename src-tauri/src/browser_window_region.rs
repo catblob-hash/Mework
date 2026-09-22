@@ -17,6 +17,7 @@ use tauri::Webview;
 
 use crate::chromium_capability::WebView2Permit;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const PAGE_STACKING_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Moves the remote child HWND to the bottom (`parked`) or the top of its siblings.

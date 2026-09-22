@@ -3,6 +3,9 @@
 //! Security invariant: `BROWSER_PAGE_LABEL` is the untrusted, remote webview. Never add that
 //! label to an application capability. Browser chrome lives in the trusted main React WebView;
 //! the desktop build only adds the remote page as a permissionless child WebView.
+// The DevTools-protocol half of this module (network log, cookies, screenshots,
+// dialogs, element picking) drives WebView2 and exists only on Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

@@ -145,6 +145,31 @@ describe("document normalization", () => {
   });
 
   /**
+   * A project's later workspaces are rebuilt through the same field-by-field
+   * list as its first, so they need the same care: dropping them on load would
+   * make the next save quietly shrink every conversation of the project.
+   */
+  it("keeps a project's later workspaces through normalization", () => {
+    const document = createSeedDocument();
+    const project = document.workspaces[0] as unknown as Record<string, unknown>;
+    project.additionalWorkspaces = [
+      { machine: { kind: "ssh", machineId: "m1" }, path: "/srv/api" },
+      { path: "  D:/shared/lib  " },
+      // The project's own first directory is not a second workspace.
+      { path: document.workspaces[0].path },
+      { path: "" },
+      { machine: { kind: "ssh", machineId: "m1" }, path: "/srv/api" }
+    ];
+
+    const [first] = normalizeDocument(document).workspaces;
+    expect(first.additionalWorkspaces).toEqual([
+      { machine: { kind: "ssh", machineId: "m1" }, path: "/srv/api" },
+      { path: "D:/shared/lib" }
+    ]);
+    expect(normalizeDocument(createSeedDocument()).workspaces[0]).not.toHaveProperty("additionalWorkspaces");
+  });
+
+  /**
    * A workspace-sourced descriptor is the only thing that tells the renderer which
    * conversations may select it, so normalization must not flatten it away.
    */

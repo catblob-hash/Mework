@@ -383,6 +383,25 @@ function normalizeAttachedWorkspaces(value: unknown, legacy: unknown): AttachedW
   return entries;
 }
 
+/**
+ * The most workspaces one project may have, the first included. Mirrors the
+ * host's per-project limit; the host rejects a document over it.
+ */
+export const MAX_PROJECT_WORKSPACES = 16;
+
+/**
+ * A project's workspaces after the first, on the same terms as a conversation's
+ * attached ones: an entry that could not have come from a host picker is
+ * dropped, and so is one that repeats the project's first workspace — the host
+ * refuses a project that names the same directory twice.
+ */
+function normalizeProjectMembers(value: unknown, primary: AttachedWorkspace): AttachedWorkspace[] {
+  const primaryKey = `${runEnvKey(primary.machine)} ${primary.path.trim()}`;
+  return normalizeAttachedWorkspaces(value, undefined)
+    .filter((entry) => `${runEnvKey(entry.machine)} ${entry.path}` !== primaryKey)
+    .slice(0, MAX_PROJECT_WORKSPACES - 1);
+}
+
 /** Host validation of execution environments is authoritative; discard malformed entries here. */
 function normalizeExecutionEnvironments(
   value: unknown,
@@ -1484,12 +1503,17 @@ export function normalizeDocument(value: unknown): AppDocument {
     const workspaceMachine = normalizeRunTarget(
       (workspace as unknown as { machine?: unknown }).machine
     );
+    const additionalWorkspaces = normalizeProjectMembers(
+      (workspace as unknown as { additionalWorkspaces?: unknown }).additionalWorkspaces,
+      { machine: workspaceMachine, path: workspace.path }
+    );
     regularWorkspaces.push({
       id: workspace.id,
       name: workspace.name,
       kind: "directory",
       path: workspace.path,
       ...(workspaceMachine ? { machine: workspaceMachine } : {}),
+      ...(additionalWorkspaces.length ? { additionalWorkspaces } : {}),
       createdAt: workspace.createdAt,
       defaultConversationPresetId: workspacePresetId(workspace),
       lastConversationSettings: workspaceLastSettings(workspace),

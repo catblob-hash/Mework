@@ -2745,6 +2745,9 @@ mod tests {
 
     /// A `.cmd` is not an executable image, so `npm` on Windows has to become
     /// `cmd /C ...\npm.cmd`; spawning the batch file directly fails with ENOENT.
+    /// Windows-only: the fixture's `C:\tools` candidates are built with the
+    /// host's own `Path::join`, which only a Windows host spells with `\`.
+    #[cfg(windows)]
     #[test]
     fn windows_resolution_wraps_scripts_in_their_interpreters() {
         let directories = [PathBuf::from("C:\\tools")];

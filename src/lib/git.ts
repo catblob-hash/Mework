@@ -806,20 +806,47 @@ export function gitFileHasUnstagedChange(file: GitFileChange): boolean {
  */
 export type GitTarget =
   | { kind: "conversation"; conversationId: string }
-  | { kind: "workspace"; workspaceId: string };
+  | {
+    kind: "workspace";
+    workspaceId: string;
+    /**
+     * Which of the project's workspaces, 1-based: absent or 1 is its first
+     * directory, 2 and on the ones added after it. Still an index rather than a
+     * path — the host looks the directory up in its own saved project.
+     */
+    member?: number;
+  };
 
 export function gitConversationTarget(conversationId: string): GitTarget {
   return { kind: "conversation", conversationId };
 }
 
-export function gitWorkspaceTarget(workspaceId: string): GitTarget {
-  return { kind: "workspace", workspaceId };
+export function gitWorkspaceTarget(workspaceId: string, member?: number): GitTarget {
+  return member && member > 1
+    ? { kind: "workspace", workspaceId, member }
+    : { kind: "workspace", workspaceId };
+}
+
+/**
+ * The key a conversation's Git snapshot is stored under: the project id for the project's first
+ * workspace, and `<project id>#<member>` for another of its workspaces. Two directories of one
+ * project are two checkouts, and a snapshot of one must never be shown for the other.
+ */
+export function gitSurfaceKey(workspaceId: string, member = 1): string {
+  return member > 1 ? `${workspaceId}#${member}` : workspaceId;
+}
+
+/** The project a {@link gitSurfaceKey} belongs to. */
+export function gitSurfaceProjectId(surfaceKey: string): string {
+  const separator = surfaceKey.indexOf("#");
+  return separator < 0 ? surfaceKey : surfaceKey.slice(0, separator);
 }
 
 /** Stable string suitable for React keys, cache keys, and dependency arrays. */
 export function gitTargetKey(target: GitTarget): string {
-  return target.kind === "conversation"
-    ? `conversation:${target.conversationId}`
+  if (target.kind === "conversation") return `conversation:${target.conversationId}`;
+  return target.member && target.member > 1
+    ? `workspace:${target.workspaceId}#${target.member}`
     : `workspace:${target.workspaceId}`;
 }
 

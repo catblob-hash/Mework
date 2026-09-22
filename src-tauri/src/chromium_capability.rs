@@ -496,10 +496,10 @@ impl WebView2Control {
     }
 
     #[cfg_attr(
-        all(windows, not(test)),
+        not(test),
         expect(
             dead_code,
-            reason = "Windows production attestation owns a pre-dispatch permit; this shorthand remains for tests and non-Windows binding"
+            reason = "Windows production attestation owns a pre-dispatch permit, and no other platform attests a WebView2 folder; this shorthand remains for tests"
         )
     )]
     pub(crate) fn verify_attested_user_data_folder(

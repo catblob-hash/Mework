@@ -103,6 +103,134 @@ pub(crate) fn restore_dev_application_path() {
     }
 }
 
+/// Markers around the login shell's `PATH` in [`adopt_login_shell_path`], so
+/// whatever its startup files print cannot be mistaken for the value.
+const LOGIN_PATH_BEGIN: &str = "__MEWORK_LOGIN_PATH_BEGIN__";
+const LOGIN_PATH_END: &str = "__MEWORK_LOGIN_PATH_END__";
+
+/// Puts the user's login-shell `PATH` in front of this process's own (macOS).
+///
+/// An app started from Finder, the Dock or Spotlight inherits launchd's
+/// environment, whose `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin`: no Homebrew, no
+/// `~/.cargo/bin`, no version-manager shims. Every program Mework starts — the
+/// bash tool, hooks, MCP and language servers, preview dev servers, Git — would
+/// then miss the tools the user runs every day in Terminal, and `bash` itself
+/// would always be the system's 3.2 even when a newer one is installed. So the
+/// login shell is asked once, at start, what `PATH` it ends up with. Its order
+/// wins, as it does in Terminal; entries only the inherited `PATH` had (a
+/// development launcher's) are kept after it.
+///
+/// Must be called from the entry point before any thread exists, like
+/// [`restore_dev_application_path`]. The probe itself starts no thread: its
+/// output goes to a file, so a daemon the startup files leave holding the
+/// descriptor cannot keep a reader waiting. A shell that fails, prints no
+/// marker, or takes longer than the deadline leaves `PATH` as it was.
+pub(crate) fn adopt_login_shell_path() {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        let Some(login) = login_shell_path() else {
+            return;
+        };
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let Some(merged) = merged_search_path(&login, &inherited) else {
+            return;
+        };
+        // SAFETY: called from the entry point before the Tauri builder, the
+        // runtime or any spawn; the probe above started a process, not a thread.
+        unsafe { std::env::set_var("PATH", merged) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn login_shell_path() -> Option<OsString> {
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use wait_timeout::ChildExt;
+
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| Path::new(shell).is_absolute() && Path::new(shell).is_file())
+        .unwrap_or_else(|| OsString::from("/bin/zsh"));
+    let capture_path = std::env::temp_dir().join(format!(
+        "mework-login-path-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut capture = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&capture_path)
+        .ok()?;
+    let output = (|| {
+        let mut command = Command::new(&shell);
+        // `printenv` rather than `$PATH`: fish, say, joins its list with spaces.
+        command
+            .args([
+                "-i",
+                "-l",
+                "-c",
+                &format!("echo {LOGIN_PATH_BEGIN}; /usr/bin/printenv PATH; echo {LOGIN_PATH_END}"),
+            ])
+            .env("MEWORK_RESOLVING_ENVIRONMENT", "1")
+            .stdin(Stdio::null())
+            .stdout(capture.try_clone().ok()?)
+            .stderr(Stdio::null());
+        // A session of its own: an interactive shell must not reach for the
+        // terminal a development launch was started from, and a hung one is
+        // killed along with everything it started.
+        // SAFETY: `setsid` is async-signal-safe and touches no Rust state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().ok()?;
+        match child.wait_timeout(TIMEOUT) {
+            Ok(Some(_)) => {}
+            _ => {
+                // SAFETY: the child leads its own process group.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                return None;
+            }
+        }
+        capture.rewind().ok()?;
+        let mut text = String::new();
+        (&capture).take(1 << 20).read_to_string(&mut text).ok()?;
+        parse_login_shell_path(&text)
+    })();
+    let _ = std::fs::remove_file(&capture_path);
+    output
+}
+
+/// The `PATH` between the probe's markers, or `None` when the shell never got
+/// that far or printed something that is not a search path.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_login_shell_path(output: &str) -> Option<OsString> {
+    let after_begin = output.split_once(LOGIN_PATH_BEGIN)?.1;
+    let value = after_begin.split_once(LOGIN_PATH_END)?.0.trim();
+    (value.contains('/') && !value.contains('\0')).then(|| OsString::from(value))
+}
+
+/// `primary`'s entries in order, then the entries only `secondary` has.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn merged_search_path(primary: &OsStr, secondary: &OsStr) -> Option<OsString> {
+    let mut merged: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::env::split_paths(primary).chain(std::env::split_paths(secondary)) {
+        if !entry.as_os_str().is_empty() && !merged.contains(&entry) {
+            merged.push(entry);
+        }
+    }
+    std::env::join_paths(merged).ok()
+}
+
 /// True for a variable that exists to wire up development and end-to-end
 /// harnesses, and that a user command has no reason to inherit.
 ///
@@ -189,6 +317,52 @@ pub(crate) fn normalized_proxy_bypass(
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn the_login_path_is_read_only_from_between_its_markers() {
+        let output = format!(
+            "Last login: today\n{LOGIN_PATH_BEGIN}\n/opt/homebrew/bin:/usr/bin\n{LOGIN_PATH_END}\nbye\n"
+        );
+        assert_eq!(
+            parse_login_shell_path(&output),
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin"))
+        );
+        assert_eq!(parse_login_shell_path("/usr/bin:/bin"), None);
+        assert_eq!(
+            parse_login_shell_path(&format!("{LOGIN_PATH_BEGIN}\n\n{LOGIN_PATH_END}")),
+            None
+        );
+    }
+
+    /// Asks this machine's real login shell, which is the only way to know the
+    /// probe survives an actual set of startup files.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "runs the user's login shell and their startup files"]
+    fn a_real_login_shell_reports_its_path() {
+        let path = login_shell_path().expect("the login shell reports a PATH");
+        let entries: Vec<_> = std::env::split_paths(&path).collect();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry == std::path::Path::new("/usr/bin")),
+            "{path:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_shell_order_leads_and_inherited_extras_follow() {
+        let merged = merged_search_path(
+            OsStr::new("/opt/homebrew/bin:/usr/bin:/bin"),
+            OsStr::new("/usr/bin:/bin:/usr/sbin:/repo/node_modules/.bin::/bin"),
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            OsString::from("/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/repo/node_modules/.bin")
+        );
+    }
 
     fn private(name: &str) -> bool {
         is_private_child_environment_name(OsStr::new(name))

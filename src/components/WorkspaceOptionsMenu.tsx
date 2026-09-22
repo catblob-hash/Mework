@@ -1,4 +1,4 @@
-import { MoreHorizontal } from "lucide-react";
+import { MoreHorizontal, Pencil } from "lucide-react";
 import { useI18n } from "../i18n";
 import { PopoverMenu } from "./PopoverMenu";
 
@@ -13,7 +13,8 @@ export function WorkspaceOptionsMenu({
   presets,
   selectedPresetId,
   disabled = false,
-  onSelectPreset
+  onSelectPreset,
+  onEditProject
 }: {
   workspaceName: string;
   presets: WorkspacePresetOption[];
@@ -21,6 +22,8 @@ export function WorkspaceOptionsMenu({
   selectedPresetId: string;
   disabled?: boolean;
   onSelectPreset: (presetId: string) => void;
+  /** Opens the project dialog on this project; absent for the temporary project, which has none. */
+  onEditProject?: () => void;
 }) {
   const { t } = useI18n();
   const selected = presets.find((preset) => preset.id === selectedPresetId) ?? null;
@@ -38,7 +41,12 @@ export function WorkspaceOptionsMenu({
       anchorToPointer
       sections={[{
         id: "workspace",
-        items: [{
+        items: [...(onEditProject ? [{
+          id: "edit-project",
+          label: t("编辑项目…", "Edit project…"),
+          icon: <Pencil size={14} />,
+          onSelect: onEditProject
+        }] : []), {
           id: "default-preset",
           label: t("默认对话预设", "Default conversation preset"),
           // Nothing to choose from means nothing to follow; the workspace keeps reusing its most recent settings.

@@ -58,8 +58,8 @@ describe("App model run flow — timeline", () => {
     const user = userEvent.setup();
 
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: `工作区：${document.workspaces[0].name}` }));
-    await user.click(within(screen.getByRole("menu", { name: "选择工作区" })).getByRole("menuitemradio", { name: "临时工作区" }));
+    await user.click(await screen.findByRole("button", { name: `项目：${document.workspaces[0].name}` }));
+    await user.click(within(screen.getByRole("menu", { name: "选择项目" })).getByRole("menuitemradio", { name: "临时项目" }));
     await user.type(screen.getByLabelText("向 Agent 发送消息"), "检查临时目录");
     await user.click(screen.getByRole("button", { name: "发送" }));
 

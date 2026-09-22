@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readdirSync,
+  realpathSync,
   renameSync,
   symlinkSync,
   unlinkSync,
@@ -187,6 +188,14 @@ test("the OS mutex endpoint is deterministic across workspace aliases", () => {
   );
   assert.deepEqual(aliasCandidates, directCandidates);
   assert.equal(directCandidates.length, 1);
+  if (process.platform === "darwin") {
+    assert.equal(directCandidates[0].lockFile, true);
+    assert.equal(
+      path.dirname(directCandidates[0].path),
+      path.join(realpathSync.native(workspaceRoot), ".codex-tmp")
+    );
+    return;
+  }
   assert.equal(
     process.platform === "win32"
       ? directCandidates[0].path.startsWith("\\\\.\\pipe\\")

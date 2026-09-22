@@ -1462,25 +1462,25 @@ describe("App model run flow — modelRun", () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
-    await user.click(screen.getByRole("button", { name: "添加工作区" }));
-    const dialog = screen.getByRole("dialog", { name: "添加工作区" });
-    expect(within(dialog).getByText("浏览器预览无法读取系统目录，请粘贴绝对路径。")).toBeInTheDocument();
-    const path = within(dialog).getByRole("textbox", { name: /工作区路径/ });
+    await user.click(screen.getByRole("button", { name: "新建项目" }));
+    const dialog = screen.getByRole("dialog", { name: "新建项目" });
+    // Without a host picker the first workspace takes a typed path.
+    const path = within(dialog).getByRole("textbox", { name: "工作区 1 的绝对路径" });
     await user.type(path, "relative/path");
-    await user.click(within(dialog).getByRole("button", { name: "添加工作区" }));
+    await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
     // Relative paths are rejected without closing the dialog or creating a
-    // workspace.
+    // project.
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(screen.getByRole("dialog", { name: "添加工作区" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "新建项目" })).toBeInTheDocument();
     expect(path).toHaveValue("relative/path");
     expect(screen.queryByRole("button", { name: "relative/path" })).not.toBeInTheDocument();
 
     await user.clear(path);
     await user.type(path, "C:\\Temp\\qa-workspace");
     await user.type(within(dialog).getByLabelText("显示名称"), "QA Workspace");
-    await user.click(within(dialog).getByRole("button", { name: "添加工作区" }));
+    await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
     expect(await screen.findByRole("button", { name: "QA Workspace" })).toBeInTheDocument();
   });
 
@@ -1490,9 +1490,9 @@ describe("App model run flow — modelRun", () => {
     const user = userEvent.setup();
     const { container } = render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
-    await user.click(screen.getByRole("button", { name: `工作区：${document.workspaces[0].name}` }));
-    await user.click(within(screen.getByRole("menu", { name: "选择工作区" })).getByRole("menuitemradio", { name: "临时工作区" }));
-    expect(screen.getByRole("button", { name: "工作区：临时工作区" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: `项目：${document.workspaces[0].name}` }));
+    await user.click(within(screen.getByRole("menu", { name: "选择项目" })).getByRole("menuitemradio", { name: "临时项目" }));
+    expect(screen.getByRole("button", { name: "项目：临时项目" })).toBeInTheDocument();
 
     fireEvent.contextMenu(container.querySelector(".empty-state")!, { clientX: 40, clientY: 180 });
     await user.click(screen.getByRole("menuitem", { name: /工具调用/ }));
@@ -1915,8 +1915,8 @@ describe("App model run flow — modelRun", () => {
     const user = userEvent.setup();
     const { container } = render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
-    await user.click(screen.getByRole("button", { name: `工作区：${document.workspaces[0].name}` }));
-    await user.click(within(screen.getByRole("menu", { name: "选择工作区" })).getByRole("menuitemradio", { name: "临时工作区" }));
+    await user.click(screen.getByRole("button", { name: `项目：${document.workspaces[0].name}` }));
+    await user.click(within(screen.getByRole("menu", { name: "选择项目" })).getByRole("menuitemradio", { name: "临时项目" }));
 
     fireEvent.contextMenu(container.querySelector(".empty-state")!, { clientX: 40, clientY: 180 });
     await user.click(screen.getByRole("menuitem", { name: /工具调用/ }));

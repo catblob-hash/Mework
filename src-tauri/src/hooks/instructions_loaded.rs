@@ -1458,6 +1458,7 @@ mod tests {
                 stderr: String::new(),
             })
         });
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut first = definition(None);
         #[cfg(windows)]
         {

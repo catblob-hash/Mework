@@ -3,7 +3,6 @@ import {
   ChevronDown,
   CircleAlert,
   Folder,
-  FolderOpen,
   FolderPlus,
   Gauge,
   GitBranch,
@@ -14,8 +13,8 @@ import {
   ListChecks,
   Monitor,
   PanelLeft,
+  PanelRight,
   RotateCcw,
-  Settings,
   ShieldCheck,
   Server,
   SlidersHorizontal,
@@ -55,10 +54,10 @@ import {
   SIDEBAR_DEFAULT_WIDTH
 } from "./components/Sidebar";
 import { RemoteDirectoryPicker } from "./components/RemoteDirectoryPicker";
-import { WorkspaceSelector } from "./components/WorkspaceSelector";
+import { ProjectSelector, TerminalShellButton, terminalShellMenuItems, WorkspaceMemberSelector } from "./components/ProjectChips";
+import { ProjectDialog } from "./components/ProjectDialog";
 import { ForkRequestTray } from "./components/ForkRequestTray";
 import { detachAbsentParents, reparentChildren } from "./lib/conversationTree";
-import { RunLocationPicker } from "./components/RunLocationPicker";
 import { GitStatusCard } from "./components/GitStatusCard";
 import {
   TasksPane,
@@ -71,7 +70,6 @@ import type { TaskSources } from "./lib/taskContainer";
 import { reorderItems } from "./components/usePointerDrag";
 import { createId } from "./lib/id";
 import { estimateContextsTokens, liveContextTokens } from "./lib/contextTokens";
-import { errorMessage } from "./lib/errors";
 import { hasUsableBaseUrl, isEncryptedReasoning, supportsVision } from "./lib/modelCapabilities";
 import {
   imageShortIdsInUse,
@@ -107,11 +105,17 @@ import {
 } from "./lib/sendPipeline";
 import {
   conversationWorkspaces,
+  hostIsWindows,
   isReservedWorkspace,
+  projectWorkspaces,
+  terminalShellLabel,
+  terminalShellsFor,
   runEnvKey,
   sameMachine,
   TEMPORARY_WORKSPACE_ID,
+  toolsForHost,
   withWorkspaceArgument,
+  workspaceDirectoryLabel,
   workspaceLocationTitle
 } from "./lib/workspaces";
 import {
@@ -120,7 +124,7 @@ import {
   withRunToolLock
 } from "./lib/toolLock";
 import { grantsWebFetch } from "./lib/webSearch";
-import type { NewConversationSource } from "./lib/workspaces";
+import type { NewConversationSource, TerminalShell } from "./lib/workspaces";
 import {
   draftAsConversation,
   draftSlotOf,
@@ -184,7 +188,7 @@ import {
   terminalTabsFor,
   terminalTabsReducer
 } from "./lib/terminalTabs";
-import type { TerminalTabsAction } from "./lib/terminalTabs";
+import type { TerminalTab, TerminalTabsAction } from "./lib/terminalTabs";
 import { listShellTasks, stopConversationTask, stopShellTask } from "./lib/shellTasks";
 import type { ShellTaskSnapshot } from "./lib/shellTasks";
 import { isPreviewPageToolName } from "./lib/taskTools";
@@ -220,6 +224,8 @@ import {
   getGitBranches,
   gitConversationTarget,
   gitPeerBlocksMutation,
+  gitSurfaceKey,
+  gitSurfaceProjectId,
   gitWorkspaceTarget,
   releaseConversationWorktree
 } from "./lib/git";
@@ -564,9 +570,7 @@ const COMPOSER_TEXTAREA_MAX_HEIGHT = 180;
  * user checks when two directories share a name.
  */
 function directoryLabel(path: string): string {
-  const trimmed = path.trim().replace(/[\\/]+$/, "");
-  const separator = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-  return trimmed.slice(separator + 1) || trimmed;
+  return workspaceDirectoryLabel(path);
 }
 
 /**
@@ -762,6 +766,20 @@ function App() {
   const [questionEditor, setQuestionEditor] = useState<QuestionEditorState | null>(null);
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
   const [assignWorkspaceAfterAdd, setAssignWorkspaceAfterAdd] = useState(false);
+  /**
+   * Which of its project's workspaces each conversation's composer is looking at, 1-based.
+   * Absent is the first. Choosing one changes nothing in the conversation: it only decides
+   * which directory the Git chip, the status card and the review pane describe, and where the
+   * composer's terminal button opens a shell. Kept per conversation for the session only.
+   */
+  const [selectedWorkspaceMembers, setSelectedWorkspaceMembers] = useState<Record<string, number>>({});
+  /** The project whose edit dialog is open, from the sidebar's project menu. */
+  const [projectEditor, setProjectEditor] = useState<string | null>(null);
+  const editedProject = projectEditor
+    ? document?.workspaces.find((workspace) => (
+      workspace.id === projectEditor && workspace.kind === "directory"
+    )) ?? null
+    : null;
   const [startingTerminals, setStartingTerminals] = useState<Set<string>>(() => new Set());
   /** Reload branch lists whenever their conversation is revisited because repository state is live. */
   const [branchPicker, setBranchPicker] = useState<{
@@ -1243,12 +1261,17 @@ function App() {
     [conversationSync, documentStore]
   );
 
+  /**
+   * `surfaceKey` is what the snapshot is stored under: a project id, or a project id with the
+   * member number when the snapshot is of another of the project's workspaces.
+   */
   const refreshGitSnapshot = useCallback(async (
     conversationId: string,
-    workspaceId: string,
+    surfaceKey: string,
     target: GitTarget
   ): Promise<GitWorkspaceSnapshot | null | undefined> => {
-    const workspace = documentStore.current()?.workspaces.find((candidate) => candidate.id === workspaceId);
+    const projectId = gitSurfaceProjectId(surfaceKey);
+    const workspace = documentStore.current()?.workspaces.find((candidate) => candidate.id === projectId);
     if (
       !hasBackendRuntime()
       // Drafts can hold mutation leases despite being absent from workspace conversation lists.
@@ -1257,7 +1280,7 @@ function App() {
         gitController.mutationIsActive(conversation.id)
       ))
     ) return undefined;
-    return gitController.refresh(conversationId, workspaceId, target);
+    return gitController.refresh(conversationId, surfaceKey, target);
   }, [gitController]);
 
   const browserSessionDeletionIsActive = useCallback((conversationId: string): boolean => (
@@ -2144,10 +2167,32 @@ function App() {
     && activeWorkspace
     && draftSlotOf(activeWorkspace.conversations)?.id === activeConversation.id
   );
+  /** The project's own workspaces as this conversation uses them: its worktree stands in for the first. */
+  const activeProjectWorkspaces = useMemo(
+    () => projectWorkspaces(activeWorkspace, activeConversation),
+    [activeWorkspace, activeConversation]
+  );
+  /**
+   * The project workspace the composer's workspace chip has selected, 1-based. A selection
+   * past the end — a workspace removed from the project since — falls back to the first.
+   */
+  const activeWorkspaceMember = (() => {
+    const selected = activeConversation ? selectedWorkspaceMembers[activeConversation.id] ?? 1 : 1;
+    return selected >= 1 && selected <= activeProjectWorkspaces.length ? selected : 1;
+  })();
+  const activeSelectedWorkspace = activeProjectWorkspaces[activeWorkspaceMember - 1] ?? null;
+  /**
+   * The key the Git snapshot of the selected workspace is stored under: the project id for its
+   * first workspace, and the id with the member number for the others, so a snapshot of one
+   * directory is never read as another's.
+   */
+  const activeGitSurfaceKey = activeWorkspace
+    ? gitSurfaceKey(activeWorkspace.id, activeWorkspaceMember)
+    : undefined;
   const activeGitSnapshotEntry = activeConversation ? gitSnapshots[activeConversation.id] : undefined;
   const activeGitSnapshotState = gitSnapshotForWorkspace(
     activeGitSnapshotEntry,
-    activeWorkspace?.id
+    activeGitSurfaceKey
   );
   const activeGitSnapshot = activeGitSnapshotState ?? null;
   /**
@@ -2165,15 +2210,78 @@ function App() {
    * resolve its path locally.
    */
   const activeWorkspaceIsRemote = Boolean(activeWorkspace?.machine);
-  const activeGitTarget = useMemo((): GitTarget | null => {
+  /**
+   * The conversation's own checkout — the project's first workspace, or its worktree. The file
+   * pane, previews and worktree bookkeeping act on this one whatever the chip has selected.
+   */
+  const activePrimaryGitTarget = useMemo((): GitTarget | null => {
     if (!activeGitConversationId || activeWorkspaceIsRemote) return null;
     if (!draftActive) return gitConversationTarget(activeGitConversationId);
     if (!activeGitWorkspaceId || activeGitWorkspaceKind !== "directory") return null;
     return gitWorkspaceTarget(activeGitWorkspaceId);
   }, [activeGitConversationId, activeGitWorkspaceId, activeGitWorkspaceKind, activeWorkspaceIsRemote, draftActive]);
+  /** Whether the selected workspace's directory is on another machine, where the host has no checkout. */
+  const activeSelectedWorkspaceIsRemote = Boolean(activeSelectedWorkspace?.machine);
+  /**
+   * The checkout the Git chip, the status card and the review pane describe: the selected
+   * workspace. Another workspace of the project is addressed by its number within the project,
+   * never by path, and a remote one has no Git surface here.
+   */
+  const activeGitTarget = useMemo((): GitTarget | null => {
+    if (activeWorkspaceMember === 1) return activePrimaryGitTarget;
+    if (!activeGitConversationId || !activeGitWorkspaceId || activeSelectedWorkspaceIsRemote) return null;
+    return gitWorkspaceTarget(activeGitWorkspaceId, activeWorkspaceMember);
+  }, [
+    activeGitConversationId,
+    activeGitWorkspaceId,
+    activePrimaryGitTarget,
+    activeSelectedWorkspaceIsRemote,
+    activeWorkspaceMember
+  ]);
+  /**
+   * Whether the conversation has started. The project it belongs to is settled from then on,
+   * so the composer stops offering to change it.
+   */
+  const activeConversationStarted = Boolean(
+    !draftActive && activeConversation && activeConversation.contexts.length > 0
+  );
+  /**
+   * How many of the conversation's workspace numbers the project takes. A temporary project
+   * still takes one — the host gives it a scratch directory — so attached workspaces always
+   * start after it.
+   */
+  const activeProjectWorkspaceCount = Math.max(1, activeProjectWorkspaces.length);
+  /** The shells a terminal in the selected workspace can start, which follow its machine. */
+  const activeTerminalShells = useMemo(
+    () => terminalShellsFor(activeSelectedWorkspace?.machine ?? activeWorkspace?.machine, platform),
+    [activeSelectedWorkspace?.machine, activeWorkspace?.machine, platform]
+  );
+  /**
+   * Opens a terminal in the workspace the composer has selected, in `shell`.
+   *
+   * The tab every conversation starts with is only a place for the pane to park until a shell is
+   * asked for; while it has never started one, the choice lands in it rather than beside it.
+   */
+  const openTerminalInSelectedWorkspace = useCallback((shell: TerminalShell) => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId || isDraftConversationId(conversationId)) return;
+    const launch = { workspace: activeWorkspaceMember, shell };
+    const layout = terminalTabsFor(terminalTabsStateRef.current, conversationId);
+    const [only] = layout.tabs;
+    const pristine = layout.tabs.length === 1
+      && layout.nextOrdinal === only.ordinal + 1
+      && only.launch === null
+      && !terminalController.current()[terminalSessionKey(conversationId, only.id)];
+    if (pristine) {
+      dispatchTerminalTabs({ type: "configure", conversationId, terminalId: only.id, launch });
+    } else {
+      dispatchTerminalTabs({ type: "add", conversationId, launch });
+    }
+    openPane("terminal");
+  }, [activeWorkspaceMember, dispatchTerminalTabs, openPane, terminalController]);
   useEffect(() => {
     const conversationId = activeConversation?.id;
-    const workspaceId = activeWorkspace?.id;
+    const workspaceId = activeGitSurfaceKey;
     if (!conversationId || !workspaceId || !activeGitTarget || !hasBackendRuntime()) return;
     let cancelled = false;
     let inFlight = false;
@@ -2212,7 +2320,7 @@ function App() {
       window.removeEventListener("focus", refreshWhenVisible);
       window.document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [activeConversation?.id, activeGitTarget, activeWorkspace?.id, refreshGitSnapshot]);
+  }, [activeConversation?.id, activeGitTarget, activeGitSurfaceKey, refreshGitSnapshot]);
   // A workspace that stopped being a Git repository has no review pane to show. Leaving it up
   // would strand the user on a pane whose panel has nothing to render.
   useEffect(() => {
@@ -2284,7 +2392,7 @@ function App() {
           isolated: Boolean(activeConversation.worktree)
         },
         peer: {
-          snapshot: gitSnapshotForWorkspace(gitSnapshots[conversation.id], activeWorkspace.id),
+          snapshot: gitSnapshotForWorkspace(gitSnapshots[conversation.id], activeGitSurfaceKey),
           isolated: Boolean(conversation.worktree)
         },
         peerModelRunActive: Boolean(modelRunSummaries[conversation.id]),
@@ -2461,10 +2569,12 @@ function App() {
     ? Boolean(draftConversation?.worktreeRequested)
     : Boolean(activeWorktree);
   /** A worktree displays its own branch because that is where the Agent writes, not the workspace-root HEAD. */
-  const activeBranchLabel = activeWorktree?.branch ?? activeGitSnapshot?.branch ?? null;
+  const activeBranchLabel = (activeWorkspaceMember === 1 ? activeWorktree?.branch : undefined)
+    ?? activeGitSnapshot?.branch
+    ?? null;
   /** The directory a path written in this conversation's transcript is written against. */
   const timelinePathBaseDir = activeWorktree?.path
-    ?? activeGitSnapshot?.worktreeRoot
+    ?? (activeWorkspaceMember === 1 ? activeGitSnapshot?.worktreeRoot : undefined)
     ?? activeWorkspace?.path
     ?? null;
   /** The checkout the file pane browses, which is what the pane can show a file from. */
@@ -2511,8 +2621,9 @@ function App() {
   // Tool-description overrides are assembled by the backend from a trusted snapshot at runtime.
   const activeConversationTools = useMemo(() => {
     if (!document) return [];
-    return document.tools.map((tool) => localizeToolDescriptor(tool, resolvedLanguage));
-  }, [document, resolvedLanguage]);
+    return toolsForHost(document.tools, platform)
+      .map((tool) => localizeToolDescriptor(tool, resolvedLanguage));
+  }, [document, platform, resolvedLanguage]);
   /**
    * What the timeline's manual tool cards are edited against: the catalog plus
    * the `workspace` argument the host puts on the wire once the conversation
@@ -2851,12 +2962,12 @@ function App() {
   }, []);
   useEffect(() => {
     const conversationId = activeConversation?.id;
-    if (!conversationId || !activeGitTarget || !hasBackendRuntime()) {
+    if (!conversationId || !activePrimaryGitTarget || !hasBackendRuntime()) {
       previewServersRef.current = [];
       setPreviewServers([]);
       return undefined;
     }
-    const target = activeGitTarget;
+    const target = activePrimaryGitTarget;
     // A conversation switch starts from nothing rather than from the previous conversation's list:
     // a server missing from *this* conversation's list was never this conversation's to close.
     previewServersRef.current = [];
@@ -2867,7 +2978,7 @@ function App() {
       void refreshPreviewServers(conversationId, target, event.stopped);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeConversation?.id, JSON.stringify(activeGitTarget), refreshPreviewServers]);
+  }, [activeConversation?.id, JSON.stringify(activePrimaryGitTarget), refreshPreviewServers]);
   const activeModelStopping = Boolean(
     activeConversation && modelStoppingIds.has(activeConversation.id)
   );
@@ -3028,8 +3139,8 @@ function App() {
     )
       : activeWorkspacePeerOperationRunning
           ? t(
-            "同一工作区中的另一项任务正在运行，暂不能执行 Git 写操作",
-            "Another task in this workspace is running, so Git changes are temporarily unavailable."
+            "同一项目中的另一项任务正在运行，暂不能执行 Git 写操作",
+            "Another task in this project is running, so Git changes are temporarily unavailable."
           )
           : activeWorkspaceTerminalBusy
             ? t(
@@ -3038,8 +3149,8 @@ function App() {
             )
         : activeWorkspaceDeletionRunning
           ? t(
-            "工作区正在删除，无法执行 Git 写操作",
-            "Git changes are unavailable while the workspace is being deleted."
+            "项目正在删除，无法执行 Git 写操作",
+            "Git changes are unavailable while the project is being deleted."
           )
           : null;
   // The mirror of `gitMutationDisabledReason`: a Git write is rewriting the very checkout the
@@ -3062,13 +3173,13 @@ function App() {
       "Wait for the model turn to finish or stop before switching branches"
     )
       : activeWorkspaceDeletionRunning
-        ? t("工作区正在删除，无法切换分支", "Cannot switch branches while the workspace is being deleted")
+        ? t("项目正在删除，无法切换分支", "Cannot switch branches while the project is being deleted")
         : null;
   // Branching only opens a new conversation with this message as a draft, so
   // it needs neither a configured model nor an idle turn — only a workspace
   // that is not going away underneath it.
   const branchFromDisabledReason = activeWorkspaceDeletionRunning
-    ? t("工作区正在删除，无法创建分支", "Cannot create a branch while the workspace is being deleted")
+    ? t("项目正在删除，无法创建分支", "Cannot create a branch while the project is being deleted")
     : null;
 
   const syncBrowserPanelBounds = useCallback((bounds: { x: number; y: number; width: number; height: number }) => {
@@ -3647,7 +3758,7 @@ function App() {
   /** Reload branches whenever the menu opens; show read failures in place without interrupting composition. */
   const loadBranchPicker = useCallback(() => {
     const conversationId = activeConversationId;
-    const workspaceId = activeWorkspaceId;
+    const workspaceId = activeGitSurfaceKey;
     if (!conversationId || !workspaceId || !activeGitTarget || !hasBackendRuntime()) return;
     setBranchPicker({ conversationId, status: "loading", branches: [] });
     void (async () => {
@@ -3668,12 +3779,12 @@ function App() {
           : current);
       }
     })();
-  }, [activeConversationId, activeGitTarget, activeWorkspaceId, t]);
+  }, [activeConversationId, activeGitTarget, activeGitSurfaceKey, t]);
 
   /** Switch branches through the shared GitAction channel and workspace mutation lease; preserve Git's own checkout errors rather than discarding changes. */
   const checkoutComposerBranch = useCallback(async (branch: string) => {
     const conversationId = activeConversationId;
-    const workspaceId = activeWorkspaceId;
+    const workspaceId = activeGitSurfaceKey;
     const target = activeGitTarget;
     if (!conversationId || !workspaceId || !target) return;
     if (!beginGitMutation(conversationId)) {
@@ -3696,27 +3807,13 @@ function App() {
   }, [
     activeConversationId,
     activeGitTarget,
-    activeWorkspaceId,
+    activeGitSurfaceKey,
     beginGitMutation,
     endGitMutation,
     refreshGitSnapshot,
     t
   ]);
 
-
-  /** Persist real conversation targets directly; drafts retain the intent until materialization because `updateActiveConversation` preserves settings only. */
-  const setConversationRunTarget = useCallback((target: RunTargetType | null) => {
-    if (isDraftConversationId(activeConversationIdRef.current)) {
-      setDraftConversation((current) => (current ? { ...current, runTarget: target } : current));
-      return;
-    }
-    if (!activeWorkspaceId || !activeConversationId) return;
-    updateConversation(activeWorkspaceId, activeConversationId, (conversation) => ({
-      ...conversation,
-      runTarget: target,
-      updatedAt: new Date().toISOString()
-    }));
-  }, [activeWorkspaceId, activeConversationId, updateConversation]);
 
   /**
    * WSL distributions offered by the attach-workspace menu, or `null` before the
@@ -3731,16 +3828,8 @@ function App() {
    * conversation, or the workspace the conversation moves to.
    */
   const [remoteWorkspacePicker, setRemoteWorkspacePicker] = useState<
-    { machine: RunTargetType; name: string; purpose: "attach" | "primary" } | null
+    { machine: RunTargetType; name: string; purpose: "attach" } | null
   >(null);
-
-  /** The name the picker's title uses for a machine: the distribution, or the SSH catalog name. */
-  const machineDisplayName = useCallback((machine: RunTargetType): string => (
-    machine.kind === "wsl"
-      ? machine.distro
-      : documentStore.current()?.globalSettings.executionEnvironments.sshMachines
-        .find((entry) => entry.id === machine.machineId)?.name ?? machine.machineId
-  ), [documentStore]);
 
   const loadMachineMenu = useCallback(() => {
     void listWslDistros().then(setMachineMenuDistros).catch(() => setMachineMenuDistros([]));
@@ -3843,26 +3932,6 @@ function App() {
     });
   }, [documentStore]);
 
-  /** Remove the machine and its variables; orphaned conversation bindings fail at dispatch until the user selects local execution. */
-  const deleteSshMachine = useCallback((machineId: string) => {
-    documentStore.update((current) => {
-      if (!current) return current;
-      const envVars = { ...current.globalSettings.executionEnvironments.envVars };
-      delete envVars[`ssh:${machineId}`];
-      return {
-        ...current,
-        globalSettings: {
-          ...current.globalSettings,
-          executionEnvironments: {
-            sshMachines: current.globalSettings.executionEnvironments.sshMachines
-              .filter((item) => item.id !== machineId),
-            envVars
-          }
-        }
-      };
-    });
-  }, [documentStore]);
-
   /**
    * Create worktrees from the current workspace HEAD and persist their record for trusted host path resolution.
    * On disable, release before clearing the conversation pointer because the host uses that record to find the tree.
@@ -3871,7 +3940,7 @@ function App() {
   const toggleConversationWorktree = useCallback(async (enabled: boolean) => {
     const conversationId = activeConversationId;
     const workspaceId = activeWorkspaceId;
-    const target = activeGitTarget;
+    const target = activePrimaryGitTarget;
     if (!conversationId || !workspaceId || !target) return;
     if (draftConversationRef.current && isDraftConversationId(conversationId)) {
       setBranchChipError(null);
@@ -3918,7 +3987,7 @@ function App() {
     }
   }, [
     activeConversationId,
-    activeGitTarget,
+    activePrimaryGitTarget,
     activeWorkspaceId,
     beginGitMutation,
     endGitMutation,
@@ -4856,22 +4925,34 @@ function App() {
   }, [shortcutBindings]);
 
   /**
-   * Registers a directory as a workspace, or reuses the workspace already
-   * registered for it. `machine` is where the directory lives; `null` is this
-   * machine. Identity is the machine and the path together — one machine's
-   * `/srv/app` is not another's — and a POSIX path keeps its case, since
-   * `normalizedWorkspacePath` folds only Windows spellings.
+   * Registers a project — one or more workspaces, the first being its own directory — or reuses
+   * the project already registered with exactly those workspaces. Each workspace's identity is
+   * its machine and its path together — one machine's `/srv/app` is not another's — and a POSIX
+   * path keeps its case, since `normalizedWorkspacePath` folds only Windows spellings.
    */
   const addWorkspace = async (
     name: string,
-    path: string,
-    assignConversation = assignWorkspaceAfterAdd,
-    machine: RunTargetType | null = null
+    workspaces: AttachedWorkspace[],
+    assignConversation = assignWorkspaceAfterAdd
   ) => {
     const current = documentStore.current();
     if (!current) return;
-    if (!isAbsoluteWorkspacePath(path)) return;
+    const [first, ...members] = workspaces;
+    if (!first) return;
+    const path = first.path;
+    const machine = first.machine ?? null;
+    // A remote directory is POSIX and may begin `~`; only a directory on this machine is held
+    // to this machine's idea of an absolute path.
+    if (!machine && !isAbsoluteWorkspacePath(path)) return;
     const normalized = normalizedWorkspacePath(path);
+    const sameMembers = (workspace: Workspace) => {
+      const existingMembers = workspace.additionalWorkspaces ?? [];
+      return existingMembers.length === members.length
+        && existingMembers.every((entry, index) => (
+          sameMachine(entry.machine, members[index].machine)
+          && normalizedWorkspacePath(entry.path) === normalizedWorkspacePath(members[index].path)
+        ));
+    };
     const sourceWorkspaceId = activeWorkspaceIdRef.current;
     const movingConversationId = activeConversationIdRef.current;
     const sourceWorkspace = current.workspaces.find((workspace) => workspace.id === sourceWorkspaceId);
@@ -4882,6 +4963,7 @@ function App() {
       workspace.kind === "directory"
       && sameMachine(workspace.machine, machine)
       && normalizedWorkspacePath(workspace.path) === normalized
+      && sameMembers(workspace)
     ));
     // Drafts have no stored ownership; assign their workspace id directly when it exists, or after creation.
     const assigningDraft = assignConversation && Boolean(draftConversationRef.current);
@@ -4912,10 +4994,15 @@ function App() {
       id: createId("ws"),
       name: name.trim()
         || path.trim().split(/[\\/]/).filter(Boolean).at(-1)
-        || t("新工作区", "New workspace"),
+        || t("新项目", "New project"),
       kind: "directory",
       path: path.trim(),
       ...(machine ? { machine } : {}),
+      ...(members.length ? {
+        additionalWorkspaces: members.map((member) => (
+          member.machine ? { machine: member.machine, path: member.path.trim() } : { path: member.path.trim() }
+        ))
+      } : {}),
       createdAt: new Date().toISOString(),
       // A new workspace has no history, so leave its default preset empty until first creation records a snapshot.
       defaultConversationPresetId: "",
@@ -4924,7 +5011,7 @@ function App() {
     };
     const next = { ...current, workspaces: [...current.workspaces, workspace] };
     documentStore.update(() => next);
-    /* A new directory workspace adds a whole configuration level: its `.mework`
+    /* A new project adds a whole configuration level: its first directory's `.mework`
      * may already hold skills, MCP servers and hooks that nothing has scanned
      * yet. A failure here only leaves the catalog as stale as it already was.
      * A directory on another machine is not scanned: the host reads capability
@@ -4955,27 +5042,30 @@ function App() {
 
 
   /**
-   * Picks the conversation's workspace on `machine` (`null` is this one). The
-   * host's own picker is what authorizes the directory — the native dialog for
-   * this machine, the remote browser for another — so the remote case only
-   * opens that browser here; its confirmation lands in `addWorkspace`.
+   * Changes an existing project's name and the workspaces after its first. The first workspace
+   * is the project's identity — its conversations' worktrees, files pane and capability files
+   * hang off it — so the dialog never offers to change it and this never does.
    */
-  const chooseWorkspaceDirectory = async (machine: RunTargetType | null) => {
-    if (machine) {
-      setRemoteWorkspacePicker({ machine, name: machineDisplayName(machine), purpose: "primary" });
-      return;
-    }
-    if (!hasNativeWorkspacePicker()) {
-      setAssignWorkspaceAfterAdd(true);
-      setWorkspaceDialogOpen(true);
-      return;
-    }
-    try {
-      const path = await pickWorkspaceDirectory();
-      if (path) await addWorkspace("", path, true);
-    } catch {
-      // Cancellation or failure of directory selection is non-fatal and can be retried.
-    }
+  const updateProject = (projectId: string, name: string, workspaces: AttachedWorkspace[]) => {
+    documentStore.update((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        workspaces: current.workspaces.map((workspace) => {
+          if (workspace.id !== projectId || workspace.kind !== "directory") return workspace;
+          const members = workspaces.slice(1).map((member): AttachedWorkspace => (
+            member.machine ? { machine: member.machine, path: member.path.trim() } : { path: member.path.trim() }
+          ));
+          const { additionalWorkspaces: _previous, ...rest } = workspace;
+          return {
+            ...rest,
+            name: name.trim() || workspace.name,
+            ...(members.length ? { additionalWorkspaces: members } : {})
+          };
+        })
+      };
+    });
+    setProjectEditor(null);
   };
 
   const deleteConversation = async (conversation: Conversation, workspace: Workspace) => {
@@ -6393,10 +6483,20 @@ function App() {
       // The reference shell names a lone terminal after the thing itself and numbers them only
       // once there is more than one to tell apart. The number is the tab's place in the strip,
       // so a closed terminal gives its number back to the next one.
-      const tabLabel = (tab: { id: string; name: string | null }) => tab.name
-        ?? (terminals.tabs.length > 1
+      // A tab opened for a particular shell is named after it, the way the reference shell names
+      // its tabs after the program running in them.
+      const tabLabel = (tab: TerminalTab) => {
+        if (tab.name) return tab.name;
+        const shell = tab.launch?.shell;
+        if (shell) {
+          return terminals.tabs.length > 1
+            ? `${terminalShellLabel(shell)} ${terminalDisplayNumber(terminals, tab.id)}`
+            : terminalShellLabel(shell);
+        }
+        return terminals.tabs.length > 1
           ? t("终端 {n}", "Terminal {n}", { n: terminalDisplayNumber(terminals, tab.id) })
-          : t("终端", "Terminal"));
+          : t("终端", "Terminal");
+      };
       return (
         <SidePane
           id={pane}
@@ -6432,7 +6532,12 @@ function App() {
                   name: tab && name.trim() === tabLabel(tab) ? "" : name
                 });
               }}
-              onAdd={() => dispatchTerminalTabs({ type: "add", conversationId })}
+              // Another terminal like the one in front: same workspace, same shell.
+              onAdd={() => dispatchTerminalTabs({
+                type: "add",
+                conversationId,
+                launch: terminals.tabs.find((tab) => tab.id === terminals.activeId)?.launch ?? null
+              })}
             />
           )}
         >
@@ -6447,6 +6552,7 @@ function App() {
               conversationId={conversationId}
               terminalId={tab.id}
               label={tabLabel(tab)}
+              launch={tab.launch ?? undefined}
               // Every tab stays mounted; only the selected one is on screen. A hidden tab keeps
               // its shell, its scrollback and its box, so coming back to it is a repaint.
               open={terminalPaneOpen && tab.id === terminals.activeId}
@@ -6521,7 +6627,7 @@ function App() {
           // measures. The host parks the page for the same reason, and the panel has to agree, or
           // it goes on reporting the page as covered and swapping in snapshots nobody can see.
           active={activeExpandedPane === null || expanded}
-          target={activeGitTarget}
+          target={activePrimaryGitTarget}
           onReservedBottomChange={(reservedBottom) => reservePreviewBottom(target, reservedBottom)}
         />
       );
@@ -6547,12 +6653,16 @@ function App() {
             gitSnapshotsAfterWorkspaceMutation(
               current,
               // Broadcast Git snapshots only to conversations using the same checkout. Drafts use the workspace root; worktree conversations do not.
+              // A worktree only ever stands in for the project's first workspace, so every
+              // conversation of the project shares the checkout of any other one.
               gitSnapshotBroadcastIds(
-                workspace.conversations,
+                workspace.conversations.map((conversation) => (
+                  activeWorkspaceMember === 1 ? conversation : { ...conversation, worktree: null }
+                )),
                 conversationId,
-                Boolean(activeWorktree)
+                activeWorkspaceMember === 1 && Boolean(activeWorktree)
               ),
-              workspace.id,
+              activeGitSurfaceKey ?? workspace.id,
               next
             )
           ))}
@@ -6567,7 +6677,7 @@ function App() {
         <FilesPane
           key={conversationId}
           paneId={pane}
-          target={activeGitTarget ?? { kind: "conversation", conversationId }}
+          target={activePrimaryGitTarget ?? { kind: "conversation", conversationId }}
           rootLabel={activeWorkspace?.name ?? t("工作区", "Workspace")}
           workspacePath={filesPaneRoot}
           active
@@ -6822,6 +6932,7 @@ function App() {
             onSelectConversation={selectConversation}
             onNewConversation={openDraftConversation}
             onAddWorkspace={() => { setAssignWorkspaceAfterAdd(false); setWorkspaceDialogOpen(true); }}
+            onEditProject={(workspaceId) => setProjectEditor(workspaceId)}
             onRenameConversation={(workspaceId, conversationId, title) => {
               updateConversation(workspaceId, conversationId, (conversation) => ({
                 ...conversation,
@@ -6868,7 +6979,7 @@ function App() {
                 <div className="conversation-title">
                   <div>
                     <span>
-                      {activeWorkspace?.name ?? t("未选择工作区", "No workspace selected")}
+                      {activeWorkspace?.name ?? t("未选择项目", "No project selected")}
                     </span>
                     <ChevronDown size={12} />
                   </div>
@@ -6900,7 +7011,39 @@ function App() {
                       title: draftActive
                         ? t("先发送一条消息再打开", "Send a message first")
                         : undefined,
-                      onToggle: () => togglePane("terminal")
+                      onToggle: () => togglePane("terminal"),
+                      // The same choice as the composer's terminal button: a new shell in the
+                      // selected workspace. Showing or hiding the terminals already open is the
+                      // row after them.
+                      menu: {
+                        label: t("新建终端", "New terminal"),
+                        sections: [
+                          {
+                            id: "shells",
+                            label: activeSelectedWorkspace
+                              ? t("在 {name} 打开", "Open in {name}", {
+                                name: workspaceDirectoryLabel(activeSelectedWorkspace.path)
+                              })
+                              : undefined,
+                            items: terminalShellMenuItems(
+                              activeTerminalShells,
+                              openTerminalInSelectedWorkspace,
+                              activeWorkspaceLifecycleOperationRunning
+                            )
+                          },
+                          {
+                            id: "pane",
+                            items: [{
+                              id: "toggle",
+                              label: terminalPaneOpen
+                                ? t("收起终端面板", "Hide the terminal pane")
+                                : t("显示终端面板", "Show the terminal pane"),
+                              icon: <PanelRight size={14} />,
+                              onSelect: () => togglePane("terminal")
+                            }]
+                          }
+                        ]
+                      }
                     },
                     {
                       id: "review",
@@ -6911,7 +7054,7 @@ function App() {
                       activity: Boolean(activeGitSnapshot && activeGitSnapshot.files.length > 0),
                       // Without a snapshot and a target there is no repository to review.
                       disabled: !(activeGitSnapshot && activeGitTarget),
-                      title: activeWorkspaceIsRemote
+                      title: activeSelectedWorkspaceIsRemote
                         ? t("工作区在另一台机器上，本机的 Git 面板不可用", "This workspace is on another machine; the host's Git pane is unavailable")
                         : !(activeGitSnapshot && activeGitTarget)
                           ? t("当前工作区不是 Git 仓库", "This workspace is not a Git repository")
@@ -7115,53 +7258,40 @@ function App() {
                     message.id
                   )}
                 />
-                {/* Run location, workspace, and branch describe where the conversation runs, so they sit above the composer rather than inside it. */}
+                {/* Project, workspace, and branch describe where the conversation runs, so they sit above the composer rather than inside it. */}
                 <div className="composer-context">
-                    <RunLocationPicker
-                      runTarget={draftActive
-                        ? draftConversation?.runTarget ?? null
-                        : activeConversation.runTarget}
-                      sshMachines={document.globalSettings.executionEnvironments.sshMachines}
-                      envVars={document.globalSettings.executionEnvironments.envVars}
-                      selectionDisabled={Boolean(modelRunSummaries[activeConversation.id])
-                        || activeWorkspaceLifecycleOperationRunning}
-                      onSelect={setConversationRunTarget}
-                      onSaveEnvVars={saveRunEnvironmentVars}
-                      onSaveMachine={saveSshMachine}
-                      onDeleteMachine={(machineId) => {
-                        // Clear the active SSH binding before deleting its machine to avoid an orphaned run target.
-                        const active = draftActive
-                          ? draftConversation?.runTarget
-                          : activeConversation.runTarget;
-                        if (active?.kind === "ssh" && active.machineId === machineId) {
-                          setConversationRunTarget(null);
-                        }
-                        deleteSshMachine(machineId);
-                      }}
-                    />
-                    <WorkspaceSelector
-                      workspaces={document.workspaces}
-                      activeWorkspace={activeWorkspace}
-                      machines={{
-                        wslDistros: machineMenuDistros,
-                        sshMachines: document.globalSettings.executionEnvironments.sshMachines
-                      }}
-                      remoteMachines={hasNativeWorkspacePicker()}
-                      onOpen={loadMachineMenu}
-                      onSelect={(workspaceId) => {
-                        // Drafts change one field; persisted conversations must relocate.
-                        if (draftActive) setDraftWorkspace(workspaceId);
-                        else void moveActiveConversation(workspaceId);
-                      }}
-                      onChooseDirectory={(machine) => void chooseWorkspaceDirectory(machine)}
-                      movementDisabled={deletingConversationIds.has(activeConversation.id)
-                        || activeConversation.contexts.length > 0}
-                      movementDisabledReason={t(
-                        "对话已经有内容，不能再更换工作区",
-                        "This conversation already has content, so it can no longer change workspace"
-                      )}
-                      isWorkspaceDeleting={(workspaceId) => deletingWorkspaceIds.has(workspaceId)}
-                    />
+                    {/* The project is chosen before the task starts; once the conversation has
+                        content it belongs to that project for good, and the chip goes away. */}
+                    {!activeConversationStarted && (
+                      <ProjectSelector
+                        projects={document.workspaces}
+                        activeProject={activeWorkspace}
+                        sshMachines={document.globalSettings.executionEnvironments.sshMachines}
+                        disabled={deletingConversationIds.has(activeConversation.id)}
+                        disabledReason={t("对话正在删除", "The conversation is being deleted")}
+                        isProjectDeleting={(projectId) => deletingWorkspaceIds.has(projectId)}
+                        onSelect={(projectId) => {
+                          // Drafts change one field; persisted conversations must relocate.
+                          if (draftActive) setDraftWorkspace(projectId);
+                          else void moveActiveConversation(projectId);
+                        }}
+                        onCreateProject={() => {
+                          setAssignWorkspaceAfterAdd(true);
+                          setWorkspaceDialogOpen(true);
+                        }}
+                      />
+                    )}
+                    {activeProjectWorkspaces.length > 1 && (
+                      <WorkspaceMemberSelector
+                        workspaces={activeProjectWorkspaces}
+                        selected={activeWorkspaceMember}
+                        sshMachines={document.globalSettings.executionEnvironments.sshMachines}
+                        onSelect={(member) => setSelectedWorkspaceMembers((current) => ({
+                          ...current,
+                          [activeConversation.id]: member
+                        }))}
+                      />
+                    )}
                     {activeGitSnapshot && (
                       <div className="composer-chip-group">
                         <PopoverMenu
@@ -7205,6 +7335,7 @@ function App() {
                             }))
                           }]}
                         />
+                        {activeWorkspaceMember === 1 && <>
                         <span className="composer-chip-group__divider" aria-hidden="true" />
                         <label
                           className="composer-worktree"
@@ -7214,8 +7345,8 @@ function App() {
                               "Run this task on its own checkout. The worktree is created when you send the first message."
                             )
                             : t(
-                              "在一份独立检出上运行本对话，与工作区里别的对话互不干扰",
-                              "Run this conversation on its own checkout, isolated from other conversations in this workspace"
+                              "在一份独立检出上运行本对话，与项目里别的对话互不干扰",
+                              "Run this conversation on its own checkout, isolated from other conversations in this project"
                             )}
                         >
                           <input
@@ -7226,6 +7357,7 @@ function App() {
                           />
                           <span>{t("工作树", "worktree")}</span>
                         </label>
+                        </>}
                       </div>
                     )}
                     {/* Attached workspaces sit with the other "where this runs" chips, and the
@@ -7247,7 +7379,7 @@ function App() {
                         )}
                       >
                         <WorkspaceMachineIcon machine={workspace.machine} />
-                        <span className="composer-chip__index" aria-hidden="true">{position + 2}</span>
+                        <span className="composer-chip__index" aria-hidden="true">{position + activeProjectWorkspaceCount + 1}</span>
                         <span className="composer-chip__label">{directoryLabel(workspace.path)}</span>
                         <button
                           type="button"
@@ -7260,6 +7392,20 @@ function App() {
                         </button>
                       </span>
                     ))}
+                    {/* Opens a shell in the workspace selected to the left, so it sits with the
+                        chips that say where things run. Drafts have no host conversation to hang a
+                        PTY on until the first message materializes one. */}
+                    <TerminalShellButton
+                      workspaceLabel={activeSelectedWorkspace
+                        ? workspaceDirectoryLabel(activeSelectedWorkspace.path)
+                        : t("工作区", "the workspace")}
+                      shells={activeTerminalShells}
+                      disabled={draftActive || activeWorkspaceLifecycleOperationRunning}
+                      disabledReason={draftActive
+                        ? t("先发送一条消息再打开终端", "Send a message before opening a terminal")
+                        : undefined}
+                      onSelect={(shell) => openTerminalInSelectedWorkspace(shell)}
+                    />
                     {hasNativeWorkspacePicker() && (
                       <PopoverMenu
                         triggerClassName="composer-chip composer-chip--icon"
@@ -7460,7 +7606,7 @@ function App() {
                               ? t("正在停止生成", "Stopping generation")
                               : t("停止生成", "Stop generating")
                             : activeWorkspaceDeletionRunning
-                              ? t("工作区删除中", "Workspace deletion in progress")
+                              ? t("项目删除中", "Project deletion in progress")
                               : t("发送", "Send")}
                         disabled={activeModelStopping || (activeComposerImageLoading && !activeComposerStopsRun) || (!activeModelRunning && (activeWorkspaceLifecycleOperationRunning || !activeModelChoice || activeComposerImagesUnsupported))}
                         onClick={() => activeComposerQueuesMessage
@@ -7778,127 +7924,50 @@ function App() {
           </Dialog>
         )}
 
-        {workspaceDialogOpen && <WorkspaceDialog
+        {workspaceDialogOpen && <ProjectDialog
+          mode="create"
+          sshMachines={document.globalSettings.executionEnvironments.sshMachines}
+          envVars={document.globalSettings.executionEnvironments.envVars}
+          showWsl={hostIsWindows(platform)}
+          nativePicker={hasNativeWorkspacePicker()}
+          onPickLocalDirectory={pickWorkspaceDirectory}
+          onSaveSshMachine={(machine, vars) => {
+            saveSshMachine(machine);
+            saveRunEnvironmentVars(`ssh:${machine.id}`, vars);
+          }}
           onClose={() => { setWorkspaceDialogOpen(false); setAssignWorkspaceAfterAdd(false); }}
-          onSubmit={(name, path) => void addWorkspace(name, path)}
+          onSubmit={(name, workspaces) => void addWorkspace(name, workspaces)}
+        />}
+
+        {editedProject && <ProjectDialog
+          mode="edit"
+          initialName={editedProject.name}
+          initialWorkspaces={projectWorkspaces(editedProject)}
+          sshMachines={document.globalSettings.executionEnvironments.sshMachines}
+          envVars={document.globalSettings.executionEnvironments.envVars}
+          showWsl={hostIsWindows(platform)}
+          nativePicker={hasNativeWorkspacePicker()}
+          onPickLocalDirectory={pickWorkspaceDirectory}
+          onSaveSshMachine={(machine, vars) => {
+            saveSshMachine(machine);
+            saveRunEnvironmentVars(`ssh:${machine.id}`, vars);
+          }}
+          onClose={() => setProjectEditor(null)}
+          onSubmit={(name, workspaces) => updateProject(editedProject.id, name, workspaces)}
         />}
 
         {remoteWorkspacePicker && <RemoteDirectoryPicker
           machine={remoteWorkspacePicker.machine}
           machineName={remoteWorkspacePicker.name}
           onPick={(path) => {
-            const { machine, purpose } = remoteWorkspacePicker;
+            const { machine } = remoteWorkspacePicker;
             setRemoteWorkspacePicker(null);
-            if (purpose === "attach") attachWorkspace(machine, path);
-            else void addWorkspace("", path, true, machine);
+            attachWorkspace(machine, path);
           }}
           onClose={() => setRemoteWorkspacePicker(null)}
         />}
       </div>
     </CommonErrorBoundary>
-  );
-}
-
-function WorkspaceDialog({ onClose, onSubmit }: { onClose: () => void; onSubmit: (name: string, path: string) => void }) {
-  const { t } = useI18n();
-  const [name, setName] = useState("");
-  const [path, setPath] = useState("");
-  const [picking, setPicking] = useState(false);
-  const [pickerError, setPickerError] = useState<string | null>(null);
-  const nativePicker = hasNativeWorkspacePicker();
-  const chooseDirectory = async () => {
-    setPicking(true);
-    setPickerError(null);
-    try {
-      const selected = await pickWorkspaceDirectory();
-      if (selected) setPath(selected);
-    } catch (error) {
-      setPickerError(errorMessage(error, t("未知错误", "Unknown error")));
-    } finally {
-      setPicking(false);
-    }
-  };
-  return (
-    <Dialog
-      title={t("添加工作区", "Add workspace")}
-      description={t(
-        "文件、搜索和命令工具会以这个目录作为安全边界。",
-        "File, search, and command tools use this directory as their security boundary."
-      )}
-      onClose={onClose}
-      footer={(
-        <>
-          <button type="button" className="button button--ghost" onClick={onClose}>
-            {t("取消", "Cancel")}
-          </button>
-          <button
-            type="button"
-            className="button button--primary"
-            disabled={!path.trim()}
-            onClick={() => onSubmit(name, path)}
-          >
-            <FolderPlus size={15} />{t("添加工作区", "Add workspace")}
-          </button>
-        </>
-      )}
-    >
-      <label className="field">
-        <span className="field__label">{t("工作区路径 *", "Workspace path *")}</span>
-        <span className="workspace-path-picker">
-          <input
-            className="input"
-            autoFocus
-            value={path}
-            readOnly={nativePicker}
-            onChange={(event) => !nativePicker && setPath(event.target.value)}
-            placeholder={nativePicker
-              ? t("点击浏览选择文件夹", "Click Browse to choose a folder")
-              : "C:\\Projects\\my-app"}
-          />
-          {nativePicker && (
-            <button type="button" className="button button--secondary" disabled={picking} onClick={() => void chooseDirectory()}>
-              {picking ? <LoaderCircle size={15} className="spin" /> : <FolderOpen size={15} />}
-              {picking ? t("选择中", "Selecting") : t("浏览", "Browse")}
-            </button>
-          )}
-        </span>
-        <span className={`field__hint ${pickerError ? "field__hint--error" : ""}`}>
-          {pickerError
-            ? t(
-              "无法打开目录选择器：{error}",
-              "Unable to open the directory picker: {error}",
-              { error: pickerError }
-            )
-            : nativePicker
-              ? t(
-                "桌面版只接受系统目录选择器授权的文件夹。",
-                "The desktop app only accepts folders authorized through the system directory picker."
-              )
-              : t(
-                "浏览器预览无法读取系统目录，请粘贴绝对路径。",
-                "The browser preview cannot read system directories. Paste an absolute path."
-              )}
-        </span>
-      </label>
-      <label className="field">
-        <span className="field__label">{t("显示名称", "Display name")}</span>
-        <input
-          className="input"
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          placeholder={t("留空时使用文件夹名称", "Leave blank to use the folder name")}
-        />
-      </label>
-      <div className="safe-boundary-note">
-        <Settings size={15} />
-        <span>
-          {t(
-            "移除工作区只会从 Mework 取消注册，不会删除任何本地文件。",
-            "Removing a workspace only unregisters it from Mework; no local files are deleted."
-          )}
-        </span>
-      </div>
-    </Dialog>
   );
 }
 

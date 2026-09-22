@@ -384,6 +384,7 @@ fn spawn_sidecar(
     }
     configure_child_process(&mut command);
 
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut child = command.spawn().map_err(|error| {
         McpError::new(
             McpErrorKind::Transport,

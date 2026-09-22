@@ -37,7 +37,7 @@ API Key 或订阅由你自己提供，其余一切都在你的机器上运行和
 
 ## 目前还做不到的
 
-- **仅支持 Windows。** 代码保留了跨平台接缝，但目前只发布并支持 Windows 构建。
+- **只发布 Windows 版。** macOS 可以从源码构建并运行（见[从源码构建](#从源码构建)），但还没有 macOS 发布包和应用内更新；内置浏览器里依赖 DevTools 协议的功能——页面快照、元素检查、截图、视口模拟、对话框——需要 Windows 的 WebView2。
 - **没有自动压缩。** 长会话需要你自己修剪（见上文）。
 - **没有 IDE 插件、命令行或斜杠命令。** Mework 是桌面应用；技能承担了斜杠命令的角色。
 - **钩子只支持命令类型**，且只有上述七个事件。
@@ -67,7 +67,9 @@ npm run tauri:build
 
 安装器产出在 `src-tauri/target/release/bundle/nsis/`；`npm run package:portable` 从同一产物打出便携版。`npm test` 与 `npm run test:rust` 运行检查。
 
-在 Linux 上开发（容器、WSL 或 CI worker）：`bash scripts/setup-linux-dev.sh` 会装好工具链，并补齐 Rust 构建脚本需要、而只有 Windows 天然具备的三件产物。之后上面的检查都可用；只有两个例外：`npm run tauri:build` 面向 WebView2 与 NSIS 打包，`npm run prob:fetch` 钉的是 Windows 版 ProB 制品。
+在 macOS（11 及以上，Apple 芯片或 Intel）上，前置要求是 Xcode Command Line Tools、nodejs.org 的 Node.js ≥ 22.12 和稳定版 Rust。`bash scripts/setup-macos-dev.sh` 会检查它们并准备好检出目录；之后 `npm test`、`npm run test:rust`、`npm run tauri:dev` 都可用，`npm run tauri:build` 会在 `src-tauri/target/release/bundle/` 下产出 `Mework.app` 和 `.dmg`。产物没有整体签名，其中的可执行文件只带 ad-hoc 签名，在构建它的那台 Mac 上足够用；要分发给别人，需要 Developer ID 签名和公证，并且在 hardened runtime 下 Node 侧车需要 `com.apple.security.cs.allow-jit` 权限。Mac 上没有 PowerShell：所有工作区都是 POSIX，shell 工具运行登录 shell `PATH` 里排在最前的 `bash`（即使从 Finder 启动，应用也会采用这份 `PATH`），内置终端可以用登录方式打开 zsh、bash 或 fish，Key 保存在 macOS 钥匙串。
+
+在 Linux 上开发（容器、WSL 或 CI worker）：`bash scripts/setup-linux-dev.sh` 会装好工具链，并准备好 Rust 构建脚本需要的前端产物与 AI SDK 侧车。之后上面的检查都可用；只有两个例外：`npm run tauri:build` 面向 WebView2 与 NSIS 打包，`npm run prob:fetch` 钉的是 Windows 版 ProB 制品。
 
 ## 许可证
 

@@ -2,6 +2,7 @@ import { EllipsisVertical } from "lucide-react";
 import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
 import { PopoverMenu } from "./PopoverMenu";
+import type { PopoverMenuSection } from "./PopoverMenu";
 import "./PaneToolbar.css";
 
 /** One pane toggle. `pressed` is "the pane is open", not "the surface is busy". */
@@ -18,6 +19,12 @@ export interface PaneToolbarButton {
   /** Why the button is disabled. Takes the tooltip's place so the reason is reachable. */
   title?: string;
   onToggle: () => void;
+  /**
+   * Turns the button into a menu: a pane whose contents are made from a choice — which shell a
+   * new terminal runs — asks for it on the button itself, and `onToggle` is left for a row of
+   * the menu to call.
+   */
+  menu?: { label: string; sections: PopoverMenuSection[] };
 }
 
 export interface PaneToolbarMenuItem {
@@ -55,6 +62,26 @@ export function PaneToolbar({ buttons, menuItems, menuLabel }: PaneToolbarProps)
     <div className="pane-toolbar">
       {buttons.map((button) => {
         const name = button.activity && button.activeLabel ? button.activeLabel : button.label;
+        if (button.menu) {
+          return (
+            <PopoverMenu
+              key={button.id}
+              rootClassName="pane-toolbar__button-menu"
+              triggerClassName={`icon-button pane-toolbar__button${button.pressed ? " pane-toolbar__button--pressed" : ""}`}
+              trigger={<>
+                {button.icon}
+                {button.activity && <span className="pane-toolbar__indicator" aria-hidden="true" />}
+              </>}
+              triggerLabel={name}
+              triggerTitle={button.title ?? name}
+              disabled={button.disabled}
+              menuLabel={button.menu.label}
+              align="end"
+              dense
+              sections={button.menu.sections}
+            />
+          );
+        }
         return (
           <button
             key={button.id}

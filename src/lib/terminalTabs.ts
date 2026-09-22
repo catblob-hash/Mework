@@ -1,3 +1,5 @@
+import type { TerminalLaunchChoice } from "./terminal";
+
 /**
  * The terminal pane's tab strip, one entry per PTY.
  *
@@ -22,6 +24,12 @@ export interface TerminalTab {
   ordinal: number;
   /** The user's name for this terminal; null follows the derived one. */
   name: string | null;
+  /**
+   * The workspace and shell this tab's terminal was asked for. `null` leaves both
+   * to the host — workspace 1 and its machine's default shell — which is what a
+   * tab nobody chose for (the one every conversation starts with) gets.
+   */
+  launch: TerminalLaunchChoice | null;
 }
 
 export interface TerminalTabsLayout {
@@ -38,7 +46,12 @@ export interface TerminalTabsState {
 export type TerminalTabsAction =
   /** Gives the conversation a tab if it has none; the way opening the pane finds something to show. */
   | { type: "ensure"; conversationId: string }
-  | { type: "add"; conversationId: string }
+  | { type: "add"; conversationId: string; launch?: TerminalLaunchChoice | null }
+  /**
+   * Gives a tab that has not started a shell yet the workspace and shell it should start. The
+   * way a menu choice lands in the tab every conversation starts with instead of beside it.
+   */
+  | { type: "configure"; conversationId: string; terminalId: string; launch: TerminalLaunchChoice }
   | { type: "close"; conversationId: string; terminalId: string }
   | { type: "activate"; conversationId: string; terminalId: string }
   | { type: "rename"; conversationId: string; terminalId: string; name: string }
@@ -59,7 +72,7 @@ export function terminalTabId(ordinal: number): string {
  * element to reopen into — long before it is ever expanded into a live shell.
  */
 const FIRST_LAYOUT: TerminalTabsLayout = {
-  tabs: [{ id: terminalTabId(1), ordinal: 1, name: null }],
+  tabs: [{ id: terminalTabId(1), ordinal: 1, name: null, launch: null }],
   activeId: terminalTabId(1),
   nextOrdinal: 2
 };
@@ -99,11 +112,14 @@ function withLayout(
   return { ...state, byConversation: { ...state.byConversation, [conversationId]: layout } };
 }
 
-function added(layout: TerminalTabsLayout): TerminalTabsLayout {
+function added(
+  layout: TerminalTabsLayout,
+  launch: TerminalLaunchChoice | null = null
+): TerminalTabsLayout {
   const ordinal = layout.nextOrdinal;
   const id = terminalTabId(ordinal);
   return {
-    tabs: [...layout.tabs, { id, ordinal, name: null }],
+    tabs: [...layout.tabs, { id, ordinal, name: null, launch }],
     activeId: id,
     nextOrdinal: ordinal + 1
   };
@@ -119,7 +135,18 @@ export function terminalTabsReducer(
     case "ensure":
       return layout.tabs.length > 0 ? state : withLayout(state, conversationId, added(layout));
     case "add":
-      return withLayout(state, conversationId, added(layout));
+      return withLayout(state, conversationId, added(layout, action.launch ?? null));
+    case "configure": {
+      const tab = layout.tabs.find((candidate) => candidate.id === action.terminalId);
+      if (!tab) return state;
+      return withLayout(state, conversationId, {
+        ...layout,
+        activeId: tab.id,
+        tabs: layout.tabs.map((candidate) => (
+          candidate.id === action.terminalId ? { ...candidate, launch: action.launch } : candidate
+        ))
+      });
+    }
     case "close": {
       const index = layout.tabs.findIndex((tab) => tab.id === action.terminalId);
       if (index < 0) return state;

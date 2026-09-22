@@ -252,7 +252,7 @@ describe("draft conversation", () => {
     runtimeMocks.loadDocument.mockResolvedValue(document);
     const user = userEvent.setup();
     const { container } = render(<App />);
-    await screen.findByRole("button", { name: "工作区：选择工作区" });
+    await screen.findByRole("button", { name: "项目：选择项目" });
     expect(container.querySelector(".composer-cat")).not.toBeNull();
 
     await user.type(screen.getByLabelText("向 Agent 发送消息"), "将被丢弃的无工作区草稿");
@@ -311,7 +311,7 @@ describe("draft conversation", () => {
     const user = userEvent.setup();
 
     render(<App />);
-    await screen.findByRole("button", { name: "工作区：选择工作区" });
+    await screen.findByRole("button", { name: "项目：选择项目" });
     await waitFor(() => expect(savedWorkspaces().flatMap((workspace) => workspace.conversations)).toEqual([]));
 
     await user.type(screen.getByLabelText("向 Agent 发送消息"), "先说再挑目录");
@@ -346,7 +346,7 @@ describe("draft conversation", () => {
     runtimeMocks.loadDocument.mockResolvedValue(document);
     const user = userEvent.setup();
     const { container } = render(<App />);
-    await screen.findByRole("button", { name: "工作区：选择工作区" });
+    await screen.findByRole("button", { name: "项目：选择项目" });
     expect(securityLevel()).toBe("允许编辑");
 
     // Content is written after the workspace exists, never before: a conversation that already has
@@ -354,10 +354,10 @@ describe("draft conversation", () => {
     await user.type(screen.getByLabelText("向 Agent 发送消息"), "选工作区前的输入");
     await waitFor(() => expect(savedWorkspaces().flatMap((workspace) => workspace.conversations)).toEqual([]));
 
-    await user.click(screen.getByRole("button", { name: "工作区：选择工作区" }));
+    await user.click(screen.getByRole("button", { name: "项目：选择项目" }));
     await user.click(await screen.findByRole("menuitemradio", { name: "Mework" }));
 
-    await screen.findByRole("button", { name: "工作区：Mework" });
+    await screen.findByRole("button", { name: "项目：Mework" });
     expect(securityLevel()).toBe("允许编辑");
     expect(screen.getByLabelText("向 Agent 发送消息")).toHaveValue("选工作区前的输入");
     await waitFor(() => {

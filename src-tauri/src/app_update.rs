@@ -1177,6 +1177,8 @@ impl UpdateSession {
 /// launcher takes it by value and keeps it until the installer process exists.
 pub struct AuthorizedInstall {
     pub downloaded: DownloadedUpdate,
+    // Held for its sharing mode; only the Windows installer launch reaches it.
+    #[cfg_attr(not(windows), allow(dead_code))]
     guard: fs::File,
 }
 
@@ -1254,6 +1256,7 @@ pub struct InstallOutcome {
 
 /// Arguments Tauri's own updater passes to its NSIS installer: passive progress UI, update
 /// mode (keep user data, shortcuts and install directory), relaunch when done.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const NSIS_UPDATE_ARGUMENTS: &str = "/P /UPDATE /R";
 
 /// Starts the downloaded installer. The installer requests elevation itself (per-machine

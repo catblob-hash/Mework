@@ -256,18 +256,18 @@ describe("Sidebar conversation actions", () => {
 
     const secondHeading = screen.getByText("第二工作区").closest(".workspace-group");
     expect(secondHeading?.querySelector(".lucide-folder")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "删除工作区 第二工作区" }))
-      .toHaveAttribute("title", "删除工作区 第二工作区");
+    expect(screen.getByRole("button", { name: "删除项目 第二工作区" }))
+      .toHaveAttribute("title", "删除项目 第二工作区");
     await user.click(screen.getByRole("button", { name: "在 第二工作区 新建任务" }));
     expect(props.onNewConversation).toHaveBeenCalledWith(secondWorkspace.id, "workspace");
 
-    const heading = screen.getByText("临时工作区").closest(".workspace-group");
+    const heading = screen.getByText("临时项目").closest(".workspace-group");
     expect(heading).not.toBeNull();
     expect(heading?.querySelector(".lucide-folder-clock")).toBeInTheDocument();
     expect(heading?.querySelector(".lucide-message-square-plus")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "删除工作区 临时工作区" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "删除项目 临时项目" })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "在 临时工作区 新建任务" }));
+    await user.click(screen.getByRole("button", { name: "在 临时项目 新建任务" }));
     expect(props.onNewConversation).toHaveBeenCalledWith(temporaryWorkspace.id, "workspace");
     expect(container.querySelectorAll(".workspace-group")).toHaveLength(3);
   });
@@ -360,16 +360,16 @@ describe("Sidebar conversation actions", () => {
     const user = userEvent.setup();
     render(<Sidebar {...props} />);
 
-    await user.click(screen.getByRole("button", { name: `删除工作区 ${workspace.name}` }));
+    await user.click(screen.getByRole("button", { name: `删除项目 ${workspace.name}` }));
     expect(props.onDeleteWorkspace).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: `确认删除工作区 ${workspace.name}` })).toHaveClass("confirm-delete--armed");
+    expect(screen.getByRole("button", { name: `确认删除项目 ${workspace.name}` })).toHaveClass("confirm-delete--armed");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "设置" }));
-    expect(screen.getByRole("button", { name: `删除工作区 ${workspace.name}` })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `删除项目 ${workspace.name}` })).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: `删除工作区 ${workspace.name}` }));
-    await user.click(screen.getByRole("button", { name: `确认删除工作区 ${workspace.name}` }));
+    await user.click(screen.getByRole("button", { name: `删除项目 ${workspace.name}` }));
+    await user.click(screen.getByRole("button", { name: `确认删除项目 ${workspace.name}` }));
     expect(props.onDeleteWorkspace).toHaveBeenCalledWith(expect.objectContaining({ id: workspace.id }));
   });
 
@@ -379,7 +379,7 @@ describe("Sidebar conversation actions", () => {
 
     render(<Sidebar {...props} isConversationRunning={() => true} />);
     expect(screen.getByRole("button", { name: `删除 ${title}` })).toBeDisabled();
-    expect(screen.getByRole("button", { name: `删除工作区 ${workspace.name}` })).toBeDisabled();
+    expect(screen.getByRole("button", { name: `删除项目 ${workspace.name}` })).toBeDisabled();
   });
 
   it("paints the blinking dot only for conversations that are doing something", () => {

@@ -193,7 +193,7 @@ describe("App model run flow — images", () => {
     // The rollback restores an empty persisted slot. It remains usable as the
     // active conversation, but the sidebar intentionally withholds it until it
     // has durable content.
-    expect(within(screen.getByRole("complementary", { name: "工作区和对话" }))
+    expect(within(screen.getByRole("complementary", { name: "项目和对话" }))
       .queryByText(originalTitle)).not.toBeInTheDocument();
   });
 
@@ -755,7 +755,7 @@ describe("App model run flow — images", () => {
     });
     await waitFor(() => expect(runtimeMocks.prepareImageAttachment).toHaveBeenCalledTimes(1));
 
-    const navigation = screen.getByRole("complementary", { name: "工作区和对话" });
+    const navigation = screen.getByRole("complementary", { name: "项目和对话" });
     await user.click(within(navigation).getByRole("button", { name: "删除 待删除图片任务" }));
     await user.click(within(navigation).getByRole("button", { name: "确认删除 待删除图片任务" }));
     await waitFor(() => expect(within(navigation).queryByText("待删除图片任务")).not.toBeInTheDocument());
@@ -829,9 +829,9 @@ describe("App model run flow — images", () => {
     });
     await waitFor(() => expect(runtimeMocks.prepareImageAttachment).toHaveBeenCalledTimes(1));
 
-    const navigation = screen.getByRole("complementary", { name: "工作区和对话" });
-    await user.click(within(navigation).getByRole("button", { name: "删除工作区 待删除图片工作区" }));
-    await user.click(within(navigation).getByRole("button", { name: "确认删除工作区 待删除图片工作区" }));
+    const navigation = screen.getByRole("complementary", { name: "项目和对话" });
+    await user.click(within(navigation).getByRole("button", { name: "删除项目 待删除图片工作区" }));
+    await user.click(within(navigation).getByRole("button", { name: "确认删除项目 待删除图片工作区" }));
     await waitFor(() => expect(
       window.document.querySelector('[data-workspace-group-id="workspace_pending-upload"]')
     ).not.toBeInTheDocument());

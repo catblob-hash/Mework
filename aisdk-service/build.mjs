@@ -1,7 +1,8 @@
 // Sidecar build.
 //
 //   node build.mjs         -> dist/main.mjs   (ESM for development and checks)
-//   node build.mjs --sea   -> dist/mework-aisdk.exe (single-file release artifact)
+//   node build.mjs --sea   -> dist/mework-aisdk.exe on Windows, dist/mework-aisdk
+//                             elsewhere (single-file release artifact)
 //
 // Use `platform: "node"` rather than neutral: AI SDK provider-utils branches by
 // platform, and a browser build would include unused polyfills and select the wrong fetch branch.
@@ -95,8 +96,15 @@ if (!sea) {
   );
   execFileSync(process.execPath, ["--experimental-sea-config", config], { stdio: "inherit", cwd: here });
 
-  const exe = resolve(dist, "mework-aisdk.exe");
+  // `src-tauri/build.rs` and `scripts/build-aisdk-sidecar.mjs` look for the
+  // platform's own executable name; the target triple is added when staging.
+  const macos = process.platform === "darwin";
+  const exe = resolve(dist, process.platform === "win32" ? "mework-aisdk.exe" : "mework-aisdk");
   await copyFile(process.execPath, exe);
+  // Node's official SEA steps for macOS: the copied binary carries Node's own
+  // signature, which injection would invalidate, and an arm64 Mac refuses to
+  // run a binary whose signature does not verify.
+  if (macos) execFileSync("codesign", ["--remove-signature", exe], { stdio: "inherit" });
   // Run postject's CLI directly instead of `npx postject`: on Windows, npx needs
   // `shell: true` and may fetch packages during the build. The dev dependency has a stable path.
   execFileSync(
@@ -108,13 +116,21 @@ if (!sea) {
       resolve(dist, "sea-prep.blob"),
       "--sentinel-fuse",
       "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
+      // Mach-O keeps the blob in a segment of its own; without it Node never
+      // finds the blob and the executable starts as a plain `node`.
+      ...(macos ? ["--macho-segment-name", "NODE_SEA"] : []),
     ],
     { stdio: "inherit", cwd: here },
   );
+  // Ad-hoc signature so the binary runs locally; a release is re-signed with a
+  // Developer ID when the app bundle is signed.
+  if (macos) execFileSync("codesign", ["--sign", "-", exe], { stdio: "inherit" });
 
   const { size } = await stat(exe);
   process.stderr.write(`[build] ${exe} — ${(size / 1024 / 1024).toFixed(1)} MiB\n`);
-  // postject invalidates Node's Authenticode signature. Sign the sidecar
-  // executable separately; signing NSIS does not sign the embedded sidecar.
-  process.stderr.write("[build] 提醒：postject 已使 node.exe 的签名失效，发布前必须对该 exe 单独 Authenticode 签名。\n");
+  if (process.platform === "win32") {
+    // postject invalidates Node's Authenticode signature. Sign the sidecar
+    // executable separately; signing NSIS does not sign the embedded sidecar.
+    process.stderr.write("[build] 提醒：postject 已使 node.exe 的签名失效，发布前必须对该 exe 单独 Authenticode 签名。\n");
+  }
 }

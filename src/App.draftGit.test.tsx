@@ -195,7 +195,7 @@ describe("draft conversation Git surface", () => {
 
     render(<App />);
     // A draft in the temporary workspace has no repository coordinate.
-    await screen.findByRole("button", { name: "工作区：选择工作区" });
+    await screen.findByRole("button", { name: "项目：选择项目" });
     await waitFor(() => expect(runtimeMocks.loadDocument).toHaveBeenCalled());
     expect(gitMocks.getGitWorkspaceSummary).not.toHaveBeenCalled();
     expect(screen.queryByRole("complementary", { name: "Git 状态" })).not.toBeInTheDocument();
@@ -425,7 +425,7 @@ describe("draft conversation Git surface", () => {
       { type: "stage", paths: ["src/App.tsx"] }
     ));
     expect(screen.queryByText(
-      "同一工作区中的另一项任务正在运行，暂不能执行 Git 写操作"
+      "同一项目中的另一项任务正在运行，暂不能执行 Git 写操作"
     )).not.toBeInTheDocument();
   });
 
@@ -441,7 +441,7 @@ describe("draft conversation Git surface", () => {
     await user.click(stage);
 
     expect(await screen.findByText(
-      "同一工作区中的另一项任务正在运行，暂不能执行 Git 写操作"
+      "同一项目中的另一项任务正在运行，暂不能执行 Git 写操作"
     )).toBeInTheDocument();
     expect(gitMocks.executeGitAction).not.toHaveBeenCalled();
   });

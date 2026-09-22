@@ -57,6 +57,14 @@ export interface PopoverMenuProps {
   menuWidth?: number;
   /** Alignment edge between the menu and trigger. */
   align?: "start" | "end";
+  /**
+   * The side of the trigger the menu prefers; see `PopoverAnchorOptions.placement`. Defaults to
+   * `below`. `above` suits a trigger with more content underneath it, such as a row in a list
+   * that grows downward, and still falls back below when there is no room above.
+   */
+  placement?: "below" | "above";
+  /** Extra class on the portaled panel, e.g. to lift a menu above a modal dialog's backdrop. */
+  panelClassName?: string;
   /** Single-line rows with tighter metrics, for menus that carry no descriptions. */
   dense?: boolean;
   /** Open with the panel's top-left corner at the pointer instead of below the trigger. */
@@ -149,6 +157,8 @@ export function PopoverMenu({
   menuLabel,
   menuWidth,
   align = "start",
+  placement = "below",
+  panelClassName = "",
   dense = false,
   anchorToPointer = false,
   searchPlaceholder,
@@ -163,6 +173,7 @@ export function PopoverMenu({
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const { open, position, triggerRef, panelRef, toggle, close } = usePopoverAnchor({
     align,
+    placement,
     width: menuWidth,
     anchorToPointer,
     onOpen,
@@ -309,7 +320,7 @@ export function PopoverMenu({
       {open && createPortal(
         <div
           ref={panelRef}
-          className={`popover-menu__panel${position?.flipped ? " popover-menu__panel--flipped" : ""}${dense ? " popover-menu__panel--dense" : ""}${submenu === "flyout" ? " popover-menu__panel--flyout" : ""}`}
+          className={`popover-menu__panel${position?.flipped ? " popover-menu__panel--flipped" : ""}${dense ? " popover-menu__panel--dense" : ""}${submenu === "flyout" ? " popover-menu__panel--flyout" : ""}${panelClassName ? ` ${panelClassName}` : ""}`}
           role="menu"
           aria-label={menuLabel}
           style={{

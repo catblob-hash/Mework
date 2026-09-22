@@ -159,6 +159,31 @@ describe("terminal tabs", () => {
     });
   });
 
+  describe("launch choices", () => {
+    it("records the workspace and shell a new tab was asked for", () => {
+      const launch = { workspace: 2, shell: "fish" as const };
+      const state = apply(initialTerminalTabsState, { type: "add", conversationId, launch });
+      const layout = terminalTabsFor(state, conversationId);
+      expect(layout.tabs.map((tab) => tab.launch)).toEqual([null, launch]);
+      expect(layout.activeId).toBe(terminalTabId(2));
+    });
+
+    it("gives an existing tab its launch choice and brings it forward", () => {
+      const launch = { workspace: 1, shell: "zsh" as const };
+      const state = apply(
+        initialTerminalTabsState,
+        { type: "add", conversationId },
+        { type: "configure", conversationId, terminalId: terminalTabId(1), launch }
+      );
+      const layout = terminalTabsFor(state, conversationId);
+      expect(layout.tabs[0].launch).toEqual(launch);
+      expect(layout.activeId).toBe(terminalTabId(1));
+      expect(apply(state, {
+        type: "configure", conversationId, terminalId: "terminal-9", launch
+      })).toBe(state);
+    });
+  });
+
   it("forgets a conversation, and says nothing changed when it never knew it", () => {
     const state = add(initialTerminalTabsState);
     expect(apply(state, { type: "remove_conversation", conversationId }))

@@ -2,8 +2,9 @@
 //!
 //! A conversation works in one or more directories, and each of them lives on a
 //! machine: the host, a WSL distribution, or a registered SSH machine. This
-//! module turns the persisted record of that — a primary workspace plus the
-//! attached ones — into the single list everything else reads.
+//! module turns the persisted record of that — the project's workspace 1, the
+//! project's further workspaces, then the conversation's own attached ones —
+//! into the single list everything else reads.
 //!
 //! The list is ordered and 1-based, and that number is the whole of the model's
 //! addressing scheme. It is what the `workspace` parameter on every path-taking
@@ -19,12 +20,16 @@
 use crate::model::{AttachedWorkspace, ExecutionEnvironmentAssets, RunTarget};
 use crate::run_environment::{resolve_shell_runner, ShellRunner};
 
-/// The most workspaces one conversation may address.
+/// The most workspaces one conversation may address: every workspace its
+/// project may hold, then every directory it may attach.
 ///
-/// The bound exists so the enum of allowed values stays a thing a model can read
-/// at a glance, and so a document cannot make a tool schema unboundedly large.
-/// It matches the renderer's own limit on attachable directories.
-pub const MAX_WORKSPACES: usize = 32;
+/// The bound exists so a document cannot make a tool schema unboundedly large.
+/// It is the sum of the two limits the host enforces on save rather than a
+/// number of its own, because a smaller cap here would drop the last attached
+/// workspaces without a word — the list is truncated, not refused — and the
+/// model would never learn they were granted.
+pub const MAX_WORKSPACES: usize =
+    crate::storage::MAX_PROJECT_WORKSPACES + crate::storage::MAX_ADDITIONAL_DIRECTORIES;
 
 /// Which family of shell a workspace's machine speaks.
 ///
@@ -85,7 +90,10 @@ impl WorkspaceSet {
     ///
     /// `primary` is the conversation's effective workspace — its worktree when it
     /// has one, the workspace root otherwise — already carrying the machine that
-    /// workspace is registered on. `attached` follows in its recorded order.
+    /// workspace is registered on. `attached` follows in its recorded order; for
+    /// a conversation that is
+    /// [`Workspace::conversation_workspaces_after_primary`](crate::model::Workspace::conversation_workspaces_after_primary):
+    /// the project's further workspaces, then the conversation's own.
     ///
     /// A machine that is no longer in the catalog fails the whole resolution
     /// rather than dropping the entry. Dropping it would renumber everything
@@ -178,6 +186,15 @@ impl WorkspaceSet {
     /// The primary workspace — entry 1 — or `None` for a set built empty.
     pub fn primary(&self) -> Option<&ResolvedWorkspace> {
         self.entries.first()
+    }
+
+    /// Workspace 1's shell environment, which is the run's own: what a tool
+    /// approval is bound to and what a child agent inherits. The host's for a
+    /// set built empty.
+    pub fn primary_runner(&self) -> ShellRunner {
+        self.primary()
+            .map(|workspace| workspace.runner.clone())
+            .unwrap_or_default()
     }
 
     /// Looks a workspace up by the number the model used.
@@ -422,6 +439,70 @@ mod tests {
         let set = WorkspaceSet::resolve(&assets(), &local("C:/work/app"), &attached).unwrap();
         assert_eq!(set.len(), MAX_WORKSPACES);
         assert_eq!(*set.addresses().last().unwrap(), MAX_WORKSPACES as u32);
+    }
+
+    /// A conversation's list is its project's workspaces first — workspace 1,
+    /// then the project's further ones in order — and its own attached
+    /// workspaces after them.
+    #[test]
+    fn project_workspaces_are_numbered_before_the_conversations_own() {
+        let mut document = crate::catalog::default_document();
+        let project = &mut document.workspaces[0];
+        project.path = "C:/work/app".into();
+        project.additional_workspaces = vec![remote("~/services"), local("D:/shared")];
+        project.conversations[0].attached_workspaces = vec![local("E:/notes")];
+        let project = &document.workspaces[0];
+        let conversation = &project.conversations[0];
+
+        let set = WorkspaceSet::resolve(
+            &assets(),
+            &local(&project.path),
+            &project.conversation_workspaces_after_primary(conversation),
+        )
+        .unwrap();
+
+        assert_eq!(set.addresses(), vec![1, 2, 3, 4]);
+        assert_eq!(set.get(1).unwrap().root, "C:/work/app");
+        assert_eq!(set.get(2).unwrap().root, "~/services");
+        assert_eq!(set.get(2).unwrap().machine_label, "devbox");
+        assert_eq!(set.get(3).unwrap().root, "D:/shared");
+        assert_eq!(set.get(4).unwrap().root, "E:/notes");
+        // The run's own shell is workspace 1's, whatever the members are on.
+        assert!(matches!(set.primary_runner(), ShellRunner::Local { .. }));
+    }
+
+    /// A temporary project has no shared root, so an entry recorded on one
+    /// (which validation refuses) never reaches its conversations' list.
+    #[test]
+    fn a_temporary_project_contributes_no_members() {
+        let mut document = crate::catalog::default_document();
+        let temporary = document
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.kind == crate::model::WorkspaceKind::Temporary)
+            .unwrap();
+        temporary.additional_workspaces = vec![local("D:/shared")];
+        let mut conversation = document.workspaces[0].conversations[0].clone();
+        conversation.attached_workspaces = vec![local("E:/notes")];
+        let temporary = document
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.kind == crate::model::WorkspaceKind::Temporary)
+            .unwrap();
+        assert_eq!(
+            temporary.conversation_workspaces_after_primary(&conversation),
+            vec![local("E:/notes")]
+        );
+    }
+
+    #[test]
+    fn the_run_environment_follows_a_remote_primary() {
+        let set = WorkspaceSet::resolve(&assets(), &remote("~/app"), &[local("C:/work")]).unwrap();
+        assert!(matches!(set.primary_runner(), ShellRunner::Ssh { .. }));
+        assert_eq!(
+            WorkspaceSet::default().primary_runner(),
+            ShellRunner::default()
+        );
     }
 
     #[test]

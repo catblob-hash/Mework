@@ -24,7 +24,12 @@ import { WorkspaceOptionsMenu } from "./WorkspaceOptionsMenu";
 import type { WorkspacePresetOption } from "./WorkspaceOptionsMenu";
 import { buildConversationTree, conversationAncestorIds } from "../lib/conversationTree";
 import { visibleConversations } from "../lib/draftConversation";
-import { isReservedWorkspace, isTemporaryWorkspace, workspaceLocationTitle } from "../lib/workspaces";
+import {
+  isReservedWorkspace,
+  isTemporaryWorkspace,
+  projectWorkspaces,
+  workspaceLocationTitle
+} from "../lib/workspaces";
 import type { NewConversationSource } from "../lib/workspaces";
 import { isBrowserDevRuntime } from "../lib/backend";
 import { usePointerDrag } from "./usePointerDrag";
@@ -81,6 +86,8 @@ interface SidebarProps {
   onSelectConversation: (workspaceId: string, conversationId: string) => void;
   onNewConversation: (workspaceId?: string, source?: NewConversationSource) => void;
   onAddWorkspace: () => void;
+  /** Opens the project dialog on an existing project, to rename it or change its later workspaces. */
+  onEditProject?: (workspaceId: string) => void;
   onRenameConversation: (workspaceId: string, conversationId: string, title: string) => void;
   onDeleteWorkspace: (workspace: Workspace) => void;
   onDeleteConversation: (conversation: Conversation, workspace: Workspace) => void;
@@ -228,6 +235,7 @@ export function Sidebar({
   onSelectConversation,
   onNewConversation,
   onAddWorkspace,
+  onEditProject,
   onRenameConversation,
   onDeleteWorkspace,
   onDeleteConversation,
@@ -262,7 +270,7 @@ export function Sidebar({
     onDrop: (item, target) => {
       if (item.kind === "workspace" && target.kind === "workspace" && item.workspaceId !== target.workspaceId) {
         onReorderWorkspace(item.workspaceId, target.workspaceId, target.position);
-        setDragAnnouncement(t("工作区顺序已更新", "Workspace order updated"));
+        setDragAnnouncement(t("项目顺序已更新", "Project order updated"));
         return;
       }
       if (item.kind === "conversation" && target.kind === "conversation"
@@ -353,8 +361,8 @@ export function Sidebar({
     if (!target) return;
     onReorderWorkspace(workspaceId, target.id, direction < 0 ? "before" : "after");
     setDragAnnouncement(direction < 0
-      ? t("工作区已向上移动", "Workspace moved up")
-      : t("工作区已向下移动", "Workspace moved down"));
+      ? t("项目已向上移动", "Project moved up")
+      : t("项目已向下移动", "Project moved down"));
   };
 
   const moveConversationByKeyboard = (workspaceId: string, conversationId: string, direction: -1 | 1) => {
@@ -422,7 +430,7 @@ export function Sidebar({
   return (
     <aside
       className={`sidebar ${open ? "" : "sidebar--closed"}`}
-      aria-label={t("工作区和对话", "Workspaces and conversations")}
+      aria-label={t("项目和对话", "Projects and conversations")}
       aria-hidden={!open || undefined}
       {...(!open ? { inert: true } : {})}
     >
@@ -439,7 +447,7 @@ export function Sidebar({
         type="button"
         disabled={Boolean(activeWorkspaceId && isWorkspaceDeleting(activeWorkspaceId))}
         title={activeWorkspaceId && isWorkspaceDeleting(activeWorkspaceId)
-          ? t("工作区正在删除", "Workspace is being deleted")
+          ? t("项目正在删除", "Project is being deleted")
           : undefined}
         onClick={() => onNewConversation()}
       >
@@ -448,8 +456,8 @@ export function Sidebar({
       </button>
 
       <div className="sidebar__section-heading">
-        <span>{t("工作区", "Workspaces")}</span>
-        <IconButton label={t("添加工作区", "Add workspace")} onClick={onAddWorkspace}>
+        <span>{t("项目", "Projects")}</span>
+        <IconButton label={t("新建项目", "New project")} onClick={onAddWorkspace}>
           <FolderPlus size={16} />
         </IconButton>
       </div>
@@ -459,7 +467,7 @@ export function Sidebar({
           const temporary = isTemporaryWorkspace(workspace);
           const reserved = isReservedWorkspace(workspace);
           const workspaceDisplayName = temporary
-            ? t("临时工作区", "Temporary workspace")
+            ? t("临时项目", "Temporary project")
             : workspace.name;
           const isCollapsed = collapsed.has(workspace.id);
           // An unsent draft slot has nothing to show yet, so the list withholds it until it does.
@@ -623,7 +631,11 @@ export function Sidebar({
                 <button
                   type="button"
                   onClick={() => toggleWorkspace(workspace.id)}
-                  title={workspaceLocationTitle(workspace.path, workspace.machine, sshMachines)}
+                  title={temporary
+                    ? workspaceDisplayName
+                    : projectWorkspaces(workspace)
+                      .map((entry) => workspaceLocationTitle(entry.path, entry.machine, sshMachines))
+                      .join("\n")}
                   aria-expanded={!isCollapsed}
                   aria-controls={`workspace-conversations-${workspace.id}`}
                   aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
@@ -649,27 +661,28 @@ export function Sidebar({
                   selectedPresetId={workspace.defaultConversationPresetId}
                   disabled={isLifecycleLocked}
                   onSelectPreset={(presetId) => onSetWorkspaceDefaultPreset(workspace.id, presetId)}
+                  onEditProject={reserved || !onEditProject ? undefined : () => onEditProject(workspace.id)}
                 />
                 <IconButton
                   label={t("在 {name} 新建任务", "Create a task in {name}", { name: workspaceDisplayName })}
                   disabled={isLifecycleLocked}
-                  title={isDeleting ? t("工作区正在删除", "Workspace is being deleted") : undefined}
+                  title={isDeleting ? t("项目正在删除", "Project is being deleted") : undefined}
                   onClick={() => onNewConversation(workspace.id, "workspace")}
                 >
                   <Plus size={15} />
                 </IconButton>
                 {!reserved && <ConfirmDeleteButton
-                  label={t("删除工作区 {name}", "Delete workspace {name}", { name: workspaceDisplayName })}
-                  confirmLabel={t("确认删除工作区 {name}", "Confirm deleting workspace {name}", { name: workspaceDisplayName })}
+                  label={t("删除项目 {name}", "Delete project {name}", { name: workspaceDisplayName })}
+                  confirmLabel={t("确认删除项目 {name}", "Confirm deleting project {name}", { name: workspaceDisplayName })}
                   className="workspace-heading__delete"
                   size={14}
                   disabled={isWorkspaceDeleteBlocked}
                   title={isDeleting
-                    ? t("工作区正在删除", "Workspace is being deleted")
+                    ? t("项目正在删除", "Project is being deleted")
                     : isWorkspaceRunning
                     ? t(
-                      "当前操作结束后才能删除工作区",
-                      "Wait for the current operation to finish before deleting the workspace"
+                      "当前操作结束后才能删除项目",
+                      "Wait for the current operation to finish before deleting the project"
                     )
                     : undefined}
                   onDelete={() => onDeleteWorkspace(workspace)}

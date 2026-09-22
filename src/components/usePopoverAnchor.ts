@@ -16,6 +16,14 @@ export interface PopoverPosition {
 export interface PopoverAnchorOptions {
   /** Alignment edge between panel and trigger. */
   align?: "start" | "end";
+  /**
+   * The side of the trigger the panel prefers. `below`, the default, opens above only when the
+   * panel does not fit below and there is more room above. `above` is the mirror image, for a
+   * trigger whose content continues underneath it (a row in a list that grows downward): the
+   * panel opens above whenever it fits there, falls back below when it does not but fits below,
+   * and takes the roomier side when it fits neither. Ignored when the panel opens at the pointer.
+   */
+  placement?: "below" | "above";
   /** Fixed panel width in px, used only before the actual width can be measured. */
   width?: number;
   /**
@@ -58,7 +66,14 @@ export interface PopoverAnchor<
 export function usePopoverAnchor<
   Trigger extends HTMLElement = HTMLButtonElement,
   Panel extends HTMLElement = HTMLDivElement
->({ align = "start", width, anchorToPointer = false, onOpen, openSignal }: PopoverAnchorOptions = {}): PopoverAnchor<Trigger, Panel> {
+>({
+  align = "start",
+  placement = "below",
+  width,
+  anchorToPointer = false,
+  onOpen,
+  openSignal
+}: PopoverAnchorOptions = {}): PopoverAnchor<Trigger, Panel> {
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState<PopoverPosition | null>(null);
   const triggerRef = useRef<Trigger>(null);
@@ -149,7 +164,10 @@ export function usePopoverAnchor<
     const below = pointer ? pointer.y : anchor.bottom + ANCHOR_GAP;
     const roomBelow = viewportHeight - below - VIEWPORT_MARGIN;
     const roomAbove = (pointer ? pointer.y : anchor.top) - ANCHOR_GAP - VIEWPORT_MARGIN;
-    const flipped = panelHeight > roomBelow && roomAbove > roomBelow;
+    const fitsBelow = panelHeight <= roomBelow;
+    const flipped = placement === "above" && !pointer
+      ? panelHeight <= roomAbove || (!fitsBelow && roomAbove > roomBelow)
+      : !fitsBelow && roomAbove > roomBelow;
     const top = flipped
       ? Math.max(VIEWPORT_MARGIN, (pointer ? pointer.y : anchor.top) - ANCHOR_GAP - panelHeight)
       : Math.min(below, Math.max(VIEWPORT_MARGIN, viewportHeight - panelHeight - VIEWPORT_MARGIN));

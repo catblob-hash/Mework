@@ -1,0 +1,135 @@
+.execution-env {
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.execution-env__section {
+  margin-top: 14px;
+}
+
+.execution-env__section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.execution-env__section-title {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 650;
+}
+
+.execution-env__section-heading .execution-env__section-title {
+  margin-bottom: 0;
+}
+
+.execution-env__add {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 26px;
+  font-size: 11px;
+}
+
+.execution-env__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.execution-env__row {
+  min-height: 52px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.execution-env__row + .execution-env__row {
+  border-top: 1px solid var(--border);
+}
+
+.execution-env__icon {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--subtle);
+  color: var(--muted);
+}
+
+.execution-env__copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.execution-env__copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.execution-env__copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.execution-env__copy .execution-env__address {
+  font: 9.5px var(--mono);
+}
+
+.execution-env__count {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 99px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.execution-env__count--empty {
+  background: var(--subtle);
+  color: var(--faint);
+}
+
+.execution-env__action {
+  flex: 0 0 auto;
+  min-height: 26px;
+  font-size: 11px;
+}
+
+.execution-env__empty {
+  margin: 0;
+  padding: 14px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  color: var(--faint);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.execution-env__confirm-note {
+  margin-top: 8px;
+  font-size: 11.5px;
+}
+
+.execution-env__section-heading + .execution-env__list,
+.execution-env__section-heading + .execution-env__empty {
+  margin-top: 6px;
+}

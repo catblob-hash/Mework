@@ -624,8 +624,30 @@ pub fn local_bash_candidates() -> Vec<String> {
     }
     #[cfg(not(windows))]
     {
-        vec!["bash".into()]
+        // By path rather than by name, because the tool also hands it to the
+        // command as `SHELL`, and a program that re-runs `$SHELL` or checks it
+        // is executable needs a path. `PATH` order decides, so a newer bash the
+        // user installed wins over macOS's `/bin/bash` 3.2, as it does in their
+        // own terminal (see `child_environment::adopt_login_shell_path`).
+        vec![unix_path_lookup("bash")
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "bash".into())]
     }
+}
+
+/// The first executable file called `name` in an absolute `PATH` directory.
+#[cfg(not(windows))]
+fn unix_path_lookup(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
 }
 
 /// Picks the first native Bash from `PATH`, then from a Git installation named
@@ -768,6 +790,11 @@ fn well_known_bash_paths() -> Vec<PathBuf> {
 /// A bare name is returned rather than an absolute path when `PATH` resolves it,
 /// matching Claude Code; unlike Bash there is no launcher-shaped impostor on
 /// Windows for a bare `pwsh` to hit.
+///
+/// Only Windows has a local PowerShell as far as Mework is concerned. A Mac or
+/// Linux host is a POSIX workspace — [`crate::workspace_set::WorkspaceOs`] says
+/// so and the tool is withdrawn there — even when `pwsh` happens to be
+/// installed, so no candidate is offered off Windows.
 pub fn local_powershell_candidates() -> Vec<String> {
     #[cfg(windows)]
     {
@@ -777,7 +804,7 @@ pub fn local_powershell_candidates() -> Vec<String> {
     }
     #[cfg(not(windows))]
     {
-        vec!["pwsh".into()]
+        Vec::new()
     }
 }
 
@@ -866,6 +893,7 @@ pub struct WslDistro {
 }
 
 /// Hard timeout for enumeration so a stuck WSL service cannot block IPC.
+#[cfg_attr(not(windows), allow(dead_code))]
 const WSL_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Enumerates installed WSL distributions. Missing WSL, spawn failures, timeouts, and
@@ -950,6 +978,7 @@ pub fn decode_wsl_output(bytes: &[u8]) -> String {
 
 /// Parses a `--list --verbose` table. Distribution names may contain spaces, so split
 /// columns on two or more spaces and discard rows with invalid names.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_wsl_list_output(text: &str) -> Vec<WslDistro> {
     static ROW: OnceLock<regex::Regex> = OnceLock::new();
     let row = ROW.get_or_init(|| {

@@ -1,7 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
+  closeSync,
+  constants as fsConstants,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   readlinkSync,
@@ -16,6 +19,10 @@ import { createServer } from "node:net";
 import path from "node:path";
 
 export const WORKSPACE_COORDINATOR_PROTOCOL = "mework-workspace-coordinator-v2";
+
+// BSD `open(2)` flag that takes an exclusive `flock` atomically with the open.
+// Node does not export it; the value is fixed by macOS's <sys/fcntl.h>.
+const DARWIN_O_EXLOCK = 0x20;
 
 function coordinationRoot(workspaceRoot) {
   return path.resolve(workspaceRoot, ".codex-tmp");
@@ -87,7 +94,42 @@ export function workspaceMutexListenCandidates(workspaceRoot, directory) {
       exclusive: true
     }];
   }
+  if (process.platform === "darwin") {
+    // macOS has neither named pipes nor abstract sockets, and a socket file
+    // outlives a crashed owner. A lock file opened with `O_EXLOCK` has the
+    // property the other two endpoints provide: the kernel releases it when the
+    // descriptor closes, including when its process dies. It lives under the
+    // physical root so every alias of the workspace contends for one file.
+    return [{
+      path: path.join(physicalRoot, ".codex-tmp", `.workspace-mutex-${token}.lock`),
+      lockFile: true
+    }];
+  }
   throw new Error("当前平台不支持 Mework 工作区协调 mutex");
+}
+
+function tryLockWorkspaceMutexFile(lockPath) {
+  const directory = path.dirname(lockPath);
+  mkdirSync(directory, { recursive: true });
+  assertOrdinaryDirectoryIfPresent(directory);
+  try {
+    const descriptor = openSync(
+      lockPath,
+      fsConstants.O_RDWR
+        | fsConstants.O_CREAT
+        | fsConstants.O_NOFOLLOW
+        | fsConstants.O_NONBLOCK
+        | DARWIN_O_EXLOCK,
+      0o600
+    );
+    return { errorCode: null, mutex: { descriptor } };
+  } catch (error) {
+    // With O_NONBLOCK a held lock fails the open instead of waiting for it.
+    if (error?.code === "EAGAIN" || error?.code === "EWOULDBLOCK") {
+      return { errorCode: "EADDRINUSE", mutex: null };
+    }
+    throw error;
+  }
 }
 
 async function tryListenWorkspaceMutex(listenOptions) {
@@ -125,7 +167,9 @@ async function tryAcquireWorkspaceMutex(workspaceRoot, directory) {
   try {
     const candidates = workspaceMutexListenCandidates(workspaceRoot, directory);
     for (let index = 0; index < candidates.length; index += 1) {
-      const attempt = await tryListenWorkspaceMutex(candidates[index]);
+      const attempt = candidates[index].lockFile
+        ? tryLockWorkspaceMutexFile(candidates[index].path)
+        : await tryListenWorkspaceMutex(candidates[index]);
       if (attempt.mutex) {
         keepAliveTransferred = true;
         return { ...attempt.mutex, keepAlive };
@@ -142,6 +186,14 @@ async function tryAcquireWorkspaceMutex(workspaceRoot, directory) {
 }
 
 async function releaseWorkspaceMutex(mutex) {
+  if (mutex.descriptor !== undefined) {
+    try {
+      closeSync(mutex.descriptor);
+    } finally {
+      clearInterval(mutex.keepAlive);
+    }
+    return;
+  }
   try {
     await new Promise((resolve, reject) => {
       mutex.server.close((error) => {

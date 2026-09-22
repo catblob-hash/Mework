@@ -308,6 +308,17 @@ fn is_git_repository(path: &Path) -> bool {
         .any(|ancestor| ancestor.join(".git").exists())
 }
 
+/// This host's operating system as people name it, for messages that tell the
+/// model why a tool is unavailable here.
+pub(crate) fn host_os_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    }
+}
+
 /// Host operating-system version, read once per process.
 fn os_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();

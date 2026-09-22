@@ -2792,6 +2792,7 @@ pub(crate) fn product_default_document() -> AppDocument {
             kind: WorkspaceKind::Temporary,
             path: String::new(),
             machine: None,
+            additional_workspaces: Vec::new(),
             created_at: timestamp(0),
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
@@ -2867,6 +2868,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
             machine: None,
+            additional_workspaces: Vec::new(),
             conversations: vec![Conversation {
                 id: "conv_welcome".into(),
                 title: String::new(),

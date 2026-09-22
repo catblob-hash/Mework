@@ -210,7 +210,7 @@ button.subagent-chip:hover { border-color: var(--border-strong); background: var
 .context-usage-meter__ring { transform: rotate(-90deg); overflow: visible; }
 .context-usage-meter__track { fill: none; stroke: var(--border-strong); stroke-width: 2.5; }
 .context-usage-meter__fill { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; transition: stroke-dasharray .24s ease; }
-.workspace-selector { min-width: 0; }
+.project-selector, .workspace-member-selector { min-width: 0; }
 .composer-add-menu { display: inline-flex; }
 .composer-add-menu__file-input { display: none; }
 .composer-add-menu__trigger { width: 25px; height: 25px; display: inline-grid; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 50%; background: var(--subtle); color: var(--color-686862); transition: color .14s ease, background .14s ease, border-color .14s ease; }

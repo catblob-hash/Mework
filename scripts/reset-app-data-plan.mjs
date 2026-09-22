@@ -110,7 +110,14 @@ export function selectIdentifiers(entries, scope) {
 export function resolveDataDirectory(parent, identifier) {
   const root = path.resolve(parent);
   const target = path.resolve(root, identifier);
-  if (path.dirname(target) !== root || path.basename(target) !== identifier) {
+  // A separator of either kind is refused on every host: on macOS and Linux a
+  // backslash is an ordinary filename character, so `..\\elsewhere` would
+  // otherwise pass as one directory name here and mean a parent on Windows.
+  if (
+    /[\\/]/u.test(identifier)
+    || path.dirname(target) !== root
+    || path.basename(target) !== identifier
+  ) {
     throw new Error(`拒绝清理越出 ${root} 的数据目录`);
   }
   return target;

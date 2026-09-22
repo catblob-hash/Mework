@@ -2,7 +2,8 @@
    loads after this file: every rule that changes it is scoped under `.pane-toolbar` so it
    outranks the barrel's single-class rules instead of tying with them. */
 .pane-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
-.pane-toolbar__menu { flex: 0 0 auto; }
+.pane-toolbar__menu,
+.pane-toolbar__button-menu { flex: 0 0 auto; }
 
 /* The indicator dot is placed against the 32px button box rather than the icon, so it cannot
    drift with whatever glyph the caller passes in. */

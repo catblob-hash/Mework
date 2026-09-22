@@ -16,7 +16,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 // Use the packaged ESM bundle by default. `--sea` (or `MEWORK_AISDK_BIN=<path>`)
 // runs the same checks against the executable shipped to users.
 const OVERRIDE = process.argv.includes("--sea")
-  ? "dist/mework-aisdk.exe"
+  ? process.platform === "win32" ? "dist/mework-aisdk.exe" : "dist/mework-aisdk"
   : process.env.MEWORK_AISDK_BIN;
 const BUNDLE = resolve(here, "dist/main.mjs");
 // Protocol generation. Keep this literal because packaged artifacts do not export

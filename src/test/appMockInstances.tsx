@@ -139,6 +139,7 @@ export function terminalPanelModuleMock() {
       terminalId,
       label,
       open,
+      launch,
       initialState,
       onStateChange,
       onCleanExit
@@ -147,6 +148,7 @@ export function terminalPanelModuleMock() {
       terminalId: string;
       label: string;
       open: boolean;
+      launch?: { workspace: number | null; shell: string | null };
       initialState: {
         phase: "idle" | "running";
         busy: boolean;
@@ -164,6 +166,7 @@ export function terminalPanelModuleMock() {
         aria-label={label}
         aria-hidden={!open || undefined}
         inert={!open || undefined}
+        data-launch={launch ? JSON.stringify(launch) : undefined}
       >
         <div className="collapse-region__inner terminal-panel-region__inner" />
         <button

@@ -668,6 +668,16 @@ fn comparable_source_path(report: &ProjectMemoryReport, path: &Path) -> String {
 }
 
 fn normalize_workspace_relative_path(report: &ProjectMemoryReport, path: &Path) -> String {
+    // The workspace root is canonical, so an absolute read path has to be too,
+    // or a symlinked spelling of the same directory (`/var` -> `/private/var` on
+    // macOS) lands outside it.
+    #[cfg(unix)]
+    let respelled = path
+        .is_absolute()
+        .then(|| canonical_or_lexical(path))
+        .flatten();
+    #[cfg(unix)]
+    let path = respelled.as_deref().unwrap_or(path);
     let raw = normalized_slash_input(&path_sort_key(path));
     let absolute =
         path.is_absolute() || raw.starts_with('/') || raw.as_bytes().get(1).copied() == Some(b':');
@@ -1370,9 +1380,13 @@ impl<'a> Loader<'a> {
 
     fn load_managed_policy(&mut self, path: PathBuf, prompt_path: &'static str) {
         let path = absolute_lexical(&path);
+        // Source identities are canonical, so the domain they are judged against
+        // has to be too: a policy directory reached through a symlink (`/etc` and
+        // `/var` are links into `/private` on macOS) would otherwise make its own
+        // file look external and untrusted.
         let parent = path
             .parent()
-            .map(Path::to_path_buf)
+            .map(|parent| canonical_or_lexical(parent).unwrap_or_else(|| parent.to_path_buf()))
             .unwrap_or_else(|| path.clone());
         let domain = CandidateDomain {
             trust_root: parent.clone(),
@@ -2796,8 +2810,37 @@ fn markdown_path(path: &Path) -> bool {
 fn canonical_or_lexical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path).ok().or_else(|| {
         let normalized = lexical_normalize(path);
-        (!normalized.as_os_str().is_empty()).then_some(normalized)
+        if normalized.as_os_str().is_empty() {
+            return None;
+        }
+        #[cfg(unix)]
+        if let Some(respelled) = under_canonical_ancestor(&normalized) {
+            return Some(respelled);
+        }
+        Some(normalized)
     })
+}
+
+/// A path that does not exist yet, respelled under the canonical form of its
+/// nearest existing ancestor.
+///
+/// Existing paths are compared canonically, so a new file has to be spelled the
+/// same way or it stops being "inside" the workspace it is in: on macOS the
+/// temporary and system directories sit behind `/var` and `/tmp`, which are
+/// symlinks into `/private`.
+#[cfg(unix)]
+fn under_canonical_ancestor(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        if let Ok(canonical) = fs::canonicalize(candidate) {
+            return Some(canonical.join(path.strip_prefix(candidate).ok()?));
+        }
+        ancestor = candidate.parent();
+    }
+    None
 }
 
 fn absolute_lexical(path: &Path) -> PathBuf {

@@ -228,7 +228,7 @@ describe("App model run flow — layout", () => {
     expect(within(settingsNavigation).queryByRole("button", { name: "通用" })).not.toBeInTheDocument();
 
     // The sidebar kept its own navigation, its 设置 button and its width: there is no 返回 state.
-    const workspaceSidebar = screen.getByRole("complementary", { name: "工作区和对话" });
+    const workspaceSidebar = screen.getByRole("complementary", { name: "项目和对话" });
     expect(screen.queryByRole("complementary", { name: "全局设置导航" })).not.toBeInTheDocument();
     expect(within(workspaceSidebar).getByRole("button", { name: "设置" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "返回" })).not.toBeInTheDocument();
@@ -441,7 +441,7 @@ describe("App model run flow — layout", () => {
     // The row keeps its place across the round trip; its label does not, because sending the
     // prompt that registered the preview retitled the conversation.
     const conversationRow = (index: number) => screen
-      .getByRole("complementary", { name: "工作区和对话" })
+      .getByRole("complementary", { name: "项目和对话" })
       .querySelectorAll(".conversation-row")[index]
       .querySelector("button")!;
 

@@ -69,6 +69,8 @@ describe("terminal IPC", () => {
       terminalId: "terminal-1",
       cols: 100,
       rows: 30,
+      workspace: null,
+      shell: null,
       onEvent: coreMocks.channels[0]
     });
     const output: TerminalEvent = {

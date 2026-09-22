@@ -624,6 +624,17 @@ export interface Workspace {
    * machine, which is what every workspace registered before machines existed is.
    */
   machine?: RunTarget | null;
+  /**
+   * The project's workspaces after the first. The sidebar entry is a project: one
+   * or more directories, each on its own machine. `path` and `machine` above are
+   * the first — workspace 1, the one worktrees and the Git review act on by
+   * default — and these follow it as workspaces 2, 3, … in every conversation
+   * of the project, ahead of the conversation's own attached workspaces.
+   *
+   * Absent on projects registered with a single directory. Each entry came back
+   * from a host directory picker, on the same terms as an attached workspace.
+   */
+  additionalWorkspaces?: AttachedWorkspace[];
   createdAt: string;
   /**
    * Preset ID automatically applied when the workspace's plus button creates a
@@ -1791,6 +1802,7 @@ export type SettingsView =
   | "skills"
   | "shortcuts"
   | "usage"
+  | "execution_environments"
   | "dependencies"
   | "updates"
   | "web_search"

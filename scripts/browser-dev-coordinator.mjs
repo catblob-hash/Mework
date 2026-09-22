@@ -110,6 +110,7 @@ const browserDevRustFingerprintEntries = [
   "src-tauri/resources",
   "src-tauri/src",
   "src-tauri/tauri.conf.json",
+  "src-tauri/tauri.macos.conf.json",
   "src-tauri/tauri.windows.conf.json",
   "src-tauri/windows-app-manifest.xml"
 ];

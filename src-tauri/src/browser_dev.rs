@@ -104,7 +104,7 @@ type Outgoing = mpsc::UnboundedSender<Message>;
 
 pub(super) fn run() -> i32 {
     let exit_coordinator = AppExitCoordinator::default();
-    let mut context = tauri::generate_context!();
+    let mut context = super::tauri_context();
     context.config_mut().identifier = browser_data_identifier()
         .unwrap_or_else(|error| panic!("浏览器开发数据隔离配置无效: {error}"));
     // The browser-development binary owns only the Rust application/runtime. The UI is served by
@@ -1501,6 +1501,8 @@ async fn dispatch(
                 arg(args, "terminalId")?,
                 arg(args, "cols")?,
                 arg(args, "rows")?,
+                optional_arg(args, "workspace")?,
+                optional_arg(args, "shell")?,
                 channel,
             ))
         }

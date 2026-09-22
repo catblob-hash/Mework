@@ -10,7 +10,7 @@ Mework's model-protocol executor. The host is Rust, this service is Node, and th
 
 Responsibilities are separated:
 
-- `npm run build:sidecar` **only builds** `aisdk-service/dist/mework-aisdk.exe`.
+- `npm run build:sidecar` **only builds** `aisdk-service/dist/mework-aisdk.exe` (`dist/mework-aisdk` on macOS and Linux; on macOS the build also re-signs it ad hoc, as Node's SEA instructions require).
 - `src-tauri/build.rs` **only stages** it. The target triple comes from Cargo's authoritative `TARGET`, without reparsing `rustc -vV`, and is recopied when the source artifact changes.
 
 `beforeBuildCommand` runs both. Development requires no additional action: `cargo run` / `dev:browser` causes Tauri to copy the same executable beside `target/debug/`, where the production branch of `resolve_binary()` finds it. If neither artifact exists, `build.rs` stops with an error explaining how to produce it instead of leaving `externalBin` to fail obscurely at the end of packaging.
@@ -111,7 +111,7 @@ The CLI process is spawned by the sidecar itself (`spawnClaudeCodeProcess`) so t
 ```bash
 npm run build          # dist/main.mjs (ESM, for development)
 npm run selfcheck      # offline checks against the ESM bundle
-npm run build:sea      # dist/mework-aisdk.exe (CJS -> SEA blob -> postject)
+npm run build:sea      # dist/mework-aisdk[.exe] (CJS -> SEA blob -> postject)
 npm run selfcheck:sea  # same discriminators, run against the actual shipped single-file exe
 npm run typecheck      # tsc --noEmit
 ```

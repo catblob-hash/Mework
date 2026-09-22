@@ -1,3 +1,6 @@
+// Suspend and resume are WebView2 operations; elsewhere these waits are unused.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::{
     sync::{Condvar, Mutex, MutexGuard},
     time::Duration,

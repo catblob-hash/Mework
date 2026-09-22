@@ -376,7 +376,7 @@ describe("App model run flow — gitSnapshots", () => {
       undefined
     ));
 
-    const navigation = await screen.findByRole("complementary", { name: "工作区和对话" });
+    const navigation = await screen.findByRole("complementary", { name: "项目和对话" });
     await user.click(within(navigation).getByText(conversationB.title).closest("button")!);
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary).toHaveBeenCalledWith(
       gitConversationTarget(conversationB.id),
@@ -646,7 +646,7 @@ describe("App Git writes across checkouts", () => {
       gitConversationTarget(ISOLATED_ID),
       undefined
     ));
-    const navigation = await screen.findByRole("complementary", { name: "工作区和对话" });
+    const navigation = await screen.findByRole("complementary", { name: "项目和对话" });
 
     // The peer starts running after the first render and before any Git click, so the
     // synchronous gate and the button state are judged on the same facts.
@@ -679,7 +679,7 @@ describe("App Git writes across checkouts", () => {
       { type: "stage", paths: [changedFile.path] }
     ));
     expect(screen.queryByText(
-      "同一工作区中的另一项任务正在运行，暂不能执行 Git 写操作"
+      "同一项目中的另一项任务正在运行，暂不能执行 Git 写操作"
     )).not.toBeInTheDocument();
   });
 
@@ -692,7 +692,7 @@ describe("App Git writes across checkouts", () => {
     await user.click(stage);
 
     expect(await screen.findByText(
-      "同一工作区中的另一项任务正在运行，暂不能执行 Git 写操作"
+      "同一项目中的另一项任务正在运行，暂不能执行 Git 写操作"
     )).toBeInTheDocument();
     expect(gitMocks.executeGitAction).not.toHaveBeenCalled();
   });

@@ -2298,6 +2298,15 @@ pub enum ResourceSource {
     Workspace,
 }
 
+/// A sidebar **project** (项目): the entity that owns conversations.
+///
+/// The type keeps its historical name because the document, the store and every
+/// IPC coordinate (`workspaceId`) are keyed on it; only the product term moved.
+/// A project has one or more *workspaces*, each a directory on some machine:
+/// `path` + `machine` are workspace 1 — the one isolated worktrees, the files
+/// pane and the default Git review act on — and `additional_workspaces` are
+/// workspaces 2..k. A conversation's own attached workspaces are numbered after
+/// all of those.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -2305,11 +2314,23 @@ pub struct Workspace {
     pub name: String,
     #[serde(default)]
     pub kind: WorkspaceKind,
+    /// Workspace 1's directory. Empty for the temporary project.
     pub path: String,
     /// Machine this workspace's directory lives on. `None` is the host machine,
     /// which is what every workspace registered before machines existed is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<RunTarget>,
+    /// The project's further workspaces, 2..k in order, each on the machine it
+    /// names. Every conversation in the project can address them, numbered
+    /// right after workspace 1 and before the conversation's own attached ones.
+    ///
+    /// Only a directory project has them; the temporary project's list must be
+    /// empty. Each entry passed through a host directory picker, which
+    /// `storage::validate_workspace_authorizations` re-checks on every save just
+    /// as it does for `path`. Worktrees never apply to these: an isolated
+    /// worktree is a checkout of workspace 1 only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_workspaces: Vec<AttachedWorkspace>,
     pub created_at: String,
     /// Preset forced for workspace-created conversations. Empty or dangling IDs
     /// use `last_conversation_settings`.
@@ -2320,6 +2341,36 @@ pub struct Workspace {
     #[serde(default)]
     pub last_conversation_settings: Option<ConversationSettings>,
     pub conversations: Vec<Conversation>,
+}
+
+impl Workspace {
+    /// The project's workspaces after workspace 1, as the conversation workspace
+    /// list numbers them. Only a directory project has any: a temporary project
+    /// is one scratch directory per conversation, and an entry recorded on one
+    /// anyway (validation refuses it) must not widen what its conversations
+    /// can reach.
+    pub fn member_workspaces(&self) -> &[AttachedWorkspace] {
+        match self.kind {
+            WorkspaceKind::Directory => &self.additional_workspaces,
+            WorkspaceKind::Temporary | WorkspaceKind::Unsupported => &[],
+        }
+    }
+
+    /// Every workspace a conversation in this project addresses after its
+    /// primary: the project's members (2..k), then the conversation's own
+    /// attached workspaces (k+1..). This is the one place that order is decided;
+    /// the model run, the manual tool-card policy and the terminal all resolve
+    /// through it, so workspace 3 means the same directory to each of them.
+    pub fn conversation_workspaces_after_primary(
+        &self,
+        conversation: &Conversation,
+    ) -> Vec<AttachedWorkspace> {
+        self.member_workspaces()
+            .iter()
+            .cloned()
+            .chain(conversation.effective_attached_workspaces())
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2379,6 +2430,12 @@ pub struct Conversation {
     pub worktree: Option<ConversationWorktree>,
     /// Shell execution location. `None` means local execution. It belongs on the
     /// conversation because settings copies must not copy an SSH machine binding.
+    ///
+    /// Retained for compatibility only: the host no longer resolves it. A run's
+    /// shell environment is its workspace 1's machine, and every other machine
+    /// is reached through the numbered workspace list. The composer's picker that
+    /// set it is gone, so a stale value here (a deleted SSH machine, say) must
+    /// not be able to fail a run the user has no way left to repair.
     #[serde(default)]
     pub run_target: Option<RunTarget>,
     /// The conversation this one was forked from. `None` is a top-level
@@ -3706,8 +3763,9 @@ pub struct RunModelRequest {
     /// Trusted Tauri application-data root injected by Rust. Renderer input is ignored.
     #[serde(default)]
     pub app_data_path: String,
-    /// Trusted shell environment resolved from persisted `run_target`. It is
-    /// host-only, so neither the renderer nor tool arguments can select a
+    /// Trusted shell environment of workspace 1's machine, taken from
+    /// `workspaces` (the persisted `Conversation::run_target` is no longer read).
+    /// It is host-only, so neither the renderer nor tool arguments can select a
     /// machine or inject variables. Child agents inherit it unchanged.
     #[serde(skip)]
     pub run_environment: crate::run_environment::ShellRunner,

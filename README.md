@@ -37,7 +37,7 @@ Most agent tools decide what the model is told and lock the transcript. Mework d
 
 ## What it does not do yet
 
-- **Windows only.** The code has cross-platform seams, but only the Windows build is released and supported.
+- **Released for Windows only.** macOS builds from source and runs (see [Build from source](#build-from-source)), but there is no macOS release or in-app update yet, and the built-in browser's DevTools-driven features — page snapshots, element inspection, screenshots, viewport emulation, dialogs — need Windows's WebView2.
 - **No automatic compaction.** Long sessions are your responsibility to trim (see above).
 - **No IDE plugin, CLI or slash commands.** Mework is a desktop app; skills take the place of slash commands.
 - **Hooks are command hooks only**, and only the seven events above.
@@ -67,7 +67,9 @@ npm run tauri:build
 
 The installer lands under `src-tauri/target/release/bundle/nsis/`; `npm run package:portable` zips the portable flavor from the same output. `npm test` and `npm run test:rust` run the checks.
 
-Developing on Linux (a container, WSL, or a CI worker): `bash scripts/setup-linux-dev.sh` provisions the toolchain and the three artifacts the Rust build script needs but only Windows gets for free. The checks above work afterwards; `npm run tauri:build`, which bundles for WebView2 and NSIS, and `npm run prob:fetch`, whose pinned ProB artifacts are Windows-only, do not.
+On macOS (11 or later, Apple silicon or Intel) the prerequisites are the Xcode Command Line Tools, Node.js ≥ 22.12 from nodejs.org, and stable Rust. `bash scripts/setup-macos-dev.sh` checks them and prepares the checkout; afterwards `npm test`, `npm run test:rust` and `npm run tauri:dev` work, and `npm run tauri:build` produces `Mework.app` and a `.dmg` under `src-tauri/target/release/bundle/`. The bundle is not signed as a whole and its executables carry only ad-hoc signatures, which is enough on the Mac that built it; shipping it to others needs a Developer ID signature and notarization, and under the hardened runtime the Node sidecar needs the `com.apple.security.cs.allow-jit` entitlement. On a Mac there is no PowerShell: every workspace is POSIX, the shell tool runs the `bash` first on your login shell's `PATH` (the app adopts that `PATH` even when started from Finder), the integrated terminal opens zsh, bash or fish as a login shell, and keys live in the macOS Keychain.
+
+Developing on Linux (a container, WSL, or a CI worker): `bash scripts/setup-linux-dev.sh` provisions the toolchain, the frontend bundle and the AI SDK sidecar the Rust build script needs. The checks above work afterwards; `npm run tauri:build`, which bundles for WebView2 and NSIS, and `npm run prob:fetch`, whose pinned ProB artifacts are Windows-only, do not.
 
 ## License
 

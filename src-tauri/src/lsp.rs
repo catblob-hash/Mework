@@ -1363,7 +1363,14 @@ mod tests {
         let guarded = crate::lsp_servers::path_to_uri(
             &std::fs::canonicalize(&file).expect("the probe source resolves"),
         );
-        for spelling in ["src/a.rs", "./src/a.rs", "src\\a.rs"] {
+        // A backslash separates components only on Windows; elsewhere it is an
+        // ordinary filename character and `src\a.rs` names a different file.
+        let spellings: &[&str] = if cfg!(windows) {
+            &["src/a.rs", "./src/a.rs", "src\\a.rs"]
+        } else {
+            &["src/a.rs", "./src/a.rs"]
+        };
+        for spelling in spellings {
             assert_eq!(
                 crate::lsp_servers::path_to_uri(&resolved_workspace_path(&workspace, spelling)),
                 guarded,

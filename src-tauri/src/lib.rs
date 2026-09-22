@@ -4456,7 +4456,9 @@ fn trusted_git_write_operation(
 /// Whether a Git write conflicts with a model run writing the same checkout.
 ///
 /// Conversation addressing checks that conversation. Workspace addressing checks
-/// all conversations running at the workspace root because it has no conversation.
+/// all conversations running at the workspace root because it has no conversation;
+/// for a project's further workspace that is every conversation in the project,
+/// since none of them has a worktree of it (see `trusted_target_workspace_operation`).
 #[cfg(not(test))]
 fn reject_git_write_during_model_run(
     state: &AppState,
@@ -5265,6 +5267,14 @@ async fn execute_github_action(
     .map_err(|error| format!("执行 GitHub 操作的后台任务失败: {error}"))?
 }
 
+/// Opens (or reattaches to) an interactive terminal for a conversation.
+///
+/// `workspace` is the conversation's 1-based workspace address — the same
+/// numbering the model's tools use: workspace 1, the project's further
+/// workspaces, then the conversation's attached ones. Absent means workspace 1.
+/// `shell` picks the shell program; absent is that machine's default.
+// The arguments are the IPC contract's named fields, not a grouping choice.
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(test))]
 #[tauri::command]
 fn open_terminal(
@@ -5274,13 +5284,29 @@ fn open_terminal(
     terminal_id: String,
     cols: u16,
     rows: u16,
+    workspace: Option<u32>,
+    shell: Option<terminal::TerminalShell>,
     on_event: Channel<terminal::TerminalEvent>,
 ) -> Result<terminal::TerminalOpenResponse, String> {
+    if let Some(index) = workspace.filter(|index| *index != 1) {
+        let (launch, startup_lease, command_lease_factory) =
+            workspace_terminal_launch(&app, state.inner(), &conversation_id, index, shell)?;
+        return state.terminals.open(
+            &conversation_id,
+            &terminal_id,
+            launch,
+            cols,
+            rows,
+            on_event,
+            startup_lease,
+            command_lease_factory,
+        );
+    }
     // A conversation whose workspace is on another machine gets a shell on that
     // machine. There is no host checkout under it, so no workspace lease is
     // taken and the command lease is a no-op: the mutex those guard exists for
     // Git operations on this filesystem.
-    if let Some(launch) = remote_terminal_launch(&app, state.inner(), &conversation_id)? {
+    if let Some(launch) = remote_terminal_launch(&app, state.inner(), &conversation_id, shell)? {
         return state.terminals.open(
             &conversation_id,
             &terminal_id,
@@ -5289,7 +5315,7 @@ fn open_terminal(
             rows,
             on_event,
             Box::new(()),
-            Arc::new(|| Ok(Box::new(()) as terminal::TerminalCommandLease)),
+            no_op_terminal_command_leases(),
         );
     }
     let operation = trusted_workspace_operation(
@@ -5299,16 +5325,12 @@ fn open_terminal(
         "终端请求",
         TrustedWorkspaceAccess::Shared,
     )?;
-    let launch = terminal::TerminalLaunch::host(&operation.workspace_path)?;
-    let workspace_key = operation.workspace_key;
-    let startup_lease = operation.lease;
-    let operation_gate = state.operation_gate();
-    let lease_conversation_id = conversation_id.clone();
-    let command_lease_factory: terminal::TerminalCommandLeaseFactory = Arc::new(move || {
-        operation_gate
-            .begin_workspace_operation(workspace_key.clone(), Some(lease_conversation_id.clone()))
-            .map(|operation| Box::new(operation) as terminal::TerminalCommandLease)
-    });
+    let launch = terminal::TerminalLaunch::host(&operation.workspace_path, shell)?;
+    let command_lease_factory = terminal_command_leases(
+        state.inner(),
+        operation.workspace_key,
+        conversation_id.clone(),
+    );
     state.terminals.open(
         &conversation_id,
         &terminal_id,
@@ -5316,9 +5338,34 @@ fn open_terminal(
         cols,
         rows,
         on_event,
-        startup_lease,
+        operation.lease,
         command_lease_factory,
     )
+}
+
+/// Command leases for a terminal whose directory is not a checkout on this
+/// filesystem. The workspace mutex exists for Git operations here, so there is
+/// nothing for a remote shell's commands to hold.
+#[cfg(not(test))]
+fn no_op_terminal_command_leases() -> terminal::TerminalCommandLeaseFactory {
+    Arc::new(|| Ok(Box::new(()) as terminal::TerminalCommandLease))
+}
+
+/// Command leases for a terminal in a directory on this machine: every command
+/// the user runs holds that workspace shared, attributed to the conversation,
+/// so a Git write or a worktree release cannot cross it.
+#[cfg(not(test))]
+fn terminal_command_leases(
+    state: &AppState,
+    workspace_key: WorkspaceKey,
+    conversation_id: String,
+) -> terminal::TerminalCommandLeaseFactory {
+    let operation_gate = state.operation_gate();
+    Arc::new(move || {
+        operation_gate
+            .begin_workspace_operation(workspace_key.clone(), Some(conversation_id.clone()))
+            .map(|operation| Box::new(operation) as terminal::TerminalCommandLease)
+    })
 }
 
 /// The terminal launch for a conversation whose workspace is on another
@@ -5328,6 +5375,7 @@ fn remote_terminal_launch(
     app: &AppHandle,
     state: &AppState,
     conversation_id: &str,
+    shell: Option<terminal::TerminalShell>,
 ) -> Result<Option<terminal::TerminalLaunch>, String> {
     let _guard = state
         .storage_lock
@@ -5352,7 +5400,87 @@ fn remote_terminal_launch(
         .app_data_dir()
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
     let anchor = effective_workspace_path(&app_data, workspace, conversation)?;
-    terminal::TerminalLaunch::remote(&runner, &workspace.path, Path::new(&anchor)).map(Some)
+    terminal::TerminalLaunch::remote(&runner, &workspace.path, Path::new(&anchor), shell).map(Some)
+}
+
+/// The terminal launch, startup lease and command leases for a conversation's
+/// workspace `index` (`>= 2`): a project's further workspace or one the
+/// conversation attached.
+///
+/// The entry comes from the conversation's trusted workspace set, resolved from
+/// the same document read — under the storage lock — that a model run resolves
+/// its own set from, so terminal workspace 3 is the directory the model's
+/// workspace 3 is. The renderer names a number, never a path. The startup lease
+/// is taken before the lock is released, which binds the resolved directory to
+/// the coordinator acquisition the way `trusted_target_workspace_operation`
+/// does. An entry on another machine gets that machine's shell with no-op
+/// leases, anchored locally at the conversation's own effective directory.
+#[cfg(not(test))]
+fn workspace_terminal_launch(
+    app: &AppHandle,
+    state: &AppState,
+    conversation_id: &str,
+    index: u32,
+    shell: Option<terminal::TerminalShell>,
+) -> Result<
+    (
+        terminal::TerminalLaunch,
+        terminal::TerminalCommandLease,
+        terminal::TerminalCommandLeaseFactory,
+    ),
+    String,
+> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let document = state.document_store.read(&document_path(app)?)?;
+    let (project, conversation) =
+        trusted_workspace_and_conversation(&document, conversation_id, "终端请求")?;
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    let anchor = effective_workspace_path(&app_data, project, conversation)?;
+    let workspaces = crate::workspace_set::WorkspaceSet::resolve(
+        &document.assets.execution_environments,
+        &primary_workspace(project, &anchor),
+        &project.conversation_workspaces_after_primary(conversation),
+    )?;
+    let entry = workspaces.get(index).ok_or_else(|| {
+        format!(
+            "终端请求的对话没有工作区 {index}（共 {} 个）",
+            workspaces.len()
+        )
+    })?;
+    if !entry.is_local() {
+        let launch = terminal::TerminalLaunch::remote(
+            &entry.runner,
+            &entry.root,
+            Path::new(&anchor),
+            shell,
+        )?;
+        return Ok((launch, Box::new(()), no_op_terminal_command_leases()));
+    }
+    let root = PathBuf::from(&entry.root);
+    let canonical = std::fs::canonicalize(&root).map_err(|error| {
+        format!(
+            "终端请求的工作区 {index} 路径不存在或无法访问（{}）: {error}",
+            root.display()
+        )
+    })?;
+    let workspace_key = WorkspaceKey::new(canonical);
+    let startup_lease: terminal::TerminalCommandLease = Box::new(
+        state
+            .operation_gate()
+            .begin_workspace_operation(workspace_key.clone(), Some(conversation_id.to_owned()))?,
+    );
+    let launch = terminal::TerminalLaunch::host(&root, shell)?;
+    Ok((
+        launch,
+        startup_lease,
+        terminal_command_leases(state, workspace_key, conversation_id.to_owned()),
+    ))
 }
 
 #[cfg(not(test))]
@@ -6303,24 +6431,27 @@ fn trusted_run_request(
     request.workspace_id = workspace.id.clone();
     request.workspace_path = workspace_path;
     // Extra directories widen this run's filesystem boundary, so they are taken
-    // from the persisted conversation rather than from the request the renderer
-    // sent. Every entry was authorized through the host's directory picker, and
-    // `storage::validate_workspace_authorizations` re-checks that on each save.
+    // from the persisted project and conversation rather than from the request
+    // the renderer sent. Every entry was authorized through the host's directory
+    // picker, and `storage::validate_workspace_authorizations` re-checks that on
+    // each save.
     //
-    // Resolve shell run locations from the persisted `run_target`. A deleted SSH
-    // machine must fail explicitly rather than silently running locally.
-    request.run_environment = crate::run_environment::resolve_shell_runner(
-        &document.assets.execution_environments,
-        conversation.run_target.as_ref(),
-    )?;
-    // The numbered workspaces this run addresses. Resolved here, from the same
-    // atomic read of the document, so the machine catalog a call dispatches to
-    // cannot change between this snapshot and the calls the turn makes.
+    // The numbered workspaces this run addresses: the project's workspace 1, its
+    // further workspaces, then the conversation's attached ones. Resolved here,
+    // from the same atomic read of the document, so the machine catalog a call
+    // dispatches to cannot change between this snapshot and the calls the turn
+    // makes. A deleted SSH machine fails the resolution explicitly rather than
+    // silently running locally.
     request.workspaces = crate::workspace_set::WorkspaceSet::resolve(
         &document.assets.execution_environments,
         &primary_workspace(workspace, &request.workspace_path),
-        &conversation.effective_attached_workspaces(),
+        &workspace.conversation_workspaces_after_primary(conversation),
     )?;
+    // The run's own shell environment is workspace 1's machine. The persisted
+    // `run_target` is no longer read: its picker is gone from the composer, so a
+    // stale value — one naming a deleted SSH machine, say — would fail every run
+    // with nothing left in the interface to clear it.
+    request.run_environment = request.workspaces.primary_runner();
     // The local path guard trusts every workspace on this machine. A workspace on
     // another machine is not a path in this filesystem, so it never widens the
     // local boundary — the tool that reaches it goes through that machine's shell.
@@ -6532,8 +6663,8 @@ struct TrustedConversationPolicy {
     security_level: SecurityLevel,
     enabled_tools: Vec<String>,
     tools: Vec<ToolDescriptor>,
-    /// Trusted shell environment resolved from the persisted `run_target`; it is
-    /// never supplied in the renderer request body.
+    /// Trusted shell environment of workspace 1's machine, taken from
+    /// `workspaces`; it is never supplied in the renderer request body.
     run_environment: crate::run_environment::ShellRunner,
     /// The numbered workspaces this conversation addresses, resolved from the
     /// same persisted record a model run reads. A manually executed tool card
@@ -6611,7 +6742,8 @@ fn git_network_policy_uses_persisted_conversation_and_restricts_workspace_target
     );
     assert_eq!(
         git_network_policy_for_target(&workspace_lookup::ResolvedGitTarget::Workspace {
-            workspace
+            workspace,
+            member: None,
         }),
         git::GitNetworkPolicy::Restricted
     );
@@ -6656,11 +6788,20 @@ fn trusted_target_workspace_operation(
     // Git, worktrees and the file pane act on a checkout in this filesystem. A
     // workspace on another machine has none here, and resolving its path
     // locally would act on whatever sits at the same spelling on this host.
-    let target_workspace = match &resolved_target {
+    // A project's further workspace is held to the same rule by its own
+    // machine, not by workspace 1's.
+    let target_machine = match &resolved_target {
         workspace_lookup::ResolvedGitTarget::Conversation { workspace, .. }
-        | workspace_lookup::ResolvedGitTarget::Workspace { workspace } => *workspace,
+        | workspace_lookup::ResolvedGitTarget::Workspace {
+            workspace,
+            member: None,
+        } => workspace.machine.as_ref(),
+        workspace_lookup::ResolvedGitTarget::Workspace {
+            member: Some(member),
+            ..
+        } => member.machine.as_ref(),
     };
-    if let Some(machine) = &target_workspace.machine {
+    if let Some(machine) = target_machine {
         return Err(format!(
             "{request_label}的工作区在另一台机器上（{}），本机的 Git 与文件操作无法作用于它",
             workspace_machine_label(&document.assets.execution_environments, machine)
@@ -6669,7 +6810,9 @@ fn trusted_target_workspace_operation(
     let git_network_policy = git_network_policy_for_target(&resolved_target);
     // Workspace-addressed writes have no conversation to inspect, so they collect the
     // conversations running against the same root checkout; isolated-worktree
-    // conversations use another directory and are excluded.
+    // conversations use another directory and are excluded. A project's further
+    // workspace has no worktree counterpart — every conversation in the project
+    // reaches the same directory — so all of them count.
     let (workspace_path, attribution, root_conversation_ids) = match resolved_target {
         workspace_lookup::ResolvedGitTarget::Conversation {
             workspace,
@@ -6679,13 +6822,28 @@ fn trusted_target_workspace_operation(
             Some(conversation.id.clone()),
             Vec::new(),
         ),
-        workspace_lookup::ResolvedGitTarget::Workspace { workspace } => (
+        workspace_lookup::ResolvedGitTarget::Workspace {
+            workspace,
+            member: None,
+        } => (
             workspace.path.clone(),
             None,
             workspace
                 .conversations
                 .iter()
                 .filter(|conversation| !conversation_runs_in_its_own_worktree(conversation))
+                .map(|conversation| conversation.id.clone())
+                .collect(),
+        ),
+        workspace_lookup::ResolvedGitTarget::Workspace {
+            workspace,
+            member: Some(member),
+        } => (
+            member.path.clone(),
+            None,
+            workspace
+                .conversations
+                .iter()
                 .map(|conversation| conversation.id.clone())
                 .collect(),
         ),
@@ -6793,15 +6951,14 @@ fn trusted_conversation_policy_from_document(
         .filter(|name| available_tool_names.contains(name.as_str()))
         .cloned()
         .collect();
-    let run_environment = crate::run_environment::resolve_shell_runner(
-        &document.assets.execution_environments,
-        conversation.run_target.as_ref(),
-    )?;
+    // Resolved exactly as `trusted_run_request` resolves a model run's set, so a
+    // manually executed tool card addresses the same numbered list.
     let workspaces = crate::workspace_set::WorkspaceSet::resolve(
         &document.assets.execution_environments,
         &primary_workspace(workspace, &workspace_path),
-        &conversation.effective_attached_workspaces(),
+        &workspace.conversation_workspaces_after_primary(conversation),
     )?;
+    let run_environment = workspaces.primary_runner();
     Ok(TrustedConversationPolicy {
         workspace_path,
         additional_directories: workspaces.local_roots(),
@@ -7738,6 +7895,17 @@ fn finalize_app_shutdown(app_handle: &AppHandle, coordinator: &app_exit::AppExit
     crate::aisdk::process::shutdown_sidecar();
 }
 
+/// The application's Tauri context, expanded once for the whole crate.
+///
+/// On macOS `generate_context!` embeds `Info.plist` into the binary as a named
+/// static, so a second expansion — `browser_dev::run` needs the same context —
+/// fails to link with a duplicate `_EMBED_INFO_PLIST`. Both entry points call
+/// this instead.
+#[cfg(not(test))]
+fn tauri_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg(not(test))]
 pub fn run() {
@@ -7745,6 +7913,7 @@ pub fn run() {
     // application should run with, which is not the toolchain-first PATH cargo
     // needed to build it.
     child_environment::restore_dev_application_path();
+    child_environment::adopt_login_shell_path();
     let exit_coordinator = app_exit::AppExitCoordinator::default();
     let tray_exit_coordinator = exit_coordinator.clone();
     let app = tauri::Builder::default()
@@ -7930,7 +8099,7 @@ pub fn run() {
                 true
             }
         })
-        .build(tauri::generate_context!())
+        .build(tauri_context())
         .expect("error while building Mework");
     app.run(move |app_handle, event| {
         match event {
@@ -7964,6 +8133,14 @@ pub fn run() {
                 );
             }
             tauri::RunEvent::Exit => finalize_app_shutdown(app_handle, &exit_coordinator),
+            // Clicking the Dock icon of a running app is how macOS asks for its
+            // window back. Closing the window only hides it into the menu bar,
+            // so without this the Dock icon would do nothing at all.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => app_tray::show_main_window(app_handle, BROWSER_RENDERER_MOUNT_MAIN_LABEL),
             _ => {}
         }
     });
@@ -7974,5 +8151,6 @@ pub fn run_browser_dev() -> i32 {
     // Same handoff as `run`, and for the same reason: `cargo run` builds and
     // executes under one environment, so only the application can split them.
     child_environment::restore_dev_application_path();
+    child_environment::adopt_login_shell_path();
     browser_dev::run()
 }

@@ -14,17 +14,12 @@
 # It is idempotent: every step is skipped when its result is already in place,
 # so re-running after a container is recycled costs only the npm install.
 #
-# Three things need help that a Windows checkout gets for free, and each is a
+# Two things need help that a Windows checkout gets for free, and each is a
 # step below rather than a note in a README nobody reads:
 #
-#   * `tauri::generate_context!` opens `src-tauri/icons/icon.png` on non-Windows
-#     targets. `src-tauri/build.rs` generates `icon.ico` only — that is the
-#     shipped icon — so the PNG is rendered here from the same SVG. It is a
-#     local artifact, not a tracked file.
-#   * `src-tauri/build.rs` refuses to build without the AI SDK sidecar staged.
-#     `aisdk-service/build.mjs` always writes `dist/mework-aisdk.exe`, while
-#     `scripts/build-aisdk-sidecar.mjs` and `build.rs` look for the
-#     extension-less name off Windows, so the artifact is copied across.
+#   * `src-tauri/build.rs` refuses to build without the AI SDK sidecar staged,
+#     so the single-file sidecar is built here. (The Linux window icon needs no
+#     step: build.rs renders `icons/icon.png` for every non-Windows target.)
 #   * The browser-driven tests spawn Chrome from a fixed candidate list with a
 #     fixed flag list. A container running as root has no usable Chromium
 #     sandbox, so `MEWORK_CHROME_PATH` points at a wrapper that supplies the
@@ -48,7 +43,7 @@ for argument in "$@"; do
 done
 
 if [ "$(uname -s)" != "Linux" ]; then
-  echo "setup-linux-dev.sh targets Linux; on Windows follow README 'Build from source'." >&2
+  echo "setup-linux-dev.sh targets Linux; on macOS run scripts/setup-macos-dev.sh, on Windows follow README 'Build from source'." >&2
   exit 1
 fi
 
@@ -128,131 +123,19 @@ fi
 step "frontend bundle (tauri.conf.json frontendDist)"
 (cd "$repo_root" && npm run build >/dev/null)
 
-step "linux window icon"
-rsvg-convert -w 512 -h 512 "$repo_root/src/mework-icon.svg" -o "$repo_root/src-tauri/icons/icon.png"
-# Local-only artifact: keep it out of `git status` without touching .gitignore,
-# which is shared with the Windows checkouts that never generate this file.
-exclude_file="$repo_root/.git/info/exclude"
-if [ -f "$exclude_file" ] && ! grep -qxF 'src-tauri/icons/icon.png' "$exclude_file"; then
-  echo 'src-tauri/icons/icon.png' >> "$exclude_file"
-fi
-
 step "aisdk sidecar"
 if [ ! -f "$repo_root/aisdk-service/dist/mework-aisdk" ]; then
-  # build.mjs exits non-zero through the wrapper on Linux (it writes the
-  # Windows name and the wrapper then cannot find the Unix one), so drive the
-  # single-file build directly and place the artifact ourselves.
-  (cd "$repo_root/aisdk-service" && node build.mjs --sea)
-  cp "$repo_root/aisdk-service/dist/mework-aisdk.exe" "$repo_root/aisdk-service/dist/mework-aisdk"
+  (cd "$repo_root" && npm run build:sidecar)
 fi
 
 # --- agent-client configuration ----------------------------------------------
-# `.gitignore` keeps /AGENTS.md, /CLAUDE.md, /.claude/ and /.codex/ out of the
-# repository — they are per-developer — but
-# scripts/tests/debug-client-entrypoints.test.mjs asserts their exact shape, so
-# `npm test` is red on a fresh clone until they exist. Writing an agent's hook
-# configuration into someone's checkout is not a thing a setup script should do
-# behind their back: by default this only reports what is missing, and
-# `--seed-agent-config` writes the minimum the test requires.
+# See scripts/seed-agent-config.sh: by default this only reports what is
+# missing, and --seed-agent-config writes the minimum the tests require.
 step "agent-client configuration"
-missing_agent_config=()
-for relative in AGENTS.md CLAUDE.md .claude/launch.json .claude/settings.json .codex/hooks.json; do
-  [ -e "$repo_root/$relative" ] || missing_agent_config+=("$relative")
-done
-if [ "${#missing_agent_config[@]}" -eq 0 ]; then
-  echo "  present"
-elif [ "$seed_agent_config" -eq 0 ]; then
-  echo "  missing: ${missing_agent_config[*]}"
-  echo "  npm run test:debug-client-entrypoints stays red until these exist;"
-  echo "  re-run with --seed-agent-config to write them."
+if [ "$seed_agent_config" -eq 1 ]; then
+  bash "$repo_root/scripts/seed-agent-config.sh" --write
 else
-  mkdir -p "$repo_root/.claude" "$repo_root/.codex"
-  for relative in "${missing_agent_config[@]}"; do
-    case "$relative" in
-      AGENTS.md)
-        cat > "$repo_root/AGENTS.md" <<'SEED'
-# Mework — project contract for coding agents
-
-The native window (`npm run tauri:dev`) is invisible to an agent and holds the
-terminal. Use the browser bridge, which serves the UI of the same Rust host on
-http://127.0.0.1:1420:
-
-    npm run dev:browser -- --codex     # from Codex
-    npm run dev:browser -- --claude    # from Claude Code
-
-`scripts/browser-dev-command-hook.mjs`, configured as a PreToolUse hook,
-rewrites a bare `npm run tauri:dev` into the calling client's flag and denies it
-when it carries arguments or is chained.
-
-Before handing work back: `npm test`, and `cargo test` in `src-tauri/`.
-SEED
-        ;;
-      CLAUDE.md) printf '@AGENTS.md\n' > "$repo_root/CLAUDE.md" ;;
-      .claude/launch.json)
-        cat > "$repo_root/.claude/launch.json" <<'SEED'
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "mework-dev-browser-claude-start",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev:browser", "--", "--claude"],
-      "port": 1420,
-      "autoPort": false,
-      "url": "http://127.0.0.1:1420"
-    },
-    {
-      "name": "mework-dev-browser-shared-attach",
-      "url": "http://127.0.0.1:1420"
-    }
-  ]
-}
-SEED
-        ;;
-      .claude/settings.json)
-        cat > "$repo_root/.claude/settings.json" <<'SEED'
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "command": "node",
-            "args": [
-              "${CLAUDE_PROJECT_DIR}/scripts/browser-dev-command-hook.mjs",
-              "--claude"
-            ]
-          }
-        ]
-      }
-    ]
-  }
-}
-SEED
-        ;;
-      .codex/hooks.json)
-        cat > "$repo_root/.codex/hooks.json" <<'SEED'
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "^(Bash|shell_command)$",
-        "hooks": [
-          {
-            "command": "node \"$(git rev-parse --show-toplevel)/scripts/browser-dev-command-hook.mjs\" --codex",
-            "commandWindows": "node \"$(git rev-parse --show-toplevel)/scripts/browser-dev-command-hook.mjs\" --codex"
-          }
-        ]
-      }
-    ]
-  }
-}
-SEED
-        ;;
-    esac
-    echo "  wrote $relative"
-  done
+  bash "$repo_root/scripts/seed-agent-config.sh"
 fi
 
 # --- shell environment -------------------------------------------------------

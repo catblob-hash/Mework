@@ -2266,6 +2266,12 @@ fn shell_launch_plan(
     let env = &runner.normalized_env()?;
     match runner {
         ShellRunner::Local { .. } => {
+            if matches!(kind, ShellKind::PowerShell) && !cfg!(windows) {
+                return Err(format!(
+                    "This workspace is on {}, where the powershell tool is unavailable; use the bash tool instead",
+                    crate::environment_prompt::host_os_name()
+                ));
+            }
             let candidates: Vec<String> = match kind {
                 ShellKind::PowerShell => run_environment::local_powershell_candidates(),
                 // Resolved to an absolute path instead of named: a bare `bash`
@@ -3940,7 +3946,7 @@ mod tests {
             &state,
             ExecutionScope::workspace_only(directory.path()),
             Some(app_data.as_path()),
-            &crate::run_environment::ShellRunner::default(),
+            &crate::workspace_set::WorkspaceSet::default(),
             &PromptProfile::builtin_english(),
         );
         assert!(result.success, "{}", result.output);
@@ -4596,11 +4602,28 @@ mod tests {
         .contains("nested/probe.txt:1"));
         assert!(run("find", json!({"path":".","query":"*.txt"})).contains("nested/probe.txt"));
         assert!(run("ls", json!({"path":".","depth":2})).contains("nested/probe.txt"));
-        assert!(run(
-            "powershell",
-            json!({"command":"Write-Output MEWORK_POWERSHELL_E2E"}),
-        )
-        .contains("MEWORK_POWERSHELL_E2E"));
+        if cfg!(windows) {
+            assert!(run(
+                "powershell",
+                json!({"command":"Write-Output MEWORK_POWERSHELL_E2E"}),
+            )
+            .contains("MEWORK_POWERSHELL_E2E"));
+        } else {
+            let refused = execute(
+                request(
+                    directory.path(),
+                    "powershell",
+                    json!({"command":"Write-Output MEWORK_POWERSHELL_E2E"}),
+                ),
+                &state,
+            );
+            assert!(!refused.success, "{}", refused.output);
+            assert!(
+                refused.output.contains("use the bash tool"),
+                "{}",
+                refused.output
+            );
+        }
         assert!(
             run("bash", json!({"command":"printf MEWORK_BASH_E2E"})).contains("MEWORK_BASH_E2E")
         );
@@ -4877,7 +4900,14 @@ mod tests {
                 assert!(bash.local_hardening);
                 assert!(!bash.candidates.is_empty());
                 #[cfg(not(windows))]
-                assert_eq!(bash.candidates, vec!["bash"]);
+                {
+                    assert_eq!(bash.candidates.len(), 1);
+                    let candidate = std::path::Path::new(&bash.candidates[0]);
+                    assert!(
+                        candidate.is_absolute() && candidate.ends_with("bash"),
+                        "{candidate:?}"
+                    );
+                }
                 #[cfg(windows)]
                 for candidate in &bash.candidates {
                     let lowered = candidate.to_ascii_lowercase().replace('/', "\\");
@@ -4948,9 +4978,17 @@ mod tests {
                     "{first}"
                 );
             }
-            Err(error) => {
-                assert!(cfg!(windows), "{error}");
+            Err(error) if cfg!(windows) => {
                 assert!(error.contains("No PowerShell was found"), "{error}");
+            }
+            Err(error) => {
+                // A Mac or Linux host is a POSIX workspace: the refusal names
+                // the machine and the tool to use instead, not an installer.
+                assert!(
+                    error.contains(crate::environment_prompt::host_os_name())
+                        && error.contains("use the bash tool"),
+                    "{error}"
+                );
             }
         }
     }
@@ -5681,7 +5719,9 @@ mod tests {
     }
 
     /// `powershell` and `bash` use separate dispatch arms, so each must independently
-    /// prove that a task-level stop reaches its running command.
+    /// prove that a task-level stop reaches its running command. The PowerShell arm
+    /// only runs a command on a Windows host.
+    #[cfg(windows)]
     #[test]
     fn a_task_level_stop_reaches_the_command_the_powershell_arm_is_running() {
         let directory = tempfile::tempdir().unwrap();

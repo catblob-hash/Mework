@@ -131,6 +131,32 @@ pub(crate) fn bash_path(path: &Path) -> String {
 /// would fail.
 fn generator_script(snapshot_file: &Path, rc_file: Option<&Path>) -> String {
     let target = quote(&bash_path(snapshot_file));
+    // macOS's `/etc/profile` runs `path_helper`, which moves the system
+    // directories to the front of `PATH`: `/usr/bin/git`, `/usr/bin/python3` and
+    // `/bin/bash` would then shadow the Homebrew builds the user runs in their
+    // own terminal. The application's `PATH` already has the login shell's order
+    // (`child_environment::adopt_login_shell_path`), so it leads here, and only
+    // what the profile added follows.
+    let restore_path_order = if cfg!(target_os = "macos") {
+        r#"
+if [ -n "${MEWORK_APPLICATION_PATH-}" ]; then
+  __mework_path="$MEWORK_APPLICATION_PATH"
+  __mework_ifs="$IFS"
+  set -f
+  IFS=:
+  for __mework_entry in $PATH; do
+    case ":$__mework_path:" in
+      *":$__mework_entry:"*) ;;
+      *) __mework_path="$__mework_path:$__mework_entry" ;;
+    esac
+  done
+  IFS="$__mework_ifs"
+  set +f
+  PATH="$__mework_path"
+fi"#
+    } else {
+        ""
+    };
     let source_rc = match rc_file {
         Some(rc) => format!("source {} < /dev/null", quote(&bash_path(rc))),
         None => "# No user config file to source".to_owned(),
@@ -160,7 +186,10 @@ declare -F | cut -d' ' -f3 | grep -vE '^_[^_]' | while read -r func; do
 done
 
 echo "# Shell Options" >> "$SNAPSHOT_FILE"
-set -o | grep "on" | awk '{{print "set -o " $1}}' | head -n 1000 >> "$SNAPSHOT_FILE"
+# Match the state column, not the line: `grep on` also matches `monitor off` and
+# `onecmd off`. `monitor` is never replayed even when on: job control gives each
+# command its own process group, and stopping a command kills exactly one group.
+set -o | awk '$2 == "on" && $1 != "monitor" && $1 != "onecmd" {{print "set -o " $1}}' | head -n 1000 >> "$SNAPSHOT_FILE"
 echo "shopt -s expand_aliases" >> "$SNAPSHOT_FILE"
 
 echo "# Aliases" >> "$SNAPSHOT_FILE"
@@ -170,7 +199,7 @@ else
   alias | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> "$SNAPSHOT_FILE"
 fi
 
-echo "# Path" >> "$SNAPSHOT_FILE"
+echo "# Path" >> "$SNAPSHOT_FILE"{restore_path_order}
 echo "export PATH='$PATH'" >> "$SNAPSHOT_FILE"
 
 # Exit silently on success, only report errors
@@ -216,6 +245,12 @@ pub(crate) fn build(app_data: &Path, shell_path: &str) -> Option<PathBuf> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if cfg!(target_os = "macos") {
+        command.env(
+            "MEWORK_APPLICATION_PATH",
+            std::env::var_os("PATH").unwrap_or_default(),
+        );
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -303,6 +338,56 @@ mod tests {
         let script = generator_script(Path::new("/tmp/s.sh"), Some(Path::new("/home/u/.bashrc")));
         assert!(script.contains(r#"grep -v "='winpty ""#));
         assert!(script.contains("source '/home/u/.bashrc' < /dev/null"));
+    }
+
+    /// Only options that are on are replayed, and never job control. Matching
+    /// `on` anywhere in the line picked up `monitor off`, so every later command
+    /// ran in a process group of its own that a stop could not reach.
+    #[cfg(not(windows))]
+    #[test]
+    fn replayed_options_exclude_off_options_and_job_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("snapshot.sh");
+        let rc = directory.path().join("rc.sh");
+        std::fs::write(&rc, "set -o monitor\nset -o noclobber\n").unwrap();
+        let status = Command::new("bash")
+            .args(["-c", generator_script(&file, Some(&rc)).as_str()])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let body = std::fs::read_to_string(&file).unwrap();
+        let replayed: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("set -o "))
+            .collect();
+        assert!(replayed.contains(&"set -o noclobber"), "{body}");
+        assert!(replayed.contains(&"set -o hashall"), "{body}");
+        for absent in ["set -o monitor", "set -o onecmd", "set -o errexit"] {
+            assert!(!replayed.contains(&absent), "{absent} replayed: {body}");
+        }
+    }
+
+    /// A login bash on macOS reorders `PATH` through `path_helper`; the snapshot
+    /// keeps the application's order in front and appends what the profile added.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_snapshot_keeps_the_application_path_order_on_macos() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("snapshot.sh");
+        let status = Command::new("/bin/bash")
+            .args(["-c", generator_script(&file, None).as_str()])
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/profile/added")
+            .env("MEWORK_APPLICATION_PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            body.contains("export PATH='/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/profile/added'"),
+            "{body}"
+        );
     }
 
     /// One `eval` per function: a body that stopped parsing must not take the

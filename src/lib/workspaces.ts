@@ -46,6 +46,18 @@ export function workspaceMachineLabel(
   return `SSH: ${sshMachines.find((entry) => entry.id === machine.machineId)?.name ?? machine.machineId}`;
 }
 
+/**
+ * The chip label for a directory: its last segment, since a chip cannot hold an
+ * absolute path. The full path stays in the chip's `title`, which is what the
+ * user checks when two directories share a name.
+ */
+export function workspaceDirectoryLabel(path: string): string {
+  const trimmed = path.trim().replace(/[\\/]+$/, "");
+  const separator = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  // A root has no last segment; it is labelled by itself.
+  return trimmed.slice(separator + 1) || trimmed || path.trim();
+}
+
 /** A path with its machine appended when the machine is not this one. */
 export function workspaceLocationTitle(
   path: string,
@@ -57,25 +69,83 @@ export function workspaceLocationTitle(
 }
 
 /**
+ * A project's own workspaces in order: its first directory, then the ones added
+ * after it. These are the directories every conversation of the project shares.
+ *
+ * With a conversation, the first entry is the directory that conversation's
+ * tools actually use: its isolated worktree when it has one. A temporary
+ * project has no shared directory and so no entries.
+ */
+export function projectWorkspaces(
+  workspace: Workspace | null | undefined,
+  conversation?: Pick<Conversation, "worktree"> | null
+): AttachedWorkspace[] {
+  if (!workspace || isTemporaryWorkspace(workspace)) return [];
+  return [
+    {
+      machine: conversation?.worktree ? null : workspace.machine ?? null,
+      path: conversation?.worktree?.path ?? workspace.path
+    },
+    ...(workspace.additionalWorkspaces ?? [])
+  ];
+}
+
+/**
  * The conversation's workspaces in the order the model addresses them: the
- * primary workspace is 1 and the attached ones follow.
+ * project's workspaces first — its primary is 1 — and the conversation's own
+ * attached ones after them.
  *
  * This mirrors `workspace_set::WorkspaceSet::resolve` on the host, which is the
  * authority — the renderer reads this only to label chips and to decide what the
  * tool picker may offer. The primary entry uses the worktree when the
  * conversation has one, because that is the directory its tools resolve against.
+ * A temporary project still counts as workspace 1: the host gives it a scratch
+ * directory of its own.
  */
 export function conversationWorkspaces(
   workspace: Workspace | null | undefined,
   conversation: Pick<Conversation, "worktree" | "attachedWorkspaces"> | null | undefined
 ): AttachedWorkspace[] {
-  const primary: AttachedWorkspace[] = workspace
-    ? [{
-      machine: conversation?.worktree ? null : workspace.machine ?? null,
-      path: conversation?.worktree?.path ?? workspace.path
-    }]
-    : [];
-  return [...primary, ...(conversation?.attachedWorkspaces ?? [])];
+  const project: AttachedWorkspace[] = !workspace
+    ? []
+    : isTemporaryWorkspace(workspace)
+      ? [{ machine: null, path: workspace.path }]
+      : projectWorkspaces(workspace, conversation);
+  return [...project, ...(conversation?.attachedWorkspaces ?? [])];
+}
+
+/** A shell the built-in terminal can start. Mirrors the host's `terminal::TerminalShell`. */
+export type TerminalShell = "powershell" | "bash" | "zsh" | "fish";
+
+/** Whether the renderer runs on a Windows host. */
+export function hostIsWindows(platform: string): boolean {
+  return /^win/i.test(platform.trim());
+}
+
+/**
+ * The shells a terminal in a workspace on `machine` can start, in menu order,
+ * the first being the one opened when nobody chose.
+ *
+ * Only a directory on a Windows host offers PowerShell, beside Git Bash. Every
+ * other machine is POSIX — a Mac, a Linux host, a WSL distribution, an SSH
+ * machine — and offers zsh, bash and fish.
+ */
+export function terminalShellsFor(
+  machine: RunTarget | null | undefined,
+  platform: string
+): TerminalShell[] {
+  if (!machine && hostIsWindows(platform)) return ["powershell", "bash"];
+  return ["zsh", "bash", "fish"];
+}
+
+/** The name a shell goes by in a menu and on a tab. */
+export function terminalShellLabel(shell: TerminalShell): string {
+  switch (shell) {
+    case "powershell": return "PowerShell";
+    case "bash": return "bash";
+    case "zsh": return "zsh";
+    case "fish": return "fish";
+  }
 }
 
 /**
@@ -86,6 +156,29 @@ export function conversationWorkspaces(
 const WORKSPACE_SCOPED_TOOLS: ReadonlySet<string> = new Set([
   "ls", "grep", "find", "read", "write", "edit", "lsp", "bash", "powershell"
 ]);
+
+/** The tools that run PowerShell. Mirrors `builtin_schemas::is_powershell_tool`. */
+const POWERSHELL_TOOLS: ReadonlySet<string> = new Set(["powershell", "powershell_find_output"]);
+
+/**
+ * Whether the renderer can tell it runs on a host with no PowerShell.
+ *
+ * On a Mac or a Linux machine every workspace is POSIX, and the host withdraws
+ * both PowerShell tools from every request (`aisdk::tools::enabled_tools`), so a
+ * picker offering them would show a switch that does nothing. An unrecognized
+ * platform string keeps them: hiding a tool the host would run is the worse
+ * mistake.
+ */
+export function hostLacksPowerShell(platform: string): boolean {
+  return /^(mac|linux|iphone|ipad)/i.test(platform.trim());
+}
+
+/** The catalog as this host can use it: no PowerShell tools where there is no PowerShell. */
+export function toolsForHost<T extends { name: string }>(tools: readonly T[], platform: string): T[] {
+  return hostLacksPowerShell(platform)
+    ? tools.filter((tool) => !POWERSHELL_TOOLS.has(tool.name))
+    : [...tools];
+}
 
 /**
  * The descriptors a timeline's manual tool cards are edited against, with the

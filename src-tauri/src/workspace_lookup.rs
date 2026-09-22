@@ -9,7 +9,7 @@
 
 use serde::Deserialize;
 
-use crate::model::{AppDocument, Conversation, Workspace, WorkspaceKind};
+use crate::model::{AppDocument, AttachedWorkspace, Conversation, Workspace, WorkspaceKind};
 
 /// Identifies the persisted checkout for a Git request.
 ///
@@ -22,8 +22,17 @@ use crate::model::{AppDocument, Conversation, Workspace, WorkspaceKind};
 pub enum GitTarget {
     #[serde(rename_all = "camelCase")]
     Conversation { conversation_id: String },
+    /// A project (the `Workspace` row) addressed without a conversation.
     #[serde(rename_all = "camelCase")]
-    Workspace { workspace_id: String },
+    Workspace {
+        workspace_id: String,
+        /// Which of the project's workspaces, 1-based: absent or `1` is
+        /// workspace 1 (the project root), `k >= 2` is its `k - 2`th further
+        /// workspace. A position, never a path, for the same reason the target
+        /// carries only IDs.
+        #[serde(default)]
+        member: Option<u32>,
+    },
 }
 
 /// Resolved coordinates. Workspace targets have no conversation, so callers must
@@ -35,6 +44,10 @@ pub enum ResolvedGitTarget<'a> {
     },
     Workspace {
         workspace: &'a Workspace,
+        /// `None` is workspace 1. `Some` is the project's further workspace the
+        /// target's `member` named, whose directory — not `workspace.path` — is
+        /// the one the request acts on.
+        member: Option<&'a AttachedWorkspace>,
     },
 }
 
@@ -52,7 +65,10 @@ pub fn resolve_git_target<'a>(
                 conversation,
             })
         }
-        GitTarget::Workspace { workspace_id } => {
+        GitTarget::Workspace {
+            workspace_id,
+            member,
+        } => {
             let workspace = find_workspace_by_id(document, workspace_id, request_label)?;
             // Temporary workspaces are created per conversation and have no shared
             // root. Only directory workspaces may be addressed directly.
@@ -62,9 +78,44 @@ pub fn resolve_git_target<'a>(
             if workspace.path.trim().is_empty() {
                 return Err(format!("工作区 {} 的路径为空", workspace.id));
             }
-            Ok(ResolvedGitTarget::Workspace { workspace })
+            let member = resolve_project_member(workspace, *member, request_label)?;
+            Ok(ResolvedGitTarget::Workspace { workspace, member })
         }
     }
+}
+
+/// Looks a project workspace up by its 1-based position.
+///
+/// Out of range is an error rather than a fall back to workspace 1: a Git write
+/// that lands in a different checkout than the one the user selected is the one
+/// outcome no caller can undo.
+fn resolve_project_member<'a>(
+    workspace: &'a Workspace,
+    position: Option<u32>,
+    request_label: &str,
+) -> Result<Option<&'a AttachedWorkspace>, String> {
+    let position = match position {
+        None | Some(1) => return Ok(None),
+        Some(position) => position,
+    };
+    let count = workspace.member_workspaces().len() + 1;
+    let entry = usize::try_from(position)
+        .ok()
+        .and_then(|position| position.checked_sub(2))
+        .and_then(|offset| workspace.member_workspaces().get(offset))
+        .ok_or_else(|| {
+            format!(
+                "{request_label}的项目 {} 没有工作区 {position}（共 {count} 个）",
+                workspace.id
+            )
+        })?;
+    if entry.path.trim().is_empty() {
+        return Err(format!(
+            "项目 {} 的工作区 {position} 路径为空",
+            workspace.id
+        ));
+    }
+    Ok(Some(entry))
 }
 
 /// Resolves a renderer-supplied conversation ID against the persisted document. A caller must
@@ -195,10 +246,14 @@ mod tests {
             .path = "C:/repo".to_owned();
         let target = GitTarget::Workspace {
             workspace_id: "workspace-a".to_owned(),
+            member: None,
         };
         match resolve_git_target(&document, &target, "测试请求").expect("目录工作区可以解析")
         {
-            ResolvedGitTarget::Workspace { workspace } => assert_eq!(workspace.id, "workspace-a"),
+            ResolvedGitTarget::Workspace { workspace, member } => {
+                assert_eq!(workspace.id, "workspace-a");
+                assert!(member.is_none(), "未指定成员时指向工作区 1");
+            }
             ResolvedGitTarget::Conversation { .. } => panic!("工作区寻址不该解析出对话"),
         }
     }
@@ -215,6 +270,7 @@ mod tests {
         workspace.path = String::new();
         let target = GitTarget::Workspace {
             workspace_id: "workspace-a".to_owned(),
+            member: None,
         };
         assert!(resolve_git_target(&document, &target, "测试请求").is_err());
     }
@@ -230,6 +286,7 @@ mod tests {
             .path = "   ".to_owned();
         let target = GitTarget::Workspace {
             workspace_id: "workspace-a".to_owned(),
+            member: None,
         };
         assert!(resolve_git_target(&document, &target, "测试请求").is_err());
     }
@@ -249,8 +306,111 @@ mod tests {
                 .expect("工作区寻址可以反序列化");
         assert!(matches!(
             workspace,
-            GitTarget::Workspace { workspace_id } if workspace_id == "ws_1"
+            GitTarget::Workspace { workspace_id, member: None } if workspace_id == "ws_1"
+        ));
+        let member: GitTarget =
+            serde_json::from_str(r#"{"kind":"workspace","workspaceId":"x","member":2}"#)
+                .expect("项目成员寻址可以反序列化");
+        assert!(matches!(
+            member,
+            GitTarget::Workspace { ref workspace_id, member: Some(2) } if workspace_id == "x"
+        ));
+        let first: GitTarget =
+            serde_json::from_str(r#"{"kind":"workspace","workspaceId":"x","member":1}"#)
+                .expect("显式的工作区 1 可以反序列化");
+        assert!(matches!(
+            first,
+            GitTarget::Workspace {
+                member: Some(1),
+                ..
+            }
         ));
         assert!(serde_json::from_str::<GitTarget>(r#"{"conversationId":"conv_1"}"#).is_err());
+        assert!(serde_json::from_str::<GitTarget>(
+            r#"{"kind":"workspace","workspaceId":"x","member":-1}"#
+        )
+        .is_err());
+    }
+
+    fn document_with_members() -> AppDocument {
+        let mut document = document_with_conversation("workspace-a", "conversation-a");
+        let workspace = document
+            .workspaces
+            .first_mut()
+            .expect("默认文档至少有一个工作区");
+        workspace.path = "C:/repo".to_owned();
+        workspace.additional_workspaces = vec![
+            AttachedWorkspace {
+                machine: None,
+                path: "C:/shared".to_owned(),
+            },
+            AttachedWorkspace {
+                machine: Some(crate::model::RunTarget::Ssh {
+                    machine_id: "m1".to_owned(),
+                }),
+                path: "~/services".to_owned(),
+            },
+        ];
+        document
+    }
+
+    fn member_target(member: Option<u32>) -> GitTarget {
+        GitTarget::Workspace {
+            workspace_id: "workspace-a".to_owned(),
+            member,
+        }
+    }
+
+    /// Position 1 (explicit or absent) is the project root; 2..k are the
+    /// project's further workspaces in their recorded order.
+    #[test]
+    fn a_member_position_resolves_to_that_project_workspace() {
+        let document = document_with_members();
+        for primary in [None, Some(1)] {
+            match resolve_git_target(&document, &member_target(primary), "测试请求").unwrap() {
+                ResolvedGitTarget::Workspace { member: None, .. } => {}
+                _ => panic!("{primary:?} 应解析为工作区 1"),
+            }
+        }
+        match resolve_git_target(&document, &member_target(Some(2)), "测试请求").unwrap() {
+            ResolvedGitTarget::Workspace {
+                workspace,
+                member: Some(member),
+            } => {
+                assert_eq!(workspace.id, "workspace-a");
+                assert_eq!(member.path, "C:/shared");
+                assert!(member.machine.is_none());
+            }
+            _ => panic!("成员 2 应解析为第一个额外工作区"),
+        }
+        match resolve_git_target(&document, &member_target(Some(3)), "测试请求").unwrap() {
+            ResolvedGitTarget::Workspace {
+                member: Some(member),
+                ..
+            } => {
+                assert_eq!(member.path, "~/services");
+                assert!(member.machine.is_some());
+            }
+            _ => panic!("成员 3 应解析为第二个额外工作区"),
+        }
+    }
+
+    /// An out-of-range position must fail rather than fall back to the root: a
+    /// Git write in a checkout the user did not select cannot be undone.
+    #[test]
+    fn an_out_of_range_member_is_refused() {
+        let document = document_with_members();
+        for position in [0, 4, u32::MAX] {
+            let error =
+                match resolve_git_target(&document, &member_target(Some(position)), "测试请求")
+                {
+                    Ok(_) => panic!("成员 {position} 不应解析成功"),
+                    Err(error) => error,
+                };
+            assert!(error.contains(&format!("没有工作区 {position}")), "{error}");
+        }
+        // A project with no further workspaces has only position 1.
+        let plain = document_with_conversation("workspace-a", "conversation-a");
+        assert!(resolve_git_target(&plain, &member_target(Some(2)), "测试请求").is_err());
     }
 }

@@ -32,11 +32,15 @@ pub(crate) fn enabled_tools(request: &RunModelRequest) -> Vec<&ToolDescriptor> {
         // host-side executor (Task*); subagent runs exclude them from this list.
         .filter(|tool| enabled.contains(&tool.name) || plan_tools.contains(&tool.name.as_str()))
         .filter(|tool| supports_vision || is_usable_without_vision(&tool.name))
-        // A conversation whose every workspace is on a POSIX machine has nowhere
-        // to run PowerShell. Withdrawing the tool is the honest form: the user
-        // may well have it enabled, and advertising it would buy one wasted call
-        // and one error per turn until the model stopped trying.
-        .filter(|tool| tool.name != "powershell" || runs_powershell(&request.workspaces))
+        // A conversation whose every workspace is on a POSIX machine — a Mac, a
+        // Linux host, WSL or SSH — has nowhere to run PowerShell. Withdrawing both
+        // PowerShell tools is the honest form: the user may well have them
+        // enabled, and advertising them would buy one wasted call and one error
+        // per turn until the model stopped trying.
+        .filter(|tool| {
+            !crate::builtin_schemas::is_powershell_tool(&tool.name)
+                || runs_powershell(&request.workspaces)
+        })
         .collect()
 }
 

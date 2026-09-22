@@ -1,4 +1,5 @@
 import { Channel, hasBackendRuntime, invoke } from "./backend";
+import type { TerminalShell } from "./workspaces";
 
 export interface TerminalCommandState {
   revision: number;
@@ -43,12 +44,23 @@ function requireDesktopRuntime(): void {
   if (!hasBackendRuntime()) throw new Error("终端仅可在桌面应用中使用");
 }
 
+/**
+ * Where a terminal runs and what it runs: the conversation's workspace number —
+ * the same 1-based address the model uses — and the shell. `null` leaves either
+ * to the host: workspace 1, and that machine's default shell.
+ */
+export interface TerminalLaunchChoice {
+  workspace: number | null;
+  shell: TerminalShell | null;
+}
+
 export async function openTerminal(
   conversationId: string,
   terminalId: string,
   cols: number,
   rows: number,
-  onEvent: (event: TerminalEvent) => void
+  onEvent: (event: TerminalEvent) => void,
+  launch: TerminalLaunchChoice = { workspace: null, shell: null }
 ): Promise<OpenTerminalResult> {
   requireDesktopRuntime();
   const channel = new Channel<TerminalEvent>();
@@ -58,6 +70,8 @@ export async function openTerminal(
     terminalId,
     cols,
     rows,
+    workspace: launch.workspace,
+    shell: launch.shell,
     onEvent: channel
   });
 }

@@ -70,6 +70,11 @@ key.txt
 # 三元组放在这里给 externalBin 取。是构建产物，不是源码。
 /src-tauri/binaries/
 
+# Icons src-tauri/build.rs renders for non-Windows targets from the same SVGs as the
+# tracked icon.ico: the window icon generate_context! opens, and the macOS bundle icon.
+/src-tauri/icons/icon.png
+/src-tauri/icons/icon.icns
+
 # Development documentation stays local; the public repository ships the README only.
 # docs/context-injections is exempt: the Rust golden test builtin_schema_baseline_is_current
 # reads builtin-tool-schemas.json from disk, so those generated exports must stay tracked.

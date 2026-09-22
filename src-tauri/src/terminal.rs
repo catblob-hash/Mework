@@ -17,6 +17,11 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
+mod bash_control;
+#[cfg(unix)]
+mod posix_control;
+mod reply_files;
+
 const MAX_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_SESSIONS: usize = 64;
@@ -25,6 +30,13 @@ const MAX_ROWS: u16 = 300;
 const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_PREFIX: &[u8] = b"\x1b]633;Mework;v1;";
 const CONTROL_TERMINATOR: u8 = 0x07;
+/// How long a zsh, bash or fish hook waits for the host to answer `start`
+/// before refusing the line itself, matching the PowerShell hook.
+const DECISION_TIMEOUT_SECONDS: u32 = 30;
+/// The message a refused line prints in zsh, bash and fish, where the line
+/// stays in the editor; PowerShell's own says to recall it instead.
+const REFUSED_MESSAGE: &str =
+    "Mework 未执行该命令：工作区正在进行 Git、模型或其他写操作；请稍后按回车重试。";
 
 pub type TerminalCommandLease = Box<dyn Send + 'static>;
 pub type TerminalCommandLeaseFactory =
@@ -103,13 +115,95 @@ pub struct TerminalOpenResponse {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellControl {
+    /// PowerShell with the PSReadLine hook from [`configure_powershell_control`].
+    #[cfg(windows)]
     PowerShell,
+    /// zsh with the startup files from [`posix_control::ControlFifo`]: the same
+    /// frames, answered through a FIFO instead of named events.
+    #[cfg(unix)]
+    Zsh,
+    /// bash with the rcfile from [`bash_control`], answered through a FIFO on a
+    /// Mac or Linux host and through [`reply_files`] under Git Bash on Windows.
+    Bash,
+    /// fish with the script from [`posix_control::ControlFifo`].
+    #[cfg(unix)]
+    Fish,
     /// A shell on another machine, reached through `wsl.exe` or `ssh`. It has no
     /// command-state frames, and needs none: the frames exist to hold the host
     /// checkout's Git mutex while a command runs, and a remote workspace has no
     /// host checkout to protect.
     Remote,
     Unsupported,
+}
+
+/// How the host answers a shell's `start` frame.
+///
+/// The shell does not run the command until it hears back, which is what makes
+/// the command lease a barrier rather than a record. PowerShell waits on two
+/// named Win32 events; zsh, bash and fish read a line naming the generation
+/// from a FIFO; Git Bash looks for a reply file naming it.
+enum ControlReply {
+    /// A remote shell sends no frames, so it is never answered.
+    None,
+    #[cfg(windows)]
+    Events { ack: String, reject: String },
+    #[cfg(unix)]
+    Fifo(posix_control::ControlFifo),
+    #[cfg(windows)]
+    ReplyFiles(reply_files::ControlReplyFiles),
+}
+
+impl ControlReply {
+    fn ack(&self, generation: u64) -> Result<(), String> {
+        self.send(true, generation)
+    }
+
+    fn reject(&self, generation: u64) -> Result<(), String> {
+        self.send(false, generation)
+    }
+
+    fn send(&self, accepted: bool, generation: u64) -> Result<(), String> {
+        let _ = (accepted, generation);
+        match self {
+            Self::None => Err("该终端没有命令确认通道".into()),
+            #[cfg(windows)]
+            Self::Events { ack, reject } => {
+                signal_control_event(if accepted { ack } else { reject })
+            }
+            #[cfg(unix)]
+            Self::Fifo(fifo) => fifo.send(accepted, generation),
+            #[cfg(windows)]
+            Self::ReplyFiles(files) => files.send(accepted, generation),
+        }
+    }
+}
+
+/// The shell a terminal runs, as the renderer's shell menu names it.
+///
+/// Which shells are offered depends on the machine the workspace is on: a
+/// Windows host offers PowerShell and Git Bash; a Mac, a Linux host, a WSL
+/// distribution and an SSH machine offer zsh, bash and fish. `None` wherever an
+/// `Option<TerminalShell>` is taken means that machine's default: PowerShell on
+/// a Windows host, zsh everywhere else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalShell {
+    PowerShell,
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl TerminalShell {
+    /// The name the shell is started by, and the label a tab shows for it.
+    pub fn program_name(self) -> &'static str {
+        match self {
+            Self::PowerShell => "pwsh",
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+        }
+    }
 }
 
 pub struct TerminalLaunch {
@@ -123,9 +217,12 @@ pub struct TerminalLaunch {
 }
 
 impl TerminalLaunch {
-    pub fn host(cwd: &Path) -> Result<Self, String> {
+    /// A shell on this machine: `shell`, or the machine's default when `None`.
+    /// A shell the machine does not have is refused rather than replaced, and
+    /// so is one this host cannot run with the command barrier.
+    pub fn host(cwd: &Path, shell: Option<TerminalShell>) -> Result<Self, String> {
         let cwd = canonical_directory(cwd)?;
-        let (program, args, shell, control) = host_shell();
+        let (program, args, shell, control) = host_shell(shell)?;
         Ok(Self::new(
             program,
             args,
@@ -146,12 +243,27 @@ impl TerminalLaunch {
     /// the directory; unlike the tool leg it does not set `BatchMode`, because a
     /// person is sitting in front of this one and may answer a prompt. The
     /// machine's variable table is applied the way the tool leg applies it.
+    ///
+    /// A chosen `shell` is started as a login shell by `/bin/sh`, which falls
+    /// back to the user's own login shell, with a note, on a machine without
+    /// it. `/bin/sh` rather than the login shell parses that choice because the
+    /// login shell may be fish, which reads neither `${SHELL:-…}` nor `if … fi`.
+    /// A remote shell has no command barrier: there is no host checkout behind
+    /// it to protect.
     pub fn remote(
         runner: &crate::run_environment::ShellRunner,
         remote_cwd: &str,
         local_cwd: &Path,
+        shell: Option<TerminalShell>,
     ) -> Result<Self, String> {
         use crate::run_environment::{self as run_env, ShellRunner};
+        let chosen = match shell {
+            None => None,
+            Some(TerminalShell::PowerShell) => {
+                return Err("WSL 与 SSH 终端不提供 PowerShell；请选择 zsh、bash 或 fish".into());
+            }
+            Some(shell) => Some(shell.program_name()),
+        };
         let local_cwd = canonical_directory(local_cwd)?;
         let env = runner.normalized_env()?;
         let injected: Vec<String> = env
@@ -159,6 +271,10 @@ impl TerminalLaunch {
             .filter(|(key, _)| !run_env::is_shell_startup_env_name(key))
             .map(|(key, value)| format!("{key}={value}"))
             .collect();
+        let labelled = |machine: String| match chosen {
+            Some(name) => format!("{machine} · {name}"),
+            None => machine,
+        };
         let (program, args, shell, scope) = match runner {
             ShellRunner::Local { .. } => {
                 return Err("本机工作区的终端不经远端启动".into());
@@ -171,7 +287,18 @@ impl TerminalLaunch {
                     OsString::from("--cd"),
                     OsString::from(remote_cwd),
                 ];
-                if !injected.is_empty() {
+                if let Some(name) = chosen {
+                    args.push(OsString::from("--exec"));
+                    if !injected.is_empty() {
+                        args.push(OsString::from("/usr/bin/env"));
+                        args.extend(injected.iter().map(OsString::from));
+                    }
+                    args.extend([
+                        OsString::from("/bin/sh"),
+                        OsString::from("-c"),
+                        OsString::from(remote_shell_script(name)),
+                    ]);
+                } else if !injected.is_empty() {
                     args.extend([OsString::from("--exec"), OsString::from("/usr/bin/env")]);
                     args.extend(injected.iter().map(OsString::from));
                     args.extend([OsString::from("bash"), OsString::from("-l")]);
@@ -179,7 +306,7 @@ impl TerminalLaunch {
                 (
                     OsString::from("wsl.exe"),
                     args,
-                    format!("WSL: {distro}"),
+                    labelled(format!("WSL: {distro}")),
                     "wsl",
                 )
             }
@@ -210,7 +337,13 @@ impl TerminalLaunch {
                     }
                     remote.push_str("&& ");
                 }
-                remote.push_str(r#"exec "${SHELL:-/bin/sh}" -l"#);
+                match chosen {
+                    Some(name) => {
+                        remote.push_str("exec /bin/sh -c ");
+                        remote.push_str(&run_env::sh_single_quote(&remote_shell_script(name)));
+                    }
+                    None => remote.push_str(r#"exec "${SHELL:-/bin/sh}" -l"#),
+                }
                 args.push(OsString::from(remote));
                 let program = run_env::ssh_client_candidates()
                     .into_iter()
@@ -219,7 +352,7 @@ impl TerminalLaunch {
                 (
                     OsString::from(program),
                     args,
-                    format!("SSH: {host}"),
+                    labelled(format!("SSH: {host}")),
                     "ssh",
                 )
             }
@@ -260,6 +393,19 @@ impl TerminalLaunch {
             control,
         }
     }
+}
+
+/// The `/bin/sh` script that starts `name` as a login shell on another
+/// machine, or that user's own login shell when the machine lacks it. `name`
+/// is one of [`TerminalShell::program_name`]'s, never text from the user, and
+/// the script has neither a single quote nor a backslash, so it reads the same
+/// to a POSIX shell and to fish once single-quoted.
+fn remote_shell_script(name: &str) -> String {
+    format!(
+        "if command -v {name} >/dev/null 2>&1; then exec {name} -l; fi; \
+         echo \"Mework：这台机器上没有 {name}，改用 ${{SHELL:-/bin/sh}}。\" >&2; \
+         exec \"${{SHELL:-/bin/sh}}\" -l"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,8 +572,7 @@ struct TerminalOutputState {
     command_lease: Option<TerminalCommandLease>,
     startup_lease: Option<TerminalCommandLease>,
     command_lease_factory: TerminalCommandLeaseFactory,
-    control_ack_event: String,
-    control_reject_event: String,
+    control_reply: ControlReply,
 }
 
 struct TerminalSession {
@@ -467,7 +612,14 @@ impl TerminalSession {
     /// the exit: a panel that did not ask for this close — the task list did,
     /// or a workspace closing — has no other way to learn its shell is gone.
     fn terminate(mut self) {
-        lock(&self.output).closed = true;
+        {
+            let mut output = lock(&self.output);
+            output.closed = true;
+            // The shell is about to die, and nothing it asks from here on will be
+            // answered. Dropping the channel now removes its private directory
+            // even when the process exits before the waiter thread finishes.
+            output.control_reply = ControlReply::None;
+        }
         mark_handshake(&self.control_handshake, ControlHandshake::Failed);
         if let Some(mut writer) = lock(&self.writer).take() {
             let _ = writer.flush();
@@ -691,20 +843,56 @@ impl TerminalManager {
             .master
             .take_writer()
             .map_err(|error| format!("无法写入伪终端：{error}"))?;
-        if launch.control == ShellControl::Unsupported {
-            return Err(
-                "当前系统没有可用的 PowerShell；为保证 Git 与终端命令严格互斥，未启动不受支持的 shell"
-                    .into(),
-            );
-        }
         let remote = launch.control == ShellControl::Remote;
         let control_nonce = Uuid::new_v4().simple().to_string();
-        let control_ack_event = format!("MeworkTerminalAck_{}", Uuid::new_v4().simple());
-        let control_reject_event = format!("MeworkTerminalReject_{}", Uuid::new_v4().simple());
         let mut launch_args = launch.args.clone();
-        if !remote {
-            configure_powershell_control(&mut launch_args);
-        }
+        // The startup files live in the session's private directory, so the
+        // arguments naming them are added here rather than in the launch, whose
+        // binding must stay the same from one open to the next.
+        let (control_reply, control_env, leading_args): ControlSetup = match launch.control {
+            ShellControl::Remote => (ControlReply::None, Vec::new(), Vec::new()),
+            ShellControl::Unsupported => return Err(UNSUPPORTED_SHELL_MESSAGE.into()),
+            #[cfg(windows)]
+            ShellControl::PowerShell => {
+                configure_powershell_control(&mut launch_args);
+                let ack = format!("MeworkTerminalAck_{}", Uuid::new_v4().simple());
+                let reject = format!("MeworkTerminalReject_{}", Uuid::new_v4().simple());
+                let environment = vec![
+                    (
+                        "MEWORK_TERMINAL_CONTROL_NONCE",
+                        OsString::from(&control_nonce),
+                    ),
+                    ("MEWORK_TERMINAL_ACK_EVENT", OsString::from(&ack)),
+                    ("MEWORK_TERMINAL_REJECT_EVENT", OsString::from(&reject)),
+                ];
+                (
+                    ControlReply::Events { ack, reject },
+                    environment,
+                    Vec::new(),
+                )
+            }
+            #[cfg(unix)]
+            ShellControl::Zsh => fifo_control(posix_control::PosixShell::Zsh, &control_nonce)?,
+            #[cfg(unix)]
+            ShellControl::Bash => fifo_control(posix_control::PosixShell::Bash, &control_nonce)?,
+            #[cfg(unix)]
+            ShellControl::Fish => fifo_control(posix_control::PosixShell::Fish, &control_nonce)?,
+            #[cfg(windows)]
+            ShellControl::Bash => {
+                let files = reply_files::ControlReplyFiles::create()?;
+                let mut environment = files.environment(&control_nonce);
+                // Unlike PowerShell, Git Bash is a terminal program: without a
+                // terminal type readline assumes one that cannot clear a line,
+                // and every `bind -x` hook would leave a copy of the line behind.
+                environment.push(("TERM", OsString::from("xterm-256color")));
+                // An MSYS2 profile changes to $HOME unless told the shell was
+                // started where it should stay; Git's own ignores it.
+                environment.push(("CHERE_INVOKING", OsString::from("1")));
+                let leading_args = files.leading_args();
+                (ControlReply::ReplyFiles(files), environment, leading_args)
+            }
+        };
+        launch_args.splice(0..0, leading_args);
         let mut command = CommandBuilder::new(&launch.program);
         command.args(&launch_args);
         command.cwd(&launch.cwd);
@@ -727,10 +915,17 @@ impl TerminalManager {
         {
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
+            // Inherited from whatever terminal started the app. macOS's
+            // `/etc/zshrc` sources `/etc/zshrc_$TERM_PROGRAM`, and Apple
+            // Terminal's copy installs session-restore hooks keyed on a session
+            // this shell does not belong to.
+            for name in ["TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID"] {
+                command.env_remove(name);
+            }
         }
-        command.env("MEWORK_TERMINAL_CONTROL_NONCE", &control_nonce);
-        command.env("MEWORK_TERMINAL_ACK_EVENT", &control_ack_event);
-        command.env("MEWORK_TERMINAL_REJECT_EVENT", &control_reject_event);
+        for (name, value) in &control_env {
+            command.env(name, value);
+        }
         let mut child = pair
             .slave
             .spawn_command(command)
@@ -762,8 +957,7 @@ impl TerminalManager {
             command_lease: None,
             startup_lease: Some(startup_lease),
             command_lease_factory,
-            control_ack_event,
-            control_reject_event,
+            control_reply,
         }));
         if remote {
             lock(&output).startup_lease = None;
@@ -936,6 +1130,7 @@ impl TerminalManager {
                 let (sink, command_state, exit_code, error) = {
                     let mut state = lock(&wait_output);
                     state.running = false;
+                    state.control_reply = ControlReply::None;
                     let command_state = status.as_ref().ok().and_then(|_| {
                         drop(state.startup_lease.take());
                         (state.command_state.status == TerminalCommandStatus::Running).then(|| {
@@ -1217,6 +1412,20 @@ impl TerminalManager {
     }
 }
 
+/// How a host shell's command barrier is wired up: the reply channel, the
+/// variables its startup reads (and removes) before any user file runs, and the
+/// arguments that go ahead of its own to point it at its startup files.
+type ControlSetup = (ControlReply, Vec<(&'static str, OsString)>, Vec<OsString>);
+
+/// The FIFO route of a zsh, bash or fish host terminal.
+#[cfg(unix)]
+fn fifo_control(shell: posix_control::PosixShell, nonce: &str) -> Result<ControlSetup, String> {
+    let fifo = posix_control::ControlFifo::create(shell, nonce)?;
+    let environment = fifo.environment();
+    let leading_args = fifo.leading_args();
+    Ok((ControlReply::Fifo(fifo), environment, leading_args))
+}
+
 fn remove_matching_sessions<K: Clone + Eq + std::hash::Hash, T>(
     sessions: &mut HashMap<K, T>,
     mut should_remove: impl FnMut(&K) -> bool,
@@ -1368,7 +1577,7 @@ fn apply_control_frame(
                 || state.last_control_generation.checked_add(1) != Some(frame.generation)
                 || state.command_state.status == TerminalCommandStatus::Running
             {
-                let _ = signal_control_event(&state.control_reject_event);
+                let _ = state.control_reply.reject(frame.generation);
                 return None;
             }
             state.last_control_generation = frame.generation;
@@ -1376,7 +1585,7 @@ fn apply_control_frame(
                 Ok(command_lease) => command_lease,
                 Err(error) => {
                     eprintln!("终端命令因工作区操作冲突被拒绝：{error}");
-                    let _ = signal_control_event(&state.control_reject_event);
+                    let _ = state.control_reply.reject(frame.generation);
                     state.command_state.revision = state.command_state.revision.saturating_add(1);
                     return Some(TerminalControlUpdate::CommandState(
                         state.command_state.clone(),
@@ -1385,11 +1594,11 @@ fn apply_control_frame(
             };
             state.command_lease = Some(command_lease);
             state.active_control_generation = Some(frame.generation);
-            if let Err(error) = signal_control_event(&state.control_ack_event) {
+            if let Err(error) = state.control_reply.ack(frame.generation) {
                 eprintln!("无法确认终端命令租约：{error}");
                 state.active_control_generation = None;
                 drop(state.command_lease.take());
-                let _ = signal_control_event(&state.control_reject_event);
+                let _ = state.control_reply.reject(frame.generation);
                 state.command_state.revision = state.command_state.revision.saturating_add(1);
                 return Some(TerminalControlUpdate::CommandState(
                     state.command_state.clone(),
@@ -1476,11 +1685,7 @@ fn signal_control_event(name: &str) -> Result<(), String> {
     })
 }
 
-#[cfg(not(windows))]
-fn signal_control_event(_name: &str) -> Result<(), String> {
-    Err("当前平台不支持终端命令确认事件".into())
-}
-
+#[cfg_attr(not(windows), allow(dead_code))]
 fn configure_powershell_control(args: &mut Vec<OsString>) {
     // PowerShell is launched with -NoProfile so the control nonce and event names can be removed
     // from the process environment before profiles (or any child they start) run. The standard
@@ -1589,6 +1794,7 @@ function global:PSConsoleHostReadLine {
 ///
 /// These are deliberately not the `powershell` tool's preamble: that one matches
 /// Claude Code byte for byte and is weaker. See `powershell_host`.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_bootstrap_script(head: &str, tail: &str) -> String {
     let defaults = crate::powershell_host::strict_text_defaults().join("\n");
     format!("{head}\n{defaults}\n{tail}")
@@ -1625,8 +1831,25 @@ fn kill_process_tree(_process_id: Option<u32>, process_group_id: Option<i32>) ->
     false
 }
 
+/// What a host terminal starts: the program, its arguments, the label a tab
+/// shows, and how its command barrier is answered.
+type HostShell = (OsString, Vec<OsString>, String, ShellControl);
+
+/// A Windows host offers PowerShell, its default, and Git Bash.
 #[cfg(windows)]
-fn host_shell() -> (OsString, Vec<OsString>, String, ShellControl) {
+fn host_shell(shell: Option<TerminalShell>) -> Result<HostShell, String> {
+    match shell {
+        None | Some(TerminalShell::PowerShell) => Ok(powershell()),
+        Some(TerminalShell::Bash) => git_bash(),
+        Some(other @ (TerminalShell::Zsh | TerminalShell::Fish)) => Err(format!(
+            "Windows 本机终端不提供 {}；请选择 PowerShell 或 Git Bash",
+            other.program_name()
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn powershell() -> HostShell {
     for (name, label) in [
         ("pwsh.exe", "PowerShell"),
         ("powershell.exe", "Windows PowerShell"),
@@ -1648,23 +1871,114 @@ fn host_shell() -> (OsString, Vec<OsString>, String, ShellControl) {
     )
 }
 
+/// Git Bash: the native bash [`crate::run_environment::local_bash_candidates`]
+/// resolves first, which is never the WSL launcher that also answers to
+/// `bash.exe`. It runs interactive with the session's rcfile, which starts up
+/// the way Git Bash's own login shell does.
+#[cfg(windows)]
+fn git_bash() -> Result<HostShell, String> {
+    let program = crate::run_environment::local_bash_candidates()
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            "未找到 Git Bash；请先安装 Git for Windows，或在终端菜单中选择 PowerShell".to_owned()
+        })?;
+    Ok((
+        OsString::from(program),
+        vec![OsString::from("-i")],
+        "bash".into(),
+        ShellControl::Bash,
+    ))
+}
+
+/// Why a host terminal was refused: it could not have held the Git mutex.
+#[cfg(windows)]
+const UNSUPPORTED_SHELL_MESSAGE: &str =
+    "当前系统没有可用的 PowerShell；为保证 Git 与终端命令严格互斥，未启动不受支持的 shell";
 #[cfg(not(windows))]
-fn host_shell() -> (OsString, Vec<OsString>, String, ShellControl) {
-    let program = env::var_os("SHELL")
-        .filter(|value| Path::new(value).is_file())
+const UNSUPPORTED_SHELL_MESSAGE: &str =
+    "当前系统没有可用的 zsh；为保证 Git 与终端命令严格互斥，未启动不受支持的 shell";
+
+/// A Mac or Linux host offers zsh, its default, bash and fish, each run the way
+/// macOS's Terminal runs a login shell, so `/etc/zprofile`'s `path_helper`, the
+/// system profile and the user's own startup files all apply.
+///
+/// Only a shell whose line editor can be told to wait for the host before
+/// running a line is offered — that is what holds the Git mutex — and a shell
+/// the machine does not have is refused rather than replaced by another. The
+/// default is the one exception, as it always was: without zsh it resolves to
+/// an unsupported `sh`, which `open` then refuses with the general message.
+#[cfg(unix)]
+fn host_shell(shell: Option<TerminalShell>) -> Result<HostShell, String> {
+    let chosen = shell.unwrap_or(TerminalShell::Zsh);
+    let (control, args): (ShellControl, &[&str]) = match chosen {
+        TerminalShell::PowerShell => {
+            return Err("本机终端不提供 PowerShell；请选择 zsh、bash 或 fish".into());
+        }
+        TerminalShell::Zsh => (ShellControl::Zsh, &["-l", "-i"]),
+        // `-l` is emulated by the rcfile: a login bash reads no rcfile.
+        TerminalShell::Bash => (ShellControl::Bash, &["-i"]),
+        TerminalShell::Fish => (ShellControl::Fish, &["-l", "-i"]),
+    };
+    let name = chosen.program_name();
+    match posix_shell_program(chosen) {
+        Some(program) => Ok((
+            program,
+            args.iter().map(OsString::from).collect(),
+            name.into(),
+            control,
+        )),
+        None if shell.is_some() => Err(format!(
+            "未找到 {name}；请先安装 {name}，或在终端菜单中选择其他 shell"
+        )),
+        None => Ok((
+            OsString::from("/bin/sh"),
+            Vec::new(),
+            "sh".into(),
+            ShellControl::Unsupported,
+        )),
+    }
+}
+
+/// Where a shell is: `$SHELL` when it names that shell (a Homebrew build the
+/// user logs in with, say), then the places systems and package managers put
+/// it. zsh keeps the system build first, as it always has; for bash a newer
+/// build wins over macOS's `/bin/bash` 3.2, as it would on the user's `PATH`.
+#[cfg(unix)]
+fn posix_shell_program(shell: TerminalShell) -> Option<OsString> {
+    let well_known: &[&str] = match shell {
+        TerminalShell::Zsh => &[
+            "/bin/zsh",
+            "/usr/bin/zsh",
+            "/opt/homebrew/bin/zsh",
+            "/usr/local/bin/zsh",
+        ],
+        TerminalShell::Bash => &[
+            "/opt/homebrew/bin/bash",
+            "/usr/local/bin/bash",
+            "/bin/bash",
+            "/usr/bin/bash",
+        ],
+        TerminalShell::Fish => &[
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/fish",
+            "/bin/fish",
+        ],
+        TerminalShell::PowerShell => &[],
+    };
+    let name = shell.program_name();
+    let is_shell = |path: &Path| {
+        path.file_name().and_then(std::ffi::OsStr::to_str) == Some(name) && path.is_file()
+    };
+    env::var_os("SHELL")
+        .filter(|value| is_shell(Path::new(value)))
         .or_else(|| {
-            ["/bin/zsh", "/bin/bash", "/bin/sh"]
-                .into_iter()
-                .find(|path| Path::new(path).is_file())
+            well_known
+                .iter()
+                .find(|path| is_shell(Path::new(path)))
                 .map(OsString::from)
         })
-        .unwrap_or_else(|| OsString::from("/bin/sh"));
-    let label = Path::new(&program)
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("shell")
-        .to_owned();
-    (program, Vec::new(), label, ShellControl::Unsupported)
 }
 
 #[cfg(windows)]
@@ -1740,7 +2054,7 @@ mod tests {
 
     #[test]
     fn terminal_launches_in_the_directory_the_user_would_type() {
-        let launch = TerminalLaunch::host(&std::env::current_dir().unwrap()).unwrap();
+        let launch = TerminalLaunch::host(&std::env::current_dir().unwrap(), None).unwrap();
         assert!(
             !launch.display_cwd.starts_with(r"\\?\"),
             "a verbatim working directory turns $PWD into a provider-qualified \
@@ -1752,6 +2066,278 @@ mod tests {
         // Session reuse is keyed on the binding, so the launched and displayed
         // directory must be the same one recorded there.
         assert!(launch.binding.contains(&launch.display_cwd));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_terminal_runs_the_shell_asked_for_or_refuses() {
+        let cwd = std::env::current_dir().unwrap();
+        let error = TerminalLaunch::host(&cwd, Some(TerminalShell::PowerShell))
+            .err()
+            .expect("no PowerShell on a Mac or Linux host");
+        assert!(error.contains("PowerShell"), "{error}");
+
+        let default = TerminalLaunch::host(&cwd, None).unwrap();
+        if default.control != ShellControl::Unsupported {
+            assert_eq!(default.shell, "zsh");
+            assert_eq!(default.args, ["-l", "-i"]);
+            let zsh = TerminalLaunch::host(&cwd, Some(TerminalShell::Zsh)).unwrap();
+            assert_eq!(zsh.binding, default.binding, "zsh is the default");
+        }
+        match TerminalLaunch::host(&cwd, Some(TerminalShell::Bash)) {
+            Ok(bash) => {
+                assert_eq!(bash.shell, "bash");
+                assert_eq!(bash.control, ShellControl::Bash);
+                assert_eq!(bash.args, ["-i"]);
+                assert_eq!(
+                    Path::new(&bash.program).file_name(),
+                    Some(std::ffi::OsStr::new("bash"))
+                );
+                // Switching shells must not reattach the old session.
+                assert_ne!(bash.binding, default.binding);
+            }
+            Err(error) => assert!(error.contains("未找到 bash"), "{error}"),
+        }
+        match TerminalLaunch::host(&cwd, Some(TerminalShell::Fish)) {
+            Ok(fish) => {
+                assert_eq!(fish.shell, "fish");
+                assert_eq!(fish.control, ShellControl::Fish);
+                assert_eq!(fish.args, ["-l", "-i"]);
+            }
+            Err(error) => assert!(error.contains("未找到 fish"), "{error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_host_offers_powershell_and_git_bash() {
+        let cwd = std::env::current_dir().unwrap();
+        for shell in [TerminalShell::Zsh, TerminalShell::Fish] {
+            let error = TerminalLaunch::host(&cwd, Some(shell)).err().unwrap();
+            assert!(error.contains(shell.program_name()), "{error}");
+        }
+        let default = TerminalLaunch::host(&cwd, None).unwrap();
+        match TerminalLaunch::host(&cwd, Some(TerminalShell::Bash)) {
+            Ok(bash) => {
+                assert_eq!(bash.shell, "bash");
+                assert_eq!(bash.control, ShellControl::Bash);
+                assert_eq!(bash.args, ["-i"]);
+                let program = bash.program.to_string_lossy().to_ascii_lowercase();
+                assert!(!program.contains(r"\system32\"), "{program}");
+                assert_ne!(bash.binding, default.binding);
+            }
+            Err(error) => assert!(error.contains("Git Bash"), "{error}"),
+        }
+    }
+
+    fn wsl_runner(env: &[(&str, &str)]) -> crate::run_environment::ShellRunner {
+        crate::run_environment::ShellRunner::Wsl {
+            distro: "Ubuntu".into(),
+            env: env
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn ssh_runner(env: &[(&str, &str)]) -> crate::run_environment::ShellRunner {
+        crate::run_environment::ShellRunner::Ssh {
+            host: "ada@build".into(),
+            port: 2222,
+            identity_file: String::new(),
+            env: env
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+        }
+    }
+
+    const REMOTE_SHELLS: [TerminalShell; 3] =
+        [TerminalShell::Zsh, TerminalShell::Bash, TerminalShell::Fish];
+
+    #[test]
+    fn a_wsl_terminal_starts_the_chosen_shell_through_sh() {
+        let local = std::env::current_dir().unwrap();
+        let args = |launch: &TerminalLaunch| {
+            launch
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        // No choice keeps the distribution's default shell, exactly as before.
+        let plain =
+            TerminalLaunch::remote(&wsl_runner(&[]), "/home/ada/project", &local, None).unwrap();
+        assert_eq!(plain.shell, "WSL: Ubuntu");
+        assert_eq!(args(&plain), ["-d", "Ubuntu", "--cd", "/home/ada/project"]);
+        let plain_env = TerminalLaunch::remote(
+            &wsl_runner(&[("FOO", "bar baz")]),
+            "/home/ada/project",
+            &local,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            args(&plain_env)[4..],
+            ["--exec", "/usr/bin/env", "FOO=bar baz", "bash", "-l"]
+        );
+
+        for shell in REMOTE_SHELLS {
+            let name = shell.program_name();
+            let launch =
+                TerminalLaunch::remote(&wsl_runner(&[]), "/home/ada/project", &local, Some(shell))
+                    .unwrap();
+            assert_eq!(launch.program, OsString::from("wsl.exe"));
+            assert_eq!(launch.shell, format!("WSL: Ubuntu · {name}"));
+            assert_eq!(launch.control, ShellControl::Remote);
+            assert_eq!(
+                args(&launch),
+                [
+                    "-d",
+                    "Ubuntu",
+                    "--cd",
+                    "/home/ada/project",
+                    "--exec",
+                    "/bin/sh",
+                    "-c",
+                    &remote_shell_script(name),
+                ]
+            );
+            assert_ne!(launch.binding, plain.binding);
+
+            let with_env = TerminalLaunch::remote(
+                &wsl_runner(&[("FOO", "bar baz"), ("BASH_ENV", "/tmp/evil")]),
+                "/home/ada/project",
+                &local,
+                Some(shell),
+            )
+            .unwrap();
+            assert_eq!(
+                args(&with_env)[4..],
+                [
+                    "--exec",
+                    "/usr/bin/env",
+                    "FOO=bar baz",
+                    "/bin/sh",
+                    "-c",
+                    &remote_shell_script(name),
+                ]
+            );
+        }
+        let error = TerminalLaunch::remote(
+            &wsl_runner(&[]),
+            "/home/ada/project",
+            &local,
+            Some(TerminalShell::PowerShell),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("PowerShell"), "{error}");
+    }
+
+    #[test]
+    fn an_ssh_terminal_quotes_the_chosen_shell_into_its_remote_command() {
+        use crate::run_environment::sh_single_quote;
+        let local = std::env::current_dir().unwrap();
+        let remote_command =
+            |launch: &TerminalLaunch| launch.args.last().unwrap().to_string_lossy().into_owned();
+        let plain = TerminalLaunch::remote(&ssh_runner(&[]), "~/project", &local, None).unwrap();
+        assert_eq!(plain.shell, "SSH: ada@build");
+        assert_eq!(
+            remote_command(&plain),
+            r#"cd ~/'project' && exec "${SHELL:-/bin/sh}" -l"#
+        );
+        for shell in REMOTE_SHELLS {
+            let name = shell.program_name();
+            let launch =
+                TerminalLaunch::remote(&ssh_runner(&[]), "~/project", &local, Some(shell)).unwrap();
+            assert_eq!(launch.shell, format!("SSH: ada@build · {name}"));
+            assert_eq!(launch.control, ShellControl::Remote);
+            assert_eq!(
+                launch.args[..6],
+                ["-t", "-o", "ConnectTimeout=10", "-p", "2222", "--"].map(OsString::from)
+            );
+            assert_eq!(
+                remote_command(&launch),
+                format!(
+                    "cd ~/'project' && exec /bin/sh -c {}",
+                    sh_single_quote(&remote_shell_script(name))
+                )
+            );
+            assert_ne!(launch.binding, plain.binding);
+            let with_env = TerminalLaunch::remote(
+                &ssh_runner(&[("FOO", "it's")]),
+                "~/project",
+                &local,
+                Some(shell),
+            )
+            .unwrap();
+            assert_eq!(
+                remote_command(&with_env),
+                format!(
+                    "cd ~/'project' && export 'FOO=it'\\''s' && exec /bin/sh -c {}",
+                    sh_single_quote(&remote_shell_script(name))
+                )
+            );
+        }
+        assert!(TerminalLaunch::remote(
+            &ssh_runner(&[]),
+            "~/project",
+            &local,
+            Some(TerminalShell::PowerShell)
+        )
+        .is_err());
+    }
+
+    /// The remote command as a remote login shell would run it, here, with a
+    /// shell this machine has and one it lacks: the first is exec'd as a login
+    /// shell, the second falls back to `$SHELL` with a note.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_shell_that_is_missing_falls_back_to_the_login_shell() {
+        use std::process::{Command, Stdio};
+        let local = std::env::current_dir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_string_lossy().into_owned();
+        std::fs::write(home.path().join(".bash_profile"), "echo BASH-LOGIN:$PWD\n").unwrap();
+        // `exec` needs the shell on PATH; an empty directory makes "fish" missing
+        // whether or not this machine has one.
+        let empty = tempfile::tempdir().unwrap();
+        let run = |shell: TerminalShell, path: &str| {
+            let launch =
+                TerminalLaunch::remote(&ssh_runner(&[]), &workspace_path, &local, Some(shell))
+                    .unwrap();
+            let command = launch.args.last().unwrap().clone();
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("PATH", path)
+                .env("SHELL", "/bin/echo")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let missing = run(TerminalShell::Fish, &empty.path().to_string_lossy());
+        assert_eq!(String::from_utf8_lossy(&missing.stdout), "-l\n");
+        let note = String::from_utf8_lossy(&missing.stderr);
+        assert!(
+            note.contains("没有 fish") && note.contains("/bin/echo"),
+            "{note}"
+        );
+        if Path::new("/bin/bash").is_file() {
+            let found = run(TerminalShell::Bash, "/bin:/usr/bin");
+            let stdout = String::from_utf8_lossy(&found.stdout);
+            let canonical = std::fs::canonicalize(workspace.path()).unwrap();
+            assert!(
+                stdout.contains(&format!("BASH-LOGIN:{}", canonical.display()))
+                    || stdout.contains(&format!("BASH-LOGIN:{workspace_path}")),
+                "{stdout:?} {:?}",
+                String::from_utf8_lossy(&found.stderr)
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -1931,8 +2517,7 @@ mod tests {
             command_lease: Some(Box::new(DropProbe(drops.clone()))),
             startup_lease: None,
             command_lease_factory: Arc::new(|| Err("not used".into())),
-            control_ack_event: "unused-ack".into(),
-            control_reject_event: "unused-reject".into(),
+            control_reply: ControlReply::None,
         };
 
         assert!(matches!(
@@ -2002,8 +2587,7 @@ mod tests {
             command_lease: None,
             startup_lease: None,
             command_lease_factory: Arc::new(|| Err("workspace writer active".into())),
-            control_ack_event: "unused-ack".into(),
-            control_reject_event: "unused-reject".into(),
+            control_reply: ControlReply::None,
         };
 
         let Some(TerminalControlUpdate::CommandState(rejected)) = apply_control_frame(
@@ -2091,10 +2675,31 @@ mod tests {
         assert!(!script.contains("function global:prompt"));
     }
 
-    #[cfg(windows)]
+    /// The whole barrier against the real host shell: PowerShell under ConPTY on
+    /// Windows, a login zsh under a pty elsewhere, with the user's own profile.
     #[test]
-    #[ignore = "spawns the real PowerShell console host and ConPTY"]
-    fn real_powershell_barrier_survives_prompt_calls_fast_queue_and_detach() {
+    #[ignore = "spawns the real host shell under a pseudo terminal"]
+    fn real_shell_barrier_survives_prompt_calls_fast_queue_and_detach() {
+        exercise_real_shell_barrier(None);
+    }
+
+    /// The same against bash: Git Bash on Windows, and elsewhere the bash the
+    /// menu would start — macOS's 3.2 when nothing newer is installed.
+    #[test]
+    #[ignore = "spawns a real bash under a pseudo terminal"]
+    fn real_bash_barrier_survives_prompt_calls_fast_queue_and_detach() {
+        exercise_real_shell_barrier(Some(TerminalShell::Bash));
+    }
+
+    /// And against fish, where it is installed.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawns a real fish under a pseudo terminal"]
+    fn real_fish_barrier_survives_prompt_calls_fast_queue_and_detach() {
+        exercise_real_shell_barrier(Some(TerminalShell::Fish));
+    }
+
+    fn exercise_real_shell_barrier(shell: Option<TerminalShell>) {
         use std::{
             sync::mpsc,
             time::{Duration, Instant},
@@ -2211,7 +2816,46 @@ mod tests {
             }))
         });
         let startup_drops = Arc::new(AtomicUsize::new(0));
-        let launch = TerminalLaunch::host(&std::env::current_dir().unwrap()).unwrap();
+        let launch = match TerminalLaunch::host(&std::env::current_dir().unwrap(), shell) {
+            Ok(launch) => launch,
+            // A chosen shell the machine does not have is refused up front.
+            Err(error) if shell.is_some() => {
+                eprintln!("skipped: {error}");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        // The first command touches the shell's own prompt machinery, which must
+        // not be taken for the command ending.
+        let (slow_then_print, two_queued_lines, short_sleep) = match launch.control {
+            #[cfg(windows)]
+            ShellControl::PowerShell => (
+                "prompt; Start-Sleep -Milliseconds 600; Write-Output mework-finished\r",
+                "Write-Output first\rWrite-Output second\r",
+                "Start-Sleep -Milliseconds 350\r",
+            ),
+            #[cfg(unix)]
+            ShellControl::Zsh => (
+                "print -P '%~' >/dev/null; sleep 0.6; echo mework-finished\r",
+                "echo first\recho second\r",
+                "sleep 0.35\r",
+            ),
+            ShellControl::Bash => (
+                "printf '%s' \"${PS1-}\" >/dev/null; sleep 0.6; echo mework-finished\r",
+                "echo first\recho second\r",
+                "sleep 0.35\r",
+            ),
+            #[cfg(unix)]
+            ShellControl::Fish => (
+                "fish_prompt >/dev/null; sleep 0.6; echo mework-finished\r",
+                "echo first\recho second\r",
+                "sleep 0.35\r",
+            ),
+            // A host without its default shell refuses to open a terminal at
+            // all; there is no barrier to exercise.
+            ShellControl::Unsupported => return,
+            ShellControl::Remote => unreachable!("a host launch is never remote"),
+        };
         let opened = manager
             .open(
                 "conversation-real",
@@ -2235,7 +2879,7 @@ mod tests {
                 "conversation-real",
                 "terminal-real",
                 &opened.session_id,
-                "prompt; Start-Sleep -Milliseconds 600; Write-Output mework-finished\r",
+                slow_then_print,
             )
             .unwrap();
         let running = wait_for_status(&receiver, "running", Duration::from_secs(5));
@@ -2252,7 +2896,7 @@ mod tests {
                 "conversation-real",
                 "terminal-real",
                 &opened.session_id,
-                "Write-Output first\rWrite-Output second\r",
+                two_queued_lines,
             )
             .unwrap();
         for expected in [2_u64, 3] {
@@ -2267,7 +2911,7 @@ mod tests {
                 "conversation-real",
                 "terminal-real",
                 &opened.session_id,
-                "Start-Sleep -Milliseconds 350\r",
+                short_sleep,
             )
             .unwrap();
         let _ = wait_for_status(&receiver, "running", Duration::from_secs(5));
@@ -2284,7 +2928,7 @@ mod tests {
             .open(
                 "conversation-real",
                 "terminal-real",
-                TerminalLaunch::host(&std::env::current_dir().unwrap()).unwrap(),
+                TerminalLaunch::host(&std::env::current_dir().unwrap(), shell).unwrap(),
                 100,
                 30,
                 reattach_sink,

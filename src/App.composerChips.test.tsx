@@ -76,6 +76,23 @@ function summaryResult(value: GitWorkspaceSnapshot) {
   };
 }
 
+function devbox() {
+  return {
+    id: "machine-devbox",
+    name: "devbox",
+    host: "user@devbox.local",
+    port: 0,
+    identityFile: "",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+}
+
+/** The seed project's name, which is what the composer's terminal button names its workspace by. */
+function document_workspaceName(): string {
+  return "Mework";
+}
+
 /** Wait for and return the branch chip in the input header row. */
 async function branchChip(branch: string) {
   return await screen.findByRole("button", { name: `分支：${branch}` });
@@ -90,13 +107,15 @@ describe("composer context chips", () => {
     gitMocks.getGitWorkspaceSummary.mockResolvedValue(summaryResult(snapshot("main")));
   });
 
-  it("names the run location, the workspace, and the branch above the input", async () => {
+  it("names the project and the branch above the input", async () => {
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
 
-    // The run location remains a menu even with only one available value.
-    expect(screen.getByRole("button", { name: "运行地点：本机" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^工作区：/ })).toBeInTheDocument();
+    // The run-location chip is gone: where things run is a property of each workspace.
+    expect(screen.queryByRole("button", { name: /^运行地点：/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^项目：/ })).toBeInTheDocument();
+    // A project with one workspace has nothing to choose between, so there is no workspace chip.
+    expect(screen.queryByRole("button", { name: /^工作区：/ })).not.toBeInTheDocument();
     expect(await branchChip("main")).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked();
   });
@@ -105,7 +124,7 @@ describe("composer context chips", () => {
     render(<App />);
     const textarea = await screen.findByLabelText("向 Agent 发送消息");
 
-    const row = screen.getByRole("button", { name: "运行地点：本机" }).closest(".composer-context");
+    const row = screen.getByRole("button", { name: /^项目：/ }).closest(".composer-context");
     const box = textarea.closest(".composer");
     expect(row).not.toBeNull();
     expect(box).not.toBeNull();
@@ -113,6 +132,122 @@ describe("composer context chips", () => {
     expect(box).not.toContainElement(row as HTMLElement);
     expect(row!.closest(".composer-wrap")).toBe(box!.closest(".composer-wrap"));
     expect(row!.compareDocumentPosition(box!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("hides the project chip once the conversation has started", async () => {
+    const document = documentWithModel();
+    document.workspaces[0].conversations[0].contexts = [{
+      id: "ctx-started",
+      kind: "user",
+      content: "已经开始了",
+      createdAt: "2026-01-01T00:00:00.000Z"
+    }];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    await branchChip("main");
+    expect(screen.queryByRole("button", { name: /^项目：/ })).not.toBeInTheDocument();
+  });
+
+  it("points the Git chip at the workspace picked in a multi-workspace project", async () => {
+    const document = documentWithModel();
+    document.workspaces[0].additionalWorkspaces = [{ path: "D:/shared/design-tokens" }];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    gitMocks.getGitWorkspaceSummary.mockImplementation(async (target: { kind: string; member?: number }) => (
+      summaryResult(snapshot(target.kind === "workspace" && target.member === 2 ? "tokens-main" : "main"))
+    ));
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await branchChip("main");
+
+    const chip = screen.getByRole("button", { name: /^工作区：/ });
+    await user.click(chip);
+    const menu = await screen.findByRole("menu", { name: "选择工作区" });
+    await user.click(within(menu).getByRole("menuitemradio", { name: /^design-tokens/ }));
+
+    // The second workspace is addressed by its number within the project, never by its path.
+    await waitFor(() => expect(gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target))
+      .toContainEqual({ kind: "workspace", workspaceId: document.workspaces[0].id, member: 2 }));
+    expect(await branchChip("tokens-main")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "工作区：design-tokens" })).toBeInTheDocument();
+    // Worktrees only ever stand in for the project's first workspace.
+    expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
+  });
+
+  it("opens a terminal in the selected workspace with the shell picked from the menu", async () => {
+    const document = documentWithModel();
+    document.workspaces[0].additionalWorkspaces = [{
+      machine: { kind: "wsl", distro: "Ubuntu" },
+      path: "/home/dev/services"
+    }];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    await user.click(screen.getByRole("button", { name: /^工作区：/ }));
+    await user.click(within(await screen.findByRole("menu", { name: "选择工作区" }))
+      .getByRole("menuitemradio", { name: /^services/ }));
+
+    // A workspace on a POSIX machine offers the POSIX shells, whatever the host is.
+    await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
+    const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
+    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
+      .toEqual(["zsh", "bash", "fish"]);
+    await user.click(within(menu).getByRole("menuitem", { name: "fish" }));
+
+    const conversationId = document.workspaces[0].conversations[0].id;
+    const panel = window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`);
+    // The tab every conversation starts with takes the choice instead of gaining a sibling.
+    expect(panel).toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "fish" }));
+    expect(screen.getByRole("tab", { name: "fish" })).toBeInTheDocument();
+  });
+
+  it("offers PowerShell and Git Bash for a workspace on a Windows host", async () => {
+    const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("Win32");
+    try {
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByLabelText("向 Agent 发送消息");
+
+      const project = document_workspaceName();
+      await user.click(screen.getByRole("button", { name: `在 ${project} 打开终端` }));
+      const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
+      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
+        .toEqual(["PowerShell", "bash"]);
+    } finally {
+      platform.mockRestore();
+    }
+  });
+
+  it("gives the top-right terminal button the same shell menu", async () => {
+    const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("MacIntel");
+    try {
+      const document = documentWithModel();
+      runtimeMocks.loadDocument.mockResolvedValue(document);
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByLabelText("向 Agent 发送消息");
+
+      const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
+      await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+      const menu = await screen.findByRole("menu", { name: "新建终端" });
+      await user.click(within(menu).getByRole("menuitem", { name: "zsh" }));
+
+      const conversationId = document.workspaces[0].conversations[0].id;
+      expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
+        .toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "zsh" }));
+
+      // A second choice opens a second terminal beside the first.
+      await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+      await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
+        .getByRole("menuitem", { name: "bash" }));
+      expect(screen.queryAllByRole("tab").map((tab) => tab.textContent)).toEqual(["zsh 1", "bash 2"]);
+    } finally {
+      platform.mockRestore();
+    }
   });
 
   it("lists only local branches and checks the current one", async () => {
@@ -203,126 +338,6 @@ describe("composer context chips", () => {
     await waitFor(() => expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked());
   });
 
-  it("selects a WSL distro from the run-location picker", async () => {
-    runtimeMocks.listWslDistros.mockResolvedValue([
-      { name: "Ubuntu", version: 2, isDefault: true },
-      { name: "Debian", version: 1, isDefault: false }
-    ]);
-    const user = userEvent.setup();
-    render(<App />);
-    await screen.findByLabelText("向 Agent 发送消息");
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const panel = await screen.findByRole("dialog", { name: "运行地点" });
-    // Distributions are enumerated asynchronously after opening the panel.
-    await user.click(await within(panel).findByText("Ubuntu"));
-
-    // Selection updates the chip immediately and persists as the conversation run location.
-    expect(await screen.findByRole("button", { name: "运行地点：Ubuntu" })).toBeInTheDocument();
-  });
-
-  it("edits environment variables behind the per-row gear", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-    await screen.findByLabelText("向 Agent 发送消息");
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const panel = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(panel).getByRole("button", { name: "为 本机 配置环境变量" }));
-
-    const dialog = await screen.findByRole("dialog", { name: /本机 的环境变量/ });
-    await user.type(within(dialog).getByPlaceholderText(/API_KEY=value/), "FOO=bar");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
-
-    // Environment variables are global assets and must reappear with a count badge.
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const reopened = await screen.findByRole("dialog", { name: "运行地点" });
-    expect(within(reopened).getByTitle("1 个环境变量")).toBeInTheDocument();
-    await user.click(within(reopened).getByRole("button", { name: "为 本机 配置环境变量" }));
-    expect(
-      (await screen.findByPlaceholderText(/API_KEY=value/) as HTMLTextAreaElement).value
-    ).toBe("FOO=bar");
-  });
-
-  it("rejects invalid variable names instead of silently dropping them", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-    await screen.findByLabelText("向 Agent 发送消息");
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const panel = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(panel).getByRole("button", { name: "为 本机 配置环境变量" }));
-
-    const dialog = await screen.findByRole("dialog", { name: /本机 的环境变量/ });
-    await user.type(within(dialog).getByPlaceholderText(/API_KEY=value/), "1BAD=x");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
-
-    expect(await within(dialog).findByRole("alert")).toHaveTextContent("1BAD");
-    // Keep the dialog open for correction instead of silently dropping invalid rows.
-    expect(screen.getByRole("dialog", { name: /本机 的环境变量/ })).toBeInTheDocument();
-  });
-
-  it("keeps environment values verbatim, including surrounding whitespace", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-    await screen.findByLabelText("向 Agent 发送消息");
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    let panel = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(panel).getByRole("button", { name: "为 本机 配置环境变量" }));
-
-    // `=` and surrounding whitespace are part of the value; trimming breaks format-sensitive tokens.
-    const dialog = await screen.findByRole("dialog", { name: /本机 的环境变量/ });
-    await user.type(within(dialog).getByPlaceholderText(/API_KEY=value/), "TOKEN= a=b ");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    panel = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(panel).getByRole("button", { name: "为 本机 配置环境变量" }));
-    expect(
-      (await screen.findByPlaceholderText(/API_KEY=value/) as HTMLTextAreaElement).value
-    ).toBe("TOKEN= a=b ");
-  });
-
-  it("refuses host-reserved variable names instead of letting the document become unsavable", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-    await screen.findByLabelText("向 Agent 发送消息");
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const panel = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(panel).getByRole("button", { name: "为 本机 配置环境变量" }));
-
-    // BASH_ENV runs a script before each visible command. Reject it here because
-    // host validation rejects the entire document.
-    const dialog = await screen.findByRole("dialog", { name: /本机 的环境变量/ });
-    await user.type(within(dialog).getByPlaceholderText(/API_KEY=value/), "BASH_ENV=/tmp/pwn");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
-
-    expect(await within(dialog).findByRole("alert")).toHaveTextContent("BASH_ENV");
-    expect(screen.getByRole("dialog", { name: /本机 的环境变量/ })).toBeInTheDocument();
-  });
-
-  it("adds an SSH machine and selects it as the run location", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-    await screen.findByLabelText("向 Agent 发送消息");
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const panel = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(panel).getByRole("button", { name: "添加 SSH 机器…" }));
-
-    const dialog = await screen.findByRole("dialog", { name: "添加 SSH 机器" });
-    await user.type(within(dialog).getByLabelText("名称"), "devbox");
-    await user.type(within(dialog).getByLabelText("主机"), "user@devbox.local");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const reopened = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(reopened).getByText("devbox"));
-    expect(await screen.findByRole("button", { name: "运行地点：devbox" })).toBeInTheDocument();
-  });
-
   it("explains the failure instead of silently leaving the checkbox where it was", async () => {
     gitMocks.createConversationWorktree.mockRejectedValue(new Error("仓库还没有任何提交"));
     const user = userEvent.setup();
@@ -335,7 +350,7 @@ describe("composer context chips", () => {
     expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked();
   });
 
-  it("attaches a picked directory as its own numbered chip beside the other run-location chips", async () => {
+  it("attaches a picked directory as its own numbered chip beside the other location chips", async () => {
     workspacePickerMocks.pickWorkspaceDirectory.mockResolvedValue("D:/shared/design-tokens");
     const user = userEvent.setup();
     render(<App />);
@@ -344,8 +359,11 @@ describe("composer context chips", () => {
     const add = screen.getByRole("button", { name: "附加工作区" });
     // The picker button trails the existing chips, so a new workspace lands where it was.
     expect(add.closest(".composer-context")).toBe(
-      screen.getByRole("button", { name: "运行地点：本机" }).closest(".composer-context")
+      screen.getByRole("button", { name: /^项目：/ }).closest(".composer-context")
     );
+    // The terminal button sits immediately before it.
+    const terminal = screen.getByRole("button", { name: /打开终端$/ });
+    expect(terminal.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     await user.click(add);
     const menu = await screen.findByRole("menu", { name: "在哪台机器上选目录" });
@@ -353,7 +371,7 @@ describe("composer context chips", () => {
 
     const chip = await screen.findByTitle("D:/shared/design-tokens");
     expect(chip).toHaveTextContent("design-tokens");
-    // Workspace 1 is the conversation's own, so the first attached one is 2.
+    // Workspace 1 is the project's own, so the first attached one is 2.
     expect(chip).toHaveTextContent("2");
     expect(chip.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
@@ -365,17 +383,12 @@ describe("composer context chips", () => {
       hasParent: true
     });
     workspacePickerMocks.authorizeRemoteWorkspace.mockResolvedValue("/home/dev/services");
+    const document = documentWithModel();
+    document.globalSettings.executionEnvironments.sshMachines = [devbox()];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
     const user = userEvent.setup();
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
-
-    await user.click(screen.getByRole("button", { name: "运行地点：本机" }));
-    const panel = await screen.findByRole("dialog", { name: "运行地点" });
-    await user.click(within(panel).getByRole("button", { name: "添加 SSH 机器…" }));
-    const machineDialog = await screen.findByRole("dialog", { name: "添加 SSH 机器" });
-    await user.type(within(machineDialog).getByLabelText("名称"), "devbox");
-    await user.type(within(machineDialog).getByLabelText("主机"), "user@devbox.local");
-    await user.click(within(machineDialog).getByRole("button", { name: "保存" }));
 
     await user.click(screen.getByRole("button", { name: "附加工作区" }));
     const menu = await screen.findByRole("menu", { name: "在哪台机器上选目录" });
@@ -387,6 +400,22 @@ describe("composer context chips", () => {
     await user.click(within(browser).getByRole("button", { name: "选择" }));
 
     expect(await screen.findByTitle("/home/dev/services (SSH: devbox)")).toBeInTheDocument();
+  });
+
+  it("numbers attached workspaces after every workspace of the project", async () => {
+    const document = documentWithModel();
+    document.workspaces[0].additionalWorkspaces = [{ path: "D:/shared/lib" }];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    workspacePickerMocks.pickWorkspaceDirectory.mockResolvedValue("D:/shared/design-tokens");
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    await user.click(screen.getByRole("button", { name: "附加工作区" }));
+    const menu = await screen.findByRole("menu", { name: "在哪台机器上选目录" });
+    await user.click(within(menu).getByRole("menuitem", { name: "本机" }));
+
+    expect(await screen.findByTitle("D:/shared/design-tokens")).toHaveTextContent("3");
   });
 
   it("keeps the directory out of the conversation when the picker is cancelled", async () => {
@@ -427,30 +456,20 @@ describe("composer context chips", () => {
     expect(screen.queryByRole("button", { name: "附加工作区" })).not.toBeInTheDocument();
   });
 
+
   /** A document with an SSH machine registered and no conversation yet, so the composer is a draft. */
   function draftDocumentWithDevbox() {
     const document = documentWithModel();
     document.workspaces.forEach((workspace) => { workspace.conversations = []; });
-    document.globalSettings.executionEnvironments.sshMachines = [{
-      id: "machine-devbox",
-      name: "devbox",
-      host: "user@devbox.local",
-      port: 0,
-      identityFile: "",
-      createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z"
-    }];
+    document.globalSettings.executionEnvironments.sshMachines = [devbox()];
     return document;
   }
 
-  async function chooseWorkspaceOn(user: ReturnType<typeof userEvent.setup>, machine: string) {
-    await user.click(screen.getByRole("button", { name: "工作区：选择工作区" }));
-    const menu = await screen.findByRole("menu", { name: "选择工作区" });
-    await user.click(within(menu).getByRole("menuitem", { name: "选择工作区" }));
-    await user.click(within(menu).getByRole("menuitem", { name: machine }));
+  function lastSaved(): AppDocument | undefined {
+    return runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined;
   }
 
-  it("chooses the conversation's workspace on an SSH machine through the remote browser", async () => {
+  it("creates a project on an SSH machine from the project chip, through the remote browser", async () => {
     runtimeMocks.loadDocument.mockResolvedValue(draftDocumentWithDevbox());
     workspacePickerMocks.listRemoteDirectory.mockResolvedValue({
       path: "/home/dev",
@@ -460,56 +479,65 @@ describe("composer context chips", () => {
     workspacePickerMocks.authorizeRemoteWorkspace.mockResolvedValue("/home/dev/services");
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByRole("button", { name: "工作区：选择工作区" });
+    await user.click(await screen.findByRole("button", { name: "项目：选择项目" }));
+    await user.click(within(await screen.findByRole("menu", { name: "选择项目" }))
+      .getByRole("menuitem", { name: "新建项目…" }));
 
-    await chooseWorkspaceOn(user, "devbox");
+    const dialog = await screen.findByRole("dialog", { name: "新建项目" });
+    await user.click(within(dialog).getByRole("button", { name: "工作区 1 的机器：本机" }));
+    const machines = await screen.findByRole("menu", { name: "选择机器" });
+    await user.click(within(machines).getByRole("menuitem", { name: "SSH" }));
+    await user.click(await screen.findByRole("menuitemradio", { name: "devbox" }));
+    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
+
     const browser = await screen.findByRole("dialog", { name: "选择 devbox 上的工作区" });
     expect(workspacePickerMocks.pickWorkspaceDirectory).not.toHaveBeenCalled();
     await user.click(await within(browser).findByText("services"));
     await user.click(within(browser).getByRole("button", { name: "选择" }));
+    await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
 
-    // The directory becomes the conversation's workspace, named by its last segment and
-    // titled with the machine, and the document records where it lives.
-    const chip = await screen.findByRole("button", { name: "工作区：services" });
-    expect(chip).toHaveAttribute("title", "/home/dev/services (SSH: devbox)");
-    // The browser authorizes on the machine it was opened for; the host returns the resolved path.
-    expect(workspacePickerMocks.authorizeRemoteWorkspace).toHaveBeenCalledWith(
-      { kind: "ssh", machineId: "machine-devbox" },
-      expect.any(String)
-    );
+    // The draft moves into the new project, named after its directory.
+    expect(await screen.findByRole("button", { name: "项目：services" })).toBeInTheDocument();
     await waitFor(() => {
-      const saved = runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined;
-      const workspace = saved?.workspaces.find((entry) => entry.path === "/home/dev/services");
-      expect(workspace?.machine).toEqual({ kind: "ssh", machineId: "machine-devbox" });
-      expect(workspace?.name).toBe("services");
+      const project = lastSaved()?.workspaces.find((entry) => entry.path === "/home/dev/services");
+      expect(project?.machine).toEqual({ kind: "ssh", machineId: "machine-devbox" });
+      expect(project?.name).toBe("services");
     });
-    // No checkout exists on this machine, so nothing asks the host for Git facts and the
-    // branch and worktree controls stay away.
+    // No checkout exists on this machine, so nothing asks the host for Git facts.
     expect(gitMocks.getGitWorkspaceSummary).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: /^分支：/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
   });
 
-  it("chooses the conversation's workspace on this machine through the native dialog", async () => {
+  it("creates a project of several workspaces, each picked on its own machine", async () => {
     runtimeMocks.loadDocument.mockResolvedValue(draftDocumentWithDevbox());
-    workspacePickerMocks.pickWorkspaceDirectory.mockResolvedValue("D:/projects/tokens");
+    workspacePickerMocks.pickWorkspaceDirectory
+      .mockResolvedValueOnce("D:/projects/app")
+      .mockResolvedValueOnce("D:/projects/tokens");
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByRole("button", { name: "工作区：选择工作区" });
+    await user.click(await screen.findByRole("button", { name: "项目：选择项目" }));
+    await user.click(within(await screen.findByRole("menu", { name: "选择项目" }))
+      .getByRole("menuitem", { name: "新建项目…" }));
 
-    await chooseWorkspaceOn(user, "本机");
-    const chip = await screen.findByRole("button", { name: "工作区：tokens" });
-    expect(chip).toHaveAttribute("title", "D:/projects/tokens");
-    expect(workspacePickerMocks.authorizeRemoteWorkspace).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("dialog", { name: "新建项目" });
+    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
+    await user.click(within(dialog).getByRole("button", { name: "添加工作区" }));
+    await user.click(await within(dialog).findByRole("button", { name: "为工作区 2 选择目录" }));
+    await within(dialog).findByRole("button", { name: "工作区 2：D:/projects/tokens" });
+    await user.type(within(dialog).getByLabelText("显示名称"), "平台");
+    await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
+
+    expect(await screen.findByRole("button", { name: "项目：平台" })).toBeInTheDocument();
+    // Two workspaces: the chip that picks which one Git shows appears.
+    expect(screen.getByRole("button", { name: "工作区：app" })).toBeInTheDocument();
     await waitFor(() => {
-      const saved = runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined;
-      const workspace = saved?.workspaces.find((entry) => entry.path === "D:/projects/tokens");
-      expect(workspace).toBeDefined();
-      expect(workspace?.machine).toBeUndefined();
+      const project = lastSaved()?.workspaces.find((entry) => entry.name === "平台");
+      expect(project?.path).toBe("D:/projects/app");
+      expect(project?.additionalWorkspaces).toEqual([{ path: "D:/projects/tokens" }]);
     });
   });
 
-  it("reuses the workspace already registered for the same machine and directory", async () => {
+  it("reuses the project already registered with the same workspaces", async () => {
     const document = draftDocumentWithDevbox();
     document.workspaces.unshift({
       ...document.workspaces[0],
@@ -528,16 +556,49 @@ describe("composer context chips", () => {
     workspacePickerMocks.authorizeRemoteWorkspace.mockResolvedValue("/home/dev/services");
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByRole("button", { name: "工作区：选择工作区" });
+    await user.click(await screen.findByRole("button", { name: "项目：选择项目" }));
+    await user.click(within(await screen.findByRole("menu", { name: "选择项目" }))
+      .getByRole("menuitem", { name: "新建项目…" }));
 
-    await chooseWorkspaceOn(user, "devbox");
+    const dialog = await screen.findByRole("dialog", { name: "新建项目" });
+    await user.click(within(dialog).getByRole("button", { name: "工作区 1 的机器：本机" }));
+    await user.click(within(await screen.findByRole("menu", { name: "选择机器" }))
+      .getByRole("menuitem", { name: "SSH" }));
+    await user.click(await screen.findByRole("menuitemradio", { name: "devbox" }));
+    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
     const browser = await screen.findByRole("dialog", { name: "选择 devbox 上的工作区" });
     await user.click(within(browser).getByRole("button", { name: "选择" }));
+    await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
 
-    await screen.findByRole("button", { name: "工作区：services" });
+    await screen.findByRole("button", { name: "项目：services" });
     await waitFor(() => {
-      const saved = runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined;
-      expect(saved?.workspaces.filter((entry) => entry.path === "/home/dev/services")).toHaveLength(1);
+      expect(lastSaved()?.workspaces.filter((entry) => entry.path === "/home/dev/services")).toHaveLength(1);
+    });
+  });
+
+  it("adds a workspace to an existing project from the sidebar's project menu", async () => {
+    workspacePickerMocks.pickWorkspaceDirectory.mockResolvedValue("D:/shared/lib");
+    const document = documentWithModel();
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    const name = document.workspaces[0].name;
+    await user.click(screen.getByRole("button", { name: `${name} 的更多选项` }));
+    await user.click(await screen.findByRole("menuitem", { name: "编辑项目…" }));
+    const dialog = await screen.findByRole("dialog", { name: "编辑项目" });
+    // The project's first workspace is its identity; it cannot be swapped out here.
+    expect(within(dialog).getByRole("button", { name: `工作区 1：${document.workspaces[0].path}` })).toBeDisabled();
+    await user.click(within(dialog).getByRole("button", { name: "添加工作区" }));
+    await user.click(await within(dialog).findByRole("button", { name: "为工作区 2 选择目录" }));
+    await within(dialog).findByRole("button", { name: "工作区 2：D:/shared/lib" });
+    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByRole("button", { name: `工作区：${document.workspaces[0].path.split(/[\\/]/).filter(Boolean).at(-1)}` }))
+      .toBeInTheDocument();
+    await waitFor(() => {
+      expect(lastSaved()?.workspaces[0].additionalWorkspaces).toEqual([{ path: "D:/shared/lib" }]);
     });
   });
 });

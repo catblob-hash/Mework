@@ -6,6 +6,7 @@ import {
   Palette,
   Scale,
   Search,
+  ServerCog,
   Terminal
 } from "lucide-react";
 import { Fragment } from "react";
@@ -50,6 +51,7 @@ export const globalSettingsNavigationGroups: Array<{
   {
     id: "system",
     items: [
+      { id: "execution_environments", icon: ServerCog },
       { id: "dependencies", icon: Terminal },
       { id: "updates", icon: Download }
     ]
@@ -78,6 +80,7 @@ export function GlobalSettingsNavigation({
     decision_providers: t("决策模型提供商", "Decision model providers"),
     shortcuts: t("快捷键", "Keyboard shortcuts"),
     usage: t("用量统计", "Usage statistics"),
+    execution_environments: t("执行环境", "Execution environments"),
     dependencies: t("环境依赖", "Dependencies"),
     updates: t("版本更新", "Updates")
   };

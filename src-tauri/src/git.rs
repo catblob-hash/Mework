@@ -2733,8 +2733,9 @@ fn parse_network_config_values(
     for record in fields.chunks_exact(3) {
         let scope = std::str::from_utf8(record[0])
             .map_err(|_| "Git credential.helper scope 无效".to_owned())?;
-        let _origin = std::str::from_utf8(record[1])
+        let origin = std::str::from_utf8(record[1])
             .map_err(|_| "Git credential.helper origin 无效".to_owned())?;
+        let scope = effective_config_scope(scope, origin);
         let helper = std::str::from_utf8(record[2])
             .map_err(|_| "Git credential.helper 值无效".to_owned())?;
         if helper.as_bytes().len() > MAX_GIT_REMOTE_VALUE_BYTES
@@ -2802,6 +2803,38 @@ fn parse_network_config_values(
         }
     }
     Ok(helpers)
+}
+
+/// The scope a configuration value is judged under.
+///
+/// Apple's Git — the `/usr/bin/git` every Mac gets from the Command Line Tools
+/// or Xcode — reads one extra file from its own installation,
+/// `usr/share/git-core/gitconfig`, and `--show-scope` reports it as `unknown`.
+/// It is that installation's system configuration in every sense that matters
+/// here: only an administrator can write it, and it is where Apple sets
+/// `credential.helper=osxkeychain`. Refusing it refused every network Git
+/// operation on a stock Mac. Any other `unknown` stays unknown and is refused.
+fn effective_config_scope<'a>(scope: &'a str, origin: &str) -> &'a str {
+    if scope == "unknown" && is_apple_git_installation_config(origin) {
+        "system"
+    } else {
+        scope
+    }
+}
+
+fn is_apple_git_installation_config(origin: &str) -> bool {
+    let Some(installation) = origin
+        .strip_prefix("file:")
+        .and_then(|path| path.strip_suffix("/usr/share/git-core/gitconfig"))
+    else {
+        return false;
+    };
+    if installation.split('/').any(|part| part == "..") {
+        return false;
+    }
+    installation == "/Library/Developer/CommandLineTools"
+        || (installation.starts_with("/Applications/")
+            && installation.ends_with(".app/Contents/Developer"))
 }
 
 fn sanitized_transport_output(output: &CliOutput, transport: &RemoteTransport) -> String {
@@ -12481,6 +12514,7 @@ fn disabled_hooks_path() -> &'static str {
 
 fn safe_git_ssh_command(repository: &Repository) -> Option<String> {
     let git_parent = repository.git.parent()?;
+    #[cfg(windows)]
     let git_root = git_parent.parent().unwrap_or(git_parent);
     #[cfg(windows)]
     let candidates = [
@@ -14065,7 +14099,9 @@ u UU N... 100644 100644 100644 100644 a b c d conflict.txt\0\
             "src/main.rs"
         );
         assert!(validate_relative_path("../secret").is_err());
-        assert!(validate_relative_path("C:/secret").is_err());
+        // A drive prefix only means "absolute" on Windows; elsewhere `C:` is an
+        // ordinary directory name a repository may contain.
+        assert_eq!(validate_relative_path("C:/secret").is_err(), cfg!(windows));
         assert!(validate_relative_path("bad\\path").is_err());
         let encoded = encode_pathspecs(&["-leading.txt".into(), "line\nbreak.txt".into()]).unwrap();
         assert_eq!(encoded, b"-leading.txt\0line\nbreak.txt\0");
@@ -19227,6 +19263,37 @@ u UU N... 100644 100644 100644 100644 a b c d conflict.txt\0\
         )
         .is_err());
         assert!(parse_trusted_credential_helpers(b"local\0file:.git/config\0manager\0").is_err());
+        // Apple's Git reports its installation config as `unknown`; that file,
+        // and only that file, is judged as system configuration.
+        assert_eq!(
+            parse_trusted_credential_helpers(
+                b"unknown\0file:/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig\0osxkeychain\0"
+            )
+            .unwrap(),
+            ["osxkeychain"]
+        );
+        assert_eq!(
+            parse_trusted_credential_helpers(
+                b"unknown\0file:/Applications/Xcode-beta.app/Contents/Developer/usr/share/git-core/gitconfig\0osxkeychain\0"
+            )
+            .unwrap(),
+            ["osxkeychain"]
+        );
+        assert!(parse_trusted_credential_helpers(
+            b"unknown\0file:/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig\0!sh -c evil\0"
+        )
+        .is_err());
+        for origin in [
+            "file:/Users/me/usr/share/git-core/gitconfig",
+            "file:/Library/Developer/CommandLineTools/../../Users/me/usr/share/git-core/gitconfig",
+            "command line:",
+        ] {
+            let bytes = format!("unknown\0{origin}\0osxkeychain\0");
+            assert!(
+                parse_trusted_credential_helpers(bytes.as_bytes()).is_err(),
+                "{origin}"
+            );
+        }
 
         if !git_available() {
             return;

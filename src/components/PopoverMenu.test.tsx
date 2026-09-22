@@ -1,8 +1,9 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configureI18n } from "../i18n";
 import { PopoverMenu } from "./PopoverMenu";
+import type { PopoverMenuProps } from "./PopoverMenu";
 
 function renderMenu() {
   render(
@@ -113,5 +114,78 @@ describe("PopoverMenu", () => {
     expect(nested).not.toHaveClass("popover-menu__submenu--flyout");
     expect(screen.getByRole("menu", { name: "分组" }))
       .not.toHaveClass("popover-menu__panel--flyout");
+  });
+
+  describe("placement", () => {
+    const PANEL_HEIGHT = 120;
+
+    /** jsdom lays nothing out, so hand the anchor and the panel the boxes a real window would. */
+    function layout(triggerTop: number) {
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+        this: HTMLElement
+      ) {
+        const box = this.classList.contains("popover-menu__panel")
+          ? { left: 0, top: 0, width: 200, height: PANEL_HEIGHT }
+          : this.tagName === "BUTTON" && this.getAttribute("aria-haspopup") === "menu"
+            ? { left: 40, top: triggerTop, width: 90, height: 25 }
+            : { left: 0, top: 0, width: 0, height: 0 };
+        return {
+          ...box,
+          x: box.left,
+          y: box.top,
+          right: box.left + box.width,
+          bottom: box.top + box.height,
+          toJSON: () => box
+        } as DOMRect;
+      });
+    }
+
+    function renderPlaced(props: Partial<PopoverMenuProps> = {}) {
+      render(
+        <PopoverMenu
+          trigger={<span>机器</span>}
+          triggerLabel="机器"
+          menuLabel="机器"
+          sections={[{ id: "machines", items: [{ id: "local", label: "本机" }] }]}
+          {...props}
+        />
+      );
+    }
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it("opens below by default even when there is room above", async () => {
+      layout(500);
+      const user = userEvent.setup();
+      renderPlaced();
+      await user.click(screen.getByRole("button", { name: "机器" }));
+
+      const panel = screen.getByRole("menu", { name: "机器" });
+      expect(panel).not.toHaveClass("popover-menu__panel--flipped");
+      expect(panel.style.top).toBe(`${500 + 25 + 6}px`);
+    });
+
+    it("opens above the trigger when asked to and the panel fits there", async () => {
+      layout(500);
+      const user = userEvent.setup();
+      renderPlaced({ placement: "above", panelClassName: "extra-layer" });
+      await user.click(screen.getByRole("button", { name: "机器" }));
+
+      const panel = screen.getByRole("menu", { name: "机器" });
+      expect(panel).toHaveClass("popover-menu__panel--flipped");
+      expect(panel).toHaveClass("extra-layer");
+      expect(panel.style.top).toBe(`${500 - 6 - PANEL_HEIGHT}px`);
+    });
+
+    it("falls back below when there is no room above", async () => {
+      layout(40);
+      const user = userEvent.setup();
+      renderPlaced({ placement: "above" });
+      await user.click(screen.getByRole("button", { name: "机器" }));
+
+      const panel = screen.getByRole("menu", { name: "机器" });
+      expect(panel).not.toHaveClass("popover-menu__panel--flipped");
+      expect(panel.style.top).toBe(`${40 + 25 + 6}px`);
+    });
   });
 });

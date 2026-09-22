@@ -1172,7 +1172,7 @@ pub(crate) fn takes_a_workspace(tool_name: &str) -> bool {
 }
 
 /// The one tool shape that cannot reach a POSIX workspace: PowerShell, under either name.
-fn is_powershell_tool(tool_name: &str) -> bool {
+pub(crate) fn is_powershell_tool(tool_name: &str) -> bool {
     matches!(tool_name, "powershell" | "powershell_find_output")
 }
 

@@ -73,6 +73,7 @@ pub(crate) fn strict_text_defaults() -> Vec<String> {
 ///
 /// `$PSStyle` and `$ProgressPreference` are here because a hook's stdout is
 /// parsed, and neither ANSI colour nor a progress bar is valid JSON.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn wrap_command(command: &str) -> String {
     let mut statements = strict_text_defaults();
     statements.push("if($null -ne $PSStyle){$PSStyle.OutputRendering='PlainText'}".to_owned());

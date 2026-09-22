@@ -9,6 +9,7 @@ import { ApiProviderSettings } from "./ProviderSettings";
 import { GlobalSettingsNavigation } from "./GlobalSettingsNavigation";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { DependencySettings } from "./DependencySettings";
+import { ExecutionEnvironmentSettings } from "./ExecutionEnvironmentSettings";
 import { ShortcutSettings } from "./ShortcutSettings";
 import { UsageSettings } from "./UsageSettings";
 import { UpdateSettings } from "./UpdateSettings";
@@ -21,7 +22,10 @@ type GlobalSettingsChangeHandler = (change: GlobalSettingsChange) => void;
 interface GlobalSettingsProps {
   initialView: SettingsView;
   settings: GlobalSettingsType;
-  /** Read only by the usage page, to backfill turns recorded before the ledger existed. */
+  /**
+   * Read only: by the usage page, to backfill turns recorded before the ledger existed, and by
+   * the execution-environments page, to say what still uses a machine before it is deleted.
+   */
   document?: AppDocument | null;
   onChange: GlobalSettingsChangeHandler;
   onFlush?: () => Promise<void>;
@@ -80,6 +84,16 @@ export function GlobalSettings({
             />
           )}
           {view === "usage" && <UsageSettings document={document} />}
+          {view === "execution_environments" && (
+            <ExecutionEnvironmentSettings
+              environments={settings.executionEnvironments}
+              document={document}
+              onChange={(update) => onChange((current) => ({
+                ...current,
+                executionEnvironments: update(current.executionEnvironments)
+              }))}
+            />
+          )}
           {view === "dependencies" && (
             <DependencySettings
               tools={settings.environmentTools}

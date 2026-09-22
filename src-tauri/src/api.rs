@@ -34808,7 +34808,7 @@ mod tests {
         for name in [
             "read",
             "grep",
-            "powershell",
+            "bash",
             "write",
             "agent_spawn",
             "send_message",
@@ -34819,6 +34819,11 @@ mod tests {
             "todo",
         ] {
             assert!(exposed.contains(name), "{name} must be advertised");
+        }
+        // PowerShell runs only on a Windows host; everywhere else both of its
+        // tools are withdrawn rather than advertised to fail.
+        for name in ["powershell", "powershell_find_output"] {
+            assert_eq!(exposed.contains(name), cfg!(windows), "{name}");
         }
     }
 
@@ -34844,6 +34849,8 @@ mod tests {
                 .filter(|name| {
                     !matches!(name.as_str(), "preview_screenshot" | "preview_upload_image")
                 })
+                // A POSIX host withdraws both PowerShell tools.
+                .filter(|name| cfg!(windows) || !crate::builtin_schemas::is_powershell_tool(name))
                 .collect::<Vec<_>>();
             let step = step_request(&request);
             let exposed = step

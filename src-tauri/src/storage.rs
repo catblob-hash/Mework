@@ -378,6 +378,7 @@ fn canonicalize_temporary_workspace(document: &mut AppDocument) {
             kind: WorkspaceKind::Temporary,
             path: String::new(),
             machine: None,
+            additional_workspaces: Vec::new(),
             created_at: Utc::now().to_rfc3339(),
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
@@ -831,25 +832,30 @@ fn validate_workspace_authorizations(
     // A workspace's identity is its machine and its path: one machine's
     // `/srv/app` is not another's, and a remote path spelled like a local one
     // must not be read as the local grant.
-    let previous_exact = previous
+    //
+    // Every directory a previous project held counts as held — its workspace 1
+    // and its further workspaces alike — so reordering a project's workspaces,
+    // or moving one from one project to another, is not read as a new grant.
+    let previous_directories = previous
         .workspaces
         .iter()
         .filter(|workspace| workspace.kind == WorkspaceKind::Directory)
-        .map(|workspace| {
-            (
-                crate::run_environment::env_key(workspace.machine.as_ref()),
-                workspace.path.as_str(),
-            )
-        })
+        .flat_map(project_directories)
+        .collect::<Vec<_>>();
+    let previous_exact = previous_directories
+        .iter()
+        .map(|(machine, path)| (crate::run_environment::env_key(*machine), *path))
         .collect::<HashSet<_>>();
-    let previous_canonical = previous
+    let previous_canonical = previous_directories
+        .iter()
+        .filter(|(machine, _)| machine.is_none())
+        .filter_map(|(_, path)| AppState::workspace_key(Path::new(path)))
+        .collect::<HashSet<_>>();
+    let previous_by_id = previous
         .workspaces
         .iter()
-        .filter(|workspace| {
-            workspace.kind == WorkspaceKind::Directory && workspace.machine.is_none()
-        })
-        .filter_map(|workspace| AppState::workspace_key(Path::new(&workspace.path)))
-        .collect::<HashSet<_>>();
+        .map(|workspace| (workspace.id.as_str(), workspace))
+        .collect::<HashMap<_, _>>();
     let previous_machine_by_id = previous
         .workspaces
         .iter()
@@ -866,49 +872,146 @@ fn validate_workspace_authorizations(
         if workspace.kind != WorkspaceKind::Directory {
             continue;
         }
-        let machine_key = crate::run_environment::env_key(workspace.machine.as_ref());
-        if previous_exact.contains(&(machine_key.clone(), workspace.path.as_str())) {
-            continue;
-        }
-        // A directory on another machine has no canonical form this host can
-        // compute, so its grant is the machine plus the exact text the remote
-        // browser returned — the same rule attached workspaces follow.
-        if let Some(machine) = &workspace.machine {
-            state
-                .require_remote_workspace_authorization(
-                    &crate::run_environment::env_key(Some(machine)),
-                    &workspace.path,
-                )
-                .map_err(|error| format!("工作区 {} 未获授权: {error}", workspace.id))?;
-            continue;
-        }
-        if AppState::workspace_key(Path::new(&workspace.path))
-            .is_some_and(|key| previous_canonical.contains(&key))
-        {
-            continue;
-        }
-        state
-            .require_workspace_authorization(Path::new(&workspace.path))
+        authorize_project_directory(
+            workspace.machine.as_ref(),
+            &workspace.path,
+            &previous_exact,
+            &previous_canonical,
+            state,
+        )
+        .map_err(|error| {
+            // The same workspace stood on another machine a moment ago and
+            // now claims to be local at the same spelling: a load path
+            // dropped `machine`, not a user re-picking a directory. Say so.
+            // The local check that just failed would otherwise explain it
+            // as a POSIX path not being "absolute" on Windows.
+            match (
+                &workspace.machine,
+                previous_machine_by_id.get(workspace.id.as_str()),
+            ) {
+                (None, Some(machine)) => format!(
+                    "工作区 {} 位于另一台机器上（{}），但这次提交没有带 machine 字段，宿主不能把 {} 当作本机目录: {error}",
+                    workspace.id,
+                    crate::run_environment::env_key(Some(machine)),
+                    workspace.path
+                ),
+                _ => format!("工作区 {} 未获授权: {error}", workspace.id),
+            }
+        })?;
+        for (offset, member) in workspace.additional_workspaces.iter().enumerate() {
+            let position = offset + 2;
+            authorize_project_directory(
+                member.machine.as_ref(),
+                &member.path,
+                &previous_exact,
+                &previous_canonical,
+                state,
+            )
             .map_err(|error| {
-                // The same workspace stood on another machine a moment ago and
-                // now claims to be local at the same spelling: a load path
-                // dropped `machine`, not a user re-picking a directory. Say so.
-                // The local check that just failed would otherwise explain it
-                // as a POSIX path not being "absolute" on Windows.
-                match previous_machine_by_id.get(workspace.id.as_str()) {
+                // The same rule as workspace 1: a member that was on another
+                // machine at this spelling and now claims to be local lost its
+                // `machine` on the way here.
+                let dropped_machine = member
+                    .machine
+                    .is_none()
+                    .then(|| previous_by_id.get(workspace.id.as_str()))
+                    .flatten()
+                    .and_then(|held| {
+                        held.additional_workspaces.iter().find_map(|existing| {
+                            (existing.path == member.path)
+                                .then_some(existing.machine.as_ref())
+                                .flatten()
+                        })
+                    });
+                match dropped_machine {
                     Some(machine) => format!(
-                        "工作区 {} 位于另一台机器上（{}），但这次提交没有带 machine 字段，宿主不能把 {} 当作本机目录: {error}",
+                        "项目 {} 的工作区 {position}（{}）位于另一台机器上（{}），但这次提交没有带 machine 字段，宿主不能把它当作本机目录: {error}",
                         workspace.id,
-                        crate::run_environment::env_key(Some(machine)),
-                        workspace.path
+                        member.path,
+                        crate::run_environment::env_key(Some(machine))
                     ),
-                    None => format!("工作区 {} 未获授权: {error}", workspace.id),
+                    None => format!(
+                        "项目 {} 的工作区 {position}（{}）未获授权: {error}",
+                        workspace.id, member.path
+                    ),
                 }
             })?;
+        }
+        reject_duplicate_project_workspaces(workspace)?;
     }
 
     validate_additional_directory_authorizations(previous, document, state)?;
 
+    Ok(())
+}
+
+/// A project's directories in workspace order — workspace 1, then its further
+/// workspaces — each as the machine it is on and the path recorded there.
+fn project_directories(workspace: &Workspace) -> Vec<(Option<&crate::model::RunTarget>, &str)> {
+    std::iter::once((workspace.machine.as_ref(), workspace.path.as_str()))
+        .chain(
+            workspace
+                .additional_workspaces
+                .iter()
+                .map(|member| (member.machine.as_ref(), member.path.as_str())),
+        )
+        .collect()
+}
+
+/// Whether one directory may stand in a project: the previous document already
+/// held it, or a picker of the host's own returned it in this session.
+///
+/// A local directory is compared by canonical key as well as by literal text, so
+/// re-proposing one spelled differently is not read as a new grant. A directory
+/// on another machine has no canonical form this host can compute, so its grant
+/// is the machine plus the exact text the remote browser returned — the same
+/// rule attached workspaces follow. The error is the picker check's own; the
+/// caller says which workspace it was about.
+fn authorize_project_directory(
+    machine: Option<&crate::model::RunTarget>,
+    path: &str,
+    held_exact: &HashSet<(String, &str)>,
+    held_canonical: &HashSet<String>,
+    state: &AppState,
+) -> Result<(), String> {
+    let machine_key = crate::run_environment::env_key(machine);
+    if held_exact.contains(&(machine_key.clone(), path)) {
+        return Ok(());
+    }
+    if machine.is_some() {
+        return state.require_remote_workspace_authorization(&machine_key, path);
+    }
+    if AppState::workspace_key(Path::new(path)).is_some_and(|key| held_canonical.contains(&key)) {
+        return Ok(());
+    }
+    state.require_workspace_authorization(Path::new(path))
+}
+
+/// Refuses a project that lists one directory twice, workspace 1 included.
+///
+/// Two numbers for one directory would give the model two addresses for the
+/// same files and make "which workspace is this" ambiguous in every path it is
+/// shown. Local directories are compared by canonical key when the directory
+/// resolves — two spellings of one checkout are one workspace — and by exact
+/// text otherwise; a remote directory can only be compared by the machine and
+/// the exact text, since only that machine can resolve its own paths.
+fn reject_duplicate_project_workspaces(workspace: &Workspace) -> Result<(), String> {
+    let mut seen_exact = HashSet::new();
+    let mut seen_canonical = HashSet::new();
+    for (offset, (machine, path)) in project_directories(workspace).into_iter().enumerate() {
+        let duplicate_text =
+            !seen_exact.insert((crate::run_environment::env_key(machine), path.to_owned()));
+        let duplicate_directory = machine.is_none()
+            && AppState::workspace_key(Path::new(path))
+                .is_some_and(|key| !seen_canonical.insert(key));
+        if duplicate_text || duplicate_directory {
+            return Err(format!(
+                "项目 {} 的工作区 {} 与前面的工作区是同一个目录: {path}",
+                workspace.id,
+                offset + 1
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -941,7 +1044,13 @@ fn validate_additional_directory_authorizations(
 /// malfunctioning renderer cannot grow the list without bound; the composer's
 /// own chip row stops being readable long before this, and the number is also
 /// the address space the model is given, which has to stay readable at a glance.
-const MAX_ADDITIONAL_DIRECTORIES: usize = 32;
+pub(crate) const MAX_ADDITIONAL_DIRECTORIES: usize = 32;
+
+/// The most workspaces one project may hold, workspace 1 included (so fifteen
+/// further ones). Every conversation in the project addresses all of them
+/// before its own attached workspaces, so the bound keeps the shared prefix of
+/// every conversation's numbered list short enough to read at a glance.
+pub(crate) const MAX_PROJECT_WORKSPACES: usize = 16;
 
 /// Holds one conversation's attached workspaces to the workspace rule.
 ///
@@ -1031,6 +1140,12 @@ struct PersistedWorkspaceShell {
     /// every anchor written before workspaces could be remote means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     machine: Option<crate::model::RunTarget>,
+    /// The project's workspaces after workspace 1. Absent in every anchor
+    /// written before projects could hold more than one directory. This shell
+    /// is rebuilt field by field in both directions, so a field left out here
+    /// would be silently dropped on the next save.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    additional_workspaces: Vec<crate::model::AttachedWorkspace>,
     created_at: String,
     #[serde(default)]
     default_conversation_preset_id: String,
@@ -1097,6 +1212,7 @@ fn assemble_layout(path: &Path, value: serde_json::Value) -> Result<AppDocument,
             kind: shell.kind,
             path: shell.path,
             machine: shell.machine,
+            additional_workspaces: shell.additional_workspaces,
             created_at: shell.created_at,
             default_conversation_preset_id: shell.default_conversation_preset_id,
             last_conversation_settings: shell.last_conversation_settings,
@@ -1338,6 +1454,7 @@ pub fn save_unchecked(path: &Path, document: &AppDocument) -> Result<(), String>
                 kind: workspace.kind,
                 path: workspace.path.clone(),
                 machine: workspace.machine.clone(),
+                additional_workspaces: workspace.additional_workspaces.clone(),
                 created_at: workspace.created_at.clone(),
                 default_conversation_preset_id: workspace.default_conversation_preset_id.clone(),
                 last_conversation_settings: workspace.last_conversation_settings.clone(),
@@ -1575,6 +1692,7 @@ pub fn validate_shape(document: &AppDocument) -> Result<(), String> {
                 if workspace.path.trim().is_empty() {
                     return Err(format!("工作区 {} 的路径为空", workspace.id));
                 }
+                validate_project_member_shape(workspace)?;
             }
             WorkspaceKind::Temporary => {
                 if workspace.id != TEMPORARY_WORKSPACE_ID {
@@ -1584,6 +1702,12 @@ pub fn validate_shape(document: &AppDocument) -> Result<(), String> {
                 }
                 if !workspace.path.is_empty() {
                     return Err("临时工作区不得设置持久化路径".into());
+                }
+                // The temporary project is one scratch directory per
+                // conversation; there is no shared root for a second workspace
+                // to sit beside.
+                if !workspace.additional_workspaces.is_empty() {
+                    return Err("临时工作区不得设置额外工作区".into());
                 }
                 temporary_workspace_count += 1;
             }
@@ -1611,6 +1735,29 @@ pub fn validate_shape(document: &AppDocument) -> Result<(), String> {
     }
     if temporary_workspace_count != 1 {
         return Err("文档必须且只能包含一个临时工作区".into());
+    }
+    Ok(())
+}
+
+/// The shape a directory project's further workspaces must have: a bounded
+/// list of non-blank paths. Whether each entry was granted, and whether two of
+/// them name the same directory, needs the previous document and the
+/// filesystem, so [`validate_workspace_authorizations`] decides that.
+fn validate_project_member_shape(workspace: &Workspace) -> Result<(), String> {
+    if workspace.additional_workspaces.len() + 1 > MAX_PROJECT_WORKSPACES {
+        return Err(format!(
+            "项目 {} 的工作区超过 {MAX_PROJECT_WORKSPACES} 个",
+            workspace.id
+        ));
+    }
+    for (offset, member) in workspace.additional_workspaces.iter().enumerate() {
+        if member.path.trim().is_empty() {
+            return Err(format!(
+                "项目 {} 的工作区 {} 路径为空",
+                workspace.id,
+                offset + 2
+            ));
+        }
     }
     Ok(())
 }
@@ -6023,6 +6170,7 @@ b"
             default_conversation_preset_id: String::new(),
             last_conversation_settings: None,
             machine: None,
+            additional_workspaces: Vec::new(),
             conversations: Vec::new(),
         });
         assert!(validate_shape(&unsupported)
@@ -7646,5 +7794,231 @@ b"
             .expect_err("a remote path with no machine is not a local workspace");
         assert!(error.contains("/srv/app"), "{error}");
         assert!(error.contains("ssh:m1"), "{error}");
+    }
+
+    fn host_member(path: &Path) -> crate::model::AttachedWorkspace {
+        crate::model::AttachedWorkspace {
+            machine: None,
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn ssh_member(path: &str) -> crate::model::AttachedWorkspace {
+        crate::model::AttachedWorkspace {
+            machine: Some(crate::model::RunTarget::Ssh {
+                machine_id: "m1".into(),
+            }),
+            path: path.into(),
+        }
+    }
+
+    /// The anchor rebuilds each project field by field in both directions, so
+    /// a field it forgets is dropped on the next save without any error.
+    #[test]
+    fn project_members_survive_the_anchor_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state").join("document.v1.json");
+        let mut document = default_document();
+        document.workspaces[0].additional_workspaces =
+            vec![host_member(directory.path()), ssh_member("~/services")];
+        let store = crate::conversation_store::store_for(&path).unwrap();
+        seed_conversations(&store, &document).unwrap();
+        save_all(&path, &document).unwrap();
+
+        let loaded = read_document(&path).unwrap();
+        assert_eq!(
+            loaded.workspaces[0].additional_workspaces,
+            document.workspaces[0].additional_workspaces
+        );
+        assert_eq!(loaded, document);
+
+        // An anchor written before projects had members reads as none, and a
+        // project without members writes no key at all.
+        let anchor = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            anchor.matches("additionalWorkspaces").count(),
+            1,
+            "{anchor}"
+        );
+    }
+
+    #[test]
+    fn a_new_project_member_requires_a_picker_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let picked = directory.path().join("shared-library");
+        fs::create_dir(&picked).unwrap();
+        let previous = default_document();
+        let mut changed = previous.clone();
+        changed.workspaces[0].additional_workspaces = vec![host_member(&picked)];
+
+        let state = AppState::default();
+        let error = validate_workspace_authorizations(&previous, &changed, &state)
+            .expect_err("an unpicked directory must not join a project");
+        assert!(error.contains("工作区 2"), "{error}");
+        state.authorize_workspace(&picked).unwrap();
+        assert!(validate_workspace_authorizations(&previous, &changed, &state).is_ok());
+
+        // A member on another machine needs the remote browser's grant for that
+        // machine and that exact text; a local grant at the same spelling or a
+        // grant on another machine does not stand in for it.
+        let mut remote = previous.clone();
+        remote.workspaces[0].additional_workspaces = vec![ssh_member("/srv/app")];
+        let state = AppState::default();
+        assert!(validate_workspace_authorizations(&previous, &remote, &state).is_err());
+        state.authorize_remote_workspace("local", "/srv/app");
+        state.authorize_remote_workspace("wsl:Ubuntu", "/srv/app");
+        assert!(validate_workspace_authorizations(&previous, &remote, &state).is_err());
+        state.authorize_remote_workspace("ssh:m1", "/srv/app");
+        assert!(validate_workspace_authorizations(&previous, &remote, &state).is_ok());
+    }
+
+    /// Reloading must not revoke a grant, and a directory the previous document
+    /// held anywhere — as some project's workspace 1 or as a member — keeps its
+    /// standing wherever it moves among the projects.
+    #[test]
+    fn a_previously_held_directory_needs_no_new_grant_as_a_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let picked = directory.path().join("shared-library");
+        fs::create_dir(&picked).unwrap();
+        let fresh = AppState::default();
+
+        let mut held = default_document();
+        held.workspaces[0].additional_workspaces =
+            vec![host_member(&picked), ssh_member("/srv/app")];
+        assert!(validate_workspace_authorizations(&held, &held, &fresh).is_ok());
+
+        // Reordering members is not a new grant.
+        let mut reordered = held.clone();
+        reordered.workspaces[0].additional_workspaces.reverse();
+        assert!(validate_workspace_authorizations(&held, &reordered, &fresh).is_ok());
+
+        // Another spelling of the same local directory is the same grant.
+        let mut respelled = held.clone();
+        respelled.workspaces[0].additional_workspaces[0] = host_member(&picked.join("."));
+        assert!(validate_workspace_authorizations(&held, &respelled, &fresh).is_ok());
+
+        // A member promoted to its own project's workspace 1 keeps its standing.
+        let mut promoted = held.clone();
+        let mut project = promoted.workspaces[0].clone();
+        project.id = "ws_promoted".into();
+        project.path = picked.to_string_lossy().into_owned();
+        project.additional_workspaces.clear();
+        project.conversations.clear();
+        promoted.workspaces.push(project);
+        assert!(validate_workspace_authorizations(&held, &promoted, &fresh).is_ok());
+
+        // And a project's workspace 1 may join another project as a member.
+        let mut primary_only = promoted.clone();
+        primary_only.workspaces[0].additional_workspaces.clear();
+        let mut joined = primary_only.clone();
+        joined.workspaces[0].additional_workspaces = vec![host_member(&picked)];
+        assert!(validate_workspace_authorizations(&primary_only, &joined, &fresh).is_ok());
+
+        // The same text on another machine is not what was held.
+        let mut relocated = held.clone();
+        relocated.workspaces[0].additional_workspaces[1].machine =
+            Some(crate::model::RunTarget::Wsl {
+                distro: "Ubuntu".into(),
+            });
+        assert!(validate_workspace_authorizations(&held, &relocated, &fresh).is_err());
+
+        // A remote member that lost its machine is named as such.
+        let mut dropped = held.clone();
+        dropped.workspaces[0].additional_workspaces[1].machine = None;
+        let error = validate_workspace_authorizations(&held, &dropped, &fresh)
+            .expect_err("a remote path with no machine is not a local directory");
+        assert!(error.contains("ssh:m1"), "{error}");
+        assert!(error.contains("machine 字段"), "{error}");
+    }
+
+    #[test]
+    fn a_project_cannot_list_one_directory_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let picked = directory.path().join("shared-library");
+        fs::create_dir(&picked).unwrap();
+        let root = directory.path().join("app");
+        fs::create_dir(&root).unwrap();
+        let state = AppState::default();
+        state.authorize_workspace(&picked).unwrap();
+        state.authorize_workspace(&root).unwrap();
+        state.authorize_remote_workspace("ssh:m1", "/srv/app");
+        state.authorize_remote_workspace("wsl:Ubuntu", "/srv/app");
+        let previous = default_document();
+
+        let mut twice = previous.clone();
+        twice.workspaces[0].additional_workspaces =
+            vec![host_member(&picked), host_member(&picked)];
+        let error = validate_workspace_authorizations(&previous, &twice, &state)
+            .expect_err("the same directory twice is refused");
+        assert!(error.contains("工作区 3"), "{error}");
+
+        // Workspace 1 counts, and two spellings of one local directory are one.
+        let mut shadowing = previous.clone();
+        shadowing.workspaces[0].path = root.to_string_lossy().into_owned();
+        shadowing.workspaces[0].additional_workspaces = vec![host_member(&root.join("."))];
+        let error = validate_workspace_authorizations(&previous, &shadowing, &state)
+            .expect_err("a member that is workspace 1 again is refused");
+        assert!(error.contains("工作区 2"), "{error}");
+
+        // Remote directories compare by machine and exact text.
+        let mut remote_twice = previous.clone();
+        remote_twice.workspaces[0].additional_workspaces =
+            vec![ssh_member("/srv/app"), ssh_member("/srv/app")];
+        assert!(validate_workspace_authorizations(&previous, &remote_twice, &state).is_err());
+        let mut two_machines = previous.clone();
+        two_machines.workspaces[0].additional_workspaces = vec![
+            ssh_member("/srv/app"),
+            crate::model::AttachedWorkspace {
+                machine: Some(crate::model::RunTarget::Wsl {
+                    distro: "Ubuntu".into(),
+                }),
+                path: "/srv/app".into(),
+            },
+            host_member(&picked),
+        ];
+        assert!(validate_workspace_authorizations(&previous, &two_machines, &state).is_ok());
+    }
+
+    #[test]
+    fn a_project_holds_a_bounded_number_of_workspaces() {
+        let mut document = default_document();
+        document.workspaces[0].additional_workspaces = (0..MAX_PROJECT_WORKSPACES - 1)
+            .map(|index| ssh_member(&format!("/srv/app-{index}")))
+            .collect();
+        assert!(validate_shape(&document).is_ok());
+
+        document.workspaces[0]
+            .additional_workspaces
+            .push(ssh_member("/srv/one-too-many"));
+        let error = validate_shape(&document).expect_err("an unbounded project is refused");
+        assert!(
+            error.contains(&format!("超过 {MAX_PROJECT_WORKSPACES} 个")),
+            "{error}"
+        );
+
+        let mut blank = default_document();
+        blank.workspaces[0].additional_workspaces = vec![ssh_member("  ")];
+        assert!(validate_shape(&blank).unwrap_err().contains("路径为空"));
+    }
+
+    /// The temporary project is one scratch directory per conversation, so it
+    /// has no root for a second workspace to sit beside — and the save-time
+    /// canonicalization that clears its path must not quietly clear these.
+    #[test]
+    fn the_temporary_project_has_no_members() {
+        let previous = default_document();
+        let mut changed = previous.clone();
+        changed
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.kind == WorkspaceKind::Temporary)
+            .unwrap()
+            .additional_workspaces = vec![ssh_member("/srv/app")];
+
+        let error = validate_shape(&changed).expect_err("a temporary project has no members");
+        assert!(error.contains("额外工作区"), "{error}");
+        let state = AppState::default();
+        state.authorize_remote_workspace("ssh:m1", "/srv/app");
+        assert!(prepare_save_transition(&previous, &changed, &state).is_err());
     }
 }

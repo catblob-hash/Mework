@@ -47,6 +47,7 @@ fn main() {
     if !matches!(fs::read(&manifest_icon), Ok(existing) if existing == icon) {
         fs::write(&manifest_icon, &icon).expect("write generated application icon");
     }
+    stage_non_windows_icons(manifest_icon.parent().expect("icon parent"));
 
     let windows = if embed_windows_manifest_for_all_link_targets(&output_dir) {
         // The Windows manifest is already linked into every executable (bins and every
@@ -412,30 +413,91 @@ fn prefer_mingw_toolchain() {
     }
 }
 
-fn generated_icon() -> Vec<u8> {
+/// Renders the icon as a PNG `size` pixels square, from the scene or, below
+/// [`APP_ICON_SCENE_MIN_SIZE`], from the head alone.
+fn render_icon_png(size: u32) -> Vec<u8> {
     let options = resvg::usvg::Options::default();
-    let parse = |svg: &[u8], what: &str| {
-        resvg::usvg::Tree::from_data(svg, &options).unwrap_or_else(|_| panic!("parse {what}"))
+    let (svg, what) = if size >= APP_ICON_SCENE_MIN_SIZE {
+        (APP_ICON_SVG, "the canonical Mework SVG icon")
+    } else {
+        (APP_ICON_SMALL_SVG, "the small-frame Mework SVG icon")
     };
-    let scene = parse(APP_ICON_SVG, "the canonical Mework SVG icon");
-    let head = parse(APP_ICON_SMALL_SVG, "the small-frame Mework SVG icon");
+    let tree =
+        resvg::usvg::Tree::from_data(svg, &options).unwrap_or_else(|_| panic!("parse {what}"));
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(size, size).expect("allocate Mework icon pixmap");
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        size as f32 / tree.size().width(),
+        size as f32 / tree.size().height(),
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().expect("encode Mework icon PNG")
+}
+
+/// Writes `bytes` to `path` unless it already holds exactly them, so an
+/// unchanged icon does not touch the file and retrigger downstream work.
+fn write_if_changed(path: &Path, bytes: &[u8]) {
+    if !matches!(fs::read(path), Ok(existing) if existing == bytes) {
+        fs::write(path, bytes).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    }
+}
+
+/// The icons a non-Windows target needs, rendered from the same two SVGs as
+/// `icon.ico`, so a fresh clone builds without a manual icon step.
+///
+/// `tauri::generate_context!` opens `icons/icon.png` for the window icon on
+/// every target but Windows, and the macOS bundler takes the app icon from
+/// `icons/icon.icns` (`tauri.macos.conf.json`). Both are build output, ignored
+/// by Git; only `icon.ico`, the shipped Windows icon, is tracked.
+fn stage_non_windows_icons(icons: &Path) {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        return;
+    }
+    write_if_changed(&icons.join("icon.png"), &render_icon_png(512));
+    if target_os == "macos" {
+        write_if_changed(&icons.join("icon.icns"), &generated_icns());
+    }
+}
+
+/// An `.icns` holding one PNG per slot macOS looks for, standard and Retina.
+///
+/// The format is a big-endian `icns` header and length, then one
+/// `type, length, PNG` element per image; every type below takes PNG data.
+fn generated_icns() -> Vec<u8> {
+    const ELEMENTS: [(&[u8; 4], u32); 10] = [
+        (b"icp4", 16),
+        (b"icp5", 32),
+        (b"ic11", 32),
+        (b"ic12", 64),
+        (b"ic07", 128),
+        (b"ic13", 256),
+        (b"ic08", 256),
+        (b"ic14", 512),
+        (b"ic09", 512),
+        (b"ic10", 1024),
+    ];
+    let mut rendered = std::collections::BTreeMap::new();
+    let mut body = Vec::new();
+    for (kind, size) in ELEMENTS {
+        let png = rendered
+            .entry(size)
+            .or_insert_with(|| render_icon_png(size));
+        body.extend_from_slice(kind);
+        body.extend_from_slice(&(8 + png.len() as u32).to_be_bytes());
+        body.extend_from_slice(png);
+    }
+    let mut icns = Vec::with_capacity(8 + body.len());
+    icns.extend_from_slice(b"icns");
+    icns.extend_from_slice(&(8 + body.len() as u32).to_be_bytes());
+    icns.extend_from_slice(&body);
+    icns
+}
+
+fn generated_icon() -> Vec<u8> {
     let png_images = APP_ICON_SIZES
         .into_iter()
-        .map(|size| {
-            let tree = if size >= APP_ICON_SCENE_MIN_SIZE {
-                &scene
-            } else {
-                &head
-            };
-            let mut pixmap =
-                resvg::tiny_skia::Pixmap::new(size, size).expect("allocate Mework icon pixmap");
-            let transform = resvg::tiny_skia::Transform::from_scale(
-                size as f32 / tree.size().width(),
-                size as f32 / tree.size().height(),
-            );
-            resvg::render(tree, transform, &mut pixmap.as_mut());
-            pixmap.encode_png().expect("encode Mework icon PNG")
-        })
+        .map(render_icon_png)
         .collect::<Vec<_>>();
 
     let directory_bytes = 6 + png_images.len() * 16;
