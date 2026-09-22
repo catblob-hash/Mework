@@ -31,6 +31,7 @@ const APP_COMMANDS: &[&str] = mework_app_commands!(app_command_names);
 fn main() {
     prefer_mingw_toolchain();
     stage_aisdk_sidecar();
+    stage_claude_code();
     println!("cargo:rerun-if-changed=../src/mework-icon.svg");
     println!("cargo:rerun-if-changed=../src/mework-icon-small.svg");
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
@@ -173,6 +174,154 @@ fn stage_aisdk_sidecar() {
     fs::create_dir_all(staged.parent().expect("binaries directory"))
         .expect("create the sidecar staging directory");
     fs::copy(&built, &staged).expect("stage the AI SDK sidecar for externalBin");
+}
+
+/// The Claude Code build the `claude_agent` family runs, and the only one it will
+/// run: this is the version Mework ships, not whatever the user happens to have
+/// installed.
+///
+/// It is the CLI inside the Agent SDK's own platform package, so the SDK and the
+/// executable it drives can never disagree — the npm pin in
+/// `aisdk-service/package.json` is exact for that reason, and
+/// [`stage_claude_code`] refuses to build if the installed SDK declares a
+/// different `claudeCodeVersion`. Bumping the CLI therefore means bumping the SDK
+/// pin and this constant together, then re-reading what changed in the CLI's own
+/// behaviour (see `docs/model-providers.md`).
+const CLAUDE_CODE_VERSION: &str = "2.1.261";
+
+/// The Agent SDK's npm platform package for the build target, in the SDK's own
+/// naming: `process.platform`-`process.arch`, plus `-musl` where the C library
+/// decides which binary runs. The SDK resolves exactly this name when no
+/// executable is handed to it, so mirroring it here ships the file the SDK itself
+/// would have picked.
+fn claude_code_platform_package() -> String {
+    let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is set for build scripts");
+    let arch =
+        env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is set for build scripts");
+    let platform = match os.as_str() {
+        "windows" => "win32",
+        "macos" => "darwin",
+        "linux" => "linux",
+        other => panic!("Claude Code 没有 {other} 的平台包；该家族无法在此目标上发布"),
+    };
+    let arch = match arch.as_str() {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => panic!("Claude Code 没有 {platform}-{other} 的平台包"),
+    };
+    // The musl and glibc builds are separate downloads: a glibc binary on a musl
+    // host fails to launch because the loader it names is absent.
+    let libc = if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl") {
+        "-musl"
+    } else {
+        ""
+    };
+    format!("@anthropic-ai/claude-agent-sdk-{platform}-{arch}{libc}")
+}
+
+/// Reads one string field out of a package manifest.
+///
+/// A whole JSON parser is not a build dependency here, and the input is npm's own
+/// published `package.json` rather than user input: the field is found by key and
+/// the answer is the next quoted string.
+fn json_string_field(text: &str, key: &str) -> Option<String> {
+    let after_key = text.split_once(&format!("\"{key}\""))?.1;
+    let after_colon = after_key.split_once(':')?.1;
+    let opened = after_colon.split_once('"')?.1;
+    Some(opened.split_once('"')?.0.to_owned())
+}
+
+/// Stages the bundled Claude Code CLI where `externalBin` expects it.
+///
+/// `tauri.conf.json` declares `binaries/claude` next to `binaries/mework-aisdk`,
+/// so the CLI lands beside the application executable and both the host (login
+/// probe, interactive login) and the sidecar resolve it from there — see
+/// `src-tauri/src/aisdk/agent.rs::bundled_executable`.
+///
+/// The source is the Agent SDK's platform package in `aisdk-service/node_modules`,
+/// which npm installs as an optional dependency of the pinned SDK. An install that
+/// skipped optional dependencies has no CLI to ship, and the resulting build would
+/// fail every `claude_agent` request at runtime instead, so that is a build error
+/// here.
+///
+/// The version gate is the point of the exercise: the declared `claudeCodeVersion`
+/// must equal [`CLAUDE_CODE_VERSION`], and the value is exported to the crate so a
+/// test can assert the same number the build shipped. A tree with no
+/// `node_modules` at all keeps an already-staged copy rather than failing — the
+/// release flow always has one (`beforeBuildCommand` needs it), and a stale staged
+/// binary is caught at runtime by
+/// `aisdk::agent::tests::the_bundled_executable_reports_the_pinned_claude_code_version`
+/// and by the sidecar's `cc_version` assertion.
+fn stage_claude_code() {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let repo = manifest.parent().expect("repository root").to_path_buf();
+    let exe_suffix = if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let modules = repo.join("aisdk-service").join("node_modules");
+    let sdk_manifest = modules
+        .join("@anthropic-ai")
+        .join("claude-agent-sdk")
+        .join("package.json");
+    let source = modules
+        .join(claude_code_platform_package())
+        .join(format!("claude{exe_suffix}"));
+    println!("cargo:rerun-if-changed={}", sdk_manifest.display());
+    println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rustc-env=MEWORK_CLAUDE_CODE_VERSION={CLAUDE_CODE_VERSION}");
+
+    let target = env::var("TARGET").expect("TARGET is set by Cargo for build scripts");
+    let staged = manifest
+        .join("binaries")
+        .join(format!("claude-{target}{exe_suffix}"));
+    println!("cargo:rerun-if-changed={}", staged.display());
+
+    // The SDK ships the CLI's version in its own manifest. Checking it before the
+    // copy is what makes "Mework runs Claude Code 2.1.261" a fact about the build
+    // rather than a hope about node_modules.
+    if let Ok(text) = fs::read_to_string(&sdk_manifest) {
+        let declared = json_string_field(&text, "claudeCodeVersion");
+        assert!(
+            declared.as_deref() == Some(CLAUDE_CODE_VERSION),
+            "{} 声明的 Claude Code 版本是 {}，而 Mework 锁定的是 {CLAUDE_CODE_VERSION}。\n\
+             两者必须一致：要么把 aisdk-service/package.json 的 @anthropic-ai/claude-agent-sdk \
+             钉回捆绑 {CLAUDE_CODE_VERSION} 的那个版本，\n\
+             要么连同 build.rs 的 CLAUDE_CODE_VERSION 一起升级，并复核 CLI 自身行为的变化。",
+            sdk_manifest.display(),
+            declared.unwrap_or_else(|| "（读不到）".to_owned()),
+        );
+    }
+
+    let Some(source_meta) = fs::metadata(&source).ok() else {
+        // Nothing to stage from. An already-staged copy is fine — that is the packaging box,
+        // where `beforeBuildCommand` populated `aisdk-service/` before this ran.
+        assert!(
+            staged.is_file(),
+            "Mework 要随包附带的 Claude Code 缺席，Tauri 的 externalBin 找不到 {}。\n\
+             它来自 Agent SDK 的平台包 {}，\n\
+             在 aisdk-service/ 里跑 `npm install`（不要带 --omit=optional）就会装上。",
+            staged.display(),
+            source.display(),
+        );
+        return;
+    };
+
+    if let Ok(staged_meta) = fs::metadata(&staged) {
+        let same_size = staged_meta.len() == source_meta.len();
+        let fresh = match (staged_meta.modified(), source_meta.modified()) {
+            (Ok(staged_at), Ok(source_at)) => staged_at >= source_at,
+            _ => false,
+        };
+        if same_size && fresh {
+            return;
+        }
+    }
+
+    fs::create_dir_all(staged.parent().expect("binaries directory"))
+        .expect("create the sidecar staging directory");
+    fs::copy(&source, &staged).expect("stage the bundled Claude Code for externalBin");
 }
 
 ///

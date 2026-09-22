@@ -6,13 +6,15 @@
 //
 // The archive is an allowlist, never a copy of `target/release`: that directory
 // also holds PDBs, dependency intermediates, and staging left over from earlier
-// resource configurations. Two executables and the license files are the whole payload.
+// resource configurations. Three executables and the license files are the whole payload.
 //
-// The adjacent sidecar name is a hard runtime contract. A release build resolves
-// the AI SDK sidecar as `<dir of mework.exe>/mework-aisdk.exe` and has no
-// source-tree fallback (src-tauri/src/aisdk/process.rs), so renaming it, keeping
-// the `-<target-triple>` suffix, or nesting it in a subdirectory produces an
-// archive that launches and then fails every model request.
+// The adjacent binary names are hard runtime contracts. A release build resolves
+// the AI SDK sidecar as `<dir of mework.exe>/mework-aisdk.exe` and the bundled
+// Claude Code as `<dir of mework.exe>/claude.exe`, neither with a source-tree
+// fallback (src-tauri/src/aisdk/process.rs, src-tauri/src/aisdk/agent.rs), so
+// renaming either, keeping the `-<target-triple>` suffix, or nesting one in a
+// subdirectory produces an archive that launches and then fails every model
+// request — or, for `claude.exe`, every request of the Claude Agent family.
 //
 // Usage:
 //   node scripts/package-portable.mjs             # writes the default archive
@@ -51,10 +53,11 @@ const packageVersion = JSON.parse(
 ).version;
 
 // Every entry lands at the archive root: the documented instruction is "unzip
-// anywhere and run mework.exe", and the sidecar must sit next to it.
+// anywhere and run mework.exe", and both adjacent binaries must sit next to it.
 const payload = [
   { from: path.join(releaseDirectory, "mework.exe"), as: "mework.exe" },
   { from: path.join(releaseDirectory, "mework-aisdk.exe"), as: "mework-aisdk.exe" },
+  { from: path.join(releaseDirectory, "claude.exe"), as: "claude.exe" },
   { from: path.join(root, "LICENSE"), as: "LICENSE" },
   { from: path.join(root, "THIRD-PARTY-NOTICES.md"), as: "THIRD-PARTY-NOTICES.md" },
   { from: path.join(root, "THIRD-PARTY-LICENSES.md"), as: "THIRD-PARTY-LICENSES.md" }

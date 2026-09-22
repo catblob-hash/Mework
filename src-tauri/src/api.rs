@@ -276,6 +276,11 @@ const SUBAGENT_DISABLED_TOOL_NAMES: &[&str] = &[
     // parent conversation's selection, and the call is a lookup in memory. A
     // child doing work the user packaged a skill for should be able to read
     // that skill; a role that disagrees can still exclude it by name.
+    //
+    // The decision-model tools (`decision_tools::DECISION_TOOL_NAMES`) are absent
+    // for the same reason `grep` and `read` are: each is a read of material the
+    // child could read anyway, scored by a provider the user configured, and
+    // delegated research is exactly where keeping bulk out of a context pays.
 ];
 
 fn subagent_tool_is_disabled(name: &str) -> bool {
@@ -12423,6 +12428,9 @@ fn deliver_pending_child_messages(
             tool_name: BOX_TOOL.to_owned(),
             round: Some(round),
             model_turn_id: None,
+            // The host issued this call, so there is no provider id to keep;
+            // both legs mint the same digest from the card's own id.
+            provider_call_id: None,
             requested_input: None,
             input,
             result,
@@ -12970,6 +12978,8 @@ fn fold_undrained_agent_results(
             // renderer and wire projection recognize the host-collected card by id.
             round: Some(round),
             model_turn_id: None,
+            // Host-issued call: no provider id to keep.
+            provider_call_id: None,
             requested_input: None,
             input,
             result,
@@ -13038,6 +13048,9 @@ fn fold_workflow_restart_notices(
             tool_name: BOX_TOOL.to_owned(),
             round: Some(round),
             model_turn_id: None,
+            // The host issued this call, so there is no provider id to keep;
+            // both legs mint the same digest from the card's own id.
+            provider_call_id: None,
             requested_input: None,
             input,
             result,
@@ -13810,6 +13823,11 @@ fn tool_context_for_turn(
         tool_name: execution.call.name.clone(),
         round: Some(round),
         model_turn_id: Some(model_turn_id.to_owned()),
+        // Kept alongside the derived local id, not recoverable from it: the
+        // digest is one-way, and replay that cannot read this back has to mint a
+        // new id, which rewrites every tool call in the turn the moment the next
+        // turn replays it.
+        provider_call_id: Some(execution.call.id.clone()),
         requested_input,
         input,
         result,
@@ -16106,6 +16124,7 @@ mod tests {
             tool_name: "read".into(),
             round: Some(1),
             model_turn_id: Some("image-turn".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(json!({"path":"pixel.png"})).unwrap(),
             result: ToolResult {
@@ -17181,6 +17200,7 @@ mod tests {
                 tool_name: "read".into(),
                 round: Some(1),
                 model_turn_id: Some("pure-image-turn".into()),
+                provider_call_id: None,
                 requested_input: None,
                 input: serde_json::from_value(json!({"path":"pixel.png"})).unwrap(),
                 result: result.clone(),
@@ -17616,6 +17636,7 @@ mod tests {
             tool_name: tool_name.into(),
             round: Some(1),
             model_turn_id: Some(format!("turn-{id}")),
+            provider_call_id: None,
             requested_input: None,
             input: Default::default(),
             result: ToolResult {
@@ -18367,6 +18388,7 @@ mod tests {
                 tool_name: "read".into(),
                 round: Some(1),
                 model_turn_id: Some("turn-1".into()),
+                provider_call_id: None,
                 requested_input: None,
                 input: serde_json::from_value(json!({"path":"a.txt"})).unwrap(),
                 result: ToolResult {
@@ -18551,6 +18573,7 @@ mod tests {
                 tool_name: name.into(),
                 round,
                 model_turn_id: model_turn_id.map(str::to_owned),
+                provider_call_id: None,
                 requested_input: None,
                 input: serde_json::from_value(json!({"path": format!("{id}.txt")})).unwrap(),
                 result: ToolResult {
@@ -19520,6 +19543,7 @@ mod tests {
             tool_name: "read".into(),
             round: Some(1),
             model_turn_id: Some(model_turn_id.clone()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(json!({"path": "README.md"})).unwrap(),
             result: ToolResult {
@@ -25523,6 +25547,7 @@ mod tests {
             tool_name: "workflow".into(),
             round: Some(1),
             model_turn_id: None,
+            provider_call_id: None,
             requested_input: None,
             input: json!({
                 "name": "scriptless-first",
@@ -26955,6 +26980,7 @@ mod tests {
             tool_name: "agent_spawn".into(),
             round: Some(1),
             model_turn_id: Some("old-spawn-turn".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(json!({"prompt":"历史任务","name":"a9"})).unwrap(),
             result: ToolResult {
@@ -27183,6 +27209,7 @@ mod tests {
                 tool_name: "agent_spawn".into(),
                 round: Some(1),
                 model_turn_id: Some("persisted-agent-turn".into()),
+                provider_call_id: None,
                 requested_input: None,
                 input: JsonObject::new(),
                 result: ToolResult {
@@ -28088,6 +28115,7 @@ mod tests {
                 tool_name: "agent_spawn".into(),
                 round: Some(1),
                 model_turn_id: Some(format!("turn-{name}")),
+                provider_call_id: None,
                 requested_input: None,
                 input: serde_json::from_value(json!({
                     "prompt": "Review persisted history",
@@ -29891,6 +29919,7 @@ mod tests {
             tool_name: "agent_spawn".into(),
             round: Some(1),
             model_turn_id: Some("turn-named-agent".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(json!({
                 "prompt": "Review",
@@ -31869,6 +31898,7 @@ mod tests {
             tool_name: "agent_spawn".into(),
             round: Some(1),
             model_turn_id: Some("old-spawn-turn".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(json!({"prompt":"历史任务","name":"a9"})).unwrap(),
             result: ToolResult {
@@ -31996,6 +32026,7 @@ mod tests {
             tool_name: "agent_spawn".into(),
             round: Some(1),
             model_turn_id: Some("old-spawn-turn".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(json!({"prompt":"历史任务","name":"a9"})).unwrap(),
             result: ToolResult {
@@ -32727,6 +32758,7 @@ mod tests {
             tool_name: tool_name.to_owned(),
             round: Some(1),
             model_turn_id: None,
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(json!({"tasks": ["a1"]})).unwrap(),
             result: ToolResult {
@@ -33875,8 +33907,8 @@ mod tests {
     #[test]
     fn the_main_agent_catalog_exposes_exactly_the_two_web_names() {
         let catalog = catalog::tool_catalog();
-        // The web group has exactly search, fetch, and the fifteen preview tools; `web_query`
-        // remains retired.
+        // The web group has exactly search, fetch, the fifteen preview tools and the five
+        // decision-model preview tools; `web_query` remains retired.
         let web_names = catalog
             .iter()
             .filter(|tool| tool.category == ToolCategory::Web)
@@ -33902,6 +33934,11 @@ mod tests {
                 "preview_resize",
                 "preview_upload_image",
                 "preview_dialog",
+                "preview_find_element",
+                "preview_find_logs",
+                "preview_click_by_description",
+                "preview_fill_by_description",
+                "preview_inspect_by_description",
             ]
         );
 

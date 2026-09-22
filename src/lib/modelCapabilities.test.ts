@@ -13,6 +13,7 @@ import {
   normalizeCapabilities,
   normalizeEndpointTypes,
   normalizePromptCache,
+  knownFamilySettings,
   normalizeReasoningContent,
   promptCacheTakesEffect,
   reasoningContentTakesEffect,
@@ -24,6 +25,11 @@ function model(id: string, group = ""): ModelProfile {
   return { id, name: "", group, capabilities: [], reasoningContent: "plaintext", promptCache: true };
 }
 
+describe("known family settings", () => {
+  it("has no settings for the bundled Claude Agent", () => {
+    expect(knownFamilySettings("claude_agent")).toEqual([]);
+  });
+});
 describe("modelGroup", () => {
   it("prefers an explicit group over anything inferred", () => {
     expect(modelGroup(model("Qwen/Qwen3-8B", "  我的分组  "))).toBe("我的分组");

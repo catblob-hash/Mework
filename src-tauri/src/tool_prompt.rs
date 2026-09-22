@@ -80,7 +80,10 @@ const MAX_FEEDBACK_CHARS: usize = 4_000;
 /// because "this class of call" is not a meaningful category when the class is
 /// "run anything".
 pub fn is_shell_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "bash" | "powershell")
+    matches!(
+        tool_name,
+        "bash" | "powershell" | "bash_find_output" | "powershell_find_output"
+    )
 }
 
 /// Tools that may never carry a standing allowance, whatever the level says.
@@ -115,7 +118,7 @@ pub fn summarize_tool_input(tool_name: &str, input: &JsonObject) -> String {
         // The background marker rides in front of the command so the user
         // approving the card knows this call returns immediately and the
         // command then runs detached from the round.
-        "bash" | "powershell" => text("command").map(|command| {
+        "bash" | "powershell" | "bash_find_output" | "powershell_find_output" => text("command").map(|command| {
             if input.get("run_in_background") == Some(&Value::Bool(true)) {
                 format!("[后台] {command}")
             } else {

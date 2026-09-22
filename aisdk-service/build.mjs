@@ -28,9 +28,10 @@ const ESM_BANNER = [
 ].join("\n");
 
 // The Claude Agent SDK evaluates `import.meta.url` at module load (it derives a
-// `createRequire` from it, used only to locate its optional bundled CLI, which
-// Mework never uses). CommonJS has no `import.meta`, so the SEA bundle defines it
-// from `__filename`; inside the single-file executable that is the sidecar itself.
+// `createRequire` from it, used only to locate its bundled CLI when no
+// `pathToClaudeCodeExecutable` is given — which the sidecar always gives).
+// CommonJS has no `import.meta`, so the SEA bundle defines it from `__filename`;
+// inside the single-file executable that is the sidecar itself.
 const CJS_BANNER = [
   "// mework-aisdk sidecar bundle — generated, do not edit.",
   'const __mework_import_meta_url = require("node:url").pathToFileURL(__filename).href;',
@@ -38,9 +39,11 @@ const CJS_BANNER = [
 
 /**
  * The Agent SDK's platform packages (`@anthropic-ai/claude-agent-sdk-<os>-<arch>`)
- * hold a 200 MiB Claude Code binary. They are resolved only when no
- * `pathToClaudeCodeExecutable` is given; the sidecar always gives one, so they
- * stay out of the bundle and out of the release.
+ * hold a ~200 MiB Claude Code binary. Mework ships that binary, but as a file of
+ * its own beside the application — `src-tauri/build.rs` stages it and
+ * `tauri.conf.json` declares it an `externalBin` — and the host hands its path to
+ * the sidecar in `agent.executable`. Bundling it into this JavaScript would only
+ * make the sidecar 200 MiB larger for nothing, so esbuild keeps it out.
  */
 const EXTERNAL = ["@anthropic-ai/claude-agent-sdk-*"];
 

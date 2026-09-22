@@ -5753,6 +5753,7 @@ mod tests {
             tool_name: "read".into(),
             round: Some(1),
             model_turn_id: Some("turn-1".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(serde_json::json!({"path": "a.txt"})).expect("input"),
             result: ToolResult {

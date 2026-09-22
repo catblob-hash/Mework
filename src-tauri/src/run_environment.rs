@@ -340,6 +340,36 @@ pub fn ssh_client_candidates() -> Vec<String> {
     }
 }
 
+/// Whether a failed remote invocation was answered by `cmd.exe` or PowerShell
+/// rather than a POSIX shell.
+///
+/// Every remote leg sends the `cd … || exit 1; exec env … bash -c …` line from
+/// [`ssh_shell_args`], and a Windows sshd whose `DefaultShell` is still the
+/// factory `cmd.exe` cannot run a word of it. What comes back is that shell's
+/// own "not recognized" complaint about `exec`, which read raw says nothing
+/// about what to change on the machine. The signatures: `cmd.exe` says so in
+/// the console language and exits 9009; PowerShell prints the
+/// locale-independent `CommandNotFoundException` category. The exit code is
+/// only a secondary signal — the Windows OpenSSH client passes it through
+/// whole, a POSIX client folds it to eight bits — so the text carries the
+/// weight, and an unknown language falls through to the raw reply.
+pub fn answered_by_non_posix_shell(status: Option<i32>, stderr: &str) -> bool {
+    const SIGNATURES: [&str; 6] = [
+        "is not recognized as an internal or external command",
+        "is not recognized as the name of a cmdlet",
+        "CommandNotFoundException",
+        "不是内部或外部命令",
+        "不是內部或外部命令",
+        "内部コマンドまたは外部コマンド",
+    ];
+    status == Some(9009) || SIGNATURES.iter().any(|needle| stderr.contains(needle))
+}
+
+/// What to tell someone whose SSH machine answered through `cmd.exe` or
+/// PowerShell: the remote legs need a POSIX shell as that account's login
+/// shell, and on Windows that is a registry change, not a Mework setting.
+pub const NON_POSIX_SHELL_ADVICE: &str = "这台机器的 SSH 默认 shell 不是 POSIX shell（回应来自 cmd.exe 或 PowerShell）。Mework 的远端腿需要 bash：在那台 Windows 上安装 Git for Windows 之类的 MSYS 环境，把注册表 HKLM\\SOFTWARE\\OpenSSH 下的 DefaultShell 指向它的 bash.exe、DefaultShellCommandOption 设为 -c，重启 sshd 后再试";
+
 /// What one remote invocation left behind.
 ///
 /// `stdout` stays raw. A remote `read` carries file bytes through it, and
@@ -1443,5 +1473,40 @@ mod tests {
         );
 
         assert!(remote_script_invocation(&ShellRunner::default(), "pwd").is_err());
+    }
+
+    /// The factory Windows sshd hands the POSIX line to `cmd.exe`, which
+    /// complains about `exec` in the console language and exits 9009;
+    /// PowerShell names the exception category regardless of locale. A POSIX
+    /// shell's own failures must not be mistaken for either.
+    #[test]
+    fn a_cmd_or_powershell_answer_is_recognized_in_any_language() {
+        assert!(answered_by_non_posix_shell(
+            Some(1),
+            "'exec' is not recognized as an internal or external command,\noperable program or batch file."
+        ));
+        assert!(answered_by_non_posix_shell(
+            Some(1),
+            "'exec' 不是内部或外部命令，也不是可运行的程序\n或批处理文件。"
+        ));
+        assert!(answered_by_non_posix_shell(Some(9009), "Der Befehl ist falsch."));
+        assert!(answered_by_non_posix_shell(
+            Some(1),
+            "exec : The term 'exec' is not recognized as the name of a cmdlet, function, script file, or operable program."
+        ));
+        assert!(answered_by_non_posix_shell(
+            Some(1),
+            "    + CategoryInfo          : ObjectNotFound: (exec:String) [], CommandNotFoundException"
+        ));
+
+        assert!(!answered_by_non_posix_shell(
+            Some(1),
+            "bash: line 1: cd: /srv/missing: No such file or directory"
+        ));
+        assert!(!answered_by_non_posix_shell(
+            Some(255),
+            "ssh: connect to host devbox port 22: Connection refused"
+        ));
+        assert!(!answered_by_non_posix_shell(Some(127), "bash: rg: command not found"));
     }
 }

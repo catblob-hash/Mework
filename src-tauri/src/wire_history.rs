@@ -57,8 +57,66 @@ const WIRE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) struct CanonicalToolExchange {
     pub local_id: String,
     pub tool_name: String,
+    /// The provider's own call id, already screened by
+    /// [`replayable_provider_call_id`]. `None` means this exchange mints a
+    /// digest of `local_id` instead.
+    pub provider_call_id: Option<String>,
     pub requested_input: JsonObject,
     pub result: ToolResult,
+}
+
+/// Longest provider call id replay will echo. Real ids are a prefix plus a
+/// couple of dozen characters; the bound exists so a rewritten card cannot push
+/// an unbounded string onto the wire.
+const MAX_PROVIDER_CALL_ID_BYTES: usize = 128;
+
+/// Whether `id` has the shape [`crate::aisdk::project::wire_tool_id`] mints: a
+/// family prefix followed by exactly 48 lowercase hex characters.
+///
+/// That space is reserved for cards that fall back to a digest, so a stored id
+/// claiming it is refused — otherwise a card could be handed the id another
+/// card is about to mint, and the request would carry two calls with one id.
+/// Nothing legitimate is caught: real provider ids are shorter and mixed-case
+/// (`toolu_01DijKBKyyWKCXcHTjEoAuJz`, `call_9xQ…`).
+fn looks_like_a_minted_wire_id(id: &str) -> bool {
+    ["toolu_", "call_"].iter().any(|prefix| {
+        id.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.len() == 48
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    })
+}
+
+/// The provider call id a card may replay verbatim, or `None` when it has to
+/// mint a digest instead.
+///
+/// Screening happens here, on every projection, rather than once at write time:
+/// the field rides back through the renderer like `round` and `modelTurnId` and
+/// carries no attestation, so what reaches the wire has to be checked where it
+/// reaches the wire.
+///
+/// Three refusals, each for its own reason:
+///
+/// - **Shape.** Only `[A-Za-z0-9_-]` within [`MAX_PROVIDER_CALL_ID_BYTES`], so a
+///   rewritten card cannot smuggle whitespace, punctuation or an unbounded blob
+///   into a protocol field. Every provider's ids already live in that alphabet.
+/// - **Reserved shape.** See [`looks_like_a_minted_wire_id`].
+/// - **`synth_` prefix.** The sidecar synthesizes `synth_<stream>_<slot>` when a
+///   Chat upstream omits the id entirely (`chat-dialect.ts`). Those are
+///   stream-local, not provider identity, and two runs can mint the same one —
+///   which is the one way a conversation could end up with two cards claiming a
+///   single id. The digest, derived from the card's own local id, is unique by
+///   construction, so these fall back to it.
+pub(crate) fn replayable_provider_call_id(candidate: Option<&str>) -> Option<&str> {
+    let id = candidate?;
+    let shaped = !id.is_empty()
+        && id.len() <= MAX_PROVIDER_CALL_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    (shaped && !looks_like_a_minted_wire_id(id) && !id.starts_with("synth_")).then_some(id)
 }
 
 #[derive(Clone, Debug)]
@@ -481,6 +539,7 @@ impl CanonicalFold {
                 id,
                 tool_name,
                 model_turn_id,
+                provider_call_id,
                 requested_input,
                 input,
                 result,
@@ -521,6 +580,8 @@ impl CanonicalFold {
                 turn.tools.push(CanonicalToolExchange {
                     local_id: id.clone(),
                     tool_name: tool_name.clone(),
+                    provider_call_id: replayable_provider_call_id(provider_call_id.as_deref())
+                        .map(str::to_owned),
                     requested_input,
                     result: result.clone(),
                 });
@@ -1130,6 +1191,7 @@ mod tests {
             tool_name: name.into(),
             round: None,
             model_turn_id: None,
+            provider_call_id: None,
             requested_input: None,
             input: JsonObject::new(),
             result: ToolResult {
@@ -1695,6 +1757,99 @@ mod tests {
         assert!(!label.contains("Ignore previous instructions"));
         assert!(!label.contains('\n'));
         assert!(label.contains("untrusted tool data"));
+    }
+
+    /// The screen is the whole trust boundary for this field: it rides back
+    /// through the renderer unattested, so anything implausible, reserved, or
+    /// known not to be unique falls back to the digest.
+    #[test]
+    fn only_a_plausible_unreserved_provider_call_id_survives_the_screen() {
+        // Real ids from the three families, all kept.
+        for id in [
+            "toolu_01DijKBKyyWKCXcHTjEoAuJz",
+            "call_9xQabcDEF",
+            "fc_68a1b2c3-d4e5",
+        ] {
+            assert_eq!(replayable_provider_call_id(Some(id)), Some(id), "{id}");
+        }
+
+        // No id at all: manual cards, host deliveries, archives older than the field.
+        assert_eq!(replayable_provider_call_id(None), None);
+        assert_eq!(replayable_provider_call_id(Some("")), None);
+
+        // Outside the alphabet the Messages API documents for a client tool id
+        // (`^[a-zA-Z0-9_-]+$`), or simply unbounded.
+        for id in ["call with space", "call\nid", "call/id", "call:id"] {
+            assert_eq!(replayable_provider_call_id(Some(id)), None, "{id}");
+        }
+        assert_eq!(replayable_provider_call_id(Some(&"a".repeat(129))), None);
+        assert!(replayable_provider_call_id(Some(&"a".repeat(128))).is_some());
+
+        // The digest space is reserved: a card claiming it could be handed the
+        // id another card is about to mint, putting two calls on one id.
+        for prefix in ["toolu_", "call_"] {
+            let minted = format!("{prefix}{}", "ab".repeat(24));
+            assert_eq!(replayable_provider_call_id(Some(&minted)), None, "{minted}");
+        }
+        // Uppercase hex is not the minted shape, so it is a legitimate id.
+        assert!(replayable_provider_call_id(Some(&format!("toolu_{}", "AB".repeat(24)))).is_some());
+
+        // Synthesized by the sidecar when a Chat upstream omits the id; stream-local,
+        // so two runs in one conversation can carry the same one.
+        assert_eq!(replayable_provider_call_id(Some("synth_chatcmpl-77_0")), None);
+    }
+
+    /// Both legs of a replayed exchange have to carry the provider's own id, or
+    /// the request pairs a call with nothing.
+    #[test]
+    fn a_stored_provider_call_id_reaches_both_wire_legs() {
+        let mut card = tool("ctx_tool_1", "ls", "src/main.rs");
+        let ContextItem::Tool {
+            provider_call_id, ..
+        } = &mut card
+        else {
+            unreachable!()
+        };
+        *provider_call_id = Some("toolu_01DijKBKyyWKCXcHTjEoAuJz".into());
+
+        let projected = project_full(WireVariant::Anthropic, &[card]);
+        let call = projected[0]["content"]
+            .as_array()
+            .expect("assistant 内容是数组")
+            .iter()
+            .find(|part| part["type"] == "tool-call")
+            .expect("必须有 tool-call 部件");
+        assert_eq!(call["toolCallId"], "toolu_01DijKBKyyWKCXcHTjEoAuJz");
+        assert_eq!(
+            projected[1]["content"][0]["toolCallId"],
+            "toolu_01DijKBKyyWKCXcHTjEoAuJz"
+        );
+    }
+
+    /// A card the screen refuses still projects — it just mints a digest, the
+    /// same as a card that never had an id. Refusal must never drop the call.
+    #[test]
+    fn a_refused_provider_call_id_falls_back_to_the_digest() {
+        let mut card = tool("ctx_tool_1", "ls", "src/main.rs");
+        let ContextItem::Tool {
+            provider_call_id, ..
+        } = &mut card
+        else {
+            unreachable!()
+        };
+        *provider_call_id = Some("synth_chatcmpl-77_0".into());
+
+        let projected = project_full(WireVariant::Anthropic, &[card]);
+        let call = projected[0]["content"]
+            .as_array()
+            .expect("assistant 内容是数组")
+            .iter()
+            .find(|part| part["type"] == "tool-call")
+            .expect("必须有 tool-call 部件");
+        let minted = call["toolCallId"].as_str().expect("字符串 id");
+        assert!(minted.starts_with("toolu_"), "{minted}");
+        assert_ne!(minted, "synth_chatcmpl-77_0");
+        assert_eq!(projected[1]["content"][0]["toolCallId"], minted);
     }
 
     /// A user message containing only an image does not emit an empty text part.

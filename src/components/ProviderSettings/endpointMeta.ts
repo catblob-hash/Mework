@@ -160,14 +160,5 @@ export function familySettingMeta(
           "Azure passes this as a query parameter. Blank uses the AI SDK default; pinning an unverified version is worse than not pinning one."
         ),
       };
-    case "claude_executable":
-      return {
-        label: t("Claude Code 路径", "Claude Code executable"),
-        placeholder: t("留空 = 自动查找 ~/.local/bin 与 PATH", "blank = search ~/.local/bin and PATH"),
-        hint: t(
-          "只支持原生安装的 Claude Code（claude.exe / claude），npm 安装的 claude.cmd 不行。",
-          "Only the native Claude Code install (claude.exe / claude) works; the npm claude.cmd shim does not."
-        ),
-      };
   }
 }

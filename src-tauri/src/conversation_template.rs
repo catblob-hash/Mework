@@ -47,7 +47,7 @@ pub fn instantiate(
     let Some(last) = contexts.last() else {
         return Ok(Vec::new());
     };
-    fork_contexts(
+    let mut instantiated = fork_contexts(
         state,
         &ForkRequest {
             workspace_path,
@@ -56,7 +56,23 @@ pub fn instantiate(
         },
         contexts,
         |prefix| format!("{prefix}_{}", uuid::Uuid::new_v4().simple()),
-    )
+    )?;
+    // A fork carries the provider call id over, because a fork happens once into
+    // a conversation of its own. A template does not: the same body can be
+    // applied twice into one conversation, and then both copies would claim the
+    // same id — two `tool_use` blocks with one id in a single request. Cards
+    // placed from a template therefore mint a digest from their own fresh id,
+    // which is unique by construction. The attestation is unaffected: it is
+    // issued over the card's evidence fields, and this is not one of them.
+    for context in &mut instantiated {
+        if let ContextItem::Tool {
+            provider_call_id, ..
+        } = context
+        {
+            *provider_call_id = None;
+        }
+    }
+    Ok(instantiated)
 }
 
 /// Normalizes a renderer-edited body so no card claims more than this
@@ -131,6 +147,9 @@ pub fn normalize_tool_cards(
                 tool_name,
                 round: None,
                 model_turn_id: None,
+                // 模板卡不是某次 provider 交换：同一个模板可以在一段对话里套用
+                // 多次，照搬 provider call id 会让两张卡认领同一个线上 id。
+                provider_call_id: None,
                 requested_input: None,
                 input,
                 result: ToolResult {
@@ -182,6 +201,8 @@ pub fn normalize_tool_cards(
             tool_name,
             round: *stored_round,
             model_turn_id: stored_model_turn_id.clone(),
+            // 同上：套用出来的卡不认领任何一次真实调用的 id。
+            provider_call_id: None,
             requested_input: None,
             input,
             result: edited_result,
@@ -484,6 +505,7 @@ mod tests {
             tool_name: "write".into(),
             round: Some(3),
             model_turn_id: Some("turn_3".into()),
+            provider_call_id: None,
             requested_input: Some(tool_input(serde_json::json!({"path": "/tmp/model"}))),
             input: tool_input(serde_json::json!({"path": "/tmp/x", "content": "y"})),
             result: ToolResult {
@@ -508,6 +530,7 @@ mod tests {
             tool_name: "shell".into(),
             round: Some(9),
             model_turn_id: Some("turn_forged".into()),
+            provider_call_id: None,
             requested_input: Some(tool_input(serde_json::json!({"command": "rm -rf build"}))),
             input: tool_input(serde_json::json!({"command": "rm -rf build"})),
             result: ToolResult {
@@ -531,6 +554,7 @@ mod tests {
             tool_name: "shell".into(),
             round: None,
             model_turn_id: None,
+            provider_call_id: None,
             requested_input: None,
             input: tool_input(serde_json::json!({"command": "rm -rf build"})),
             result: ToolResult {
@@ -681,6 +705,7 @@ mod tests {
                 tool_name: "write".into(),
                 round: Some(3),
                 model_turn_id: Some("turn_3".into()),
+                provider_call_id: None,
                 requested_input: None,
                 input: tool_input(serde_json::json!({"path": "/tmp/rewritten", "content": "z"})),
                 result: ToolResult {

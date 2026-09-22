@@ -86,7 +86,7 @@ The dispatcher is global rather than a per-provider `fetch`: npm undici and Node
 | `bedrock` | `createAmazonBedrock()` | `tools.webSearch_20250305()` | `tools.webFetch_20250910()` |
 | `vertex` | `createGoogleVertex()` | `tools.googleSearch()` | 无 |
 | `openai-compatible` | `createOpenAICompatible().chatModel()` | 无（可修复的拒绝） | 无 |
-| `claude-agent` | not AI SDK: `claude-agent.ts` drives the local Claude Code executable through `@anthropic-ai/claude-agent-sdk` | 无（宿主自己检索） | 无 |
+| `claude-agent` | not AI SDK: `claude-agent.ts` drives the Claude Code executable Mework ships through `@anthropic-ai/claude-agent-sdk` | 无（宿主解析并随包附带） | 无 |
 
 **搜索与抓取不对称，这一点承重。** 没有任何一家的 *搜索* 结果里带宿主可读的正文：Anthropic 把它封在 `encrypted_content` 里，Responses 干脆不返回。所以原生搜索仍然要靠一次嵌套模型请求把结果写成报告。抓取则相反：Anthropic 的 `web_fetch_result` 用 `content.source.{type:"text", data}` 直接给出转成纯文本的页面，宿主自己解析，不需要模型复述。这就是 `StepResult.webDocuments` 只在抓取那条腿上非空的原因，也是对话设置里「抓取提供商」这个选项存在的原因——只有会抓取的后端才不需要另外指定一家。
 
@@ -96,7 +96,7 @@ The dispatcher is global rather than a per-provider `fetch`: npm undici and Node
 
 ### `claude-agent`: Claude Code as a model backend
 
-`src/claude-agent.ts` is the one family that bypasses `resolveModel()` and `streamText()`. The host's `StepRequest` carries an extra `agent: { session, executable, cwd, env }` block; the sidecar spawns the **user's own native Claude Code executable** (never redistributed) through the official Agent SDK and keeps one CLI process per host run, keyed by `agent.session`.
+`src/claude-agent.ts` is the one family that bypasses `resolveModel()` and `streamText()`. The host's `StepRequest` carries an extra `agent: { session, executable, cwd, env }` block; the sidecar spawns the **Claude Code executable Mework ships** — the CLI inside the pinned Agent SDK's platform package (SDK `0.3.261`, Claude Code `2.1.261`), staged by `src-tauri/build.rs` and installed beside the application, never the user's own install — through the official Agent SDK, and keeps one CLI process per host run, keyed by `agent.session`. Pinning it is what makes the rest of this section true from one release to the next: the CLI's behaviour changes between versions, and `CLAUDE_CODE_CARVED_SLATE=0` — which suppresses the `# Environment` block the CLI would otherwise attach to the first user message — exists in `2.1.261` and is gone in `2.1.278`.
 
 What the CLI is allowed to do is nothing of its own: `tools: []`, `settingSources: []`, `strictMcpConfig: true`, no plugins/agents, and an environment that switches off compaction, attachments, auto-memory, CLAUDE.md, background tasks, telemetry and updates. The only tools the model sees are the host's, published by one hand-written in-process MCP server (`mework`) so the host schemas reach the model verbatim. `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1` makes the CLI register them under their bare host names, so nothing in the tool loop ever sees an `mcp__mework__` prefix (it is still stripped defensively). The request the CLI sends therefore has `system = [billing header, "You are a Claude agent, built on Anthropic's Claude Agent SDK.", host prompt]` and `tools = the host's tools`; the SDK's identity line and billing header are the SDK's own and are not touched.
 
@@ -116,7 +116,7 @@ npm run selfcheck:sea  # same discriminators, run against the actual shipped sin
 npm run typecheck      # tsc --noEmit
 ```
 
-`npm run selfcheck` runs offline against one local fake upstream and one real sidecar child process; no API key is required, and the `claude-agent` section additionally needs a locally installed native Claude Code and is skipped without one.
+`npm run selfcheck` runs offline against one local fake upstream and one real sidecar child process; no API key is required, and the `claude-agent` section additionally needs the Agent SDK's platform package (installed by `npm install` unless optional dependencies were skipped) and is skipped without it.
 
 The development and release forms are separated by CJS bundling, SEA injection, and an invalidated signature, so any stage can fail only in the final artifact. Node SEA **requires CommonJS** entry points because ESM entry points are unsupported, which makes these two distinct builds rather than one artifact in a different wrapper.
 

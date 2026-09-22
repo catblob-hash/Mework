@@ -171,6 +171,7 @@ pub fn fork_contexts(
                 tool_name,
                 round,
                 model_turn_id,
+                provider_call_id,
                 requested_input,
                 input,
                 result,
@@ -208,6 +209,11 @@ pub fn fork_contexts(
                     tool_name: tool_name.clone(),
                     round: *round,
                     model_turn_id: remap(model_turn_id, &mut turn_ids),
+                    // Carried over, unlike the attestation: the id is not bound
+                    // to a conversation, and the fork is supposed to replay the
+                    // exchange exactly as the source would. It stays unique in
+                    // its new home because it was unique in the old one.
+                    provider_call_id: provider_call_id.clone(),
                     requested_input: requested_input.clone(),
                     input: input.clone(),
                     result: result.clone(),

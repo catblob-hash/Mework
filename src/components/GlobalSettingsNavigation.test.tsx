@@ -16,6 +16,7 @@ describe("GlobalSettingsNavigation", () => {
     expect(within(navigation).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "Model providers",
       "Search providers",
+      "Decision model providers",
       "Appearance",
       "Keyboard shortcuts",
       "Usage statistics",
@@ -43,6 +44,8 @@ describe("GlobalSettingsNavigation", () => {
     // Search providers are their own column, not a section of the model page.
     fireEvent.click(within(navigation).getByRole("button", { name: "Search providers" }));
     expect(onSelect).toHaveBeenCalledWith("search_providers");
+    fireEvent.click(within(navigation).getByRole("button", { name: "Decision model providers" }));
+    expect(onSelect).toHaveBeenCalledWith("decision_providers");
     // Skills and MCP are configured on disk and have no page of their own here.
     expect(within(navigation).queryByRole("button", { name: "MCP" })).toBeNull();
     expect(within(navigation).queryByRole("button", { name: "Skills" })).toBeNull();
@@ -53,6 +56,7 @@ describe("GlobalSettingsNavigation", () => {
     expect(within(localizedNavigation).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "模型提供商",
       "搜索提供商",
+      "决策模型提供商",
       "外观",
       "快捷键",
       "用量统计",

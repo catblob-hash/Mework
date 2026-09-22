@@ -695,6 +695,9 @@ fn canonicalize_tool_payload_numbers(document: &mut AppDocument) {
 ///   is an unknown enum *variant*, not an unknown field, so serde rejects the whole
 ///   document rather than skipping the entry — every pre-existing profile would be
 ///   quarantined and rebuilt empty.
+/// - `familySettings` used to accept `claude_executable`, the path to the user's
+///   own Claude Code. Mework now ships that executable, and the retired key is an
+///   unknown variant in a map *key*, which fails the document just as hard.
 ///
 /// A third key, `promptCache`, is newer than schema 2 and defaults on: an archive
 /// that omits it, or carries a non-boolean, is made concrete here so the saved
@@ -711,6 +714,24 @@ fn migrate_persisted_models(value: &mut serde_json::Value) {
         return;
     };
     for provider in providers {
+        // `claude_executable` is retired: Mework ships the Claude Code build the
+        // `claude_agent` family drives, so there is no path for the user to name.
+        // A retired setting is an unknown enum *variant* in the key position of
+        // `BTreeMap<FamilySetting, String>`, so serde rejects the whole document
+        // rather than skipping the entry — every archive that ever showed that
+        // field would be quarantined. Ask serde which keys still exist rather
+        // than naming the survivors here.
+        if let Some(settings) = provider
+            .get_mut("familySettings")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            settings.retain(|name, _| {
+                serde_json::from_value::<crate::model::FamilySetting>(serde_json::Value::String(
+                    name.clone(),
+                ))
+                .is_ok()
+            });
+        }
         // Single source of truth for which families return ciphertext.
         let encrypted = provider
             .get("family")
@@ -829,6 +850,17 @@ fn validate_workspace_authorizations(
         })
         .filter_map(|workspace| AppState::workspace_key(Path::new(&workspace.path)))
         .collect::<HashSet<_>>();
+    let previous_machine_by_id = previous
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.kind == WorkspaceKind::Directory)
+        .filter_map(|workspace| {
+            workspace
+                .machine
+                .as_ref()
+                .map(|machine| (workspace.id.as_str(), machine))
+        })
+        .collect::<HashMap<_, _>>();
 
     for workspace in &document.workspaces {
         if workspace.kind != WorkspaceKind::Directory {
@@ -857,7 +889,22 @@ fn validate_workspace_authorizations(
         }
         state
             .require_workspace_authorization(Path::new(&workspace.path))
-            .map_err(|error| format!("工作区 {} 未获授权: {error}", workspace.id))?;
+            .map_err(|error| {
+                // The same workspace stood on another machine a moment ago and
+                // now claims to be local at the same spelling: a load path
+                // dropped `machine`, not a user re-picking a directory. Say so.
+                // The local check that just failed would otherwise explain it
+                // as a POSIX path not being "absolute" on Windows.
+                match previous_machine_by_id.get(workspace.id.as_str()) {
+                    Some(machine) => format!(
+                        "工作区 {} 位于另一台机器上（{}），但这次提交没有带 machine 字段，宿主不能把 {} 当作本机目录: {error}",
+                        workspace.id,
+                        crate::run_environment::env_key(Some(machine)),
+                        workspace.path
+                    ),
+                    None => format!("工作区 {} 未获授权: {error}", workspace.id),
+                }
+            })?;
     }
 
     validate_additional_directory_authorizations(previous, document, state)?;
@@ -942,7 +989,20 @@ pub(crate) fn validate_additional_directories(
             state
                 .require_workspace_authorization(Path::new(&workspace.path))
                 .map_err(|error| {
-                    format!("对话 {} 的工作区未获授权: {error}", conversation.id)
+                    let dropped_machine = held.iter().find_map(|existing| {
+                        (existing.path == workspace.path)
+                            .then_some(existing.machine.as_ref())
+                            .flatten()
+                    });
+                    match dropped_machine {
+                        Some(machine) => format!(
+                            "对话 {} 的工作区 {} 位于另一台机器上（{}），但这次提交没有带 machine 字段，宿主不能把它当作本机目录: {error}",
+                            conversation.id,
+                            workspace.path,
+                            crate::run_environment::env_key(Some(machine))
+                        ),
+                        None => format!("对话 {} 的工作区未获授权: {error}", conversation.id),
+                    }
                 })?;
             continue;
         };
@@ -1386,14 +1446,18 @@ pub fn validate_shape(document: &AppDocument) -> Result<(), String> {
         "API 提供商 ID",
     )?;
     for provider in &document.assets.api_providers {
-        // This namespace is reserved because search-provider credentials are keyed only by provider ID.
-        if provider
-            .id
-            .trim()
-            .starts_with(crate::web_search::SEARCH_PROVIDER_ID_PREFIX)
-        {
+        // These namespaces are reserved because search-provider and decision-provider
+        // credentials are keyed only by provider ID.
+        let id = provider.id.trim();
+        if id.starts_with(crate::web_search::SEARCH_PROVIDER_ID_PREFIX) {
             return Err(format!(
                 "API 提供商 ID 不能占用搜索提供商保留命名空间：{}",
+                provider.id
+            ));
+        }
+        if id.starts_with(crate::decision_model::DECISION_PROVIDER_ID_PREFIX) {
+            return Err(format!(
+                "API 提供商 ID 不能占用决策模型提供商保留命名空间：{}",
                 provider.id
             ));
         }
@@ -3738,6 +3802,71 @@ mod tests {
             .clone()
     }
 
+    /// `claude_executable` was where the user named their own Claude Code
+    /// install. Mework ships that executable now, so the setting is gone — and a
+    /// retired setting sits in the *key* position of a `BTreeMap<FamilySetting,
+    /// String>`, where an unknown variant fails the whole document. An archive
+    /// that carries one must still load, with the field dropped.
+    #[test]
+    fn an_archive_carrying_the_retired_claude_executable_setting_still_loads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.v1.json");
+        save_all(&path, &default_document()).unwrap();
+
+        // Reach past the serializer twice over: the enum can no longer express
+        // this key, and the built-in Claude Agent row is seeded by the renderer
+        // rather than by `default_document`.
+        let mut anchor: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let providers = anchor["assets"]["apiProviders"].as_array_mut().unwrap();
+        providers.push(serde_json::json!({
+            "id": "claude-agent-legacy",
+            "name": "Claude Agent",
+            "family": "claude_agent",
+            "baseUrl": "",
+            "familySettings": { "claude_executable": "C:\\Users\\me\\.local\\bin\\claude.exe" },
+        }));
+        // A surviving setting on another family must not be swept up with it.
+        providers.push(serde_json::json!({
+            "id": "bedrock-legacy",
+            "name": "Bedrock",
+            "family": "bedrock",
+            "baseUrl": "",
+            "familySettings": { "region": "us-east-1", "claude_executable": "/nonsense" },
+        }));
+        fs::write(&path, serde_json::to_vec_pretty(&anchor).unwrap()).unwrap();
+
+        let loaded = read_document(&path).expect("旧档案必须还能装载");
+        let reloaded = read_document(&path).unwrap();
+        assert_eq!(loaded, reloaded, "迁移不是幂等的");
+        let find = |id: &str| {
+            loaded
+                .assets
+                .api_providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .unwrap_or_else(|| panic!("{id} 那一行必须还在"))
+        };
+        assert!(
+            find("claude-agent-legacy").family_settings.is_empty(),
+            "{:?}",
+            find("claude-agent-legacy").family_settings
+        );
+        assert_eq!(
+            find("bedrock-legacy")
+                .family_settings
+                .get(&crate::model::FamilySetting::Region)
+                .map(String::as_str),
+            Some("us-east-1"),
+            "只有退役的键该被丢掉"
+        );
+        assert_eq!(
+            find("bedrock-legacy").family_settings.len(),
+            1,
+            "退役的键在别的家族上也要丢掉"
+        );
+    }
+
     /// `promptCache` is newer than schema 2. A schema-2 archive that never had
     /// the key, or a hand-edited one carrying a non-boolean, loads as enabled —
     /// the default Claude Code applies — while an explicit `false` is the user's
@@ -4065,6 +4194,7 @@ mod tests {
             tool_name: "read".into(),
             round: Some(1),
             model_turn_id: Some("turn-one".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::json!({"path":"a.txt"})
                 .as_object()
@@ -4113,6 +4243,7 @@ mod tests {
             tool_name: "ask_user".into(),
             round: Some(1),
             model_turn_id: None,
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(serde_json::json!({
                 "questions": [{
@@ -4148,6 +4279,7 @@ mod tests {
             tool_name: "agent_spawn".into(),
             round: Some(1),
             model_turn_id: None,
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(serde_json::json!({
                 "prompt": format!("task for {name}"),
@@ -4190,6 +4322,7 @@ mod tests {
             tool_name: "read".into(),
             round: Some(1),
             model_turn_id: Some("child-turn".into()),
+            provider_call_id: None,
             requested_input: None,
             input: serde_json::from_value(serde_json::json!({
                 "path": "README.md"
@@ -4457,6 +4590,19 @@ b"
             let error = validate_shape(&colliding).unwrap_err();
             assert!(
                 error.contains("搜索提供商保留命名空间"),
+                "{stolen} 必须因命名空间冲突被拒：{error}"
+            );
+        }
+        // The decision-model namespace is reserved for the same reason.
+        for stolen in ["decision-provider:typesafe", "decision-provider:"] {
+            let mut colliding = document.clone();
+            let mut provider = colliding.assets.api_providers[0].clone();
+            provider.id = stolen.to_owned();
+            colliding.assets.api_providers.push(provider);
+            colliding.global_settings.active_provider_id = None;
+            let error = validate_shape(&colliding).unwrap_err();
+            assert!(
+                error.contains("决策模型提供商保留命名空间"),
                 "{stolen} 必须因命名空间冲突被拒：{error}"
             );
         }
@@ -5134,6 +5280,7 @@ b"
                     || name == crate::capabilities::SKILL_TOOL
                     || name == crate::capabilities::TOOL_SEARCH_TOOL
                     || name.starts_with("preview_")
+                    || crate::decision_tools::is_decision_tool_name(name)
                     || name == crate::workflow::WORKFLOW_TOOL
             };
             let enabled = &preset.settings.enabled_tools;
@@ -7458,5 +7605,46 @@ b"
             distro: "Ubuntu".into(),
         });
         assert!(validate_workspace_authorizations(&changed, &relocated, &fresh).is_err());
+    }
+
+    /// A load path that rebuilds a remote workspace without its machine has to
+    /// be told apart from a user picking a new local directory. The local check
+    /// used to answer "Workspace path must be absolute" — true of a POSIX path
+    /// on Windows and silent about where the field went.
+    #[test]
+    fn a_remote_workspace_that_lost_its_machine_is_named_as_such() {
+        let mut previous = default_document();
+        let mut workspace = previous.workspaces[0].clone();
+        workspace.id = "ws_remote".into();
+        workspace.path = "/home/dev/app".into();
+        workspace.machine = Some(crate::model::RunTarget::Ssh {
+            machine_id: "m1".into(),
+        });
+        workspace.conversations.clear();
+        previous.workspaces.push(workspace);
+
+        let mut changed = previous.clone();
+        changed.workspaces.last_mut().unwrap().machine = None;
+
+        let error = validate_workspace_authorizations(&previous, &changed, &AppState::default())
+            .expect_err("a remote path with no machine is not a local workspace");
+        assert!(error.contains("ws_remote"), "{error}");
+        assert!(error.contains("ssh:m1"), "{error}");
+        assert!(error.contains("machine 字段"), "{error}");
+
+        // The same rule for a conversation's attached list.
+        let mut held = default_document().workspaces[0].conversations[0].clone();
+        held.attached_workspaces = vec![crate::model::AttachedWorkspace {
+            machine: Some(crate::model::RunTarget::Ssh {
+                machine_id: "m1".into(),
+            }),
+            path: "/srv/app".into(),
+        }];
+        let mut proposed = held.clone();
+        proposed.attached_workspaces[0].machine = None;
+        let error = validate_additional_directories(&proposed, Some(&held), &AppState::default())
+            .expect_err("a remote path with no machine is not a local workspace");
+        assert!(error.contains("/srv/app"), "{error}");
+        assert!(error.contains("ssh:m1"), "{error}");
     }
 }

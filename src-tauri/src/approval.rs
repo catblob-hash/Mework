@@ -266,6 +266,16 @@ pub fn remote_workspace_key(machine_key: &str, path: &str) -> String {
 
 fn canonical_workspace(path: &Path) -> Result<(String, String), String> {
     if !path.is_absolute() {
+        // On Windows a POSIX path like `/home/dev/app` has a root but is not
+        // absolute. Reaching this local-only check with one is the signature
+        // of a directory on another machine whose `machine` was lost on the
+        // way here, so name that instead of leaving "absolute" to explain it.
+        if path.has_root() {
+            return Err(format!(
+                "Workspace path {} is not absolute on this machine; a directory on another machine must be recorded with its machine",
+                path.display()
+            ));
+        }
         return Err("Workspace path must be absolute".into());
     }
     let canonical = fs::canonicalize(path)
@@ -369,6 +379,21 @@ mod tests {
         assert!(registry
             .require_workspace_authorization(directory.path())
             .is_ok());
+    }
+
+    /// A POSIX path reaching the local check is a remote directory that lost
+    /// its machine, and the refusal has to say that; "must be absolute" is
+    /// reserved for a path that is relative anywhere.
+    #[cfg(windows)]
+    #[test]
+    fn a_posix_path_is_refused_as_another_machines_not_as_relative() {
+        let error = canonical_workspace(Path::new("/home/dev/app")).unwrap_err();
+        assert!(error.contains("/home/dev/app"), "{error}");
+        assert!(error.contains("another machine"), "{error}");
+        assert_eq!(
+            canonical_workspace(Path::new("relative/dir")).unwrap_err(),
+            "Workspace path must be absolute"
+        );
     }
 
     /// Capacity eviction is scoped to the requesting conversation before it can

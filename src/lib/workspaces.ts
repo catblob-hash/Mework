@@ -1,4 +1,11 @@
-import type { AttachedWorkspace, Conversation, RunTarget, SshMachineConfig, Workspace } from "../types";
+import type {
+  AttachedWorkspace,
+  Conversation,
+  RunTarget,
+  SshMachineConfig,
+  ToolDescriptor,
+  Workspace
+} from "../types";
 
 export const TEMPORARY_WORKSPACE_ID = "__temporary__";
 
@@ -69,6 +76,61 @@ export function conversationWorkspaces(
     }]
     : [];
   return [...primary, ...(conversation?.attachedWorkspaces ?? [])];
+}
+
+/**
+ * The tools whose wire schema the host gives a `workspace` argument once the
+ * conversation has more than one workspace. Mirrors the list in
+ * `builtin_schemas.rs`; a tool absent here takes no workspace number.
+ */
+const WORKSPACE_SCOPED_TOOLS: ReadonlySet<string> = new Set([
+  "ls", "grep", "find", "read", "write", "edit", "lsp", "bash", "powershell"
+]);
+
+/**
+ * The descriptors a timeline's manual tool cards are edited against, with the
+ * `workspace` argument the host adds on the wire when the conversation has
+ * more than one workspace. The static descriptors cannot carry it: which
+ * numbers exist is a property of the conversation, not of the tool, and a
+ * card placed by hand has to be able to name workspace 2 the same way the
+ * model does.
+ *
+ * The argument is optional and starts empty, so an untouched field records
+ * nothing and the host applies its own default of 1. `powershell` lists only
+ * workspaces on this machine, and only when this machine runs PowerShell;
+ * with none, the host withdraws the tool from the wire and the descriptor is
+ * left alone.
+ */
+export function withWorkspaceArgument(
+  tools: ToolDescriptor[],
+  workspaces: readonly AttachedWorkspace[],
+  hostRunsPowershell: boolean,
+  label: string
+): ToolDescriptor[] {
+  if (workspaces.length < 2) return tools;
+  const all = workspaces.map((_, position) => position + 1);
+  const powershell = hostRunsPowershell
+    ? workspaces.flatMap((workspace, position) => (workspace.machine ? [] : [position + 1]))
+    : [];
+  return tools.map((tool) => {
+    if (!WORKSPACE_SCOPED_TOOLS.has(tool.name)) return tool;
+    if (tool.parameters.some((parameter) => parameter.name === "workspace")) return tool;
+    const addresses = tool.name === "powershell" ? powershell : all;
+    if (addresses.length === 0) return tool;
+    return {
+      ...tool,
+      parameters: [
+        ...tool.parameters,
+        {
+          name: "workspace",
+          label,
+          type: "number",
+          required: false,
+          placeholder: addresses.join(" | ")
+        }
+      ]
+    };
+  });
 }
 
 /**

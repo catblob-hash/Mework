@@ -2,7 +2,7 @@
   "name": "Mework 内置工具上下文重设计基线",
   "note": "schemaNotes replaces the built-in tool description; usageGuidance is appended after a blank line. Copy this file to .mework/tool-descriptions only when you want Mework to discover it, then explicitly select it in the conversation preset.",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
-  "toolCount": 46,
+  "toolCount": 56,
   "tools": [
     {
       "toolName": "ls",
@@ -25,6 +25,16 @@
       "usageGuidance": ""
     },
     {
+      "toolName": "bash_find_output",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "powershell_find_output",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
       "toolName": "write",
       "schemaNotes": "",
       "usageGuidance": ""
@@ -41,6 +51,21 @@
     },
     {
       "toolName": "read",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "find_content",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "find_files",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "find_output",
       "schemaNotes": "",
       "usageGuidance": ""
     },
@@ -131,6 +156,31 @@
     },
     {
       "toolName": "preview_dialog",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "preview_find_element",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "preview_find_logs",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "preview_click_by_description",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "preview_fill_by_description",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "preview_inspect_by_description",
       "schemaNotes": "",
       "usageGuidance": ""
     },

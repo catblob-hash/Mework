@@ -1,29 +1,69 @@
 // Claude Agent family checks for selfcheck.mjs.
 //
-// These drive the real, locally installed Claude Code executable through the
-// sidecar, against a scripted Anthropic Messages upstream on 127.0.0.1. The CLI
-// never talks to Anthropic: `ANTHROPIC_BASE_URL` and a dummy key travel in
-// `agent.env`, which is the only channel that may redirect this family and only
-// towards a loopback address. `request.apiKey` / `request.baseURL` are set too,
-// with values that must appear nowhere upstream. When no native executable is
-// installed the section is skipped with a warning so the rest of the selfcheck
-// stays meaningful on any machine.
+// These drive the real Claude Code executable Mework ships — the CLI inside the
+// Agent SDK's own platform package — through the sidecar, against a scripted
+// Anthropic Messages upstream on 127.0.0.1. The CLI never talks to Anthropic:
+// `ANTHROPIC_BASE_URL` and a dummy key travel in `agent.env`, which is the only
+// channel that may redirect this family and only towards a loopback address.
+// `request.apiKey` / `request.baseURL` are set too, with values that must appear
+// nowhere upstream. When the platform package is absent (an install that skipped
+// optional dependencies) the section is skipped with a warning so the rest of the
+// selfcheck stays meaningful.
 
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-/** Locates the native Claude Code executable the checks may use, or `null`. */
+const require = createRequire(import.meta.url);
+
+/**
+ * Claude Code version the installed SDK pin ships, read from the SDK rather than
+ * written down here: this assertion is about the SDK and its CLI agreeing, and
+ * the deliberate gate on *which* version that is belongs to
+ * `src-tauri/build.rs::CLAUDE_CODE_VERSION`. `null` when the SDK is not installed.
+ */
+export const BUNDLED_CLI_VERSION = (() => {
+  try {
+    // Via the main entry, not `.../package.json`: the SDK declares an `exports`
+    // map, and Node refuses a subpath the map does not list.
+    const root = path.dirname(require.resolve("@anthropic-ai/claude-agent-sdk"));
+    return JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).claudeCodeVersion ?? null;
+  } catch {
+    return null;
+  }
+})();
+
+/**
+ * Locates the Claude Code executable Mework ships, or `null`.
+ *
+ * This mirrors the SDK's own resolution (`@anthropic-ai/claude-agent-sdk-<os>-<arch>`,
+ * `-musl` first on a musl Linux host) so the checks drive the same file the
+ * release does. `MEWORK_CLAUDE_EXECUTABLE` overrides it, for measuring another
+ * build against these fixtures.
+ */
 export function resolveClaudeExecutable() {
   const override = process.env.MEWORK_CLAUDE_EXECUTABLE;
   if (override) return existsSync(override) ? override : null;
-  const name = process.platform === "win32" ? "claude.exe" : "claude";
-  const candidate = path.join(os.homedir(), ".local", "bin", name);
-  return existsSync(candidate) ? candidate : null;
+  const binary = process.platform === "win32" ? "claude.exe" : "claude";
+  const musl = process.platform === "linux"
+    && process.report?.getReport?.()?.header?.glibcVersionRuntime === undefined;
+  const bases = process.platform === "linux"
+    ? (musl ? [`linux-${process.arch}-musl`, `linux-${process.arch}`] : [`linux-${process.arch}`, `linux-${process.arch}-musl`])
+    : [`${process.platform}-${process.arch}`];
+  for (const base of bases) {
+    try {
+      const resolved = require.resolve(`@anthropic-ai/claude-agent-sdk-${base}/${binary}`);
+      if (existsSync(resolved)) return resolved;
+    } catch {
+      // Not installed for this platform; try the next candidate.
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------- fake Anthropic upstream
@@ -312,6 +352,32 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
       && !/Claude Code, Anthropic's official CLI/.test(systemText) && !/# Tone and style|# Tool usage policy/.test(systemText)
       && systemBlocks.length <= 3,
     `${systemBlocks.length} blocks: ${systemText.slice(0, 200).replace(/\n/g, " ")}`,
+  );
+  // The version lock, as the upstream sees it: the CLI stamps its own version
+  // into the billing header block it prepends to the system prompt, and it must
+  // be the version the pinned SDK declares. A resolution that picked up some
+  // other Claude Code shows up here.
+  const billing = systemBlocks.map((block) => block.text ?? "").find((text) => text.includes("cc_version="));
+  check(
+    `30 claude-agent：跑的是 SDK 钉住的 Claude Code ${BUNDLED_CLI_VERSION ?? "（读不到版本）"}`,
+    BUNDLED_CLI_VERSION !== null
+      && new RegExp(`cc_version=${BUNDLED_CLI_VERSION.replace(/\./g, "\\.")}(\\D|$)`).test(billing ?? ""),
+    (billing ?? "(no billing header block)").slice(0, 120),
+  );
+  // Left to itself the CLI attaches an `# Environment` of its own (its cwd —
+  // Mework's private session folder — its platform and OS version) as a meta
+  // message on the first user message. `CLAUDE_CODE_CARVED_SLATE=0` removes it,
+  // and the pinned CLI is a version that honours that switch, so the block must
+  // be absent from the request altogether rather than merely out of `system`.
+  // 2.1.278 dropped the switch; if a future pin lands there, this fails loudly
+  // instead of quietly telling the model about a directory it must not use.
+  const CLI_ENVIRONMENT = "You have been invoked in the following environment";
+  const environmentInSystem = systemBlocks.some((block) => (block.text ?? "").includes(CLI_ENVIRONMENT));
+  const environmentAttached = (call1?.messages ?? []).some((message) => textOf(message).includes(CLI_ENVIRONMENT));
+  check(
+    "30 claude-agent：CARVED_SLATE=0 压掉了 CLI 自带的 # Environment，上游请求里一处都没有",
+    !environmentInSystem && !environmentAttached,
+    environmentInSystem ? "leaked into system" : environmentAttached ? "attached to the messages" : "absent",
   );
   const toolNames = (call1?.tools ?? []).map((tool) => tool.name);
   check(
@@ -651,12 +717,15 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
   );
   sc.send({ v: V, type: "release", session: "ca-img" });
 
-  // 30k: a missing executable fails fast with installation guidance.
+  // 30k: a missing executable fails fast, and says what it means — the bundled
+  // CLI is part of the install, so its absence is a broken install, not
+  // something the user can configure their way out of.
   sc.send(stepFrame("ca-missing", "ca-missing", [{ role: "user", content: "hi" }], { agent: { ...agentFor("ca-missing"), executable: path.join(cwd, "no-such-claude.exe") } }));
   const missing = await sc.wait(terminal("ca-missing"), 10000);
   check(
-    "30 claude-agent：可执行文件缺失 → permanent 并给安装指引",
-    missing.type === "error" && missing.error.kind === "permanent" && missing.error.message.includes("Claude Code"),
+    "30 claude-agent：附带的可执行文件缺失 → permanent 并指向重新安装",
+    missing.type === "error" && missing.error.kind === "permanent"
+      && missing.error.message.includes("Claude Code") && missing.error.message.includes("重新安装"),
     describe(missing),
   );
 

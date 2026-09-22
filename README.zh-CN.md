@@ -20,7 +20,7 @@ API Key 或订阅由你自己提供，其余一切都在你的机器上运行和
 
 **看得见的审批。** 每个有风险的调用都会弹卡片，显示完整命令或路径，以及为什么被这样归类。四档安全级别，从逐条批准到完全放行；另有少数确认任何级别都关不掉，比如以你已登录的身份操作网站。
 
-**模型你选，Key 你管。** 支持 OpenAI、Anthropic、Google、Azure OpenAI、Amazon Bedrock、Google Vertex、xAI 以及任何 OpenAI 兼容端点。另有两家登录即用：**OpenAI Codex** 用你的 ChatGPT 订阅，**Claude Agent** 复用你本机已有的 Claude Code 登录（受 [Claude Code 使用条款](https://code.claude.com/docs/en/legal-and-compliance)约束）。Key 保存在 Windows 凭据管理器，绝不写进配置文件。
+**模型你选，Key 你管。** 支持 OpenAI、Anthropic、Google、Azure OpenAI、Amazon Bedrock、Google Vertex、xAI 以及任何 OpenAI 兼容端点。另有两家登录即用：**OpenAI Codex** 用你的 ChatGPT 订阅，**Claude Agent** 用 Mework 自带的那份 Claude Code，配你本机已有的 Claude Code 登录——不必再单独装一份、也不用操心版本对不上（受 [Claude Code 使用条款](https://code.claude.com/docs/en/legal-and-compliance)约束）。Key 保存在 Windows 凭据管理器，绝不写进配置文件。
 
 **不打扰。** 关窗即缩到托盘，子代理、工作流和 shell 任务照常运行。应用从 GitHub Releases 自动更新。
 

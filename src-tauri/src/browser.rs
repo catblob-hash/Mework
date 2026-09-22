@@ -524,7 +524,7 @@ struct ActionAftermath {
     modal_states: Vec<ModalState>,
 }
 
-/// One of the eleven preview tools that act on a page.
+/// One of the fifteen preview tools that act on a page.
 ///
 /// `preview_start`, `preview_stop`, `preview_list` and `preview_logs` never reach a page, so they
 /// are not here. Security policy, executor dispatch and page implementation all match on this
@@ -543,11 +543,15 @@ pub(crate) enum PreviewTool {
     Resize,
     UploadImage,
     Dialog,
+    FindElement,
+    ClickByDescription,
+    FillByDescription,
+    InspectByDescription,
 }
 
 impl PreviewTool {
     /// Declaration order is the order the catalog lists the page tools in.
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::ConsoleLogs,
         Self::Screenshot,
         Self::Snapshot,
@@ -559,6 +563,10 @@ impl PreviewTool {
         Self::Resize,
         Self::UploadImage,
         Self::Dialog,
+        Self::FindElement,
+        Self::ClickByDescription,
+        Self::FillByDescription,
+        Self::InspectByDescription,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -574,6 +582,10 @@ impl PreviewTool {
             Self::Resize => "preview_resize",
             Self::UploadImage => "preview_upload_image",
             Self::Dialog => "preview_dialog",
+            Self::FindElement => "preview_find_element",
+            Self::ClickByDescription => "preview_click_by_description",
+            Self::FillByDescription => "preview_fill_by_description",
+            Self::InspectByDescription => "preview_inspect_by_description",
         }
     }
 
@@ -1832,6 +1844,62 @@ impl BrowserRuntime {
         };
         self.touch_session(&session_id);
         let result = session.execute_tool_blocking(tool, input, grants);
+        self.touch_session(&session_id);
+        result
+    }
+
+    /// The page's accessibility snapshot as lines, for `preview_find_element` and the
+    /// `preview_*_by_description` variants. Same reservation, touch and page-preparation contract
+    /// as [`Self::execute_tool_blocking`]; the caller supplies the wall clock, because the
+    /// decision-model round trips that follow this read are not the page's to wait for.
+    pub(crate) fn element_lines_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<AxLine>, bool), String> {
+        self.read_page_blocking(session_id, PreviewTool::FindElement, |session| {
+            session.preview_element_lines()
+        })
+    }
+
+    /// A CSS selector for one element of the last `element_lines_blocking` read, or `None` when
+    /// the page no longer offers one.
+    pub(crate) fn selector_for_blocking(
+        &self,
+        session_id: &str,
+        backend_node_id: i64,
+    ) -> Result<Option<String>, String> {
+        self.read_page_blocking(session_id, PreviewTool::FindElement, |session| {
+            session.unique_selector_for(backend_node_id)
+        })
+    }
+
+    /// Every console entry of the page as `[level] text`, for `preview_find_logs`.
+    pub(crate) fn console_log_lines_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<String>, String> {
+        self.read_page_blocking(session_id, PreviewTool::ConsoleLogs, |session| {
+            session.console_log_lines()
+        })
+    }
+
+    fn read_page_blocking<T>(
+        &self,
+        session_id: &str,
+        tool: PreviewTool,
+        read: impl FnOnce(&BrowserSession) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let session_id = validate_session_id(session_id)?.to_owned();
+        self.reopen_closed_session_for_agent(&session_id)?;
+        let session = self.session(&session_id)?;
+        let _reservation = if browser_tool_needs_live_slot(&session.status()) {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            self.reserve_live_slot_locked(&session_id, &session)?
+        } else {
+            None
+        };
+        self.touch_session(&session_id);
+        let result = session.read_page_blocking(tool, read);
         self.touch_session(&session_id);
         result
     }
@@ -3617,6 +3685,27 @@ fn validate_preview_input(
             validate_preview_scale(optional_input_f64(input, "scale")?)?;
         }
         PreviewTool::Snapshot => {}
+        PreviewTool::FindElement => {
+            required_input_string(input, "query", 2_000, false)?;
+        }
+        PreviewTool::ClickByDescription => {
+            required_input_string(input, "description", 2_000, false)?;
+            optional_input_bool(input, "doubleClick", false)?;
+        }
+        PreviewTool::FillByDescription => {
+            required_input_string(input, "description", 2_000, false)?;
+            required_input_string(input, "value", MAX_TEXT_INPUT_CHARS, true)?;
+        }
+        PreviewTool::InspectByDescription => {
+            required_input_string(input, "description", 2_000, false)?;
+            if let Some(styles) = parse_preview_styles(input)? {
+                if styles.len() > MAX_PREVIEW_STYLES {
+                    return Err(format!(
+                        "preview_inspect_by_description styles accepts at most {MAX_PREVIEW_STYLES} properties"
+                    ));
+                }
+            }
+        }
         PreviewTool::Inspect => {
             validate_selector(&required_input_string(
                 input,
@@ -7242,6 +7331,17 @@ impl BrowserSession {
                     .preview_screenshot(optional_input_f64(input, "scale")?)
                     .map(PreviewToolOutput::Image),
                 PreviewTool::Snapshot => self.preview_snapshot().map(PreviewToolOutput::Text),
+                // The decision-model page tools are dispatched host-side by
+                // `decision_tools::preview`, which reads this page's elements and then hands
+                // the chosen action to Click/Fill/Inspect above; their network calls must not
+                // run under this page's automation lock. The variants exist so the name is a
+                // page tool everywhere a page tool is treated specially.
+                PreviewTool::FindElement
+                | PreviewTool::ClickByDescription
+                | PreviewTool::FillByDescription
+                | PreviewTool::InspectByDescription => Err(format!(
+                    "{tool} is dispatched host-side by decision_tools::preview"
+                )),
                 PreviewTool::Inspect => {
                     let selector = selector()?;
                     let styles = parse_preview_styles(input)?;
@@ -7366,6 +7466,41 @@ impl BrowserSession {
                 .map_err(|error| format!("Failed to encode preview tool result: {error}"))?;
         }
         Ok(result)
+    }
+
+    /// The same envelope as [`Self::execute_tool_blocking`] around a read that answers in the
+    /// caller's own type: the automation lock, page preparation, agent control and the modal-state
+    /// gate, and nothing after it — a read has no consequences to settle and no page block to
+    /// append.
+    ///
+    /// The decision-model preview tools use this for their two page round trips, because their
+    /// scoring runs between them and must not hold this lock while it does.
+    fn read_page_blocking<T>(
+        &self,
+        tool: PreviewTool,
+        read: impl FnOnce(&Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _automation = lock_unpoison(&self.automation);
+        let status = self.status();
+        if self.lock_state().activity.crash.is_some() {
+            self.reset_after_crash()?;
+        } else if status.suspended {
+            self.prepare(None)?;
+            self.wait_for_load(NAVIGATION_LOAD_GRACE);
+        } else if !status.has_page {
+            self.prepare(None)?;
+        }
+        let _control = self.begin_agent_control(tool)?;
+        let modal_states = self.modal_states();
+        if modal_states.iter().any(|state| !state.is_cleared_by(tool)) {
+            let mut lines = vec![
+                format!("Tool \"{tool}\" does not handle the modal state."),
+                "Modal state:".to_owned(),
+            ];
+            lines.extend(render_modal_states(&modal_states));
+            return Err(lines.join("\n"));
+        }
+        read(self)
     }
 
     /// Attaches the page's state after an interaction to its result, the way `@playwright/mcp`
@@ -10117,6 +10252,10 @@ const PREVIEW_SNAPSHOT_MAX_DEPTH: usize = 8;
 /// such bound and would recurse until the stack ran out.
 const PREVIEW_AX_MAX_TREE_DEPTH: usize = 500;
 const PREVIEW_EMPTY_SNAPSHOT: &str = "No accessible content found.";
+/// Element lines one `preview_element_lines` read hands to the decision-model tools. The
+/// whole-snapshot character cap does not apply there — a scored line is addressed by its uid,
+/// not by its position in a text — so the bound is on lines, and the caller reports when it bit.
+pub(crate) const PREVIEW_ELEMENT_LINES_CAP: usize = 2_000;
 const PREVIEW_MAX_NETWORK_ENTRIES: usize = 500;
 const PREVIEW_MAX_LOG_TEXT_CHARS: usize = 8_000;
 const PREVIEW_MAX_METHOD_CHARS: usize = 64;
@@ -10211,6 +10350,45 @@ const PREVIEW_FILL_SCRIPT: &str = r#"
 
 const PREVIEW_INNER_TEXT_SCRIPT: &str =
     r#"document.querySelector(__MEWORK_SELECTOR__)?.innerText?.substring(0, 500) || """#;
+
+/// `Runtime.callFunctionOn` body that turns the element it is called on into a CSS selector.
+///
+/// It takes no arguments and reads no page state beyond `this` and `document`: an `#id` when the
+/// document holds exactly one element with it, otherwise `tag:nth-of-type(n)` segments up to
+/// `html`. The path is returned only after the page itself agrees it selects this very node, so a
+/// node in a shadow root or one detached from the document answers `null` rather than a selector
+/// that would silently act on something else.
+const PREVIEW_UNIQUE_SELECTOR_FUNCTION: &str = r#"function () {
+  const node = this;
+  if (!node || node.nodeType !== 1 || !node.ownerDocument) return null;
+  const doc = node.ownerDocument;
+  const selects = path => {
+    try { return doc.querySelector(path) === node ? path : null; } catch (_) { return null; }
+  };
+  if (node.id && doc.querySelectorAll('#' + CSS.escape(node.id)).length === 1) {
+    const byId = selects('#' + CSS.escape(node.id));
+    if (byId) return byId;
+  }
+  const segments = [];
+  let current = node;
+  while (current && current.nodeType === 1) {
+    const tag = current.localName;
+    if (!tag) return null;
+    if (tag === 'html') { segments.unshift('html'); break; }
+    const parent = current.parentElement;
+    if (!parent) { segments.unshift(tag); break; }
+    let index = 0;
+    for (const sibling of parent.children) {
+      if (sibling.localName === tag) {
+        index += 1;
+        if (sibling === current) break;
+      }
+    }
+    segments.unshift(tag + ':nth-of-type(' + index + ')');
+    current = parent;
+  }
+  return segments.length ? selects(segments.join(' > ')) : null;
+}"#;
 
 const PREVIEW_REACT_FIBER_SCRIPT: &str = r#"(function() {
             var el = document.querySelector(__MEWORK_SELECTOR__);
@@ -11104,7 +11282,28 @@ struct AxNode {
     name: String,
     value: Option<String>,
     description: Option<String>,
+    /// The DOM node behind this accessibility node, when the tree names one. It is what
+    /// `unique_selector_for` resolves into a CSS selector; a node without one (a synthesized
+    /// accessibility node) cannot be addressed by selector at all.
+    backend_node_id: Option<i64>,
     children: Vec<AxNode>,
+}
+
+/// One line of a rendered accessibility snapshot, before it becomes text.
+///
+/// `format_ax_snapshot` is a renderer over these, so a decision-model tool can score, choose and
+/// address individual elements without re-parsing the text the model would have read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AxLine {
+    pub(crate) indent: usize,
+    pub(crate) uid: u64,
+    pub(crate) role: String,
+    pub(crate) name: String,
+    /// Empty when the node carries no value; the renderer omits the `(value: …)` part then.
+    pub(crate) value: String,
+    pub(crate) backend_node_id: Option<i64>,
+    /// `Some(n)` on a depth-capped line, which prints `... (n descendants)` instead of them.
+    pub(crate) descendants_note: Option<usize>,
 }
 
 /// Base64 JPEG returned inline as an image content block, not written to a workspace path.
@@ -11156,6 +11355,128 @@ impl BrowserSession {
     }
 
     // ----- element inspection -------------------------------------------------------------
+
+    /// The same accessibility read `preview_snapshot` performs, handed back as lines instead of
+    /// text: the decision-model preview tools score, choose among and address these individually.
+    ///
+    /// The uid minting is shared with `preview_snapshot` — both advance the page generation's
+    /// counter — so a uid the model saw in a snapshot never means a different element here.
+    /// The second half of the answer is whether the [`PREVIEW_ELEMENT_LINES_CAP`] bit.
+    pub(crate) fn preview_element_lines(&self) -> Result<(Vec<AxLine>, bool), String> {
+        let _ = self.cdp_call("Accessibility.enable", &json!({}), EVAL_TIMEOUT);
+        let tree = self.cdp_call("Accessibility.getFullAXTree", &json!({}), EVAL_TIMEOUT);
+        let _ = self.cdp_call("Accessibility.disable", &json!({}), EVAL_TIMEOUT);
+        let response = tree?;
+        let nodes = response
+            .get("nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut uid = self.lock_state().activity.snapshot_uid;
+        let tree = build_ax_tree(&nodes, &mut uid);
+        self.lock_state().activity.snapshot_uid = uid;
+        let Some(tree) = tree else {
+            return Ok((Vec::new(), false));
+        };
+        let mut lines = Vec::new();
+        ax_snapshot_lines(&tree, 0, 0, &mut lines);
+        let truncated = lines.len() > PREVIEW_ELEMENT_LINES_CAP;
+        lines.truncate(PREVIEW_ELEMENT_LINES_CAP);
+        Ok((lines, truncated))
+    }
+
+    /// A CSS selector that addresses exactly the DOM node behind `backend_node_id`, or `None`
+    /// when no selector can: the node was removed, it lives inside a shadow root, or the path
+    /// this builds does not select it back.
+    ///
+    /// The selector is what the decision-model variants hand to `preview_click`/`preview_fill`/
+    /// `preview_inspect`, so "the page agreed this path selects this node" is the whole contract.
+    pub(crate) fn unique_selector_for(
+        &self,
+        backend_node_id: i64,
+    ) -> Result<Option<String>, String> {
+        self.cdp_call("DOM.enable", &json!({}), EVAL_TIMEOUT)?;
+        let selector = self.resolve_unique_selector(backend_node_id);
+        let _ = self.cdp_call("DOM.disable", &json!({}), EVAL_TIMEOUT);
+        selector
+    }
+
+    fn resolve_unique_selector(&self, backend_node_id: i64) -> Result<Option<String>, String> {
+        // A node the tree named a moment ago and the DOM no longer holds is not a transport
+        // fault; it is the ordinary "the page moved on" the caller reports as unavailable.
+        let Ok(resolved) = self.cdp_call(
+            "DOM.resolveNode",
+            &json!({ "backendNodeId": backend_node_id }),
+            EVAL_TIMEOUT,
+        ) else {
+            return Ok(None);
+        };
+        let Some(object_id) = resolved
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let called = self.cdp_call(
+            "Runtime.callFunctionOn",
+            &json!({
+                "objectId": object_id,
+                "functionDeclaration": PREVIEW_UNIQUE_SELECTOR_FUNCTION,
+                "returnByValue": true,
+            }),
+            EVAL_TIMEOUT,
+        );
+        // The handle is the page's, not ours: it must be released whether the call answered.
+        let _ = self.cdp_call(
+            "Runtime.releaseObject",
+            &json!({ "objectId": object_id }),
+            EVAL_TIMEOUT,
+        );
+        let called = called?;
+        if called.get("exceptionDetails").is_some() {
+            return Ok(None);
+        }
+        Ok(called
+            .pointer("/result/value")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
+    /// Every console entry as `[level] text`, for scoring. Unlike `preview_console_logs` there is
+    /// no level filter, no tail slice and no footer: the decision model chunks the whole buffer
+    /// and only the pieces that clear the threshold reach the conversation anyway.
+    pub(crate) fn console_log_lines(&self) -> Result<Vec<String>, String> {
+        let payload = self.eval_value(
+            r#"
+const render = value => typeof value === "string" ? value : (() => { try { return JSON.stringify(value); } catch (_) { return String(value); } })();
+return __state.consoleEntries.map(entry => ({
+  level: String(entry.level || "log"),
+  text: Array.isArray(entry.args) ? entry.args.map(render).join(" ") : String(entry.message || "")
+}));
+"#,
+            EVAL_TIMEOUT,
+        )?;
+        Ok(payload
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| {
+                format!(
+                    "[{}] {}",
+                    entry.get("level").and_then(Value::as_str).unwrap_or("log"),
+                    truncate_with_ellipsis(
+                        entry
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        PREVIEW_MAX_LOG_TEXT_CHARS
+                    )
+                )
+            })
+            .collect())
+    }
 
     /// `preview_inspect`. `Ok(None)` is the source's "element not found", which the dispatcher
     /// renders as the ordinary (non-error) text `Element not found: {selector}`; it also covers the
@@ -12102,6 +12423,7 @@ fn build_ax_node(
             .pointer("/description/value")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        backend_node_id: node.get("backendDOMNodeId").and_then(Value::as_i64),
         children,
     }
 }
@@ -12144,26 +12466,26 @@ fn ax_descendant_count(node: &AxNode) -> usize {
     node.children.len() + node.children.iter().map(ax_descendant_count).sum::<usize>()
 }
 
-fn format_ax_snapshot(node: &AxNode, indent: usize, depth: usize) -> String {
-    let name = truncate_with_ellipsis(&node.name, PREVIEW_SNAPSHOT_TEXT_CHARS);
-    let value = node
-        .value
-        .as_deref()
-        .map(|value| truncate_with_ellipsis(value, PREVIEW_SNAPSHOT_TEXT_CHARS))
-        .unwrap_or_default();
-    let mut line = format!("{}[{}] {}", "  ".repeat(indent), node.uid, node.role);
-    if !name.is_empty() {
-        line.push_str(&format!(": \"{name}\""));
-    }
-    if !value.is_empty() {
-        line.push_str(&format!(" (value: \"{value}\")"));
-    }
+/// Walks a rebuilt tree into exactly the lines [`format_ax_snapshot`] prints, in print order.
+///
+/// The transparency, redundancy, opacity and depth rules all live here; the renderer below only
+/// turns one line into text. A transparent wrapper contributes no line of its own, a redundant
+/// one is replaced by its single child, and a node past the depth cap contributes one line whose
+/// descendants are summarised instead of walked.
+fn ax_snapshot_lines(node: &AxNode, indent: usize, depth: usize, out: &mut Vec<AxLine>) {
+    let line = |descendants_note| AxLine {
+        indent,
+        uid: node.uid,
+        role: node.role.clone(),
+        name: node.name.clone(),
+        value: node.value.clone().unwrap_or_default(),
+        backend_node_id: node.backend_node_id,
+        descendants_note,
+    };
     if depth > PREVIEW_SNAPSHOT_MAX_DEPTH {
         let descendants = ax_descendant_count(node);
-        if descendants > 0 {
-            line.push_str(&format!(" ... ({descendants} descendants)"));
-        }
-        return line;
+        out.push(line((descendants > 0).then_some(descendants)));
+        return;
     }
     // An SVG's internals, and a decorative image's, are noise the model cannot act on.
     let opaque = node.role == "SvgRoot"
@@ -12172,29 +12494,54 @@ fn format_ax_snapshot(node: &AxNode, indent: usize, depth: usize) -> String {
             && !ax_has_interesting_descendant(node));
     let children: &[AxNode] = if opaque { &[] } else { &node.children };
     if ax_is_transparent(node) {
-        return children
-            .iter()
-            .map(|child| format_ax_snapshot(child, indent, depth))
-            .filter(|rendered| !rendered.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        for child in children {
+            ax_snapshot_lines(child, indent, depth, out);
+        }
+        return;
     }
     // A generic wrapper whose only content is one child adds an indent level and nothing else.
-    let redundant = name.is_empty()
+    let redundant = node.name.is_empty()
         && !ax_value_is_set(node)
         && children.len() == 1
         && ax_role_is_generic(&node.role);
     if redundant {
-        return format_ax_snapshot(&children[0], indent, depth);
+        ax_snapshot_lines(&children[0], indent, depth, out);
+        return;
     }
-    let mut lines = vec![line];
+    out.push(line(None));
     for child in children {
-        let rendered = format_ax_snapshot(child, indent + 1, depth + 1);
-        if !rendered.is_empty() {
-            lines.push(rendered);
-        }
+        ax_snapshot_lines(child, indent + 1, depth + 1, out);
     }
-    lines.join("\n")
+}
+
+/// One snapshot line as text: `[uid] role: "name" (value: "…")`, names and values capped.
+/// `with_indent` is false where the line stands on its own — a hit, a choice option — and the
+/// tree position it came from would only be noise.
+pub(crate) fn render_ax_line(line: &AxLine, with_indent: bool) -> String {
+    let name = truncate_with_ellipsis(&line.name, PREVIEW_SNAPSHOT_TEXT_CHARS);
+    let value = truncate_with_ellipsis(&line.value, PREVIEW_SNAPSHOT_TEXT_CHARS);
+    let indent = if with_indent { "  ".repeat(line.indent) } else { String::new() };
+    let mut text = format!("{indent}[{}] {}", line.uid, line.role);
+    if !name.is_empty() {
+        text.push_str(&format!(": \"{name}\""));
+    }
+    if !value.is_empty() {
+        text.push_str(&format!(" (value: \"{value}\")"));
+    }
+    if let Some(descendants) = line.descendants_note {
+        text.push_str(&format!(" ... ({descendants} descendants)"));
+    }
+    text
+}
+
+fn format_ax_snapshot(node: &AxNode, indent: usize, depth: usize) -> String {
+    let mut lines = Vec::new();
+    ax_snapshot_lines(node, indent, depth, &mut lines);
+    lines
+        .iter()
+        .map(|line| render_ax_line(line, true))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate_preview_snapshot(text: &str) -> String {
@@ -12491,6 +12838,103 @@ mod preview_primitive_tests {
         let tree = build_ax_tree(&nodes, &mut uid).expect("tree");
         assert_eq!(uid, 8);
         assert_eq!(format_ax_snapshot(&tree, 0, 0), "[8] button: \"Go\"");
+    }
+
+    /// The line walk and the text renderer are one traversal: the lines carry exactly what the
+    /// snapshot prints, plus the DOM identity a decision-model tool needs to act on one of them.
+    #[test]
+    fn element_lines_are_the_snapshot_lines_with_dom_identity() {
+        let nodes = vec![
+            json!({
+                "nodeId": "1",
+                "backendDOMNodeId": 11,
+                "role": {"value": "RootWebArea"},
+                "name": {"value": "Example"},
+                "childIds": ["2", "3"],
+            }),
+            json!({
+                "nodeId": "2",
+                "backendDOMNodeId": 22,
+                "role": {"value": "heading"},
+                "name": {"value": "Title"},
+                "childIds": [],
+            }),
+            json!({
+                "nodeId": "3",
+                "role": {"value": "textbox"},
+                "name": {"value": "Search"},
+                "value": {"value": "hello"},
+                "childIds": [],
+            }),
+        ];
+        let mut uid = 0;
+        let tree = build_ax_tree(&nodes, &mut uid).expect("tree");
+        let mut lines = Vec::new();
+        ax_snapshot_lines(&tree, 0, 0, &mut lines);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| render_ax_line(line, true))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            format_ax_snapshot(&tree, 0, 0)
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.indent, line.uid, line.backend_node_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 1, Some(11)), (1, 2, Some(22)), (1, 3, None)]
+        );
+        // Standing on its own, a line drops the tree indentation and keeps everything else.
+        assert_eq!(
+            render_ax_line(&lines[2], false),
+            "[3] textbox: \"Search\" (value: \"hello\")"
+        );
+        assert_eq!(render_ax_line(&lines[1], true), "  [2] heading: \"Title\"");
+    }
+
+    /// Flattened wrappers contribute no line of their own, and a depth-capped node carries its
+    /// descendant count on the line instead of walking into them.
+    #[test]
+    fn element_lines_follow_the_flattening_and_depth_rules() {
+        let nodes = vec![
+            ax("1", "RootWebArea", "Page", &["2"]),
+            ax("2", "generic", "", &["3", "4"]),
+            ax("3", "StaticText", "one", &[]),
+            ax("4", "StaticText", "two", &[]),
+        ];
+        let mut uid = 0;
+        let tree = build_ax_tree(&nodes, &mut uid).expect("tree");
+        let mut lines = Vec::new();
+        ax_snapshot_lines(&tree, 0, 0, &mut lines);
+        assert_eq!(
+            lines.iter().map(|line| line.uid).collect::<Vec<_>>(),
+            vec![1, 3, 4],
+            "the nameless generic wrapper prints its children in its place"
+        );
+
+        let mut deep = vec![ax("0", "RootWebArea", "Deep", &["1"])];
+        for level in 1..=11 {
+            let child = (level + 1).to_string();
+            deep.push(ax(
+                &level.to_string(),
+                "listitem",
+                &format!("level {level}"),
+                &[child.as_str()],
+            ));
+        }
+        deep.push(ax("12", "listitem", "level 12", &[]));
+        let mut uid = 0;
+        let tree = build_ax_tree(&deep, &mut uid).expect("tree");
+        let mut lines = Vec::new();
+        ax_snapshot_lines(&tree, 0, 0, &mut lines);
+        let last = lines.last().expect("a capped line");
+        assert_eq!(last.descendants_note, Some(3));
+        assert_eq!(
+            render_ax_line(last, false),
+            "[10] listitem: \"level 9\" ... (3 descendants)"
+        );
     }
 
     #[test]
@@ -12800,6 +13244,10 @@ mod tests {
             PreviewTool::ConsoleLogs => json!({"level":"error", "lines":10}),
             PreviewTool::Screenshot => json!({"scale":0.5}),
             PreviewTool::Snapshot => json!({}),
+            PreviewTool::FindElement => json!({"query":"button"}),
+            PreviewTool::ClickByDescription => json!({"description":"the save button", "doubleClick":true}),
+            PreviewTool::FillByDescription => json!({"description":"the email field", "value":"hello"}),
+            PreviewTool::InspectByDescription => json!({"description":"the save button", "styles":["color"]}),
             PreviewTool::Inspect => json!({"selector":"button", "styles":["color"]}),
             PreviewTool::Click => json!({"selector":"button", "doubleClick":true}),
             PreviewTool::Fill => json!({"selector":"input", "value":"hello"}),
@@ -12815,7 +13263,7 @@ mod tests {
     fn every_preview_page_tool_has_a_runtime_dispatch_arm() {
         let session = BrowserSession::default();
 
-        assert_eq!(PreviewTool::ALL.len(), 11);
+        assert_eq!(PreviewTool::ALL.len(), 15);
         let catalog = crate::catalog::tool_catalog()
             .into_iter()
             .map(|tool| tool.name)
@@ -15346,7 +15794,7 @@ mod tests {
             let error = session
                 .execute_tool_blocking(
                     tool,
-                    &object(json!({"selector":"input","value":"x","expression":"1"})),
+                    &object(json!({"selector":"input","value":"x","expression":"1","query":"button","description":"the save button","doubleClick":false,"styles":["color"]})),
                     &BrowserToolGrants {
                         upload_paths: Some(vec![PathBuf::from("image.png")]),
                     },

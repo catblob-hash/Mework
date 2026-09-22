@@ -142,7 +142,11 @@ fn parse_listing(output: &str) -> Result<RemoteDirectoryListing, String> {
 /// picker's own refusals stay here, because they are written for someone
 /// standing in front of a dialog. A non-zero exit is reported with the machine's
 /// own stderr: "No such file or directory" from the remote shell tells the user
-/// more than any sentence the host could invent for it.
+/// more than any sentence the host could invent for it. The one answer that is
+/// translated is `cmd.exe`'s: a Windows machine whose sshd still hands logins to
+/// `cmd.exe` cannot run the POSIX line at all, and its "'exec' is not
+/// recognized" names neither the cause nor the fix — the picker is where that
+/// machine is first met, so this is where the user has to learn it.
 fn run(runner: &ShellRunner, command: &str) -> Result<String, String> {
     if matches!(runner, ShellRunner::Local { .. }) {
         return Err("本机目录请用系统目录选择器".into());
@@ -158,10 +162,28 @@ fn run(runner: &ShellRunner, command: &str) -> Result<String, String> {
         return Ok(decode(&output.stdout, runner));
     }
     let detail = output.stderr.trim();
-    Err(if detail.is_empty() {
-        format!("这台机器拒绝了这次目录读取（退出码 {:?}）", output.status)
-    } else {
-        detail.to_owned()
+    Err(non_posix_shell_refusal(output.status, detail).unwrap_or_else(|| {
+        if detail.is_empty() {
+            format!("这台机器拒绝了这次目录读取（退出码 {:?}）", output.status)
+        } else {
+            detail.to_owned()
+        }
+    }))
+}
+
+/// The picker's wording for a machine that answered through `cmd.exe` or
+/// PowerShell, with the machine's own words kept after the advice so the user
+/// can still see exactly what came back.
+fn non_posix_shell_refusal(status: Option<i32>, stderr: &str) -> Option<String> {
+    run_environment::answered_by_non_posix_shell(status, stderr).then(|| {
+        if stderr.is_empty() {
+            run_environment::NON_POSIX_SHELL_ADVICE.to_owned()
+        } else {
+            format!(
+                "{}。原始回应：{stderr}",
+                run_environment::NON_POSIX_SHELL_ADVICE
+            )
+        }
     })
 }
 
@@ -222,5 +244,24 @@ mod tests {
         assert!(listing_command("").is_err());
         assert!(listing_command("/srv/\nrm -rf /").is_err());
         assert!(listing_command(&"/".repeat(MAX_PATH_CHARS + 1)).is_err());
+    }
+
+    /// The factory Windows sshd answers the picker through `cmd.exe`. The
+    /// dialog then has to say what to change on that machine, and still show
+    /// the machine's own words; any other failure keeps passing through raw.
+    #[test]
+    fn a_cmd_answer_is_explained_rather_than_shown_raw() {
+        let raw = "'exec' is not recognized as an internal or external command,\noperable program or batch file.";
+        let refusal = non_posix_shell_refusal(Some(1), raw).unwrap();
+        assert!(refusal.contains("POSIX shell"), "{refusal}");
+        assert!(refusal.contains("DefaultShell"), "{refusal}");
+        assert!(refusal.ends_with(raw), "{refusal}");
+
+        assert!(non_posix_shell_refusal(Some(9009), "").is_some());
+        assert!(non_posix_shell_refusal(
+            Some(1),
+            "bash: line 1: cd: /srv/missing: No such file or directory"
+        )
+        .is_none());
     }
 }

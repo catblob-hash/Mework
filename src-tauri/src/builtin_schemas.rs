@@ -67,6 +67,22 @@ fn server_id_prop() -> Value {
     string_prop("Server ID", 256)
 }
 
+/// The natural-language query every decision-model find tool scores candidates against.
+fn query_prop(description: &str) -> Value {
+    string_prop(description, crate::decision_model::MAX_QUERY_CHARS)
+}
+
+/// The score threshold every decision-model find tool takes: `0..=1`, three decimals. Scores
+/// come back at the same precision, so a reported score can be reused as a threshold.
+fn threshold_prop() -> Value {
+    json!({
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Minimum score, 0 to 1 with at most three decimal places; only pieces scoring at or above it are returned. Start around 0.6 and lower it if nothing comes back."
+    })
+}
+
 /// One closed variant of a merged tool's `oneOf`.
 ///
 /// `action` is folded into each variant as a `const` and into its `required`, so the union stays
@@ -280,6 +296,68 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "required": ["path"],
             "additionalProperties": false
         }),
+        "find_content" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolFindContentDescription),
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Text file to search, relative to the workspace."
+                },
+                "query": query_prop("What to look for, in plain language, e.g. 'the code that handles a failed login'."),
+                "threshold": threshold_prop(),
+                "start_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "First line to consider, 1-based."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Last line to consider, inclusive; defaults to the end of the file."
+                }
+            },
+            "required": ["path", "query", "threshold"],
+            "additionalProperties": false
+        }),
+        "find_files" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolFindFilesDescription),
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "default": ".",
+                    "description": "Directory to search, relative to the workspace."
+                },
+                "query": query_prop("What files to look for, in plain language, e.g. 'code that stores provider credentials'."),
+                "threshold": threshold_prop(),
+                "depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 8,
+                    "default": 6,
+                    "description": "Recursion depth; 0 lists only the current directory."
+                }
+            },
+            "required": ["query", "threshold"],
+            "additionalProperties": false
+        }),
+        "find_output" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolFindOutputDescription),
+            "properties": {
+                "task": string_prop("The shell task address from task_list, e.g. shell:3.", 64),
+                "query": query_prop("What to look for in the command output, in plain language."),
+                "threshold": threshold_prop()
+            },
+            "required": ["task", "query", "threshold"],
+            "additionalProperties": false
+        }),
         "lsp" => json!({
             "type": "object",
             "description": profile.text(PromptKey::ToolLspDescription),
@@ -418,7 +496,55 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "required": ["command"],
             "additionalProperties": false
         }),
-        // ------------------------------------------------------------ Web search
+        "bash_find_output" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolBashFindOutputDescription),
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 65536,
+                    "description": "The Bash command line."
+                },
+                "description": {
+                    "type": "string",
+                    "description": SHELL_DESCRIPTION_PARAMETER
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": shell_timeout_parameter_description()
+                },
+                "query": query_prop("What to look for in the command output, in plain language."),
+                "threshold": threshold_prop()
+            },
+            "required": ["command", "query", "threshold"],
+            "additionalProperties": false
+        }),
+        "powershell_find_output" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolPowershellFindOutputDescription),
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 65536,
+                    "description": "The PowerShell command line."
+                },
+                "description": {
+                    "type": "string",
+                    "description": SHELL_DESCRIPTION_PARAMETER
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": shell_timeout_parameter_description()
+                },
+                "query": query_prop("What to look for in the command output, in plain language."),
+                "threshold": threshold_prop()
+            },
+            "required": ["command", "query", "threshold"],
+            "additionalProperties": false
+        }),
+
         //
         // The schemas mirror Cherry Studio's `shared/ai/builtinTools.ts`: `web_search`
         // accepts one self-contained query, `web_fetch` accepts absolute URLs, and both
@@ -707,7 +833,80 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "required": [],
             "additionalProperties": false
         }),
-        // -------------------------------------------------------------- Subagents
+        "preview_find_element" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolPreviewFindElementDescription),
+            "properties": {
+                "serverId": server_id_prop(),
+                "query": query_prop("The page element to look for in plain language."),
+                "threshold": threshold_prop()
+            },
+            "required": ["query", "threshold"],
+            "additionalProperties": false
+        }),
+        "preview_find_logs" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolPreviewFindLogsDescription),
+            "properties": {
+                "serverId": server_id_prop(),
+                "query": query_prop("What to look for in the console and server logs, in plain language."),
+                "threshold": threshold_prop(),
+                "source": {
+                    "type": "string",
+                    "enum": ["all", "console", "server"],
+                    "default": "all",
+                    "description": "Which logs to search: all, console, or server."
+                }
+            },
+            "required": ["query", "threshold"],
+            "additionalProperties": false
+        }),
+        "preview_click_by_description" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolPreviewClickByDescriptionDescription),
+            "properties": {
+                "serverId": server_id_prop(),
+                "description": query_prop("Plain-language description of the element to click, e.g. 'the Save button in the dialog'."),
+                "doubleClick": {
+                    "type": "boolean",
+                    "description": "Perform a double-click"
+                }
+            },
+            "required": ["description"],
+            "additionalProperties": false
+        }),
+        "preview_fill_by_description" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolPreviewFillByDescriptionDescription),
+            "properties": {
+                "serverId": server_id_prop(),
+                "description": query_prop("Plain-language description of the element to fill, e.g. 'the email field'."),
+                "value": {
+                    "type": "string",
+                    "maxLength": 32768,
+                    "description": "Value to fill"
+                }
+            },
+            "required": ["description", "value"],
+            "additionalProperties": false
+        }),
+        "preview_inspect_by_description" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolPreviewInspectByDescriptionDescription),
+            "properties": {
+                "serverId": server_id_prop(),
+                "description": query_prop("Plain-language description of the element to inspect, e.g. 'the Save button in the dialog'."),
+                "styles": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "description": "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
+                }
+            },
+            "required": ["description"],
+            "additionalProperties": false
+        }),
+
         "agent_spawn" => agent_spawn_schema(None, false, profile),
         "send_message" => json!({
             "type": "object",
@@ -957,8 +1156,24 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
 pub(crate) fn takes_a_workspace(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "ls" | "grep" | "find" | "read" | "write" | "edit" | "lsp" | "bash" | "powershell"
+        "ls" | "grep"
+            | "find"
+            | "read"
+            | "write"
+            | "edit"
+            | "lsp"
+            | "bash"
+            | "powershell"
+            | "find_content"
+            | "find_files"
+            | "bash_find_output"
+            | "powershell_find_output"
     )
+}
+
+/// The one tool shape that cannot reach a POSIX workspace: PowerShell, under either name.
+fn is_powershell_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "powershell" | "powershell_find_output")
 }
 
 /// Adds the `workspace` parameter naming which workspace a call acts in.
@@ -981,7 +1196,7 @@ pub(crate) fn with_workspace_parameter(
     if workspaces.len() < 2 || !takes_a_workspace(tool_name) {
         return schema;
     }
-    let addresses = if tool_name == "powershell" {
+    let addresses = if is_powershell_tool(tool_name) {
         workspaces.powershell_addresses()
     } else {
         workspaces.addresses()
@@ -995,7 +1210,7 @@ pub(crate) fn with_workspace_parameter(
     let mut description = format!(
         "Which of this conversation's workspaces this call acts in, named by the number the Environment section gives it. Defaults to {default}."
     );
-    if tool_name == "powershell" && addresses.len() < workspaces.len() {
+    if is_powershell_tool(tool_name) && addresses.len() < workspaces.len() {
         description.push_str(
             " Only workspaces on Windows machines are listed; use the bash tool for the others.",
         );
@@ -1959,7 +2174,7 @@ mod tests {
         }
     }
 
-    /// The preview surface is fifteen independent tools, not one multiplexed one. This
+    /// The preview surface is twenty independent tools, not one multiplexed one. This
     /// pins the whole set — including the two Mework-only tools the source has no
     /// equivalent for — so a tool cannot be dropped or renamed without a decision.
     #[test]
@@ -1987,6 +2202,11 @@ mod tests {
                 "preview_resize",
                 "preview_upload_image",
                 "preview_dialog",
+                "preview_find_element",
+                "preview_find_logs",
+                "preview_click_by_description",
+                "preview_fill_by_description",
+                "preview_inspect_by_description",
             ]
         );
         assert!(!tool_catalog().iter().any(|tool| tool.name == "playwright"));

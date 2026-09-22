@@ -1497,7 +1497,7 @@ describe("App model run flow — modelRun", () => {
     fireEvent.contextMenu(container.querySelector(".empty-state")!, { clientX: 40, clientY: 180 });
     await user.click(screen.getByRole("menuitem", { name: /工具调用/ }));
     await user.click(screen.getByRole("menuitem", { name: "Shell" }));
-    await user.click(screen.getByRole("menuitem", { name: /PowerShell/ }));
+    await user.click(screen.getByRole("menuitem", { name: /^PowerShell$/ }));
     await user.type(screen.getByLabelText("命令 *"), "Get-ChildItem");
     await user.click(screen.getByRole("button", { name: "执行并添加" }));
 
@@ -1921,7 +1921,7 @@ describe("App model run flow — modelRun", () => {
     fireEvent.contextMenu(container.querySelector(".empty-state")!, { clientX: 40, clientY: 180 });
     await user.click(screen.getByRole("menuitem", { name: /工具调用/ }));
     await user.click(screen.getByRole("menuitem", { name: "Shell" }));
-    await user.click(screen.getByRole("menuitem", { name: /PowerShell/ }));
+    await user.click(screen.getByRole("menuitem", { name: /^PowerShell$/ }));
     await user.type(screen.getByLabelText("命令 *"), "Get-ChildItem");
     await user.click(screen.getByRole("button", { name: "执行并添加" }));
 

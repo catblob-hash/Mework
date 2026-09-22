@@ -3,7 +3,7 @@
   "language": "en-US",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 46,
+  "toolCount": 56,
   "tools": [
     {
       "name": "ls",
@@ -135,6 +135,98 @@
       ]
     },
     {
+      "name": "bash_find_output",
+      "label": "Bash, scored output",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "git status --short"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": false,
+          "placeholder": "Show working tree status"
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "placeholder": "120000"
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "Why the tests failed",
+          "help": "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned."
+        },
+        {
+          "name": "threshold",
+          "label": "Score threshold",
+          "type": "number",
+          "required": true,
+          "placeholder": "0.6",
+          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
+        }
+      ]
+    },
+    {
+      "name": "powershell_find_output",
+      "label": "PowerShell, scored output",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "Get-ChildItem -Force"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": false,
+          "placeholder": "List files in the current directory"
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "placeholder": "120000"
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "Why the tests failed",
+          "help": "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned."
+        },
+        {
+          "name": "threshold",
+          "label": "Score threshold",
+          "type": "number",
+          "required": true,
+          "placeholder": "0.6",
+          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
+        }
+      ]
+    },
+    {
       "name": "write",
       "label": "Write file",
       "description": "",
@@ -233,6 +325,125 @@
           "type": "number",
           "required": false,
           "help": "Text files only; inclusive."
+        }
+      ]
+    },
+    {
+      "name": "find_content",
+      "label": "Find content",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "The code that handles a failed login",
+          "help": "Describe what to look for in plain language; the file is cut into chunks the decision model scores."
+        },
+        {
+          "name": "threshold",
+          "label": "Score threshold",
+          "type": "number",
+          "required": true,
+          "placeholder": "0.6",
+          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
+        },
+        {
+          "name": "start_line",
+          "label": "Start line",
+          "type": "number",
+          "required": false,
+          "defaultValue": 1,
+          "help": "1-based."
+        },
+        {
+          "name": "end_line",
+          "label": "End line",
+          "type": "number",
+          "required": false,
+          "help": "Inclusive; leave empty for the end of the file."
+        }
+      ]
+    },
+    {
+      "name": "find_files",
+      "label": "Find files by description",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": false,
+          "defaultValue": "."
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "The code that stores provider credentials",
+          "help": "Describe the files to look for in plain language; the directory listing is cut into groups the decision model scores."
+        },
+        {
+          "name": "threshold",
+          "label": "Score threshold",
+          "type": "number",
+          "required": true,
+          "placeholder": "0.6",
+          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
+        },
+        {
+          "name": "depth",
+          "label": "Recursion depth",
+          "type": "number",
+          "required": false,
+          "defaultValue": 6,
+          "help": "0 lists only the current directory."
+        }
+      ]
+    },
+    {
+      "name": "find_output",
+      "label": "Find command output",
+      "description": "",
+      "category": "shell",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "task",
+          "label": "Task address",
+          "type": "string",
+          "required": true,
+          "placeholder": "shell:3",
+          "help": "The shell task address from task_list, e.g. shell:3."
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "Are there compile errors",
+          "help": "Describe what to look for in the output in plain language; the output is cut into chunks the decision model scores."
+        },
+        {
+          "name": "threshold",
+          "label": "Score threshold",
+          "type": "number",
+          "required": true,
+          "placeholder": "0.6",
+          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
         }
       ]
     },
@@ -730,6 +941,172 @@
           "type": "string",
           "required": false,
           "help": "The answer for an open prompt dialog, used only when accepting."
+        }
+      ]
+    },
+    {
+      "name": "preview_find_element",
+      "label": "Find page elements by description",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "The login button in the top navigation",
+          "help": "Describe the page element to look for in plain language; the page's accessibility snapshot is cut into chunks the decision model scores."
+        },
+        {
+          "name": "threshold",
+          "label": "Score threshold",
+          "type": "number",
+          "required": true,
+          "placeholder": "0.6",
+          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
+        }
+      ]
+    },
+    {
+      "name": "preview_find_logs",
+      "label": "Find logs by description",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "Any errors about hydration",
+          "help": "Describe what to look for in the logs in plain language; the console and server logs are cut into chunks the decision model scores."
+        },
+        {
+          "name": "threshold",
+          "label": "Score threshold",
+          "type": "number",
+          "required": true,
+          "placeholder": "0.6",
+          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
+        },
+        {
+          "name": "source",
+          "label": "Log source",
+          "type": "string",
+          "required": false,
+          "defaultValue": "all",
+          "help": "Which logs to search: 'all' (default) searches both the page console and the dev server output, 'console' only the page console, 'server' only the server output."
+        }
+      ]
+    },
+    {
+      "name": "preview_click_by_description",
+      "label": "Click element by description",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The login button in the top navigation",
+          "help": "Describe the element to act on in plain language; the host hands the page's elements to the decision model, which picks one, and acts on it directly."
+        },
+        {
+          "name": "doubleClick",
+          "label": "Double-click",
+          "type": "boolean",
+          "required": false,
+          "help": "Perform a double-click"
+        }
+      ]
+    },
+    {
+      "name": "preview_fill_by_description",
+      "label": "Fill element by description",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The login button in the top navigation",
+          "help": "Describe the element to act on in plain language; the host hands the page's elements to the decision model, which picks one, and acts on it directly."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "string",
+          "required": true,
+          "help": "Value to fill"
+        }
+      ]
+    },
+    {
+      "name": "preview_inspect_by_description",
+      "label": "Inspect element by description",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The login button in the top navigation",
+          "help": "Describe the element to act on in plain language; the host hands the page's elements to the decision model, which picks one, and acts on it directly."
+        },
+        {
+          "name": "styles",
+          "label": "CSS properties",
+          "type": "json",
+          "required": false,
+          "placeholder": "[\"padding\",\"color\"]",
+          "help": "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
         }
       ]
     },

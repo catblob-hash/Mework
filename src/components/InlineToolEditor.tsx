@@ -17,6 +17,8 @@ interface EditableField {
   /** How the typed text becomes JSON again. */
   decode: "string" | "number" | "boolean" | "json";
   defaultValue?: JsonValue;
+  /** Shown in the empty control; the descriptor's hint at what belongs there. */
+  placeholder?: string;
 }
 
 function fieldFromParameter(parameter: ToolDescriptor["parameters"][number]): EditableField {
@@ -29,7 +31,8 @@ function fieldFromParameter(parameter: ToolDescriptor["parameters"][number]): Ed
       : parameter.type === "boolean"
         ? "boolean"
         : parameter.type === "json" ? "json" : "string",
-    defaultValue: parameter.defaultValue
+    defaultValue: parameter.defaultValue,
+    placeholder: parameter.placeholder
   };
 }
 
@@ -140,6 +143,7 @@ function ArgumentRows({
               className="context-text-editor"
               value={draft[field.name] ?? ""}
               label={field.label}
+              placeholder={field.placeholder}
               disabled={disabled}
               invalid={Boolean(errors[field.name])}
               onChange={(next) => onChange(field.name, next)}

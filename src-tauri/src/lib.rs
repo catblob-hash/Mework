@@ -37,6 +37,8 @@ mod conversation_fork;
 mod conversation_store;
 mod conversation_template;
 mod conversations;
+mod decision_model;
+mod decision_tools;
 mod document_store;
 mod environment_prompt;
 mod environment_tools;
@@ -2626,6 +2628,80 @@ async fn delete_search_api_key(
 
 #[cfg(not(test))]
 #[tauri::command]
+async fn save_decision_api_key(
+    state: State<'_, AppState>,
+    provider_kind: String,
+    api_key: String,
+) -> Result<ApiKeyStatus, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = state
+            .storage_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let api_key = zeroize::Zeroizing::new(api_key);
+        decision_model::save_provider_api_key(&provider_kind, &api_key)
+    })
+    .await
+    .map_err(|error| format!("保存决策模型提供商 API Key 的后台任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+async fn get_decision_key_status(
+    state: State<'_, AppState>,
+    provider_kind: String,
+) -> Result<ApiKeyStatus, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = state
+            .storage_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        decision_model::get_provider_key_status(&provider_kind)
+    })
+    .await
+    .map_err(|error| format!("读取决策模型提供商 API Key 状态的后台任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+async fn reveal_decision_api_key(
+    state: State<'_, AppState>,
+    provider_kind: String,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = state
+            .storage_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        decision_model::reveal_provider_api_key(&provider_kind)
+    })
+    .await
+    .map_err(|error| format!("读取决策模型提供商 API Key 的后台任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+async fn delete_decision_api_key(
+    state: State<'_, AppState>,
+    provider_kind: String,
+) -> Result<ApiKeyStatus, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = state
+            .storage_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        decision_model::delete_provider_api_key(&provider_kind)
+    })
+    .await
+    .map_err(|error| format!("删除决策模型提供商 API Key 的后台任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+#[tauri::command]
 async fn save_api_key(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -2785,8 +2861,10 @@ async fn codex_oauth_sign_out(
 }
 
 /// The persisted Claude Agent row for a login command. Same rule as the Codex
-/// pair: the executable path and the family come from the saved document, so a
-/// renderer row cannot point a subprocess launch at an arbitrary binary.
+/// pair: the family comes from the saved document, so a renderer row cannot make
+/// an arbitrary provider claim a Claude Code login. The executable is no longer
+/// part of that question — the host resolves the one it ships — but the check
+/// still keeps the two commands answering only for a genuine Claude Agent row.
 #[cfg(not(test))]
 fn trusted_claude_agent_provider(
     app: &AppHandle,
@@ -2811,7 +2889,10 @@ async fn claude_agent_login_status(
     provider: ApiProvider,
 ) -> Result<aisdk::agent::ClaudeAgentLoginStatus, String> {
     let provider = trusted_claude_agent_provider(&app, &state, &provider)?;
-    tauri::async_runtime::spawn_blocking(move || aisdk::agent::login_status(&provider))
+    // The executable is Mework's own, so the row contributes nothing but the
+    // family check above; the login it reports is still the user's.
+    drop(provider);
+    tauri::async_runtime::spawn_blocking(aisdk::agent::login_status)
         .await
         .map_err(|error| format!("读取 Claude Code 登录状态的后台任务失败: {error}"))?
 }
@@ -2827,7 +2908,8 @@ async fn claude_agent_open_login(
     provider: ApiProvider,
 ) -> Result<(), String> {
     let provider = trusted_claude_agent_provider(&app, &state, &provider)?;
-    tauri::async_runtime::spawn_blocking(move || aisdk::agent::open_login(&provider))
+    drop(provider);
+    tauri::async_runtime::spawn_blocking(aisdk::agent::open_login)
         .await
         .map_err(|error| format!("打开 Claude Code 登录的后台任务失败: {error}"))?
 }
@@ -5763,6 +5845,7 @@ mod prompt_tests {
             tool_name: tool_name.into(),
             round: Some(1),
             model_turn_id: Some(format!("state-turn-{id}")),
+            provider_call_id: None,
             requested_input: None,
             input: input.as_object().cloned().unwrap_or_else(Map::new),
             result: ToolResult {

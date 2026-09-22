@@ -82,10 +82,13 @@ const englishParameterLabels: Record<string, string> = {
   submit: "Submit after typing",
   tab: "Tab ID",
   taskId: "Task ID",
+  task: "Task address",
   tasks: "Tasks",
+  source: "Log source",
   target: "Child agent",
   text: "Text",
   text_gone: "Text to disappear",
+  threshold: "Score threshold",
   timeout_ms: "Timeout (ms)",
   timeout_seconds: "Timeout (seconds)",
   url: "URL",
@@ -98,6 +101,27 @@ const englishParameterLabels: Record<string, string> = {
 
 const englishParameterHelp: Record<string, string> = {
   "0 仅列出当前目录": "0 lists only the current directory.",
+  "用自然语言描述要找的文件；目录列表会切块送给决策模型打分":
+    "Describe the files to look for in plain language; the directory listing is cut into groups the decision model scores.",
+  "用自然语言描述要找的内容；文件会切块送给决策模型打分":
+    "Describe what to look for in plain language; the file is cut into chunks the decision model scores.",
+  "task_list 里的 shell 任务地址，如 shell:3": "The shell task address from task_list, e.g. shell:3.",
+  "用自然语言描述要在输出里找的内容；输出会切块送给决策模型打分":
+    "Describe what to look for in the output in plain language; the output is cut into chunks the decision model scores.",
+  "用自然语言描述要在命令输出里找的内容；输出会切块送给决策模型打分，只返回过阈值的片段":
+    "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned.",
+  "用自然语言描述要找的页面元素；页面的可访问性快照会切块送给决策模型打分":
+    "Describe the page element to look for in plain language; the page's accessibility snapshot is cut into chunks the decision model scores.",
+  "用自然语言描述要在日志里找的内容；Console 日志和服务器日志会切块送给决策模型打分":
+    "Describe what to look for in the logs in plain language; the console and server logs are cut into chunks the decision model scores.",
+  "要搜索的日志：all（默认）同时搜 Console 与服务器日志，console 只搜页面 Console，server 只搜服务器输出":
+    "Which logs to search: 'all' (default) searches both the page console and the dev server output, 'console' only the page console, 'server' only the server output.",
+  "用自然语言描述要操作的元素；宿主把页面元素交给决策模型选出一个并直接操作":
+    "Describe the element to act on in plain language; the host hands the page's elements to the decision model, which picks one, and acts on it directly.",
+  "0 到 1，最多三位小数；只返回分数不低于它的片段":
+    "0 to 1 with at most three decimals; only pieces scoring at or above it are returned.",
+  "从 1 开始": "1-based.",
+  "包含该行；留空到文件末尾": "Inclusive; leave empty for the end of the file.",
   "本对话已选技能的名字，取自 schema 的 enum":
     "Name of a skill this conversation selected; the schema lists them as an enum.",
   "`select:<名字>[,<名字>…]` 按名取，或者用关键词搜索":
@@ -194,6 +218,13 @@ const englishParameterHelp: Record<string, string> = {
 };
 
 const englishParameterPlaceholders: Record<string, string> = {
+  "处理登录失败的代码": "The code that handles a failed login",
+  "存放提供商凭据的代码": "The code that stores provider credentials",
+  "shell:3": "shell:3",
+  "有没有编译错误": "Are there compile errors",
+  "测试失败的原因": "Why the tests failed",
+  "顶部导航里的登录按钮": "The login button in the top navigation",
+  "有没有关于 hydration 的报错": "Any errors about hydration",
   "查清 X 的当前状态：需要回答哪些问题、已知什么、什么算答完了": "Establish the current state of X: which questions to answer, what is already known, and what counts as done",
   "对比表 / 时间线 / 清单 / 直接答案": "Comparison table / timeline / list / direct answer",
   "调查 src/ 下的路由结构并总结关键文件": "Inspect routing under src/ and summarize the key files",
@@ -219,6 +250,11 @@ const englishToolLabels: Record<string, string> = {
   edit: "Edit file",
   find: "Find files",
   read: "Read file",
+  find_content: "Find content",
+  find_files: "Find files by description",
+  find_output: "Find command output",
+  bash_find_output: "Bash, scored output",
+  powershell_find_output: "PowerShell, scored output",
   lsp: "Code navigation",
   web_search: "Web search",
   workflow: "Workflow",
@@ -237,6 +273,11 @@ const englishToolLabels: Record<string, string> = {
   preview_resize: "Resize viewport",
   preview_upload_image: "Upload image",
   preview_dialog: "Answer dialog",
+  preview_find_element: "Find page elements by description",
+  preview_find_logs: "Find logs by description",
+  preview_click_by_description: "Click element by description",
+  preview_fill_by_description: "Fill element by description",
+  preview_inspect_by_description: "Inspect element by description",
   agent_spawn: "Subagent",
   send_message: "Send message",
   followup_task: "Follow up",

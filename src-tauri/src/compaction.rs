@@ -452,6 +452,7 @@ mod tests {
             tool_name: "read".into(),
             round: None,
             model_turn_id: Some(turn.into()),
+            provider_call_id: None,
             requested_input: None,
             input,
             result: ToolResult {

@@ -122,6 +122,29 @@ describe("document normalization", () => {
   });
 
   /**
+   * The sidebar workspace is rebuilt field by field, and `machine` once fell
+   * through that list. The on-disk record and the host were both right; only
+   * the loaded copy claimed the remote directory was local, and the next save
+   * was refused ("Workspace path must be absolute", a POSIX path on Windows)
+   * for the rest of the session. A malformed binding is dropped rather than
+   * kept, which is the attached-workspace rule too.
+   */
+  it("keeps a sidebar workspace on its machine through normalization", () => {
+    const document = createSeedDocument();
+    const remote = { ...document.workspaces[0], id: "ws_remote", path: "/home/dev/app", conversations: [] };
+    (remote as unknown as Record<string, unknown>).machine = { kind: "ssh", machineId: "m1" };
+    const malformed = { ...document.workspaces[0], id: "ws_odd", path: "D:/local", conversations: [] };
+    (malformed as unknown as Record<string, unknown>).machine = { kind: "nonsense" };
+    document.workspaces.push(remote, malformed);
+
+    const workspaces = normalizeDocument(document).workspaces;
+    expect(workspaces.find((workspace) => workspace.id === "ws_remote")?.machine)
+      .toEqual({ kind: "ssh", machineId: "m1" });
+    expect(workspaces.find((workspace) => workspace.id === "ws_odd")).not.toHaveProperty("machine");
+    expect(workspaces[0]).not.toHaveProperty("machine");
+  });
+
+  /**
    * A workspace-sourced descriptor is the only thing that tells the renderer which
    * conversations may select it, so normalization must not flatten it away.
    */
@@ -1423,6 +1446,35 @@ describe("document normalization", () => {
     const loaded = (await loadDocument()).workspaces[0].conversations[0];
     expect((loaded.contexts[0] as Extract<ContextItem, { kind: "tool" }>).attestation)
       .toBe(attestation);
+  });
+
+  it("carries the provider call id through a save/load round-trip", async () => {
+    const document = createSeedDocument();
+    const conversation = document.workspaces[0].conversations[0];
+    const timestamp = "2026-08-09T00:00:00Z";
+    const providerCallId = "toolu_01DijKBKyyWKCXcHTjEoAuJz";
+    conversation.contexts = [{
+      id: "ctx_tool_abc",
+      kind: "tool",
+      toolName: "read",
+      input: { path: "README.md" },
+      result: { success: true, output: "contents", executedAt: timestamp, durationMs: 1 },
+      providerCallId,
+      createdAt: timestamp
+    }];
+
+    await saveDocument(document);
+    const stored = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+
+    // Same allowlist hazard as the attestation above, but it fails quietly:
+    // dropping this field does not break a save, it makes replay mint a digest
+    // instead, so every tool call in the turn changes id on the next turn and
+    // the prompt cache for that turn is forfeited. Nothing goes red.
+    expect(stored.workspaces[0].conversations[0].contexts[0].providerCallId).toBe(providerCallId);
+
+    const loaded = (await loadDocument()).workspaces[0].conversations[0];
+    expect((loaded.contexts[0] as Extract<ContextItem, { kind: "tool" }>).providerCallId)
+      .toBe(providerCallId);
   });
 
   it("leaves a pre-versioning binding unstamped instead of inventing a receipt version", async () => {

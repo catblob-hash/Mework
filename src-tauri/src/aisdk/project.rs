@@ -22,7 +22,9 @@
 use serde_json::{json, Value};
 
 use crate::model::ImageAttachment;
-use crate::wire_history::{canonical_history, CanonicalAssistantTurn, CanonicalHistoryBlock};
+use crate::wire_history::{
+    canonical_history, CanonicalAssistantTurn, CanonicalHistoryBlock, CanonicalToolExchange,
+};
 
 use super::protocol::{Family, MAX_LINE_BYTES};
 
@@ -148,6 +150,8 @@ pub(crate) fn push_tool_image_bridge(
 /// Local IDs never leave the host. The digest produces valid, unique provider IDs;
 /// Anthropic-shaped endpoints (including the Claude Code transcript the sidecar
 /// synthesizes) use `toolu_`, while other families use `call_`.
+///
+/// This is the fallback, not the first choice: see [`exchange_wire_id`].
 pub(crate) fn wire_tool_id(family: Family, local_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(local_id.as_bytes());
@@ -160,6 +164,31 @@ pub(crate) fn wire_tool_id(family: Family, local_id: &str) -> String {
         Family::Anthropic | Family::Bedrock | Family::ClaudeAgent => format!("toolu_{suffix}"),
         _ => format!("call_{suffix}"),
     }
+}
+
+/// The id one persisted tool exchange goes out under: the provider's own call
+/// id when the card kept one, and a digest of the local id otherwise.
+///
+/// Every wire protocol treats this id as an opaque key whose only job is to
+/// pair a call with its result — none of them derive it from the arguments or
+/// check that it is one they issued. So the original is always valid, and
+/// sending it is what keeps an exchange's identity stable for its whole life.
+/// Minting unconditionally used to rewrite every tool call in a turn the first
+/// time the next turn replayed it from the timeline, because the live leg sends
+/// the provider's id (`step::exchange_messages`) while replay had nothing but
+/// the one-way digest in the card's local id. That forfeited the prompt cache
+/// for the previous turn on every turn.
+///
+/// `wire_tool_id` still covers cards that never had a provider id — manual
+/// cards, host-fabricated `box` deliveries, archives written before the field
+/// existed — and those the screen in [`replayable_provider_call_id`] refused.
+///
+/// [`replayable_provider_call_id`]: crate::wire_history::replayable_provider_call_id
+pub(crate) fn exchange_wire_id(family: Family, exchange: &CanonicalToolExchange) -> String {
+    exchange
+        .provider_call_id
+        .clone()
+        .unwrap_or_else(|| wire_tool_id(family, &exchange.local_id))
 }
 
 /// Families whose reasoning history is only meaningful with the provider's own
@@ -212,7 +241,7 @@ fn assistant_messages(family: Family, turn: &CanonicalAssistantTurn, out: &mut V
     for exchange in &turn.tools {
         parts.push(json!({
             "type": "tool-call",
-            "toolCallId": wire_tool_id(family, &exchange.local_id),
+            "toolCallId": exchange_wire_id(family, exchange),
             "toolName": exchange.tool_name,
             "input": exchange.requested_input,
         }));
@@ -243,7 +272,7 @@ fn assistant_messages(family: Family, turn: &CanonicalAssistantTurn, out: &mut V
         .map(|exchange| {
             json!({
                 "type": "tool-result",
-                "toolCallId": wire_tool_id(family, &exchange.local_id),
+                "toolCallId": exchange_wire_id(family, exchange),
                 "toolName": exchange.tool_name,
                 "output": tool_output(exchange.result.success, &exchange.result.output),
             })
@@ -258,7 +287,7 @@ fn assistant_messages(family: Family, turn: &CanonicalAssistantTurn, out: &mut V
         push_tool_image_bridge(
             &mut bridge,
             &exchange.tool_name,
-            &wire_tool_id(family, &exchange.local_id),
+            &exchange_wire_id(family, exchange),
             &exchange.result.images,
         );
     }
@@ -359,6 +388,7 @@ mod tests {
         turn.tools.push(crate::wire_history::CanonicalToolExchange {
             local_id: "call_1".into(),
             tool_name: "ls".into(),
+            provider_call_id: None,
             requested_input: serde_json::from_str(r#"{"path":"src"}"#).unwrap(),
             result: crate::model::ToolResult {
                 success: true,
@@ -380,7 +410,8 @@ mod tests {
             .iter()
             .find(|part| part["type"] == "tool-call")
             .expect("必须有 tool-call 部件");
-        // Wire IDs are digests of local IDs with family-specific prefixes.
+        // A card that never kept a provider id falls back to a digest of the
+        // local id, with a family-specific prefix.
         let wire_id = wire_tool_id(Family::Anthropic, "call_1");
         assert!(wire_id.starts_with("toolu_"), "{wire_id}");
         assert_eq!(call["toolCallId"], wire_id);
@@ -391,6 +422,75 @@ mod tests {
         assert_eq!(out[1]["role"], "tool");
         assert_eq!(out[1]["content"][0]["toolCallId"], wire_id);
         assert_eq!(out[1]["content"][0]["output"]["type"], "text");
+    }
+
+    /// The live leg sends the provider's own call id (`step::exchange_messages`
+    /// replays the sidecar's response messages verbatim), so replay has to send
+    /// the same one. Minting here instead renamed every tool call in the turn
+    /// the first time the next turn replayed it, which cost the prompt cache for
+    /// that turn on every turn — for no protocol reason, since the id is only a
+    /// key pairing a call with its result.
+    #[test]
+    fn a_kept_provider_call_id_is_replayed_instead_of_a_fresh_digest() {
+        let mut turn = assistant("好的", "");
+        turn.tools.push(crate::wire_history::CanonicalToolExchange {
+            local_id: "ctx_tool_1".into(),
+            tool_name: "ls".into(),
+            provider_call_id: Some("toolu_01DijKBKyyWKCXcHTjEoAuJz".into()),
+            requested_input: serde_json::from_str(r#"{"path":"src"}"#).unwrap(),
+            result: crate::model::ToolResult {
+                success: true,
+                output: "src/main.rs".into(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: "2026-08-27T00:00:00Z".into(),
+                duration_ms: 1,
+            },
+        });
+
+        let mut out = Vec::new();
+        assistant_messages(Family::Anthropic, &turn, &mut out);
+        let call = out[0]["content"]
+            .as_array()
+            .expect("assistant 内容是数组")
+            .iter()
+            .find(|part| part["type"] == "tool-call")
+            .expect("必须有 tool-call 部件");
+        assert_eq!(call["toolCallId"], "toolu_01DijKBKyyWKCXcHTjEoAuJz");
+        assert_ne!(
+            call["toolCallId"],
+            Value::String(wire_tool_id(Family::Anthropic, "ctx_tool_1")),
+            "留着 provider id 的卡不该再铸摘要"
+        );
+        // Both legs of the exchange have to agree, or the provider sees a result
+        // with nothing to attach it to.
+        assert_eq!(
+            out[1]["content"][0]["toolCallId"],
+            "toolu_01DijKBKyyWKCXcHTjEoAuJz"
+        );
+    }
+
+    /// The same exchange keeps its id whatever family it goes out to: it is the
+    /// provider's own string, not something derived per family.
+    #[test]
+    fn a_kept_provider_call_id_is_family_independent() {
+        let exchange = crate::wire_history::CanonicalToolExchange {
+            local_id: "ctx_tool_1".into(),
+            tool_name: "ls".into(),
+            provider_call_id: Some("call_9xQabc".into()),
+            requested_input: crate::model::JsonObject::new(),
+            result: crate::model::ToolResult {
+                success: true,
+                output: String::new(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: String::new(),
+                duration_ms: 0,
+            },
+        };
+        for family in [Family::Anthropic, Family::OpenaiResponses, Family::OpenaiChat] {
+            assert_eq!(exchange_wire_id(family, &exchange), "call_9xQabc");
+        }
     }
 
     #[test]

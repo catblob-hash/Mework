@@ -100,7 +100,7 @@ pub const TASK_RUNTIME_TOOL_NAMES: [&str; 3] = ["task_wait", "task_list", "box"]
 ///
 /// Maps onto `orchestration::TaskRef`: `agent_spawn` / `workflow` occupy the
 /// agent pool, `preview_start` starts the dev-server process a `preview:<id>`
-/// row addresses, `bash` / `powershell` register shell tasks. The remaining
+/// row addresses, `bash` / `powershell` and their scored-output variants register shell tasks. The remaining
 /// address kind, `Terminal`, is opened by the user from the UI rather than by a
 /// tool, so it is deliberately not represented here. Search and fetch are
 /// ordinary concurrent async tools whose results come back as their own tool
@@ -110,11 +110,13 @@ pub const TASK_RUNTIME_TOOL_NAMES: [&str; 3] = ["task_wait", "task_list", "box"]
 /// the server process, not a task of its own: it has no address, it cannot be
 /// waited on, and it dies with the server. A conversation that can only drive a
 /// page has nothing in the task list and needs no task-runtime tools.
-pub const TASK_PRODUCING_TOOL_NAMES: [&str; 5] = [
+pub const TASK_PRODUCING_TOOL_NAMES: [&str; 7] = [
     "agent_spawn",
     "workflow",
     "bash",
     "powershell",
+    "bash_find_output",
+    "powershell_find_output",
     "preview_start",
 ];
 

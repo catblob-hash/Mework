@@ -2356,6 +2356,10 @@ fn synthesize_step_context(
         tool_name: WORKFLOW_STEP_TOOL.to_owned(),
         round: Some(round),
         model_turn_id: None,
+        // A synthesized step is not a provider tool call; `slot.call_id` is the
+        // host's own step address. Replay mints a digest for it like every other
+        // host-fabricated exchange.
+        provider_call_id: None,
         requested_input: None,
         input,
         result,

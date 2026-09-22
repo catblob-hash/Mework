@@ -1591,11 +1591,12 @@ pub struct ApiKeyStatus {
 /// Codex backend speaks Responses but authenticates with an OAuth session the
 /// host owns (`codex_oauth`), so it cannot be expressed as "a base URL plus a key".
 ///
-/// `ClaudeAgent` is not an HTTP dialect at all: the sidecar drives the locally
-/// installed Claude Code executable through the official Claude Agent SDK, and
-/// the CLI makes the Anthropic Messages calls itself. Its key is optional (an
-/// empty slot defers to the CLI's own login), its base URL is optional (it maps
-/// to `ANTHROPIC_BASE_URL`), and the executable path is a family setting.
+/// `ClaudeAgent` is not an HTTP dialect at all: the sidecar drives the Claude
+/// Code executable Mework ships — the CLI out of the pinned Agent SDK's platform
+/// package — through the official Claude Agent SDK, and the CLI makes the
+/// Anthropic Messages calls itself. It has no key (the CLI authenticates with the
+/// user's own login), no base URL, and no identity fields: the host resolves the
+/// executable on its own (`aisdk::agent::bundled_executable`).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFamily {
@@ -1625,10 +1626,6 @@ pub enum FamilySetting {
     Location,
     /// Optional Azure OpenAI `api-version`; an empty value uses the AI SDK default.
     ApiVersion,
-    /// Optional path to the native Claude Code executable for the `ClaudeAgent`
-    /// family; an empty value lets the host look in the standard install
-    /// locations (`~/.local/bin`, then `PATH`).
-    ClaudeExecutable,
 }
 
 impl FamilySetting {
@@ -1638,7 +1635,6 @@ impl FamilySetting {
             Self::Project => "project",
             Self::Location => "location",
             Self::ApiVersion => "api_version",
-            Self::ClaudeExecutable => "claude_executable",
         }
     }
 
@@ -1649,7 +1645,6 @@ impl FamilySetting {
             Self::Project => "project",
             Self::Location => "location",
             Self::ApiVersion => "apiVersion",
-            Self::ClaudeExecutable => "claudeExecutable",
         }
     }
 }
@@ -1702,7 +1697,6 @@ impl ProviderFamily {
             | Self::OpenaiCodex
             | Self::OpenaiChat
             | Self::Anthropic
-            // The executable is discovered when the setting is empty.
             | Self::ClaudeAgent
             | Self::Google
             | Self::Xai
@@ -1742,17 +1736,19 @@ impl ProviderFamily {
         matches!(self, Self::Anthropic)
     }
 
-    /// Identity fields this family recognizes, including optional fields.
+    /// Identity fields this family recognizes, including optional fields. Claude
+    /// Agent has none: Mework ships the Claude Code build it drives, so there is
+    /// no path for the user to name.
     pub fn known_settings(self) -> &'static [FamilySetting] {
         match self {
             Self::Bedrock => &[FamilySetting::Region],
             Self::Vertex => &[FamilySetting::Project, FamilySetting::Location],
             Self::Azure => &[FamilySetting::ApiVersion],
-            Self::ClaudeAgent => &[FamilySetting::ClaudeExecutable],
             Self::OpenaiResponses
             | Self::OpenaiCodex
             | Self::OpenaiChat
             | Self::Anthropic
+            | Self::ClaudeAgent
             | Self::Google
             | Self::Xai
             | Self::OpenaiCompatible => &[],
@@ -2939,6 +2935,28 @@ pub enum ContextItem {
             skip_serializing_if = "Option::is_none"
         )]
         model_turn_id: Option<String>,
+        /// The provider's own id for this tool call, kept so replay can send back
+        /// the very id the model issued instead of minting a fresh one.
+        ///
+        /// [`crate::api::tool_context_id`] hashes this id into the card's local
+        /// id and is therefore not reversible, so without this field replay has
+        /// nothing to send but a digest — and every tool call in a turn changes
+        /// id the moment the next turn replays it from the timeline. The wire
+        /// protocols treat the id as an opaque key that only has to pair a call
+        /// with its result, so replaying the original is always valid.
+        ///
+        /// Absent on manually inserted cards, on host-fabricated exchanges, and
+        /// on cards written before this field existed; those still mint a digest.
+        /// Unattested on purpose, like `round` and `modelTurnId`: the call and
+        /// its result read the same field, so a rewritten value still pairs, and
+        /// [`crate::wire_history::replayable_provider_call_id`] rejects anything
+        /// that is not a plausible, non-reserved provider id.
+        #[serde(
+            rename = "providerCallId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_call_id: Option<String>,
         /// Model-requested arguments before hooks changed the executed arguments.
         #[serde(
             rename = "requestedInput",
@@ -5357,6 +5375,7 @@ mod tests {
             tool_name: "subagent".into(),
             round: Some(2),
             model_turn_id: Some("turn_parent_2".into()),
+            provider_call_id: None,
             requested_input: Some(Map::from_iter([("task".into(), json!("原始任务"))])),
             input: Map::from_iter([("task".into(), json!("审查 API"))]),
             result: ToolResult {

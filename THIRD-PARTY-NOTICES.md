@@ -180,16 +180,29 @@ SOFTWARE.
 sidecar executable `mework-aisdk.exe` by esbuild. It is the runtime behind the
 "Claude Agent (Claude Code)" provider family (`aisdk-service/src/claude-agent.ts`).
 
+**Distributed file:** Mework also distributes the Claude Code executable from the
+platform package `@anthropic-ai/claude-agent-sdk-win32-x64` 0.3.261 as
+`claude.exe` beside the main application executable — a file of its own, not
+bundled into either Mework binary. That executable is Claude Code 2.1.261 and is
+staged by `src-tauri/build.rs` from the pinned platform package.
+
 The package is not open source: it is © Anthropic, PBC and licensed under
 [Anthropic's Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms)
-(see the `LICENSE.md` and `README.md` inside the npm package). Its platform
-packages (`@anthropic-ai/claude-agent-sdk-<os>-<arch>`), which contain the Claude
-Code executable itself, are **not** redistributed: the provider uses the copy of
-Claude Code the user installed on their own machine, and the sidecar never
-reads or forwards credentials — the CLI authenticates with its own login. Of the SDK's peer
-packages, `@anthropic-ai/sdk` and `@modelcontextprotocol/sdk` are used only for
-type declarations and are not bundled; `zod` was already part of the sidecar
-through the AI SDK.
+(see the `LICENSE.md` and `README.md` inside the npm package). The distributed
+platform package's `LICENSE.md` states, verbatim:
+
+```
+© Anthropic PBC. All rights reserved. Use is subject to the Legal Agreements outlined here: https://code.claude.com/docs/en/legal-and-compliance.
+```
+
+The sidecar never reads or forwards credentials — the CLI uses the user's own
+`claude auth login` authentication. Distribution of this executable is subject
+to the Anthropic Legal Agreements above; this inventory itself does not
+constitute permission to redistribute it, consistent with the warning that this
+inventory does not itself establish permission to combine or redistribute
+commercial components. Of the SDK's peer packages, `@anthropic-ai/sdk` and
+`@modelcontextprotocol/sdk` are used only for type declarations and are not
+bundled; `zod` was already part of the sidecar through the AI SDK.
 
 ---
 

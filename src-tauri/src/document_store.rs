@@ -777,6 +777,7 @@ mod tests {
                 tool_name: "playwright".into(),
                 round: Some(1),
                 model_turn_id: Some("legacy-external-turn".into()),
+                provider_call_id: None,
                 requested_input: None,
                 input: serde_json::json!({
                     "action": "screenshot",

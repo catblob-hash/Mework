@@ -2067,6 +2067,7 @@ mod tests {
             tool_name: tool_name.into(),
             round: None,
             model_turn_id: None,
+            provider_call_id: None,
             requested_input: None,
             input: object(input),
             result: ToolResult {

@@ -1,4 +1,4 @@
-//! `claude-agent` family: the locally installed Claude Code executable driven
+//! `claude-agent` family: the Claude Code executable Mework ships, driven
 //! through the official `@anthropic-ai/claude-agent-sdk`.
 //!
 //! Boundary. One host round is still one sidecar `step`, and inside the CLI it is
@@ -11,20 +11,28 @@
 //! executes them; the next step for the same `agent.session` resolves the parked
 //! handlers with the results and streams the following model reply.
 //!
+//! Version. The executable is the CLI inside the Agent SDK's own platform
+//! package, pinned exactly (SDK `0.3.261`, Claude Code `2.1.261`) and shipped
+//! beside the application; the host resolves it and sends the path in
+//! `agent.executable`. The user's own install is never consulted. That is what
+//! makes this module's knowledge of CLI behaviour — which switches exist, what the
+//! CLI prepends, how it normalizes a transcript — hold from one run to the next.
+//!
 //! Tool names. The CLI is started with `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1`, under
 //! which in-process MCP tools register under their bare names, so the model sees
 //! the host's tool names verbatim (no `mcp__mework__` prefix). The prefix is still
 //! stripped defensively wherever a name comes back from the CLI.
 //!
 //! Compliance. Authentication is the user's own Claude Code login and nothing
-//! else. Mework sends no credential for this family: every authentication channel
-//! that could ride in from the sidecar's environment is stripped before the CLI is
-//! spawned, and `apiKey` / `baseURL` on the request are not read at all. This
-//! module never reads, copies or moves `~/.claude/.credentials.json`; when a
-//! session resumes from a host-synthesized transcript, it is the SDK's own resume
-//! path that materializes a temporary `CLAUDE_CONFIG_DIR` and carries the CLI's
-//! credentials into it. The identity line and billing header the CLI prepends to a
-//! custom system prompt are the SDK's; Mework neither writes nor alters them.
+//! else — bundling the executable changes nothing about that. Mework sends no
+//! credential for this family: every authentication channel that could ride in
+//! from the sidecar's environment is stripped before the CLI is spawned, and
+//! `apiKey` / `baseURL` on the request are not read at all. This module never
+//! reads, copies or moves `~/.claude/.credentials.json`; when a session resumes
+//! from a host-synthesized transcript, it is the SDK's own resume path that
+//! materializes a temporary `CLAUDE_CONFIG_DIR` and carries the CLI's credentials
+//! into it. The identity line and billing header the CLI prepends to a custom
+//! system prompt are the SDK's; Mework neither writes nor alters them.
 //!
 //! Filesystem and environment. Unlike the AI SDK families this module checks that
 //! the host-resolved executable exists and derives the CLI's environment from the
@@ -96,8 +104,12 @@ const PARK_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 /** Parked sessions the host never released are evicted after this idle period. */
 const IDLE_EVICTION_MS = 24 * 60 * 60 * 1000;
 const EVICTION_SWEEP_MS = 60 * 60 * 1000;
-/** Fallback CLI version stamped on synthesized transcript entries before any `init` was seen. */
-const FALLBACK_CLI_VERSION = "2.1.258";
+/**
+ * CLI version stamped on synthesized transcript entries before any `init` was
+ * seen. Mework ships one Claude Code build, so this is that build rather than a
+ * guess; a live session still prefers the version its own `init` reported.
+ */
+const FALLBACK_CLI_VERSION = "2.1.261";
 /**
  * Prompt used when a tool round must continue in a fresh CLI session (the parked
  * session is gone). The transcript then already ends with the tool results, and
@@ -682,6 +694,17 @@ const CLI_CONTROL_ENV: Record<string, string> = {
   CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
   MCP_TOOL_TIMEOUT: String(PARK_TIMEOUT_MS),
   CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
+  // Left to itself the CLI attaches an `# Environment` block of its own (the
+  // directory it was started in, its platform) to the first user message, even
+  // under a custom string system prompt — and that directory is Mework's private
+  // session folder, not a workspace. This switch turns it off, together with the
+  // rest of the "carved slate" static-prompt mode. It is load-bearing rather than
+  // best-effort: the CLI is pinned at 2.1.261, which honours it. (2.1.278 removed
+  // the switch and made the block unconditional, leaving only `--bare`
+  // (`CLAUDE_CODE_SIMPLE`), which also stops the CLI reading its OAuth login and
+  // is therefore unusable here — one more reason the version is Mework's to pick.)
+  // `selfcheck-claude-agent.mjs` asserts the block is absent.
+  CLAUDE_CODE_CARVED_SLATE: "0",
 };
 
 interface CliEnvKnobs {
@@ -799,7 +822,7 @@ function validateAgent(agent: AgentSession | undefined): AgentSession {
   }
   if (!existsSync(agent.executable)) {
     throw new Error(
-      `找不到 Claude Code 可执行文件：${agent.executable}。请安装原生版 Claude Code（https://code.claude.com/docs/en/setup），或在提供商设置里填写其路径。`,
+      `找不到 Mework 附带的 Claude Code：${agent.executable}。本次安装不完整，请重新安装 Mework。`,
     );
   }
   if (typeof agent.cwd !== "string" || agent.cwd.length === 0) throw new Error("claude-agent 请求缺少工作目录");

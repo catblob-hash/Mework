@@ -12,6 +12,7 @@ import { DependencySettings } from "./DependencySettings";
 import { ShortcutSettings } from "./ShortcutSettings";
 import { UsageSettings } from "./UsageSettings";
 import { UpdateSettings } from "./UpdateSettings";
+import { DecisionProviderSettings } from "./DecisionProviderSettings";
 import { WebSearchSettings } from "./WebSearchSettings";
 
 type GlobalSettingsChange = GlobalSettingsType | ((current: GlobalSettingsType) => GlobalSettingsType);
@@ -71,6 +72,7 @@ export function GlobalSettings({
               }))}
             />
           )}
+          {view === "decision_providers" && <DecisionProviderSettings onFlush={onFlush} />}
           {view === "shortcuts" && (
             <ShortcutSettings
               shortcuts={settings.shortcuts}

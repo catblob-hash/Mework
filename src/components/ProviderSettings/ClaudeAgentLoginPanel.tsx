@@ -35,8 +35,8 @@ export function ClaudeAgentLoginPanel({
   onSignedInChange: (signedIn: boolean) => void;
   /**
    * Flushes pending document edits. The host resolves the login commands against
-   * the persisted provider row, so an unsaved executable path would be rejected
-   * as "settings not saved yet" until the debounce fires.
+   * the persisted provider row, so an unsaved row would be rejected as "settings
+   * not saved yet" until the debounce fires.
    */
   onBeforeHostCall?: () => Promise<void>;
 }) {
@@ -178,8 +178,8 @@ export function ClaudeAgentLoginPanel({
         {error && <p className="provider-field__error" role="alert">{error}</p>}
         {error && <>
           <p className="provider-field__help">{t(
-            "可以在「提供商设置」里填 Claude Code 路径。",
-            "You can set the Claude Code executable path under “Provider settings”."
+            "Mework 自带 Claude Code；读不到通常是安装不完整，或者本机 ~/.claude 不可读。",
+            "Mework ships its own Claude Code; a failure here usually means an incomplete install, or that ~/.claude is unreadable."
           )}</p>
           <div className="provider-field__row">
             <button

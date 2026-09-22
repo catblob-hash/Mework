@@ -12,6 +12,7 @@ import {
 import { implicitConversationPreset, preferredShellToolName } from "./lib/conversationPresets";
 import { toolCatalog } from "./seed";
 import { defaultConversationWebSearchSettings, normalizeDocument } from "./lib/runtime";
+import { isDecisionToolName } from "./lib/taskTools";
 
 describe("seed document", () => {
   it("keeps the Rust and TS schema version constants identical", () => {
@@ -87,7 +88,7 @@ describe("seed document", () => {
 
   it("ships workspace, web, and host-run orchestration tools", () => {
     const tools = createSeedDocument().tools;
-    expect(tools).toHaveLength(46);
+    expect(tools).toHaveLength(56);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     const webTools = tools.filter((tool) => tool.category === "web");
     expect(webTools.map((tool) => tool.name)).toEqual([
@@ -95,7 +96,8 @@ describe("seed document", () => {
       "preview_start", "preview_stop", "preview_list", "preview_logs", "preview_console_logs",
       "preview_screenshot", "preview_snapshot", "preview_inspect", "preview_click",
       "preview_fill", "preview_eval", "preview_network", "preview_resize",
-      "preview_upload_image", "preview_dialog"
+      "preview_upload_image", "preview_dialog", "preview_find_element", "preview_find_logs",
+      "preview_click_by_description", "preview_fill_by_description", "preview_inspect_by_description"
     ]);
     // preview_list and preview_logs read host-side state the user's own launch.json
     // produced: no page content, no process started or killed.
@@ -158,13 +160,15 @@ describe("seed document", () => {
       // tools among them: they follow `webSearchEnabled`, and the plan tools
       // follow the security level, not a tool toggle. The preview tools and
       // `workflow` are withheld separately — nothing re-derives those, so the
-      // seed is the only place that choice lives.
+      // seed is the only place that choice lives. The decision-model tools are
+      // withheld too: none works until the TypeSafe key is configured.
       expect(preset.settings.enabledTools).toEqual(
         document.tools.map((tool) => tool.name).filter((name) => !(
           document.tools.find((tool) => tool.name === name)!.category === "memory"
           || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
           || ["plan", "exit_plan_mode"].includes(name)
           || name.startsWith("preview_")
+          || isDecisionToolName(name)
           || name === "workflow"
         ))
       );

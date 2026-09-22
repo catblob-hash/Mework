@@ -82,7 +82,7 @@ pub fn classify(
     request: &ToolExecutionRequest,
 ) -> Result<SecurityDecision, String> {
     let (effect, path_mode) = match request.tool_name.as_str() {
-        "ls" | "grep" | "find" => (
+        "ls" | "grep" | "find" | "find_files" => (
             OperationEffect::Read,
             Some(PathMode::Existing { default: Some(".") }),
         ),
@@ -90,6 +90,20 @@ pub fn classify(
             OperationEffect::Read,
             Some(PathMode::Existing { default: None }),
         ),
+        // Scores the file's chunks with the decision model and shows only the winners: a read
+        // of the file, judged by the same path rules. The chunks leave for TypeSafe's API,
+        // which the user opted into by configuring that provider.
+        "find_content" => (
+            OperationEffect::Read,
+            Some(PathMode::Existing { default: None }),
+        ),
+        "find_output" => {
+            return Ok(internal_decision(
+                RiskLevel::Low,
+                "host.read_or_coordinate",
+                "只读取本对话一条 shell 命令已保留的输出并交给决策模型打分，不触碰文件、Shell 或外部网络",
+            ));
+        }
         // Code navigation reads one file and asks a language server about it.
         //
         // The read is the call's own boundary, but starting the server is not
@@ -120,10 +134,10 @@ pub fn classify(
             OperationEffect::Write,
             Some(PathMode::Existing { default: None }),
         ),
-        "powershell" | "bash" => {
+        "powershell" | "bash" | "powershell_find_output" | "bash_find_output" => {
             let command =
                 required_string(&request.input, "command", MAX_COMMAND_CHARS, "command argument")?;
-            let kind = if request.tool_name == "powershell" {
+            let kind = if matches!(request.tool_name.as_str(), "powershell" | "powershell_find_output") {
                 ShellKind::PowerShell
             } else {
                 ShellKind::Bash
@@ -137,7 +151,7 @@ pub fn classify(
                 command,
             );
         }
-        // Fifteen preview tools, one policy each. `dangerous` in the catalog is only the review
+        // Twenty preview tools, one policy each. `dangerous` in the catalog is only the review
         // marker the settings page draws; the approval line is decided here.
         //
         // Starting or stopping a dev server runs or kills a process the project's launch.json
@@ -159,10 +173,38 @@ pub fn classify(
             validate_required_string(&request.input, "selector", 2_048, "CSS selector argument")?;
             return classify_browser_local(workspace, app_data, additional_directories);
         }
+        // Scoring the accessibility tree reads the same thing a snapshot reads.
+        "preview_find_element" => {
+            validate_required_string(&request.input, "query", 2_000, "query argument")?;
+            return classify_browser_local(workspace, app_data, additional_directories);
+        }
         // Console lines, network rows and page pixels all carry whatever the signed-in page is
-        // showing, so they share the one boundary that names that risk.
+        // showing, so they share the one boundary that names that risk. Scoring the console
+        // and server logs reads those same lines.
         "preview_console_logs" | "preview_network" | "preview_screenshot" => {
             return Ok(classify_browser_sensitive(level, &request.tool_name))
+        }
+        "preview_find_logs" => {
+            validate_required_string(&request.input, "query", 2_000, "query argument")?;
+            return Ok(classify_browser_sensitive(level, &request.tool_name));
+        }
+        // The described variants act on whichever element the decision model chose, so they
+        // sit on the same line as the selector tools they hand the action to.
+        "preview_click_by_description" => {
+            validate_required_string(&request.input, "description", 2_000, "description argument")?;
+            return Ok(classify_unbounded(level));
+        }
+        "preview_fill_by_description" => {
+            validate_required_string(&request.input, "description", 2_000, "description argument")?;
+            match request.input.get("value") {
+                Some(Value::String(value)) if value.chars().count() <= 32_768 => {}
+                _ => return Err("Missing or invalid fill value argument".into()),
+            }
+            return Ok(classify_unbounded(level));
+        }
+        "preview_inspect_by_description" => {
+            validate_required_string(&request.input, "description", 2_000, "description argument")?;
+            return classify_browser_local(workspace, app_data, additional_directories);
         }
         "preview_click" => {
             validate_required_string(&request.input, "selector", 2_048, "CSS selector argument")?;
@@ -287,7 +329,7 @@ fn trusted_roots(workspace: &Path, app_data: &Path, additional: &[String]) -> Ve
 fn is_filesystem_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "ls" | "grep" | "find" | "read" | "write" | "edit" | "lsp"
+        "ls" | "grep" | "find" | "find_files" | "read" | "write" | "edit" | "lsp" | "find_content"
     )
 }
 
@@ -440,11 +482,11 @@ fn classify_remote_filesystem(
     request: &ToolExecutionRequest,
 ) -> Result<SecurityDecision, String> {
     let (effect, path_mode) = match request.tool_name.as_str() {
-        "ls" | "grep" | "find" => (
+        "ls" | "grep" | "find" | "find_files" => (
             OperationEffect::Read,
             PathMode::Existing { default: Some(".") },
         ),
-        "read" | "lsp" => (
+        "read" | "lsp" | "find_content" => (
             OperationEffect::Read,
             PathMode::Existing { default: None },
         ),
@@ -2290,7 +2332,9 @@ fn classify_unbounded(level: SecurityLevel) -> SecurityDecision {
 
 fn classify_browser_sensitive(level: SecurityLevel, tool_name: &str) -> SecurityDecision {
     let subject = match tool_name {
-        "preview_console_logs" => "console logs, which may contain tokens and error context",
+        "preview_console_logs" | "preview_find_logs" => {
+            "console and server log lines, which may contain tokens and error context"
+        }
         "preview_network" => {
             "network logs, which may contain complete URLs, query parameters, and response bodies"
         }
@@ -3644,7 +3688,7 @@ mod tests {
         }
     }
 
-    /// Fifteen tools, one policy each. `dangerous` in the catalog is only the review marker the
+    /// Twenty tools, one policy each. `dangerous` in the catalog is only the review marker the
     /// settings page draws, so the approval line is pinned here explicitly.
     #[test]
     fn every_preview_tool_has_a_matching_security_policy() {
@@ -3654,7 +3698,7 @@ mod tests {
             .filter(|tool| tool.name.starts_with("preview_"))
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        assert_eq!(preview_tools.len(), 15);
+        assert_eq!(preview_tools.len(), 20);
         assert!(!crate::catalog::tool_catalog()
             .into_iter()
             .any(|tool| tool.name == "playwright"));
@@ -3667,6 +3711,8 @@ mod tests {
             "preview_snapshot",
             "preview_inspect",
             "preview_resize",
+            "preview_find_element",
+            "preview_inspect_by_description",
         ];
         for name in &preview_tools {
             let input = preview_input(name);
@@ -3710,9 +3756,15 @@ mod tests {
             "preview_console_logs",
             "preview_network",
             "preview_screenshot",
+            "preview_find_logs",
         ] {
+            let input = if tool == "preview_find_logs" {
+                json!({"query":"q","threshold":0.5})
+            } else {
+                json!({})
+            };
             let guarded = fixture
-                .classify(SecurityLevel::AllowEdits, tool, json!({}))
+                .classify(SecurityLevel::AllowEdits, tool, input.clone())
                 .unwrap();
             assert!(guarded.requires_approval, "{tool} must require approval");
             assert_eq!(guarded.effect, OperationEffect::Unbounded);
@@ -3720,7 +3772,7 @@ mod tests {
             assert!(!guarded.reason.is_empty());
 
             let full = fixture
-                .classify(SecurityLevel::FullAccess, tool, json!({}))
+                .classify(SecurityLevel::FullAccess, tool, input)
                 .unwrap();
             assert!(!full.requires_approval);
         }
@@ -3753,6 +3805,8 @@ mod tests {
             ("preview_fill", json!({"selector":"input","value":""})),
             ("preview_eval", json!({"expression":"document.title"})),
             ("preview_dialog", json!({})),
+            ("preview_click_by_description", json!({"description":"the save button"})),
+            ("preview_fill_by_description", json!({"description":"the save button","value":"x"})),
         ] {
             let decision = fixture
                 .classify(SecurityLevel::RequestApproval, tool, input.clone())
@@ -3783,6 +3837,11 @@ mod tests {
             ("preview_fill", json!({"selector":"input"})),
             ("preview_fill", json!({"selector":"input","value":7})),
             ("preview_inspect", json!({})),
+            ("preview_find_element", json!({})),
+            ("preview_find_logs", json!({})),
+            ("preview_click_by_description", json!({})),
+            ("preview_fill_by_description", json!({"description":"the save button"})),
+            ("preview_inspect_by_description", json!({})),
         ] {
             assert!(
                 fixture
@@ -3809,6 +3868,15 @@ mod tests {
             "preview_inspect" | "preview_click" => json!({"selector":"button"}),
             "preview_fill" => json!({"selector":"input","value":"x"}),
             "preview_eval" => json!({"expression":"document.title"}),
+            "preview_find_element" | "preview_find_logs" => {
+                json!({"query":"q","threshold":0.5})
+            }
+            "preview_click_by_description" | "preview_inspect_by_description" => {
+                json!({"description":"the save button"})
+            }
+            "preview_fill_by_description" => {
+                json!({"description":"the save button","value":"x"})
+            },
             "preview_upload_image" => json!({"image_id":"1"}),
             _ => json!({}),
         }

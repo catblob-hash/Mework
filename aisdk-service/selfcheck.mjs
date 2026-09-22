@@ -2358,15 +2358,17 @@ async function main() {
     wideDone.type === "done" ? wideDone.result.text : JSON.stringify(wideDone.error),
   );
 
-  // Check 30: the claude-agent family against the locally installed Claude Code
-  // executable and a scripted Anthropic upstream. Skipped, loudly, without one.
+  // Check 30: the claude-agent family against the Claude Code executable Mework
+  // ships (the Agent SDK's platform package) and a scripted Anthropic upstream.
+  // Skipped, loudly, when that optional package was not installed.
   const claudeExecutable = resolveClaudeExecutable();
   if (claudeExecutable) {
     await runClaudeAgentChecks({ sc, check, V, executable: claudeExecutable });
     await runClaudeAgentShutdownCheck({ startSidecar, check, V, executable: claudeExecutable });
   } else {
     process.stdout.write(
-      "警告：未找到原生 Claude Code 可执行文件（~/.local/bin/claude 或 MEWORK_CLAUDE_EXECUTABLE），跳过 claude-agent 判别器\n",
+      "警告：找不到 Agent SDK 的平台包（@anthropic-ai/claude-agent-sdk-<os>-<arch>，或 MEWORK_CLAUDE_EXECUTABLE），"
+        + "跳过 claude-agent 判别器；在 aisdk-service/ 里 `npm install`（不要带 --omit=optional）即可装上\n",
     );
   }
 

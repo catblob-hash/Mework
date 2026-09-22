@@ -979,6 +979,26 @@ async fn dispatch(
             )
             .await,
         ),
+        "save_decision_api_key" => result_value(
+            super::save_decision_api_key(
+                app.state::<AppState>(),
+                arg(args, "providerKind")?,
+                arg(args, "apiKey")?,
+            )
+            .await,
+        ),
+        "get_decision_key_status" => result_value(
+            super::get_decision_key_status(app.state::<AppState>(), arg(args, "providerKind")?)
+                .await,
+        ),
+        "reveal_decision_api_key" => result_value(
+            super::reveal_decision_api_key(app.state::<AppState>(), arg(args, "providerKind")?)
+                .await,
+        ),
+        "delete_decision_api_key" => result_value(
+            super::delete_decision_api_key(app.state::<AppState>(), arg(args, "providerKind")?)
+                .await,
+        ),
         "fetch_models" => result_value(
             super::fetch_models(app.clone(), app.state::<AppState>(), arg(args, "provider")?).await,
         ),

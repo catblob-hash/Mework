@@ -112,10 +112,9 @@ export function knownFamilySettings(family: ProviderFamily): readonly FamilySett
     // Azure's `api_version` is optional because the AI SDK provides a default.
     case "azure":
       return ["api_version"];
-    // The Claude Code path is optional: an empty value lets the host search the
-    // standard install locations.
+    // Claude Agent has no identity fields; Mework bundles and version-locks the
+    // executable, which the host locates itself.
     case "claude_agent":
-      return ["claude_executable"];
     default:
       return [];
   }

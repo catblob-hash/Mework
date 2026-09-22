@@ -20,7 +20,7 @@ You bring your own API key or subscription. Everything else runs and stays on yo
 
 **Approvals you can see.** Every risky call shows a card with the exact command or path and why it was classified that way. Four security levels, from approve-everything to full access, and a few confirmations that no level can turn off — like acting on a site you logged into yourself.
 
-**Your models, your keys.** OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, Google Vertex, xAI and any OpenAI-compatible endpoint. Two sign in instead: **OpenAI Codex** with your ChatGPT subscription, and **Claude Agent**, which reuses the Claude Code login already on your machine (subject to the [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance)). Keys live in Windows Credential Manager, never in a settings file.
+**Your models, your keys.** OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, Google Vertex, xAI and any OpenAI-compatible endpoint. Two sign in instead: **OpenAI Codex** with your ChatGPT subscription, and **Claude Agent**, which runs the Claude Code build Mework ships against the Claude Code login already on your machine — no separate install to keep in step (subject to the [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance)). Keys live in Windows Credential Manager, never in a settings file.
 
 **Stays out of the way.** Closing the window sends Mework to the tray; subagents, workflows and shell tasks keep running. The app updates itself from GitHub Releases.
 

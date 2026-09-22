@@ -269,6 +269,13 @@ export interface ToolContext {
   round?: number;
   /** Local association shared by every canonical item emitted by one model round. */
   modelTurnId?: string;
+  /**
+   * The provider's own id for this tool call, replayed verbatim on later turns
+   * so the exchange keeps one id for its whole life. Opaque to the renderer,
+   * which must carry it through untouched. Absent on manual, host-fabricated
+   * and legacy cards, which fall back to a host-minted digest.
+   */
+  providerCallId?: string;
   /** Model-requested arguments before hooks changed the arguments that were executed. */
   requestedInput?: JsonObject;
   input: JsonObject;
@@ -693,7 +700,7 @@ export type ProviderFamily =
   | "openai_compatible";
 
 /** Family-specific identity field. Mirrors Rust `model.rs::FamilySetting`. */
-export type FamilySetting = "region" | "project" | "location" | "api_version" | "claude_executable";
+export type FamilySetting = "region" | "project" | "location" | "api_version";
 
 /**
  * Endpoint shape supported by a provider. Mirrors Rust `model.rs::EndpointType`.
@@ -1779,6 +1786,7 @@ export type SettingsView =
   | "appearance"
   | "providers"
   | "search_providers"
+  | "decision_providers"
   | "mcp"
   | "skills"
   | "shortcuts"

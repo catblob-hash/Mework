@@ -70,7 +70,7 @@
     "publisher": "Mework",
     "icon": ["icons/icon.ico"],
     "resources": [],
-    "externalBin": ["binaries/mework-aisdk"],
+    "externalBin": ["binaries/mework-aisdk", "binaries/claude"],
     "windows": {
       "digestAlgorithm": "sha256",
       "allowDowngrades": false,

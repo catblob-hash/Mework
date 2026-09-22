@@ -106,10 +106,12 @@ import {
   type ToolExposureMode
 } from "./lib/sendPipeline";
 import {
+  conversationWorkspaces,
   isReservedWorkspace,
   runEnvKey,
   sameMachine,
   TEMPORARY_WORKSPACE_ID,
+  withWorkspaceArgument,
   workspaceLocationTitle
 } from "./lib/workspaces";
 import {
@@ -2511,6 +2513,30 @@ function App() {
     if (!document) return [];
     return document.tools.map((tool) => localizeToolDescriptor(tool, resolvedLanguage));
   }, [document, resolvedLanguage]);
+  /**
+   * What the timeline's manual tool cards are edited against: the catalog plus
+   * the `workspace` argument the host puts on the wire once the conversation
+   * has more than one workspace. Only the timeline sees it — the tool picker
+   * and the subagent panel name tools, they do not fill in calls. Keyed on the
+   * two conversation fields that decide the numbers, not the conversation,
+   * so a streaming turn does not hand the timeline a fresh descriptor list on
+   * every context row.
+   */
+  const activeAttachedWorkspaces = activeConversation?.attachedWorkspaces ?? null;
+  const activeTimelineTools = useMemo(
+    () => withWorkspaceArgument(
+      activeConversationTools,
+      conversationWorkspaces(
+        activeWorkspace,
+        activeAttachedWorkspaces
+          ? { worktree: activeWorktree, attachedWorkspaces: activeAttachedWorkspaces }
+          : null
+      ),
+      /^win/i.test(platform),
+      t("工作区编号", "Workspace number")
+    ),
+    [activeConversationTools, activeWorkspace, activeAttachedWorkspaces, activeWorktree, platform, t]
+  );
   const activeEnabledTools = useMemo(() => {
     const available = new Set(activeConversationTools.map((tool) => tool.name));
     return activeConversation?.settings.enabledTools.filter((name) => available.has(name)) ?? [];
@@ -6994,7 +7020,7 @@ function App() {
                     ? modelRunErrors[activeConversation.id]?.requestId ?? null
                     : null
                 }
-                tools={activeConversationTools}
+                tools={activeTimelineTools}
                 enabledTools={activeEnabledTools}
                 pathBaseDir={timelinePathBaseDir}
                 pendingQuestionId={pendingQuestion?.context.id ?? null}

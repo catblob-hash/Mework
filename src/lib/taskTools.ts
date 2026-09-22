@@ -36,7 +36,12 @@ export const PREVIEW_PAGE_TOOL_NAMES = [
   "preview_network",
   "preview_resize",
   "preview_upload_image",
-  "preview_dialog"
+  "preview_dialog",
+  "preview_find_element",
+  "preview_find_logs",
+  "preview_click_by_description",
+  "preview_fill_by_description",
+  "preview_inspect_by_description"
 ] as const;
 
 export const PREVIEW_PAGE_TOOL_NAME_SET: ReadonlySet<string> = new Set(PREVIEW_PAGE_TOOL_NAMES);
@@ -58,6 +63,40 @@ export function isPreviewToolName(name: string): boolean {
 }
 
 /**
+ * Catalog names of the tools that run through the decision model. Mirrors Rust
+ * `decision_tools::DECISION_TOOL_NAMES`.
+ *
+ * They are ordinary, individually toggled tools: each needs the TypeSafe key
+ * before it can do anything, so the preview-flavoured ones are listed one by
+ * one in the picker instead of riding the folded preview row, and none is on
+ * in a seeded preset. They still count as preview tools everywhere else — the
+ * timeline does not offer to re-place a call against a page that is gone.
+ */
+export const DECISION_TOOL_NAMES = [
+  "find_content",
+  "find_files",
+  "find_output",
+  "bash_find_output",
+  "powershell_find_output",
+  "preview_find_element",
+  "preview_find_logs",
+  "preview_click_by_description",
+  "preview_fill_by_description",
+  "preview_inspect_by_description"
+] as const;
+
+export const DECISION_TOOL_NAME_SET: ReadonlySet<string> = new Set(DECISION_TOOL_NAMES);
+
+export function isDecisionToolName(name: string): boolean {
+  return DECISION_TOOL_NAME_SET.has(name);
+}
+
+/** The preview tools the picker folds into its one `preview` row. */
+export function isFoldedPreviewToolName(name: string): boolean {
+  return isPreviewToolName(name) && !isDecisionToolName(name);
+}
+
+/**
  * Enabling any producer can create a task-list row, making the runtime tools reachable.
  *
  * Mirrors Rust `agents::TASK_PRODUCING_TOOL_NAMES`, which maps onto
@@ -74,6 +113,8 @@ export const TASK_PRODUCING_TOOL_NAMES = [
   "workflow",
   "bash",
   "powershell",
+  "bash_find_output",
+  "powershell_find_output",
   "preview_start"
 ] as const;
 

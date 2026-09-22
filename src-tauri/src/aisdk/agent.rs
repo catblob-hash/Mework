@@ -1,9 +1,15 @@
-//! Host side of the `claude-agent` family: where the Claude Code executable is,
-//! which profile variables the CLI needs, and the per-run session lease.
+//! Host side of the `claude-agent` family: where the bundled Claude Code
+//! executable is, which profile variables the CLI needs, and the per-run session
+//! lease.
 //!
 //! The sidecar owns the CLI process and its parked tool handlers; the host only
 //! names the session, resolves the executable, and guarantees a `release` frame
 //! when the run ends, whichever way it ends.
+//!
+//! The executable is Mework's own: the CLI out of the Agent SDK's platform
+//! package, pinned with the SDK and shipped beside the application. The login is
+//! not — it stays the user's own `claude auth login` in `~/.claude`, and this
+//! family has no credential of its own. See [`bundled_executable`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wait_timeout::ChildExt as _;
 
-use crate::model::{ApiProvider, FamilySetting, ProviderFamily};
+use crate::model::{ApiProvider, ProviderFamily};
 
 use super::protocol::AgentSession;
 
@@ -41,7 +47,8 @@ const CLAUDE_AGENT_ENV: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
 ];
 
-/// Executable file name per platform. Only the native build is supported: the
+/// Executable file name per platform, for the copy Mework ships and for the
+/// staged artifact `build.rs` produces. Only the native build is ever named: the
 /// npm `claude.cmd`/`cli.js` shims need a Node runtime the single-file sidecar
 /// cannot provide.
 fn executable_name() -> &'static str {
@@ -58,56 +65,111 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Locations searched when the provider leaves `claude_executable` empty, in
-/// order: the native installer's `~/.local/bin`, then `PATH`.
-fn discovered_candidates() -> Vec<PathBuf> {
-    let name = executable_name();
-    let mut candidates = Vec::new();
-    if let Some(home) = home_dir() {
-        candidates.push(home.join(".local").join("bin").join(name));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            candidates.push(dir.join(name));
-        }
-    }
-    candidates
-}
+/// Overrides the bundled CLI in development, for driving another build against
+/// the fixtures. Debug builds only: a shipped Mework must run the version it
+/// shipped with, which is the whole point of bundling one.
+#[cfg(debug_assertions)]
+const EXECUTABLE_ENV: &str = "MEWORK_CLAUDE_BIN";
 
-/// Resolve the Claude Code executable for a provider.
+/// Where the bundled Claude Code is — and the only place it is looked for.
 ///
-/// A configured path must exist as a file: a stale explicit path is a
-/// configuration error to surface, not something to silently paper over with
-/// discovery. Discovery accepts only the native executable name.
-pub(crate) fn resolve_executable(provider: &ApiProvider) -> Result<PathBuf, String> {
-    let configured = provider
-        .family_settings
-        .get(&FamilySetting::ClaudeExecutable)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty());
-    if let Some(configured) = configured {
-        let path = PathBuf::from(configured);
+/// Mework ships the CLI out of the Agent SDK's own platform package, so the SDK
+/// and the executable it drives cannot disagree: `build.rs` stages it as
+/// `binaries/claude-<target-triple>` and `tauri.conf.json` declares it an
+/// `externalBin`, which Tauri installs beside the application executable with the
+/// triple stripped. That adjacency is the same runtime contract the AI SDK sidecar
+/// relies on (`aisdk/process.rs`), and `scripts/package-portable.mjs` carries both
+/// files for the same reason.
+///
+/// The user's own Claude Code install is deliberately not consulted. It drifts
+/// with their updates, and CLI releases change behaviour this family depends on —
+/// 2.1.278, for one, dropped the switch that keeps the CLI from attaching an
+/// `# Environment` block of its own. What is *not* bundled is the login: that
+/// lives in the user's `~/.claude`, written by their own `claude auth login`, and
+/// the bundled CLI reads it from there like any other.
+///
+/// Development has no installed layout, so debug builds fall back to the source
+/// tree: the SDK's platform package under `aisdk-service/node_modules`, then the
+/// copy `build.rs` staged.
+pub(crate) fn bundled_executable() -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var(EXECUTABLE_ENV) {
+        let path = PathBuf::from(value);
         if path.is_file() {
             return Ok(path);
         }
         return Err(format!(
-            "提供商 {} 配置的 Claude Code 可执行文件不存在：{}",
-            provider.name, configured
+            "{EXECUTABLE_ENV} 指向的 Claude Code 不存在：{}",
+            path.display()
         ));
     }
-    discovered_candidates()
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            format!(
-                "未找到 Claude Code 可执行文件（{}）。请安装原生版 Claude Code（https://claude.com/claude-code），或在提供商 {} 的设置里填写 claude_executable 路径",
-                executable_name(),
-                provider.name
-            )
-        })
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(candidate) = exe.parent().map(|dir| dir.join(executable_name())) {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    for candidate in source_tree_candidates() {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "找不到 Mework 附带的 Claude Code（{}）。{}",
+        executable_name(),
+        if cfg!(debug_assertions) {
+            "开发时先在 aisdk-service/ 里 `npm install` 装上 Agent SDK 的平台包，再重新 `cargo build` 让 build.rs 把它 staged 出来。"
+        } else {
+            "本次安装不完整，请重新安装 Mework。"
+        }
+    ))
+}
+
+/// The bundled CLI as it can be found before the application is installed: the
+/// Agent SDK's platform package first, because it is by definition the version the
+/// pinned SDK expects, then the artifact `build.rs` staged from it.
+///
+/// This exists only in debug builds because it embeds `CARGO_MANIFEST_DIR`;
+/// release builds use the adjacent `externalBin`.
+#[cfg(debug_assertions)]
+fn source_tree_candidates() -> Vec<PathBuf> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let Some(repo) = manifest.parent() else {
+        return Vec::new();
+    };
+    let name = executable_name();
+    let mut candidates = Vec::new();
+    let modules = repo.join("aisdk-service").join("node_modules");
+    // Mirrors `build.rs::claude_code_platform_package`, which is the authority on
+    // the naming; a mismatch here only costs the fallback, not the release.
+    let platform = if cfg!(windows) {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    };
+    let libc = if cfg!(target_env = "musl") { "-musl" } else { "" };
+    candidates.push(
+        modules
+            .join("@anthropic-ai")
+            .join(format!("claude-agent-sdk-{platform}-{arch}{libc}"))
+            .join(name),
+    );
+    // `build.rs` derives the triple from Cargo's `TARGET`; do not recompute it here.
+    candidates.push(manifest.join("binaries").join(format!(
+        "claude-{}{}",
+        env!("MEWORK_TARGET_TRIPLE"),
+        if cfg!(windows) { ".exe" } else { "" }
+    )));
+    candidates
 }
 
 /// Working directory for the CLI. Created on demand because the CLI refuses a
@@ -188,7 +250,7 @@ pub(crate) fn session_for(
     if provider.family != ProviderFamily::ClaudeAgent {
         return Ok(None);
     }
-    let executable = resolve_executable(provider)?;
+    let executable = bundled_executable()?;
     let cwd = session_cwd(app_data_path)?;
     #[cfg_attr(not(feature = "browser-dev"), allow(unused_mut))]
     let mut env = profile_env();
@@ -278,7 +340,8 @@ struct AuthStatus {
     subscription_type: Option<String>,
 }
 
-/// Login state of the local Claude Code CLI, as shown in provider settings.
+/// Login state of the Claude Code CLI, as shown in provider settings. The
+/// executable is Mework's own; the login it reports is the user's.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeAgentLoginStatus {
@@ -315,13 +378,17 @@ fn parse_auth_status(stdout: &str) -> Result<AuthStatus, String> {
         .map_err(|error| format!("无法解析 Claude Code 的登录状态输出：{error}"))
 }
 
-/// Read the local CLI's login state.
+/// Read the login state the CLI keeps on this machine.
+///
+/// The probe runs the bundled CLI, but the state it reads is the user's own: the
+/// login lives in `~/.claude`, written by their `claude auth login`, and nothing
+/// about bundling an executable changes whose account answers.
 ///
 /// `--setting-sources ""` keeps project and enterprise settings files out of the
 /// answer, and must precede the subcommand: the CLI rejects it as an unknown
 /// option afterwards.
-pub(crate) fn login_status(provider: &ApiProvider) -> Result<ClaudeAgentLoginStatus, String> {
-    let executable = resolve_executable(provider)?;
+pub(crate) fn login_status() -> Result<ClaudeAgentLoginStatus, String> {
+    let executable = bundled_executable()?;
     let mut command = Command::new(&executable);
     command
         .args(["--setting-sources", "", "auth", "status", "--json"])
@@ -485,8 +552,8 @@ const LINUX_TERMINALS: &[(&str, &str)] = &[
 /// The login flow is interactive — it prints a URL and waits for a pasted code —
 /// so it cannot run headless. Mework starts the terminal and stops there: it
 /// never observes the exchange, and the resulting session belongs to the CLI.
-pub(crate) fn open_login(provider: &ApiProvider) -> Result<(), String> {
-    let executable = resolve_executable(provider)?;
+pub(crate) fn open_login() -> Result<(), String> {
+    let executable = bundled_executable()?;
     let env = login_env();
 
     #[cfg(windows)]
@@ -600,18 +667,14 @@ mod tests {
     use super::*;
     use crate::model::ModelProfile;
 
-    fn provider(family: ProviderFamily, executable: &str) -> ApiProvider {
-        let mut family_settings = BTreeMap::new();
-        if !executable.is_empty() {
-            family_settings.insert(FamilySetting::ClaudeExecutable, executable.to_owned());
-        }
+    fn provider(family: ProviderFamily) -> ApiProvider {
         ApiProvider {
             id: "claude-agent".into(),
             name: "Claude Agent".into(),
             enabled: true,
             family,
             base_url: String::new(),
-            family_settings,
+            family_settings: BTreeMap::new(),
             endpoint_base_urls: BTreeMap::new(),
             notes: String::new(),
             models: Vec::<ModelProfile>::new(),
@@ -621,33 +684,68 @@ mod tests {
 
     #[test]
     fn other_families_get_no_session_block() {
-        let session = session_for(&provider(ProviderFamily::Anthropic, ""), "").unwrap();
+        let session = session_for(&provider(ProviderFamily::Anthropic), "").unwrap();
         assert!(session.is_none());
     }
 
-    /// A configured path is authoritative: when it does not exist the error
-    /// names it instead of falling back to discovery, which could silently run
-    /// a different binary than the one the user pointed at.
+    /// The version lock, end to end: whatever this build resolves as *the*
+    /// Claude Code must report the number `build.rs` pinned. A drifted
+    /// `node_modules`, a staged copy left over from an earlier pin, or an
+    /// `externalBin` that picked up something else all fail here rather than
+    /// silently changing CLI behaviour the family depends on.
     #[test]
-    fn a_configured_executable_must_exist() {
-        let missing = std::env::temp_dir().join("mework-no-such-claude.exe");
-        let error = resolve_executable(&provider(
-            ProviderFamily::ClaudeAgent,
-            &missing.to_string_lossy(),
-        ))
-        .unwrap_err();
-        assert!(error.contains("不存在"), "{error}");
-        assert!(error.contains("mework-no-such-claude.exe"), "{error}");
+    fn the_bundled_executable_reports_the_pinned_claude_code_version() {
+        let executable = bundled_executable().expect("Mework 必须能找到自己附带的 Claude Code");
+        let mut command = Command::new(&executable);
+        command
+            .arg("--version")
+            .env_clear()
+            .envs(probe_env())
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = command.output().expect("run the bundled Claude Code");
+        let reported = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            reported.trim().starts_with(env!("MEWORK_CLAUDE_CODE_VERSION")),
+            "附带的 Claude Code 报告的是 {reported:?}，而 build.rs 钉的是 {}",
+            env!("MEWORK_CLAUDE_CODE_VERSION"),
+        );
     }
 
+    /// The development fallback mirrors `build.rs::claude_code_platform_package`.
+    /// The SDK's own package comes first: it is by definition the build the pinned
+    /// SDK expects, while the staged copy can lag a `npm install`.
+    #[cfg(debug_assertions)]
     #[test]
-    fn a_configured_executable_is_used_verbatim_and_the_session_carries_profile_env() {
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join(executable_name());
-        std::fs::write(&executable, b"").unwrap();
+    fn the_source_tree_fallback_names_the_sdks_platform_package_first() {
+        let candidates = source_tree_candidates();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        let first = candidates[0].to_string_lossy().replace('\\', "/");
+        assert!(
+            first.contains("aisdk-service/node_modules/@anthropic-ai/claude-agent-sdk-"),
+            "{first}"
+        );
+        assert!(first.ends_with(executable_name()), "{first}");
+        let staged = candidates[1].to_string_lossy().replace('\\', "/");
+        assert!(
+            staged.contains(&format!("binaries/claude-{}", env!("MEWORK_TARGET_TRIPLE"))),
+            "{staged}"
+        );
+    }
+
+    /// The session names the bundled executable — the provider has no say in it —
+    /// and carries the profile variables the CLI needs to find its own login.
+    #[test]
+    fn the_session_carries_the_bundled_executable_and_the_profile_env() {
+        let executable = bundled_executable().expect("Mework 必须能找到自己附带的 Claude Code");
         let app_data = tempfile::tempdir().unwrap();
         let session = session_for(
-            &provider(ProviderFamily::ClaudeAgent, &executable.to_string_lossy()),
+            &provider(ProviderFamily::ClaudeAgent),
             &app_data.path().to_string_lossy(),
         )
         .unwrap()
@@ -681,26 +779,12 @@ mod tests {
         }
         // Two runs never share a session key.
         let second = session_for(
-            &provider(ProviderFamily::ClaudeAgent, &executable.to_string_lossy()),
+            &provider(ProviderFamily::ClaudeAgent),
             &app_data.path().to_string_lossy(),
         )
         .unwrap()
         .unwrap();
         assert_ne!(session.session, second.session);
-    }
-
-    /// Discovery ignores non-native shims: a `claude.cmd` on PATH is not a match.
-    #[test]
-    fn discovery_only_accepts_the_native_executable_name() {
-        let name = executable_name();
-        assert!(name == "claude.exe" || name == "claude");
-        let candidates = discovered_candidates();
-        assert!(candidates
-            .iter()
-            .all(|candidate| candidate.file_name().and_then(|f| f.to_str()) == Some(name)));
-        if let Some(home) = home_dir() {
-            assert_eq!(candidates[0], home.join(".local").join("bin").join(name));
-        }
     }
 
     #[test]

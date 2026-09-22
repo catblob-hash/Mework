@@ -2088,6 +2088,11 @@ function contextForPersistence(context: ContextItem): ContextItem {
         // card's only durable credential and get the card quarantined on the
         // very next save.
         ...(context.attestation ? { attestation: context.attestation } : {}),
+        // The provider's own call id for this exchange. Dropped here, replay
+        // would silently fall back to a minted digest and every tool call in
+        // the turn would change id on the next turn — no error, just a forfeited
+        // prompt cache. Same allowlist hazard as the subagent record above.
+        ...(context.providerCallId ? { providerCallId: context.providerCallId } : {}),
         createdAt: context.createdAt
       };
     }

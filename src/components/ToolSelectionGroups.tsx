@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { isHostDerivedToolName, isPreviewToolName } from "../lib/taskTools";
+import { isFoldedPreviewToolName, isHostDerivedToolName } from "../lib/taskTools";
 import type { ToolDescriptor } from "../types";
 import { ToolDocsLink } from "./DocsLink";
 
@@ -104,7 +104,7 @@ export function ToolSelectionGroups({
   const { t } = useI18n();
   const instanceId = useId().replace(/:/g, "");
   const previewNames = useMemo(
-    () => uniqueTools(tools).filter((tool) => isPreviewToolName(tool.name)).map((tool) => tool.name),
+    () => uniqueTools(tools).filter((tool) => isFoldedPreviewToolName(tool.name)).map((tool) => tool.name),
     [tools]
   );
   const previewNameSet = useMemo(() => new Set(previewNames), [previewNames]);
@@ -129,8 +129,8 @@ export function ToolSelectionGroups({
       (tool) => tool.category !== "memory" && !isHostDerivedToolName(tool.name)
     );
     const pickable = [
-      ...deduplicated.filter((tool) => !isPreviewToolName(tool.name)),
-      ...(deduplicated.some((tool) => isPreviewToolName(tool.name)) ? [mergedPreviewDescriptor()] : [])
+      ...deduplicated.filter((tool) => !isFoldedPreviewToolName(tool.name)),
+      ...(deduplicated.some((tool) => isFoldedPreviewToolName(tool.name)) ? [mergedPreviewDescriptor()] : [])
     ];
     return (Object.keys(groupMeta) as ToolCategory[])
       .filter((category) => category !== "memory")

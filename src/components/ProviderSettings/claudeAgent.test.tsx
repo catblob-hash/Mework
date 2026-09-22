@@ -7,7 +7,8 @@ import { createTestDocument } from "../../test/fixtures";
 import {
   CLAUDE_AGENT_LEGAL_URL,
   CLAUDE_AGENT_LOGIN_COMMAND,
-  CLAUDE_AGENT_REGISTRY
+  CLAUDE_AGENT_REGISTRY,
+  ensureClaudeAgentProvider
 } from "../../lib/claudeAgentProvider";
 import { normalizeDocument } from "../../lib/runtime";
 import type {
@@ -139,6 +140,16 @@ describe("Claude Agent provider", () => {
     expect(within(protocols).queryByRole("option", { name: /Claude Agent/u })).not.toBeInTheDocument();
   });
 
+  it("removes legacy executable settings without cloning clean settings", () => {
+    const legacy = claudeAgentProvider();
+    legacy.familySettings = { claude_executable: "C:\\Users\\me\\.local\\bin\\claude.exe" } as typeof legacy.familySettings;
+    const cleaned = ensureClaudeAgentProvider([legacy]);
+    expect(cleaned[0]?.familySettings).toEqual({});
+    const clean = claudeAgentProvider();
+    const unchanged = ensureClaudeAgentProvider([clean]);
+    expect(unchanged[0]).toBe(clean);
+  });
+
   it("cannot be deleted or repurposed into another family", async () => {
     const user = userEvent.setup();
     renderProviders();
@@ -155,7 +166,7 @@ describe("Claude Agent provider", () => {
     expect(within(protocol).queryByRole("option", { name: "Anthropic Messages" })).not.toBeInTheDocument();
   });
 
-  it("offers neither a key nor an address, only the local CLI path", async () => {
+  it("offers neither a key, address, nor identity fields", async () => {
     const user = userEvent.setup();
     const { getSettings } = renderProviders();
 
@@ -177,19 +188,13 @@ describe("Claude Agent provider", () => {
     expect(screen.getByRole("link", { name: "Claude Code 使用条款" }))
       .toHaveAttribute("href", CLAUDE_AGENT_LEGAL_URL);
 
-    // `knownFamilySettings` drives the identity section: the executable path shows up.
+    // Claude Code is bundled by Mework, so this provider has no identity fields.
     await user.click(screen.getByRole("button", { name: "提供商设置" }));
     const drawer = screen.getByRole("dialog", { name: "提供商设置" });
-    const executable = within(drawer).getByLabelText("Claude Code 路径");
-    expect(executable).toHaveAttribute("placeholder", "留空 = 自动查找 ~/.local/bin 与 PATH");
-    // It is optional, so the label carries no required marker.
-    expect(within(drawer).queryByText("Claude Code 路径 *")).not.toBeInTheDocument();
+    expect(within(drawer).queryByLabelText(/Claude Code.*路径/u)).not.toBeInTheDocument();
+    expect(within(drawer).queryByText("身份字段")).not.toBeInTheDocument();
     // No address of any kind, not even the non-chat endpoints.
     expect(within(drawer).queryByText("端点地址")).not.toBeInTheDocument();
-
-    await user.type(executable, "C:\\Users\\me\\.local\\bin\\claude.exe");
-    expect(getSettings().apiProviders.find((provider) => provider.family === "claude_agent")!.familySettings)
-      .toEqual({ claude_executable: "C:\\Users\\me\\.local\\bin\\claude.exe" });
   });
 
   it("tells the browser preview it cannot read the sign-in status", async () => {
@@ -293,7 +298,7 @@ describe("ClaudeAgentLoginPanel", () => {
     expect(onSignedInChange).not.toHaveBeenCalled();
   });
 
-  it("offers a retry and points at the executable path when the read fails", async () => {
+  it("offers a retry and explains bundled-install or config-read failures", async () => {
     const user = userEvent.setup();
     runtimeMocks.claudeAgentLoginStatus
       .mockRejectedValueOnce(new Error("找不到 claude 可执行文件"))
@@ -301,7 +306,7 @@ describe("ClaudeAgentLoginPanel", () => {
     renderPanel();
 
     expect(await screen.findByRole("alert")).toHaveTextContent("找不到 claude 可执行文件");
-    expect(screen.getByText("可以在「提供商设置」里填 Claude Code 路径。")).toBeInTheDocument();
+    expect(screen.getByText("Mework 自带 Claude Code；读不到通常是安装不完整，或者本机 ~/.claude 不可读。")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "重试" }));
     expect(await screen.findByRole("button", { name: "打开终端登录" })).toBeEnabled();

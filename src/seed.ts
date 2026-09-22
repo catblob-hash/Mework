@@ -20,7 +20,7 @@ import {
   CLAUDE_AGENT_REGISTRY
 } from "./lib/claudeAgentProvider";
 import { CODEX_PROVIDER_FAMILY, CODEX_PROVIDER_NAME } from "./lib/codexProvider";
-import { isHostDerivedToolName, isPreviewToolName } from "./lib/taskTools";
+import { isDecisionToolName, isHostDerivedToolName, isPreviewToolName } from "./lib/taskTools";
 import { createId } from "./lib/id";
 
 export const toolCatalog: ToolDescriptor[] = [
@@ -74,6 +74,34 @@ export const toolCatalog: ToolDescriptor[] = [
     ]
   },
   {
+    name: "bash_find_output",
+    label: "Bash（筛选输出）",
+    description: "",
+    category: "shell",
+    dangerous: true,
+    parameters: [
+      { name: "command", label: "命令", type: "multiline", required: true, placeholder: "git status --short" },
+      { name: "description", label: "说明", type: "string", required: false, placeholder: "查看工作树状态" },
+      { name: "timeout", label: "超时（毫秒）", type: "number", required: false, placeholder: "120000" },
+      { name: "query", label: "查找内容", type: "string", required: true, placeholder: "测试失败的原因", help: "用自然语言描述要在命令输出里找的内容；输出会切块送给决策模型打分，只返回过阈值的片段" },
+      { name: "threshold", label: "分数阈值", type: "number", required: true, placeholder: "0.6", help: "0 到 1，最多三位小数；只返回分数不低于它的片段" }
+    ]
+  },
+  {
+    name: "powershell_find_output",
+    label: "PowerShell（筛选输出）",
+    description: "",
+    category: "shell",
+    dangerous: true,
+    parameters: [
+      { name: "command", label: "命令", type: "multiline", required: true, placeholder: "Get-ChildItem -Force" },
+      { name: "description", label: "说明", type: "string", required: false, placeholder: "列出当前目录的文件" },
+      { name: "timeout", label: "超时（毫秒）", type: "number", required: false, placeholder: "120000" },
+      { name: "query", label: "查找内容", type: "string", required: true, placeholder: "测试失败的原因", help: "用自然语言描述要在命令输出里找的内容；输出会切块送给决策模型打分，只返回过阈值的片段" },
+      { name: "threshold", label: "分数阈值", type: "number", required: true, placeholder: "0.6", help: "0 到 1，最多三位小数；只返回分数不低于它的片段" }
+    ]
+  },
+  {
     name: "write",
     label: "写入文件",
     description: "",
@@ -117,6 +145,45 @@ export const toolCatalog: ToolDescriptor[] = [
       { name: "path", label: "文件路径", type: "string", required: true },
       { name: "start_line", label: "起始行", type: "number", required: false, defaultValue: 1 },
       { name: "end_line", label: "结束行", type: "number", required: false }
+    ]
+  },
+  {
+    name: "find_content",
+    label: "查找内容",
+    description: "",
+    category: "filesystem",
+    dangerous: false,
+    parameters: [
+      { name: "path", label: "文件路径", type: "string", required: true },
+      { name: "query", label: "查找内容", type: "string", required: true, placeholder: "处理登录失败的代码", help: "用自然语言描述要找的内容；文件会切块送给决策模型打分" },
+      { name: "threshold", label: "分数阈值", type: "number", required: true, placeholder: "0.6", help: "0 到 1，最多三位小数；只返回分数不低于它的片段" },
+      { name: "start_line", label: "起始行", type: "number", required: false, defaultValue: 1, help: "从 1 开始" },
+      { name: "end_line", label: "结束行", type: "number", required: false, help: "包含该行；留空到文件末尾" }
+    ]
+  },
+  {
+    name: "find_files",
+    label: "按描述查找文件",
+    description: "",
+    category: "filesystem",
+    dangerous: false,
+    parameters: [
+      { name: "path", label: "目录", type: "string", required: false, defaultValue: "." },
+      { name: "query", label: "查找文件", type: "string", required: true, placeholder: "存放提供商凭据的代码", help: "用自然语言描述要找的文件；目录列表会切块送给决策模型打分" },
+      { name: "threshold", label: "分数阈值", type: "number", required: true, placeholder: "0.6", help: "0 到 1，最多三位小数；只返回分数不低于它的片段" },
+      { name: "depth", label: "递归深度", type: "number", required: false, defaultValue: 6, help: "0 仅列出当前目录" }
+    ]
+  },
+  {
+    name: "find_output",
+    label: "查找命令输出",
+    description: "",
+    category: "shell",
+    dangerous: false,
+    parameters: [
+      { name: "task", label: "任务地址", type: "string", required: true, placeholder: "shell:3", help: "task_list 里的 shell 任务地址，如 shell:3" },
+      { name: "query", label: "查找内容", type: "string", required: true, placeholder: "有没有编译错误", help: "用自然语言描述要在输出里找的内容；输出会切块送给决策模型打分" },
+      { name: "threshold", label: "分数阈值", type: "number", required: true, placeholder: "0.6", help: "0 到 1，最多三位小数；只返回分数不低于它的片段" }
     ]
   },
   {
@@ -323,6 +390,67 @@ export const toolCatalog: ToolDescriptor[] = [
       { name: "serverId", label: "服务器 ID", type: "string", required: false, help: "服务器 ID" },
       { name: "accept", label: "接受", type: "boolean", required: false, defaultValue: true, help: "true 接受对话框，false 取消（默认 true）" },
       { name: "prompt_text", label: "Prompt 输入", type: "string", required: false, help: "prompt 对话框的输入，仅在接受时生效" }
+    ]
+  },
+  {
+    name: "preview_find_element",
+    label: "按描述查找页面元素",
+    description: "",
+    category: "web",
+    dangerous: true,
+    parameters: [
+      { name: "serverId", label: "服务器 ID", type: "string", required: false, help: "服务器 ID" },
+      { name: "query", label: "查找元素", type: "string", required: true, placeholder: "顶部导航里的登录按钮", help: "用自然语言描述要找的页面元素；页面的可访问性快照会切块送给决策模型打分" },
+      { name: "threshold", label: "分数阈值", type: "number", required: true, placeholder: "0.6", help: "0 到 1，最多三位小数；只返回分数不低于它的片段" }
+    ]
+  },
+  {
+    name: "preview_find_logs",
+    label: "按描述查找日志",
+    description: "",
+    category: "web",
+    dangerous: true,
+    parameters: [
+      { name: "serverId", label: "服务器 ID", type: "string", required: false, help: "服务器 ID" },
+      { name: "query", label: "查找日志", type: "string", required: true, placeholder: "有没有关于 hydration 的报错", help: "用自然语言描述要在日志里找的内容；Console 日志和服务器日志会切块送给决策模型打分" },
+      { name: "threshold", label: "分数阈值", type: "number", required: true, placeholder: "0.6", help: "0 到 1，最多三位小数；只返回分数不低于它的片段" },
+      { name: "source", label: "来源", type: "string", required: false, defaultValue: "all", help: "要搜索的日志：all（默认）同时搜 Console 与服务器日志，console 只搜页面 Console，server 只搜服务器输出" }
+    ]
+  },
+  {
+    name: "preview_click_by_description",
+    label: "按描述点击元素",
+    description: "",
+    category: "web",
+    dangerous: true,
+    parameters: [
+      { name: "serverId", label: "服务器 ID", type: "string", required: false, help: "服务器 ID" },
+      { name: "description", label: "元素描述", type: "string", required: true, placeholder: "顶部导航里的登录按钮", help: "用自然语言描述要操作的元素；宿主把页面元素交给决策模型选出一个并直接操作" },
+      { name: "doubleClick", label: "双击", type: "boolean", required: false, help: "改为双击" }
+    ]
+  },
+  {
+    name: "preview_fill_by_description",
+    label: "按描述填写输入",
+    description: "",
+    category: "web",
+    dangerous: true,
+    parameters: [
+      { name: "serverId", label: "服务器 ID", type: "string", required: false, help: "服务器 ID" },
+      { name: "description", label: "元素描述", type: "string", required: true, placeholder: "顶部导航里的登录按钮", help: "用自然语言描述要操作的元素；宿主把页面元素交给决策模型选出一个并直接操作" },
+      { name: "value", label: "值", type: "string", required: true, help: "要填入的值" }
+    ]
+  },
+  {
+    name: "preview_inspect_by_description",
+    label: "按描述检查元素",
+    description: "",
+    category: "web",
+    dangerous: true,
+    parameters: [
+      { name: "serverId", label: "服务器 ID", type: "string", required: false, help: "服务器 ID" },
+      { name: "description", label: "元素描述", type: "string", required: true, placeholder: "顶部导航里的登录按钮", help: "用自然语言描述要操作的元素；宿主把页面元素交给决策模型选出一个并直接操作" },
+      { name: "styles", label: "CSS 属性", type: "json", required: false, placeholder: "[\"padding\",\"color\"]", help: "要返回的 CSS 属性名数组；不给时返回一组常用属性" }
     ]
   },
   {
@@ -724,13 +852,17 @@ function seedPreset(
       // `preview_*` and `workflow` are withheld separately: nothing strips or
       // re-derives them, so they would really persist. A first conversation
       // should not open a dev server or an orchestration pool by itself, and
-      // both are one toggle away in the picker. Mirrors the extra two clauses
-      // in `catalog.rs::seed_preset_enabled_tools`.
+      // both are one toggle away in the picker. The decision-model tools are
+      // withheld for a third reason: none works until the TypeSafe key is set.
+      // Mirrors the extra three clauses in `catalog.rs::seed_preset_enabled_tools`.
       enabledTools: tools
         .map((tool) => tool.name)
         .filter(
           (name) =>
-            !isHostDerivedToolName(name) && !isPreviewToolName(name) && name !== "workflow"
+            !isHostDerivedToolName(name)
+            && !isPreviewToolName(name)
+            && !isDecisionToolName(name)
+            && name !== "workflow"
         ),
       toolDescriptionFileId: null,
       agentDefinitions,
