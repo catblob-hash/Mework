@@ -13,7 +13,7 @@
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -232,7 +232,7 @@ const TOOLS = [
 
 function profileEnv() {
   const env = {};
-  for (const name of ["USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "HOME", "CLAUDE_CONFIG_DIR"]) {
+  for (const name of ["USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "HOME", "USER", "CLAUDE_CONFIG_DIR"]) {
     if (process.env[name]) env[name] = process.env[name];
   }
   return env;
@@ -750,17 +750,83 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
     describe(remote),
   );
 
+  // 30n: the CLI's own login must stay reachable on both session paths. A
+  // stand-in CLI records the environment it was started with and exits. On
+  // macOS the login is a Keychain entry under the account `$USER`; and a resumed
+  // session runs under the SDK's temporary `CLAUDE_CONFIG_DIR`, whose only
+  // credential is a copy without its refresh token — so the secure-storage
+  // directory must keep naming the user's own, or the session dies with the
+  // access token. The stub key keeps the SDK away from the real Keychain.
+  const fakeCli = path.join(cwd, "fake-claude-env.mjs");
+  writeFileSync(
+    fakeCli,
+    [
+      'import { writeFileSync } from "node:fs";',
+      "const dump = {};",
+      'for (const name of ["USER", "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"]) {',
+      "  if (name in process.env) dump[name] = process.env[name];",
+      "}",
+      "writeFileSync(process.env.MEWORK_SELFCHECK_ENV_DUMP, JSON.stringify(dump));",
+      "process.exit(1);",
+      "",
+    ].join("\n"),
+  );
+  const cliEnvOf = async (id, messages) => {
+    const dump = path.join(cwd, `${id}.json`);
+    rmSync(dump, { force: true });
+    const agent = agentFor(id);
+    sc.send(stepFrame(id, id, messages, {
+      agent: { ...agent, executable: fakeCli, env: { ...agent.env, MEWORK_SELFCHECK_ENV_DUMP: dump } },
+    }));
+    // The stand-in exits before speaking, so the step itself fails; only the dump matters.
+    await sc.wait(terminal(id), 30000).catch(() => null);
+    try {
+      return JSON.parse(readFileSync(dump, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const ownStorage = process.env.CLAUDE_CONFIG_DIR ?? "";
+  const expectedUser = process.platform === "win32" ? undefined : os.userInfo().username;
+  const freshEnv = await cliEnvOf("ca-env-fresh", [{ role: "user", content: "hi" }]);
+  check(
+    "30 claude-agent：新会话的 CLI 拿到 USER，安全存储目录指向用户自己的配置目录",
+    freshEnv !== null && freshEnv.CLAUDE_SECURESTORAGE_CONFIG_DIR === ownStorage
+      && freshEnv.CLAUDE_CONFIG_DIR === process.env.CLAUDE_CONFIG_DIR
+      && (expectedUser === undefined || freshEnv.USER === expectedUser),
+    JSON.stringify(freshEnv),
+  );
+  const resumedEnv = await cliEnvOf("ca-env-resume", [
+    { role: "user", content: "earlier" },
+    { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
+    { role: "user", content: "and now" },
+  ]);
+  check(
+    "30 claude-agent：resume 会话在 SDK 的临时 CLAUDE_CONFIG_DIR 下仍读写用户自己的登录",
+    resumedEnv !== null && typeof resumedEnv.CLAUDE_CONFIG_DIR === "string"
+      && resumedEnv.CLAUDE_CONFIG_DIR !== ownStorage
+      && resumedEnv.CLAUDE_SECURESTORAGE_CONFIG_DIR === ownStorage
+      && (expectedUser === undefined || resumedEnv.USER === expectedUser),
+    JSON.stringify(resumedEnv),
+  );
+
   // 30m: every frame above carried `apiKey`/`baseURL` on the request. The CLI is
   // authenticated by the loopback stub key from `agent.env` — proof that the
   // upstream was reached at all — and the request-only key appears in no request
-  // the CLI made. Putting `request.apiKey` back into `cliEnv` fails this.
+  // the CLI made. Putting `request.apiKey` back into `cliEnv` fails this. Every
+  // request carries a key from `agent.env` and none a bearer: a CLI that reached
+  // for the developer's stored login instead would be handing a real OAuth
+  // token to the stub.
   const requestOnlyLeaks = upstream.requests.filter((entry) =>
     JSON.stringify({ headers: entry.headers, body: entry.body }).includes(REQUEST_ONLY_KEY));
   const upstreamKeyUsed = upstream.calls.some((entry) => JSON.stringify(entry.headers).includes(UPSTREAM_KEY));
+  const storedLoginUsed = upstream.calls.filter(
+    (entry) => typeof entry.headers["x-api-key"] !== "string" || entry.headers.authorization !== undefined,
+  ).length;
   check(
     "30 claude-agent：request.apiKey 不进 CLI 环境（上游只见 agent.env 里的本机测试桩 Key）",
-    upstreamKeyUsed && requestOnlyLeaks.length === 0,
-    `upstream_key_seen=${upstreamKeyUsed} leaks=${requestOnlyLeaks.length}`,
+    upstreamKeyUsed && requestOnlyLeaks.length === 0 && storedLoginUsed === 0,
+    `upstream_key_seen=${upstreamKeyUsed} leaks=${requestOnlyLeaks.length} stored_login=${storedLoginUsed}`,
   );
 
   // HEAD /api/hello is the CLI's fire-and-forget TLS preconnect to the base URL:

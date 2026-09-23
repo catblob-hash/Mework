@@ -68,15 +68,9 @@ export function RemoteDirectoryPicker({
 
   useEffect(() => navigate(HOME), [navigate]);
 
-  const parentOf = (path: string): string => {
-    const trimmed = path.replace(/\/+$/, "");
-    const cut = trimmed.lastIndexOf("/");
-    return cut <= 0 ? "/" : trimmed.slice(0, cut);
-  };
-
-  const join = (path: string, name: string): string => (
-    path.endsWith("/") ? `${path}${name}` : `${path}/${name}`
-  );
+  // Parent and child paths come from the host, which knows whether this
+  // machine spells them `/srv/app` or `C:/Users/dev`.
+  const parent = listing?.parent ?? null;
 
   const confirm = () => {
     const path = draft.trim();
@@ -131,30 +125,30 @@ export function RemoteDirectoryPicker({
           />
         </label>
         <div className="remote-picker__list" role="listbox" aria-busy={busy || undefined}>
-          {listing?.hasParent && (
+          {parent !== null && (
             <button
               type="button"
               className="remote-picker__entry"
               disabled={busy}
-              onClick={() => navigate(parentOf(listing.path))}
+              onClick={() => navigate(parent)}
             >
               <CornerLeftUp size={13} />
               <span>{t("上一级", "Up one level")}</span>
             </button>
           )}
-          {listing?.directories.map((name) => (
+          {listing?.entries.map((entry) => (
             <button
-              key={name}
+              key={entry.path}
               type="button"
               className="remote-picker__entry"
               disabled={busy}
-              onClick={() => navigate(join(listing.path, name))}
+              onClick={() => navigate(entry.path)}
             >
               <Folder size={13} />
-              <span className="remote-picker__name">{name}</span>
+              <span className="remote-picker__name">{entry.name}</span>
             </button>
           ))}
-          {listing && listing.directories.length === 0 && (
+          {listing && listing.entries.length === 0 && (
             <p className="remote-picker__empty">
               {t("这个目录里没有子目录", "This directory has no subdirectories")}
             </p>

@@ -32,7 +32,7 @@ pub struct AssetLibrary {
     /// [`ConversationWebSearchSettings`].
     #[serde(default)]
     pub web_search: WebSearchAssets,
-    /// SSH machine catalog and environment-specific variables. Conversations own
+    /// SSH machine catalog and workspace-specific variables. Conversations own
     /// their selected execution environment.
     #[serde(default)]
     pub execution_environments: ExecutionEnvironmentAssets,
@@ -48,8 +48,11 @@ pub struct AssetLibrary {
 pub struct ExecutionEnvironmentAssets {
     #[serde(default)]
     pub ssh_machines: Vec<SshMachineConfig>,
-    /// Environment key to variables. Dangling keys are allowed so deleting a
-    /// machine does not invalidate the document.
+    /// Workspace key to variables: variables belong to a workspace — a
+    /// directory on a machine — not to the machine. Keyed by
+    /// [`workspace_env_key`](crate::run_environment::workspace_env_key).
+    /// Dangling keys are allowed so removing a workspace or deleting a machine
+    /// does not invalidate the document.
     #[serde(default)]
     pub env_vars: BTreeMap<String, BTreeMap<String, String>>,
 }

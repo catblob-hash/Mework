@@ -6,11 +6,13 @@ import {
   hostLacksPowerShell,
   isReservedWorkspace,
   isTemporaryWorkspace,
+  machineUsage,
   projectWorkspaces,
   terminalShellsFor,
   toolsForHost,
   withWorkspaceArgument,
-  workspaceDirectoryLabel
+  workspaceDirectoryLabel,
+  workspaceEnvKey
 } from "./workspaces";
 
 describe("PowerShell on the host", () => {
@@ -157,6 +159,40 @@ describe("project workspaces", () => {
     expect(workspaceDirectoryLabel("C:\\platform\\")).toBe("platform");
     expect(workspaceDirectoryLabel("~/code/api")).toBe("api");
     expect(workspaceDirectoryLabel("/")).toBe("/");
+  });
+});
+
+describe("workspace variables and machine usage", () => {
+  it("keys a workspace's variables by its machine and its path", () => {
+    expect(workspaceEnvKey(null, "C:\\platform")).toBe("local|C:\\platform");
+    expect(workspaceEnvKey({ kind: "wsl", distro: "Ubuntu" }, "/home/dev/app")).toBe("wsl:Ubuntu|/home/dev/app");
+    // The same spelling on two machines is two workspaces, with two tables.
+    expect(workspaceEnvKey({ kind: "ssh", machineId: "m1" }, "/srv/app"))
+      .not.toBe(workspaceEnvKey({ kind: "ssh", machineId: "m2" }, "/srv/app"));
+  });
+
+  it("counts projects by any of their workspaces and conversations by their attached ones", () => {
+    const devbox = { kind: "ssh" as const, machineId: "m1" };
+    const base = { ...createTemporaryWorkspace(), kind: "directory" as const, conversations: [] };
+    const workspaces = [
+      { ...base, id: "a", path: "/srv/a", machine: devbox },
+      { ...base, id: "b", path: "C:\\b", additionalWorkspaces: [{ machine: devbox, path: "/srv/b" }] },
+      {
+        ...base,
+        id: "c",
+        path: "C:\\c",
+        conversations: [
+          { attachedWorkspaces: [{ machine: devbox, path: "~/x" }] },
+          { attachedWorkspaces: [{ path: "D:\\y" }] }
+        ] as unknown as typeof base.conversations
+      },
+      // The temporary project has no directory of its own and never counts as on this machine.
+      createTemporaryWorkspace()
+    ];
+    expect(machineUsage(workspaces, devbox)).toEqual({ projects: 2, conversations: 1 });
+    expect(machineUsage(workspaces, null)).toEqual({ projects: 2, conversations: 1 });
+    expect(machineUsage(workspaces, { kind: "ssh", machineId: "gone" })).toEqual({ projects: 0, conversations: 0 });
+    expect(machineUsage(null, null)).toEqual({ projects: 0, conversations: 0 });
   });
 });
 

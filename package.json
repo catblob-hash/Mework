@@ -28,6 +28,7 @@
     "verify:formal": "node scripts/formal-verify.mjs",
     "build": "tsc && vite --config vite.config.ts build",
     "build:sidecar": "node scripts/build-aisdk-sidecar.mjs",
+    "build:remote-agents": "node scripts/build-remote-agents.mjs",
     "preview": "vite --config vite.config.ts preview",
     "test": "node scripts/shared-test.mjs",
     "test:rust": "node scripts/cargo-test.mjs",

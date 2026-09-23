@@ -562,6 +562,15 @@ fn invalidate_active_mount(state: &mut BrowserRendererMountState) -> bool {
     if state.in_flight_mutations > 0 {
         state.presentation_fence_dirty = true;
     }
+    // The retained lease only exists so a lost registration response can be
+    // answered again with the same lease. That lease is now invalid, and
+    // keeping it would make every later registration for this document fail
+    // closed on it forever — the document would have to be loaded again before
+    // the browser could be opened at all. The challenge is unchanged and is
+    // still the native proof that this document is the current main renderer,
+    // so drop the lease and let the next registration issue a new generation,
+    // which fences the invalidated one rather than resurrecting it.
+    state.bootstrap_lease = None;
     true
 }
 
@@ -583,6 +592,10 @@ mod tests {
     };
 
     use super::*;
+
+    /// A heartbeat deadline in the same shape as the host's, for the tests that
+    /// let one expire.
+    const HEARTBEAT_IDLE: Duration = Duration::from_secs(12);
 
     fn assert_valid_lease(lease: &BrowserRendererMountLease) {
         assert!(is_canonical_uuid_v4(&lease.mount_id));
@@ -956,6 +969,84 @@ mod tests {
             Some(BrowserRendererPresentationOrphanAction {
                 hide_through_generation: lease.generation,
             })
+        );
+    }
+
+    /// The regression this guard exists for: a renderer whose heartbeat was late
+    /// once — a stalled main thread, a throttled timer — had its mount revoked
+    /// and could never register again, because the retained bootstrap lease kept
+    /// answering every retry with `UnknownMount`. The document was still the
+    /// current main renderer, so every browser and preview action failed closed
+    /// for the rest of its life, with only a full page load to recover.
+    #[test]
+    fn a_renderer_whose_mount_went_stale_registers_again_on_the_same_challenge() {
+        let registry = BrowserRendererMountRegistry::new();
+        let challenge = registry.begin_main_document_load().unwrap();
+        let stale = registry.register_bootstrapped_mount(&challenge).unwrap();
+
+        assert!(registry
+            .invalidate_stale_mount_at(Instant::now() + Duration::from_secs(30), HEARTBEAT_IDLE)
+            .unwrap());
+        let renewed = registry.register_bootstrapped_mount(&challenge).unwrap();
+
+        // A new generation, not the revoked one resurrected: the invalidated
+        // mount stays invalid and its presentation fence stays below the new one.
+        assert_ne!(renewed.mount_id, stale.mount_id);
+        assert_eq!(renewed.generation, stale.generation + 1);
+        assert_eq!(
+            registry
+                .with_validated_mutation(&stale.mount_id, stale.generation, || ())
+                .unwrap_err(),
+            BrowserRendererMountError::StaleMount
+        );
+        assert_eq!(
+            registry.pending_presentation_orphan_action().unwrap(),
+            Some(BrowserRendererPresentationOrphanAction {
+                hide_through_generation: stale.generation,
+            })
+        );
+        registry
+            .with_validated_mutation(&renewed.mount_id, renewed.generation, || ())
+            .unwrap();
+        // Registration stays idempotent for the mount that is now current.
+        assert_eq!(
+            registry.register_bootstrapped_mount(&challenge).unwrap(),
+            renewed
+        );
+    }
+
+    /// Only the document that was handed the challenge may register again after
+    /// a stale invalidation. Dropping the retained lease must not turn the
+    /// challenge into a second chance for anything else.
+    #[test]
+    fn a_stale_invalidation_does_not_widen_who_may_register() {
+        let registry = BrowserRendererMountRegistry::new();
+        let challenge = registry.begin_main_document_load().unwrap();
+        registry.register_bootstrapped_mount(&challenge).unwrap();
+        assert!(registry
+            .invalidate_stale_mount_at(Instant::now() + Duration::from_secs(30), HEARTBEAT_IDLE)
+            .unwrap());
+
+        assert_eq!(
+            registry
+                .register_bootstrapped_mount(&Uuid::new_v4().hyphenated().to_string())
+                .unwrap_err(),
+            BrowserRendererMountError::UnknownMount
+        );
+        assert_eq!(
+            registry
+                .register_bootstrapped_mount("not-a-uuid")
+                .unwrap_err(),
+            BrowserRendererMountError::InvalidMountId
+        );
+        // A revoked challenge stays revoked: a document load that failed its
+        // native presentation cleanup is still the one case with no way back.
+        assert!(registry.abort_main_document_load(&challenge).unwrap());
+        assert_eq!(
+            registry
+                .register_bootstrapped_mount(&challenge)
+                .unwrap_err(),
+            BrowserRendererMountError::UnknownMount
         );
     }
 

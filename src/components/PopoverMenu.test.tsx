@@ -25,6 +25,45 @@ function renderMenu() {
 describe("PopoverMenu", () => {
   beforeEach(() => configureI18n("zh-CN"));
 
+  it("puts a row's and a heading's action beside them, not inside them, and closes on it", async () => {
+    const user = userEvent.setup();
+    const onRow = vi.fn();
+    const onRowAction = vi.fn();
+    const onSectionAction = vi.fn();
+    render(
+      <PopoverMenu
+        trigger={<span>机器</span>}
+        triggerLabel="机器"
+        menuLabel="机器"
+        sections={[{
+          id: "machines",
+          label: "本机",
+          action: { label: "本机 的设置", icon: <span>⚙</span>, onSelect: onSectionAction },
+          items: [{ id: "app", label: "app", onSelect: onRow, action: { label: "app 的环境变量", icon: <span>⚙</span>, onSelect: onRowAction } }]
+        }]}
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "机器" }));
+    const menu = screen.getByRole("menu", { name: "机器" });
+    const rowAction = within(menu).getByRole("button", { name: "app 的环境变量" });
+    // Nested buttons are invalid, so the action is the row button's sibling.
+    expect(rowAction.closest(".popover-menu__item")).toBeNull();
+    expect(rowAction).toHaveAttribute("title", "app 的环境变量");
+    expect(within(menu).getByRole("button", { name: "本机 的设置" }).closest(".popover-menu__label"))
+      .toHaveTextContent("本机");
+
+    await user.click(rowAction);
+    expect(onRowAction).toHaveBeenCalledTimes(1);
+    expect(onRow).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu", { name: "机器" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "机器" }));
+    await user.click(screen.getByRole("button", { name: "本机 的设置" }));
+    expect(onSectionAction).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu", { name: "机器" })).toBeNull();
+  });
+
   it("stays open while its own list scrolls", async () => {
     const user = userEvent.setup();
     renderMenu();

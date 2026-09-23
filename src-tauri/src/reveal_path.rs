@@ -156,20 +156,29 @@ pub fn reveal(path: &Path) -> Result<(), String> {
 /// Show a validated path in the file manager.
 #[cfg(not(windows))]
 pub fn reveal(path: &Path) -> Result<(), String> {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut command = std::process::Command::new("open");
-        command.arg("-R").arg(path);
-        command
-    } else {
-        // No portable select verb exists, so open the containing folder.
-        let target = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(target);
-        command
+    use crate::host_platform::{host_platform, HostPlatform};
+
+    let mut command = match host_platform() {
+        // Only macOS has a select verb of its own.
+        HostPlatform::Macos => {
+            let mut command = std::process::Command::new("open");
+            command.arg("-R").arg(path);
+            command
+        }
+        // Elsewhere no portable select verb exists, so open the containing
+        // folder. Windows never reaches this build of the function —
+        // `explorer.exe /select,` is the sibling above — and is named here only
+        // so the match stays closed.
+        HostPlatform::Linux | HostPlatform::Windows => {
+            let target = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            let mut command = std::process::Command::new("xdg-open");
+            command.arg(target);
+            command
+        }
     };
     command
         .spawn()
@@ -180,6 +189,7 @@ pub fn reveal(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_platform::host_platform;
 
     /// An existing directory every platform provides, without creating fixtures.
     ///
@@ -284,7 +294,7 @@ mod tests {
             .expect("the temporary directory has a name")
             .to_str()
             .expect("temporary path is UTF-8");
-        let verbatim = if cfg!(windows) {
+        let verbatim = if host_platform().is_windows() {
             format!("\\\\?\\{}", base.display())
         } else {
             base.display().to_string()

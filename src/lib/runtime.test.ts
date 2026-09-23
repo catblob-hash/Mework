@@ -129,6 +129,41 @@ describe("document normalization", () => {
    * for the rest of the session. A malformed binding is dropped rather than
    * kept, which is the attached-workspace rule too.
    */
+  /**
+   * Variables once belonged to a machine. They now belong to each workspace, so
+   * a table keyed by a bare machine is spread over every workspace on it that
+   * has none of its own — the commands keep the variables they ran with — and
+   * the machine key, which the host never reads, is dropped.
+   */
+  it("spreads a machine's variables over the workspaces on it", () => {
+    const document = createSeedDocument();
+    const project = document.workspaces[0];
+    project.additionalWorkspaces = [
+      { machine: { kind: "ssh", machineId: "m1" }, path: "/srv/api" },
+      { path: "D:/shared/lib" }
+    ];
+    project.conversations[0].attachedWorkspaces = [{ machine: { kind: "wsl", distro: "Ubuntu" }, path: "/home/dev/x" }];
+    (document as unknown as { globalSettings: { executionEnvironments: unknown } }).globalSettings.executionEnvironments = {
+      sshMachines: [],
+      envVars: {
+        local: { PROXY: "http://proxy" },
+        "ssh:m1": { K: "v" },
+        "wsl:Ubuntu": { W: "1" },
+        "wsl:Debian": { UNUSED: "1" },
+        // A workspace that already has its own table keeps it.
+        "local|D:/shared/lib": { OWN: "yes" },
+        "docker:x|/srv": { BAD: "1" }
+      }
+    };
+
+    expect(normalizeDocument(document).globalSettings.executionEnvironments.envVars).toEqual({
+      [`local|${project.path}`]: { PROXY: "http://proxy" },
+      "local|D:/shared/lib": { OWN: "yes" },
+      "ssh:m1|/srv/api": { K: "v" },
+      "wsl:Ubuntu|/home/dev/x": { W: "1" }
+    });
+  });
+
   it("keeps a sidebar workspace on its machine through normalization", () => {
     const document = createSeedDocument();
     const remote = { ...document.workspaces[0], id: "ws_remote", path: "/home/dev/app", conversations: [] };

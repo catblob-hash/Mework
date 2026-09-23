@@ -133,13 +133,16 @@ fn launch(url: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn launch(url: &str) -> Result<(), String> {
+    use crate::host_platform::host_platform;
+
     // Validated HTTP(S) URLs cannot be interpreted as options by `open` or
-    // `xdg-open`, which would require a leading `-`.
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
+    // `xdg-open`, which would require a leading `-`. Which of the two opens a
+    // link here is the host's to answer, and it answers for all three platforms
+    // in one place; Windows never reaches this build of the function, which is
+    // why the answer can be absent at all.
+    let opener = host_platform()
+        .desktop_opener()
+        .ok_or_else(|| "这个平台没有可用的外部链接打开方式".to_owned())?;
     std::process::Command::new(opener)
         .arg(url)
         .spawn()

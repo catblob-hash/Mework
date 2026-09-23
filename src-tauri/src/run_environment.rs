@@ -18,6 +18,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
+use crate::host_platform::host_platform;
 use crate::model::{ExecutionEnvironmentAssets, RunTarget};
 
 /// Trusted shell environment resolved by the host. Only [`resolve_shell_runner`] may
@@ -56,7 +57,7 @@ impl ShellRunner {
         let proxy = crate::child_environment::normalized_proxy_bypass(
             &BTreeMap::new(),
             self.env(),
-            cfg!(windows) && matches!(self, Self::Local { .. }),
+            host_platform().is_windows() && matches!(self, Self::Local { .. }),
         )?;
         let mut env = self.env().clone();
         env.retain(|name, _| !name.eq_ignore_ascii_case("NO_PROXY"));
@@ -108,7 +109,7 @@ impl ShellRunner {
     }
 }
 
-/// Key for the environment-variable map in [`ExecutionEnvironmentAssets::env_vars`].
+/// A machine's identity: `local`, `wsl:<distro>`, or `ssh:<machine id>`.
 pub fn env_key(target: Option<&RunTarget>) -> String {
     match target {
         None => "local".into(),
@@ -117,21 +118,44 @@ pub fn env_key(target: Option<&RunTarget>) -> String {
     }
 }
 
-/// Resolves a persisted conversation target to a trusted dispatch environment.
-/// A missing SSH catalog entry must fail explicitly rather than silently falling back
-/// to local execution, which would run remote-intended commands on the wrong machine.
+/// Key of a workspace's variable table in [`ExecutionEnvironmentAssets::env_vars`]:
+/// the machine's [`env_key`] and the directory as the workspace records it,
+/// joined by `|`. Variables belong to the workspace, not the machine — two
+/// directories on one machine each carry their own table.
+pub fn workspace_env_key(target: Option<&RunTarget>, path: &str) -> String {
+    format!("{}|{path}", env_key(target))
+}
+
+/// Resolves a machine to a trusted dispatch environment.
+///
+/// `workspace_path` names the workspace the shell runs for, and the runner
+/// carries that workspace's variable table; `None` is the machine alone, with
+/// no variables, which is what browsing a machine before any of its directories
+/// is a workspace wants. A missing SSH catalog entry must fail explicitly rather
+/// than silently falling back to local execution, which would run
+/// remote-intended commands on the wrong machine.
 pub fn resolve_shell_runner(
     assets: &ExecutionEnvironmentAssets,
     target: Option<&RunTarget>,
+    workspace_path: Option<&str>,
 ) -> Result<ShellRunner, String> {
-    let env = assets
-        .env_vars
-        .get(&env_key(target))
+    let env = workspace_path
+        .and_then(|path| assets.env_vars.get(&workspace_env_key(target, path)))
         .cloned()
         .unwrap_or_default();
     match target {
         None => Ok(ShellRunner::Local { env }),
         Some(RunTarget::Wsl { distro }) => {
+            // WSL exists on Windows and nowhere else. A document that travelled
+            // between machines can still name one here, and without this the
+            // call would reach `wsl.exe` and come back as a missing program —
+            // a message about a file, for what is really the wrong machine.
+            if !host_platform().has_wsl() {
+                return Err(format!(
+                    "This conversation runs in WSL ({distro}), which a {} host cannot reach; select an execution location again",
+                    host_platform().display_name()
+                ));
+            }
             validate_wsl_distro_name(distro)?;
             Ok(ShellRunner::Wsl {
                 distro: distro.clone(),
@@ -272,22 +296,10 @@ pub fn wsl_shell_args(
     args
 }
 
-/// Builds OpenSSH arguments. The remote login shell parses one command string, so all
-/// host-supplied fragments use [`sh_single_quote`]. `BatchMode=yes` fails explicitly
-/// when credentials or host-key confirmation are unavailable.
-///
-/// `remote_cwd` is the root of the workspace the call named, not a property of the
-/// machine: the same machine serves as many working directories as the
-/// conversation has attached on it. Empty leaves the remote login shell wherever
-/// it starts, which is the remote user's home.
-pub fn ssh_shell_args(
-    host: &str,
-    port: u16,
-    identity_file: &str,
-    remote_cwd: &str,
-    env: &BTreeMap<String, String>,
-    command: &str,
-) -> Vec<String> {
+/// OpenSSH's options and destination for an unattended call — everything
+/// before the remote command. `BatchMode=yes` fails explicitly when credentials
+/// or host-key confirmation are unavailable.
+pub fn ssh_connection_args(host: &str, port: u16, identity_file: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-o".into(),
         "BatchMode=yes".into(),
@@ -302,7 +314,59 @@ pub fn ssh_shell_args(
     }
     args.push("--".into());
     args.push(host.to_owned());
+    args
+}
 
+/// Builds OpenSSH arguments that run `command` in bash on the machine.
+///
+/// This is the per-command transport: one SSH login per call. A machine the
+/// agent serves ([`crate::remote_link`]) does not use it for tool calls,
+/// scripts or terminals; it remains for machines the agent cannot serve.
+///
+/// The POSIX script around the command — the `cd`, the variables, the `bash`
+/// it hands the command to — is composed with [`sh_single_quote`] for every
+/// host-supplied fragment, as `sh` will read it. What travels is that script in
+/// [`remote_shell::posix_line`] form, because the login shell reads the line
+/// first and is not necessarily a POSIX shell: fish, tcsh and nushell each read
+/// quotes their own way, and the neutral line reads the same to all of them.
+///
+/// `remote_cwd` is the root of the workspace the call named, not a property of the
+/// machine: the same machine serves as many working directories as the
+/// conversation has attached on it. Empty leaves the remote login shell wherever
+/// it starts, which is the remote user's home.
+///
+/// [`remote_shell::posix_line`]: crate::remote_shell::posix_line
+pub fn ssh_shell_args(
+    host: &str,
+    port: u16,
+    identity_file: &str,
+    remote_cwd: &str,
+    env: &BTreeMap<String, String>,
+    command: &str,
+) -> Vec<String> {
+    let mut args = ssh_connection_args(host, port, identity_file);
+    let script = ssh_bash_script(remote_cwd, env, command);
+    let line = crate::remote_shell::posix_line(&script);
+    // The line is one argument to the login shell, and Linux refuses a single
+    // argument over 128 KiB. A command dense enough in escaped bytes to cross
+    // that goes as the script itself, which every POSIX login shell still reads
+    // — what such a command loses is only fish and tcsh.
+    args.push(if line.len() <= MAX_NEUTRAL_LINE_BYTES {
+        line
+    } else {
+        script
+    });
+    args
+}
+
+/// Longest [`crate::remote_shell::posix_line`] sent: Linux's `MAX_ARG_STRLEN`
+/// (32 pages of 4 KiB) with room for its terminating NUL.
+const MAX_NEUTRAL_LINE_BYTES: usize = 128 * 1024 - 1;
+
+/// The `sh` script [`ssh_shell_args`] sends: enter the workspace, then hand the
+/// command to a bash that reads no startup files, with the variable table in
+/// its environment.
+fn ssh_bash_script(remote_cwd: &str, env: &BTreeMap<String, String>, command: &str) -> String {
     let mut remote = String::new();
     if !remote_cwd.is_empty() {
         remote.push_str(&format!("cd {} || exit 1; ", quote_remote_path(remote_cwd)));
@@ -323,8 +387,7 @@ pub fn ssh_shell_args(
         "bash --noprofile --norc -c {}",
         sh_single_quote(command)
     ));
-    args.push(remote);
-    args
+    remote
 }
 
 /// SSH client executable candidates in priority order. On Windows, the system OpenSSH
@@ -343,16 +406,25 @@ pub fn ssh_client_candidates() -> Vec<String> {
 /// Whether a failed remote invocation was answered by `cmd.exe` or PowerShell
 /// rather than a POSIX shell.
 ///
-/// Every remote leg sends the `cd … || exit 1; exec env … bash -c …` line from
-/// [`ssh_shell_args`], and a Windows sshd whose `DefaultShell` is still the
-/// factory `cmd.exe` cannot run a word of it. What comes back is that shell's
+/// Every bash leg sends the `exec /bin/sh -c '…'` line from [`ssh_shell_args`], and
+/// a Windows sshd whose `DefaultShell` is still the factory `cmd.exe` cannot
+/// run a word of it. What comes back is that shell's
 /// own "not recognized" complaint about `exec`, which read raw says nothing
 /// about what to change on the machine. The signatures: `cmd.exe` says so in
 /// the console language and exits 9009; PowerShell prints the
 /// locale-independent `CommandNotFoundException` category. The exit code is
 /// only a secondary signal — the Windows OpenSSH client passes it through
-/// whole, a POSIX client folds it to eight bits — so the text carries the
-/// weight, and an unknown language falls through to the raw reply.
+/// whole, a POSIX client folds it to eight bits, and a Windows sshd reached
+/// from macOS has been seen to report plain 1 — so the text carries the weight.
+///
+/// The console language arrives in the machine's OEM code page, not UTF-8: a
+/// Chinese install answers in GBK, which lossy decoding here turns into
+/// replacement characters, so the localized sentences match only on a console
+/// switched to UTF-8. What survives every code page is the ASCII head of
+/// `cmd.exe`'s reply — it quotes the unknown command first, `'exec' …` in
+/// English, Chinese, Japanese and Korean alike — and no POSIX shell ever opens a
+/// complaint about its own `exec` builtin that way. An unknown language that
+/// quotes differently falls through to the raw reply.
 pub fn answered_by_non_posix_shell(status: Option<i32>, stderr: &str) -> bool {
     const SIGNATURES: [&str; 6] = [
         "is not recognized as an internal or external command",
@@ -362,13 +434,22 @@ pub fn answered_by_non_posix_shell(status: Option<i32>, stderr: &str) -> bool {
         "不是內部或外部命令",
         "内部コマンドまたは外部コマンド",
     ];
-    status == Some(9009) || SIGNATURES.iter().any(|needle| stderr.contains(needle))
+    status == Some(9009)
+        || stderr.trim_start().starts_with("'exec'")
+        || SIGNATURES.iter().any(|needle| stderr.contains(needle))
 }
 
-/// What to tell someone whose SSH machine answered through `cmd.exe` or
-/// PowerShell: the remote legs need a POSIX shell as that account's login
-/// shell, and on Windows that is a registry change, not a Mework setting.
-pub const NON_POSIX_SHELL_ADVICE: &str = "这台机器的 SSH 默认 shell 不是 POSIX shell（回应来自 cmd.exe 或 PowerShell）。Mework 的远端腿需要 bash：在那台 Windows 上安装 Git for Windows 之类的 MSYS 环境，把注册表 HKLM\\SOFTWARE\\OpenSSH 下的 DefaultShell 指向它的 bash.exe、DefaultShellCommandOption 设为 -c，重启 sshd 后再试";
+/// A remote reply fit to show someone, or `None` when there is nothing to show
+/// or it did not survive decoding.
+///
+/// Remote stderr is decoded as UTF-8 with replacement, and a Windows console
+/// answering in its OEM code page (GBK, Big5, Shift_JIS…) comes out as
+/// replacement characters around the ASCII. Shown raw that is noise that buries
+/// whatever was said next to it, so the caller leaves it out instead.
+pub fn legible_remote_reply(stderr: &str) -> Option<&str> {
+    let reply = stderr.trim();
+    (!reply.is_empty() && !reply.contains(char::REPLACEMENT_CHARACTER)).then_some(reply)
+}
 
 /// What one remote invocation left behind.
 ///
@@ -396,6 +477,11 @@ const REMOTE_POLL: Duration = Duration::from_millis(100);
 /// [`sh_single_quote`] first. A `Local` runner is refused — this host's own
 /// filesystem is reached directly, and silently running a POSIX script through
 /// some local Bash would act on paths that mean something else here.
+///
+/// An SSH machine the agent serves runs the script through it
+/// ([`crate::remote_link`]): the same `bash --noprofile --norc -c`, started by
+/// the agent directly instead of by the login shell, over the machine's one
+/// long-lived connection instead of a fresh SSH login.
 pub fn run_remote_script(
     runner: &ShellRunner,
     script: &str,
@@ -403,6 +489,13 @@ pub fn run_remote_script(
     timeout: Duration,
     cancel: &crate::cancel::CancelSignal,
 ) -> Result<RemoteCommandOutput, String> {
+    let argv = ["bash", "--noprofile", "--norc", "-c", script]
+        .iter()
+        .map(|part| (*part).to_owned())
+        .collect();
+    if let Some(result) = crate::remote_link::run_script(runner, argv, stdin, timeout, cancel) {
+        return result;
+    }
     let child = spawn_remote_script(runner, script, stdin.is_some())?;
     pump_remote_child(child, runner, stdin, timeout, cancel)
 }
@@ -442,6 +535,93 @@ pub fn remote_script_invocation(
     }
 }
 
+/// Runs a POSIX `sh` script on the machine `runner` dispatches to, assuming
+/// nothing there but `/bin/sh`.
+///
+/// This is for the host's own read-only probes, such as the directory picker,
+/// which should work on a machine before anything else about it is known —
+/// including whether it has bash. On SSH the script is the whole
+/// [`remote_shell::posix_line`] payload, so `sh` runs it directly; on WSL
+/// `--exec` starts `/bin/sh` itself.
+///
+/// [`remote_shell::posix_line`]: crate::remote_shell::posix_line
+pub fn run_remote_sh_script(
+    runner: &ShellRunner,
+    script: &str,
+    timeout: Duration,
+    cancel: &crate::cancel::CancelSignal,
+) -> Result<RemoteCommandOutput, String> {
+    let argv = vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()];
+    if let Some(result) = crate::remote_link::run_script(runner, argv, None, timeout, cancel) {
+        return result;
+    }
+    let (candidates, args) = match runner {
+        ShellRunner::Local { .. } => {
+            return Err(
+                "This machine's own filesystem is not reached through a remote shell".into(),
+            )
+        }
+        ShellRunner::Wsl { distro, .. } => {
+            validate_wsl_distro_name(distro)?;
+            (
+                vec!["wsl.exe".to_owned()],
+                vec![
+                    "-d".into(),
+                    distro.clone(),
+                    "--cd".into(),
+                    "/".into(),
+                    "--exec".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    script.to_owned(),
+                ],
+            )
+        }
+        ShellRunner::Ssh {
+            host,
+            port,
+            identity_file,
+            ..
+        } => {
+            let mut args = ssh_connection_args(host, *port, identity_file);
+            args.push(crate::remote_shell::posix_line(script));
+            (ssh_client_candidates(), args)
+        }
+    };
+    let child = spawn_invocation(runner, &candidates, &args, false)?;
+    pump_remote_child(child, runner, None, timeout, cancel)
+}
+
+/// Sends one command line, verbatim, to an SSH machine's login shell.
+///
+/// Nothing is wrapped around `line`, so it must already be in a form the login
+/// shell reads as intended: [`remote_shell::PROBE_COMMAND`], or a
+/// [`remote_shell::powershell_line`] for a Windows machine. Only SSH has a login
+/// shell in the way; any other runner is refused.
+///
+/// [`remote_shell::PROBE_COMMAND`]: crate::remote_shell::PROBE_COMMAND
+/// [`remote_shell::powershell_line`]: crate::remote_shell::powershell_line
+pub fn run_ssh_line(
+    runner: &ShellRunner,
+    line: &str,
+    timeout: Duration,
+    cancel: &crate::cancel::CancelSignal,
+) -> Result<RemoteCommandOutput, String> {
+    let ShellRunner::Ssh {
+        host,
+        port,
+        identity_file,
+        ..
+    } = runner
+    else {
+        return Err("Only an SSH machine is reached through a login shell".into());
+    };
+    let mut args = ssh_connection_args(host, *port, identity_file);
+    args.push(line.to_owned());
+    let child = spawn_invocation(runner, &ssh_client_candidates(), &args, false)?;
+    pump_remote_child(child, runner, None, timeout, cancel)
+}
+
 /// Starts `script` on the machine `runner` dispatches to, with stdout and
 /// stderr piped and stdin piped only when the caller has something to feed it.
 ///
@@ -454,11 +634,22 @@ pub fn spawn_remote_script(
     pipe_stdin: bool,
 ) -> Result<std::process::Child, String> {
     let (candidates, args) = remote_script_invocation(runner, script)?;
+    spawn_invocation(runner, &candidates, &args, pipe_stdin)
+}
+
+/// Starts the first of `candidates` that exists with `args`, piping stdout and
+/// stderr, and stdin only when asked to.
+fn spawn_invocation(
+    runner: &ShellRunner,
+    candidates: &[String],
+    args: &[String],
+    pipe_stdin: bool,
+) -> Result<std::process::Child, String> {
     let mut last_error = None;
-    for executable in &candidates {
+    for executable in candidates {
         let mut process = Command::new(executable);
         process
-            .args(&args)
+            .args(args)
             .stdin(if pipe_stdin {
                 Stdio::piped()
             } else {
@@ -1189,9 +1380,15 @@ mod tests {
     }
 
     #[test]
-    fn local_resolution_picks_the_local_env_table() {
-        let assets = assets_with(Vec::new(), &[("local", &[("FOO", "bar")])]);
-        let runner = resolve_shell_runner(&assets, None).unwrap();
+    fn local_resolution_picks_the_workspace_env_table() {
+        let assets = assets_with(
+            Vec::new(),
+            &[
+                ("local|C:/work/app", &[("FOO", "bar")]),
+                ("local|C:/work/other", &[("FOO", "other")]),
+            ],
+        );
+        let runner = resolve_shell_runner(&assets, None, Some("C:/work/app")).unwrap();
         assert_eq!(
             runner,
             ShellRunner::Local {
@@ -1201,13 +1398,38 @@ mod tests {
     }
 
     #[test]
-    fn wsl_resolution_keys_env_by_distro_and_validates_the_name() {
-        let assets = assets_with(Vec::new(), &[("wsl:Ubuntu", &[("A", "1")])]);
+    fn machine_resolution_without_a_workspace_carries_no_variables() {
+        // A machine-wide table from before variables moved onto workspaces is
+        // never read: the variables are the workspace's, not the machine's.
+        let assets = assets_with(Vec::new(), &[("local", &[("FOO", "bar")])]);
+        assert_eq!(
+            resolve_shell_runner(&assets, None, None).unwrap(),
+            ShellRunner::default()
+        );
+        assert_eq!(
+            resolve_shell_runner(&assets, None, Some("C:/work/app")).unwrap(),
+            ShellRunner::default()
+        );
+    }
+
+    #[test]
+    fn wsl_resolution_keys_env_by_distro_and_path_and_validates_the_name() {
+        if !host_platform().has_wsl() {
+            return;
+        }
+        let assets = assets_with(
+            Vec::new(),
+            &[
+                ("wsl:Ubuntu|/home/dev/app", &[("A", "1")]),
+                ("wsl:Debian|/home/dev/app", &[("A", "2")]),
+            ],
+        );
         let runner = resolve_shell_runner(
             &assets,
             Some(&RunTarget::Wsl {
                 distro: "Ubuntu".into(),
             }),
+            Some("/home/dev/app"),
         )
         .unwrap();
         let ShellRunner::Wsl { distro, env } = runner else {
@@ -1219,7 +1441,33 @@ mod tests {
         let injection = RunTarget::Wsl {
             distro: "Ubuntu; rm -rf /".into(),
         };
-        assert!(resolve_shell_runner(&assets, Some(&injection)).is_err());
+        assert!(resolve_shell_runner(&assets, Some(&injection), None).is_err());
+    }
+
+    /// A document that travelled from a Windows machine still names WSL
+    /// distributions. On a host that has none, resolution has to say that —
+    /// otherwise the call reaches `wsl.exe` and the user is told a file is
+    /// missing when what is missing is the machine.
+    #[test]
+    fn a_wsl_target_is_refused_by_a_host_that_has_no_wsl() {
+        let assets = assets_with(Vec::new(), &[]);
+        let resolved = resolve_shell_runner(
+            &assets,
+            Some(&RunTarget::Wsl {
+                distro: "Ubuntu".into(),
+            }),
+            None,
+        );
+        if host_platform().has_wsl() {
+            assert!(matches!(resolved, Ok(ShellRunner::Wsl { .. })));
+            return;
+        }
+        let error = resolved.unwrap_err();
+        assert!(error.contains("Ubuntu"), "{error}");
+        assert!(
+            error.contains(host_platform().display_name()),
+            "the refusal has to name the machine it is about: {error}"
+        );
     }
 
     #[test]
@@ -1230,6 +1478,7 @@ mod tests {
             Some(&RunTarget::Ssh {
                 machine_id: "m1".into(),
             }),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1248,12 +1497,13 @@ mod tests {
             identity_file: "C:/keys/id_ed25519".into(),
             ..Default::default()
         };
-        let assets = assets_with(vec![machine], &[("ssh:m1", &[("K", "v")])]);
+        let assets = assets_with(vec![machine], &[("ssh:m1|~/app", &[("K", "v")])]);
         let runner = resolve_shell_runner(
             &assets,
             Some(&RunTarget::Ssh {
                 machine_id: "m1".into(),
             }),
+            Some("~/app"),
         )
         .unwrap();
         let ShellRunner::Ssh {
@@ -1361,8 +1611,9 @@ mod tests {
             ]
         );
         assert_eq!(&args[8..10], &["--", "user@devbox"]);
+        assert_eq!(args.len(), 11);
         assert_eq!(
-            args[10],
+            crate::remote_shell::tests::decode_posix_line(&args[10]),
             r"cd ~/'my work' || exit 1; exec env 'FOO=a'\''b' bash --noprofile --norc -c 'echo '\''hi'\'''"
         );
     }
@@ -1371,17 +1622,31 @@ mod tests {
     fn ssh_args_omit_port_identity_and_cd_when_unset() {
         let args = ssh_shell_args("devbox", 0, "", "", &BTreeMap::new(), "pwd");
         assert_eq!(
-            args,
-            vec![
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "--",
-                "devbox",
-                "exec bash --noprofile --norc -c 'pwd'",
-            ]
+            args[..6],
+            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "devbox"]
         );
+        assert_eq!(args.len(), 7);
+        assert_eq!(
+            crate::remote_shell::tests::decode_posix_line(&args[6]),
+            "exec bash --noprofile --norc -c 'pwd'"
+        );
+    }
+
+    /// A command whose neutral line would pass Linux's one-argument limit is
+    /// sent the way it always was, rather than refused by the remote kernel.
+    #[test]
+    fn ssh_args_fall_back_to_the_plain_script_past_the_argument_limit() {
+        let dense = "\"".repeat(40 * 1024);
+        let args = ssh_shell_args("devbox", 0, "", "", &BTreeMap::new(), &dense);
+        let sent = args.last().unwrap();
+        assert!(sent.len() <= MAX_NEUTRAL_LINE_BYTES, "{}", sent.len());
+        assert_eq!(
+            *sent,
+            format!("exec bash --noprofile --norc -c {}", sh_single_quote(&dense))
+        );
+        let ordinary = "x".repeat(40 * 1024);
+        let args = ssh_shell_args("devbox", 0, "", "", &BTreeMap::new(), &ordinary);
+        assert!(args.last().unwrap().starts_with("exec /bin/sh -c 'eval"));
     }
 
     #[test]
@@ -1527,6 +1792,16 @@ mod tests {
             Some(1),
             "    + CategoryInfo          : ObjectNotFound: (exec:String) [], CommandNotFoundException"
         ));
+        // What a Chinese Windows actually sends: the same sentence in GBK,
+        // unreadable once decoded as UTF-8, with only the quoted head intact.
+        let gbk = String::from_utf8_lossy(
+            b"'exec' \xb2\xbb\xca\xc7\xc4\xda\xb2\xbf\xbb\xf2\xcd\xe2\xb2\xbf\xc3\xfc\xc1\xee\xa3\xac\r\n",
+        );
+        assert!(answered_by_non_posix_shell(Some(1), &gbk));
+        assert!(answered_by_non_posix_shell(
+            Some(1),
+            "'exec'은(는) 내부 또는 외부 명령, 실행할 수 있는 프로그램, 또는 배치 파일이 아닙니다."
+        ));
 
         assert!(!answered_by_non_posix_shell(
             Some(1),
@@ -1537,5 +1812,24 @@ mod tests {
             "ssh: connect to host devbox port 22: Connection refused"
         ));
         assert!(!answered_by_non_posix_shell(Some(127), "bash: rg: command not found"));
+        assert!(!answered_by_non_posix_shell(
+            Some(127),
+            "bash: line 1: exec: bash: not found"
+        ));
+    }
+
+    #[test]
+    fn a_reply_that_did_not_survive_decoding_is_not_shown() {
+        assert_eq!(
+            legible_remote_reply("  cd: /srv/missing: No such file or directory\n"),
+            Some("cd: /srv/missing: No such file or directory")
+        );
+        assert_eq!(
+            legible_remote_reply("'exec' 不是内部或外部命令"),
+            Some("'exec' 不是内部或外部命令")
+        );
+        assert_eq!(legible_remote_reply(" \r\n"), None);
+        let gbk = String::from_utf8_lossy(b"'exec' \xb2\xbb\xca\xc7\r\n");
+        assert_eq!(legible_remote_reply(&gbk), None);
     }
 }

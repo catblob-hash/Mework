@@ -37,6 +37,9 @@
 .popover-menu__list { min-height: 0; max-height: min(420px, calc(100vh - 32px)); display: flex; flex-direction: column; overflow: auto; overscroll-behavior: contain; }
 .popover-menu__section { display: flex; flex-direction: column; }
 .popover-menu__label { padding: 6px 8px 3px; color: var(--faint); font-size: 10px; font-weight: 650; }
+/* A heading that carries a trailing button: the text ellipsizes and the button keeps the row's right edge. */
+.popover-menu__label--action { padding-top: 3px; padding-bottom: 1px; padding-right: 3px; display: flex; align-items: center; gap: 6px; }
+.popover-menu__label--action > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .popover-menu__divider { height: 1px; margin: 4px 2px; background: var(--border); }
 .popover-menu__row { display: flex; flex-direction: column; }
 .popover-menu__item {
@@ -45,6 +48,12 @@
 }
 .popover-menu__item:hover:not(:disabled), .popover-menu__item:focus-visible { background: var(--hover); outline: 0; }
 .popover-menu__item:disabled { color: var(--faint); cursor: not-allowed; }
+/* A row with a trailing action: the row's own button and the action are siblings, since nested buttons are invalid. */
+.popover-menu__line { display: flex; align-items: center; gap: 2px; }
+.popover-menu__line > .popover-menu__item { flex: 1; min-width: 0; }
+.popover-menu__action { flex: 0 0 auto; width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 6px; background: transparent; color: var(--faint); }
+.popover-menu__action:hover, .popover-menu__action:focus-visible { background: var(--hover); color: var(--text); outline: 0; }
+.popover-menu__panel--dense .popover-menu__action { width: 20px; height: 20px; border-radius: 5px; }
 .popover-menu__icon { flex: 0 0 auto; display: inline-flex; color: var(--muted); }
 .popover-menu__item:disabled .popover-menu__icon { color: var(--faint); }
 .popover-menu__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }

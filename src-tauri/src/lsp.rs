@@ -962,9 +962,10 @@ pub fn resolved_workspace_path(workspace: &Path, path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_platform::host_platform;
 
     fn root() -> PathBuf {
-        PathBuf::from(if cfg!(windows) {
+        PathBuf::from(if host_platform().is_windows() {
             "C:/work/project"
         } else {
             "/work/project"
@@ -972,7 +973,7 @@ mod tests {
     }
 
     fn uri(relative: &str) -> String {
-        if cfg!(windows) {
+        if host_platform().is_windows() {
             format!("file:///C:/work/project/{relative}")
         } else {
             format!("file:///work/project/{relative}")
@@ -1231,7 +1232,7 @@ mod tests {
 
     #[test]
     fn a_path_outside_the_root_keeps_its_absolute_form() {
-        let outside = if cfg!(windows) {
+        let outside = if host_platform().is_windows() {
             "file:///C:/other/place/x.rs"
         } else {
             "file:///other/place/x.rs"
@@ -1285,7 +1286,7 @@ mod tests {
         assert_eq!(pathdiff(Path::new("/srv/app/src/x.rs"), posix), "src/x.rs");
         assert_eq!(pathdiff(Path::new("/srv/App/src/x.rs"), posix), "../App/src/x.rs");
 
-        if cfg!(windows) {
+        if host_platform().is_windows() {
             let windows = Path::new("C:/work/project");
             assert!(folds_case(windows));
             assert!(is_inside(Path::new("c:/Work/project/x.rs"), windows));
@@ -1365,7 +1366,7 @@ mod tests {
         );
         // A backslash separates components only on Windows; elsewhere it is an
         // ordinary filename character and `src\a.rs` names a different file.
-        let spellings: &[&str] = if cfg!(windows) {
+        let spellings: &[&str] = if host_platform().is_windows() {
             &["src/a.rs", "./src/a.rs", "src\\a.rs"]
         } else {
             &["src/a.rs", "./src/a.rs"]

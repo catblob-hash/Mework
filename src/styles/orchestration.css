@@ -180,6 +180,11 @@ button.subagent-chip:hover { border-color: var(--border-strong); background: var
 .run-location__env-input:focus-visible { border-color: var(--border-strong); outline: 0; }
 .run-location__error { margin: 7px 0 0; color: var(--danger); font-size: 10.5px; line-height: 1.4; }
 .run-location__delete { margin-right: auto; color: var(--danger); }
+/* A machine with nothing to configure — this one, a WSL distribution — says what it is instead. */
+.machine-settings__facts { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 7px 14px; font-size: 12px; }
+.machine-settings__facts dt { color: var(--muted); }
+.machine-settings__facts dd { min-width: 0; margin: 0; color: var(--text); overflow-wrap: anywhere; }
+.machine-settings__note { margin: 14px 0 0; padding: 9px 10px; border-radius: 8px; background: var(--subtle); color: var(--muted); font-size: 10.5px; line-height: 1.45; }
 
 .remote-picker { display: flex; flex-direction: column; gap: 9px; }.remote-picker__list { height: 208px; overflow-y: auto; padding: 3px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); border-radius: 8px; }
 .remote-picker__entry { min-height: 27px; padding: 4px 7px; display: flex; align-items: center; gap: 8px; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 12px; }

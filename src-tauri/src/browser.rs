@@ -31,6 +31,7 @@ use tauri::{
 use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::host_platform::host_platform;
 use crate::{
     browser_file_preview, browser_profile_data, browser_webview_lifecycle,
     browser_window_region::set_page_stacking,
@@ -7153,7 +7154,7 @@ impl BrowserSession {
                 "preview_dialog prompt_text exceeds the {MAX_DIALOG_PROMPT_CHARS}-character limit"
             ));
         }
-        if cfg!(not(windows)) {
+        if !host_platform().is_windows() {
             // Without native holding the page intercepts its own dialogs; this arms the answer
             // for the next confirm/prompt and reads the records, the pre-WebView2 contract.
             let arm = accept.is_some() || prompt_text.is_some();
@@ -10231,7 +10232,7 @@ const BROWSER_INITIALIZATION_SCRIPT: &str = r#"
 fn browser_initialization_script() -> String {
     BROWSER_INITIALIZATION_SCRIPT.replace(
         "\"__MEWORK_NATIVE_DIALOGS__\" === \"true\"",
-        if cfg!(windows) { "true" } else { "false" },
+        if host_platform().is_windows() { "true" } else { "false" },
     )
 }
 

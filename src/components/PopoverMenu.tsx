@@ -8,6 +8,18 @@ import { usePopoverAnchor } from "./usePopoverAnchor";
 /** A copy of the open panel's measured box, by value. */
 export type PopoverPanelRect = Pick<DOMRect, "x" | "y" | "left" | "top" | "right" | "bottom" | "width" | "height">;
 
+/**
+ * A small icon button trailing a row or a section heading — a gear that opens
+ * the settings of what the row names, say. It is a sibling of the row's own
+ * button, never inside it, and choosing it closes the menu like choosing the row.
+ */
+export interface PopoverMenuAction {
+  /** Accessible name and tooltip; the button shows only its icon. */
+  label: string;
+  icon: ReactNode;
+  onSelect: () => void;
+}
+
 /** A row in the menu. */
 export interface PopoverMenuItem {
   id: string;
@@ -33,12 +45,16 @@ export interface PopoverMenuItem {
   /** Expands into a nested list. Clicking an item with children only expands it. */
   children?: PopoverMenuItem[];
   onSelect?: () => void;
+  /** A trailing button beside the row, for acting on what the row names rather than choosing it. */
+  action?: PopoverMenuAction;
 }
 
 /** A group of rows with an optional heading. Adjacent groups are separated. */
 export interface PopoverMenuSection {
   id: string;
   label?: string;
+  /** A trailing button on the heading, for acting on what the whole group shares. Needs a `label`. */
+  action?: PopoverMenuAction;
   items: PopoverMenuItem[];
 }
 
@@ -220,6 +236,21 @@ export function PopoverMenu({
     focusable[next]?.focus();
   };
 
+  const renderAction = (action: PopoverMenuAction) => (
+    <button
+      type="button"
+      className="popover-menu__action"
+      aria-label={action.label}
+      title={action.label}
+      onClick={() => {
+        close(false);
+        action.onSelect();
+      }}
+    >
+      {action.icon}
+    </button>
+  );
+
   const renderItem = (item: PopoverMenuItem, depth: number): ReactNode => {
     const expandable = Boolean(item.children?.length);
     const expanded = expandable && expandedId === item.id;
@@ -232,6 +263,44 @@ export function PopoverMenu({
           {item.children?.map((child) => renderItem(child, depth + 1))}
         </div>
     );
+    const button = (
+      <button
+        type="button"
+        role={item.checked === undefined
+          ? "menuitem"
+          : item.checkedRole === "checkbox" ? "menuitemcheckbox" : "menuitemradio"}
+        aria-checked={item.checked === undefined ? undefined : item.checked}
+        aria-haspopup={expandable ? "menu" : undefined}
+        aria-expanded={expandable ? expanded : undefined}
+        className={`popover-menu__item${depth > 0 ? " popover-menu__item--nested" : ""}`}
+        disabled={item.disabled}
+        title={item.title}
+        onClick={() => {
+          if (expandable) {
+            setExpandedId((current) => (current === item.id ? null : item.id));
+            return;
+          }
+          item.onSelect?.();
+          close(false);
+        }}
+      >
+        {item.icon && <span className="popover-menu__icon">{item.icon}</span>}
+        <span className="popover-menu__copy">
+          <strong>{item.label}</strong>
+          {item.description && <small>{item.description}</small>}
+        </span>
+        {item.hint && <span className="popover-menu__hint">{item.hint}</span>}
+        {item.checked && <Check size={14} className="popover-menu__check" />}
+        {expandable && (
+          <ChevronRight
+            size={13}
+            className={`popover-menu__chevron${
+              expanded && submenu === "inline" ? " popover-menu__chevron--open" : ""
+            }`}
+          />
+        )}
+      </button>
+    );
     return (
       <div
         className={`popover-menu__row${
@@ -239,42 +308,9 @@ export function PopoverMenu({
         }`}
         key={item.id}
       >
-        <button
-          type="button"
-          role={item.checked === undefined
-            ? "menuitem"
-            : item.checkedRole === "checkbox" ? "menuitemcheckbox" : "menuitemradio"}
-          aria-checked={item.checked === undefined ? undefined : item.checked}
-          aria-haspopup={expandable ? "menu" : undefined}
-          aria-expanded={expandable ? expanded : undefined}
-          className={`popover-menu__item${depth > 0 ? " popover-menu__item--nested" : ""}`}
-          disabled={item.disabled}
-          title={item.title}
-          onClick={() => {
-            if (expandable) {
-              setExpandedId((current) => (current === item.id ? null : item.id));
-              return;
-            }
-            item.onSelect?.();
-            close(false);
-          }}
-        >
-          {item.icon && <span className="popover-menu__icon">{item.icon}</span>}
-          <span className="popover-menu__copy">
-            <strong>{item.label}</strong>
-            {item.description && <small>{item.description}</small>}
-          </span>
-          {item.hint && <span className="popover-menu__hint">{item.hint}</span>}
-          {item.checked && <Check size={14} className="popover-menu__check" />}
-          {expandable && (
-            <ChevronRight
-              size={13}
-              className={`popover-menu__chevron${
-                expanded && submenu === "inline" ? " popover-menu__chevron--open" : ""
-              }`}
-            />
-          )}
-        </button>
+        {item.action
+          ? <div className="popover-menu__line">{button}{renderAction(item.action)}</div>
+          : button}
         {nested}
       </div>
     );
@@ -341,7 +377,14 @@ export function PopoverMenu({
             {visibleSections.map((section, index) => (
               <div className="popover-menu__section" key={section.id}>
                 {index > 0 && <div className="popover-menu__divider" />}
-                {section.label && <div className="popover-menu__label">{section.label}</div>}
+                {section.label && (section.action
+                  ? (
+                    <div className="popover-menu__label popover-menu__label--action">
+                      <span>{section.label}</span>
+                      {renderAction(section.action)}
+                    </div>
+                  )
+                  : <div className="popover-menu__label">{section.label}</div>)}
                 {section.items.map((item) => renderItem(item, 0))}
               </div>
             ))}

@@ -97,6 +97,16 @@ pub enum AppPushEvent {
     /// task row for a server the *model* started, and the page of a server the
     /// model has just stopped.
     PreviewServersChanged { stopped: Vec<String> },
+    /// The link to an SSH machine's agent changed state: connected, dropped
+    /// and reconnecting, given up, or not usable on that machine (which then
+    /// keeps the per-command transport). What the heartbeat sees, so the
+    /// renderer can say a machine is unreachable instead of looking frozen.
+    /// The backlog keeps only each machine's latest state.
+    RemoteLinkChanged {
+        host: String,
+        state: RemoteLinkState,
+        detail: Option<String>,
+    },
     /// A background task (subagent, shell, or workflow) produced a deliverable
     /// completed, failed, or round-limit result for a conversation without an
     /// active model run. The renderer starts a message-free wake run so the
@@ -210,9 +220,21 @@ impl AppPushEvent {
             AppPushEvent::DocumentWriteFailure { .. }
             | AppPushEvent::DocumentWriteRecovered
             | AppPushEvent::PreviewServersChanged { .. }
+            | AppPushEvent::RemoteLinkChanged { .. }
             | AppPushEvent::ToolContextsQuarantined { .. } => None,
         }
     }
+}
+
+/// The states of an SSH machine's agent link a person needs to tell apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteLinkState {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Lost,
+    Unavailable,
 }
 
 #[derive(Clone, Default)]
@@ -273,6 +295,12 @@ impl AppEventHub {
                 }
                 return;
             }
+        }
+        // A machine's link state only matters as its latest value.
+        if let AppPushEvent::RemoteLinkChanged { host, .. } = &event {
+            inner.backlog.retain(|queued| {
+                !matches!(queued, AppPushEvent::RemoteLinkChanged { host: queued_host, .. } if queued_host == host)
+            });
         }
         if inner.backlog.len() >= BACKLOG_LIMIT {
             let position = {

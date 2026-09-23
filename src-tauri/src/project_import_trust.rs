@@ -6,6 +6,7 @@
 //! while canonical workspace/target paths remain backend-only authorization
 //! identities.
 
+use crate::host_platform::host_platform;
 use crate::project_memory::{
     self, ProjectMemoryDiagnosticKind, ProjectMemoryOptions, ProjectMemoryReport,
 };
@@ -1254,8 +1255,13 @@ fn normal_path_segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Whether two path components name the same directory entry on this host.
+///
+/// Case is folded wherever the host's filesystem folds it — Windows and macOS
+/// both do — so a component that differs only in case is not read as a
+/// different directory from the one that was trusted.
 fn components_equal(left: Component<'_>, right: Component<'_>) -> bool {
-    if cfg!(windows) {
+    if host_platform().paths_are_case_insensitive() {
         left.as_os_str()
             .to_string_lossy()
             .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
@@ -1370,8 +1376,14 @@ fn canonical_existing_directory(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Whether `path` is `root` or lies under it.
+///
+/// On a host whose filesystem folds case the comparison folds it too, and
+/// compares the normalized keys rather than components: a path that the
+/// filesystem would open inside `root` must not read as outside it here. The
+/// separator test keeps `…/rootExtra` from passing as a child of `…/root`.
 fn path_is_within(path: &Path, root: &Path) -> bool {
-    if cfg!(windows) {
+    if host_platform().paths_are_case_insensitive() {
         let path = path_sort_key(path);
         let root = path_sort_key(root);
         path == root
@@ -1384,7 +1396,7 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
-    if cfg!(windows) {
+    if host_platform().paths_are_case_insensitive() {
         path_sort_key(left) == path_sort_key(right)
     } else {
         left == right
@@ -1392,12 +1404,7 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 }
 
 fn path_sort_key(path: &Path) -> String {
-    let value = path.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        value.to_lowercase()
-    } else {
-        value
-    }
+    host_platform().path_key(&path.to_string_lossy())
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
+use crate::host_platform::host_platform;
 use crate::model::{RunModelRequest, ToolDescriptor, ToolParameterType};
 use crate::prompt_profile::PromptProfile;
 
@@ -50,7 +51,7 @@ pub(crate) fn enabled_tools(request: &RunModelRequest) -> Vec<&ToolDescriptor> {
 /// is on the host machine and the host's own platform answers.
 fn runs_powershell(workspaces: &crate::workspace_set::WorkspaceSet) -> bool {
     if workspaces.is_empty() {
-        return cfg!(windows);
+        return host_platform().runs_powershell();
     }
     workspaces.runs_powershell()
 }
@@ -268,10 +269,13 @@ mod tests {
         // A host workspace brings it back exactly where PowerShell exists.
         assert_eq!(
             runs_powershell(&WorkspaceSet::local_root("C:/work/app")),
-            cfg!(windows)
+            host_platform().runs_powershell()
         );
         // A run that resolved no set predates machine-bound workspaces, so the
         // host's own platform answers rather than a silent withdrawal.
-        assert_eq!(runs_powershell(&WorkspaceSet::default()), cfg!(windows));
+        assert_eq!(
+            runs_powershell(&WorkspaceSet::default()),
+            host_platform().runs_powershell()
+        );
     }
 }

@@ -28,18 +28,21 @@
 //! credential for this family: every authentication channel that could ride in
 //! from the sidecar's environment is stripped before the CLI is spawned, and
 //! `apiKey` / `baseURL` on the request are not read at all. This module never
-//! reads, copies or moves `~/.claude/.credentials.json`; when a session resumes
-//! from a host-synthesized transcript, it is the SDK's own resume path that
-//! materializes a temporary `CLAUDE_CONFIG_DIR` and carries the CLI's credentials
-//! into it. The identity line and billing header the CLI prepends to a custom
-//! system prompt are the SDK's; Mework neither writes nor alters them.
+//! reads, copies or moves `~/.claude/.credentials.json`. When a session resumes
+//! from a host-synthesized transcript, the SDK's resume path materializes a
+//! temporary `CLAUDE_CONFIG_DIR` (and drops a refresh-token-less copy of the
+//! credentials into it); `CLAUDE_SECURESTORAGE_CONFIG_DIR` keeps the CLI reading
+//! and refreshing the user's own login instead of that copy. The identity line
+//! and billing header the CLI prepends to a custom system prompt are the SDK's;
+//! Mework neither writes nor alters them.
 //!
 //! Filesystem and environment. Unlike the AI SDK families this module checks that
 //! the host-resolved executable exists and derives the CLI's environment from the
 //! sidecar's own environment with the credential variables removed, plus the
-//! profile-location variables the host sends in `agent.env`. `CLAUDE_CONFIG_DIR`
-//! is never set here: the login lives in the CLI's default `~/.claude`, and on
-//! macOS the SDK only falls through to the Keychain while that variable is absent.
+//! profile-location variables the host sends in `agent.env` (`USER` among them:
+//! it names the macOS Keychain account). `CLAUDE_CONFIG_DIR` is never set here:
+//! the login lives in the CLI's default `~/.claude`, and on macOS the SDK only
+//! falls through to the Keychain while that variable is absent.
 //! The one upstream override this family accepts is a local test stub — an
 //! `ANTHROPIC_BASE_URL` in `agent.env` addressing a loopback host, which alone
 //! also lets a key from `agent.env` through; a remote one fails the request rather
@@ -669,7 +672,16 @@ function defaultProfileEnv(): Record<string, string> {
       LOCALAPPDATA: path.win32.join(home, "AppData", "Local"),
     };
   }
-  return { HOME: home };
+  // The CLI names its macOS Keychain account after `$USER`; without it the
+  // bundled build looks up a different account, and the sidecar's cleared
+  // environment would hide a signed-in user's login.
+  const env: Record<string, string> = { HOME: home };
+  try {
+    env.USER = os.userInfo().username;
+  } catch {
+    // No passwd entry for this uid; the host's `agent.env` may still supply it.
+  }
+  return env;
 }
 
 /** Behaviour switches: everything Claude Code would do on its own is off. */
@@ -785,11 +797,26 @@ function cliEnv(agent: AgentSession, modelId: string, knobs: CliEnvKnobs = {}) {
   // credentials would override it silently, and the SDK only falls back to the
   // stored login when no credential is forced through the environment.
   for (const name of CREDENTIAL_ENV) delete env[name];
+  // A Claude Code session the sidecar was started from (a developer's shell,
+  // the selfcheck) exports its own entrypoint. Inherited, it relabels this CLI
+  // and makes it prefer the stored login over a stub key in `agent.env`; absent,
+  // the SDK stamps its own `sdk-ts`, as it does for the host's cleared
+  // environment.
+  delete env.CLAUDE_CODE_ENTRYPOINT;
   Object.assign(env, defaultProfileEnv(), CLI_CONTROL_ENV);
   env.CLAUDE_CODE_USE_BEDROCK = "0";
   env.CLAUDE_CODE_USE_VERTEX = "0";
   env.CLAUDE_CODE_USE_FOUNDRY = "0";
   Object.assign(env, agentEnvOverrides(agent), pinnedModelEnv(modelId));
+  // Where the CLI keeps its login — the Keychain entry name, the plaintext
+  // `.credentials.json`, and the lock that serializes token refreshes — follows
+  // `CLAUDE_CONFIG_DIR` unless this names it. A resumed session runs under the
+  // SDK's temporary `CLAUDE_CONFIG_DIR`, where the only credential is a copy
+  // with its refresh token removed: the session fails once the access token
+  // expires. Pinning the storage to the user's own directory (empty: the
+  // default `~/.claude`) keeps every session on the real login. The SDK already
+  // does this for a resume on Windows; this makes it hold everywhere.
+  env.CLAUDE_SECURESTORAGE_CONFIG_DIR = env.CLAUDE_CONFIG_DIR ?? "";
   const { maxOutputTokens } = knobs;
   if (maxOutputTokens !== undefined && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0) {
     env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(Math.floor(maxOutputTokens));

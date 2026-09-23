@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::console_text::ConsoleTextDecoder;
 use crate::tool_executor::{kill_process_tree_or_child, ShellJob};
+use crate::host_platform::host_platform;
 
 /// Dev servers one worktree may run at once.
 pub const MAX_SERVERS_PER_WORKTREE: usize = 5;
@@ -498,7 +499,7 @@ pub fn external_port_conflict(
 
 /// The kernel refuses the bind outright, which no amount of stopping things fixes.
 pub fn os_reserved_port_message(port: u16) -> String {
-    let reason = if cfg!(windows) {
+    let reason = if host_platform().is_windows() {
         "a Windows excluded port range, or a privileged port"
     } else {
         "a privileged port below 1024"
@@ -782,7 +783,7 @@ pub fn preview_start_failure(
                              permissions \u{2014} the command may not be executable."
                         )
                     } else {
-                        let detail = if cfg!(target_os = "macos") && code == "EPERM" {
+                        let detail = if host_platform().is_macos() && code == "EPERM" {
                             " macOS privacy protection likely blocked access to this folder. \
                              Grant access in System Settings > Privacy & Security > Files and \
                              Folders, or move the project outside Documents/Desktop/Downloads."
@@ -901,7 +902,7 @@ pub fn resolve_preview_command(
         command,
         args,
         path_directories,
-        cfg!(windows),
+        host_platform().is_windows(),
         &system_root(),
         &|path| {
             std::fs::metadata(path)
@@ -2448,7 +2449,7 @@ mod tests {
         let message = os_reserved_port_message(80);
         assert!(message.starts_with("Port 80 is reserved by the OS ("));
         assert!(message.contains("set \"autoPort\": true to use an OS-assigned port."));
-        if cfg!(windows) {
+        if host_platform().is_windows() {
             assert!(message.contains("a Windows excluded port range, or a privileged port"));
         } else {
             assert!(message.contains("a privileged port below 1024"));

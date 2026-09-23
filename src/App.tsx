@@ -17,6 +17,7 @@ import {
   RotateCcw,
   ShieldCheck,
   Server,
+  Settings,
   SlidersHorizontal,
   Square,
   SquareTerminal,
@@ -56,6 +57,7 @@ import {
 import { RemoteDirectoryPicker } from "./components/RemoteDirectoryPicker";
 import { ProjectSelector, TerminalShellButton, terminalShellMenuItems, WorkspaceMemberSelector } from "./components/ProjectChips";
 import { ProjectDialog } from "./components/ProjectDialog";
+import { MachineSettingsDialog, WorkspaceEnvironmentDialog } from "./components/MachineDialogs";
 import { ForkRequestTray } from "./components/ForkRequestTray";
 import { detachAbsentParents, reparentChildren } from "./lib/conversationTree";
 import { GitStatusCard } from "./components/GitStatusCard";
@@ -107,6 +109,7 @@ import {
   conversationWorkspaces,
   hostIsWindows,
   isReservedWorkspace,
+  machineUsage,
   projectWorkspaces,
   terminalShellLabel,
   terminalShellsFor,
@@ -116,6 +119,7 @@ import {
   toolsForHost,
   withWorkspaceArgument,
   workspaceDirectoryLabel,
+  workspaceEnvKey,
   workspaceLocationTitle
 } from "./lib/workspaces";
 import {
@@ -3830,6 +3834,15 @@ function App() {
   const [remoteWorkspacePicker, setRemoteWorkspacePicker] = useState<
     { machine: RunTargetType; name: string; purpose: "attach" } | null
   >(null);
+  /** The machine whose settings a gear opened; `{ machine: null }` is this one. */
+  const [machineSettings, setMachineSettings] = useState<{ machine: RunTargetType | null } | null>(null);
+  /**
+   * The workspace whose environment variables a gear opened: its machine and the directory
+   * it is registered at — never a worktree standing in for it — with its display name.
+   */
+  const [workspaceEnvEditor, setWorkspaceEnvEditor] = useState<
+    { machine: RunTargetType | null; path: string; name: string } | null
+  >(null);
 
   const loadMachineMenu = useCallback(() => {
     void listWslDistros().then(setMachineMenuDistros).catch(() => setMachineMenuDistros([]));
@@ -3893,7 +3906,13 @@ function App() {
     )));
   }, [setConversationAttachedWorkspaces]);
 
-  const saveRunEnvironmentVars = useCallback((envKey: string, vars: Record<string, string>) => {
+  /** Sets one workspace's environment variables; an empty table removes its entry. */
+  const saveWorkspaceEnvVars = useCallback((
+    machine: RunTargetType | null,
+    path: string,
+    vars: Record<string, string>
+  ) => {
+    const envKey = workspaceEnvKey(machine, path);
     documentStore.update((current) => {
       if (!current) return current;
       const envVars = { ...current.globalSettings.executionEnvironments.envVars };
@@ -3926,6 +3945,31 @@ function App() {
             sshMachines: exists
               ? machines.map((item) => (item.id === machine.id ? machine : item))
               : [...machines, machine]
+          }
+        }
+      };
+    });
+  }, [documentStore]);
+
+  /**
+   * Removes an SSH machine from the catalog, and the variables of every workspace on it with
+   * it: a machine registered again gets a new id, so those tables could never be reached.
+   * Workspaces on it stay where they are and read as a deleted machine until chosen again.
+   */
+  const deleteSshMachine = useCallback((machineId: string) => {
+    const prefix = `${runEnvKey({ kind: "ssh", machineId })}|`;
+    documentStore.update((current) => {
+      if (!current) return current;
+      const environments = current.globalSettings.executionEnvironments;
+      return {
+        ...current,
+        globalSettings: {
+          ...current.globalSettings,
+          executionEnvironments: {
+            sshMachines: environments.sshMachines.filter((machine) => machine.id !== machineId),
+            envVars: Object.fromEntries(
+              Object.entries(environments.envVars).filter(([key]) => !key.startsWith(prefix))
+            )
           }
         }
       };
@@ -7281,15 +7325,30 @@ function App() {
                         }}
                       />
                     )}
-                    {activeProjectWorkspaces.length > 1 && (
+                    {/* Shown for a single workspace too: besides picking what Git shows, its
+                        menu is where a workspace's variables and its machine's settings open. */}
+                    {activeProjectWorkspaces.length > 0 && (
                       <WorkspaceMemberSelector
                         workspaces={activeProjectWorkspaces}
                         selected={activeWorkspaceMember}
                         sshMachines={document.globalSettings.executionEnvironments.sshMachines}
+                        showIndex={activeProjectWorkspaces.length + activeConversation.attachedWorkspaces.length > 1}
                         onSelect={(member) => setSelectedWorkspaceMembers((current) => ({
                           ...current,
                           [activeConversation.id]: member
                         }))}
+                        onConfigureMachine={(machine) => setMachineSettings({ machine })}
+                        onConfigureWorkspace={(member) => {
+                          // The registered directory, not the worktree standing in for workspace 1:
+                          // the variables belong to the directory the worktree was checked out from.
+                          const registered = projectWorkspaces(activeWorkspace)[member - 1];
+                          if (!registered) return;
+                          setWorkspaceEnvEditor({
+                            machine: registered.machine ?? null,
+                            path: registered.path,
+                            name: workspaceDirectoryLabel(registered.path)
+                          });
+                        }}
                       />
                     )}
                     {activeGitSnapshot && (
@@ -7381,6 +7440,23 @@ function App() {
                         <WorkspaceMachineIcon machine={workspace.machine} />
                         <span className="composer-chip__index" aria-hidden="true">{position + activeProjectWorkspaceCount + 1}</span>
                         <span className="composer-chip__label">{directoryLabel(workspace.path)}</span>
+                        <button
+                          type="button"
+                          className="composer-chip__remove"
+                          aria-label={t("{name} 的环境变量", "Environment variables for {name}", {
+                            name: directoryLabel(workspace.path)
+                          })}
+                          title={t("{name} 的环境变量", "Environment variables for {name}", {
+                            name: directoryLabel(workspace.path)
+                          })}
+                          onClick={() => setWorkspaceEnvEditor({
+                            machine: workspace.machine ?? null,
+                            path: workspace.path,
+                            name: directoryLabel(workspace.path)
+                          })}
+                        >
+                          <Settings size={11} />
+                        </button>
                         <button
                           type="button"
                           className="composer-chip__remove"
@@ -7927,14 +8003,12 @@ function App() {
         {workspaceDialogOpen && <ProjectDialog
           mode="create"
           sshMachines={document.globalSettings.executionEnvironments.sshMachines}
-          envVars={document.globalSettings.executionEnvironments.envVars}
           showWsl={hostIsWindows(platform)}
           nativePicker={hasNativeWorkspacePicker()}
           onPickLocalDirectory={pickWorkspaceDirectory}
-          onSaveSshMachine={(machine, vars) => {
-            saveSshMachine(machine);
-            saveRunEnvironmentVars(`ssh:${machine.id}`, vars);
-          }}
+          onSaveSshMachine={saveSshMachine}
+          onDeleteSshMachine={deleteSshMachine}
+          machineUsage={(machine) => machineUsage(document.workspaces, machine)}
           onClose={() => { setWorkspaceDialogOpen(false); setAssignWorkspaceAfterAdd(false); }}
           onSubmit={(name, workspaces) => void addWorkspace(name, workspaces)}
         />}
@@ -7944,16 +8018,35 @@ function App() {
           initialName={editedProject.name}
           initialWorkspaces={projectWorkspaces(editedProject)}
           sshMachines={document.globalSettings.executionEnvironments.sshMachines}
-          envVars={document.globalSettings.executionEnvironments.envVars}
           showWsl={hostIsWindows(platform)}
           nativePicker={hasNativeWorkspacePicker()}
           onPickLocalDirectory={pickWorkspaceDirectory}
-          onSaveSshMachine={(machine, vars) => {
-            saveSshMachine(machine);
-            saveRunEnvironmentVars(`ssh:${machine.id}`, vars);
-          }}
+          onSaveSshMachine={saveSshMachine}
+          onDeleteSshMachine={deleteSshMachine}
+          machineUsage={(machine) => machineUsage(document.workspaces, machine)}
           onClose={() => setProjectEditor(null)}
           onSubmit={(name, workspaces) => updateProject(editedProject.id, name, workspaces)}
+        />}
+
+        {machineSettings && <MachineSettingsDialog
+          machine={machineSettings.machine}
+          sshMachines={document.globalSettings.executionEnvironments.sshMachines}
+          usage={machineUsage(document.workspaces, machineSettings.machine)}
+          onSaveSshMachine={saveSshMachine}
+          onDeleteSshMachine={deleteSshMachine}
+          onClose={() => setMachineSettings(null)}
+        />}
+
+        {workspaceEnvEditor && <WorkspaceEnvironmentDialog
+          title={t("{name} 的环境变量", "Environment variables for {name}", { name: workspaceEnvEditor.name })}
+          vars={document.globalSettings.executionEnvironments.envVars[
+            workspaceEnvKey(workspaceEnvEditor.machine, workspaceEnvEditor.path)
+          ] ?? {}}
+          onSave={(vars) => {
+            saveWorkspaceEnvVars(workspaceEnvEditor.machine, workspaceEnvEditor.path, vars);
+            setWorkspaceEnvEditor(null);
+          }}
+          onClose={() => setWorkspaceEnvEditor(null)}
         />}
 
         {remoteWorkspacePicker && <RemoteDirectoryPicker

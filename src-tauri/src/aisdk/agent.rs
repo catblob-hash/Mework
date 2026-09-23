@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wait_timeout::ChildExt as _;
 
+use crate::host_platform::host_platform;
 use crate::model::{ApiProvider, ProviderFamily};
 
 use super::protocol::AgentSession;
@@ -42,6 +43,10 @@ const CLAUDE_AGENT_ENV: &[&str] = &[
     "LOCALAPPDATA",
     "ProgramData",
     "HOME",
+    // macOS keeps the login in the Keychain under the account `$USER`. Without
+    // the variable the bundled CLI looks up a different account, and a
+    // signed-in user reads as "Not logged in".
+    "USER",
     "XDG_CONFIG_HOME",
     // Honors a user who relocated their Claude Code configuration.
     "CLAUDE_CONFIG_DIR",
@@ -51,12 +56,8 @@ const CLAUDE_AGENT_ENV: &[&str] = &[
 /// staged artifact `build.rs` produces. Only the native build is ever named: the
 /// npm `claude.cmd`/`cli.js` shims need a Node runtime the single-file sidecar
 /// cannot provide.
-fn executable_name() -> &'static str {
-    if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    }
+fn executable_name() -> String {
+    format!("claude{}", host_platform().executable_suffix())
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -144,13 +145,7 @@ fn source_tree_candidates() -> Vec<PathBuf> {
     let modules = repo.join("aisdk-service").join("node_modules");
     // Mirrors `build.rs::claude_code_platform_package`, which is the authority on
     // the naming; a mismatch here only costs the fallback, not the release.
-    let platform = if cfg!(windows) {
-        "win32"
-    } else if cfg!(target_os = "macos") {
-        "darwin"
-    } else {
-        "linux"
-    };
+    let platform = host_platform().npm_platform_tag();
     let arch = if cfg!(target_arch = "aarch64") {
         "arm64"
     } else {
@@ -167,7 +162,7 @@ fn source_tree_candidates() -> Vec<PathBuf> {
     candidates.push(manifest.join("binaries").join(format!(
         "claude-{}{}",
         env!("MEWORK_TARGET_TRIPLE"),
-        if cfg!(windows) { ".exe" } else { "" }
+        host_platform().executable_suffix()
     )));
     candidates
 }
@@ -730,7 +725,7 @@ mod tests {
             first.contains("aisdk-service/node_modules/@anthropic-ai/claude-agent-sdk-"),
             "{first}"
         );
-        assert!(first.ends_with(executable_name()), "{first}");
+        assert!(first.ends_with(&executable_name()), "{first}");
         let staged = candidates[1].to_string_lossy().replace('\\', "/");
         assert!(
             staged.contains(&format!("binaries/claude-{}", env!("MEWORK_TARGET_TRIPLE"))),
@@ -801,12 +796,24 @@ mod tests {
         if std::env::var("PATH").is_ok() {
             assert!(env.contains_key("PATH"));
         }
-        if cfg!(windows) {
+        if host_platform().is_windows() {
             assert!(
                 env.contains_key("SYSTEMROOT") || env.contains_key("SystemRoot"),
                 "Windows 上缺 SystemRoot 会让 CLI 连 socket 都开不了"
             );
         }
+    }
+
+    /// The Keychain account the CLI reads its macOS login from is `$USER`, so
+    /// both the probe and every run must carry it; a probe without it reports a
+    /// signed-in user as signed out.
+    #[test]
+    fn the_keychain_account_reaches_the_probe_and_the_run() {
+        let Ok(user) = std::env::var("USER") else {
+            return;
+        };
+        assert_eq!(probe_env().get("USER"), Some(&user));
+        assert_eq!(profile_env().get("USER"), Some(&user));
     }
 
     /// The login runs in the user's own environment (a terminal needs far more

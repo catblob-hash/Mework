@@ -3,7 +3,8 @@ import { createId } from "./id";
 import {
   createTemporaryWorkspace,
   runEnvKey,
-  TEMPORARY_WORKSPACE_ID
+  TEMPORARY_WORKSPACE_ID,
+  workspaceEnvKey
 } from "./workspaces";
 import { createSeedDocument } from "../seed";
 import {
@@ -74,6 +75,7 @@ import type {
   AttestEditedToolContextResponse,
   ToolExecutionRequest,
   WslDistro,
+  Workspace,
   ToolExecutionResponse,
   ToolApprovalGrant,
   ToolPromptDecision,
@@ -402,6 +404,47 @@ function normalizeProjectMembers(value: unknown, primary: AttachedWorkspace): At
     .slice(0, MAX_PROJECT_WORKSPACES - 1);
 }
 
+/** Mirrors the host's bound on environment-variable tables. */
+const MAX_ENV_TABLES = 1024;
+
+/** Whether `key` is a machine's `runEnvKey`: `local`, `wsl:<distro>`, or `ssh:<id>`. */
+function isMachineEnvKey(key: string): boolean {
+  return key === "local"
+    || (key.startsWith("wsl:") && WSL_DISTRO_PATTERN.test(key.slice(4)))
+    || (key.startsWith("ssh:") && key.slice(4).trim().length > 0 && key.slice(4).length <= 128);
+}
+
+/**
+ * Moves tables keyed by a bare machine — written when variables belonged to the
+ * machine — onto every workspace on that machine that has no table of its own,
+ * so commands keep the variables they ran with. The machine keys are dropped:
+ * the host never reads them.
+ */
+function spreadMachineEnvVars(
+  envVars: Record<string, Record<string, string>>,
+  workspaces: readonly Workspace[]
+): Record<string, Record<string, string>> {
+  const machineKeys = Object.keys(envVars).filter((key) => !key.includes("|"));
+  if (!machineKeys.length) return envVars;
+  const spread: Record<string, Record<string, string>> = {};
+  for (const [key, table] of Object.entries(envVars)) {
+    if (key.includes("|")) spread[key] = table;
+  }
+  const directories: AttachedWorkspace[] = workspaces.flatMap((project) => [
+    ...(project.kind === "directory" && project.path ? [{ machine: project.machine, path: project.path }] : []),
+    ...(project.additionalWorkspaces ?? []),
+    ...project.conversations.flatMap((conversation) => conversation.attachedWorkspaces)
+  ]);
+  for (const directory of directories) {
+    const table = envVars[runEnvKey(directory.machine)];
+    const key = workspaceEnvKey(directory.machine, directory.path);
+    if (!table || !Object.keys(table).length || key in spread) continue;
+    if (Object.keys(spread).length >= MAX_ENV_TABLES) break;
+    spread[key] = { ...table };
+  }
+  return spread;
+}
+
 /** Host validation of execution environments is authoritative; discard malformed entries here. */
 function normalizeExecutionEnvironments(
   value: unknown,
@@ -454,12 +497,16 @@ function normalizeExecutionEnvironments(
     .slice(0, 64);
   const envVars: Record<string, Record<string, string>> = {};
   const tables = record(input.envVars) ?? {};
-  for (const [key, tableValue] of Object.entries(tables).slice(0, 256)) {
-    // Keys must name one of the three environments. A dangling `ssh:<id>` remains
-    // valid so a deleted machine does not prevent document persistence.
-    const validKey = key === "local"
-      || (key.startsWith("wsl:") && WSL_DISTRO_PATTERN.test(key.slice(4)))
-      || (key.startsWith("ssh:") && key.slice(4).trim().length > 0 && key.slice(4).length <= 128);
+  for (const [key, tableValue] of Object.entries(tables).slice(0, MAX_ENV_TABLES)) {
+    // Keys name a workspace — `<machine key>|<path>` — or, from before variables
+    // moved onto workspaces, a bare machine; `normalizeDocument` spreads those
+    // over the machine's workspaces. A dangling `ssh:<id>` remains valid so a
+    // deleted machine does not prevent document persistence.
+    const separator = key.indexOf("|");
+    const machineKey = separator < 0 ? key : key.slice(0, separator);
+    const path = separator < 0 ? null : key.slice(separator + 1);
+    const validKey = isMachineEnvKey(machineKey)
+      && (path === null || (path.trim().length > 0 && path.length <= 4096 && !controlChars.test(path)));
     if (!validKey) continue;
     const table = record(tableValue);
     if (!table) continue;
@@ -1524,9 +1571,16 @@ export function normalizeDocument(value: unknown): AppDocument {
     ...regularWorkspaces,
     temporaryWorkspace ?? createTemporaryWorkspace()
   ];
+  const executionEnvironments = globalSettings.executionEnvironments;
   return {
     schemaVersion: fallback.schemaVersion,
-    globalSettings,
+    globalSettings: {
+      ...globalSettings,
+      executionEnvironments: {
+        ...executionEnvironments,
+        envVars: spreadMachineEnvVars(executionEnvironments.envVars, workspaces)
+      }
+    },
     workspaces,
     tools,
     capabilities: record(input.capabilities)

@@ -54,6 +54,15 @@ export type AppPushEvent =
   // purpose — a server that exits by itself is gone from the list but is not in here, because a
   // stop takes down the page it was serving and a crash leaves it there to be looked at.
   | { type: "previewServersChanged"; stopped: string[] }
+  // The link to an SSH machine's agent changed state. The heartbeat is what
+  // notices a dead network; `reconnecting` and `lost` carry the reason, and
+  // `unavailable` means the machine keeps the per-command SSH transport.
+  | {
+      type: "remoteLinkChanged";
+      host: string;
+      state: "connecting" | "connected" | "reconnecting" | "lost" | "unavailable";
+      detail: string | null;
+    }
   // A terminal background-task result without an active model run requires a message-less wake run to fold it into the first round boundary. Every terminal result qualifies, a task the user closed included.
   | { type: "taskSettled"; conversationId: string }
   // Background tasks can require dangerous-tool approval when no unsettled run can carry its card. Deliver the prompt through this push event and resolve it with `resolveToolPrompt`.

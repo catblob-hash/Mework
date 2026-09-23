@@ -16,6 +16,7 @@ use similar::TextDiff;
 use wait_timeout::ChildExt;
 use walkdir::WalkDir;
 
+use crate::host_platform::host_platform;
 use crate::{
     cancel::CancelSignal,
     file_read_state::{self, FileReadRecord, FileReadRegistry, ScopeRef},
@@ -1955,8 +1956,113 @@ pub(crate) fn shell_run_in_background_requested(input: &JsonObject) -> bool {
 /// A spawned shell process together with the job object that can kill its
 /// whole tree. Handed to the background worker thread; `ShellJob` is `Send`.
 pub(crate) struct SpawnedShell {
-    pub child: std::process::Child,
+    pub child: ShellChild,
     pub job: ShellJob,
+}
+
+/// The process a shell call runs: a child of this host, or a process the
+/// agent runs for it on an SSH machine ([`crate::remote_link`]).
+///
+/// Both answer the same questions the call asks — its output pipes, whether it
+/// has ended, how to end it — so the synchronous leg, the hand-off to the task
+/// surface at the deadline and the background leg treat them alike. A remote
+/// process whose link drops is simply still running as far as this side
+/// knows; its output resumes when the link does.
+pub(crate) enum ShellChild {
+    Local(std::process::Child),
+    Remote {
+        child: crate::remote_link::AgentChild,
+        /// Set once a kill was requested, which bounds how long a later wait
+        /// may take to hear it confirmed.
+        killed: bool,
+    },
+}
+
+/// How long a remote kill is waited on before the call moves on. The agent
+/// carries out a kill that reaches it late, and reclaims the process by itself
+/// if the host never comes back; the call does not need to wait for either.
+const REMOTE_KILL_CONFIRMATION: Duration = Duration::from_secs(5);
+
+impl ShellChild {
+    pub(crate) fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        match self {
+            Self::Local(child) => child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+            Self::Remote { child, .. } => child
+                .process
+                .take_stdout()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        }
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<Box<dyn Read + Send>> {
+        match self {
+            Self::Local(child) => child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+            Self::Remote { child, .. } => child
+                .process
+                .take_stderr()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        }
+    }
+
+    /// The process's input. A remote process's writer queues what it is
+    /// given and delivers it in order across reconnects.
+    pub(crate) fn take_stdin(&mut self) -> Option<Box<dyn std::io::Write + Send>> {
+        match self {
+            Self::Local(child) => child
+                .stdin
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn std::io::Write + Send>),
+            Self::Remote { child, .. } => {
+                Some(Box::new(child.process.stdin()) as Box<dyn std::io::Write + Send>)
+            }
+        }
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Local(child) => child.try_wait(),
+            Self::Remote { .. } => self.wait_timeout(Duration::ZERO),
+        }
+    }
+
+    pub(crate) fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Local(child) => ChildExt::wait_timeout(child, timeout),
+            Self::Remote { child, .. } => Ok(child
+                .process
+                .wait_timeout(timeout)?
+                .map(|exit| crate::remote_link::exit_status(&exit))),
+        }
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::Local(child) => child.wait(),
+            Self::Remote { child, killed } => {
+                if !*killed {
+                    return child
+                        .process
+                        .wait()
+                        .map(|exit| crate::remote_link::exit_status(&exit));
+                }
+                match child.process.wait_timeout(REMOTE_KILL_CONFIRMATION) {
+                    Ok(Some(exit)) => Ok(crate::remote_link::exit_status(&exit)),
+                    // Not confirmed yet — the link is down, or the tree takes
+                    // a moment to die. Report it as killed; the agent finishes
+                    // the job either way.
+                    Ok(None) | Err(_) => Ok(crate::remote_link::exit_status(
+                        &remote_agent::protocol::ExitInfo {
+                            code: None,
+                            signal: Some(9),
+                            reason: remote_agent::protocol::ExitReason::Signalled,
+                            ends: Default::default(),
+                        },
+                    )),
+                }
+            }
+        }
+    }
+
 }
 
 /// Claude Code's PowerShell prologue, byte for byte.
@@ -2206,8 +2312,8 @@ pub(crate) fn shell_call_context(
     };
     // Git Bash inherits neither TEMP nor TMP from MSYS, and native children
     // started from it expect both.
-    let temp_dir =
-        (local && cfg!(windows) && matches!(kind, ShellKind::Bash)).then(|| std::env::temp_dir());
+    let temp_dir = (local && host_platform().is_windows() && matches!(kind, ShellKind::Bash))
+        .then(|| std::env::temp_dir());
     ShellCallContext {
         snapshot,
         cwd_file,
@@ -2245,7 +2351,8 @@ struct ShellLaunchPlan {
 ///   /usr/bin/env K=V… bash --noprofile --norc -c <command>` so the command
 ///   reaches bash intact without an intermediate shell.
 /// - SSH: invoke OpenSSH with `BatchMode=yes`; every host-composed fragment is
-///   POSIX-single-quoted.
+///   POSIX-single-quoted. Only for machines the agent does not serve:
+///   [`spawn_shell_process`] hands the others to [`crate::remote_link`] first.
 ///
 /// Only the local legs carry a session. Claude Code has no remote runner, so
 /// there is nothing to copy for WSL and SSH: they keep the plain invocation,
@@ -2266,7 +2373,7 @@ fn shell_launch_plan(
     let env = &runner.normalized_env()?;
     match runner {
         ShellRunner::Local { .. } => {
-            if matches!(kind, ShellKind::PowerShell) && !cfg!(windows) {
+            if matches!(kind, ShellKind::PowerShell) && !host_platform().is_windows() {
                 return Err(format!(
                     "This workspace is on {}, where the powershell tool is unavailable; use the bash tool instead",
                     crate::environment_prompt::host_os_name()
@@ -2371,7 +2478,10 @@ fn shell_launch_plan(
 ///
 /// `runner` is the trusted environment resolved by the host. Local calls inject
 /// its variables; WSL and SSH package the command into one wrapper invocation.
-/// Killing the local wrapper process tree does not guarantee SSH descendants exit.
+/// Killing the local wrapper process tree does not guarantee SSH descendants
+/// exit — which is why an SSH machine the agent serves runs the command
+/// through the agent instead, where a kill reaches the whole process group on
+/// the machine and a dropped connection does not end the command.
 ///
 /// `start_dir` is where this call begins. It is the workspace on the first call
 /// of a conversation and the directory the previous call reported afterwards,
@@ -2394,6 +2504,32 @@ pub(crate) fn spawn_shell_process(
     } else {
         anchor.clone()
     };
+    // An SSH machine the agent serves runs the command itself: the same bash
+    // invocation, started in the workspace by the agent rather than by a login
+    // shell, and not tied to any SSH connection's lifetime.
+    if matches!(runner, crate::run_environment::ShellRunner::Ssh { .. })
+        && matches!(kind, ShellKind::Bash)
+    {
+        let argv = ["bash", "--noprofile", "--norc", "-c", command]
+            .iter()
+            .map(|part| (*part).to_owned())
+            .collect();
+        if let Some(spawned) = crate::remote_link::spawn(
+            runner,
+            argv,
+            Some(workspace_root),
+            remote_agent::protocol::StdinMode::Null,
+            "bash",
+        ) {
+            return spawned.map(|child| SpawnedShell {
+                child: ShellChild::Remote {
+                    child,
+                    killed: false,
+                },
+                job: ShellJob::create(),
+            });
+        }
+    }
     let plan = shell_launch_plan(workspace_root, kind, command, runner, session)?;
 
     let mut last_not_found = None;
@@ -2427,7 +2563,7 @@ pub(crate) fn spawn_shell_process(
             let proxy = crate::child_environment::normalized_proxy_bypass(
                 &inherited,
                 &configured,
-                cfg!(windows),
+                host_platform().is_windows(),
             )?;
             for name in inherited.keys() {
                 process.env_remove(name);
@@ -2503,7 +2639,10 @@ pub(crate) fn spawn_shell_process(
                 // the whole tree at once instead of racing its parent links.
                 let job = ShellJob::create();
                 job.assign(&child);
-                return Ok(SpawnedShell { child, job });
+                return Ok(SpawnedShell {
+                    child: ShellChild::Local(child),
+                    job,
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 last_not_found = Some(error);
@@ -2563,7 +2702,7 @@ const MAX_CWD_FILE: usize = 64 * 1024;
 /// Only the `/<letter>/` shape is rewritten. A genuine POSIX path on a POSIX
 /// host is absolute already and passes through untouched.
 fn windows_native_path(reported: &str) -> String {
-    if !cfg!(windows) {
+    if !host_platform().is_windows() {
         return reported.to_owned();
     }
     let bytes = reported.as_bytes();
@@ -2813,7 +2952,7 @@ fn run_shell(
         {
             Ok(guard) => guard,
             Err(error) => {
-                kill_process_tree_or_child(&mut spawned.child, &spawned.job);
+                kill_shell_child(&mut spawned.child, &spawned.job);
                 let _ = spawned.child.wait();
                 return Err(error);
             }
@@ -3068,7 +3207,7 @@ pub(crate) type ShellHandoff<'a> = dyn Fn(ShellRun, crate::shell_tasks::ShellTas
 /// value. Splitting them would leave the pipes being drained by threads the new
 /// owner cannot join.
 pub(crate) struct ShellRun {
-    child: std::process::Child,
+    child: ShellChild,
     job: ShellJob,
     /// Carried only so a timed-out result can name the deadline it missed.
     timeout: Option<Duration>,
@@ -3097,12 +3236,10 @@ impl ShellRun {
     ) -> Result<Self, String> {
         let SpawnedShell { mut child, job } = spawned;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| "Failed to capture command standard output".to_owned())?;
         let stderr = child
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| "Failed to capture command standard error".to_owned())?;
         let stdout_thread = collect_pipe(stdout, guard.output_sink(ShellOutputStream::Stdout));
         let stderr_thread = collect_pipe(stderr, guard.output_sink(ShellOutputStream::Stderr));
@@ -3150,7 +3287,7 @@ impl ShellRun {
                     // `child.kill()` reaches only the shell itself. A shell that spawned anything —
                     // which is the whole reason a command runs long — would leave those children
                     // running, still holding the workspace and still writing to pipes nobody reads.
-                    kill_process_tree_or_child(&mut self.child, &self.job);
+                    kill_shell_child(&mut self.child, &self.job);
                     let status = self
                         .child
                         .wait()
@@ -3188,7 +3325,7 @@ impl ShellRun {
         guard: &mut crate::shell_tasks::ShellTaskGuard,
         profile: &PromptProfile,
     ) -> Result<ShellProcessResult, String> {
-        kill_process_tree_or_child(&mut self.child, &self.job);
+        kill_shell_child(&mut self.child, &self.job);
         let status = self
             .child
             .wait()
@@ -3278,6 +3415,18 @@ pub(crate) fn collect_shell_process(
 /// Kills the command and everything it started, falling back to the direct kill when the tree kill
 /// is unavailable. Leaving grandchildren alive is the failure mode that makes a "stopped" command
 /// keep writing to the workspace.
+pub(crate) fn kill_shell_child(child: &mut ShellChild, job: &ShellJob) {
+    match child {
+        ShellChild::Local(child) => kill_process_tree_or_child(child, job),
+        // The agent signals the whole process group on the machine; nothing
+        // on this host belongs to the command.
+        ShellChild::Remote { child, killed } => {
+            child.process.kill();
+            *killed = true;
+        }
+    }
+}
+
 pub(crate) fn kill_process_tree_or_child(child: &mut std::process::Child, job: &ShellJob) {
     // The job object is first because it is the only atomic option: it kills every process in
     // the tree in one call, including ones that were already orphaned. `taskkill /T` walks
@@ -4044,7 +4193,7 @@ mod tests {
     /// and the session silently never moves.
     #[test]
     fn a_git_bash_path_is_rewritten_before_it_is_judged_absolute() {
-        if cfg!(windows) {
+        if host_platform().is_windows() {
             assert_eq!(windows_native_path("/c/Users/a/b"), r"C:\Users\a\b");
             assert!(Path::new(&windows_native_path("/c/Users/a/b")).is_absolute());
             // A path that is already native passes through.
@@ -4602,7 +4751,7 @@ mod tests {
         .contains("nested/probe.txt:1"));
         assert!(run("find", json!({"path":".","query":"*.txt"})).contains("nested/probe.txt"));
         assert!(run("ls", json!({"path":".","depth":2})).contains("nested/probe.txt"));
-        if cfg!(windows) {
+        if host_platform().is_windows() {
             assert!(run(
                 "powershell",
                 json!({"command":"Write-Output MEWORK_POWERSHELL_E2E"}),
@@ -4939,7 +5088,7 @@ mod tests {
             // A Windows host with no native Bash installed: the plan refuses with an
             // actionable message instead of handing the command to the launcher.
             Err(error) => {
-                assert!(cfg!(windows), "{error}");
+                assert!(host_platform().is_windows(), "{error}");
                 assert!(error.contains("No native Bash was found"), "{error}");
             }
         }
@@ -4978,7 +5127,7 @@ mod tests {
                     "{first}"
                 );
             }
-            Err(error) if cfg!(windows) => {
+            Err(error) if host_platform().is_windows() => {
                 assert!(error.contains("No PowerShell was found"), "{error}");
             }
             Err(error) => {

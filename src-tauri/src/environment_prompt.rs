@@ -105,7 +105,7 @@ impl EnvironmentFacts {
             is_worktree,
             is_git_repository: Some(is_git_repository(workspace)),
             workspaces: displayed_workspaces(workspaces),
-            platform: std::env::consts::OS.to_owned(),
+            platform: crate::host_platform::host_platform().os_tag().to_owned(),
             os_version: os_version().to_owned(),
             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
         }
@@ -128,7 +128,7 @@ impl EnvironmentFacts {
             is_worktree: false,
             is_git_repository: None,
             workspaces: displayed_workspaces(workspaces),
-            platform: std::env::consts::OS.to_owned(),
+            platform: crate::host_platform::host_platform().os_tag().to_owned(),
             os_version: os_version().to_owned(),
             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
         }
@@ -311,12 +311,7 @@ fn is_git_repository(path: &Path) -> bool {
 /// This host's operating system as people name it, for messages that tell the
 /// model why a tool is unavailable here.
 pub(crate) fn host_os_name() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "macOS",
-        "windows" => "Windows",
-        "linux" => "Linux",
-        other => other,
-    }
+    crate::host_platform::host_platform().display_name()
 }
 
 /// Host operating-system version, read once per process.

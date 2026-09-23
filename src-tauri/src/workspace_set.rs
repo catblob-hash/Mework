@@ -17,6 +17,7 @@
 //! conversation and the machine catalog; neither renderer input nor a tool
 //! argument can introduce a root or a machine that is not already recorded.
 
+use crate::host_platform::{host_platform, HostPlatform};
 use crate::model::{AttachedWorkspace, ExecutionEnvironmentAssets, RunTarget};
 use crate::run_environment::{resolve_shell_runner, ShellRunner};
 
@@ -95,13 +96,20 @@ impl WorkspaceSet {
     /// [`Workspace::conversation_workspaces_after_primary`](crate::model::Workspace::conversation_workspaces_after_primary):
     /// the project's further workspaces, then the conversation's own.
     ///
+    /// Each entry's runner carries the variable table recorded for that
+    /// workspace — its machine and its path. Workspace 1's is the one recorded
+    /// under `primary_env_path`, which is not its root when the conversation
+    /// runs in an isolated worktree: the variables belong to the project's
+    /// registered directory the worktree was checked out from.
+    ///
     /// A machine that is no longer in the catalog fails the whole resolution
     /// rather than dropping the entry. Dropping it would renumber everything
     /// after it, and a conversation whose "workspace 3" silently became a
     /// different directory is worse than one that says the machine is gone.
-    pub fn resolve(
+    pub fn resolve_with_primary_env(
         assets: &ExecutionEnvironmentAssets,
         primary: &AttachedWorkspace,
+        primary_env_path: &str,
         attached: &[AttachedWorkspace],
     ) -> Result<Self, String> {
         let mut entries = Vec::with_capacity(1 + attached.len());
@@ -109,7 +117,12 @@ impl WorkspaceSet {
             if position >= MAX_WORKSPACES {
                 break;
             }
-            let runner = resolve_shell_runner(assets, workspace.machine.as_ref())?;
+            let env_path = if position == 0 {
+                primary_env_path
+            } else {
+                workspace.path.as_str()
+            };
+            let runner = resolve_shell_runner(assets, workspace.machine.as_ref(), Some(env_path))?;
             entries.push(ResolvedWorkspace {
                 index: position as u32 + 1,
                 machine: workspace.machine.clone(),
@@ -120,6 +133,17 @@ impl WorkspaceSet {
             });
         }
         Ok(Self { entries })
+    }
+
+    /// [`resolve_with_primary_env`](Self::resolve_with_primary_env) for a
+    /// primary whose variables are recorded under its own root.
+    #[cfg(test)]
+    pub fn resolve(
+        assets: &ExecutionEnvironmentAssets,
+        primary: &AttachedWorkspace,
+        attached: &[AttachedWorkspace],
+    ) -> Result<Self, String> {
+        Self::resolve_with_primary_env(assets, primary, &primary.path, attached)
     }
 
     /// Builds a single-workspace set on the host machine.
@@ -286,12 +310,11 @@ fn workspace_os(runner: &ShellRunner) -> WorkspaceOs {
     }
 }
 
-/// This machine's shell family.
+/// This machine's shell family, from the host platform resolved at startup.
 fn host_os() -> WorkspaceOs {
-    if cfg!(windows) {
-        WorkspaceOs::Windows
-    } else {
-        WorkspaceOs::Posix
+    match host_platform() {
+        HostPlatform::Windows => WorkspaceOs::Windows,
+        HostPlatform::Macos | HostPlatform::Linux => WorkspaceOs::Posix,
     }
 }
 
@@ -399,7 +422,7 @@ mod tests {
         let set =
             WorkspaceSet::resolve(&assets(), &local("C:/work/app"), &[remote("~/services")])
                 .unwrap();
-        if cfg!(windows) {
+        if host_platform().is_windows() {
             assert_eq!(set.powershell_addresses(), vec![1]);
             assert!(set.runs_powershell());
         } else {
@@ -493,6 +516,48 @@ mod tests {
             temporary.conversation_workspaces_after_primary(&conversation),
             vec![local("E:/notes")]
         );
+    }
+
+    #[test]
+    fn each_workspace_carries_its_own_variables() {
+        let mut assets = assets();
+        for (key, value) in [
+            ("local|C:/work/app", "app"),
+            ("ssh:m1|~/services", "services"),
+            ("local|C:/work/tools", "tools"),
+        ] {
+            assets.env_vars.insert(
+                key.to_owned(),
+                [("WHICH".to_owned(), value.to_owned())].into_iter().collect(),
+            );
+        }
+        let which = |set: &WorkspaceSet, index: u32| {
+            set.get(index)
+                .and_then(|workspace| workspace.runner.env().get("WHICH").cloned())
+        };
+
+        let set = WorkspaceSet::resolve(
+            &assets,
+            &local("C:/work/app"),
+            &[remote("~/services"), local("C:/work/tools"), local("C:/work/bare")],
+        )
+        .unwrap();
+        assert_eq!(which(&set, 1).as_deref(), Some("app"));
+        assert_eq!(which(&set, 2).as_deref(), Some("services"));
+        assert_eq!(which(&set, 3).as_deref(), Some("tools"));
+        assert_eq!(which(&set, 4), None);
+
+        // A worktree stands in for workspace 1 at another path, and still runs
+        // with the variables of the directory it was checked out from.
+        let worktree = WorkspaceSet::resolve_with_primary_env(
+            &assets,
+            &local("C:/data/worktrees/app-1"),
+            "C:/work/app",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(worktree.get(1).unwrap().root, "C:/data/worktrees/app-1");
+        assert_eq!(which(&worktree, 1).as_deref(), Some("app"));
     }
 
     #[test]

@@ -24,6 +24,7 @@
 //! CLI. Mework bundles no ripgrep and has no such process to protect, so those
 //! clauses would be inert at best.
 
+use crate::host_platform::host_platform;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,7 +138,7 @@ fn generator_script(snapshot_file: &Path, rc_file: Option<&Path>) -> String {
     // own terminal. The application's `PATH` already has the login shell's order
     // (`child_environment::adopt_login_shell_path`), so it leads here, and only
     // what the profile added follows.
-    let restore_path_order = if cfg!(target_os = "macos") {
+    let restore_path_order = if host_platform().is_macos() {
         r#"
 if [ -n "${MEWORK_APPLICATION_PATH-}" ]; then
   __mework_path="$MEWORK_APPLICATION_PATH"
@@ -245,7 +246,7 @@ pub(crate) fn build(app_data: &Path, shell_path: &str) -> Option<PathBuf> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if cfg!(target_os = "macos") {
+    if host_platform().is_macos() {
         command.env(
             "MEWORK_APPLICATION_PATH",
             std::env::var_os("PATH").unwrap_or_default(),

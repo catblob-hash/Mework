@@ -10,15 +10,60 @@ import type {
 export const TEMPORARY_WORKSPACE_ID = "__temporary__";
 
 /**
- * Address key for a machine's environment-variable table. Matches the host
- * `run_environment::env_key` exactly.
+ * A machine's identity: `local`, `wsl:<distro>`, or `ssh:<machine id>`. Matches
+ * the host `run_environment::env_key` exactly.
  *
- * It doubles as the machine's identity wherever two workspaces have to be told
- * apart: one machine's `/srv/app` is not another's.
+ * It is what tells two workspaces apart when their paths are spelled alike: one
+ * machine's `/srv/app` is not another's.
  */
 export function runEnvKey(target: RunTarget | null | undefined): string {
   if (!target) return "local";
   return target.kind === "wsl" ? `wsl:${target.distro}` : `ssh:${target.machineId}`;
+}
+
+/**
+ * Key of a workspace's environment-variable table in
+ * `ExecutionEnvironmentAssets.envVars`: the machine's {@link runEnvKey} and the
+ * directory as the workspace records it, joined by `|`. Matches the host
+ * `run_environment::workspace_env_key` exactly.
+ *
+ * Variables belong to the workspace, not to the machine it is on: two
+ * directories on one machine each carry their own table.
+ */
+export function workspaceEnvKey(machine: RunTarget | null | undefined, path: string): string {
+  return `${runEnvKey(machine)}|${path}`;
+}
+
+/** How many projects and conversations have a workspace on one machine. */
+export interface MachineUsage {
+  projects: number;
+  conversations: number;
+}
+
+/**
+ * How many projects and conversations still have a workspace on `machine`
+ * (`null` for this one): a project by its first workspace or any of its further
+ * ones, a conversation by one of its attached workspaces. The temporary project
+ * has no directory of its own and never counts.
+ */
+export function machineUsage(
+  workspaces: readonly Workspace[] | null | undefined,
+  machine: RunTarget | null
+): MachineUsage {
+  const key = runEnvKey(machine);
+  const onMachine = (entry: Pick<AttachedWorkspace, "machine">) => runEnvKey(entry.machine) === key;
+  let projects = 0;
+  let conversations = 0;
+  for (const project of workspaces ?? []) {
+    if (!isTemporaryWorkspace(project)
+      && (onMachine(project) || (project.additionalWorkspaces ?? []).some(onMachine))) {
+      projects += 1;
+    }
+    for (const conversation of project.conversations) {
+      if ((conversation.attachedWorkspaces ?? []).some(onMachine)) conversations += 1;
+    }
+  }
+  return { projects, conversations };
 }
 
 /** Whether two machine bindings name the same machine. */

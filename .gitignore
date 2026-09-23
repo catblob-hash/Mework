@@ -66,6 +66,10 @@ key.txt
 # AI SDK 迁移期的临时脚本与日志。
 .aisdk-tmp/
 
+# Remote agent builds staged by `npm run build:remote-agents`, one directory per
+# target triple; bundled as a resource and uploaded to SSH machines at runtime.
+/src-tauri/remote-agents/
+
 # Tauri sidecar staging: `npm run build:sidecar` 把 90 MiB 的单文件可执行按宿主
 # 三元组放在这里给 externalBin 取。是构建产物，不是源码。
 /src-tauri/binaries/

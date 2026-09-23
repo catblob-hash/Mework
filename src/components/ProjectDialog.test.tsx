@@ -36,6 +36,8 @@ function renderDialog(props: Partial<ProjectDialogProps> = {}) {
   const handlers = {
     onPickLocalDirectory: vi.fn<() => Promise<string | null>>().mockResolvedValue(null),
     onSaveSshMachine: vi.fn(),
+    onDeleteSshMachine: vi.fn(),
+    machineUsage: vi.fn(() => ({ projects: 0, conversations: 0 })),
     onSubmit: vi.fn(),
     onClose: vi.fn()
   };
@@ -43,7 +45,6 @@ function renderDialog(props: Partial<ProjectDialogProps> = {}) {
     <ProjectDialog
       mode="create"
       sshMachines={[devbox]}
-      envVars={{}}
       showWsl
       nativePicker
       {...handlers}
@@ -145,11 +146,18 @@ describe("ProjectDialog", () => {
     const wsl = await screen.findByRole("menu", { name: "WSL" });
     expect(await within(wsl).findByRole("menuitemradio", { name: /Ubuntu/ })).toBeInTheDocument();
     expect(within(wsl).getByRole("menuitemradio", { name: /Debian/ })).toBeInTheDocument();
+    // Every machine carries a gear for its settings.
+    expect(within(menu).getByRole("button", { name: "本机 的设置" })).toBeInTheDocument();
+    expect(within(wsl).getByRole("button", { name: "Ubuntu 的设置" })).toBeInTheDocument();
+    expect(within(wsl).getByRole("button", { name: "Debian 的设置" })).toBeInTheDocument();
 
     await user.click(within(menu).getByRole("menuitem", { name: "SSH" }));
     const ssh = screen.getByRole("menu", { name: "SSH" });
     const sshItems = Array.from(ssh.querySelectorAll(".popover-menu__item"));
     expect(sshItems.map((item) => item.textContent)).toEqual(["devbox", "添加 SSH 机器…"]);
+    // The add item is not a machine and has no gear.
+    expect(within(ssh).getAllByRole("button", { name: /的设置$/ }).map((button) => button.getAttribute("aria-label")))
+      .toEqual(["devbox 的设置"]);
 
     // Choosing another machine clears the path chosen on the old one.
     await user.click(within(ssh).getByRole("menuitemradio", { name: "devbox" }));
@@ -214,12 +222,81 @@ describe("ProjectDialog", () => {
     await user.click(within(dialog).getByRole("button", { name: "保存" }));
 
     expect(onSaveSshMachine).toHaveBeenCalledTimes(1);
-    const [machine, vars] = onSaveSshMachine.mock.calls[0];
+    const [machine] = onSaveSshMachine.mock.calls[0];
     expect(machine).toMatchObject({ name: "buildbox", host: "ci@build", port: 0 });
-    expect(vars).toEqual({});
+    // A machine carries no environment variables: those belong to its workspaces.
+    expect(within(dialog).queryByText(/环境变量（/)).toBeNull();
     expect(screen.queryByRole("dialog", { name: "添加 SSH 机器" })).toBeNull();
     // The caller's catalog has not caught up yet; the row still names the new machine.
     expect(machineChip(2)).toHaveTextContent("buildbox");
+    expect(machineChip(1)).toHaveTextContent("本机");
+  });
+
+  it("opens an SSH machine's settings from its gear, where it can be edited", async () => {
+    const user = userEvent.setup();
+    const machineUsage = vi.fn(() => ({ projects: 2, conversations: 1 }));
+    const { onSaveSshMachine } = renderDialog({ machineUsage });
+
+    await user.click(machineChip(1));
+    await user.click(screen.getByRole("menuitem", { name: "SSH" }));
+    await user.click(screen.getByRole("button", { name: "devbox 的设置" }));
+
+    // The gear acts on the machine without choosing it for the row.
+    expect(screen.queryByRole("menu", { name: "选择机器" })).toBeNull();
+    expect(machineChip(1)).toHaveTextContent("本机");
+    const dialog = screen.getByRole("dialog", { name: "配置 SSH 机器" });
+    expect(machineUsage).toHaveBeenCalledWith({ kind: "ssh", machineId: devbox.id });
+    expect(within(dialog).getByRole("button", { name: "删除" }))
+      .toHaveAttribute("title", "2 个项目、1 个对话在这台机器上有工作区");
+    const host = within(dialog).getByLabelText("主机");
+    await user.clear(host);
+    await user.type(host, "dev@devbox.lan");
+    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    expect(onSaveSshMachine).toHaveBeenCalledWith(expect.objectContaining({ id: devbox.id, host: "dev@devbox.lan" }));
+    expect(screen.queryByRole("dialog", { name: "配置 SSH 机器" })).toBeNull();
+  });
+
+  it("deletes an SSH machine from its settings and returns rows on it to an unpicked local row", async () => {
+    const user = userEvent.setup();
+    const { onDeleteSshMachine } = renderDialog({
+      initialWorkspaces: [{ path: "/Users/me/app" }, { machine: { kind: "ssh", machineId: devbox.id }, path: "~/api" }]
+    });
+
+    await user.click(machineChip(2));
+    await user.click(screen.getByRole("menuitem", { name: "SSH" }));
+    await user.click(screen.getByRole("button", { name: "devbox 的设置" }));
+    await user.click(within(screen.getByRole("dialog", { name: "配置 SSH 机器" })).getByRole("button", { name: "删除" }));
+    const confirm = screen.getByRole("dialog", { name: "删除 SSH 机器“devbox”？" });
+    expect(confirm).toHaveTextContent("没有项目或对话在使用这台机器。");
+    await user.click(within(confirm).getByRole("button", { name: "删除" }));
+
+    expect(onDeleteSshMachine).toHaveBeenCalledWith(devbox.id);
+    expect(screen.queryByRole("dialog", { name: /SSH 机器/ })).toBeNull();
+    expect(machineChip(2)).toHaveTextContent("本机");
+    expect(screen.getByRole("button", { name: "为工作区 2 选择目录" })).toBeInTheDocument();
+    expect(machineChip(1)).toHaveTextContent("本机");
+  });
+
+  it("opens this machine's and a WSL distribution's settings, which have nothing to configure", async () => {
+    const user = userEvent.setup();
+    renderDialog({ machineUsage: vi.fn(() => ({ projects: 1, conversations: 0 })) });
+
+    await user.click(machineChip(1));
+    await user.click(screen.getByRole("button", { name: "本机 的设置" }));
+    let dialog = screen.getByRole("dialog", { name: "本机" });
+    expect(dialog).toHaveTextContent("1 个项目、0 个对话在这台机器上有工作区");
+    // Variables are not a machine's: the dialog points to where they are set instead.
+    expect(within(dialog).queryByRole("textbox")).toBeNull();
+    expect(dialog).toHaveTextContent("环境变量属于工作区");
+    await user.click(within(dialog.querySelector(".dialog__footer") as HTMLElement).getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog", { name: "本机" })).toBeNull();
+
+    await user.click(machineChip(1));
+    await user.click(screen.getByRole("menuitem", { name: "WSL" }));
+    await user.click(await screen.findByRole("button", { name: "Ubuntu 的设置" }));
+    dialog = screen.getByRole("dialog", { name: "Ubuntu" });
+    expect(await within(dialog).findByText("WSL 2 · 默认")).toBeInTheDocument();
     expect(machineChip(1)).toHaveTextContent("本机");
   });
 
@@ -279,7 +356,11 @@ describe("ProjectDialog", () => {
 
   it("browses a remote row's machine and records the path the host authorized", async () => {
     const user = userEvent.setup();
-    mocks.listRemoteDirectory.mockResolvedValue({ path: "/home/dev", directories: ["app"], hasParent: true });
+    mocks.listRemoteDirectory.mockResolvedValue({
+      path: "/home/dev",
+      parent: "/home",
+      entries: [{ name: "app", path: "/home/dev/app" }]
+    });
     mocks.authorizeRemoteWorkspace.mockResolvedValue("/home/dev");
     const { onSubmit } = renderDialog({
       initialWorkspaces: [{ machine: { kind: "ssh", machineId: devbox.id }, path: "" }]

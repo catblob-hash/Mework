@@ -19,6 +19,7 @@
 //! `--rcfile` ([`super::bash_control`]), and fish sources the session's script
 //! through `--init-command`, after its own configuration.
 
+use crate::host_platform::host_platform;
 use std::{
     ffi::{CString, OsString},
     fs,
@@ -117,7 +118,7 @@ impl ControlFifo {
                 // Apple's bash 3.2 opens every interactive shell with a notice
                 // that zsh is now the default. Someone who picked bash from the
                 // menu has already made that choice.
-                if cfg!(target_os = "macos") {
+                if host_platform().is_macos() {
                     environment.push(("BASH_SILENCE_DEPRECATION_WARNING", OsString::from("1")));
                 }
                 environment

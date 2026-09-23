@@ -735,6 +735,7 @@ pub fn remove_server_from_file(path: &Path, name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_platform::host_platform;
 
     fn fake_env(name: &str) -> Option<String> {
         match name {
@@ -812,7 +813,7 @@ mod tests {
         .expect_err("a bare command with spaces is an argument mistake");
         assert!(reason.contains("args"), "{reason}");
 
-        let absolute = if cfg!(windows) {
+        let absolute = if host_platform().is_windows() {
             "C:\\Program Files\\lsp\\server.exe"
         } else {
             "/opt/Language Servers/server"

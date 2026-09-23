@@ -111,6 +111,16 @@ describe("retired view redirects", () => {
     }
   });
 
+  it("redirects the retired execution-environments id to Appearance", () => {
+    renderHistoricalView("execution_environments");
+
+    expect(screen.getByRole("button", { name: "外观" })).toHaveClass("settings-nav__item--active");
+    // Machines are configured from the gear beside them, and variables belong to workspaces,
+    // so the page and its navigation row are gone.
+    expect(screen.queryByRole("button", { name: "执行环境" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "执行环境" })).not.toBeInTheDocument();
+  });
+
   it("redirects the retired preset, hook, agent and catalog ids to Model providers", () => {
     for (const view of ["conversation_presets", "hooks", "agents", "capability_catalog"] as const) {
       const { container, unmount } = renderHistoricalView(view);

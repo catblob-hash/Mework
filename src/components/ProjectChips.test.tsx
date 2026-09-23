@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { createTestDocument as createSeedDocument } from "../test/fixtures";
 import { TEMPORARY_WORKSPACE_ID } from "../lib/workspaces";
-import type { SshMachineConfig, Workspace } from "../types";
+import type { AttachedWorkspace, SshMachineConfig, Workspace } from "../types";
 import { ProjectSelector, TerminalShellButton, WorkspaceMemberSelector } from "./ProjectChips";
 
 const devbox: SshMachineConfig = {
@@ -122,20 +122,33 @@ describe("ProjectSelector", () => {
 });
 
 describe("WorkspaceMemberSelector", () => {
-  it("names the selected workspace by its directory and number, and switches between them", async () => {
-    const onSelect = vi.fn();
-    const user = userEvent.setup();
+  const workspaces: AttachedWorkspace[] = [
+    { path: "C:\\platform" },
+    { machine: { kind: "ssh", machineId: devbox.id }, path: "/srv/api" },
+    { path: "D:\\shared\\tokens" }
+  ];
+
+  function renderSelector(props: Partial<Parameters<typeof WorkspaceMemberSelector>[0]> = {}) {
+    const handlers = {
+      onSelect: vi.fn(),
+      onConfigureMachine: vi.fn(),
+      onConfigureWorkspace: vi.fn()
+    };
     render(
       <WorkspaceMemberSelector
-        workspaces={[
-          { path: "C:\\platform" },
-          { machine: { kind: "ssh", machineId: devbox.id }, path: "/srv/api" }
-        ]}
+        workspaces={workspaces}
         selected={2}
         sshMachines={[devbox]}
-        onSelect={onSelect}
+        {...handlers}
+        {...props}
       />
     );
+    return handlers;
+  }
+
+  it("names the selected workspace by its directory and number, and switches between them", async () => {
+    const user = userEvent.setup();
+    const { onSelect } = renderSelector();
 
     const trigger = screen.getByRole("button", { name: "工作区：api" });
     expect(trigger).toHaveAttribute("title", "/srv/api (SSH: devbox)");
@@ -145,6 +158,48 @@ describe("WorkspaceMemberSelector", () => {
     expect(within(menu).getByRole("menuitemradio", { name: /^api/ })).toHaveAttribute("aria-checked", "true");
     await user.click(within(menu).getByRole("menuitemradio", { name: /^platform/ }));
     expect(onSelect).toHaveBeenCalledWith(1);
+  });
+
+  it("groups the workspaces under the machine each is on, keeping their numbers", async () => {
+    const user = userEvent.setup();
+    renderSelector();
+
+    await user.click(screen.getByRole("button", { name: "工作区：api" }));
+    const menu = screen.getByRole("menu", { name: "选择工作区" });
+    const sections = Array.from(menu.querySelectorAll(".popover-menu__section")).map((section) => ({
+      heading: section.querySelector(".popover-menu__label")?.textContent,
+      items: Array.from(section.querySelectorAll(".popover-menu__item")).map((item) => item.textContent)
+    }));
+    expect(sections).toEqual([
+      { heading: "本机", items: ["platform1", "tokens3"] },
+      { heading: "SSH: devbox", items: ["api2"] }
+    ]);
+  });
+
+  it("opens a machine's settings from its heading's gear and a workspace's variables from its own", async () => {
+    const user = userEvent.setup();
+    const { onSelect, onConfigureMachine, onConfigureWorkspace } = renderSelector();
+
+    await user.click(screen.getByRole("button", { name: "工作区：api" }));
+    await user.click(screen.getByRole("button", { name: "SSH: devbox 的设置" }));
+    expect(onConfigureMachine).toHaveBeenCalledWith({ kind: "ssh", machineId: devbox.id });
+    // The gear closes the menu like any choice, without selecting anything.
+    expect(screen.queryByRole("menu", { name: "选择工作区" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "工作区：api" }));
+    await user.click(screen.getByRole("button", { name: "本机 的设置" }));
+    expect(onConfigureMachine).toHaveBeenLastCalledWith(null);
+
+    await user.click(screen.getByRole("button", { name: "工作区：api" }));
+    await user.click(screen.getByRole("button", { name: "tokens 的环境变量" }));
+    expect(onConfigureWorkspace).toHaveBeenCalledWith(3);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("leaves the number off a lone workspace, which the model is never told", () => {
+    renderSelector({ workspaces: [{ path: "C:\\platform" }], selected: 1, showIndex: false });
+    const trigger = screen.getByRole("button", { name: "工作区：platform" });
+    expect(trigger.querySelector(".composer-chip__index")).toBeNull();
   });
 });
 

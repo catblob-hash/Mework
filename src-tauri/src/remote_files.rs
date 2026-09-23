@@ -500,9 +500,13 @@ fn exit_message(
         }
         status if crate::run_environment::answered_by_non_posix_shell(status, detail) => {
             // The machine's login shell is cmd.exe or PowerShell, so the POSIX
-            // line never ran; its own "not recognized" names neither.
+            // line never ran; its own "not recognized" names neither, and in a
+            // console code page this host cannot read it says nothing at all.
+            let said = crate::run_environment::legible_remote_reply(detail)
+                .map(|reply| format!(" The machine said: {reply}"))
+                .unwrap_or_default();
             format!(
-                "The SSH login shell on {} is not a POSIX shell (the reply came from cmd.exe or PowerShell), so nothing can run in workspace {} until that machine's sshd DefaultShell points at a bash. Tell the user; this is a machine setting, not something a tool call can fix. The machine said: {detail}",
+                "The SSH login shell on {} is not a POSIX shell (the reply came from cmd.exe or PowerShell), so nothing can run in workspace {} until that machine's sshd DefaultShell points at a bash. Tell the user; this is a machine setting, not something a tool call can fix.{said}",
                 machine_name(target),
                 target.workspace.index
             )
@@ -1401,6 +1405,79 @@ pub(crate) mod tests {
         }
     }
 
+    /// The file tools against a real Windows machine over SSH, through the
+    /// agent: Git Bash runs the same scripts a Unix machine does, in a
+    /// workspace rooted at a Windows path the way the directory picker
+    /// records one — whatever shell the account logs in with. Set
+    /// `MEWORK_E2E_SSH_WINDOWS_HOST` and run with `--ignored`; the agent is
+    /// installed from `src-tauri/remote-agents/`.
+    #[test]
+    #[ignore]
+    fn over_real_ssh_the_file_tools_work_on_a_windows_workspace() {
+        let host = std::env::var("MEWORK_E2E_SSH_WINDOWS_HOST").expect("MEWORK_E2E_SSH_WINDOWS_HOST");
+        let app_data = tempfile::tempdir().unwrap();
+        crate::remote_link::install(app_data.path(), Vec::new(), None);
+        let runner = ShellRunner::Ssh {
+            host,
+            port: 0,
+            identity_file: String::new(),
+            env: Default::default(),
+        };
+        let cancel = CancelSignal::default();
+        let home = runner
+            .run("cygpath -m ~", None, FILE_TIMEOUT, &cancel)
+            .unwrap();
+        let home = String::from_utf8_lossy(&home.stdout).trim().to_owned();
+        assert!(home.contains(":/"), "{home}");
+        let root = format!("{home}/mework-e2e-files");
+        let quoted = run_environment::sh_single_quote(&root);
+        let reset = runner
+            .run(&format!("rm -rf -- {quoted} && mkdir -p -- {quoted}"), None, FILE_TIMEOUT, &cancel)
+            .unwrap();
+        assert_eq!(reset.status, Some(0), "{}", reset.stderr);
+
+        let set = WorkspaceSet::single(root.clone(), runner.clone());
+        let profile = PromptProfile::default();
+        let target = RemoteWorkspace {
+            workspace: set.primary().expect("one workspace"),
+            machine_key: "ssh:e2e".to_owned(),
+            confinement: Confinement::Workspace,
+            profile: &profile,
+            cancel: &cancel,
+        };
+        run_write(
+            &target,
+            &input(json!({"path": "notes/hello.txt", "content": "hello 中文\nsecond line\n"})),
+            None,
+        )
+        .unwrap();
+        let read = run_read(&target, &input(json!({"path": "notes/hello.txt"})), None, None).unwrap();
+        assert!(read.output.contains("hello 中文"), "{}", read.output);
+        let edited = run_edit(
+            &target,
+            &input(json!({"path": "notes/hello.txt", "find": "second", "replace": "2nd"})),
+            None,
+        )
+        .unwrap();
+        assert!(edited.diff.as_deref().is_some_and(|diff| diff.contains("+2nd line")), "{:?}", edited.diff);
+        let listing = run_ls(&target, &input(json!({"depth": 2}))).unwrap();
+        assert!(listing.contains("notes/hello.txt"), "{listing}");
+        let grep = run_grep(&target, &input(json!({"pattern": "2nd"}))).unwrap();
+        assert!(grep.contains("hello.txt"), "{grep}");
+        let found = run_find(&target, &input(json!({"query": "*.txt"}))).unwrap();
+        assert!(found.contains("notes/hello.txt"), "{found}");
+        let beside = run_environment::sh_single_quote(&format!("{home}/mework-e2e-outside.txt"));
+        runner.run(&format!("echo secret > {beside}"), None, FILE_TIMEOUT, &cancel).unwrap();
+        let outside = run_read(&target, &input(json!({"path": "../mework-e2e-outside.txt"})), None, None).refusal();
+        assert!(outside.contains("outside workspace"), "{outside}");
+
+        let cleaned = runner
+            .run(&format!("rm -rf -- {quoted} {beside}"), None, FILE_TIMEOUT, &cancel)
+            .unwrap();
+        assert_eq!(cleaned.status, Some(0));
+        crate::remote_link::shutdown();
+    }
+
     #[test]
     fn every_host_supplied_fragment_reaches_the_script_quoted() {
         let set = workspace_set("~/my projects");
@@ -1627,6 +1704,12 @@ pub(crate) mod tests {
         assert!(cmd.contains("not a POSIX shell"), "{cmd}");
         assert!(cmd.contains("DefaultShell"), "{cmd}");
         assert!(cmd.ends_with("batch file."), "{cmd}");
+        // The same reply in GBK is still recognized, and its unreadable text
+        // is left out rather than handed to the model.
+        let gbk = String::from_utf8_lossy(b"'exec' \xb2\xbb\xca\xc7\xc4\xda\xb2\xbf\r\n");
+        let cmd = exit_message(&target, &wording, &answer(1, &gbk));
+        assert!(cmd.contains("not a POSIX shell"), "{cmd}");
+        assert!(cmd.ends_with("a tool call can fix."), "{cmd}");
     }
 
     // -- integration through a local Bash -----------------------------------

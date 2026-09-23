@@ -931,6 +931,7 @@ fn validate_globs(globs: &[String]) -> Result<(), InstructionsLoadedInputError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_platform::host_platform;
     use serde_json::{json, Value};
     use std::{
         collections::HashMap,
@@ -1502,7 +1503,7 @@ mod tests {
         executions.sort_unstable();
         let mut expected = vec![
             (
-                if cfg!(windows) {
+                if host_platform().is_windows() {
                     "observe-platform".to_owned()
                 } else {
                     "observe".to_owned()

@@ -9,7 +9,6 @@ import { ApiProviderSettings } from "./ProviderSettings";
 import { GlobalSettingsNavigation } from "./GlobalSettingsNavigation";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { DependencySettings } from "./DependencySettings";
-import { ExecutionEnvironmentSettings } from "./ExecutionEnvironmentSettings";
 import { ShortcutSettings } from "./ShortcutSettings";
 import { UsageSettings } from "./UsageSettings";
 import { UpdateSettings } from "./UpdateSettings";
@@ -22,10 +21,7 @@ type GlobalSettingsChangeHandler = (change: GlobalSettingsChange) => void;
 interface GlobalSettingsProps {
   initialView: SettingsView;
   settings: GlobalSettingsType;
-  /**
-   * Read only: by the usage page, to backfill turns recorded before the ledger existed, and by
-   * the execution-environments page, to say what still uses a machine before it is deleted.
-   */
+  /** Read only: by the usage page, to backfill turns recorded before the ledger existed. */
   document?: AppDocument | null;
   onChange: GlobalSettingsChangeHandler;
   onFlush?: () => Promise<void>;
@@ -42,9 +38,12 @@ export function GlobalSettings({
 }: GlobalSettingsProps) {
   const { t } = useI18n();
   // Retired view IDs remain valid navigation entry points and redirect to active pages.
+  // Execution environments were retired as a page: a machine's settings open from the gear
+  // beside it, and environment variables belong to each workspace.
   const redirectedView = (nextView: SettingsView): SettingsView => nextView === "web_search"
     ? "search_providers"
     : nextView === "advanced" || nextView === "memory" || nextView === "general"
+        || nextView === "execution_environments"
       ? "appearance"
       : nextView === "hooks" || nextView === "capability_catalog" || nextView === "agents"
           || nextView === "conversation_presets" || nextView === "mcp" || nextView === "skills"
@@ -84,16 +83,6 @@ export function GlobalSettings({
             />
           )}
           {view === "usage" && <UsageSettings document={document} />}
-          {view === "execution_environments" && (
-            <ExecutionEnvironmentSettings
-              environments={settings.executionEnvironments}
-              document={document}
-              onChange={(update) => onChange((current) => ({
-                ...current,
-                executionEnvironments: update(current.executionEnvironments)
-              }))}
-            />
-          )}
           {view === "dependencies" && (
             <DependencySettings
               tools={settings.environmentTools}

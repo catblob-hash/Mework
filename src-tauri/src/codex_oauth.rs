@@ -1182,7 +1182,7 @@ pub fn request_headers(credentials: &CodexCredentials) -> BTreeMap<String, Strin
             format!(
                 "mework/{} ({}; {})",
                 env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
+                crate::host_platform::host_platform().os_tag(),
                 std::env::consts::ARCH
             ),
         ),

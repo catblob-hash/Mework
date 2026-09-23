@@ -1,0 +1,52 @@
+[package]
+name = "mework-remote-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+description = "The persistent process Mework keeps on a remote machine, and the host's link to it."
+
+[lib]
+# The host imports this crate as `remote_agent`; the package name follows the
+# workspace `mework-` prefix convention.
+name = "remote_agent"
+path = "src/lib.rs"
+
+[[bin]]
+# Uploaded to the remote machine and run there: `proxy` from each SSH session,
+# `daemon` detached and outliving them.
+name = "mework-remote"
+path = "src/main.rs"
+required-features = ["agent"]
+test = false
+bench = false
+
+[features]
+default = ["agent", "client"]
+# The remote side: daemon, proxy, process and terminal sessions. The host does
+# not link it, so none of its platform calls reach the shipped app.
+agent = ["dep:portable-pty", "dep:sha2", "dep:getrandom"]
+# The host side: one multiplexed, self-healing link per machine.
+client = []
+
+[dependencies]
+# Deliberately short: this crate is cross-compiled for every machine Mework can
+# reach (Linux musl, macOS, Windows), and each dependency is one more thing that
+# has to build there. Every version below is one the workspace already locks.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = { version = "0.9", optional = true }
+sha2 = { version = "0.10", optional = true }
+getrandom = { version = "0.3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Process-tree ownership (job objects, a child started suspended until its job
+# holds it), detaching the daemon from the SSH session's job, and the daemon's
+# log handles. Nothing here reaches input, windows or the desktop.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

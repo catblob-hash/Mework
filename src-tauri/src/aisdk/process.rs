@@ -26,6 +26,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{ModelRequestError, RequestFailure, StreamPartial};
+use crate::host_platform::host_platform;
 use crate::api::ModelEventSink;
 use crate::model::{ModelStreamEvent, ModelUsage};
 
@@ -175,11 +176,10 @@ fn resolve_binary() -> Result<PathBuf, String> {
     // Production places `externalBin` next to the main executable.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join(if cfg!(windows) {
-                "mework-aisdk.exe"
-            } else {
-                "mework-aisdk"
-            });
+            let candidate = dir.join(format!(
+                "mework-aisdk{}",
+                host_platform().executable_suffix()
+            ));
             if candidate.is_file() {
                 return Ok(candidate);
             }
@@ -210,7 +210,7 @@ fn resolve_binary() -> Result<PathBuf, String> {
 pub(crate) fn source_tree_sidecar() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest.parent()?;
-    let exe = if cfg!(windows) { ".exe" } else { "" };
+    let exe = host_platform().executable_suffix();
     // `build.rs` derives the triple from Cargo's `TARGET`; do not recompute it here.
     let staged = manifest.join("binaries").join(format!(
         "mework-aisdk-{}{exe}",

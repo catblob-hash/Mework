@@ -1683,6 +1683,7 @@ fn tool_search_schema(profile: &PromptProfile) -> Value {
 mod tests {
     use super::*;
     use crate::catalog::tool_catalog;
+    use crate::host_platform::host_platform;
     use crate::model::{AttachedWorkspace, ExecutionEnvironmentAssets, RunTarget, SshMachineConfig};
     use std::collections::BTreeSet;
 
@@ -1770,7 +1771,7 @@ mod tests {
     fn powershell_lists_only_the_workspaces_it_could_run_in() {
         let workspaces = mixed_workspaces();
         let schema = schema_with_workspaces("powershell", &workspaces);
-        if cfg!(windows) {
+        if host_platform().runs_powershell() {
             assert_eq!(schema["properties"]["workspace"]["enum"], json!([1]));
             let description = schema["properties"]["workspace"]["description"]
                 .as_str()

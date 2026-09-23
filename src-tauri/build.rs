@@ -32,6 +32,7 @@ fn main() {
     prefer_mingw_toolchain();
     stage_aisdk_sidecar();
     stage_claude_code();
+    ensure_remote_agents_dir();
     println!("cargo:rerun-if-changed=../src/mework-icon.svg");
     println!("cargo:rerun-if-changed=../src/mework-icon-small.svg");
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
@@ -107,6 +108,20 @@ fn prune_retired_command_permissions() {
             println!("cargo:warning=删除已退役命令的权限文件 {stem}.toml");
         }
     }
+}
+
+/// Makes sure the remote agent resource directory exists.
+///
+/// `tauri.conf.json` bundles `remote-agents/`, and a resource path that does not
+/// exist fails every build — `cargo check` included — just as a missing sidecar
+/// would. The builds themselves come from `npm run build:remote-agents`; an
+/// empty directory only means no SSH machine gets the agent, which the host
+/// reports and handles by using the per-command transport.
+fn ensure_remote_agents_dir() {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let directory = manifest.join("remote-agents");
+    fs::create_dir_all(&directory).expect("create the remote agent resource directory");
+    println!("cargo:rerun-if-changed={}", directory.display());
 }
 
 /// Stages the AI SDK sidecar where `externalBin` expects it.

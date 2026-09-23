@@ -8,6 +8,10 @@ members = [
     # The rquickjs adapter is the workflow tool's only script-engine implementation;
     # the host uses it through ScriptSpec/ScriptSource.
     "workflow-script",
+    # The persistent agent Mework keeps on SSH machines, and the host's link to
+    # it. Cross-compiled for every machine Mework can reach, so its own
+    # dependencies stay minimal; the host links only its `client` half.
+    "remote-agent",
 ]
 
 [package]
@@ -63,6 +67,9 @@ mework-workflow-core = { path = "workflow-core" }
 # rquickjs/QuickJS-NG script source for the workflow tool.
 mework-workflow-script = { path = "workflow-script" }
 mework-agent-kernel = { path = "agent-kernel" }
+# The host's link to the agent it keeps on SSH machines. Only the `client` half:
+# the agent's own process and terminal code runs on the remote machine, not here.
+mework-remote-agent = { path = "remote-agent", default-features = false, features = ["client"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 # Persists the conversation data plane. `bundled` compiles SQLite from source,
@@ -84,6 +91,9 @@ wait-timeout = "0.2"
 # Skills may be installed from ZIP archives. Enable only deflate, the common ZIP
 # method, to avoid adding bzip2, zstd, and deflate64 C dependencies.
 portable-pty = "0.9"
+# `portable_pty::MasterPty` spells its errors as `anyhow::Error`; the terminal an
+# SSH machine's agent serves implements that trait, so it names the same type.
+anyhow = "1"
 base64 = "0.22.1"
 gif = "=0.13.3"
 image-webp = "=0.2.4"

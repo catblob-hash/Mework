@@ -20,7 +20,6 @@ describe("GlobalSettingsNavigation", () => {
       "Appearance",
       "Keyboard shortcuts",
       "Usage statistics",
-      "Execution environments",
       "Dependencies",
       "Updates"
     ]);
@@ -61,7 +60,6 @@ describe("GlobalSettingsNavigation", () => {
       "外观",
       "快捷键",
       "用量统计",
-      "执行环境",
       "环境依赖",
       "版本更新"
     ]);

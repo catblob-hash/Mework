@@ -113,7 +113,7 @@ pub fn version_info(version: &str, executable_dir: &Path) -> AppVersionInfo {
         flavor: detect_flavor(executable_dir),
         development_build: cfg!(debug_assertions),
         arch: std::env::consts::ARCH.to_owned(),
-        os: std::env::consts::OS.to_owned(),
+        os: crate::host_platform::host_platform().os_tag().to_owned(),
         repository_url: REPOSITORY_URL.to_owned(),
         releases_url: format!("{}/releases", REPOSITORY_URL.trim_end_matches('/')),
         executable_dir: executable_dir.display().to_string(),
@@ -1356,12 +1356,15 @@ pub fn reveal_file(path: &Path) -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub fn reveal_file(path: &Path) -> Result<(), String> {
+    use crate::host_platform::host_platform;
+
     let directory = path.parent().ok_or_else(|| "文件没有所在目录".to_owned())?;
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
+    // Which command opens a folder here is the host's to answer, and it answers
+    // for all three platforms in one place. Windows never reaches this build of
+    // the function: `explorer.exe /select,` is the sibling above.
+    let opener = host_platform()
+        .desktop_opener()
+        .ok_or_else(|| "这个平台没有可用的文件管理器打开方式".to_owned())?;
     std::process::Command::new(opener)
         .arg(directory)
         .spawn()

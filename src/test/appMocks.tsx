@@ -409,7 +409,7 @@ export function resetAppMocks() {
   workspacePickerMocks.hasNativeWorkspacePicker.mockReset().mockReturnValue(true);
   workspacePickerMocks.pickWorkspaceDirectory.mockReset().mockResolvedValue(null);
   workspacePickerMocks.listRemoteDirectory.mockReset()
-    .mockResolvedValue({ path: "/home/dev", directories: [], hasParent: true });
+    .mockResolvedValue({ path: "/home/dev", parent: "/home", entries: [] });
   workspacePickerMocks.authorizeRemoteWorkspace.mockReset().mockResolvedValue("/home/dev");
   browserMocks.openBrowser.mockReset().mockResolvedValue({
     hasPage: true,

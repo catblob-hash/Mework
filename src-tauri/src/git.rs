@@ -18,6 +18,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
+use crate::host_platform::host_platform;
+
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const BULK_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -10928,7 +10930,7 @@ fn validate_ssh_host_token(host: &str) -> Result<(), String> {
 }
 
 fn scp_transport_parts(locator: &str) -> Option<(&str, &str)> {
-    let windows_drive_path = cfg!(windows)
+    let windows_drive_path = host_platform().is_windows()
         && locator
             .as_bytes()
             .get(0..2)
@@ -12505,7 +12507,7 @@ fn internal_remote_config_exists(
 }
 
 fn disabled_hooks_path() -> &'static str {
-    if cfg!(windows) {
+    if host_platform().is_windows() {
         "NUL"
     } else {
         "/dev/null"
@@ -14101,7 +14103,7 @@ u UU N... 100644 100644 100644 100644 a b c d conflict.txt\0\
         assert!(validate_relative_path("../secret").is_err());
         // A drive prefix only means "absolute" on Windows; elsewhere `C:` is an
         // ordinary directory name a repository may contain.
-        assert_eq!(validate_relative_path("C:/secret").is_err(), cfg!(windows));
+        assert_eq!(validate_relative_path("C:/secret").is_err(), host_platform().is_windows());
         assert!(validate_relative_path("bad\\path").is_err());
         let encoded = encode_pathspecs(&["-leading.txt".into(), "line\nbreak.txt".into()]).unwrap();
         assert_eq!(encoded, b"-leading.txt\0line\nbreak.txt\0");

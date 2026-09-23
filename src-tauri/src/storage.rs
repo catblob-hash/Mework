@@ -2425,7 +2425,9 @@ fn validate_execution_environments(
     assets: &crate::model::ExecutionEnvironmentAssets,
 ) -> Result<(), String> {
     const MAX_SSH_MACHINES: usize = 64;
-    const MAX_ENV_TABLES: usize = 256;
+    // One table per workspace rather than per machine, so the bound leaves room
+    // for many projects of up to sixteen workspaces each.
+    const MAX_ENV_TABLES: usize = 1024;
     const MAX_ENV_VARS_PER_TABLE: usize = 128;
     const MAX_ENV_VALUE_CHARS: usize = 8192;
     const MAX_HOST_CHARS: usize = 512;
@@ -2477,13 +2479,29 @@ fn validate_execution_environments(
     }
     for (key, table) in &assets.env_vars {
         // Allow dangling SSH environment tables so removed machines do not invalidate the document.
-        let valid_key = key == "local"
-            || key.strip_prefix("wsl:").is_some_and(|distro| {
-                crate::run_environment::validate_wsl_distro_name(distro).is_ok()
-            })
-            || key
-                .strip_prefix("ssh:")
-                .is_some_and(|id| !id.trim().is_empty() && id.len() <= 128);
+        let valid_machine_key = |machine: &str| {
+            machine == "local"
+                || machine.strip_prefix("wsl:").is_some_and(|distro| {
+                    crate::run_environment::validate_wsl_distro_name(distro).is_ok()
+                })
+                || machine
+                    .strip_prefix("ssh:")
+                    .is_some_and(|id| !id.trim().is_empty() && id.len() <= 128)
+        };
+        // A table belongs to a workspace: `<machine key>|<path>`, see
+        // `run_environment::workspace_env_key`. A bare machine key is a table
+        // from before variables moved onto workspaces; the renderer spreads it
+        // over that machine's workspaces on load, and until it saves, the key is
+        // tolerated but never read. Tables of removed workspaces may dangle.
+        let valid_key = match key.split_once('|') {
+            Some((machine, path)) => {
+                valid_machine_key(machine)
+                    && !path.trim().is_empty()
+                    && path.chars().count() <= MAX_PATH_FIELD_CHARS
+                    && !path.chars().any(char::is_control)
+            }
+            None => valid_machine_key(key),
+        };
         if !valid_key {
             return Err(format!("运行环境键 {key:?} 不合法"));
         }
@@ -4505,28 +4523,44 @@ mod tests {
         let mut valid = base.clone();
         valid.assets.execution_environments.ssh_machines = vec![machine.clone()];
         valid.assets.execution_environments.env_vars.insert(
-            "local".into(),
+            "local|C:\\work\\app".into(),
             [("FOO".to_owned(), "bar".to_owned())].into(),
         );
         valid.assets.execution_environments.env_vars.insert(
-            "wsl:Ubuntu".into(),
+            "wsl:Ubuntu|/home/dev/app".into(),
             [("A".to_owned(), "1".to_owned())].into(),
         );
         valid
             .assets
             .execution_environments
             .env_vars
-            .insert("ssh:ssh_a".into(), Default::default());
+            .insert("ssh:ssh_a|~/app".into(), Default::default());
         assert!(validate_shape(&valid).is_ok(), "完整配置必须被接受");
 
-        // Dangling SSH environment tables remain valid.
+        // Dangling SSH environment tables remain valid, and so do tables from
+        // before variables belonged to workspaces.
         let mut dangling = base.clone();
-        dangling
-            .assets
-            .execution_environments
-            .env_vars
-            .insert("ssh:gone".into(), Default::default());
+        for key in ["ssh:gone|/srv/app", "ssh:gone", "local", "wsl:Ubuntu"] {
+            dangling
+                .assets
+                .execution_environments
+                .env_vars
+                .insert(key.into(), Default::default());
+        }
         assert!(validate_shape(&dangling).is_ok());
+
+        for key in ["local|", "local|  ", "docker:x|/srv", "wsl:bad;name|/srv", "local|a\nb"] {
+            let mut bad_workspace_key = base.clone();
+            bad_workspace_key
+                .assets
+                .execution_environments
+                .env_vars
+                .insert(key.into(), Default::default());
+            assert!(
+                validate_shape(&bad_workspace_key).is_err(),
+                "工作区环境键 {key:?} 必须被拒绝"
+            );
+        }
 
         let mut bad_host = base.clone();
         bad_host.assets.execution_environments.ssh_machines =

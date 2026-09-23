@@ -214,6 +214,10 @@ pub struct TerminalLaunch {
     shell: String,
     binding: String,
     control: ShellControl,
+    /// For an SSH machine: the terminal the agent runs there. The program and
+    /// arguments above are then the interactive `ssh` it falls back to when
+    /// the agent does not serve the machine ([`crate::remote_terminal`]).
+    agent: Option<crate::remote_terminal::AgentTerminalSpec>,
 }
 
 impl TerminalLaunch {
@@ -246,10 +250,17 @@ impl TerminalLaunch {
     ///
     /// A chosen `shell` is started as a login shell by `/bin/sh`, which falls
     /// back to the user's own login shell, with a note, on a machine without
-    /// it. `/bin/sh` rather than the login shell parses that choice because the
-    /// login shell may be fish, which reads neither `${SHELL:-…}` nor `if … fi`.
+    /// it. Over SSH the whole remote line reaches `/bin/sh` in
+    /// [`crate::remote_shell::posix_line`] form, because the login shell reads
+    /// it first and may be fish or tcsh, which read neither `${SHELL:-…}` nor
+    /// `if … fi` nor POSIX quoting.
     /// A remote shell has no command barrier: there is no host checkout behind
     /// it to protect.
+    ///
+    /// On an SSH machine the launch also carries the same shell choice for the
+    /// agent to run ([`crate::remote_terminal`]): a terminal owned by the
+    /// machine's agent survives the network dropping, and the `ssh -t` above is
+    /// what it falls back to where the agent does not serve the machine.
     pub fn remote(
         runner: &crate::run_environment::ShellRunner,
         remote_cwd: &str,
@@ -344,7 +355,7 @@ impl TerminalLaunch {
                     }
                     None => remote.push_str(r#"exec "${SHELL:-/bin/sh}" -l"#),
                 }
-                args.push(OsString::from(remote));
+                args.push(OsString::from(crate::remote_shell::posix_line(&remote)));
                 let program = run_env::ssh_client_candidates()
                     .into_iter()
                     .find(|candidate| candidate == "ssh" || Path::new(candidate).is_file())
@@ -357,7 +368,7 @@ impl TerminalLaunch {
                 )
             }
         };
-        Ok(Self::new(
+        let mut launch = Self::new(
             program,
             args,
             local_cwd,
@@ -365,7 +376,28 @@ impl TerminalLaunch {
             shell,
             scope,
             ShellControl::Remote,
-        ))
+        );
+        // On an SSH machine the agent runs the same shell choice itself, on a
+        // pseudo terminal of its own that outlives any one connection. Its
+        // variables come from the runner the way every agent process's do.
+        if let ShellRunner::Ssh { host, .. } = runner {
+            let script = match chosen {
+                Some(name) => remote_shell_script(name),
+                None => r#"exec "${SHELL:-/bin/sh}" -l"#.to_owned(),
+            };
+            launch.agent = Some(crate::remote_terminal::AgentTerminalSpec {
+                runner: runner.clone(),
+                argv: vec!["/bin/sh".into(), "-c".into(), script],
+                windows_shell: chosen.map(str::to_owned),
+                cwd: remote_cwd.to_owned(),
+                env: vec![
+                    ("TERM".into(), "xterm-256color".into()),
+                    ("COLORTERM".into(), "truecolor".into()),
+                ],
+                machine_label: host.clone(),
+            });
+        }
+        Ok(launch)
     }
 
     fn new(
@@ -391,6 +423,7 @@ impl TerminalLaunch {
             shell,
             binding,
             control,
+            agent: None,
         }
     }
 }
@@ -832,17 +865,6 @@ impl TerminalManager {
             ));
         }
 
-        let pair = native_pty_system()
-            .openpty(size)
-            .map_err(|error| format!("无法创建伪终端：{error}"))?;
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| format!("无法读取伪终端：{error}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| format!("无法写入伪终端：{error}"))?;
         let remote = launch.control == ShellControl::Remote;
         let control_nonce = Uuid::new_v4().simple().to_string();
         let mut launch_args = launch.args.clone();
@@ -926,11 +948,41 @@ impl TerminalManager {
         for (name, value) in &control_env {
             command.env(name, value);
         }
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("无法启动终端 shell：{error}"))?;
-        drop(pair.slave);
+        let (pty_master, mut reader, writer, mut child) = match launch.agent.clone() {
+            // An SSH machine: the agent's terminal when it serves the machine,
+            // and this very command in a local pseudo terminal when it does not.
+            // Either attaches behind a front that answers at once, because
+            // reaching the agent may first mean installing it.
+            Some(agent) => {
+                let (master, child) = crate::remote_terminal::start(agent, command, size);
+                let reader = master
+                    .try_clone_reader()
+                    .map_err(|error| format!("无法读取伪终端：{error}"))?;
+                let writer = master
+                    .take_writer()
+                    .map_err(|error| format!("无法写入伪终端：{error}"))?;
+                (master, reader, writer, child)
+            }
+            None => {
+                let pair = native_pty_system()
+                    .openpty(size)
+                    .map_err(|error| format!("无法创建伪终端：{error}"))?;
+                let reader = pair
+                    .master
+                    .try_clone_reader()
+                    .map_err(|error| format!("无法读取伪终端：{error}"))?;
+                let writer = pair
+                    .master
+                    .take_writer()
+                    .map_err(|error| format!("无法写入伪终端：{error}"))?;
+                let child = pair
+                    .slave
+                    .spawn_command(command)
+                    .map_err(|error| format!("无法启动终端 shell：{error}"))?;
+                drop(pair.slave);
+                (pair.master, reader, writer, child)
+            }
+        };
 
         let session_id = Uuid::new_v4().to_string();
         // A remote shell sends no frames, so it is ready the moment it starts:
@@ -964,11 +1016,11 @@ impl TerminalManager {
         }
         let process_id = child.process_id();
         #[cfg(unix)]
-        let process_group_id = pair.master.process_group_leader();
+        let process_group_id = pty_master.process_group_leader();
         #[cfg(not(unix))]
         let process_group_id = None;
         let mut killer = child.clone_killer();
-        let master = Arc::new(Mutex::new(Some(pair.master)));
+        let master = Arc::new(Mutex::new(Some(pty_master)));
         let writer = Arc::new(Mutex::new(Some(writer)));
         let reader_output = output.clone();
         let reader_session_id = session_id.clone();
@@ -2239,8 +2291,13 @@ mod tests {
     fn an_ssh_terminal_quotes_the_chosen_shell_into_its_remote_command() {
         use crate::run_environment::sh_single_quote;
         let local = std::env::current_dir().unwrap();
-        let remote_command =
-            |launch: &TerminalLaunch| launch.args.last().unwrap().to_string_lossy().into_owned();
+        // The login shell is sent the neutral line; what `sh` then runs is the
+        // command below.
+        let remote_command = |launch: &TerminalLaunch| {
+            crate::remote_shell::tests::decode_posix_line(
+                &launch.args.last().unwrap().to_string_lossy(),
+            )
+        };
         let plain = TerminalLaunch::remote(&ssh_runner(&[]), "~/project", &local, None).unwrap();
         assert_eq!(plain.shell, "SSH: ada@build");
         assert_eq!(

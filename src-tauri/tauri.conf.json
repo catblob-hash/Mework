@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build && npm run build:sidecar",
+    "beforeBuildCommand": "npm run build && npm run build:sidecar && npm run build:remote-agents",
     "frontendDist": "../dist"
   },
   "app": {
@@ -69,7 +69,9 @@
     "targets": ["nsis"],
     "publisher": "Mework",
     "icon": ["icons/icon.ico"],
-    "resources": [],
+    "resources": {
+      "remote-agents/": "remote-agents/"
+    },
     "externalBin": ["binaries/mework-aisdk", "binaries/claude"],
     "windows": {
       "digestAlgorithm": "sha256",

@@ -2156,6 +2156,7 @@ dependencies = [
 name = "mework"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
  "axum",
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2174,6 +2175,7 @@ dependencies = [
  "keyring",
  "libc",
  "mework-agent-kernel",
+ "mework-remote-agent",
  "mework-workflow-core",
  "mework-workflow-script",
  "png 0.17.16",
@@ -2209,6 +2211,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mework-remote-agent"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

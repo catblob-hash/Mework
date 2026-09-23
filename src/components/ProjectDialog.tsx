@@ -15,9 +15,10 @@ import { useI18n } from "../i18n";
 import { errorMessage } from "../lib/errors";
 import { listWslDistros, MAX_PROJECT_WORKSPACES } from "../lib/runtime";
 import { runEnvKey } from "../lib/workspaces";
+import type { MachineUsage } from "../lib/workspaces";
 import type { AttachedWorkspace, RunTarget, SshMachineConfig, WslDistro } from "../types";
 import { Dialog, IconButton } from "./Common";
-import { SshMachineDialog } from "./MachineDialogs";
+import { MachineSettingsDialog, SshMachineDialog } from "./MachineDialogs";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuItem, PopoverPanelRect } from "./PopoverMenu";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
@@ -33,19 +34,18 @@ export interface ProjectDialogProps {
    */
   initialWorkspaces?: AttachedWorkspace[];
   sshMachines: SshMachineConfig[];
-  /**
-   * Environment-variable tables keyed like `runEnvKey`. Accepted for parity with
-   * the other machine surfaces; a machine created here starts from an empty table.
-   */
-  envVars: Record<string, Record<string, string>>;
   /** Whether the machine menu offers WSL distributions at all. */
   showWsl: boolean;
   /** Whether the host has a native folder dialog; without one a local row takes a typed path. */
   nativePicker: boolean;
   /** Opens the host's folder dialog. Resolves `null` when the user cancels. */
   onPickLocalDirectory: () => Promise<string | null>;
-  /** Registers a machine created from a row's machine menu. */
-  onSaveSshMachine: (machine: SshMachineConfig, vars: Record<string, string>) => void;
+  /** Registers a machine created from a row's machine menu, or saves one edited from its gear. */
+  onSaveSshMachine: (machine: SshMachineConfig) => void;
+  /** Deletes an SSH machine from the catalog, from the settings its gear opens. */
+  onDeleteSshMachine: (machineId: string) => void;
+  /** What has a workspace on a machine (`null` is this one), stated in its settings. */
+  machineUsage: (machine: RunTarget | null) => MachineUsage;
   /** `workspaces[0]` is the primary; the name is trimmed and may be empty. */
   onSubmit: (name: string, workspaces: AttachedWorkspace[]) => void;
   onClose: () => void;
@@ -109,6 +109,8 @@ export function ProjectDialog({
   nativePicker,
   onPickLocalDirectory,
   onSaveSshMachine,
+  onDeleteSshMachine,
+  machineUsage,
   onSubmit,
   onClose
 }: ProjectDialogProps) {
@@ -134,6 +136,8 @@ export function ProjectDialog({
   /** Machines created from this dialog, until the caller's catalog carries them. */
   const [createdMachines, setCreatedMachines] = useState<SshMachineConfig[]>([]);
   const [machineDialogRow, setMachineDialogRow] = useState<string | null>(null);
+  /** The machine whose settings its gear opened; `{ machine: null }` is this one. */
+  const [machineSettings, setMachineSettings] = useState<{ machine: RunTarget | null } | null>(null);
   const [remotePickerRow, setRemotePickerRow] = useState<string | null>(null);
   const [pickingRow, setPickingRow] = useState<string | null>(null);
   const [pickErrors, setPickErrors] = useState<Record<string, string>>({});
@@ -237,6 +241,22 @@ export function ProjectDialog({
     )));
   };
 
+  /** Deleting a machine takes it off every row still pointing at it, back to an unpicked local row. */
+  const deleteMachine = (machineId: string) => {
+    onDeleteSshMachine(machineId);
+    setCreatedMachines((current) => current.filter((machine) => machine.id !== machineId));
+    const key = runEnvKey({ kind: "ssh", machineId });
+    setRows((current) => current.map((row) => (
+      row.locked || runEnvKey(row.machine) !== key ? row : { ...row, machine: null, path: "" }
+    )));
+  };
+
+  const settingsAction = (machine: RunTarget | null, name: string): PopoverMenuItem["action"] => ({
+    label: t("{name} 的设置", "Settings for {name}", { name }),
+    icon: <Settings size={13} />,
+    onSelect: () => setMachineSettings({ machine })
+  });
+
   const menuItems = (row: ProjectRow): PopoverMenuItem[] => {
     const current = runEnvKey(row.machine);
     const wslChildren: PopoverMenuItem[] = distros === null
@@ -253,7 +273,8 @@ export function ProjectDialog({
           icon: <SquareTerminal size={14} />,
           hint: distro.isDefault ? t("默认", "default") : undefined,
           checked: current === `wsl:${distro.name}`,
-          onSelect: () => setRowMachine(row.id, { kind: "wsl", distro: distro.name })
+          onSelect: () => setRowMachine(row.id, { kind: "wsl", distro: distro.name }),
+          action: settingsAction({ kind: "wsl", distro: distro.name }, distro.name)
         }));
     return [
       {
@@ -261,7 +282,8 @@ export function ProjectDialog({
         label: t("本机", "Local"),
         icon: <Monitor size={14} />,
         checked: row.machine === null,
-        onSelect: () => setRowMachine(row.id, null)
+        onSelect: () => setRowMachine(row.id, null),
+        action: settingsAction(null, t("本机", "Local"))
       },
       ...(showWsl
         ? [{ id: "wsl", label: "WSL", icon: <SquareTerminal size={14} />, children: wslChildren }]
@@ -276,7 +298,8 @@ export function ProjectDialog({
             label: machine.name,
             icon: <Server size={14} />,
             checked: current === `ssh:${machine.id}`,
-            onSelect: () => setRowMachine(row.id, { kind: "ssh", machineId: machine.id })
+            onSelect: () => setRowMachine(row.id, { kind: "ssh", machineId: machine.id }),
+            action: settingsAction({ kind: "ssh", machineId: machine.id }, machine.name)
           })),
           {
             id: "ssh:add",
@@ -455,16 +478,29 @@ export function ProjectDialog({
       {machineDialogRow !== null && (
         <SshMachineDialog
           machine={null}
-          vars={{}}
           machineCount={machines.length}
-          onSave={(machine, vars) => {
+          onSave={(machine) => {
             const rowId = machineDialogRow;
-            onSaveSshMachine(machine, vars);
+            onSaveSshMachine(machine);
             setCreatedMachines((current) => [...current, machine]);
             setRowMachine(rowId, { kind: "ssh", machineId: machine.id });
             setMachineDialogRow(null);
           }}
           onClose={() => setMachineDialogRow(null)}
+        />
+      )}
+
+      {machineSettings && (
+        <MachineSettingsDialog
+          machine={machineSettings.machine}
+          sshMachines={machines}
+          usage={machineUsage(machineSettings.machine)}
+          onSaveSshMachine={(machine) => {
+            onSaveSshMachine(machine);
+            setCreatedMachines((current) => current.map((entry) => (entry.id === machine.id ? machine : entry)));
+          }}
+          onDeleteSshMachine={deleteMachine}
+          onClose={() => setMachineSettings(null)}
         />
       )}
 

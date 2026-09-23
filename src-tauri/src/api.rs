@@ -14499,6 +14499,7 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_platform::host_platform;
     use crate::{
         catalog,
         model::{HookDefinition, ImageAttachment, ModelProfile},
@@ -34823,7 +34824,7 @@ mod tests {
         // PowerShell runs only on a Windows host; everywhere else both of its
         // tools are withdrawn rather than advertised to fail.
         for name in ["powershell", "powershell_find_output"] {
-            assert_eq!(exposed.contains(name), cfg!(windows), "{name}");
+            assert_eq!(exposed.contains(name), host_platform().runs_powershell(), "{name}");
         }
     }
 
@@ -34850,7 +34851,10 @@ mod tests {
                     !matches!(name.as_str(), "preview_screenshot" | "preview_upload_image")
                 })
                 // A POSIX host withdraws both PowerShell tools.
-                .filter(|name| cfg!(windows) || !crate::builtin_schemas::is_powershell_tool(name))
+                .filter(|name| {
+                    host_platform().runs_powershell()
+                        || !crate::builtin_schemas::is_powershell_tool(name)
+                })
                 .collect::<Vec<_>>();
             let step = step_request(&request);
             let exposed = step

@@ -5,6 +5,7 @@ import {
   FolderKanban,
   FolderPlus,
   Server,
+  Settings,
   SquareTerminal
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -13,14 +14,16 @@ import type { AttachedWorkspace, RunTarget, SshMachineConfig, Workspace } from "
 import {
   isTemporaryWorkspace,
   projectWorkspaces,
+  runEnvKey,
   TEMPORARY_WORKSPACE_ID,
   terminalShellLabel,
   workspaceDirectoryLabel,
-  workspaceLocationTitle
+  workspaceLocationTitle,
+  workspaceMachineLabel
 } from "../lib/workspaces";
 import type { TerminalShell } from "../lib/workspaces";
 import { PopoverMenu } from "./PopoverMenu";
-import type { PopoverMenuItem } from "./PopoverMenu";
+import type { PopoverMenuItem, PopoverMenuSection } from "./PopoverMenu";
 
 /** The icon that says which machine a directory is on: this one, a WSL distribution, an SSH machine. */
 export function machineIcon(machine: RunTarget | null | undefined, size: number): ReactNode {
@@ -144,36 +147,89 @@ export function ProjectSelector({
 }
 
 /**
- * The composer's workspace chip, shown when the project has more than one workspace.
+ * The composer's workspace chip: the project's workspaces, grouped by the machine each is on.
  *
  * Choosing one changes nothing in the conversation — every workspace of the project stays
  * reachable by its number. It only decides which directory the Git chip beside it describes
  * and where the terminal button opens a shell.
+ *
+ * Each machine heading carries a gear for that machine's settings, and each workspace a gear
+ * for its environment variables: the variables belong to the workspace, not to its machine.
  */
 export function WorkspaceMemberSelector({
   workspaces,
   selected,
   sshMachines,
-  onSelect
+  showIndex = true,
+  onSelect,
+  onConfigureMachine,
+  onConfigureWorkspace
 }: {
   /** The project's workspaces in order; the first is the project's own directory. */
   workspaces: readonly AttachedWorkspace[];
   /** 1-based. */
   selected: number;
   sshMachines: readonly SshMachineConfig[];
+  /**
+   * Whether the chip shows the selected workspace's number. Numbers are addresses the host
+   * states to the model only when the conversation has more than one workspace; a lone
+   * workspace's "1" would name something the model never sees.
+   */
+  showIndex?: boolean;
   onSelect: (member: number) => void;
+  /** Opens the settings of a machine (`null` is this one). */
+  onConfigureMachine: (machine: RunTarget | null) => void;
+  /** Opens the environment variables of workspace `member` (1-based). */
+  onConfigureWorkspace: (member: number) => void;
 }) {
   const { t } = useI18n();
   const current = workspaces[selected - 1] ?? workspaces[0];
   if (!current) return null;
   const label = workspaceDirectoryLabel(current.path);
+  // One section per machine, in the order the machines first appear, so the numbers
+  // still read in ascending order within each group.
+  const groups = new Map<string, { machine: RunTarget | null; items: PopoverMenuItem[] }>();
+  workspaces.forEach((workspace, index) => {
+    const machine = workspace.machine ?? null;
+    const key = runEnvKey(machine);
+    const directory = workspaceDirectoryLabel(workspace.path);
+    const group = groups.get(key) ?? { machine, items: [] };
+    group.items.push({
+      id: `${index + 1}`,
+      label: directory,
+      title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
+      icon: machineIcon(workspace.machine, 14),
+      hint: String(index + 1),
+      checked: index + 1 === selected,
+      onSelect: () => onSelect(index + 1),
+      action: {
+        label: t("{name} 的环境变量", "Environment variables for {name}", { name: directory }),
+        icon: <Settings size={13} />,
+        onSelect: () => onConfigureWorkspace(index + 1)
+      }
+    });
+    groups.set(key, group);
+  });
+  const sections = Array.from(groups, ([key, group]): PopoverMenuSection => {
+    const machineName = workspaceMachineLabel(group.machine, sshMachines) ?? t("本机", "This machine");
+    return {
+      id: key,
+      label: machineName,
+      action: {
+        label: t("{name} 的设置", "Settings for {name}", { name: machineName }),
+        icon: <Settings size={13} />,
+        onSelect: () => onConfigureMachine(group.machine)
+      },
+      items: group.items
+    };
+  });
   return (
     <PopoverMenu
       rootClassName="workspace-member-selector"
       triggerClassName="composer-chip"
       trigger={<>
         {machineIcon(current.machine, 13)}
-        <span className="composer-chip__index" aria-hidden="true">{selected}</span>
+        {showIndex && <span className="composer-chip__index" aria-hidden="true">{selected}</span>}
         <span className="composer-chip__label">{label}</span>
         <ChevronDown size={11} className="composer-chip__caret" />
       </>}
@@ -181,19 +237,7 @@ export function WorkspaceMemberSelector({
       triggerTitle={workspaceLocationTitle(current.path, current.machine, sshMachines)}
       menuLabel={t("选择工作区", "Select workspace")}
       menuWidth={260}
-      sections={[{
-        id: "workspaces",
-        label: t("查看哪个工作区的 Git", "Show Git for"),
-        items: workspaces.map((workspace, index): PopoverMenuItem => ({
-          id: `${index + 1}`,
-          label: workspaceDirectoryLabel(workspace.path),
-          title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
-          icon: machineIcon(workspace.machine, 14),
-          hint: String(index + 1),
-          checked: index + 1 === selected,
-          onSelect: () => onSelect(index + 1)
-        }))
-      }]}
+      sections={sections}
     />
   );
 }

@@ -48,6 +48,7 @@ mod file_read_state;
 mod fork_requests;
 mod git;
 mod hooks;
+mod host_platform;
 mod http_util;
 mod image_attachments;
 mod instance_activation;
@@ -88,7 +89,10 @@ mod prompt_profile_files;
 mod push_events;
 mod remote_directory;
 mod remote_files;
+mod remote_link;
 mod remote_lsp;
+mod remote_shell;
+mod remote_terminal;
 mod reveal_path;
 mod run_environment;
 mod run_stream;
@@ -2200,11 +2204,12 @@ fn reveal_directory(directory: &std::path::Path) -> Result<(), String> {
 
 #[cfg(all(not(test), not(windows)))]
 fn reveal_directory(directory: &std::path::Path) -> Result<(), String> {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
+    // Which command opens a folder here is the host's to answer, and it answers
+    // for all three platforms in one place. Windows never reaches this build of
+    // the function: `explorer.exe` is the sibling above.
+    let opener = host_platform::host_platform()
+        .desktop_opener()
+        .ok_or_else(|| "这个平台没有可用的目录打开方式".to_owned())?;
     std::process::Command::new(opener)
         .arg(directory)
         .spawn()
@@ -5394,6 +5399,7 @@ fn remote_terminal_launch(
     let runner = crate::run_environment::resolve_shell_runner(
         &document.assets.execution_environments,
         Some(machine),
+        Some(&workspace.path),
     )?;
     let app_data = app
         .path()
@@ -5442,11 +5448,7 @@ fn workspace_terminal_launch(
         .app_data_dir()
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
     let anchor = effective_workspace_path(&app_data, project, conversation)?;
-    let workspaces = crate::workspace_set::WorkspaceSet::resolve(
-        &document.assets.execution_environments,
-        &primary_workspace(project, &anchor),
-        &project.conversation_workspaces_after_primary(conversation),
-    )?;
+    let workspaces = conversation_workspace_set(&document, project, conversation, &anchor)?;
     let entry = workspaces.get(index).ok_or_else(|| {
         format!(
             "终端请求的对话没有工作区 {index}（共 {} 个）",
@@ -5676,7 +5678,10 @@ fn revalidate_project_memory_workspace(
         .map_err(|_| "项目记忆工作区在运行前已不可访问；请重试".to_owned())?;
     let requested = std::fs::canonicalize(&request.workspace_path)
         .map_err(|_| "项目记忆工作区在运行前已不可访问；请重试".to_owned())?;
-    let same = if cfg!(windows) {
+    // Two spellings that differ only in case are one directory wherever the
+    // host's filesystem says so, which on macOS it does — comparing them
+    // byte for byte there would report a change the user never made.
+    let same = if host_platform::host_platform().paths_are_case_insensitive() {
         current
             .to_string_lossy()
             .eq_ignore_ascii_case(&requested.to_string_lossy())
@@ -6442,11 +6447,8 @@ fn trusted_run_request(
     // dispatches to cannot change between this snapshot and the calls the turn
     // makes. A deleted SSH machine fails the resolution explicitly rather than
     // silently running locally.
-    request.workspaces = crate::workspace_set::WorkspaceSet::resolve(
-        &document.assets.execution_environments,
-        &primary_workspace(workspace, &request.workspace_path),
-        &workspace.conversation_workspaces_after_primary(conversation),
-    )?;
+    request.workspaces =
+        conversation_workspace_set(&document, workspace, conversation, &request.workspace_path)?;
     // The run's own shell environment is workspace 1's machine. The persisted
     // `run_target` is no longer read: its picker is gone from the composer, so a
     // stale value — one naming a deleted SSH machine, say — would fail every run
@@ -6953,11 +6955,7 @@ fn trusted_conversation_policy_from_document(
         .collect();
     // Resolved exactly as `trusted_run_request` resolves a model run's set, so a
     // manually executed tool card addresses the same numbered list.
-    let workspaces = crate::workspace_set::WorkspaceSet::resolve(
-        &document.assets.execution_environments,
-        &primary_workspace(workspace, &workspace_path),
-        &workspace.conversation_workspaces_after_primary(conversation),
-    )?;
+    let workspaces = conversation_workspace_set(document, workspace, conversation, &workspace_path)?;
     let run_environment = workspaces.primary_runner();
     Ok(TrustedConversationPolicy {
         workspace_path,
@@ -7046,6 +7044,32 @@ fn primary_workspace(workspace: &Workspace, anchor: &str) -> model::AttachedWork
             path: anchor.to_owned(),
         },
     }
+}
+
+/// A conversation's numbered workspaces, resolved from one read of the document.
+///
+/// `anchor` is what [`effective_workspace_path`] returned. Workspace 1's
+/// variables are the project's registered directory's, so a conversation in a
+/// worktree runs with the variables of the directory it was checked out from.
+#[cfg(not(test))]
+fn conversation_workspace_set(
+    document: &AppDocument,
+    workspace: &Workspace,
+    conversation: &model::Conversation,
+    anchor: &str,
+) -> Result<crate::workspace_set::WorkspaceSet, String> {
+    let primary = primary_workspace(workspace, anchor);
+    let primary_env_path = if workspace.kind == WorkspaceKind::Directory {
+        workspace.path.as_str()
+    } else {
+        primary.path.as_str()
+    };
+    crate::workspace_set::WorkspaceSet::resolve_with_primary_env(
+        &document.assets.execution_environments,
+        &primary,
+        primary_env_path,
+        &workspace.conversation_workspaces_after_primary(conversation),
+    )
 }
 
 #[cfg(not(test))]
@@ -7890,6 +7914,9 @@ fn finalize_app_shutdown(app_handle: &AppHandle, coordinator: &app_exit::AppExit
     // project it was started in, so one left behind makes the next launch's
     // server fail to start rather than merely leak.
     state.lsp_servers.stop_all();
+    // Every SSH machine's agent is told the host is leaving, so what it ran
+    // for this host ends now rather than after its orphan time.
+    remote_link::shutdown();
     // The AI SDK sidecar is a resident Node process. Windows Job Objects only
     // cover forced parent termination, so normal exit must explicitly stop it.
     crate::aisdk::process::shutdown_sidecar();
@@ -7909,9 +7936,12 @@ fn tauri_context() -> tauri::Context<tauri::Wry> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg(not(test))]
 pub fn run() {
-    // Before any thread exists: a development launcher hands over the PATH the
-    // application should run with, which is not the toolchain-first PATH cargo
-    // needed to build it.
+    // Before any thread exists: which machine Mework itself is. Every later
+    // host-side branch reads this one answer instead of asking the compiler
+    // again at its own site, where macOS used to inherit Linux's arm.
+    host_platform::resolve_at_startup();
+    // A development launcher hands over the PATH the application should run
+    // with, which is not the toolchain-first PATH cargo needed to build it.
     child_environment::restore_dev_application_path();
     child_environment::adopt_login_shell_path();
     let exit_coordinator = app_exit::AppExitCoordinator::default();
@@ -7984,6 +8014,46 @@ pub fn run() {
                     eprintln!("内置提示词档案未能落盘：{error}");
                 }
                 browser_file_preview::sweep_orphans(app_data);
+                // SSH machines are reached through the agent Mework keeps on
+                // them; the builds it installs there ship as resources.
+                let mut agent_dirs = Vec::new();
+                if let Ok(resources) = app.path().resource_dir() {
+                    agent_dirs.push(resources.join("remote-agents"));
+                }
+                if let Some(exe_dir) = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                {
+                    agent_dirs.push(exe_dir.join("remote-agents"));
+                }
+                let push_events = app.state::<AppState>().push_events.clone();
+                remote_link::install(
+                    app_data,
+                    agent_dirs,
+                    Some(Box::new(move |host, status| {
+                        use remote_agent::client::LinkStatus;
+                        let (state, detail) = match status {
+                            LinkStatus::Connecting => (push_events::RemoteLinkState::Connecting, None),
+                            LinkStatus::Connected { .. } => (push_events::RemoteLinkState::Connected, None),
+                            LinkStatus::Reconnecting { error, .. } => (
+                                push_events::RemoteLinkState::Reconnecting,
+                                Some(error.clone()).filter(|error| !error.is_empty()),
+                            ),
+                            LinkStatus::Lost { error } => {
+                                (push_events::RemoteLinkState::Lost, Some(error.clone()))
+                            }
+                            LinkStatus::Unavailable { error } => {
+                                (push_events::RemoteLinkState::Unavailable, Some(error.clone()))
+                            }
+                            LinkStatus::Closed => return,
+                        };
+                        push_events.publish(push_events::AppPushEvent::RemoteLinkChanged {
+                            host: host.to_owned(),
+                            state,
+                            detail,
+                        });
+                    })),
+                );
             }
             reconcile_image_attachments_on_startup(app.handle()).map_err(std::io::Error::other)?;
             install_background_write_failure_reporting(app.state::<AppState>().inner());

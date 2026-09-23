@@ -40,7 +40,7 @@ use serde_json::{json, Map, Value};
 use crate::{
     lsp_config::LspServerConfig,
     run_environment::ShellRunner,
-    tool_executor::{kill_process_tree_or_child, ShellJob},
+    tool_executor::{kill_shell_child, ShellChild, ShellJob},
 };
 
 /// Where a language server runs: in this process, or on the machine a
@@ -455,7 +455,7 @@ struct WriteRequest {
 
 /// A running language server and everything needed to talk to it.
 pub struct Connection {
-    child: Mutex<Child>,
+    child: Mutex<ShellChild>,
     /// Behind a lock because the reader thread holds an `Arc<Connection>`, and
     /// a raw Windows job handle is `Send` but not `Sync`.
     job: Mutex<ShellJob>,
@@ -1168,7 +1168,7 @@ fn start_server(
     sink: std::sync::Weak<Mutex<Registry>>,
 ) -> Result<Arc<Connection>, String> {
     let child = match host {
-        ServerHost::Local => spawn_local(config, &root.path)?,
+        ServerHost::Local => ShellChild::Local(spawn_local(config, &root.path)?),
         ServerHost::Remote { runner, .. } => spawn_remote(runner, config, &root.path)?,
     };
     attach_server(child, host, config, root, sink)
@@ -1178,27 +1178,27 @@ fn start_server(
 /// pipes, and completes the handshake. Separate from the spawn so the remote
 /// leg's script can be driven through any shell in a test.
 fn attach_server(
-    mut child: Child,
+    mut child: ShellChild,
     host: &ServerHost,
     config: &LspServerConfig,
     root: &ServerRoot,
     sink: std::sync::Weak<Mutex<Registry>>,
 ) -> Result<Arc<Connection>, String> {
-    // Before it can spawn grandchildren of its own.
+    // Before it can spawn grandchildren of its own. A server the agent runs
+    // is already its own process group on the machine; nothing here owns it.
     let job = ShellJob::create();
-    job.assign(&child);
+    if let ShellChild::Local(local) = &child {
+        job.assign(local);
+    }
 
     let stdin = child
-        .stdin
-        .take()
+        .take_stdin()
         .ok_or_else(|| "Could not acquire the language server's stdin".to_owned())?;
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "Could not acquire the language server's stdout".to_owned())?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "Could not acquire the language server's stderr".to_owned())?;
 
     let (writes, write_requests) = mpsc::sync_channel::<WriteRequest>(1);
@@ -1367,14 +1367,38 @@ fn spawn_remote(
     runner: &ShellRunner,
     config: &LspServerConfig,
     root: &Path,
-) -> Result<Child, String> {
+) -> Result<ShellChild, String> {
     let script = remote_launch_script(config, root)?;
-    crate::run_environment::spawn_remote_script(runner, &script, true).map_err(|error| {
+    let failed = |error: String| {
         format!(
             "Could not start the language server '{}' ({}) on the remote machine: {error}",
             config.name, config.command
         )
-    })
+    };
+    // An SSH machine the agent serves runs the server itself: the server then
+    // belongs to the machine's agent, not to an SSH session, and a dropped
+    // link pauses its conversation instead of ending it.
+    let argv = ["bash", "--noprofile", "--norc", "-c", script.as_str()]
+        .iter()
+        .map(|part| (*part).to_owned())
+        .collect();
+    if let Some(spawned) = crate::remote_link::spawn(
+        runner,
+        argv,
+        None,
+        remote_agent::protocol::StdinMode::Pipe,
+        "lsp",
+    ) {
+        return spawned
+            .map(|child| ShellChild::Remote {
+                child,
+                killed: false,
+            })
+            .map_err(failed);
+    }
+    crate::run_environment::spawn_remote_script(runner, &script, true)
+        .map(ShellChild::Local)
+        .map_err(failed)
 }
 
 /// The script that starts one configured server on a remote machine.
@@ -1545,7 +1569,7 @@ fn client_capabilities(config: &LspServerConfig) -> Value {
 /// even though everything the server itself writes is UTF-8. The returned
 /// receiver fires when the pipe reaches end of file.
 fn spawn_stderr_drain(
-    stderr: std::process::ChildStderr,
+    stderr: Box<dyn Read + Send>,
     sink: Arc<Mutex<String>>,
     wsl: bool,
 ) -> mpsc::Receiver<()> {
@@ -1592,7 +1616,7 @@ fn spawn_stderr_drain(
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_reader(
-    stdout: std::process::ChildStdout,
+    stdout: Box<dyn Read + Send>,
     alive: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<i64, SyncSender<Result<Value, String>>>>>,
     failure: Arc<Mutex<Option<String>>>,
@@ -1857,7 +1881,7 @@ fn stop_connection(connection: &Connection) {
         .job
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    kill_process_tree_or_child(&mut child, &job);
+    kill_shell_child(&mut child, &job);
     let _ = child.wait();
 }
 
@@ -2444,8 +2468,14 @@ process.stderr.write("fake server up\n");
 
         let host = fake_host();
         let server_root = ServerRoot::new(&host, PathBuf::from(&root));
-        let connection = attach_server(child, &host, &config, &server_root, std::sync::Weak::new())
-            .expect("the handshake completes through the shell");
+        let connection = attach_server(
+            ShellChild::Local(child),
+            &host,
+            &config,
+            &server_root,
+            std::sync::Weak::new(),
+        )
+        .expect("the handshake completes through the shell");
         assert!(connection.is_alive());
 
         let document = PathBuf::from(format!("{root}/main.rs"));
@@ -2510,7 +2540,7 @@ process.stderr.write("fake server up\n");
         };
         let host = fake_host();
         let Err(error) = attach_server(
-            child,
+            ShellChild::Local(child),
             &host,
             &config,
             &ServerRoot::new(&host, PathBuf::from("/")),
