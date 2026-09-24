@@ -58,7 +58,8 @@ const upToDateCheck: AppUpdateCheck = {
   },
   asset: null,
   checksumsAsset: null,
-  checkedAt: "2026-09-05T12:00:00Z"
+  checkedAt: "2026-09-05T12:00:00Z",
+  inAppInstall: true
 };
 
 const availableCheck: AppUpdateCheck = {
@@ -78,7 +79,8 @@ const availableCheck: AppUpdateCheck = {
     downloadUrl: "https://github.com/catblob-hash/Mework/releases/download/v1.1.0/SHA256SUMS",
     size: 128
   },
-  checkedAt: "2026-09-05T12:00:00Z"
+  checkedAt: "2026-09-05T12:00:00Z",
+  inAppInstall: true
 };
 
 const downloadedUpdate: AppUpdateDownload = {
@@ -255,6 +257,37 @@ describe("UpdateSettings", () => {
       availableCheck.release.htmlUrl
     );
     expect(screen.queryByRole("button", { name: /下载更新/ })).not.toBeInTheDocument();
+  });
+
+  it("sends a host without in-app install to the release page without downloading", async () => {
+    const backend = createBackend();
+    // A Mac detects as "portable" only because it has no NSIS uninstaller.
+    updateMocks.appVersionInfo.mockResolvedValue({
+      ...versionInfo,
+      flavor: "portable",
+      arch: "aarch64",
+      os: "macos",
+      executableDir: "/Applications/Mework.app/Contents/MacOS"
+    });
+    backend.checkAppUpdate.mockResolvedValue({
+      ...availableCheck,
+      asset: null,
+      checksumsAsset: null,
+      inAppInstall: false
+    });
+    render(<UpdateSettings controller={createAppUpdateController(backend)} />);
+
+    expect(await screen.findByText("发现新版本 v1.1.0")).toBeInTheDocument();
+    expect(screen.getByText(/当前平台暂不支持应用内更新，请到发布页下载新版本。/)).toBeInTheDocument();
+    expect(screen.queryByText(/便携版的安装文件/)).not.toBeInTheDocument();
+    // The Windows edition badge would only echo the missing NSIS uninstaller.
+    expect(screen.queryByText("便携版")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "前往发布页" })).toHaveAttribute(
+      "href",
+      availableCheck.release.htmlUrl
+    );
+    expect(screen.queryByRole("button", { name: /下载更新/ })).not.toBeInTheDocument();
+    expect(backend.downloadAppUpdate).not.toHaveBeenCalled();
   });
 
   it("shows a failed check and retries it on request", async () => {

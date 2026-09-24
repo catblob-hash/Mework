@@ -11,7 +11,7 @@ Mework ships {{TOOL_COUNT}} built-in tools. Each has its own page with what it d
 | `read_global_memory`, `create_global_memory`, `edit_global_memory` | the **global memory** switch |
 | `read_project_memory`, `create_project_memory`, `edit_project_memory` | the **project memory** switch |
 | `web_search`, `web_fetch` | the conversation's single **Enable web search** switch; which of the two a run gets depends on the resolved backend |
-| `task_wait`, `task_list`, `box` | any task-producing tool being enabled (`agent_spawn`, `workflow`, `bash`, `powershell`, `preview_start`) |
+| `task_wait`, `task_list`, `box` | any task-producing tool being enabled (`agent_spawn`, `workflow`, `bash`, `zsh`, `sh`, `powershell`, `preview_start`) |
 | `skill` | the **Load skills on demand** switch, when at least one skill is selected |
 | `tool_search` | the **Tool discovery** switch (MCP), when a run is holding MCP tool schemas back |
 | `plan`, `exit_plan_mode` | the **security level** being Plan mode |

@@ -18,6 +18,14 @@ export type ConversationAuthoritySink = (
   conversation: Conversation
 ) => void;
 
+/**
+ * Resolves once the host's document holds `workspaceId`. The host files a
+ * conversation only under a workspace it already knows, and a project added in
+ * the same event reaches it through the debounced document save — later than
+ * the conversation command that follows it.
+ */
+export type WorkspaceBarrier = (workspaceId: string) => Promise<void>;
+
 interface PendingCommit {
   workspaceId: string;
   /** Main-timeline context IDs visible to the renderer before this debounce window. */
@@ -53,7 +61,8 @@ export interface ConversationSync {
  * localStorage and have no second writer.
  */
 export function createConversationSync(
-  applyAuthority: ConversationAuthoritySink
+  applyAuthority: ConversationAuthoritySink,
+  workspaceReady: WorkspaceBarrier = async () => undefined
 ): ConversationSync {
   const pending = new Map<string, PendingCommit>();
   /** Commands execute in send order so creation, mutation, and deletion cannot overtake each other. */
@@ -66,6 +75,10 @@ export function createConversationSync(
     tail = next.catch(() => undefined);
     return next;
   };
+
+  /** A failed barrier still lets the command through: the host then refuses it
+   * with its own reason, which is the one worth recording. */
+  const awaitWorkspace = (workspaceId: string) => workspaceReady(workspaceId).catch(() => undefined);
 
   /**
    * On a rejected write, the renderer's optimistic copy is no longer valid.
@@ -88,6 +101,7 @@ export function createConversationSync(
     pending.delete(conversationId);
     if (entry.timer) clearTimeout(entry.timer);
     void enqueue(async () => {
+      await awaitWorkspace(entry.workspaceId);
       let authoritative: Conversation | null;
       try {
         authoritative = await updateConversationRemote(
@@ -120,6 +134,7 @@ export function createConversationSync(
     created(workspaceId, conversation, orderedIds) {
       if (!active()) return;
       void enqueue(async () => {
+        await awaitWorkspace(workspaceId);
         let stored: Conversation | null;
         try {
           stored = await createConversationRemote(workspaceId, conversation);
@@ -165,7 +180,11 @@ export function createConversationSync(
 
     reordered(workspaceId, orderedIds) {
       if (!active()) return;
-      void enqueue(() => reorderConversationsRemote(workspaceId, orderedIds)).catch((error) => {
+      // Moving a conversation into a project added in the same event is a reorder of that project.
+      void enqueue(async () => {
+        await awaitWorkspace(workspaceId);
+        await reorderConversationsRemote(workspaceId, orderedIds);
+      }).catch((error) => {
         console.error("对话顺序未能写入宿主", error);
       });
     },

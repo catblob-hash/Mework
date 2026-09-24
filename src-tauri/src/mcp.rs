@@ -4035,7 +4035,38 @@ fn inherit_runtime_environment(command: &mut Command) {
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
     ];
-    for name in SAFE_NAMES {
+    // What a POSIX program expects to find about who it runs as, which locale
+    // it prints in and how it reaches the network — the MCP SDK's own POSIX
+    // default passes `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER`.
+    // Without a `LANG` a Python or Node server assumes ASCII and fails on the
+    // first non-English path; without the proxy variables `npx`/`uvx` cannot
+    // download a server at all behind the proxy most users in China depend on.
+    // None of these is a Mework or provider credential: a proxy URL is the
+    // user's own network setting, and `SSH_AUTH_SOCK` names a socket any
+    // process of this user can already find and use, which a server cloning a
+    // repository over SSH needs. Windows keeps exactly its list above.
+    #[cfg(not(windows))]
+    const POSIX_NAMES: &[&str] = &[
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSH_AUTH_SOCK",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ];
+    #[cfg(windows)]
+    const POSIX_NAMES: &[&str] = &[];
+    for name in SAFE_NAMES.iter().chain(POSIX_NAMES) {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
@@ -6054,6 +6085,52 @@ process.stdin.on("data", (chunk) => {
         validate_env_passthrough(&["GITHUB_TOKEN".into(), "CUSTOM_2".into()]).unwrap();
         let mut command = Command::new("unused");
         assert!(inherit_env_passthrough(&mut command, &["OPENAI_API_KEY".into()]).is_err());
+    }
+
+    /// A POSIX server gets who it runs as, its locale and the user's proxy, as
+    /// the MCP SDK's own default would give it, and still no host or provider
+    /// credential.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_environment_carries_posix_identity_locale_and_proxy_only() {
+        let mut command = Command::new("unused");
+        command.env_clear();
+        inherit_runtime_environment(&mut command);
+        let passed: BTreeMap<_, _> = command.get_envs().collect();
+        for name in [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "SSH_AUTH_SOCK",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ] {
+            assert_eq!(
+                passed.get(std::ffi::OsStr::new(name)).copied().flatten(),
+                std::env::var_os(name).as_deref(),
+                "{name}"
+            );
+        }
+        for name in passed.keys() {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            assert!(
+                !name.starts_with("MEWORK_") && !name.contains("KEY") && !name.contains("TOKEN"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

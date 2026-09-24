@@ -164,6 +164,26 @@ enum InputCommand {
     Close,
 }
 
+/// What a session's signals reach.
+enum Process {
+    /// A child of this daemon's, and everything it started.
+    Tree(ProcessTree),
+    /// A process in a sandboxed cell (see [`super::cells`]); the cell
+    /// signals its tree.
+    Relayed(Arc<crate::client::RemoteProcess>),
+}
+
+impl Process {
+    fn signal(&self, signal: SignalKind) {
+        match self {
+            Self::Tree(tree) => {
+                tree.signal(signal);
+            }
+            Self::Relayed(process) => process.signal(signal),
+        }
+    }
+}
+
 struct InputPort {
     /// Bytes of input that have arrived, whether or not written yet.
     received: u64,
@@ -179,7 +199,7 @@ pub struct Session {
     pub started: Instant,
     pub orphan_ttl: Duration,
     pub state: Mutex<SessionState>,
-    tree: ProcessTree,
+    process: Process,
     input: Mutex<InputPort>,
     /// The pseudo terminal's master, kept for resizing; dropped when the
     /// session ends.
@@ -257,6 +277,13 @@ impl Session {
     }
 
     pub fn resize(&self, size: TerminalSize) -> Result<(), Failure> {
+        if let Process::Relayed(process) = &self.process {
+            if !self.terminal {
+                return Err(Failure::new(FailureKind::Invalid, "This session has no terminal"));
+            }
+            process.resize(size);
+            return Ok(());
+        }
         let master = lock(&self.master);
         let Some(master) = master.as_ref() else {
             return Err(Failure::new(
@@ -288,7 +315,7 @@ impl Session {
                 state.kill_reason = Some(reason);
             }
         }
-        self.tree.signal(signal);
+        self.process.signal(signal);
         // A terminal's shell may ignore the hangup; it does not get to keep
         // the session alive by doing so.
         if matches!(signal, SignalKind::Hangup | SignalKind::Terminate) {
@@ -301,7 +328,7 @@ impl Session {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                session.tree.signal(SignalKind::Kill);
+                session.process.signal(SignalKind::Kill);
             });
         }
     }
@@ -388,12 +415,18 @@ pub fn spawn(spec: &SpawnSpec, body: Vec<u8>, context: SpawnContext<'_>) -> Resu
             format!("The working directory does not exist: {}", cwd.display()),
         ));
     }
-    let resolved = resolve_program(program, &env, &cwd, context.home).ok_or_else(|| {
-        Failure::new(
-            FailureKind::NotFound,
-            format!("{program} was not found on this machine's PATH"),
-        )
-    })?;
+    let resolved = if program == crate::protocol::SELF_PROGRAM {
+        std::env::current_exe().map_err(|error| {
+            Failure::new(FailureKind::Io, format!("The agent cannot find its own executable: {error}"))
+        })?
+    } else {
+        resolve_program(program, &env, &cwd, context.home).ok_or_else(|| {
+            Failure::new(
+                FailureKind::NotFound,
+                format!("{program} was not found on this machine's PATH"),
+            )
+        })?
+    };
     let orphan_ttl = spec
         .orphan_ttl_secs
         .map(Duration::from_secs)
@@ -472,7 +505,7 @@ fn spawn_pipes(
         started: Instant::now(),
         orphan_ttl,
         state: Mutex::new(SessionState::new(capacity, true)),
-        tree,
+        process: Process::Tree(tree),
         input: Mutex::new(InputPort {
             received: 0,
             sender: stdin.is_some().then_some(sender.clone()),
@@ -584,7 +617,7 @@ fn spawn_terminal(
         started: Instant::now(),
         orphan_ttl,
         state: Mutex::new(SessionState::new(capacity, false)),
-        tree,
+        process: Process::Tree(tree),
         // A terminal is typed into for as long as it runs, whatever the spec
         // says: closing its input would hand the shell an end of file.
         input: Mutex::new(InputPort {
@@ -621,6 +654,111 @@ fn spawn_terminal(
         })
         .map_err(|error| Failure::new(FailureKind::Io, format!("Cannot start a thread: {error}")))?;
     Ok(session)
+}
+
+/// Takes a process a cell started (see [`super::cells`]) as a session of this
+/// daemon's: its output read into this daemon's rings, its input, signals
+/// and resizes passed on, its exit taken from the cell's. The host sees an
+/// ordinary session.
+pub fn spawn_relayed(
+    spec: &SpawnSpec,
+    mut process: crate::client::RemoteProcess,
+    context: SpawnContext<'_>,
+) -> Result<Arc<Session>, Failure> {
+    let terminal = spec.terminal.is_some();
+    let stdout = process.take_stdout();
+    let stderr = process.take_stderr();
+    let process = Arc::new(process);
+    let capacity = spec.output_limit.map(|limit| limit as usize).unwrap_or(if terminal {
+        DEFAULT_TERMINAL_OUTPUT
+    } else {
+        DEFAULT_PIPE_OUTPUT
+    });
+    let orphan_ttl = spec
+        .orphan_ttl_secs
+        .map(Duration::from_secs)
+        .unwrap_or(context.orphan_ttl);
+    let takes_input = terminal || spec.stdin == StdinMode::Pipe;
+    let (sender, receiver) = mpsc::channel();
+    let session = Arc::new(Session {
+        sid: spec.sid.clone(),
+        owner: context.owner,
+        pid: process.pid(),
+        terminal,
+        label: spec.label.clone(),
+        started: Instant::now(),
+        orphan_ttl,
+        state: Mutex::new(SessionState::new(capacity, !terminal)),
+        process: Process::Relayed(Arc::clone(&process)),
+        input: Mutex::new(InputPort {
+            received: 0,
+            sender: takes_input.then_some(sender),
+        }),
+        master: Mutex::new(None),
+        closing: AtomicBool::new(false),
+        reclaiming: AtomicBool::new(false),
+        notifier: context.notifier,
+    });
+    if takes_input {
+        start_input_writer(
+            &session,
+            Box::new(RelayedInput {
+                writer: process.stdin(),
+                process: Arc::clone(&process),
+            }),
+            receiver,
+        );
+    }
+    // The cell had the body with the spawn itself.
+    if spec.stdin == StdinMode::Body {
+        lock(&session.input).received = 0;
+    }
+    match stdout {
+        Some(stdout) => start_pipe_reader(&session, Stream::Stdout, stdout),
+        None => session.stream_done(Stream::Stdout),
+    }
+    if !terminal {
+        match stderr {
+            Some(stderr) => start_pipe_reader(&session, Stream::Stderr, stderr),
+            None => session.stream_done(Stream::Stderr),
+        }
+    }
+    let waiter = Arc::clone(&session);
+    std::thread::Builder::new()
+        .name(format!("wait-{}", spec.sid))
+        .spawn(move || {
+            let (code, signal) = match process.wait() {
+                Ok(exit) => (exit.code, exit.signal),
+                // The cell is gone, and the process with it.
+                Err(_) => (None, None),
+            };
+            waiter.reaped(code, signal);
+        })
+        .map_err(|error| Failure::new(FailureKind::Io, format!("Cannot start a thread: {error}")))?;
+    Ok(session)
+}
+
+/// A relayed session's input: writes go to the cell, and closing it closes
+/// the process's input there.
+struct RelayedInput {
+    writer: crate::client::SessionWriter,
+    process: Arc<crate::client::RemoteProcess>,
+}
+
+impl Write for RelayedInput {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl Drop for RelayedInput {
+    fn drop(&mut self) {
+        self.process.close_stdin();
+    }
 }
 
 fn wait_terminal_child(child: Box<dyn portable_pty::Child + Send + Sync>) -> (Option<i32>, Option<i32>) {

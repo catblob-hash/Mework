@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { configureI18n } from "./i18n";
 import type { GitTarget, GitWorkspaceSnapshot } from "./lib/git";
-import { gitConversationTarget } from "./lib/git";
+import { gitConversationTarget, gitWorkspaceTarget } from "./lib/git";
 import { documentWithModel, expandGitStatus, gitMocks, resetAppMocks, runtimeMocks } from "./test/appMocks";
 
 /**
@@ -48,6 +48,9 @@ vi.mock("./lib/git", async (importOriginal) => {
 vi.mock("./components/TerminalPanel", async () => (await import("./test/appMockInstances")).terminalPanelModuleMock());
 
 afterEach(() => configureI18n("zh-CN"));
+
+/** The fixture's project, which a new task opened from its conversation is aimed at. */
+const workspaceId = () => documentWithModel().workspaces[0].id;
 
 function snapshot(branch: string): GitWorkspaceSnapshot {
   return {
@@ -97,8 +100,9 @@ function summaryResult(value: GitWorkspaceSnapshot) {
 }
 
 /**
- * Workspace-backed drafts have host conversation rows, so Git reads and writes
- * use their persisted conversation IDs even before the first message.
+ * A new task is the renderer's draft until it materializes, so it has no host
+ * conversation row: its Git reads and writes address its project's workspace
+ * root, and a worktree it asks for is created when it first sends.
  */
 describe("draft conversation Git surface", () => {
   beforeEach(() => {
@@ -109,16 +113,16 @@ describe("draft conversation Git surface", () => {
     gitMocks.getGitWorkspaceSummary.mockResolvedValue(summaryResult(snapshot("main")));
   });
 
-  it("asks Git about the persisted draft in its selected workspace", async () => {
+  it("asks Git about the draft through its project's workspace root", async () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
 
     await user.click(screen.getByRole("button", { name: "新建任务" }));
 
-    // The existing unsent slot is reused in the inherited workspace.
+    // The draft inherits the project it was opened from, which it reads by workspace.
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary).toHaveBeenCalledWith(
-      gitConversationTarget("conv_agent_gui"),
+      gitWorkspaceTarget(workspaceId()),
       undefined
     ));
     expect(await screen.findByRole("complementary", { name: "Git 状态" })).toBeInTheDocument();
@@ -126,7 +130,7 @@ describe("draft conversation Git surface", () => {
     expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked();
   });
 
-  it("stages a draft change through its conversation target", async () => {
+  it("stages a draft change through its workspace target", async () => {
     const dirtySnapshot: GitWorkspaceSnapshot = {
       ...snapshot("main"),
       additions: 1,
@@ -177,13 +181,13 @@ describe("draft conversation Git surface", () => {
     await user.click(await screen.findByRole("button", { name: /变更.*新增 1 行/ }));
     await clickReviewFileAction(user, "src/App.tsx", "暂存");
 
-    // Reads and writes address the same persisted unsent conversation.
+    // Reads and writes address the same workspace root, never the draft's placeholder id.
     await waitFor(() => expect(gitMocks.executeGitAction).toHaveBeenCalledWith(
-      gitConversationTarget("conv_agent_gui"),
+      gitWorkspaceTarget(workspaceId()),
       { type: "stage", paths: ["src/App.tsx"] }
     ));
     expect(gitMocks.getGitChangePage).toHaveBeenCalledWith(
-      gitConversationTarget("conv_agent_gui"),
+      gitWorkspaceTarget(workspaceId()),
       expect.anything()
     );
   });
@@ -201,7 +205,7 @@ describe("draft conversation Git surface", () => {
     expect(screen.queryByRole("complementary", { name: "Git 状态" })).not.toBeInTheDocument();
   });
 
-  it("keeps the status card across the persisted draft’s first send", async () => {
+  it("keeps the status card across the draft’s first send", async () => {
     const user = userEvent.setup();
     runtimeMocks.runModel.mockResolvedValue({
       contexts: [],
@@ -215,7 +219,7 @@ describe("draft conversation Git surface", () => {
     await user.click(screen.getByRole("button", { name: "新建任务" }));
     await screen.findByRole("complementary", { name: "Git 状态" });
 
-    // Sending preserves the persisted conversation and its checkout snapshot.
+    // The conversation the draft materializes as adopts its checkout snapshot.
     await user.type(screen.getByLabelText("向 Agent 发送消息"), "第一句话");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -223,7 +227,7 @@ describe("draft conversation Git surface", () => {
     expect(screen.getByRole("button", { name: "分支：main" })).toBeInTheDocument();
   });
 
-  it("creates the persisted draft worktree immediately before its first send", async () => {
+  it("creates the draft's requested worktree at its first send, before the model runs", async () => {
     const user = userEvent.setup();
     runtimeMocks.runModel.mockResolvedValue({
       contexts: [],
@@ -242,9 +246,9 @@ describe("draft conversation Git surface", () => {
     await user.click(screen.getByRole("button", { name: "新建任务" }));
 
     await user.click(await screen.findByRole("checkbox", { name: /工作树/ }));
-    // A workspace-backed draft already has the host row needed for creation.
-    await waitFor(() => expect(gitMocks.createConversationWorktree).toHaveBeenCalledExactlyOnceWith("conv_agent_gui"));
+    // The draft has no host row yet, so the box records the request and nothing more.
     await waitFor(() => expect(screen.getByRole("checkbox", { name: /工作树/ })).toBeChecked());
+    expect(gitMocks.createConversationWorktree).not.toHaveBeenCalled();
     expect(runtimeMocks.runModel).not.toHaveBeenCalled();
 
     await user.type(screen.getByLabelText("向 Agent 发送消息"), "在隔离检出上开始");
@@ -253,42 +257,48 @@ describe("draft conversation Git surface", () => {
     // Create the worktree before the first message so every tool call in that
     // turn uses the isolated checkout.
     await waitFor(() => expect(gitMocks.createConversationWorktree).toHaveBeenCalledTimes(1));
-    expect(gitMocks.createConversationWorktree.mock.calls[0][0]).not.toBe("__draft__");
+    const created = gitMocks.createConversationWorktree.mock.calls[0][0] as string;
+    expect(created).not.toBe("__draft__");
+    expect(created).not.toBe("conv_agent_gui");
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
     expect(gitMocks.createConversationWorktree.mock.invocationCallOrder[0])
       .toBeLessThan(runtimeMocks.runModel.mock.invocationCallOrder[0]);
-    // Persist the workspace-backed draft before creating its worktree because the
+    // Persist the materialized conversation before creating its worktree because the
     // host resolves conversations from its saved document.
     expect(runtimeMocks.saveDocument).toHaveBeenCalled();
     expect(runtimeMocks.saveDocument.mock.invocationCallOrder[0])
       .toBeLessThan(gitMocks.createConversationWorktree.mock.invocationCallOrder[0]);
-    // The persisted draft's initial checkout read has no cached revision.
+    // The new checkout's first read carries no revision cached from the workspace root.
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary).toHaveBeenCalledWith(
-      gitConversationTarget("conv_agent_gui"),
+      gitConversationTarget(created),
       undefined
     ));
     const firstConversationRead = gitMocks.getGitWorkspaceSummary.mock.calls.find(
       (call) => (call[0] as GitTarget).kind === "conversation"
+        && (call[0] as { conversationId: string }).conversationId === created
     );
     expect(firstConversationRead?.[1]).toBeUndefined();
 
   });
 
-  it("reports immediate worktree creation failure without enabling isolation", async () => {
+  it("sends nothing when the draft's worktree cannot be created, and says why", async () => {
     const user = userEvent.setup();
     gitMocks.createConversationWorktree.mockRejectedValue(new Error("仓库还没有任何提交"));
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
     await user.click(screen.getByRole("button", { name: "新建任务" }));
     await user.click(await screen.findByRole("checkbox", { name: /工作树/ }));
+    await user.type(screen.getByLabelText("向 Agent 发送消息"), "在隔离检出上开始");
+    await user.click(screen.getByRole("button", { name: "发送" }));
 
-    // Failure belongs to the checkbox operation, not a deferred send.
-    // No message has been submitted and isolation must remain disabled.
+    // The first message must not fall back to the workspace root, so it is not sent at all,
+    // and isolation shows as off: the conversation it materialized as has no worktree.
     await waitFor(() => expect(gitMocks.createConversationWorktree).toHaveBeenCalled());
-    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
     const alert = await screen.findByRole("alert");
-    expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked();
     expect(alert).toHaveTextContent("仓库还没有任何提交");
+    expect(alert).toHaveTextContent("消息还没有发出");
+    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
+    expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked();
   });
 
   it("addresses a persisted conversation by conversation, not by workspace", async () => {
@@ -380,15 +390,13 @@ describe("draft conversation Git surface", () => {
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
 
     await user.click(screen.getByRole("button", { name: "新建任务" }));
+    const draftTarget = gitWorkspaceTarget(workspaceId());
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "conversation", conversationId: expect.not.stringMatching(`^${peerConversationId}$`) }),
+      draftTarget,
       undefined
     ));
     await expandGitStatus(user);
     await user.click(await screen.findByRole("button", { name: /变更.*新增 1 行/ }));
-    const draftTarget = gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target)
-      .find((target) => target.kind === "conversation" && target.conversationId !== peerConversationId);
-    expect(draftTarget).toBeDefined();
     await openReviewFileMenu(user, "src/App.tsx");
     const stage = await screen.findByRole("menuitem", { name: /^暂存/ });
     return { stage, draftTarget };

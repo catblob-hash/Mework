@@ -56,7 +56,10 @@ pub const ENVIRONMENT_TOOL_PRESETS: &[EnvironmentToolPreset] = &[
     },
     EnvironmentToolPreset {
         name: "Python",
-        executable: "python",
+        // macOS and most Linux distributions install only `python3`; a bare
+        // `python` there is absent, so probing it always reported Python as
+        // missing. The Windows installer's interpreter is `python.exe`.
+        executable: if cfg!(windows) { "python" } else { "python3" },
         description: "Python 解释器；pipx/uvx 之外的 Python MCP 服务器需要它。",
         repo_url: "https://github.com/python/cpython",
         homepage: "https://www.python.org",
@@ -181,7 +184,10 @@ fn probe_one(name: &str, executable: &str, version_args: &[String]) -> Environme
 /// Resolves a bare executable name on PATH.
 ///
 /// Do not use a shell: `where` / `which` delegate resolution to an external
-/// program that PATH can replace. This must report the first PATH match.
+/// program that PATH can replace. This must report the first PATH match that
+/// can run as the tool it is named for: on a Mac without the command line
+/// tools, `/usr/bin/git` and `/usr/bin/python3` are stand-ins that only open
+/// the install dialog, so they are skipped and the search goes on.
 pub fn resolve_on_path(executable: &str) -> Option<PathBuf> {
     let name = executable.trim();
     if name.is_empty() || name.contains('/') || name.contains('\\') {
@@ -194,7 +200,9 @@ pub fn resolve_on_path(executable: &str) -> Option<PathBuf> {
         }
         for extension in &extensions {
             let candidate = directory.join(format!("{name}{extension}"));
-            if matches!(std::fs::metadata(&candidate), Ok(metadata) if metadata.is_file()) {
+            if matches!(std::fs::metadata(&candidate), Ok(metadata) if metadata.is_file())
+                && !crate::host_platform::is_uninstalled_developer_tool_shim(&candidate)
+            {
                 return Some(candidate);
             }
         }

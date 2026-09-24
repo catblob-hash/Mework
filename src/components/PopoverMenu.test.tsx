@@ -78,6 +78,28 @@ describe("PopoverMenu", () => {
     expect(screen.getByRole("menu", { name: "模型" })).toBeInTheDocument();
   });
 
+  it("paints above a modal its trigger sits in, and keeps the stylesheet's layer elsewhere", async () => {
+    const user = userEvent.setup();
+    const { unmount } = render(
+      <div style={{ position: "fixed", zIndex: 1200 }}>
+        <PopoverMenu
+          trigger={<span>搜索提供商</span>}
+          triggerLabel="搜索提供商"
+          menuLabel="搜索提供商"
+          sections={[{ id: "backends", items: [{ id: "native", label: "原生" }] }]}
+        />
+      </div>
+    );
+    await user.click(screen.getByRole("button", { name: "搜索提供商" }));
+    // Portaled to the body, the panel stacks against the backdrop rather than inside it.
+    expect(screen.getByRole("menu", { name: "搜索提供商" }).style.zIndex).toBe("1201");
+    unmount();
+
+    renderMenu();
+    await user.click(screen.getByRole("button", { name: "模型" }));
+    expect(screen.getByRole("menu", { name: "模型" }).style.zIndex).toBe("");
+  });
+
   it("closes when the page behind it scrolls, because the measured position goes stale", async () => {
     const user = userEvent.setup();
     renderMenu();

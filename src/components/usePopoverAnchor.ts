@@ -4,6 +4,8 @@ import { useFloatingSurface } from "../lib/floatingSurfaces";
 
 const VIEWPORT_MARGIN = 8;
 const ANCHOR_GAP = 6;
+/** The panel's own stacking layer, as `.popover-menu__panel` sets it in menus.css. */
+const PANEL_LAYER = 1000;
 
 export interface PopoverPosition {
   left: number;
@@ -11,6 +13,27 @@ export interface PopoverPosition {
   /** Panel opens above the trigger; trigger-adjacent elements can move to the opposite edge. */
   flipped: boolean;
   minWidth: number;
+  /**
+   * An inline z-index for a panel whose trigger sits inside an overlay painted above the
+   * stylesheet's own layer — a modal dialog, say. Undefined leaves the stylesheet's layer.
+   */
+  layer?: number;
+}
+
+/**
+ * The z-index a panel needs to paint above every overlay its trigger sits in.
+ *
+ * The panel is portaled to `document.body`, so it stacks against the trigger's overlays rather
+ * than inside them: a trigger in a modal dialog would otherwise open its panel beneath the
+ * dialog's backdrop, where it can be neither seen nor clicked, and the control looks stuck.
+ */
+function overlayLayer(trigger: HTMLElement): number | undefined {
+  let highest = PANEL_LAYER - 1;
+  for (let node = trigger.parentElement; node; node = node.parentElement) {
+    const layer = Number.parseInt(getComputedStyle(node).zIndex, 10);
+    if (layer > highest) highest = layer;
+  }
+  return highest >= PANEL_LAYER ? highest + 1 : undefined;
 }
 
 export interface PopoverAnchorOptions {
@@ -59,9 +82,11 @@ export interface PopoverAnchor<
  *
  * Callers must portal panels to `document.body`: `.collapse-region__inner` has a persistent
  * transform and `overflow: hidden`, so a local fixed-position panel uses that ancestor as its
- * containing block and is clipped. Re-measure after every render because callers create fresh
- * React nodes each frame; the equality guard in `setPosition` prevents a render loop. Invoke
- * `onOpen` in an effect rather than a state updater so StrictMode cannot duplicate its side effect.
+ * containing block and is clipped. Portaled out, a panel no longer stacks inside the overlay its
+ * trigger sits in, so callers must also apply `position.layer` as the panel's z-index. Re-measure
+ * after every render because callers create fresh React nodes each frame; the equality guard in
+ * `setPosition` prevents a render loop. Invoke `onOpen` in an effect rather than a state updater
+ * so StrictMode cannot duplicate its side effect.
  */
 export function usePopoverAnchor<
   Trigger extends HTMLElement = HTMLButtonElement,
@@ -146,9 +171,10 @@ export function usePopoverAnchor<
 
   useLayoutEffect(() => {
     if (!open) return;
-    const anchor = triggerRef.current?.getBoundingClientRect();
+    const trigger = triggerRef.current;
+    const anchor = trigger?.getBoundingClientRect();
     const panel = panelRef.current?.getBoundingClientRect();
-    if (!anchor || !panel) return;
+    if (!trigger || !anchor || !panel) return;
     const viewportWidth = window.innerWidth || panel.width;
     const viewportHeight = window.innerHeight || panel.height;
     const panelWidth = panel.width || width || anchor.width;
@@ -172,8 +198,11 @@ export function usePopoverAnchor<
       ? Math.max(VIEWPORT_MARGIN, (pointer ? pointer.y : anchor.top) - ANCHOR_GAP - panelHeight)
       : Math.min(below, Math.max(VIEWPORT_MARGIN, viewportHeight - panelHeight - VIEWPORT_MARGIN));
 
+    // Measured once per open: the overlays around the trigger do not change while it is open.
+    const layer = position ? position.layer : overlayLayer(trigger);
+
     setPosition((current) => {
-      const next = { left, top, flipped, minWidth: anchor.width };
+      const next = { left, top, flipped, minWidth: anchor.width, layer };
       if (
         current
         && current.left === next.left

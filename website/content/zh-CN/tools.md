@@ -11,7 +11,7 @@ Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它
 | `read_global_memory`、`create_global_memory`、`edit_global_memory` | **全局记忆**开关 |
 | `read_project_memory`、`create_project_memory`、`edit_project_memory` | **项目记忆**开关 |
 | `web_search`、`web_fetch` | 对话唯一的**启用联网搜索**开关；一次运行拿到其中哪一个，取决于解析出的后端 |
-| `task_wait`、`task_list`、`box` | 任何会产生任务的工具被启用（`agent_spawn`、`workflow`、`bash`、`powershell`、`preview_start`） |
+| `task_wait`、`task_list`、`box` | 任何会产生任务的工具被启用（`agent_spawn`、`workflow`、`bash`、`zsh`、`sh`、`powershell`、`preview_start`） |
 | `skill` | **技能按需加载**开关，且至少选中了一个技能 |
 | `tool_search` | **工具发现**开关（MCP），且本次运行扣留了 MCP 工具 schema |
 | `plan`、`exit_plan_mode` | **安全层级**处于计划模式 |

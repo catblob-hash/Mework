@@ -28,6 +28,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { superviseCargoTest } from "./cargo-test-lifecycle.mjs";
 import { windowsNativeBuildEnvironment } from "./windows-native-build-tools.mjs";
+import { withCefBuildEnvironment } from "./cef-environment.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -56,7 +57,7 @@ const targetDir = process.env.CARGO_TARGET_DIR
   ? path.resolve(process.env.CARGO_TARGET_DIR)
   : path.join(crateDir, "target");
 
-const base = await windowsNativeBuildEnvironment();
+const base = withCefBuildEnvironment(await windowsNativeBuildEnvironment());
 const environment = withRuntimeDllDirectory(
   { ...base, CARGO_TARGET_DIR: targetDir },
   targetDir,

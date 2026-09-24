@@ -25,11 +25,12 @@ import {
   PREVIEW_LOG_POLL_INTERVAL_MS,
   PREVIEW_MAX_LOG_LINES,
   PREVIEW_SERVER_POLL_INTERVAL_MS,
+  previewTargetKey,
   type PreviewConfigurationList,
   type PreviewConfiguredServer,
-  type PreviewServerSnapshot
+  type PreviewServerSnapshot,
+  type PreviewTarget
 } from "../lib/preview";
-import type { GitTarget } from "../lib/git";
 import { IconButton } from "./Common";
 
 /** `Cf` — the start page lists this many servers before "See all". */
@@ -94,7 +95,9 @@ export function previewServerRows(
     return {
       name: configuration.name,
       port: server?.port ?? configuration.port,
-      url: configuration.url ?? null,
+      // A server on another machine is reached through the port it was forwarded to, which only
+      // the running process knows; a configured url names that machine's own localhost.
+      url: server?.url ?? configuration.url ?? null,
       server,
       running: server?.status === "running",
       starting: server?.status === "starting",
@@ -107,7 +110,7 @@ export function previewServerRows(
     .map((server) => ({
       name: server.name,
       port: server.port,
-      url: null,
+      url: server.url ?? null,
       server,
       running: server.status === "running",
       starting: server.status === "starting",
@@ -121,7 +124,11 @@ export function previewServerRows(
  * the url it points at, and a non-localhost one has no port at all to print.
  */
 export function previewRowDetail(row: PreviewServerRow): string {
-  if (!row.attach) return `:${row.port}`;
+  if (!row.attach) {
+    // A server on another machine keeps its own port in the label — that is the port its logs and
+    // its configuration talk about — and says where it runs.
+    return row.server?.machine ? `${row.server.machine} :${row.port}` : `:${row.port}`;
+  }
   const address = previewServerAddress({ port: row.port, url: row.url });
   try {
     return new URL(address).host;
@@ -631,6 +638,8 @@ export function PreviewLogsMenuItem({
 export interface PreviewServersController {
   configurations: PreviewConfigurationList | null;
   rows: PreviewServerRow[];
+  /** Why the last read failed — for a workspace on another machine, usually the machine itself. */
+  unreachable: string | null;
   pendingName: string | null;
   startError: { name: string; message: string } | null;
   stopped: { label: string; name: string } | null;
@@ -653,9 +662,13 @@ export interface PreviewServersController {
  *
  * Without a target the pane has no workspace to read, which is a state to render — an empty picker
  * and the no-config body — not an error, so nothing is polled and nothing throws.
+ *
+ * A workspace on another machine is read and started there; while its machine cannot be reached
+ * the last answer stands and `unreachable` carries why, so the pane can say so instead of
+ * pretending the file is empty.
  */
 export function usePreviewServers(
-  target: GitTarget | null | undefined,
+  target: PreviewTarget | null | undefined,
   onServerReady: (row: PreviewServerRow) => void
 ): PreviewServersController {
   const [configurations, setConfigurations] = useState<PreviewConfigurationList | null>(null);
@@ -664,10 +677,25 @@ export function usePreviewServers(
   const [startError, setStartError] = useState<{ name: string; message: string } | null>(null);
   const [stopped, setStopped] = useState<{ label: string; name: string } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [unreachable, setUnreachable] = useState<string | null>(null);
   const activeServer = useRef<{ serverId: string; name: string; port: number } | null>(null);
+  /** A remote server this pane started, whose page opens once the host says it answers. */
+  const pendingOpen = useRef<PreviewServerRow | null>(null);
   const readyCallback = useRef(onServerReady);
   readyCallback.current = onServerReady;
-  const targetKey = target ? JSON.stringify(target) : null;
+  const targetKey = target ? previewTargetKey(target) : null;
+
+  useEffect(() => {
+    // Another workspace's answers are not this one's, not even for the tick it takes to replace them.
+    setConfigurations(null);
+    setServers([]);
+    setUnreachable(null);
+    setStartError(null);
+    setStopped(null);
+    activeServer.current = null;
+    pendingOpen.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetKey]);
 
   useEffect(() => {
     if (!target) {
@@ -686,13 +714,25 @@ export function usePreviewServers(
         if (cancelled) return;
         setConfigurations(listed);
         setServers(running);
+        setUnreachable(null);
+        const pending = pendingOpen.current;
+        if (pending?.server) {
+          const now = running.find((server) => server.serverId === pending.server?.serverId);
+          if (!now || now.status === "running") {
+            pendingOpen.current = null;
+            // Gone before it answered: the stopped card says so, and there is nothing to open.
+            if (now) readyCallback.current({ ...pending, server: now, running: true, starting: false });
+          }
+        }
         const active = activeServer.current;
         if (active && !running.some((server) => server.serverId === active.serverId)) {
           activeServer.current = null;
           setStopped({ label: `${active.name}:${active.port}`, name: active.name });
         }
-      } catch {
-        // A workspace that has gone away answers again on the next tick; the pane keeps what it has.
+      } catch (reason) {
+        // A workspace that has gone away answers again on the next tick; the pane keeps what it
+        // has. Only the reason is new: a machine that cannot be reached is worth saying so.
+        if (!cancelled) setUnreachable(reason instanceof Error ? reason.message : String(reason));
       } finally {
         if (!cancelled) timer = window.setTimeout(() => void poll(), PREVIEW_SERVER_POLL_INTERVAL_MS);
       }
@@ -742,7 +782,7 @@ export function usePreviewServers(
         ...current.filter((server) => server.serverId !== outcome.server.serverId),
         outcome.server
       ]);
-      readyCallback.current({
+      const row: PreviewServerRow = {
         name: outcome.server.name,
         port: outcome.server.port,
         url: configurations?.servers.find((entry) => entry.name === outcome.server.name)?.url ?? null,
@@ -750,7 +790,16 @@ export function usePreviewServers(
         running: outcome.server.status === "running",
         starting: outcome.server.status === "starting",
         attach: false
-      });
+      };
+      // A server on another machine is still being waited out there when the start returns, and
+      // a page opened now would land on a refused connection a round trip before it could have
+      // answered. The pane holds its starting card instead and opens the page once the host says
+      // the server answers.
+      if (outcome.server.machine && outcome.server.status === "starting") {
+        pendingOpen.current = row;
+      } else {
+        readyCallback.current(row);
+      }
     } catch (reason) {
       setStartError({ name, message: reason instanceof Error ? reason.message : String(reason) });
     } finally {
@@ -792,7 +841,8 @@ export function usePreviewServers(
     setStopped(null);
   }, []);
 
-  const setAutoVerify = useCallback(async (enabled: boolean) => {    if (!target) return;
+  const setAutoVerify = useCallback(async (enabled: boolean) => {
+    if (!target) return;
     try {
       await setPreviewAutoVerify(target, enabled);
     } finally {
@@ -803,6 +853,7 @@ export function usePreviewServers(
   return {
     configurations,
     rows,
+    unreachable,
     pendingName,
     startError,
     stopped,

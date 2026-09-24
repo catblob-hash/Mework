@@ -8,19 +8,29 @@ function setup(overrides: Partial<TerminalTabBarProps> = {}) {
   const handlers = {
     onSelect: vi.fn(),
     onClose: vi.fn(),
-    onRename: vi.fn(),
-    onAdd: vi.fn()
+    onRename: vi.fn()
   };
+  const onAddShell = vi.fn();
   const view = render(
     <TerminalTabBar
       tabs={[{ id: "terminal-1", label: "终端 1" }, { id: "terminal-2", label: "终端 2" }]}
       activeId="terminal-1"
       panelId={(terminalId) => `panel-${terminalId}`}
+      add={{
+        sections: [{
+          id: "shells",
+          items: ["zsh", "bash"].map((shell) => ({
+            id: shell,
+            label: shell,
+            onSelect: () => onAddShell(shell)
+          }))
+        }]
+      }}
       {...handlers}
       {...overrides}
     />
   );
-  return { ...handlers, view };
+  return { ...handlers, onAddShell, view };
 }
 
 function tab(name: string) {
@@ -44,14 +54,18 @@ describe("TerminalTabBar", () => {
     expect(tab("终端 2")).toHaveAttribute("aria-selected", "false");
   });
 
-  it("selects on click and opens another terminal on the +", async () => {
+  it("selects on click and opens another terminal from the +'s menu", async () => {
     const user = userEvent.setup();
-    const { onSelect, onAdd } = setup();
+    const { onSelect, onAddShell } = setup();
 
     await user.click(tab("终端 2"));
     expect(onSelect).toHaveBeenCalledWith("terminal-2");
     await user.click(screen.getByRole("button", { name: "新建终端" }));
-    expect(onAdd).toHaveBeenCalledTimes(1);
+    // The + only asks; nothing opens until a shell is picked.
+    expect(onAddShell).not.toHaveBeenCalled();
+    const menu = screen.getByRole("menu", { name: "新建终端" });
+    await user.click(within(menu).getByRole("menuitem", { name: "bash" }));
+    expect(onAddShell).toHaveBeenCalledExactlyOnceWith("bash");
   });
 
   /** The tab is the shell's only place on screen, so this control is what ends the shell. */

@@ -435,7 +435,7 @@ describe("ConversationSettings", () => {
     // a role query would stay green no matter what the picker drew. The positive
     // half is what keeps that true: if picker rows ever stop carrying the
     // attribute, this goes red instead of the guard quietly becoming a no-op.
-    expect(document.querySelector('[data-tool-name="read"]')).not.toBeNull();
+    expect(document.querySelector('[data-tool-name="files"]')).not.toBeNull();
     expect(document.querySelector('[data-tool-name="read_global_memory"]')).toBeNull();
     // The credential channels are gone, not merely off by default.
     expect(screen.queryByText("允许联网搜索使用我的登录凭证")).toBeNull();
@@ -743,7 +743,7 @@ describe("ConversationSettings", () => {
     // `data-tool-name` whose accessible name is "{label}已启用/已关闭" — neither a
     // switch nor the bare name — so only the attribute can catch a regression.
     expect(seed.tools.some((tool) => tool.name === "skill")).toBe(true);
-    expect(document.querySelector('[data-tool-name="read"]')).not.toBeNull();
+    expect(document.querySelector('[data-tool-name="files"]')).not.toBeNull();
     expect(document.querySelector('[data-tool-name="skill"]')).toBeNull();
     expect(screen.queryByRole("button", { name: "长期记忆" })).toBeNull();
   });
@@ -1153,7 +1153,7 @@ describe("ConversationSettings", () => {
     // The name is the role's whole model-facing surface; there is no second
     // free-text field to keep in sync with it.
     expect(within(dialog).queryByRole("textbox", { name: "说明" })).toBeNull();
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onSettingsChange).toHaveBeenCalled();
     const saved = onSettingsChange.mock.calls.at(-1)![0].agentDefinitions;
@@ -1550,7 +1550,8 @@ describe("ConversationSettings", () => {
     }));
     // Saving narrows the pane's whole body back down to exactly what a preset owns.
     expect(Object.keys(onSavePreset.mock.calls.at(-1)![1]).sort()).toEqual([
-      "agentDefinitions", "allowRolelessSubagents", "enabledTools",
+      "agentDefinitions", "allowRolelessSubagents", "decisionMissScoring", "decisionParameterModes",
+      "enabledTools",
       "globalMemoryEnabled",
       "hookIds", "mcpIds", "mcpToolDiscoveryEnabled", "projectMemoryEnabled", "securityLevel",
       "skillIds",

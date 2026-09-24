@@ -69,6 +69,23 @@ if otool -L "$node_binary" | grep -qE '/(opt/homebrew|usr/local/(opt|Cellar))/';
   echo "  runs on this Mac only. Use the nodejs.org build for anything you ship." >&2
 fi
 
+# The remote agent Mework installs on SSH machines is cross-compiled here for
+# every platform a release bundles (scripts/build-remote-agents.mjs). The Linux
+# builds link with the rust-lld rustup ships and need nothing but their targets;
+# Windows ones need cargo-xwin. `npm run tauri:build` fails without all of them.
+missing_targets=""
+installed_targets=$(rustup target list --installed 2>/dev/null || true)
+for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+  printf '%s\n' "$installed_targets" | grep -qx "$target" || missing_targets="$missing_targets $target"
+done
+if [ -n "$missing_targets" ]; then
+  echo "  remote agent targets missing (a development build builds the one a machine needs when it can):" >&2
+  echo "    rustup target add$missing_targets" >&2
+fi
+if ! cargo xwin --version >/dev/null 2>&1; then
+  echo "  cargo-xwin is missing, so no Windows agent builds here: cargo install cargo-xwin" >&2
+fi
+
 # --- javascript dependencies -------------------------------------------------
 step "npm dependencies (root)"
 (cd "$repo_root" && npm ci)

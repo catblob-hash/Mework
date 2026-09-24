@@ -463,12 +463,14 @@ pub(crate) mod tests {
     fn only_ssh_endpoints_are_probed_and_remembered() {
         assert_eq!(
             login_shell(&ShellRunner::Wsl {
+                agent_shell: Default::default(),
                 distro: "Ubuntu".into(),
                 env: Default::default(),
             }),
             Ok((LoginShell::Posix, false))
         );
         let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host: "remembered@probe.invalid".into(),
             port: 2201,
             identity_file: String::new(),

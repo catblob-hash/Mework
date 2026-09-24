@@ -68,6 +68,10 @@ pub(super) struct ManagedHttpSidecar {
     child: Mutex<Child>,
     #[cfg(windows)]
     process_job: WindowsProcessJob,
+    /// Its process group, which quitting Mework ends; `Drop` only runs when
+    /// the sidecar is released while Mework keeps running.
+    #[cfg(unix)]
+    _exit_group: Option<crate::process_groups::GroupRegistration>,
 }
 
 impl std::fmt::Debug for ManagedHttpSidecar {
@@ -405,11 +409,15 @@ fn spawn_sidecar(
         return Err(error);
     }
 
+    #[cfg(unix)]
+    let exit_group = crate::process_groups::register(child.id());
     let sidecar = Arc::new(ManagedHttpSidecar {
         endpoint,
         child: Mutex::new(child),
         #[cfg(windows)]
         process_job,
+        #[cfg(unix)]
+        _exit_group: exit_group,
     });
     wait_until_ready(
         &sidecar,

@@ -39,7 +39,7 @@ import {
 } from "../lib/floatingSurfaces";
 import type { GitTarget } from "../lib/git";
 import type { SidePaneId } from "../lib/sidePanes";
-import { previewServerAddress } from "../lib/preview";
+import { previewServerAddress, type PreviewTarget } from "../lib/preview";
 import { IconButton } from "./Common";
 import { SidePane, type SidePaneBounds } from "./SidePane";
 import { SketchOverlay } from "./Sketch";
@@ -178,10 +178,25 @@ interface BrowserPanelProps {
   active?: boolean;
   /**
    * Workspace whose `.mework/launch.json` this pane's dev-server picker reads and whose servers it
-   * starts. Without it the pane is a plain browser: the picker shows its empty state and no
-   * preview command is ever sent.
+   * starts — on whichever machine it is. Without it the pane is a plain browser: the picker shows
+   * its empty state and no preview command is ever sent.
    */
-  target?: GitTarget | null;
+  target?: PreviewTarget | null;
+  /**
+   * The checkout on this computer the "Open file" picker starts in. Only a workspace here has one;
+   * the picker itself always reads this computer's files.
+   */
+  fileTarget?: GitTarget | null;
+  /**
+   * The page strip. Given one, it takes the pane's title bar and the browser toolbar moves to the
+   * row under it, the way a browser window puts its tabs above its address bar.
+   */
+  tabs?: ReactNode;
+  /**
+   * Set while the machine this page's workspace is on cannot be reached: the page keeps what it
+   * had, and a strip over it says why nothing it asks for is answering.
+   */
+  linkNotice?: string | null;
   /**
    * Viewport rectangle of a trusted overlay that another component draws over this panel. The
    * native page is a child window above the renderer, so it has to be taken out from under the
@@ -195,6 +210,12 @@ interface BrowserPanelProps {
    * from `height`.
    */
   onReservedBottomChange?: (reservedBottom: number) => void;
+  /**
+   * Opens this tab's page the way selecting the tab does. The address bar calls it first when
+   * the tab has no page — one whose open failed, or has not happened yet — so that typing an
+   * address is enough to get one.
+   */
+  onOpenPage?: () => Promise<void>;
   /** Uses the real Rust browser session while mirroring its URL in a sandboxed iframe. */
   browserDev?: boolean;
 }
@@ -250,8 +271,12 @@ function BackendBrowserPanel({
   nativeChild = false,
   active = true,
   target = null,
+  fileTarget = null,
+  tabs,
+  linkNotice = null,
   trustedOverlayRect = null,
-  onReservedBottomChange
+  onReservedBottomChange,
+  onOpenPage
 }: {
   paneId: SidePaneId;
   onPaneClose: () => void;
@@ -266,9 +291,13 @@ function BackendBrowserPanel({
   previewFrame?: boolean;
   nativeChild?: boolean;
   active?: boolean;
-  target?: GitTarget | null;
+  target?: PreviewTarget | null;
+  fileTarget?: GitTarget | null;
+  tabs?: ReactNode;
+  linkNotice?: string | null;
   trustedOverlayRect?: BrowserOverlayRect | null;
   onReservedBottomChange?: (reservedBottom: number) => void;
+  onOpenPage?: () => Promise<void>;
 }) {
   const { resolvedLanguage, t } = useI18n();
   const menuId = useId();
@@ -307,6 +336,7 @@ function BackendBrowserPanel({
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const bodyCardRef = useRef<HTMLDivElement>(null);
   const errorRef = useRef<HTMLDivElement>(null);
+  const noticeRef = useRef<HTMLDivElement>(null);
   editingAddressRef.current = editingAddress;
 
   const navigate = useCallback(async (raw: string) => {
@@ -319,6 +349,16 @@ function BackendBrowserPanel({
       setPending(true);
       setError(null);
       try {
+        // Navigation moves a page; it does not make one. A tab without a page gets it the way
+        // selecting the tab does, and the address goes to that page.
+        if (nativeChild && !status.hasPage && !status.suspended && onOpenPage) {
+          await onOpenPage();
+          // An open that failed says why only in the status it leaves behind.
+          const opened = await getBrowserStatus(sessionId);
+          if (!opened.hasPage) {
+            throw new Error(opened.error || t("无法打开这个标签页的页面", "Could not open this tab's page"));
+          }
+        }
         const next = await navigateBrowser(sessionId, url);
         setStatus(next);
         setAddress(next.url === "about:blank" ? "" : next.url);
@@ -328,7 +368,7 @@ function BackendBrowserPanel({
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [sessionId, t]);
+  }, [nativeChild, onOpenPage, sessionId, status.hasPage, status.suspended, t]);
 
   const openServerPage = useCallback((row: PreviewServerRow) => {
     void navigate(previewServerAddress({ port: row.port, url: row.url }));
@@ -343,6 +383,12 @@ function BackendBrowserPanel({
     ?? null
   ), [preview.rows]);
   const logLines = usePreviewServerLogs(logServer?.server?.serverId ?? null, logsOpen);
+
+  // The machine being away is said once, over whatever the pane is showing. A read that failed for
+  // some other reason is only worth a strip when there is nothing else on screen to go by.
+  const notice = linkNotice ?? (
+    preview.unreachable && preview.configurations === null ? preview.unreachable : null
+  );
 
   const bodyState: PreviewBodyState = useMemo(() => previewBodyState({
     url: status.url,
@@ -433,6 +479,7 @@ function BackendBrowserPanel({
     // The error strip floats over the page now that there is no chrome strip to sit in, so it
     // covers the page just like any other renderer layer drawn over it and must be counted too.
     if (errorRef.current) rects.push(errorRef.current.getBoundingClientRect());
+    if (noticeRef.current) rects.push(noticeRef.current.getBoundingClientRect());
     // The log drawer is deliberately absent: it does not cover the page, it takes height from it.
     // `onReservedBottomChange` shrinks the page by exactly the drawer's height, so the two never
     // overlap — and counting it here would freeze the page for as long as the drawer is open.
@@ -634,6 +681,7 @@ function BackendBrowserPanel({
     logsOpen,
     bodyState.kind,
     error,
+    notice,
     trustedOverlayRect,
     // Presenting or withdrawing the page changes whether there is anything to cover, so the pass
     // that decides has to run on the far side of each.
@@ -754,14 +802,14 @@ function BackendBrowserPanel({
   const openLocalFile = useCallback(async () => {
     if (!sessionId) return;
     try {
-      const next = await openLocalFileInBrowser(sessionId, target);
+      const next = await openLocalFileInBrowser(sessionId, fileTarget);
       if (!next) return;
       setStatus(next);
       setAddress(next.url === "about:blank" ? "" : next.url);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [sessionId, target]);
+  }, [sessionId, fileTarget]);
 
   const attachAnnotation = useCallback(async (dataUrl: string) => {
     annotateGenerationRef.current += 1;
@@ -919,7 +967,8 @@ function BackendBrowserPanel({
     <SidePane
       id={paneId}
       title={t("预览", "Preview")}
-      header={chrome}
+      header={tabs ?? chrome}
+      subheader={tabs ? chrome : undefined}
       trailing={paneTrailing}
       expanded={paneExpanded}
       onToggleExpand={onPaneToggleExpand}
@@ -940,6 +989,9 @@ function BackendBrowserPanel({
         }}
       >
         {error && <div ref={errorRef} className="browser-panel__error" role="alert">{error}</div>}
+        {notice && !error && (
+          <div ref={noticeRef} className="browser-panel__notice" role="status">{notice}</div>
+        )}
         {annotating && (
           <div ref={sketchRef} className="browser-panel__sketch">
             <SketchOverlay
@@ -1049,7 +1101,8 @@ function PreviewBrowserPanel({
   paneTrailing,
   paneExpanded = false,
   onPaneToggleExpand,
-  onContentBoundsChange
+  onContentBoundsChange,
+  tabs
 }: {
   paneId: SidePaneId;
   onPaneClose: () => void;
@@ -1060,6 +1113,7 @@ function PreviewBrowserPanel({
   onAttachImage?: (file: File) => void | Promise<void>;
   onElementPicked?: (element: SelectedElement) => void;
   onContentBoundsChange?: (bounds: SidePaneBounds) => void;
+  tabs?: ReactNode;
 }) {
   const { t } = useI18n();
   const [history, setHistory] = useState(["about:blank"]);
@@ -1117,7 +1171,8 @@ function PreviewBrowserPanel({
     <SidePane
       id={paneId}
       title={t("预览", "Preview")}
-      header={chrome}
+      header={tabs ?? chrome}
+      subheader={tabs ? chrome : undefined}
       trailing={paneTrailing}
       expanded={paneExpanded}
       onToggleExpand={onPaneToggleExpand}
@@ -1161,8 +1216,12 @@ export function BrowserPanel({
   sessionId,
   active = true,
   target = null,
+  fileTarget = null,
+  tabs,
+  linkNotice = null,
   trustedOverlayRect = null,
   onReservedBottomChange,
+  onOpenPage,
   browserDev = isBrowserDevRuntime()
 }: BrowserPanelProps) {
   const pane = { paneId, onPaneClose, onPaneFocus, paneTrailing, paneExpanded, onPaneToggleExpand, onAttachImage, onElementPicked, onContentBoundsChange };
@@ -1176,10 +1235,14 @@ export function BrowserPanel({
         nativeChild={native}
         active={active}
         target={target}
+        fileTarget={fileTarget}
+        tabs={tabs}
+        linkNotice={linkNotice}
         trustedOverlayRect={trustedOverlayRect}
         onReservedBottomChange={onReservedBottomChange}
+        onOpenPage={onOpenPage}
       />
     );
   }
-  return <PreviewBrowserPanel {...pane} />;
+  return <PreviewBrowserPanel {...pane} tabs={tabs} />;
 }

@@ -179,6 +179,25 @@ fn lsp_config_relative_paths() -> [String; 2] {
 /// the file, because it is last, and a count taken before the `cat` would only
 /// turn a file rewritten in between into a spurious error.
 fn probe_script(target: &RemoteWorkspace<'_>, path: &str) -> Result<String, String> {
+    if target.workspace.runner.script_dialect() == crate::shell_backend::ScriptDialect::PowerShell {
+        for (operand, label) in [(path, "path"), (target.workspace.root.as_str(), "workspace root")] {
+            if operand.trim().is_empty() || operand.chars().any(char::is_control) {
+                return Err(format!("Parameter {label} cannot be empty or contain control characters"));
+            }
+        }
+        let presets: Vec<&str> = lsp_config::preset_commands().collect();
+        return Ok(crate::remote_powershell::lsp_probe(
+            &crate::remote_powershell::Target {
+                root: &target.workspace.root,
+                confine: target.confinement == remote_files::Confinement::Workspace,
+            },
+            path,
+            MAX_FILE_BYTES,
+            MAX_CONFIG_BYTES,
+            &lsp_config_relative_paths(),
+            &presets,
+        ));
+    }
     let mut script = remote_files::prologue(target, path, TargetMode::Existing)?;
     script.push_str(&format!(
         "[ -f \"$C\" ] || exit {}\n",
@@ -365,6 +384,17 @@ fn check_ignore_with(
     if root.trim().is_empty() || root.chars().any(char::is_control) {
         return None;
     }
+    if paths.iter().any(|path| path.chars().any(char::is_control)) {
+        return None;
+    }
+    if shell.dialect() == crate::shell_backend::ScriptDialect::PowerShell {
+        let script = crate::remote_powershell::check_ignore(root.trim(), paths);
+        let output = shell
+            .run(&script, None, lsp::CHECK_IGNORE_TIMEOUT, cancel)
+            .ok()?;
+        return (output.status == Some(0))
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned());
+    }
     let mut script = format!(
         "cd -- {} || exit 64\ngit check-ignore --",
         run_environment::quote_remote_path(root.trim())
@@ -406,6 +436,13 @@ pub(crate) fn read_text_with(
 ) -> Option<String> {
     if canonical.trim().is_empty() || canonical.chars().any(char::is_control) {
         return None;
+    }
+    if shell.dialect() == crate::shell_backend::ScriptDialect::PowerShell {
+        let script = crate::remote_powershell::read_text(canonical, MAX_FILE_BYTES);
+        let output = shell.run(&script, None, PROBE_TIMEOUT, cancel).ok()?;
+        return (output.status == Some(0))
+            .then(|| String::from_utf8(output.stdout).ok())
+            .flatten();
     }
     let script = format!(
         "f={}\n[ -f \"$f\" ] || exit 66\ns=$(wc -c < \"$f\" | tr -d ' ')\n[ \"$s\" -le {MAX_FILE_BYTES} ] || exit 68\ncat -- \"$f\"\n",
@@ -483,7 +520,10 @@ fn declares_with(runner: &ShellRunner, root: &str, probe: &DeclaresProbe<'_>) ->
             return *answer;
         }
     }
-    let answer = match declares_script(root).ok().and_then(|script| probe(&script)) {
+    let answer = match declares_script(root, runner.script_dialect())
+        .ok()
+        .and_then(|script| probe(&script))
+    {
         Some(0) => Some(true),
         Some(1) => Some(false),
         _ => None,
@@ -500,9 +540,18 @@ fn declares_with(runner: &ShellRunner, root: &str, probe: &DeclaresProbe<'_>) ->
 
 /// Exit 0 when either spelling of the file exists under the root, 1 when
 /// neither does, 64 when the root cannot be entered.
-fn declares_script(root: &str) -> Result<String, String> {
+fn declares_script(
+    root: &str,
+    dialect: crate::shell_backend::ScriptDialect,
+) -> Result<String, String> {
     if root.trim().is_empty() || root.chars().any(char::is_control) {
         return Err("The workspace root cannot be tested".into());
+    }
+    if dialect == crate::shell_backend::ScriptDialect::PowerShell {
+        return Ok(crate::remote_powershell::declares(
+            root.trim(),
+            &lsp_config_relative_paths(),
+        ));
     }
     let [preferred, legacy] = lsp_config_relative_paths();
     Ok(format!(
@@ -517,6 +566,96 @@ fn declares_script(root: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::remote_files::tests::{fixture, write_fixture_file, Harness};
+
+    /// The PowerShell forms of the language-server scripts on a real Windows
+    /// machine through its agent: the probe's counted blocks, the classifier's
+    /// existence check, the edit hook's re-read and `git check-ignore`. Set
+    /// `MEWORK_E2E_SSH_WINDOWS_HOST` and run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn over_real_ssh_the_powershell_language_server_scripts_keep_their_contract() {
+        use crate::remote_files::{Confinement, RemoteShell, RemoteWorkspace};
+        use crate::shell_backend::{AgentShell, ShellBackend};
+        use crate::workspace_set::WorkspaceSet;
+        let host = std::env::var("MEWORK_E2E_SSH_WINDOWS_HOST").expect("MEWORK_E2E_SSH_WINDOWS_HOST");
+        let app_data = tempfile::tempdir().unwrap();
+        crate::remote_link::install(app_data.path(), Vec::new(), None);
+        let runner = ShellRunner::Ssh {
+            agent_shell: AgentShell::new(ShellBackend::PowerShell, "powershell"),
+            host,
+            port: 0,
+            identity_file: String::new(),
+            env: Default::default(),
+        };
+        let cancel = crate::cancel::CancelSignal::default();
+        let timeout = Duration::from_secs(60);
+        let home = runner
+            .run("[Console]::Out.Write($HOME.Replace('\\', '/'))", None, timeout, &cancel)
+            .unwrap();
+        let home = String::from_utf8_lossy(&home.stdout).trim().to_owned();
+        let root = format!("{home}/mework-e2e-ps-lsp");
+        let quoted = crate::remote_shell::ps_single_quote(&root);
+        let setup = runner
+            .run(
+                &format!(
+                    "$ErrorActionPreference = 'Stop'\n\
+                     if (Test-Path -LiteralPath {quoted}) {{ cmd /c rmdir /s /q ({quoted}.Replace('/', '\\')) }}\n\
+                     New-Item -ItemType Directory -Path ({quoted} + '/src') | Out-Null\n\
+                     New-Item -ItemType Directory -Path ({quoted} + '/.mework') | Out-Null\n\
+                     [System.IO.File]::WriteAllText({quoted} + '/src/main.rs', \"fn main() {{}}`n\")\n\
+                     [System.IO.File]::WriteAllText({quoted} + '/.mework/lsp.json', '{{}}')\n\
+                     [System.IO.File]::WriteAllText({quoted} + '/.gitignore', \"target`n\")\n\
+                     Set-Location -LiteralPath {quoted}\n\
+                     git init -q 2>$null | Out-Null\n"
+                ),
+                None,
+                timeout,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(setup.status, Some(0), "{}", setup.stderr);
+
+        let set = WorkspaceSet::single(root.clone(), runner.clone());
+        let profile = crate::prompt_profile::PromptProfile::default();
+        let target = RemoteWorkspace {
+            workspace: set.primary().expect("one workspace"),
+            machine_key: "ssh:e2e".to_owned(),
+            confinement: Confinement::Workspace,
+            profile: &profile,
+            cancel: &cancel,
+        };
+        let probe = probe_file(&runner, &target, "src/main.rs").unwrap();
+        assert_eq!(probe.root, root);
+        assert_eq!(probe.canonical, format!("{root}/src/main.rs"));
+        assert_eq!(probe.home, home);
+        assert_eq!(probe.text, "fn main() {}\n");
+        let (path, bytes) = probe.project_config.expect("the workspace's lsp.json");
+        assert_eq!(path, format!("{root}/.mework/lsp.json"));
+        assert_eq!(bytes, b"{}");
+        assert!(probe.installed.iter().all(|command| lsp_config::preset_commands().any(|preset| preset == command)));
+        assert!(probe_file(&runner, &target, "../outside.rs").is_err());
+
+        assert_eq!(declares_with(&runner, &root, &|script| {
+            run_environment::run_remote_script(&runner, script, None, timeout, &cancel).ok().and_then(|output| output.status)
+        }), Some(true));
+        assert_eq!(
+            read_text_with(&runner, &format!("{root}/src/main.rs"), &cancel).as_deref(),
+            Some("fn main() {}\n")
+        );
+        assert_eq!(read_text_with(&runner, &format!("{root}/missing.rs"), &cancel), None);
+        let ignored = check_ignore_with(
+            &runner,
+            &cancel,
+            Path::new(&root),
+            &["target/debug/x.rs".to_owned(), "src/main.rs".to_owned()],
+        );
+        assert_eq!(ignored.as_deref().map(str::trim), Some("target/debug/x.rs"));
+
+        runner
+            .run(&format!("cmd /c rmdir /s /q ({quoted}.Replace('/', '\\'))"), None, timeout, &cancel)
+            .unwrap();
+        crate::remote_link::shutdown();
+    }
 
     const PROJECT_CONFIG: &str =
         r#"{"lspServers":{"probe":{"command":"probe-ls","extensionToLanguage":{".rs":"rust"}}}}"#;
@@ -640,6 +779,7 @@ mod tests {
         let mut runner_env = std::collections::BTreeMap::new();
         runner_env.insert("TOOLS".to_owned(), "/opt/tools".to_owned());
         let runner = ShellRunner::Wsl {
+            agent_shell: Default::default(),
             distro: "Ubuntu".into(),
             env: runner_env,
         };
@@ -699,6 +839,7 @@ mod tests {
     #[test]
     fn the_declares_check_is_cached_per_machine_and_root() {
         let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host: "cache-test".into(),
             port: 0,
             identity_file: String::new(),
@@ -745,6 +886,7 @@ mod tests {
                 .and_then(|output| output.status)
         };
         let runner = ShellRunner::Wsl {
+            agent_shell: Default::default(),
             distro: "declares-test".into(),
             env: Default::default(),
         };

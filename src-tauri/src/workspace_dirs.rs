@@ -1,12 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use sha2::{Digest, Sha256};
 
-use crate::model::{AppDocument, WorkspaceKind};
+use crate::model::{AppDocument, Workspace, WorkspaceKind};
 
 const TEMPORARY_WORKSPACE_ROOT: &str = "temporary-workspaces";
 /// Host-side scratch directories for conversations whose primary workspace is
@@ -38,17 +38,22 @@ pub(crate) fn ensure_remote_workspace_anchor(
 /// Makes the App-Data-backed temporary workspace tree match the persisted
 /// document. Running this after every successful save also retries cleanup that
 /// may have been interrupted by a process exit or a transient filesystem lock.
+///
+/// `drafts` maps each renderer draft that has a shell open to the project it
+/// opened it in (see `TerminalManager::bind_draft`). A draft's directory is the
+/// one its conversation will use, keyed by the id it will materialize as, so it
+/// is kept for as long as the draft's shell may be sitting in it.
 pub(crate) fn reconcile_temporary_workspaces(
     app_data: &Path,
     document: &AppDocument,
+    drafts: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let expected = document
-        .workspaces
-        .iter()
-        .filter(|workspace| workspace.kind == WorkspaceKind::Temporary)
-        .flat_map(|workspace| workspace.conversations.iter())
-        .map(|conversation| workspace_directory_name(&conversation.id))
-        .collect::<Result<HashSet<_>, _>>()?;
+    let expected = owner_ids(document, drafts, |workspace| {
+        workspace.kind == WorkspaceKind::Temporary
+    })
+    .into_iter()
+    .map(workspace_directory_name)
+    .collect::<Result<HashSet<_>, _>>()?;
     let root = ensure_workspace_root(app_data, TEMPORARY_WORKSPACE_ROOT, "临时工作区")?;
 
     for directory_name in &expected {
@@ -59,7 +64,35 @@ pub(crate) fn reconcile_temporary_workspaces(
     }
 
     remove_orphan_workspace_entries(&root, &expected, "临时工作区")?;
-    reconcile_remote_workspace_anchors(app_data, document)
+    reconcile_remote_workspace_anchors(app_data, document, drafts)
+}
+
+/// The conversations in the workspaces `select` picks, and the drafts aimed at
+/// one of them.
+fn owner_ids<'a>(
+    document: &'a AppDocument,
+    drafts: &'a HashMap<String, String>,
+    select: impl Fn(&Workspace) -> bool,
+) -> Vec<&'a str> {
+    let selected = document
+        .workspaces
+        .iter()
+        .filter(|workspace| select(workspace))
+        .collect::<Vec<_>>();
+    let drafted = drafts
+        .iter()
+        .filter(|(_, workspace_id)| {
+            selected
+                .iter()
+                .any(|workspace| workspace.id == **workspace_id)
+        })
+        .map(|(owner, _)| owner.as_str());
+    selected
+        .iter()
+        .flat_map(|workspace| workspace.conversations.iter())
+        .map(|conversation| conversation.id.as_str())
+        .chain(drafted)
+        .collect()
 }
 
 /// Drops the anchors of conversations that no longer exist or whose workspace
@@ -68,14 +101,14 @@ pub(crate) fn reconcile_temporary_workspaces(
 fn reconcile_remote_workspace_anchors(
     app_data: &Path,
     document: &AppDocument,
+    drafts: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let expected = document
-        .workspaces
-        .iter()
-        .filter(|workspace| workspace.kind == WorkspaceKind::Directory && workspace.machine.is_some())
-        .flat_map(|workspace| workspace.conversations.iter())
-        .map(|conversation| workspace_directory_name(&conversation.id))
-        .collect::<Result<HashSet<_>, _>>()?;
+    let expected = owner_ids(document, drafts, |workspace| {
+        workspace.kind == WorkspaceKind::Directory && workspace.machine.is_some()
+    })
+    .into_iter()
+    .map(workspace_directory_name)
+    .collect::<Result<HashSet<_>, _>>()?;
     let root = ensure_workspace_root(app_data, REMOTE_ANCHOR_ROOT, "远端工作区锚点")?;
     remove_orphan_workspace_entries(&root, &expected, "远端工作区锚点")
 }
@@ -223,6 +256,29 @@ mod tests {
     }
 
     #[test]
+    fn a_drafts_scratch_directory_lasts_while_the_draft_is_bound_to_it() {
+        let app_data = tempfile::tempdir().unwrap();
+        let document = crate::catalog::default_document();
+        let temporary = document
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.kind == WorkspaceKind::Temporary)
+            .expect("the default document has the temporary project")
+            .id
+            .clone();
+        let directory = ensure_temporary_workspace(app_data.path(), "conv_draft").unwrap();
+
+        let drafts = HashMap::from([("conv_draft".to_owned(), temporary)]);
+        reconcile_temporary_workspaces(app_data.path(), &document, &drafts).unwrap();
+        assert!(directory.is_dir(), "the draft's shell may be sitting in it");
+
+        // Aimed at a project directory instead, the draft owns no scratch directory.
+        let drafts = HashMap::from([("conv_draft".to_owned(), document.workspaces[0].id.clone())]);
+        reconcile_temporary_workspaces(app_data.path(), &document, &drafts).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
     fn remote_anchors_are_dropped_once_their_workspace_is_back_on_this_machine() {
         let app_data = tempfile::tempdir().unwrap();
         let mut document = crate::catalog::default_document();
@@ -239,11 +295,11 @@ mod tests {
             "the anchor is not the temporary workspace: that tree is reconciled by other rules"
         );
 
-        reconcile_temporary_workspaces(app_data.path(), &document).unwrap();
+        reconcile_temporary_workspaces(app_data.path(), &document, &HashMap::new()).unwrap();
         assert!(anchor.is_dir(), "a remote workspace keeps its anchor");
 
         document.workspaces[0].machine = None;
-        reconcile_temporary_workspaces(app_data.path(), &document).unwrap();
+        reconcile_temporary_workspaces(app_data.path(), &document, &HashMap::new()).unwrap();
         assert!(!anchor.exists(), "a workspace back on this machine needs no anchor");
     }
 }

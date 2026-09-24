@@ -9,7 +9,7 @@ import {
   CODEX_TEMPLATE_ID,
   createSeedDocument
 } from "./seed";
-import { implicitConversationPreset, preferredShellToolName } from "./lib/conversationPresets";
+import { implicitConversationPreset } from "./lib/conversationPresets";
 import { toolCatalog } from "./seed";
 import { defaultConversationWebSearchSettings, normalizeDocument } from "./lib/runtime";
 import { isDecisionToolName } from "./lib/taskTools";
@@ -96,8 +96,7 @@ describe("seed document", () => {
       "preview_start", "preview_stop", "preview_list", "preview_logs", "preview_console_logs",
       "preview_screenshot", "preview_snapshot", "preview_inspect", "preview_click",
       "preview_fill", "preview_eval", "preview_network", "preview_resize",
-      "preview_upload_image", "preview_dialog", "preview_find_element", "preview_find_logs",
-      "preview_click_by_description", "preview_fill_by_description", "preview_inspect_by_description"
+      "preview_upload_image", "preview_dialog", "preview_find_logs"
     ]);
     // preview_list and preview_logs read host-side state the user's own launch.json
     // produced: no page content, no process started or killed.
@@ -317,10 +316,9 @@ describe("seed document", () => {
     expect(implicit.enabledTools.some((name) => memoryToolNames.has(name))).toBe(false);
   });
 
-  it("gives a fresh conversation the implicit template's platform shell", () => {
+  it("gives a fresh conversation every backend's shell tool, and no scoring variant", () => {
     const implicit = implicitConversationPreset(toolCatalog, "zh-CN").settings;
-    expect(implicit.enabledTools.filter(
-      (name) => name === "powershell" || name === "bash"
-    )).toEqual([preferredShellToolName(window.navigator.platform)]);
+    expect(implicit.enabledTools.filter((name) => /^(bash|zsh|sh|powershell)/.test(name)).sort())
+      .toEqual(["bash", "powershell", "sh", "zsh"]);
   });
 });

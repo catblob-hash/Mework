@@ -1,0 +1,11 @@
+/* Privacy prompts. Keep in step with src-tauri/Info.plist, which holds the same English texts for development binaries. */
+"NSDesktopFolderUsageDescription" = "Mework opens projects in your Desktop folder and runs the commands and agent tools you start there.";
+"NSDocumentsFolderUsageDescription" = "Mework opens projects in your Documents folder and runs the commands and agent tools you start there.";
+"NSDownloadsFolderUsageDescription" = "Mework opens projects in your Downloads folder and runs the commands and agent tools you start there.";
+"NSRemovableVolumesUsageDescription" = "Mework opens projects on removable volumes and runs the commands and agent tools you start there.";
+"NSNetworkVolumesUsageDescription" = "Mework opens projects on network volumes and runs the commands and agent tools you start there.";
+"NSLocalNetworkUsageDescription" = "Mework connects to SSH machines, model servers such as Ollama or LM Studio, and development servers on your local network.";
+"NSAppleEventsUsageDescription" = "Programs you run in Mework, such as scripts in the terminal, may ask to control other apps.";
+"NSMicrophoneUsageDescription" = "Programs you run in Mework may use the microphone.";
+"NSCameraUsageDescription" = "Programs you run in Mework may use the camera.";
+"NSBluetoothAlwaysUsageDescription" = "Programs you run in Mework may use Bluetooth.";

@@ -364,6 +364,7 @@ export function PopoverMenu({
             top: position?.top ?? 0,
             width: menuWidth,
             minWidth: position?.minWidth,
+            zIndex: position?.layer,
             visibility: position ? "visible" : "hidden"
           }}
           onKeyDown={(event) => {

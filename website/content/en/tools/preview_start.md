@@ -12,6 +12,8 @@ A server already running under the resolved entry's name — this conversation's
 
 With `autoPort: true` a taken port is swapped for a free one and `--port` and `-p` arguments rewritten to match; otherwise the conflict is reported, naming the occupant where possible. The call returns after a three-second startup gate — an exit inside it is a failure, silence is success — and readiness is then polled for up to 60 seconds, which can only move the row to `running`.
 
+With more than one workspace, `workspace` names whose `launch.json` is read and so on which machine the server runs; it defaults to 1. For a workspace on an SSH machine the server is started by the agent there and readiness is waited out there; the conversation's page moves onto that machine's network, so `http://localhost:<port>` in the page is the server on that machine.
+
 The result is the server's snapshot with `reused` and a sentence; the page opens at `http://localhost:<port>` or the entry's `url`. The server is also a task, addressed as `preview:<serverId>`.
 
 ## Related

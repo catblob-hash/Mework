@@ -613,6 +613,8 @@ mod tests {
             skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
+            decision_parameter_modes: Default::default(),
+            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model: crate::model::ModelProfile {

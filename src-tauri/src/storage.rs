@@ -846,11 +846,15 @@ fn validate_workspace_authorizations(
         .iter()
         .map(|(machine, path)| (crate::run_environment::env_key(*machine), *path))
         .collect::<HashSet<_>>();
-    let previous_canonical = previous_directories
-        .iter()
-        .filter(|(machine, _)| machine.is_none())
-        .filter_map(|(_, path)| AppState::workspace_key(Path::new(path)))
-        .collect::<HashSet<_>>();
+    // Only local directories have a canonical form this host can compute, and
+    // only a proposal that misses `previous_exact` ever needs one.
+    let previous_canonical = LazyCanonicalKeys::new(
+        previous_directories
+            .iter()
+            .filter(|(machine, _)| machine.is_none())
+            .map(|(_, path)| *path)
+            .collect(),
+    );
     let previous_by_id = previous
         .workspaces
         .iter()
@@ -958,6 +962,51 @@ fn project_directories(workspace: &Workspace) -> Vec<(Option<&crate::model::RunT
         .collect()
 }
 
+/// The canonical keys of some held local directories, resolved on first use.
+///
+/// Resolving a path touches it, and every save walks every project and every
+/// conversation, not only the one being edited. On macOS a touch under Desktop,
+/// Documents, Downloads, iCloud Drive or a removable or network volume raises a
+/// privacy prompt (again after every rebuild of an ad-hoc signed build), and a
+/// disconnected network share can stall the save. An unchanged directory is
+/// always re-proposed at the spelling it was held at, so the exact-text check
+/// answers it without the filesystem; the keys are needed only when a proposal
+/// misses that check, and then they are the same set an eager build would give.
+///
+/// The caller passes local paths only: a directory on another machine has no
+/// canonical form on this one.
+struct LazyCanonicalKeys<'a> {
+    paths: Vec<&'a str>,
+    keys: std::cell::OnceCell<HashSet<String>>,
+}
+
+impl<'a> LazyCanonicalKeys<'a> {
+    fn new(paths: Vec<&'a str>) -> Self {
+        Self {
+            paths,
+            keys: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.keys
+            .get_or_init(|| {
+                self.paths
+                    .iter()
+                    .filter_map(|path| AppState::workspace_key(Path::new(path)))
+                    .collect()
+            })
+            .contains(key)
+    }
+
+    /// Whether the held paths have been resolved yet — what the tests check to
+    /// show an exact match never reached the filesystem.
+    #[cfg(test)]
+    fn is_resolved(&self) -> bool {
+        self.keys.get().is_some()
+    }
+}
+
 /// Whether one directory may stand in a project: the previous document already
 /// held it, or a picker of the host's own returned it in this session.
 ///
@@ -967,11 +1016,15 @@ fn project_directories(workspace: &Workspace) -> Vec<(Option<&crate::model::RunT
 /// is the machine plus the exact text the remote browser returned — the same
 /// rule attached workspaces follow. The error is the picker check's own; the
 /// caller says which workspace it was about.
+///
+/// The checks run cheapest first: the literal text, which needs no filesystem,
+/// then the canonical key, which resolves the proposed path and, only if that
+/// succeeds, the held ones.
 fn authorize_project_directory(
     machine: Option<&crate::model::RunTarget>,
     path: &str,
     held_exact: &HashSet<(String, &str)>,
-    held_canonical: &HashSet<String>,
+    held_canonical: &LazyCanonicalKeys<'_>,
     state: &AppState,
 ) -> Result<(), String> {
     let machine_key = crate::run_environment::env_key(machine);
@@ -995,13 +1048,26 @@ fn authorize_project_directory(
 /// resolves — two spellings of one checkout are one workspace — and by exact
 /// text otherwise; a remote directory can only be compared by the machine and
 /// the exact text, since only that machine can resolve its own paths.
+///
+/// A project with fewer than two local directories is not resolved at all: one
+/// canonical key has nothing to collide with, so the answer is known without
+/// touching the filesystem — which, run on every save for every project, would
+/// otherwise reach into each one (see [`LazyCanonicalKeys`] for what that costs
+/// on macOS).
 fn reject_duplicate_project_workspaces(workspace: &Workspace) -> Result<(), String> {
+    let directories = project_directories(workspace);
+    let compare_canonical = directories
+        .iter()
+        .filter(|(machine, _)| machine.is_none())
+        .count()
+        > 1;
     let mut seen_exact = HashSet::new();
     let mut seen_canonical = HashSet::new();
-    for (offset, (machine, path)) in project_directories(workspace).into_iter().enumerate() {
+    for (offset, (machine, path)) in directories.into_iter().enumerate() {
         let duplicate_text =
             !seen_exact.insert((crate::run_environment::env_key(machine), path.to_owned()));
-        let duplicate_directory = machine.is_none()
+        let duplicate_directory = compare_canonical
+            && machine.is_none()
             && AppState::workspace_key(Path::new(path))
                 .is_some_and(|key| !seen_canonical.insert(key));
         if duplicate_text || duplicate_directory {
@@ -1080,11 +1146,14 @@ pub(crate) fn validate_additional_directories(
     let held = previous
         .map(Conversation::effective_attached_workspaces)
         .unwrap_or_default();
-    let held_keys = held
-        .iter()
-        .filter(|workspace| workspace.machine.is_none())
-        .filter_map(|workspace| AppState::workspace_key(Path::new(&workspace.path)))
-        .collect::<HashSet<_>>();
+    // Resolved only for a local entry the exact comparison below misses: this
+    // runs for every conversation on every save.
+    let held_keys = LazyCanonicalKeys::new(
+        held.iter()
+            .filter(|workspace| workspace.machine.is_none())
+            .map(|workspace| workspace.path.as_str())
+            .collect(),
+    );
     for workspace in &proposed {
         if held.iter().any(|existing| existing == workspace) {
             continue;
@@ -2531,6 +2600,78 @@ fn validate_execution_environments(
             if value.chars().any(char::is_control) {
                 return Err(format!(
                     "运行环境 {key} 的变量 {variable} 的值不能包含控制字符"
+                ));
+            }
+        }
+    }
+    // A WSL distribution runs POSIX shells only, so its agent shell must be one.
+    if assets.wsl_agent_shells.len() > 256 {
+        return Err("WSL 发行版的代理 shell 设置不能超过 256 条".into());
+    }
+    for (distro, backend) in &assets.wsl_agent_shells {
+        crate::run_environment::validate_wsl_distro_name(distro)?;
+        if !crate::shell_backend::is_registered(crate::shell_backend::MachineOs::Wsl, *backend) {
+            return Err(format!(
+                "WSL 发行版 {distro} 的代理 shell 不能是 {}",
+                backend.display_name()
+            ));
+        }
+    }
+    // The sandbox's lists reach every machine's agent; bounded so a document
+    // cannot make every command carry an unbounded policy.
+    const MAX_SANDBOX_ENTRIES: usize = 256;
+    let sandbox = &assets.sandbox;
+    for (label, entries) in [
+        ("沙箱网络白名单", &sandbox.network.allow),
+        ("沙箱网络黑名单", &sandbox.network.deny),
+        ("沙箱可写目录", &sandbox.writable),
+        ("沙箱禁读路径", &sandbox.deny_read),
+    ] {
+        if entries.len() > MAX_SANDBOX_ENTRIES {
+            return Err(format!("{label}不能超过 {MAX_SANDBOX_ENTRIES} 条"));
+        }
+        for entry in entries {
+            let entry = entry.trim();
+            if entry.is_empty() || entry.chars().count() > MAX_PATH_FIELD_CHARS {
+                return Err(format!("{label}的条目不能为空或过长"));
+            }
+            if entry.chars().any(char::is_control) {
+                return Err(format!("{label}的条目不能包含控制字符"));
+            }
+        }
+    }
+    for (label, entries) in [("沙箱可写目录", &sandbox.writable), ("沙箱禁读路径", &sandbox.deny_read)] {
+        for entry in entries {
+            let entry = entry.trim();
+            let absolute = entry.starts_with('/')
+                || entry.starts_with('~')
+                || (entry.len() >= 3 && entry.as_bytes()[1] == b':' && entry.as_bytes()[0].is_ascii_alphabetic());
+            if !absolute {
+                return Err(format!("{label} {entry} 必须是绝对路径或以 ~ 开头"));
+            }
+        }
+    }
+    for pattern in sandbox.network.allow.iter().chain(&sandbox.network.deny) {
+        if pattern.trim().chars().any(|c| c.is_whitespace() || c == '/') {
+            return Err(format!("沙箱网络规则 {pattern} 应是主机名（可带 :端口），不能是网址"));
+        }
+    }
+    // Each OS's priority list ranks that OS's registered backends, each once.
+    for os in crate::shell_backend::MachineOs::ALL {
+        let listed = assets.shell_priority.listed(os);
+        for (position, backend) in listed.iter().enumerate() {
+            if !crate::shell_backend::is_registered(os, *backend) {
+                return Err(format!(
+                    "{} 的 shell 优先级表不能包含 {}",
+                    os.display_name(),
+                    backend.display_name()
+                ));
+            }
+            if listed[..position].contains(backend) {
+                return Err(format!(
+                    "{} 的 shell 优先级表重复列出了 {}",
+                    os.display_name(),
+                    backend.display_name()
                 ));
             }
         }
@@ -8011,6 +8152,91 @@ b"
             host_member(&picked),
         ];
         assert!(validate_workspace_authorizations(&previous, &two_machines, &state).is_ok());
+    }
+
+    /// Every save re-checks every project's directories, so one proposed at the
+    /// spelling it was held at must pass without resolving anything: on macOS
+    /// resolving a path under Documents or on a network volume raises a privacy
+    /// prompt or stalls. A miss still resolves the held set, and then accepts or
+    /// refuses exactly what the eager check did.
+    #[test]
+    fn held_directories_are_resolved_only_when_the_exact_text_misses() {
+        let directory = tempfile::tempdir().unwrap();
+        let picked = directory.path().join("shared-library");
+        fs::create_dir(&picked).unwrap();
+        let other = directory.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let picked_text = picked.to_string_lossy().into_owned();
+        let respelled = picked.join(".").to_string_lossy().into_owned();
+        let other_text = other.to_string_lossy().into_owned();
+        let held_exact =
+            HashSet::from([(crate::run_environment::env_key(None), picked_text.as_str())]);
+        let remote = crate::model::RunTarget::Ssh {
+            machine_id: "m1".into(),
+        };
+        let fresh = AppState::default();
+
+        let held = LazyCanonicalKeys::new(vec![picked_text.as_str()]);
+        assert!(
+            authorize_project_directory(None, &picked_text, &held_exact, &held, &fresh).is_ok()
+        );
+        assert!(!held.is_resolved());
+        // A directory on another machine never consults local keys, even at a
+        // spelling that resolves here to what is held.
+        assert!(authorize_project_directory(
+            Some(&remote),
+            &picked_text,
+            &held_exact,
+            &held,
+            &fresh
+        )
+        .is_err());
+        assert!(!held.is_resolved());
+        // Another spelling of the held directory is the same grant.
+        assert!(authorize_project_directory(None, &respelled, &held_exact, &held, &fresh).is_ok());
+        assert!(held.is_resolved());
+
+        // A directory nobody held is refused until a picker returns it.
+        let held = LazyCanonicalKeys::new(vec![picked_text.as_str()]);
+        assert!(
+            authorize_project_directory(None, &other_text, &held_exact, &held, &fresh).is_err()
+        );
+        assert!(held.is_resolved());
+        fresh.authorize_workspace(&other).unwrap();
+        assert!(authorize_project_directory(None, &other_text, &held_exact, &held, &fresh).is_ok());
+    }
+
+    /// A held directory that has gone away — an unplugged drive, a network
+    /// share that is not mounted — is still re-proposed at the same text, and
+    /// that text alone keeps its standing, as a project's workspace and as a
+    /// conversation's attached one. Proposed as new, it is refused as before.
+    #[test]
+    fn an_unchanged_save_keeps_held_directories_that_no_longer_resolve() {
+        let directory = tempfile::tempdir().unwrap();
+        let gone = directory
+            .path()
+            .join("unmounted-share")
+            .to_string_lossy()
+            .into_owned();
+        let mut held = default_document();
+        let mut project = held.workspaces[0].clone();
+        project.id = "ws_gone".into();
+        project.path = gone.clone();
+        project.additional_workspaces = vec![host_member(Path::new(&gone).join("docs").as_path())];
+        project.conversations.clear();
+        held.workspaces.push(project);
+        held.workspaces[0].conversations[0].attached_workspaces =
+            vec![host_member(Path::new(&gone))];
+
+        let fresh = AppState::default();
+        assert!(validate_workspace_authorizations(&held, &held, &fresh).is_ok());
+        assert!(validate_workspace_authorizations(&default_document(), &held, &fresh).is_err());
+        let mut attached_only = default_document();
+        attached_only.workspaces[0].conversations[0].attached_workspaces =
+            vec![host_member(Path::new(&gone))];
+        assert!(
+            validate_workspace_authorizations(&default_document(), &attached_only, &fresh).is_err()
+        );
     }
 
     #[test]

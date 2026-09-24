@@ -35,6 +35,9 @@
 .browser-panel__address-host { color: var(--muted); }
 .browser-panel__address-path { color: var(--faint); }
 .browser-panel__error { position: absolute; z-index: 9; top: 4px; right: 4px; left: 4px; min-height: 34px; display: flex; align-items: center; padding: 6px 9px; overflow: hidden; border: 1px solid var(--color-edc7c7); border-radius: 8px; color: var(--color-a23737); background: var(--color-fff5f5); box-shadow: 0 4px 14px var(--color-501818-ap10); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+/* The machine a remote workspace's page is served from cannot be reached. Not an error the user
+   made, so it reads as a notice: the page keeps what it had while the link comes back. */
+.browser-panel__notice { position: absolute; z-index: 9; top: 4px; right: 4px; left: 4px; min-height: 30px; display: flex; align-items: center; padding: 5px 9px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--warning) 32%, var(--border)); border-radius: 8px; color: var(--text); background: var(--warning-soft); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .browser-panel__menu-trigger[aria-expanded="true"] { color: var(--text); background: var(--browser-menu-hover); }
 /* Anchored to the top of the body: the trigger sits in the title bar above it, so the popup opens
    directly under it, start-aligned. */
@@ -253,6 +256,7 @@
 .tool-toggle-row strong { font-size: 10.5px; }
 .tool-toggle-row small { margin-top: 1px; color: var(--faint); font-size: 8.5px; line-height: 1.3; }
 .tool-toggle-row em { padding: 2px 4px; border-radius: 4px; color: var(--warning); background: var(--warning-soft); font-size: 7.5px; font-style: normal; }
+.tool-toggle-row em.tool-toggle-row__decision { color: var(--decision); background: var(--decision-soft); }
 /* A row whose control is a picker rather than a switch. The compact metrics are
    shared with .tool-bulk-actions buttons so a row carrying both lines up. */
 .tool-toggle-row > .input, .tool-toggle-row .tool-bulk-actions .input {

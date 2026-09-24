@@ -104,13 +104,27 @@ pub fn workspace_rebound_conversations(
         .collect()
 }
 
+/// Workspaces `previous` had that `next` removed or moved to another kind or
+/// path: the ones whose shells, a draft's included, cannot stay where they are.
+pub fn rebound_workspaces(previous: &AppDocument, next: &AppDocument) -> HashSet<String> {
+    let next = workspace_lifecycle_bindings(next);
+    workspace_lifecycle_bindings(previous)
+        .into_iter()
+        .filter_map(|(workspace_id, binding)| {
+            (next.get(&workspace_id) != Some(&binding)).then_some(workspace_id)
+        })
+        .collect()
+}
+
 /// Returns whether publishing `next` must exclude every workspace-bound operation.
 ///
-/// Existing work can only own identities already present in `previous`. Adding a
-/// conversation to an unchanged workspace therefore cannot invalidate that work:
-/// its temporary directory, terminal/MCP owner, and model-run registry key are all
-/// conversation-scoped. Adding/removing a workspace or changing its kind/path still
-/// needs the fence.
+/// Existing work can only own identities already present in `previous`, so only a
+/// workspace that `previous` already had can be pulled out from under it: removing
+/// one, or changing its kind or path, needs the fence. Adding a workspace — a new
+/// project, created by the user while a model or tool is running — cannot
+/// invalidate anything, just as adding a conversation to an unchanged workspace
+/// cannot: no run, terminal, or MCP session can have been bound to an id the host
+/// has never published.
 ///
 /// Compare workspace shape only. Conversation lists are host-authoritative at this
 /// boundary; comparing them would create false positives for renderer save payloads.
@@ -118,7 +132,7 @@ pub fn requires_exclusive_workspace_lifecycle_fence(
     previous: &AppDocument,
     next: &AppDocument,
 ) -> bool {
-    workspace_lifecycle_bindings(previous) != workspace_lifecycle_bindings(next)
+    !rebound_workspaces(previous, next).is_empty()
 }
 
 #[cfg(test)]
@@ -160,9 +174,10 @@ mod tests {
             invalidated_conversations(&previous, &next),
             HashSet::from(["conv_welcome".to_owned()])
         );
-        // The fence is caused by the added workspace; it does not inspect
-        // conversation lists. Conversation moves are invalidated by `crate::conversations`.
-        assert!(requires_exclusive_workspace_lifecycle_fence(
+        // The fence does not inspect conversation lists, and the workspace the
+        // conversation moved into is new, so nothing here needs it. Conversation
+        // moves are invalidated by `crate::conversations`.
+        assert!(!requires_exclusive_workspace_lifecycle_fence(
             &previous, &next
         ));
     }
@@ -199,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_workspace_remains_an_exclusive_lifecycle_change() {
+    fn adding_a_workspace_stays_concurrent_with_running_work() {
         let previous = document();
         let mut next = previous.clone();
         let mut added = next.workspaces[0].clone();
@@ -207,9 +222,51 @@ mod tests {
         added.path = "C:/work/added".into();
         added.conversations.clear();
         next.workspaces.push(added);
+        let payload = renderer_save_payload(&next);
+
+        assert!(workspace_rebound_conversations(&previous, &payload).is_empty());
+        assert!(!requires_exclusive_workspace_lifecycle_fence(
+            &previous, &payload
+        ));
+    }
+
+    #[test]
+    fn rebound_workspaces_names_removed_and_moved_projects_only() {
+        let previous = document();
+        let mut next = previous.clone();
+        let mut added = next.workspaces[0].clone();
+        added.id = "ws_added".into();
+        added.path = "C:/work/added".into();
+        next.workspaces.push(added);
+        assert!(rebound_workspaces(&previous, &next).is_empty());
+
+        next.workspaces[0].path = "C:/work/moved".into();
+        assert_eq!(
+            rebound_workspaces(&previous, &next),
+            HashSet::from([previous.workspaces[0].id.clone()])
+        );
+
+        next.workspaces.remove(0);
+        assert_eq!(
+            rebound_workspaces(&previous, &next),
+            HashSet::from([previous.workspaces[0].id.clone()])
+        );
+    }
+
+    #[test]
+    fn adding_a_workspace_alongside_a_rebinding_still_takes_the_fence() {
+        let previous = document();
+        let mut next = previous.clone();
+        next.workspaces[0].path = "C:/work/moved".into();
+        let mut added = previous.workspaces[0].clone();
+        added.id = "ws_added".into();
+        added.path = "C:/work/added".into();
+        added.conversations.clear();
+        next.workspaces.push(added);
 
         assert!(requires_exclusive_workspace_lifecycle_fence(
-            &previous, &next
+            &previous,
+            &renderer_save_payload(&next)
         ));
     }
 

@@ -57,7 +57,9 @@
   border: 0; border-top: 1px solid color-mix(in srgb, var(--border, var(--color-dfdfda)) 52%, transparent);
   border-radius: 0; color: var(--text, var(--color-1b1b1a)); background: transparent; text-align: left;
 }
-.git-status-card__row:not(.git-status-card__row--static):hover,
+.git-status-card__row:disabled { cursor: default; }
+.git-status-card__row:disabled > svg:last-child { visibility: hidden; }
+.git-status-card__row:not(.git-status-card__row--static):not(:disabled):hover,
 .git-status-card__row:not(.git-status-card__row--static):focus-visible,
 .git-status-card__row--open { background: color-mix(in srgb, var(--hover, var(--color-e9e9e5)) 52%, transparent); }
 .git-status-card__row--open { box-shadow: inset 2px 0 var(--accent, var(--color-4d4d48)); }

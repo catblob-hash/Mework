@@ -180,10 +180,19 @@ pub fn reveal(path: &Path) -> Result<(), String> {
             command
         }
     };
-    command
+    let mut child = command
         .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("无法打开文件位置: {error}"))
+        .map_err(|error| format!("无法打开文件位置: {error}"))?;
+    // A child nobody waits on stays a zombie for the life of Mework, one per
+    // click. `open` exits as soon as Finder has the request, but `xdg-open` can
+    // stay in the foreground for as long as the file manager it started, so
+    // the wait gets a thread of its own instead of holding up the caller.
+    let _ = std::thread::Builder::new()
+        .name("reveal-path-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(())
 }
 
 #[cfg(test)]

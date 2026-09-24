@@ -185,6 +185,22 @@ button.subagent-chip:hover { border-color: var(--border-strong); background: var
 .machine-settings__facts dt { color: var(--muted); }
 .machine-settings__facts dd { min-width: 0; margin: 0; color: var(--text); overflow-wrap: anywhere; }
 .machine-settings__note { margin: 14px 0 0; padding: 9px 10px; border-radius: 8px; background: var(--subtle); color: var(--muted); font-size: 10.5px; line-height: 1.45; }
+/* A machine's shell backends: re-probe on the left, the agent shell to its right, what was found below. */
+.machine-shells { margin-top: 14px; padding-top: 12px; display: flex; flex-direction: column; gap: 9px; border-top: 1px solid var(--border); }
+.machine-shells__row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.machine-shells__agent { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--muted); }
+.machine-shells__agent select { min-width: 118px; height: 28px; }
+.machine-shells__found dd { display: flex; flex-direction: column; gap: 3px; }
+.machine-shells__shell { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.machine-shells__shell code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-family: var(--mono); font-size: 10.5px; }
+.machine-shells__pending { margin: 0; color: var(--faint); font-size: 10.5px; line-height: 1.45; }
+.shell-priority__os { margin-top: 18px; }
+.shell-priority__os h4 { margin: 0 0 7px; color: var(--text); font-size: 12px; font-weight: 650; }
+.shell-priority__list { margin: 0; padding: 3px; list-style: none; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); border-radius: 8px; max-width: 360px; }
+.shell-priority__item { min-height: 30px; padding: 2px 4px 2px 8px; display: flex; align-items: center; gap: 8px; border-radius: 6px; font-size: 12px; }
+.shell-priority__item:hover { background: var(--hover); }
+.shell-priority__rank { width: 14px; color: var(--faint); font-size: 10.5px; text-align: right; }
+.shell-priority__name { flex: 1; min-width: 0; color: var(--text); }
 
 .remote-picker { display: flex; flex-direction: column; gap: 9px; }.remote-picker__list { height: 208px; overflow-y: auto; padding: 3px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); border-radius: 8px; }
 .remote-picker__entry { min-height: 27px; padding: 4px 7px; display: flex; align-items: center; gap: 8px; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 12px; }

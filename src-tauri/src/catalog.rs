@@ -32,6 +32,7 @@ fn parameter(
     }
 }
 
+
 fn descriptor(
     name: &str,
     label: &str,
@@ -326,6 +327,204 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
             ],
         ),
         descriptor(
+            "zsh",
+            "zsh",
+            "",
+            ToolCategory::Shell,
+            true,
+            vec![
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    Some("ls -la"),
+                    None,
+                ),
+                parameter(
+                    "description",
+                    "说明",
+                    StringType,
+                    false,
+                    None,
+                    Some("列出当前目录的文件"),
+                    None,
+                ),
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    Some("120000"),
+                    None,
+                ),
+                parameter(
+                    "run_in_background",
+                    "后台运行",
+                    Boolean,
+                    false,
+                    Some(json!(false)),
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        descriptor(
+            "sh",
+            "sh",
+            "",
+            ToolCategory::Shell,
+            true,
+            vec![
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    Some("ls -la"),
+                    None,
+                ),
+                parameter(
+                    "description",
+                    "说明",
+                    StringType,
+                    false,
+                    None,
+                    Some("列出当前目录的文件"),
+                    None,
+                ),
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    Some("120000"),
+                    None,
+                ),
+                parameter(
+                    "run_in_background",
+                    "后台运行",
+                    Boolean,
+                    false,
+                    Some(json!(false)),
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        descriptor(
+            "zsh_find_output",
+            "zsh（筛选输出）",
+            "",
+            ToolCategory::Shell,
+            true,
+            vec![
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    Some("ls -la"),
+                    None,
+                ),
+                parameter(
+                    "description",
+                    "说明",
+                    StringType,
+                    false,
+                    None,
+                    Some("列出当前目录的文件"),
+                    None,
+                ),
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    Some("120000"),
+                    None,
+                ),
+                parameter(
+                    "query",
+                    "查找内容",
+                    StringType,
+                    true,
+                    None,
+                    Some("测试失败的原因"),
+                    Some("用自然语言描述要在命令输出里找的内容；输出会切块送给决策模型打分，只返回过阈值的片段"),
+                ),
+                parameter(
+                    "threshold",
+                    "分数阈值",
+                    Number,
+                    true,
+                    None,
+                    Some("0.6"),
+                    Some("0 到 1，最多三位小数；只返回分数不低于它的片段"),
+                ),
+            ],
+        ),
+        descriptor(
+            "sh_find_output",
+            "sh（筛选输出）",
+            "",
+            ToolCategory::Shell,
+            true,
+            vec![
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    Some("ls -la"),
+                    None,
+                ),
+                parameter(
+                    "description",
+                    "说明",
+                    StringType,
+                    false,
+                    None,
+                    Some("列出当前目录的文件"),
+                    None,
+                ),
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    Some("120000"),
+                    None,
+                ),
+                parameter(
+                    "query",
+                    "查找内容",
+                    StringType,
+                    true,
+                    None,
+                    Some("测试失败的原因"),
+                    Some("用自然语言描述要在命令输出里找的内容；输出会切块送给决策模型打分，只返回过阈值的片段"),
+                ),
+                parameter(
+                    "threshold",
+                    "分数阈值",
+                    Number,
+                    true,
+                    None,
+                    Some("0.6"),
+                    Some("0 到 1，最多三位小数；只返回分数不低于它的片段"),
+                ),
+            ],
+        ),
+        descriptor(
             "write",
             "写入文件",
             "",
@@ -413,7 +612,7 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
         ),
         descriptor(
             "find_content",
-            "查找内容",
+            "按描述查找内容",
             "",
             ToolCategory::Filesystem,
             false,
@@ -504,7 +703,7 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
         ),
         descriptor(
             "find_output",
-            "查找命令输出",
+            "按描述查找输出",
             "",
             ToolCategory::Shell,
             false,
@@ -735,6 +934,24 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     None,
                     Some("最多返回行数（默认 50，上限 200）"),
                 ),
+                parameter(
+                    "query",
+                    "查询",
+                    StringType,
+                    false,
+                    None,
+                    Some("有没有关于 hydration 的报错"),
+                    Some("用自然语言描述要在 Console 里找的内容；按 level 过滤后的日志送给决策模型打分，只返回分数不低于 threshold 的片段。需在对话设置里为本工具开启决策模型参数"),
+                ),
+                parameter(
+                    "threshold",
+                    "分数阈值",
+                    Number,
+                    false,
+                    None,
+                    Some("0.6"),
+                    Some("0 到 1，最多三位小数；与 query 一起给出，只返回分数不低于它的片段"),
+                ),
             ],
         ),
         descriptor(
@@ -770,15 +987,35 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
             "",
             ToolCategory::Web,
             true,
-            vec![parameter(
-                "serverId",
-                "服务器 ID",
-                StringType,
-                false,
-                None,
-                None,
-                Some("服务器 ID"),
-            )],
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "query",
+                    "查询",
+                    StringType,
+                    false,
+                    None,
+                    Some("顶部导航里的登录按钮"),
+                    Some("用自然语言描述要找的页面元素；可访问性快照送给决策模型打分，只返回分数不低于 threshold 的元素及其选择器，而不是整份快照。需在对话设置里为本工具开启决策模型参数"),
+                ),
+                parameter(
+                    "threshold",
+                    "分数阈值",
+                    Number,
+                    false,
+                    None,
+                    Some("0.6"),
+                    Some("0 到 1，最多三位小数；与 query 一起给出，只返回分数不低于它的元素"),
+                ),
+            ],
         ),
         descriptor(
             "preview_inspect",
@@ -800,10 +1037,10 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     "selector",
                     "CSS Selector",
                     StringType,
-                    true,
+                    false,
                     None,
                     Some(".button"),
-                    Some("要检查的元素 CSS 选择器"),
+                    Some("要检查的元素 CSS 选择器；开启决策模型参数后也可以改用 query"),
                 ),
                 parameter(
                     "styles",
@@ -813,6 +1050,15 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     None,
                     Some("[\"padding\",\"color\"]"),
                     Some("要返回的 CSS 属性名数组；不给时返回一组常用属性"),
+                ),
+                parameter(
+                    "query",
+                    "元素描述",
+                    StringType,
+                    false,
+                    None,
+                    Some("对话框里的保存按钮"),
+                    Some("用自然语言描述要检查的元素，代替 selector；决策模型从页面元素里选出所指的一个并读取它的样式，都不符合时会选「以上皆非」，按未找到回答。需在对话设置里为本工具开启决策模型参数"),
                 ),
             ],
         ),
@@ -836,10 +1082,10 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     "selector",
                     "CSS Selector",
                     StringType,
-                    true,
+                    false,
                     None,
                     Some("button.primary"),
-                    Some("要点击的元素 CSS 选择器"),
+                    Some("要点击的元素 CSS 选择器；开启决策模型参数后也可以改用 query"),
                 ),
                 parameter(
                     "doubleClick",
@@ -849,6 +1095,15 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     None,
                     None,
                     Some("改为双击"),
+                ),
+                parameter(
+                    "query",
+                    "元素描述",
+                    StringType,
+                    false,
+                    None,
+                    Some("对话框里的保存按钮"),
+                    Some("用自然语言描述要点击的元素，代替 selector；决策模型从页面元素里选出所指的一个并点击，都不符合时会选「以上皆非」，什么也不做。需在对话设置里为本工具开启决策模型参数"),
                 ),
             ],
         ),
@@ -872,10 +1127,10 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     "selector",
                     "CSS Selector",
                     StringType,
-                    true,
+                    false,
                     None,
                     Some("input[name=email]"),
-                    Some("要填写的输入框 CSS 选择器"),
+                    Some("要填写的输入框 CSS 选择器；开启决策模型参数后也可以改用 query"),
                 ),
                 parameter(
                     "value",
@@ -885,6 +1140,15 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     None,
                     None,
                     Some("要填入的值"),
+                ),
+                parameter(
+                    "query",
+                    "元素描述",
+                    StringType,
+                    false,
+                    None,
+                    Some("邮箱输入框"),
+                    Some("用自然语言描述要填写的输入框，代替 selector；决策模型从页面元素里选出所指的一个并填写，都不符合时会选「以上皆非」，什么也不做。需在对话设置里为本工具开启决策模型参数"),
                 ),
             ],
         ),
@@ -1087,42 +1351,6 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
             ],
         ),
         descriptor(
-            "preview_find_element",
-            "按描述查找页面元素",
-            "",
-            ToolCategory::Web,
-            true,
-            vec![
-                parameter(
-                    "serverId",
-                    "服务器 ID",
-                    StringType,
-                    false,
-                    None,
-                    None,
-                    Some("服务器 ID"),
-                ),
-                parameter(
-                    "query",
-                    "查找元素",
-                    StringType,
-                    true,
-                    None,
-                    Some("顶部导航里的登录按钮"),
-                    Some("用自然语言描述要找的页面元素；页面的可访问性快照会切块送给决策模型打分"),
-                ),
-                parameter(
-                    "threshold",
-                    "分数阈值",
-                    Number,
-                    true,
-                    None,
-                    Some("0.6"),
-                    Some("0 到 1，最多三位小数；只返回分数不低于它的片段"),
-                ),
-            ],
-        ),
-        descriptor(
             "preview_find_logs",
             "按描述查找日志",
             "",
@@ -1164,106 +1392,6 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     Some(json!("all")),
                     None,
                     Some("要搜索的日志：all（默认）同时搜 Console 与服务器日志，console 只搜页面 Console，server 只搜服务器输出"),
-                ),
-            ],
-        ),
-        descriptor(
-            "preview_click_by_description",
-            "按描述点击元素",
-            "",
-            ToolCategory::Web,
-            true,
-            vec![
-                parameter(
-                    "serverId",
-                    "服务器 ID",
-                    StringType,
-                    false,
-                    None,
-                    None,
-                    Some("服务器 ID"),
-                ),
-                parameter(
-                    "description",
-                    "元素描述",
-                    StringType,
-                    true,
-                    None,
-                    Some("顶部导航里的登录按钮"),
-                    Some("用自然语言描述要操作的元素；宿主把页面元素交给决策模型选出一个并直接操作"),
-                ),
-                parameter("doubleClick", "双击", Boolean, false, None, None, Some("改为双击")),
-            ],
-        ),
-        descriptor(
-            "preview_fill_by_description",
-            "按描述填写输入",
-            "",
-            ToolCategory::Web,
-            true,
-            vec![
-                parameter(
-                    "serverId",
-                    "服务器 ID",
-                    StringType,
-                    false,
-                    None,
-                    None,
-                    Some("服务器 ID"),
-                ),
-                parameter(
-                    "description",
-                    "元素描述",
-                    StringType,
-                    true,
-                    None,
-                    Some("顶部导航里的登录按钮"),
-                    Some("用自然语言描述要操作的元素；宿主把页面元素交给决策模型选出一个并直接操作"),
-                ),
-                parameter(
-                    "value",
-                    "值",
-                    StringType,
-                    true,
-                    None,
-                    None,
-                    Some("要填入的值"),
-                ),
-            ],
-        ),
-        descriptor(
-            "preview_inspect_by_description",
-            "按描述检查元素",
-            "",
-            ToolCategory::Web,
-            true,
-            vec![
-                parameter(
-                    "serverId",
-                    "服务器 ID",
-                    StringType,
-                    false,
-                    None,
-                    None,
-                    Some("服务器 ID"),
-                ),
-                parameter(
-                    "description",
-                    "元素描述",
-                    StringType,
-                    true,
-                    None,
-                    Some("顶部导航里的登录按钮"),
-                    Some("用自然语言描述要操作的元素；宿主把页面元素交给决策模型选出一个并直接操作"),
-                ),
-                parameter(
-                    "styles",
-                    "CSS 属性",
-                    Json,
-                    false,
-                    None,
-                    Some("[\"padding\",\"color\"]"),
-                    Some("要返回的 CSS 属性名数组；不给时返回一组常用属性"),
                 ),
             ],
         ),
@@ -1957,15 +2085,19 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
         "grep" => "Search content",
         "powershell" => "PowerShell",
         "bash" => "Bash",
+        "zsh" => "zsh",
+        "sh" => "sh",
         "write" => "Write file",
         "edit" => "Edit file",
         "find" => "Find files",
         "read" => "Read file",
-        "find_content" => "Find content",
+        "find_content" => "Find content by description",
         "find_files" => "Find files by description",
-        "find_output" => "Find command output",
+        "find_output" => "Find output by description",
         "bash_find_output" => "Bash, scored output",
         "powershell_find_output" => "PowerShell, scored output",
+        "zsh_find_output" => "zsh, scored output",
+        "sh_find_output" => "sh, scored output",
         "lsp" => "Code navigation",
         "web_search" => "Web search",
         "web_fetch" => "Fetch web pages",
@@ -1984,11 +2116,7 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
         "preview_resize" => "Resize viewport",
         "preview_upload_image" => "Upload image",
         "preview_dialog" => "Answer dialog",
-        "preview_find_element" => "Find page elements by description",
         "preview_find_logs" => "Find logs by description",
-        "preview_click_by_description" => "Click element by description",
-        "preview_fill_by_description" => "Fill element by description",
-        "preview_inspect_by_description" => "Inspect element by description",
         "agent_spawn" => "Subagent",
         "send_message" => "Send message",
         "followup_task" => "Follow up",
@@ -2154,7 +2282,10 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         ("find_output", "query") => {
             "Describe what to look for in the output in plain language; the output is cut into chunks the decision model scores."
         }
-        ("bash_find_output", "query") | ("powershell_find_output", "query") => {
+        ("bash_find_output", "query")
+        | ("powershell_find_output", "query")
+        | ("zsh_find_output", "query")
+        | ("sh_find_output", "query") => {
             "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned."
         }
         ("find_content", "threshold")
@@ -2162,7 +2293,8 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         | ("find_output", "threshold")
         | ("bash_find_output", "threshold")
         | ("powershell_find_output", "threshold")
-        | ("preview_find_element", "threshold")
+        | ("zsh_find_output", "threshold")
+        | ("sh_find_output", "threshold")
         | ("preview_find_logs", "threshold") => {
             "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
         }
@@ -2211,24 +2343,30 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         | ("preview_resize", "serverId")
         | ("preview_upload_image", "serverId")
         | ("preview_dialog", "serverId")
-        | ("preview_find_element", "serverId")
-        | ("preview_find_logs", "serverId")
-        | ("preview_click_by_description", "serverId")
-        | ("preview_fill_by_description", "serverId")
-        | ("preview_inspect_by_description", "serverId") => "Server ID",
-        ("preview_find_element", "query") => {
-            "Describe the page element to look for in plain language; the page's accessibility snapshot is cut into chunks the decision model scores."
+        | ("preview_find_logs", "serverId") => "Server ID",
+        ("preview_console_logs", "query") => {
+            "Describe what to look for in the console in plain language; the logs that pass level go to the decision model, and only pieces scoring at or above threshold come back. Needs this tool's decision-model parameters turned on in the conversation settings."
+        }
+        ("preview_console_logs", "threshold") | ("preview_snapshot", "threshold") => {
+            "0 to 1 with at most three decimals, given with query; only pieces scoring at or above it are returned."
+        }
+        ("preview_snapshot", "query") => {
+            "Describe the page element to look for in plain language; the accessibility snapshot goes to the decision model, and only elements scoring at or above threshold come back with their selectors, instead of the whole snapshot. Needs this tool's decision-model parameters turned on in the conversation settings."
+        }
+        ("preview_click", "query") => {
+            "Describe the element to click in plain language, instead of selector; the decision model chooses the one meant and it is clicked, or answers none of the above and nothing is done. Needs this tool's decision-model parameters turned on in the conversation settings."
+        }
+        ("preview_fill", "query") => {
+            "Describe the input to fill in plain language, instead of selector; the decision model chooses the one meant and it is filled, or answers none of the above and nothing is done. Needs this tool's decision-model parameters turned on in the conversation settings."
+        }
+        ("preview_inspect", "query") => {
+            "Describe the element to inspect in plain language, instead of selector; the decision model chooses the one meant and its styles are read, or answers none of the above and the element is reported as not found. Needs this tool's decision-model parameters turned on in the conversation settings."
         }
         ("preview_find_logs", "query") => {
             "Describe what to look for in the logs in plain language; the console and server logs are cut into chunks the decision model scores."
         }
         ("preview_find_logs", "source") => {
             "Which logs to search: 'all' (default) searches both the page console and the dev server output, 'console' only the page console, 'server' only the server output."
-        }
-        ("preview_click_by_description", "description")
-        | ("preview_fill_by_description", "description")
-        | ("preview_inspect_by_description", "description") => {
-            "Describe the element to act on in plain language; the host hands the page's elements to the decision model, which picks one, and acts on it directly."
         }
         ("preview_logs", "level") => {
             "Filter by level: 'all' (default) shows all output, 'error' shows only lines containing error/exception/failed/fatal"
@@ -2245,19 +2383,20 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         ("preview_screenshot", "scale") => {
             "Scale factor in [0.1, 1] for the returned image; smaller images use fewer tokens. preview_click uses element UIDs from preview_snapshot, not pixel coordinates."
         }
-        ("preview_inspect", "selector") => "CSS selector (e.g., '.button', '#header')",
+        ("preview_inspect", "selector") => {
+            "CSS selector (e.g., '.button', '#header'); with decision-model parameters on, query can name the element instead"
+        }
         ("preview_inspect", "styles") => {
             "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
         }
-        ("preview_inspect_by_description", "styles") => {
-            "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
+        ("preview_click", "selector") => {
+            "CSS selector for the element to click; with decision-model parameters on, query can name the element instead"
         }
-        ("preview_click", "selector") => "CSS selector for the element to click",
         ("preview_click", "doubleClick") => "Perform a double-click",
-        ("preview_click_by_description", "doubleClick") => "Perform a double-click",
-        ("preview_fill", "selector") => "CSS selector for the input element",
+        ("preview_fill", "selector") => {
+            "CSS selector for the input element; with decision-model parameters on, query can name the element instead"
+        }
         ("preview_fill", "value") => "Value to fill",
-        ("preview_fill_by_description", "value") => "Value to fill",
         ("preview_eval", "expression") => {
             "JavaScript expression to evaluate in the page context. Return values are serialized as JSON."
         }
@@ -2373,25 +2512,38 @@ fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static
     Some(match (tool, parameter) {
         ("bash", "description") => "Show working tree status",
         ("powershell", "description") => "List files in the current directory",
+        ("zsh", "description") | ("sh", "description") => "List files in the current directory",
         ("find_content", "query") => "The code that handles a failed login",
         ("find_files", "query") => "The code that stores provider credentials",
         ("find_output", "task") => "shell:3",
         ("find_output", "query") => "Are there compile errors",
         ("bash_find_output", "description") => "Show working tree status",
         ("powershell_find_output", "description") => "List files in the current directory",
-        ("bash_find_output", "query") | ("powershell_find_output", "query") => "Why the tests failed",
-        ("preview_find_element", "query") => "The login button in the top navigation",
-        ("preview_find_logs", "query") => "Any errors about hydration",
-        ("preview_click_by_description", "description")
-        | ("preview_fill_by_description", "description")
-        | ("preview_inspect_by_description", "description") => "The login button in the top navigation",
+        ("zsh_find_output", "description") | ("sh_find_output", "description") => {
+            "List files in the current directory"
+        }
+        ("bash_find_output", "query")
+        | ("powershell_find_output", "query")
+        | ("zsh_find_output", "query")
+        | ("sh_find_output", "query") => "Why the tests failed",
+        ("preview_find_logs", "query") | ("preview_console_logs", "query") => {
+            "Any errors about hydration"
+        }
+        ("preview_snapshot", "query") => "The login button in the top navigation",
+        ("preview_click", "query") | ("preview_inspect", "query") => {
+            "The Save button in the dialog"
+        }
+        ("preview_fill", "query") => "The email field",
         ("find_content", "threshold")
         | ("find_files", "threshold")
         | ("find_output", "threshold")
         | ("bash_find_output", "threshold")
         | ("powershell_find_output", "threshold")
-        | ("preview_find_element", "threshold")
-        | ("preview_find_logs", "threshold") => "0.6",
+        | ("zsh_find_output", "threshold")
+        | ("sh_find_output", "threshold")
+        | ("preview_find_logs", "threshold")
+        | ("preview_console_logs", "threshold")
+        | ("preview_snapshot", "threshold") => "0.6",
         ("web_search", "query") => "Anthropic Claude 4.5 release date",
         ("web_fetch", "urls") => "[\"https://example.com/docs/changelog\"]",
         ("agent_spawn", "prompt") => "Inspect routing under src/ and summarize the key files",
@@ -2639,6 +2791,8 @@ fn seed_preset(
             // selected body and every MCP schema into the system prompt.
             skill_tool_enabled: true,
             mcp_tool_discovery_enabled: true,
+            decision_parameter_modes: Default::default(),
+            decision_miss_scoring: Default::default(),
         },
     }
 }
@@ -2849,6 +3003,8 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
             project_memory_enabled: false,
             skill_tool_enabled: false,
             mcp_tool_discovery_enabled: false,
+            decision_parameter_modes: Default::default(),
+            decision_miss_scoring: Default::default(),
         },
     }];
     document.presets.default_conversation_preset_id = "conversation_default".into();
@@ -2891,6 +3047,9 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                     project_memory_enabled: false,
                     skill_tool_enabled: false,
                     mcp_tool_discovery_enabled: false,
+                    decision_parameter_modes: Default::default(),
+                    decision_miss_scoring: Default::default(),
+                    remembered_decision_forms: Default::default(),
                     tool_lock: None,
                 },
                 contexts: Vec::new(),

@@ -123,6 +123,48 @@ describe("createConversationSync", () => {
     expect(await sync.refresh("conv_a")).toBeNull();
   });
 
+  it("holds workspace commands until the host knows the workspace", async () => {
+    const order: string[] = [];
+    let release: () => void = () => undefined;
+    const barrier = vi.fn((workspaceId: string) => {
+      order.push(`barrier:${workspaceId}`);
+      return new Promise<void>((resolve) => {
+        release = () => {
+          order.push("workspace saved");
+          resolve();
+        };
+      });
+    });
+    remote.createConversationRemote.mockImplementationOnce(async (_workspaceId, next) => {
+      order.push("create");
+      return next;
+    });
+    const sync = createConversationSync(() => undefined, barrier);
+
+    sync.created("ws_new", conversation("conv_slot", []), ["conv_slot"]);
+    const flushed = sync.flush();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The project was added in the same event; its save has not landed yet.
+    expect(remote.createConversationRemote).not.toHaveBeenCalled();
+
+    release();
+    await flushed;
+    expect(order).toEqual(["barrier:ws_new", "workspace saved", "create"]);
+    expect(remote.reorderConversationsRemote).toHaveBeenCalledWith("ws_new", ["conv_slot"]);
+  });
+
+  it("still sends the command when the barrier fails, so the host reports why", async () => {
+    const sync = createConversationSync(
+      () => undefined,
+      async () => { throw new Error("save refused"); }
+    );
+
+    sync.reordered("ws_new", ["conv_moved"]);
+    await sync.flush();
+
+    expect(remote.reorderConversationsRemote).toHaveBeenCalledWith("ws_new", ["conv_moved"]);
+  });
+
   it("diffs a replaced document by object identity", async () => {
     const sync = createConversationSync(() => undefined);
     const untouched = conversation("conv_keep", ["ctx_1"]);

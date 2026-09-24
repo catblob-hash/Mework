@@ -22,7 +22,7 @@ import {
   stopPreviewServer
 } from "./preview";
 
-const target = { kind: "workspace", workspaceId: "workspace-1" } as const;
+const target = { conversationId: "conv-1", workspace: 2 } as const;
 
 function stubBackend<T>(value: T) {
   vi.spyOn(backend, "hasBackendRuntime").mockReturnValue(true);

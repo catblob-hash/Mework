@@ -18,7 +18,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
-use crate::host_platform::host_platform;
+use crate::host_platform::{host_platform, is_uninstalled_developer_tool_shim};
 
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const BULK_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1539,7 +1539,16 @@ pub fn workspace_summary(
     let lock = repository_lock(&repository);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = snapshot_for_repository(&repository)?;
-    let summary = workspace_summary_from_snapshot(&snapshot);
+    summary_result(&snapshot, known_revision)
+}
+
+/// The summary answer for `snapshot`: `Unchanged` when the caller already
+/// holds its revision.
+pub(crate) fn summary_result(
+    snapshot: &GitWorkspaceSnapshot,
+    known_revision: Option<String>,
+) -> Result<GitWorkspaceSummaryResult, String> {
+    let summary = workspace_summary_from_snapshot(snapshot);
     let known_revision = known_revision
         .as_deref()
         .map(|revision| validate_revision_token("Git 汇总修订", revision))
@@ -7021,19 +7030,7 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
         return Err("Git 状态超过安全上限，无法可靠显示完整变更".into());
     }
     let mut parsed = parse_porcelain_v2(&status.stdout)?;
-    let mut warnings = Vec::new();
-    let nested_submodule_changes = parsed
-        .changes
-        .iter()
-        .filter(|change| {
-            change.submodule && (change.submodule_modified || change.submodule_untracked)
-        })
-        .count();
-    if nested_submodule_changes > 0 {
-        warnings.push(format!(
-            "{nested_submodule_changes} 个子模块包含内部未提交变更；请将子模块目录作为独立工作区处理"
-        ));
-    }
+    let mut warnings = nested_submodule_warnings(&parsed.changes);
     let line_stats = match combined_line_stats(repository, &mut parsed.changes) {
         Ok(stats) => stats,
         Err(error) => {
@@ -7046,22 +7043,6 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
         }
     };
     let content_revision = repository_content_revision(repository, &parsed.changes)?;
-    let staged_count = parsed.changes.iter().filter(|change| change.staged).count() as u32;
-    let unstaged_count = parsed
-        .changes
-        .iter()
-        .filter(|change| change.unstaged)
-        .count() as u32;
-    let untracked_count = parsed
-        .changes
-        .iter()
-        .filter(|change| change.untracked)
-        .count() as u32;
-    let conflicted_count = parsed
-        .changes
-        .iter()
-        .filter(|change| change.conflicted)
-        .count() as u32;
     let (transports, remote_warnings) = snapshot_remote_transports(repository);
     warnings.extend(remote_warnings);
     let (upstream, upstream_target) = if let Some(branch_name) = parsed.branch.head.as_deref() {
@@ -7082,10 +7063,96 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
     } else {
         (None, None)
     };
-    let mut remotes = transports
+    let operation_state = repository_operation_state(&repository.git_dir)?;
+    Ok(assemble_snapshot(SnapshotParts {
+        repository_id: repository.repository_id.clone(),
+        worktree_id: repository.worktree_id.clone(),
+        root: repository.root.to_string_lossy().into_owned(),
+        git_version: repository.git_version.clone(),
+        parsed,
+        line_stats,
+        content_revision,
+        remote_proofs: transports
+            .iter()
+            .map(|transport| transport.proof.clone())
+            .collect(),
+        upstream,
+        upstream_target,
+        operation_state,
+        warnings,
+    }))
+}
+
+/// A warning for submodules with uncommitted work of their own, which the
+/// status of the superproject reports but cannot act on.
+fn nested_submodule_warnings(changes: &[GitFileChange]) -> Vec<String> {
+    let nested_submodule_changes = changes
         .iter()
-        .map(|transport| transport.proof.clone())
-        .collect::<Vec<_>>();
+        .filter(|change| {
+            change.submodule && (change.submodule_modified || change.submodule_untracked)
+        })
+        .count();
+    if nested_submodule_changes > 0 {
+        vec![format!(
+            "{nested_submodule_changes} 个子模块包含内部未提交变更；请将子模块目录作为独立工作区处理"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Everything a snapshot is built from, however it was read: by this host's
+/// Git on its own checkout, or by a probe on another machine
+/// ([`remote_workspace_snapshot`]).
+struct SnapshotParts {
+    repository_id: String,
+    worktree_id: String,
+    root: String,
+    git_version: String,
+    parsed: ParsedStatus,
+    line_stats: GitLineStats,
+    content_revision: String,
+    /// Configured remotes, in the order Git lists them.
+    remote_proofs: Vec<GitRemote>,
+    upstream: Option<String>,
+    upstream_target: Option<GitUpstream>,
+    operation_state: Option<RepositoryOperationState>,
+    warnings: Vec<String>,
+}
+
+fn assemble_snapshot(parts: SnapshotParts) -> GitWorkspaceSnapshot {
+    let SnapshotParts {
+        repository_id,
+        worktree_id,
+        root,
+        git_version,
+        parsed,
+        line_stats,
+        content_revision,
+        remote_proofs,
+        upstream,
+        upstream_target,
+        operation_state,
+        warnings,
+    } = parts;
+    let staged_count = parsed.changes.iter().filter(|change| change.staged).count() as u32;
+    let unstaged_count = parsed
+        .changes
+        .iter()
+        .filter(|change| change.unstaged)
+        .count() as u32;
+    let untracked_count = parsed
+        .changes
+        .iter()
+        .filter(|change| change.untracked)
+        .count() as u32;
+    let conflicted_count = parsed
+        .changes
+        .iter()
+        .filter(|change| change.conflicted)
+        .count() as u32;
+    let remote = preferred_git_remote(&remote_proofs, upstream_target.as_ref());
+    let mut remotes = remote_proofs;
     if upstream_target
         .as_ref()
         .is_some_and(|target| target.is_local)
@@ -7094,14 +7161,12 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
         remotes.sort_by(|left, right| left.name.cmp(&right.name));
         remotes.dedup_by(|left, right| left.name == right.name);
     }
-    let remote = preferred_git_remote(&transports, upstream_target.as_ref());
-    let operation_state = repository_operation_state(&repository.git_dir)?;
     let operation = operation_state.as_ref().map(|state| state.operation);
     let operation_revision = operation_state.map(|state| state.revision);
     let branch = parsed.branch;
     let mut snapshot = GitWorkspaceSnapshot {
-        repository_id: repository.repository_id.clone(),
-        worktree_id: repository.worktree_id.clone(),
+        repository_id,
+        worktree_id,
         branch: branch.head,
         head: branch.oid,
         content_revision,
@@ -7119,9 +7184,9 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
         files: parsed.changes,
         remote,
         remotes,
-        git_version: repository.git_version.clone(),
-        repository_root: repository.root.to_string_lossy().into_owned(),
-        worktree_root: repository.root.to_string_lossy().into_owned(),
+        git_version,
+        repository_root: root.clone(),
+        worktree_root: root,
         detached: branch.detached,
         unborn: branch.unborn,
         operation,
@@ -7140,7 +7205,352 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
     snapshot.changed_files = summary.changed_files;
     snapshot.stageable = summary.stageable;
     snapshot.unstageable = summary.unstageable;
-    Ok(snapshot)
+    snapshot
+}
+
+/// One Git invocation the status probe on another machine ran, as it
+/// reported it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RemoteGitOutput {
+    pub status: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl RemoteGitOutput {
+    fn success(&self, label: &str) -> Result<&[u8], String> {
+        if self.status == 0 {
+            return Ok(&self.stdout);
+        }
+        let detail = String::from_utf8_lossy(&self.stderr);
+        let detail = detail.trim();
+        Err(if detail.is_empty() {
+            format!("{label}失败（退出码 {}）", self.status)
+        } else {
+            format!("{label}失败：{detail}")
+        })
+    }
+}
+
+/// What the status probe of [`crate::remote_git`] read about a workspace on
+/// another machine: the reads [`snapshot_for_repository`] makes here, made
+/// there, each under its own name.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RemoteGitProbe {
+    /// The machine's identity (`run_environment::env_key`), folded into the
+    /// repository's: one machine's `/srv/app` is not another's.
+    pub machine_key: String,
+    pub sections: HashMap<String, RemoteGitOutput>,
+}
+
+impl RemoteGitProbe {
+    fn section(&self, name: &str) -> Result<&RemoteGitOutput, String> {
+        self.sections
+            .get(name)
+            .ok_or_else(|| format!("远端 Git 状态探测缺少 {name} 段"))
+    }
+}
+
+/// The snapshot [`snapshot_for_repository`] would build for a checkout this
+/// host cannot reach, from what the probe read on its machine; `None` when the
+/// workspace is not a repository root.
+///
+/// The rules are the local ones: a workspace below a repository's root is not
+/// a repository, line counts, remotes and the upstream fold the same way, and
+/// a failed line count, remote or upstream read is a warning rather than a
+/// failure. What differs is what the host cannot do across the link — hash
+/// the tracked diffs itself (the machine reports their digests) or read the
+/// upstream twice to prove it held still — and the identities, which are keyed
+/// by machine rather than by this filesystem's metadata.
+pub(crate) fn remote_workspace_snapshot(
+    probe: &RemoteGitProbe,
+) -> Result<Option<GitWorkspaceSnapshot>, String> {
+    let rev_parse = probe.section("rev-parse")?;
+    if rev_parse.status != 0
+        && String::from_utf8_lossy(&rev_parse.stderr)
+            .to_ascii_lowercase()
+            .contains("not a git repository")
+    {
+        return Ok(None);
+    }
+    let output = rev_parse.success("检测 Git 仓库")?;
+    // `--show-prefix` comes first and is empty exactly when the workspace is
+    // the repository root: the answer `same_path(root, workspace)` gives here,
+    // without comparing two spellings of a path on a machine whose rules the
+    // host does not share.
+    let newline = output
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "Git 返回的仓库路径数量不正确".to_owned())?;
+    if !output[..newline].iter().all(|byte| *byte == b'\r') {
+        // A selected subdirectory must not silently elevate Git access to its parent repository.
+        return Ok(None);
+    }
+    let paths = parse_rev_parse_paths(&output[newline + 1..], 3)?;
+    let root = remote_path_text(&paths[0]);
+    let git_dir = remote_absolute_path(&root, &paths[1]);
+    let git_common_dir = remote_absolute_path(&root, &paths[2]);
+    let mut digest = Sha256::new();
+    digest.update(b"mework.git.remote-repository-id.v1\0");
+    update_revision_component(&mut digest, b"machine", probe.machine_key.as_bytes());
+    update_revision_component(&mut digest, b"git-common-dir", git_common_dir.as_bytes());
+    let repository_id = format!("{:x}", digest.finalize());
+    let mut digest = Sha256::new();
+    digest.update(b"mework.git.remote-worktree-id.v1\0");
+    update_revision_component(&mut digest, b"repository-id", repository_id.as_bytes());
+    update_revision_component(&mut digest, b"root", root.as_bytes());
+    update_revision_component(&mut digest, b"git-dir", git_dir.as_bytes());
+    let worktree_id = format!("{:x}", digest.finalize());
+
+    let version = lossy(probe.section("version")?.success("读取 Git 版本")?);
+    let version = version.trim();
+    let git_version = version
+        .strip_prefix("git version ")
+        .unwrap_or(version)
+        .to_owned();
+    let mut parsed = parse_porcelain_v2(probe.section("status")?.success("读取 Git 状态")?)?;
+    let mut warnings = nested_submodule_warnings(&parsed.changes);
+    let per_file = probe
+        .section("numstat")
+        .and_then(|output| output.success("统计 Git 变更行数"))
+        .and_then(parse_numstat);
+    let line_stats = match per_file {
+        Ok(per_file) => apply_line_stats(&mut parsed.changes, per_file),
+        Err(error) => {
+            warnings.push(error);
+            GitLineStats {
+                additions: 0,
+                deletions: 0,
+                binary_files: 0,
+            }
+        }
+    };
+    let staged = probe
+        .section("staged-digest")?
+        .success("计算 Git 暂存内容修订")?;
+    let unstaged = probe
+        .section("unstaged-digest")?
+        .success("计算 Git 工作树内容修订")?;
+    let content_revision =
+        content_revision(&parsed.changes, staged.trim_ascii(), unstaged.trim_ascii());
+    let remote_proofs = match probe
+        .section("remotes")
+        .and_then(|output| output.success("读取 Git remotes"))
+    {
+        Ok(listing) => remote_proofs_from_listing(listing, &mut warnings),
+        Err(error) => {
+            warnings.push(error);
+            Vec::new()
+        }
+    };
+    let (upstream, upstream_target) = match parsed.branch.head.as_deref() {
+        Some(branch) => match remote_upstream_target(probe, branch, &remote_proofs) {
+            Ok((upstream, target, local_oid)) => {
+                if parsed.branch.oid.as_deref() != Some(local_oid.as_str())
+                    || parsed.branch.upstream != upstream
+                {
+                    return Err("Git 分支或 upstream 在状态读取期间发生变化；请重试".into());
+                }
+                (upstream, target)
+            }
+            Err(error) => {
+                warnings.push(error);
+                (parsed.branch.upstream.clone(), None)
+            }
+        },
+        None => (None, None),
+    };
+    let operation_state = remote_operation_state(probe.section("operation")?)?;
+    Ok(Some(assemble_snapshot(SnapshotParts {
+        repository_id,
+        worktree_id,
+        root,
+        git_version,
+        parsed,
+        line_stats,
+        content_revision,
+        remote_proofs,
+        upstream,
+        upstream_target,
+        operation_state,
+        warnings,
+    })))
+}
+
+/// A path the machine's Git printed, with `/` separators and no trailing one
+/// except at a filesystem root (`/`, `C:/`).
+fn remote_path_text(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".into();
+    }
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        return format!("{trimmed}/");
+    }
+    trimmed.to_owned()
+}
+
+/// `path` resolved against `root` the way Git reports relative metadata
+/// directories: relative to the directory it ran in, which is the root here.
+fn remote_absolute_path(root: &str, path: &str) -> String {
+    let path = remote_path_text(path);
+    let bytes = path.as_bytes();
+    let absolute = path.starts_with('/')
+        || (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/");
+    if absolute {
+        path
+    } else {
+        format!("{}/{path}", root.trim_end_matches('/'))
+    }
+}
+
+/// Remote proofs from `git remote -v`: one per remote, in the order Git lists
+/// them, over its fetch and push URLs. As on this host, the URLs themselves
+/// never leave the backend.
+fn remote_proofs_from_listing(listing: &[u8], warnings: &mut Vec<String>) -> Vec<GitRemote> {
+    let mut remotes: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+    for line in lossy(listing).lines() {
+        let line = line.trim_end_matches('\r');
+        let Some((name, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let (url, push) = if let Some(url) = rest.strip_suffix(" (fetch)") {
+            (url, false)
+        } else if let Some(url) = rest.strip_suffix(" (push)") {
+            (url, true)
+        } else {
+            continue;
+        };
+        if let Err(error) = validate_remote_name_syntax(name, false) {
+            warnings.push(format!(
+                "Git remote {name} 的 transport proof 不可用：{error}"
+            ));
+            continue;
+        }
+        let index = match remotes.iter().position(|(existing, _, _)| existing == name) {
+            Some(index) => index,
+            None => {
+                remotes.push((name.to_owned(), Vec::new(), Vec::new()));
+                remotes.len() - 1
+            }
+        };
+        let urls = if push {
+            &mut remotes[index].2
+        } else {
+            &mut remotes[index].1
+        };
+        urls.push(url.to_owned());
+    }
+    remotes
+        .into_iter()
+        .map(|(name, fetch_urls, push_urls)| GitRemote {
+            fetch_revision: remote_transport_revision(
+                b"mework.git.remote-fetch.v1\0",
+                &name,
+                &fetch_urls,
+                &[],
+            ),
+            push_revision: remote_transport_revision(
+                b"mework.git.remote-push.v1\0",
+                &name,
+                &push_urls,
+                &[],
+            ),
+            name,
+            url: None,
+        })
+        .collect()
+}
+
+/// [`upstream_target_for_branch`] over the probe's `for-each-ref` of the local
+/// branches, whose current one is marked by `%(HEAD)`.
+fn remote_upstream_target(
+    probe: &RemoteGitProbe,
+    branch: &str,
+    remotes: &[GitRemote],
+) -> Result<(Option<String>, Option<GitUpstream>, String), String> {
+    let listing = probe
+        .section("branches")?
+        .success("读取 Git upstream atoms")?;
+    let full_ref = format!("refs/heads/{branch}");
+    let record = listing
+        .split(|byte| *byte == b'\n')
+        .find_map(|record| record.strip_prefix(b"*\0"))
+        .ok_or_else(|| "当前本地 Git 分支已在读取 upstream 时消失".to_owned())?;
+    let local_oid = record
+        .split(|byte| *byte == 0)
+        .nth(1)
+        .map(lossy)
+        .unwrap_or_default();
+    let Some(atoms) = parse_upstream_atoms(record, &full_ref)? else {
+        let local_oid = validate_object_id("本地分支提交", local_oid)?;
+        return Ok((None, None, local_oid));
+    };
+    let tracking = probe.section("upstream-oid")?;
+    let tracking_oid = (tracking.status == 0)
+        .then(|| validate_object_id("upstream 提交", lossy(tracking.stdout.trim_ascii())).ok())
+        .flatten();
+    let is_local = atoms.remote_name == ".";
+    let remote = if is_local {
+        local_remote_proof()
+    } else {
+        remotes
+            .iter()
+            .find(|remote| remote.name == atoms.remote_name)
+            .cloned()
+            .ok_or_else(|| "Git upstream 指向不存在的 remote".to_owned())?
+    };
+    let remote_branch = atoms
+        .merge_ref
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| "Git upstream merge ref 无效".to_owned())?
+        .to_owned();
+    let target = GitUpstream {
+        remote_name: atoms.remote_name,
+        remote_branch,
+        merge_ref: atoms.merge_ref,
+        tracking_ref: atoms.tracking_ref,
+        tracking_oid,
+        is_local,
+        remote,
+    };
+    Ok((Some(atoms.tracking_short), Some(target), atoms.local_oid))
+}
+
+/// The operation in progress, from the probe's `operation` section: its label
+/// on the first line, then a checksum line per state file, which the revision
+/// is taken over.
+fn remote_operation_state(
+    output: &RemoteGitOutput,
+) -> Result<Option<RepositoryOperationState>, String> {
+    let bytes = output.success("检查 Git 操作标志")?;
+    let label_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    let label = lossy(&bytes[..label_end]);
+    let label = label.trim();
+    if label.is_empty() {
+        return Ok(None);
+    }
+    let operation = [
+        GitRepositoryOperation::Merge,
+        GitRepositoryOperation::Rebase,
+        GitRepositoryOperation::CherryPick,
+        GitRepositoryOperation::Revert,
+        GitRepositoryOperation::Bisect,
+    ]
+    .into_iter()
+    .find(|operation| repository_operation_label(*operation) == label)
+    .ok_or_else(|| format!("远端 Git 报告了未知的进行中操作 {label}"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"mework.git.remote-operation-revision.v1\0");
+    update_revision_component(&mut digest, b"state", bytes);
+    Ok(Some(RepositoryOperationState {
+        operation,
+        revision: format!("{:x}", digest.finalize()),
+    }))
 }
 
 fn workspace_summary_from_snapshot(snapshot: &GitWorkspaceSnapshot) -> GitWorkspaceSummary {
@@ -7408,6 +7818,13 @@ fn repository_content_revision(
     } else {
         empty_diff
     };
+    Ok(content_revision(changes, &staged, &unstaged))
+}
+
+/// The content revision of a change list whose staged and unstaged tracked
+/// diffs have the digests given: any change to a path, its status or the bytes
+/// of either diff changes it.
+fn content_revision(changes: &[GitFileChange], staged: &[u8], unstaged: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"mework.git.content-revision.v3-canonical\0");
     let mut ordered = changes.iter().collect::<Vec<_>>();
@@ -7462,9 +7879,9 @@ fn repository_content_revision(
             ],
         );
     }
-    update_revision_component(&mut digest, b"staged-diff", &staged);
-    update_revision_component(&mut digest, b"unstaged-diff", &unstaged);
-    Ok(format!("{:x}", digest.finalize()))
+    update_revision_component(&mut digest, b"staged-diff", staged);
+    update_revision_component(&mut digest, b"unstaged-diff", unstaged);
+    format!("{:x}", digest.finalize())
 }
 
 fn tracked_diff_digest(repository: &Repository, staged: bool) -> Result<[u8; 32], String> {
@@ -7781,11 +8198,20 @@ fn combined_line_stats(
     changes: &mut [GitFileChange],
 ) -> Result<GitLineStats, String> {
     let has_head = repository_has_head(repository)?;
-    let mut per_file = if has_head {
+    let per_file = if has_head {
         diff_numstat(repository, false)?
     } else {
         diff_numstat(repository, true)?
     };
+    Ok(apply_line_stats(changes, per_file))
+}
+
+/// Folds `git diff --numstat` against HEAD (the index, before the first commit)
+/// into the changes and their total. Untracked files carry no counts.
+fn apply_line_stats(
+    changes: &mut [GitFileChange],
+    mut per_file: HashMap<String, FileLineStats>,
+) -> GitLineStats {
     let mut total = GitLineStats {
         additions: 0,
         deletions: 0,
@@ -7807,7 +8233,7 @@ fn combined_line_stats(
         total.deletions = total.deletions.saturating_add(stats.deletions);
         total.binary_files = total.binary_files.saturating_add(u32::from(stats.binary));
     }
-    Ok(total)
+    total
 }
 
 fn diff_numstat(
@@ -11117,7 +11543,13 @@ fn read_upstream_atoms(
     if output.stdout_truncated {
         return Err("Git upstream atoms 超过安全上限".into());
     }
-    let mut bytes = output.stdout.as_slice();
+    parse_upstream_atoms(&output.stdout, &full_ref)
+}
+
+/// One `for-each-ref` record of [`read_upstream_atoms`]' format for
+/// `full_ref`, or `None` when that branch has no upstream.
+fn parse_upstream_atoms(bytes: &[u8], full_ref: &str) -> Result<Option<UpstreamAtoms>, String> {
+    let mut bytes = bytes;
     while bytes
         .last()
         .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
@@ -11221,21 +11653,18 @@ fn upstream_target_for_branch(
 }
 
 fn preferred_git_remote(
-    transports: &[RemoteTransport],
+    remotes: &[GitRemote],
     upstream: Option<&GitUpstream>,
 ) -> Option<GitRemote> {
     if let Some(upstream) = upstream {
         return Some(upstream.remote.clone());
     }
     for preferred in ["origin", "upstream"] {
-        if let Some(transport) = transports
-            .iter()
-            .find(|transport| transport.proof.name == preferred)
-        {
-            return Some(transport.proof.clone());
+        if let Some(remote) = remotes.iter().find(|remote| remote.name == preferred) {
+            return Some(remote.clone());
         }
     }
-    transports.first().map(|transport| transport.proof.clone())
+    remotes.first().cloned()
 }
 
 fn preferred_remote(
@@ -12952,7 +13381,8 @@ fn find_program(name: &str) -> Option<PathBuf> {
         return requested
             .is_absolute()
             .then(|| canonical_file(requested))
-            .flatten();
+            .flatten()
+            .filter(|path| !is_uninstalled_developer_tool_shim(path));
     }
     let mut candidates = Vec::new();
     #[cfg(windows)]
@@ -12989,9 +13419,14 @@ fn find_program(name: &str) -> Option<PathBuf> {
                 .map(|directory| directory.join(name)),
         );
     }
+    // On a Mac without the command line tools, `/usr/bin/git` is a stand-in
+    // that opens the install dialog on every run. It is passed over rather than
+    // ending the search, so a real git later on PATH (Homebrew's, say) is still
+    // found, and with none the caller reports Git as not installed.
     candidates
         .into_iter()
-        .find_map(|path| canonical_file(&path))
+        .filter_map(|path| canonical_file(&path))
+        .find(|path| !is_uninstalled_developer_tool_shim(path))
 }
 
 fn canonical_file(path: &Path) -> Option<PathBuf> {

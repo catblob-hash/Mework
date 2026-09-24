@@ -159,28 +159,15 @@ export function conversationWorkspaces(
   return [...project, ...(conversation?.attachedWorkspaces ?? [])];
 }
 
-/** A shell the built-in terminal can start. Mirrors the host's `terminal::TerminalShell`. */
-export type TerminalShell = "powershell" | "bash" | "zsh" | "fish";
+/**
+ * A shell the built-in terminal can start. Mirrors the host's `terminal::TerminalShell`.
+ * Which ones a workspace's menu offers is `machineShells::terminalShellsFor`'s answer.
+ */
+export type TerminalShell = "powershell" | "bash" | "zsh" | "fish" | "sh";
 
 /** Whether the renderer runs on a Windows host. */
 export function hostIsWindows(platform: string): boolean {
   return /^win/i.test(platform.trim());
-}
-
-/**
- * The shells a terminal in a workspace on `machine` can start, in menu order,
- * the first being the one opened when nobody chose.
- *
- * Only a directory on a Windows host offers PowerShell, beside Git Bash. Every
- * other machine is POSIX — a Mac, a Linux host, a WSL distribution, an SSH
- * machine — and offers zsh, bash and fish.
- */
-export function terminalShellsFor(
-  machine: RunTarget | null | undefined,
-  platform: string
-): TerminalShell[] {
-  if (!machine && hostIsWindows(platform)) return ["powershell", "bash"];
-  return ["zsh", "bash", "fish"];
 }
 
 /** The name a shell goes by in a menu and on a tab. */
@@ -190,39 +177,24 @@ export function terminalShellLabel(shell: TerminalShell): string {
     case "bash": return "bash";
     case "zsh": return "zsh";
     case "fish": return "fish";
+    case "sh": return "sh";
   }
 }
 
 /**
  * The tools whose wire schema the host gives a `workspace` argument once the
- * conversation has more than one workspace. Mirrors the list in
- * `builtin_schemas.rs`; a tool absent here takes no workspace number.
+ * conversation has more than one workspace, besides every shell tool. Mirrors
+ * `builtin_schemas::takes_a_workspace`; a tool absent here takes no workspace
+ * number.
  */
 const WORKSPACE_SCOPED_TOOLS: ReadonlySet<string> = new Set([
-  "ls", "grep", "find", "read", "write", "edit", "lsp", "bash", "powershell"
+  "ls", "grep", "find", "read", "write", "edit", "lsp", "find_content", "find_files"
 ]);
 
-/** The tools that run PowerShell. Mirrors `builtin_schemas::is_powershell_tool`. */
-const POWERSHELL_TOOLS: ReadonlySet<string> = new Set(["powershell", "powershell_find_output"]);
-
-/**
- * Whether the renderer can tell it runs on a host with no PowerShell.
- *
- * On a Mac or a Linux machine every workspace is POSIX, and the host withdraws
- * both PowerShell tools from every request (`aisdk::tools::enabled_tools`), so a
- * picker offering them would show a switch that does nothing. An unrecognized
- * platform string keeps them: hiding a tool the host would run is the worse
- * mistake.
- */
-export function hostLacksPowerShell(platform: string): boolean {
-  return /^(mac|linux|iphone|ipad)/i.test(platform.trim());
-}
-
-/** The catalog as this host can use it: no PowerShell tools where there is no PowerShell. */
-export function toolsForHost<T extends { name: string }>(tools: readonly T[], platform: string): T[] {
-  return hostLacksPowerShell(platform)
-    ? tools.filter((tool) => !POWERSHELL_TOOLS.has(tool.name))
-    : [...tools];
+/** The backend a shell tool runs in. Mirrors `ShellBackend::of_tool`. */
+function shellOfTool(toolName: string): string | null {
+  const match = /^(bash|zsh|sh|powershell)(?:_find_output)?$/.exec(toolName);
+  return match ? match[1]! : null;
 }
 
 /**
@@ -234,26 +206,27 @@ export function toolsForHost<T extends { name: string }>(tools: readonly T[], pl
  * model does.
  *
  * The argument is optional and starts empty, so an untouched field records
- * nothing and the host applies its own default of 1. `powershell` lists only
- * workspaces on this machine, and only when this machine runs PowerShell;
- * with none, the host withdraws the tool from the wire and the descriptor is
- * left alone.
+ * nothing and the host applies its own default of 1. A shell tool lists only
+ * the workspaces whose machine has its shell — `shellsAt` answers that from
+ * the machines' probes — and with none, the host withdraws the tool from the
+ * wire and the descriptor is left alone.
  */
 export function withWorkspaceArgument(
   tools: ToolDescriptor[],
   workspaces: readonly AttachedWorkspace[],
-  hostRunsPowershell: boolean,
+  shellsAt: (machine: RunTarget | null) => readonly string[],
   label: string
 ): ToolDescriptor[] {
   if (workspaces.length < 2) return tools;
   const all = workspaces.map((_, position) => position + 1);
-  const powershell = hostRunsPowershell
-    ? workspaces.flatMap((workspace, position) => (workspace.machine ? [] : [position + 1]))
-    : [];
+  const shells = workspaces.map((workspace) => shellsAt(workspace.machine ?? null));
   return tools.map((tool) => {
-    if (!WORKSPACE_SCOPED_TOOLS.has(tool.name)) return tool;
+    const shell = shellOfTool(tool.name);
+    if (!shell && !WORKSPACE_SCOPED_TOOLS.has(tool.name)) return tool;
     if (tool.parameters.some((parameter) => parameter.name === "workspace")) return tool;
-    const addresses = tool.name === "powershell" ? powershell : all;
+    const addresses = shell
+      ? all.filter((address) => shells[address - 1]!.includes(shell))
+      : all;
     if (addresses.length === 0) return tool;
     return {
       ...tool,

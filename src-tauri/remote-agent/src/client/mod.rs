@@ -25,6 +25,7 @@
 //! through [`Link::spawn`] reads, writes and waits like a local child whose
 //! output occasionally pauses.
 
+mod child;
 mod session;
 
 use std::collections::{BTreeMap, HashMap};
@@ -38,8 +39,27 @@ use crate::protocol::{
     self, AgentInfo, Failure, Frame, Hello, Message, Op, Outcome, Policy, Reply, ResumePoint,
     SpawnSpec, PROTOCOL_VERSION,
 };
+pub use child::{ChildLauncher, StderrSink};
 pub use session::{RemoteProcess, SessionReader, SessionWriter};
 use session::SessionPipe;
+
+/// Answers a sandboxed agent's [`Message::Dial`]: opens the connection, or
+/// says whether the policy refused it and why. Only a daemon's link to one of
+/// its cells has one (see `agent::cells`); every other link refuses dials.
+#[derive(Clone)]
+pub struct DialHandler(Arc<dyn Fn(&str, u16) -> Result<std::net::TcpStream, (bool, String)> + Send + Sync>);
+
+impl DialHandler {
+    pub fn new(handler: impl Fn(&str, u16) -> Result<std::net::TcpStream, (bool, String)> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(handler))
+    }
+}
+
+impl std::fmt::Debug for DialHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DialHandler")
+    }
+}
 
 /// Starts a fresh transport to the agent's proxy on one machine.
 ///
@@ -85,6 +105,8 @@ pub struct LinkConfig {
     pub give_up_after: Duration,
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
+    /// Opens the connections a sandboxed agent asks for.
+    pub dialer: Option<DialHandler>,
 }
 
 impl LinkConfig {
@@ -99,6 +121,7 @@ impl LinkConfig {
             give_up_after: Duration::from_secs(5 * 60),
             backoff_initial: Duration::from_millis(500),
             backoff_max: Duration::from_secs(15),
+            dialer: None,
         }
     }
 }
@@ -203,6 +226,8 @@ struct LinkState {
 struct Shared {
     config: LinkConfig,
     launcher: Box<dyn Launcher>,
+    /// Connections the agent asked for, carried inside the link.
+    tunnels: Arc<crate::tunnel::Tunnels>,
     state: Mutex<LinkState>,
     cond: Condvar,
     /// The current connection's generation, readable without the state lock.
@@ -222,9 +247,24 @@ impl Link {
     /// Creates the link and starts connecting in the background.
     pub fn start(config: LinkConfig, launcher: impl Launcher) -> Self {
         let now = Instant::now();
-        let shared = Arc::new(Shared {
+        let shared = Arc::new_cyclic(|this: &std::sync::Weak<Shared>| Shared {
             config,
             launcher: Box::new(launcher),
+            tunnels: {
+                let this = this.clone();
+                crate::tunnel::Tunnels::new(Arc::new(move |message: &Message, body: &[u8]| {
+                    let Some(shared) = this.upgrade() else {
+                        return false;
+                    };
+                    let Some((writer, generation)) = shared.current_writer() else {
+                        return false;
+                    };
+                    match protocol::encode_frame(message, body) {
+                        Ok(frame) => shared.write(&writer, generation, &frame),
+                        Err(_) => false,
+                    }
+                }))
+            },
             state: Mutex::new(LinkState {
                 status: LinkStatus::Connecting,
                 connection: None,
@@ -625,6 +665,8 @@ impl Shared {
         if let Some(closer) = closer {
             closer();
         }
+        // A tunnelled connection cannot be resumed on another transport.
+        self.tunnels.close_all();
         self.cond.notify_all();
         self.notify_observer();
     }
@@ -690,6 +732,40 @@ impl Shared {
                     drop(state);
                     pipe.finish(exit);
                 }
+            }
+            Message::Dial { conn, host, port } => {
+                drop(state);
+                let tunnels = Arc::clone(&self.tunnels);
+                let Some(dialer) = self.config.dialer.clone() else {
+                    tunnels.refuse(conn, true, "this link carries no connections".into());
+                    return;
+                };
+                if tunnels.open_count() >= crate::tunnel::MAX_CONNECTIONS {
+                    tunnels.refuse(conn, false, "too many connections are open".into());
+                    return;
+                }
+                let spawned = std::thread::Builder::new()
+                    .name("tunnel-dial".into())
+                    .spawn(move || match (dialer.0)(&host, port) {
+                        Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
+                            if let Some(upstream) = tunnels.accept(conn) {
+                                crate::tunnel::relay(stream, Vec::new(), upstream);
+                            }
+                        }
+                        Err((refused, error)) => tunnels.refuse(conn, refused, error),
+                    });
+                if spawned.is_err() {
+                    self.tunnels.refuse(conn, false, "the agent is out of threads".into());
+                }
+            }
+            message @ (Message::Dialed { .. }
+            | Message::Tunnel { .. }
+            | Message::TunnelAck { .. }
+            | Message::TunnelEnd { .. }
+            | Message::TunnelClose { .. }) => {
+                drop(state);
+                self.tunnels.dispatch(&message, &frame.body);
             }
             _ => {}
         }

@@ -17,7 +17,18 @@ export interface SidePaneLayout {
 
 export interface SidePanesState {
   layoutByConversation: Record<string, SidePaneLayout>;
+  /**
+   * Each conversation's preview pages, in tab order. A page is a native browser session: the
+   * conversation's own page is keyed by the conversation id, every further page by
+   * `<conversation>#<token>`.
+   */
   previewSessions: Record<string, string[]>;
+  /**
+   * Which of its conversation's workspaces (1-based, the model's numbering) each page belongs to,
+   * by session id: the workspace whose `.mework/launch.json` its start page lists and whose
+   * servers it runs. Absent is workspace 1.
+   */
+  previewWorkspaces: Record<string, number>;
   lastSideFlexByKind: Partial<Record<SidePaneKind, number>>;
 }
 
@@ -30,13 +41,20 @@ export type SidePanesAction =
   | { type: "toggle_expand"; conversationId: string; pane: SidePaneId }
   | { type: "set_side_flex"; conversationId: string; sideFlex: number }
   | { type: "set_pane_flex"; conversationId: string; paneFlex: Record<string, number> }
-  | { type: "register_preview"; conversationId: string; sessionId: string }
+  /**
+   * Adds a page to the conversation's roster. `workspace` records which workspace it belongs to;
+   * without one a page keeps what it had, and a new page belongs to workspace 1.
+   */
+  | { type: "register_preview"; conversationId: string; sessionId: string; workspace?: number }
   | { type: "forget_preview"; conversationId: string; sessionId: string }
+  /** Moves a page to another workspace — the one whose server it turned out to be showing. */
+  | { type: "set_preview_workspace"; conversationId: string; sessionId: string; workspace: number }
   /**
    * Moves the layout a draft accumulated under its placeholder id onto the real
    * conversation it just became, the way the composer's text and attachments move.
    * Without it a pane opened in a draft is dropped on send and left behind to
-   * reappear, unasked, in the next draft.
+   * reappear, unasked, in the next draft. The draft's preview roster comes along
+   * too: its page is already named after the conversation it became.
    */
   | { type: "adopt_conversation"; conversationId: string; from: string }
   | { type: "remove_conversation"; conversationId: string };
@@ -47,6 +65,7 @@ export const MAX_SIDE_FLEX = 8;
 export const initialSidePanesState: SidePanesState = {
   layoutByConversation: {},
   previewSessions: {},
+  previewWorkspaces: {},
   lastSideFlexByKind: {}
 };
 
@@ -68,6 +87,13 @@ export function previewSessionsFor(state: SidePanesState, conversationId: string
   if (!conversationId) return NO_PREVIEW_SESSIONS;
   return Object.prototype.hasOwnProperty.call(state.previewSessions, conversationId)
     ? state.previewSessions[conversationId] : NO_PREVIEW_SESSIONS;
+}
+
+/** The workspace a page belongs to, 1-based. A page nobody placed belongs to workspace 1. */
+export function previewWorkspaceOf(state: SidePanesState, sessionId: string): number {
+  const workspace = Object.prototype.hasOwnProperty.call(state.previewWorkspaces, sessionId)
+    ? state.previewWorkspaces[sessionId] : undefined;
+  return typeof workspace === "number" && Number.isInteger(workspace) && workspace >= 1 ? workspace : 1;
 }
 
 export function paneKind(id: SidePaneId): SidePaneKind {
@@ -120,6 +146,23 @@ export function sidePaneDomId(id: SidePaneId): string {
 
 export function previewTabSessionId(conversationId: string, token: string): string {
   return `${conversationId}#${token}`;
+}
+
+/**
+ * The session a new page opens under: the owner's own page when the roster does not hold it — it
+ * is the page the model's preview tools drive, so it is the first one to fill — and otherwise a
+ * fresh tab. `ownerId` is the host identity the pages are named after (for the draft, the id it
+ * will materialize as), which is not always the key its roster is filed under. `token` is only
+ * consulted for a tab, and has to be one the host accepts after `#`: letters, digits, hyphens and
+ * underscores.
+ */
+export function newPreviewPageSessionId(
+  roster: readonly string[],
+  ownerId: string,
+  token: string
+): string {
+  if (!roster.includes(ownerId)) return ownerId;
+  return previewTabSessionId(ownerId, token);
 }
 
 export function previewSessionBelongsToConversation(
@@ -211,18 +254,31 @@ export function sidePanesReducer(state: SidePanesState, action: SidePanesAction)
     }
     case "register_preview": {
       const sessions = previewSessionsFor(state, conversationId);
-      if (sessions.includes(action.sessionId)) return state;
-      return { ...state, previewSessions: { ...state.previewSessions, [conversationId]: [...sessions, action.sessionId] } };
+      const placed = action.workspace === undefined ? state
+        : sidePanesReducer(state, {
+          type: "set_preview_workspace", conversationId, sessionId: action.sessionId, workspace: action.workspace
+        });
+      if (sessions.includes(action.sessionId)) return placed;
+      return { ...placed, previewSessions: { ...placed.previewSessions, [conversationId]: [...sessions, action.sessionId] } };
     }
     case "forget_preview": {
       const next = sidePanesReducer(state, { type: "close", conversationId, pane: previewPaneId(action.sessionId) });
       const sessions = previewSessionsFor(state, conversationId);
-      if (!sessions.includes(action.sessionId)) return next;
+      const placed = Object.prototype.hasOwnProperty.call(next.previewWorkspaces, action.sessionId);
+      if (!sessions.includes(action.sessionId) && !placed) return next;
       const remaining = sessions.filter((sessionId) => sessionId !== action.sessionId);
       const previewSessions = { ...state.previewSessions };
       if (remaining.length) previewSessions[conversationId] = remaining;
       else delete previewSessions[conversationId];
-      return { ...next, previewSessions };
+      const previewWorkspaces = { ...next.previewWorkspaces };
+      delete previewWorkspaces[action.sessionId];
+      return { ...next, previewSessions, previewWorkspaces };
+    }
+    case "set_preview_workspace": {
+      if (!Number.isInteger(action.workspace) || action.workspace < 1) return state;
+      if (state.previewWorkspaces[action.sessionId] === action.workspace
+        && Object.prototype.hasOwnProperty.call(state.previewWorkspaces, action.sessionId)) return state;
+      return { ...state, previewWorkspaces: { ...state.previewWorkspaces, [action.sessionId]: action.workspace } };
     }
     case "adopt_conversation": {
       const adopted = Object.prototype.hasOwnProperty.call(state.layoutByConversation, action.from)
@@ -230,21 +286,35 @@ export function sidePanesReducer(state: SidePanesState, action: SidePanesAction)
       if (adopted === null || action.from === conversationId) return state;
       const layoutByConversation = { ...state.layoutByConversation };
       delete layoutByConversation[action.from];
-      // A draft never reaches a workspace, so it owns no native page. Dropping any preview
-      // pane anyway keeps a session id minted under the placeholder id from following it here.
-      const panes = adopted.panes.filter((pane) => paneKind(pane) !== "preview");
+      // The draft's page is keyed by the id it materializes as, so its pane follows. A session
+      // id minted under the placeholder id names nothing the conversation owns and stays behind.
+      const follows = (sessionId: string) => previewSessionBelongsToConversation(sessionId, conversationId);
+      const panes = adopted.panes.filter((pane) => (
+        paneKind(pane) !== "preview" || follows(paneTarget(pane) ?? "")
+      ));
       const carried = { ...adopted, panes, expanded: null };
       layoutByConversation[conversationId] = { ...carried, focused: focusedPane(carried) };
-      return { ...state, layoutByConversation };
+      const previewSessions = { ...state.previewSessions };
+      const roster = previewSessionsFor(state, action.from).filter(follows);
+      delete previewSessions[action.from];
+      if (roster.length) {
+        previewSessions[conversationId] = [
+          ...previewSessionsFor(state, conversationId).filter((sessionId) => !roster.includes(sessionId)),
+          ...roster
+        ];
+      }
+      return { ...state, layoutByConversation, previewSessions };
     }
     case "remove_conversation": {
       if (!Object.prototype.hasOwnProperty.call(state.layoutByConversation, conversationId)
         && !Object.prototype.hasOwnProperty.call(state.previewSessions, conversationId)) return state;
       const layoutByConversation = { ...state.layoutByConversation };
       const previewSessions = { ...state.previewSessions };
+      const previewWorkspaces = { ...state.previewWorkspaces };
+      for (const sessionId of previewSessionsFor(state, conversationId)) delete previewWorkspaces[sessionId];
       delete layoutByConversation[conversationId];
       delete previewSessions[conversationId];
-      return { ...state, layoutByConversation, previewSessions };
+      return { ...state, layoutByConversation, previewSessions, previewWorkspaces };
     }
   }
 }

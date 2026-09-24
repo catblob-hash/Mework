@@ -110,12 +110,16 @@ pub const TASK_RUNTIME_TOOL_NAMES: [&str; 3] = ["task_wait", "task_list", "box"]
 /// the server process, not a task of its own: it has no address, it cannot be
 /// waited on, and it dies with the server. A conversation that can only drive a
 /// page has nothing in the task list and needs no task-runtime tools.
-pub const TASK_PRODUCING_TOOL_NAMES: [&str; 7] = [
+pub const TASK_PRODUCING_TOOL_NAMES: [&str; 11] = [
     "agent_spawn",
     "workflow",
     "bash",
+    "zsh",
+    "sh",
     "powershell",
     "bash_find_output",
+    "zsh_find_output",
+    "sh_find_output",
     "powershell_find_output",
     "preview_start",
 ];
@@ -1948,6 +1952,8 @@ mod tests {
             skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
+            decision_parameter_modes: Default::default(),
+            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model: ModelProfile {

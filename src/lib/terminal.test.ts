@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   closeTerminal,
+  liveTerminalCount,
   detachTerminal,
   openTerminal,
   resizeTerminal,
@@ -71,6 +72,7 @@ describe("terminal IPC", () => {
       rows: 30,
       workspace: null,
       shell: null,
+      draftWorkspaceId: null,
       onEvent: coreMocks.channels[0]
     });
     const output: TerminalEvent = {
@@ -108,12 +110,14 @@ describe("terminal IPC", () => {
     await resizeTerminal("conversation-1", "terminal-1", "session-1", 120, 36);
     await detachTerminal("conversation-1", "terminal-1", "session-1");
     await closeTerminal("conversation-1", "terminal-1");
+    await liveTerminalCount("conversation-1");
 
     expect(coreMocks.invoke.mock.calls).toEqual([
       ["write_terminal", { conversationId: "conversation-1", terminalId: "terminal-1", sessionId: "session-1", data: "dir\r" }],
       ["resize_terminal", { conversationId: "conversation-1", terminalId: "terminal-1", sessionId: "session-1", cols: 120, rows: 36 }],
       ["detach_terminal", { conversationId: "conversation-1", terminalId: "terminal-1", sessionId: "session-1" }],
-      ["close_terminal", { conversationId: "conversation-1", terminalId: "terminal-1" }]
+      ["close_terminal", { conversationId: "conversation-1", terminalId: "terminal-1" }],
+      ["live_terminal_count", { conversationId: "conversation-1" }]
     ]);
   });
 

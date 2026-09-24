@@ -132,6 +132,17 @@ pub struct PreviewServerSnapshot {
     /// The worktree the server is registered under, not the process's own directory.
     pub cwd: String,
     pub session_id: Option<String>,
+    /// The machine the server runs on, by name, when that is not this computer. Absent for a
+    /// local server, so what the model reads about one is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Where this computer reaches the server, when that is not `http://localhost:<port>`.
+    /// The registry leaves it unset; the layer that knows how a machine is reached fills it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Which of a conversation's workspaces the server belongs to, in a list that spans them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +279,10 @@ pub enum PreviewStartErrorKind {
     EarlyExit,
     /// The worktree already runs [`MAX_SERVERS_PER_WORKTREE`].
     Capacity,
+    /// The machine the server was to run on could not be asked: its link is down, or its agent
+    /// cannot run there. The link has already waited as long as it is worth waiting, so another
+    /// attempt would only wait again.
+    Unreachable,
 }
 
 /// A start that never produced a running server.
@@ -284,7 +299,10 @@ impl PreviewStartError {
     /// Whether another attempt could plausibly do better.
     pub fn is_retryable(&self) -> bool {
         if self.kind != PreviewStartErrorKind::SpawnError {
-            return self.kind != PreviewStartErrorKind::Capacity;
+            return !matches!(
+                self.kind,
+                PreviewStartErrorKind::Capacity | PreviewStartErrorKind::Unreachable
+            );
         }
         match &self.code {
             Some(code) => !NON_RETRYABLE_SPAWN_CODES.contains(&code.as_str()),
@@ -1404,6 +1422,47 @@ fn readiness_is_https(url: Option<&str>) -> bool {
 // Registry
 // ---------------------------------------------------------------------------
 
+/// A server on another machine: where it runs, and everything the registry has to ask that machine
+/// for. Implemented over the machine's agent ([`crate::preview_remote`]); the registry itself only
+/// keeps the books, exactly as it does for a process of its own.
+pub trait RemoteServerHost: Send + Sync {
+    /// The machine's environment key, which is what "the same machine" means for ports.
+    fn machine_key(&self) -> &str;
+    /// The machine's name as the user knows it.
+    fn machine_label(&self) -> &str;
+    /// Starts the configured command there, in `config.cwd`, with `PORT` and the entry's variables.
+    fn spawn(
+        &self,
+        config: &PreviewServerConfig,
+    ) -> Result<remote_agent::client::RemoteProcess, PreviewStartError>;
+    /// Whether `port` could be bound there, and whether something already answers on it.
+    fn port_state(&self, port: u16) -> Result<(bool, bool), String>;
+    /// A port that machine's system hands out as free.
+    fn free_port(&self) -> Result<u16, String>;
+    /// Waits, there, until the server answers; the polling never crosses the network.
+    fn wait_ready(&self, port: u16, timeout: Duration, https: bool) -> bool;
+}
+
+/// Which machine a registered server runs on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServerMachine {
+    key: String,
+    label: String,
+}
+
+/// A process the agent on another machine runs for this registry.
+struct RemoteServerProcess {
+    process: remote_agent::client::RemoteProcess,
+    stopped: AtomicBool,
+}
+
+/// What a registered server's process is.
+#[derive(Clone)]
+enum ServerProcess {
+    Local(Arc<Mutex<PreviewProcess>>),
+    Remote(Arc<RemoteServerProcess>),
+}
+
 /// A running child and the job object that can kill everything it started.
 struct PreviewProcess {
     child: std::process::Child,
@@ -1420,7 +1479,11 @@ struct ServerEntry {
     status: PreviewServerStatus,
     started_at: String,
     session_id: Option<String>,
-    process: Arc<Mutex<PreviewProcess>>,
+    process: ServerProcess,
+    /// `None` on this computer.
+    machine: Option<ServerMachine>,
+    /// The directory reported as `cwd` when the registry key is not a path on this computer.
+    display_cwd: Option<String>,
 }
 
 impl ServerEntry {
@@ -1431,9 +1494,19 @@ impl ServerEntry {
             port: self.port,
             status: self.status,
             started_at: self.started_at.clone(),
-            cwd: worktree.to_string_lossy().into_owned(),
+            cwd: self
+                .display_cwd
+                .clone()
+                .unwrap_or_else(|| worktree.to_string_lossy().into_owned()),
             session_id: self.session_id.clone(),
+            machine: self.machine.as_ref().map(|machine| machine.label.clone()),
+            url: None,
+            workspace: None,
         }
+    }
+
+    fn machine_key(&self) -> Option<&str> {
+        self.machine.as_ref().map(|machine| machine.key.as_str())
     }
 }
 
@@ -1584,6 +1657,43 @@ impl PreviewServerRegistry {
         servers
     }
 
+    /// The live servers on one machine (`None` is this computer). Ports belong to a machine, so
+    /// only these can be what holds a port there.
+    fn live_on(&self, machine_key: Option<&str>) -> Vec<PreviewServerSnapshot> {
+        let registry = self.lock();
+        registry
+            .worktrees
+            .iter()
+            .flat_map(|(worktree, entries)| {
+                entries
+                    .values()
+                    .filter(|entry| entry.machine_key() == machine_key)
+                    .filter(|entry| {
+                        matches!(
+                            entry.status,
+                            PreviewServerStatus::Running | PreviewServerStatus::Starting
+                        )
+                    })
+                    .map(move |entry| entry.snapshot(worktree))
+            })
+            .collect()
+    }
+
+    /// Every server `session_id` started, in whichever worktree and on whichever machine.
+    pub fn servers_owned_by(&self, session_id: &str) -> Vec<PreviewServerSnapshot> {
+        let registry = self.lock();
+        registry
+            .worktrees
+            .iter()
+            .flat_map(|(worktree, entries)| {
+                entries
+                    .values()
+                    .filter(|entry| entry.session_id.as_deref() == Some(session_id))
+                    .map(move |entry| entry.snapshot(worktree))
+            })
+            .collect()
+    }
+
     pub fn servers_for_worktree(&self, worktree: &Path) -> Vec<PreviewServerSnapshot> {
         let registry = self.lock();
         registry
@@ -1634,16 +1744,7 @@ impl PreviewServerRegistry {
         auto_port: Option<bool>,
         session_id: Option<&str>,
     ) -> Result<u16, PortInUseError> {
-        let running: Vec<PreviewServerSnapshot> = self
-            .servers()
-            .into_iter()
-            .filter(|server| {
-                matches!(
-                    server.status,
-                    PreviewServerStatus::Running | PreviewServerStatus::Starting
-                )
-            })
-            .collect();
+        let running = self.live_on(None);
         if let Some(occupant) = running.iter().find(|server| server.port == port) {
             let cross_session = session_id.is_some()
                 && occupant.session_id.is_some()
@@ -1696,6 +1797,53 @@ impl PreviewServerRegistry {
                     occupant_text.as_deref(),
                 ))
             }
+        }
+    }
+
+    /// [`Self::select_port`] on another machine: the same `autoPort` rules and the same messages,
+    /// with the probing done there by its agent — a port is that machine's, and whether it is
+    /// free here says nothing about it. What holds a port there is named when it is one of this
+    /// registry's servers; anything else is only known to be there.
+    pub fn select_remote_port(
+        &self,
+        host: &dyn RemoteServerHost,
+        port: u16,
+        auto_port: Option<bool>,
+        session_id: Option<&str>,
+    ) -> Result<u16, PortInUseError> {
+        let running = self.live_on(Some(host.machine_key()));
+        let reassign = |occupant: Option<&PreviewServerSnapshot>| {
+            host.free_port().map_err(|_| auto_port_reassignment_failed(port, occupant, None))
+        };
+        if let Some(occupant) = running.iter().find(|server| server.port == port) {
+            let cross_session = session_id.is_some()
+                && occupant.session_id.is_some()
+                && occupant.session_id.as_deref() != session_id;
+            if auto_port == Some(true) {
+                return reassign((!cross_session).then_some(occupant));
+            }
+            return Err(preview_port_conflict(
+                port,
+                auto_port,
+                Some(occupant),
+                cross_session,
+            ));
+        }
+        if port == 0 {
+            return reassign(None);
+        }
+        match host.port_state(port) {
+            Ok((true, false)) => Ok(port),
+            Ok(_) if auto_port == Some(true) => reassign(None),
+            Ok(_) => Err(external_port_conflict(port, auto_port, None)),
+            Err(error) => Err(PortInUseError::external(
+                port,
+                format!(
+                    "Could not check port {port} on {}: {}",
+                    host.machine_label(),
+                    sanitize_message_text(&error)
+                ),
+            )),
         }
     }
 
@@ -1812,7 +1960,9 @@ impl PreviewServerRegistry {
                         status: PreviewServerStatus::Starting,
                         started_at: Utc::now().to_rfc3339(),
                         session_id: session_id.map(str::to_owned),
-                        process: process.clone(),
+                        process: ServerProcess::Local(process.clone()),
+                        machine: None,
+                        display_cwd: None,
                     },
                 );
             server_id
@@ -1877,6 +2027,208 @@ impl PreviewServerRegistry {
             exit_code: None,
             output: None,
         })
+    }
+
+    /// [`Self::start`] on another machine, through its agent.
+    ///
+    /// The books are the same — one entry under `worktree`, its output in a ring, a startup gate
+    /// in which an exit means failure, readiness decided on its own thread — and so is every
+    /// message. `worktree` is the registry's key for the remote directory, which names no path on
+    /// this computer; `display_cwd` is what the snapshot reports instead. The process belongs to
+    /// the machine's agent, not to the SSH connection: a dropped link pauses it rather than ending
+    /// it, and its output is kept there until the link is back.
+    pub fn start_remote(
+        &self,
+        worktree: &Path,
+        display_cwd: &str,
+        host: Arc<dyn RemoteServerHost>,
+        config: &PreviewServerConfig,
+        session_id: Option<&str>,
+    ) -> Result<PreviewServerSnapshot, PreviewStartError> {
+        let Some(command) = config.command.as_deref() else {
+            return Err(PreviewStartError {
+                message: NO_COMMAND_MESSAGE.to_owned(),
+                kind: PreviewStartErrorKind::SpawnError,
+                code: None,
+                exit_code: None,
+                output: None,
+            });
+        };
+        let mut remote = host.spawn(config)?;
+        let stdout = remote.take_stdout();
+        let stderr = remote.take_stderr();
+        let process = Arc::new(RemoteServerProcess {
+            process: remote,
+            stopped: AtomicBool::new(false),
+        });
+        let server_id = {
+            let mut registry = self.lock();
+            let server_id = registry.mint_server_id(&config.name);
+            registry
+                .logs
+                .insert(server_id.clone(), PreviewLogRing::new());
+            registry
+                .worktrees
+                .entry(worktree.to_path_buf())
+                .or_default()
+                .insert(
+                    server_id.clone(),
+                    ServerEntry {
+                        server_id: server_id.clone(),
+                        name: config.name.clone(),
+                        port: config.port,
+                        status: PreviewServerStatus::Starting,
+                        started_at: Utc::now().to_rfc3339(),
+                        session_id: session_id.map(str::to_owned),
+                        process: ServerProcess::Remote(process.clone()),
+                        machine: Some(ServerMachine {
+                            key: host.machine_key().to_owned(),
+                            label: host.machine_label().to_owned(),
+                        }),
+                        display_cwd: Some(display_cwd.to_owned()),
+                    },
+                );
+            server_id
+        };
+        self.emit_change();
+
+        let capturing = Arc::new(AtomicBool::new(true));
+        let early_stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(stdout) = stdout {
+            drain_pipe(
+                stdout,
+                PreviewLogSink::new(self.clone(), &server_id, PreviewLogStream::Stdout),
+                None,
+            );
+        }
+        if let Some(stderr) = stderr {
+            drain_pipe(
+                stderr,
+                PreviewLogSink::new(self.clone(), &server_id, PreviewLogStream::Stderr),
+                Some((early_stderr.clone(), capturing.clone())),
+            );
+        }
+
+        // The gate is the same race as a local one; only the clock it waits on is the agent's.
+        let exit = match process.process.wait_timeout(STARTUP_GATE) {
+            Ok(Some(exit)) => Some(exit.code),
+            Ok(None) => None,
+            Err(error) => {
+                self.remove(worktree, &server_id);
+                self.emit_change();
+                return Err(PreviewStartError {
+                    message: format!(
+                        "Lost track of the dev server on {} while it was starting: {error}",
+                        host.machine_label()
+                    ),
+                    kind: PreviewStartErrorKind::Unreachable,
+                    code: None,
+                    exit_code: None,
+                    output: None,
+                });
+            }
+        };
+        capturing.store(false, Ordering::Release);
+        if let Some(exit_code) = exit {
+            // Everything the process wrote has arrived once its exit has: the agent publishes the
+            // exit only after both streams ended. The drains still need a moment to hand it over.
+            thread::sleep(Duration::from_millis(50));
+            let output = self
+                .logs(&server_id)
+                .iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<String>()
+                .trim()
+                .to_owned();
+            let error = early_stderr
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            self.remove(worktree, &server_id);
+            self.emit_change();
+            // The launch script's own verdicts, which read like the spawn errors a local start
+            // reports for the same mistakes.
+            let failure = match exit_code {
+                Some(REMOTE_EXIT_NO_CWD) => PreviewSpawnFailure::SpawnError {
+                    code: Some("ENOENT".to_owned()),
+                    error: error.trim().to_owned(),
+                    via_exit_text: false,
+                },
+                _ => PreviewSpawnFailure::EarlyExit {
+                    exit_code,
+                    error: (!error.is_empty()).then_some(error),
+                },
+            };
+            return Err(preview_start_failure(
+                reclassify_exit_127(failure),
+                command,
+                &output,
+                exit_code == Some(REMOTE_EXIT_NO_CWD),
+            ));
+        }
+
+        self.watch_remote(worktree, &server_id, process);
+        let registry = self.clone();
+        let readiness_worktree = worktree.to_path_buf();
+        let readiness_id = server_id.clone();
+        let port = config.port;
+        let https = readiness_is_https(config.url.as_deref());
+        thread::spawn(move || {
+            // Waited out on the machine itself, so a slow link costs one round trip rather than
+            // one per probe; like a local start, a timeout still promotes the row.
+            host.wait_ready(port, READINESS_TIMEOUT, https);
+            registry.promote(&readiness_worktree, &readiness_id);
+        });
+        self.get(&server_id).ok_or_else(|| PreviewStartError {
+            message: dead_reuse_refusal_message(&config.name),
+            kind: PreviewStartErrorKind::EarlyExit,
+            code: None,
+            exit_code: None,
+            output: None,
+        })
+    }
+
+    /// Moves a starting row to running, once.
+    fn promote(&self, worktree: &Path, server_id: &str) {
+        let promoted = {
+            let mut inner = self.lock();
+            inner
+                .worktrees
+                .get_mut(worktree)
+                .and_then(|entries| entries.get_mut(server_id))
+                .filter(|entry| entry.status == PreviewServerStatus::Starting)
+                .map(|entry| entry.status = PreviewServerStatus::Running)
+                .is_some()
+        };
+        if promoted {
+            self.emit_change();
+        }
+    }
+
+    /// Forgets a remote server once it has exited, or once the host can no longer find out how
+    /// it ended — its machine reclaimed it, or its link gave up for good. A link that is merely
+    /// reconnecting is neither: the process keeps running there, and the wait keeps waiting.
+    fn watch_remote(&self, worktree: &Path, server_id: &str, process: Arc<RemoteServerProcess>) {
+        let registry = self.clone();
+        let worktree = worktree.to_path_buf();
+        let server_id = server_id.to_owned();
+        thread::spawn(move || {
+            loop {
+                if process.stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                match process.process.wait_timeout(Duration::from_secs(5)) {
+                    Ok(None) => continue,
+                    Ok(Some(_)) | Err(_) => break,
+                }
+            }
+            if process.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            if registry.remove(&worktree, &server_id) {
+                registry.emit_change();
+            }
+        });
     }
 
     /// Starts, retrying transient failures. Configuration mistakes are reported at once.
@@ -1970,19 +2322,7 @@ impl PreviewServerRegistry {
                 }
             };
             wait_until_ready_while(port, READINESS_TIMEOUT, https, &alive);
-            let promoted = {
-                let mut inner = registry.lock();
-                inner
-                    .worktrees
-                    .get_mut(&worktree)
-                    .and_then(|entries| entries.get_mut(&server_id))
-                    .filter(|entry| entry.status == PreviewServerStatus::Starting)
-                    .map(|entry| entry.status = PreviewServerStatus::Running)
-                    .is_some()
-            };
-            if promoted {
-                registry.emit_change();
-            }
+            registry.promote(&worktree, &server_id);
         });
     }
 
@@ -2034,7 +2374,7 @@ impl PreviewServerRegistry {
             registry.retire(server_id);
             entry.process.clone()
         };
-        kill_preview_process(&process);
+        kill_server_process(&process);
         self.emit_stopped(&[server_id.to_owned()]);
         true
     }
@@ -2052,7 +2392,7 @@ impl PreviewServerRegistry {
     /// Kills every server. Safe to call from the app-exit hook: synchronous, and the
     /// job objects mean a process that ignores the kill still dies with this one.
     pub fn stop_all(&self) {
-        let (processes, stopped_ids): (Vec<Arc<Mutex<PreviewProcess>>>, Vec<String>) = {
+        let (processes, stopped_ids): (Vec<ServerProcess>, Vec<String>) = {
             let mut registry = self.lock();
             let processes = registry
                 .worktrees
@@ -2073,10 +2413,39 @@ impl PreviewServerRegistry {
             (processes, retiring)
         };
         for process in &processes {
-            kill_preview_process(process);
+            kill_server_process(process);
         }
         if !processes.is_empty() {
             self.emit_stopped(&stopped_ids);
+        }
+    }
+}
+
+/// How long a remote server is given to exit on SIGTERM before its tree is killed.
+const REMOTE_STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// The launch script's exit code for a working directory that is not there.
+pub const REMOTE_EXIT_NO_CWD: i32 = 64;
+
+fn kill_server_process(process: &ServerProcess) {
+    match process {
+        ServerProcess::Local(process) => kill_preview_process(process),
+        ServerProcess::Remote(process) => {
+            if process.stopped.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // Terminate first, the way a local stop's tree kill gives a dev server its chance to
+            // clean up, then the whole group. Queued if the link is down: the agent acts on it
+            // when the link is back, and reclaims the session on its own if it never is.
+            process
+                .process
+                .signal(remote_agent::protocol::SignalKind::Terminate);
+            let process = Arc::clone(process);
+            thread::spawn(move || {
+                if !matches!(process.process.wait_timeout(REMOTE_STOP_GRACE), Ok(Some(_))) {
+                    process.process.kill();
+                }
+            });
         }
     }
 }
@@ -2198,6 +2567,9 @@ mod tests {
             started_at: "2026-01-01T00:00:00+00:00".to_owned(),
             cwd: "C:\\repo".to_owned(),
             session_id: session_id.map(str::to_owned),
+            machine: None,
+            url: None,
+            workspace: None,
         }
     }
 

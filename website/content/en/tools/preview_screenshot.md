@@ -6,7 +6,7 @@ Classified as a sensitive browser observation (`browser.sensitive_observation`, 
 
 ## Behavior and limits
 
-Windows only: the capture goes through WebView2's `Page.captureScreenshot`, and on any other platform the tool answers with an error instead. The image is JPEG at quality 75, fitted to at most 800 device pixels wide and then multiplied by `scale` (0.1 to 1). A page never laid out is given a 1280×720 viewport for the capture, then has it taken back. The pointer overlay the agent draws is hidden first, and a page the pane is not showing is moved far offscreen, shown just long enough to composite, then hidden again where it was.
+Windows and macOS: the capture goes through `Page.captureScreenshot` on the page's Chromium — WebView2 on Windows, the embedded Chromium (CEF) on macOS — and on any other platform the tool answers with an error instead. The image is JPEG at quality 75, fitted to at most 800 device pixels wide and then multiplied by `scale` (0.1 to 1). A page never laid out is given a 1280×720 viewport for the capture, then has it taken back. The pointer overlay the agent draws is hidden first, and a page the pane is not showing is moved far offscreen, shown just long enough to composite, then hidden again where it was.
 
 The pixels reach the model as a conversation image attachment; the attachment store re-encodes it into a metadata-free lossless PNG or WebP and caps it at 5 MiB, so a capture whose canonical form will not fit is refused. It is advertised only to models that can see images. The call is bounded at 30 seconds.
 

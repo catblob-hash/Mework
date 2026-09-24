@@ -85,6 +85,7 @@
   font-size: 12px;
 }
 
-.terminal-tabs .terminal-tabs__overflow { flex: 0 0 auto; display: flex; align-items: center; }
+.terminal-tabs .terminal-tabs__overflow,
+.terminal-tabs .terminal-tabs__add-menu { flex: 0 0 auto; display: flex; align-items: center; }
 .terminal-tabs .terminal-tabs__overflow-trigger,
 .terminal-tabs .terminal-tabs__add { width: 24px; height: 24px; flex: 0 0 24px; }

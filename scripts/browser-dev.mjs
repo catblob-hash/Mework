@@ -1,10 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream, lstatSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { windowsNativeBuildEnvironment } from "./windows-native-build-tools.mjs";
+import { withCefBuildEnvironment } from "./cef-environment.mjs";
 import { devChildEnvironment } from "./dev-child-environment.mjs";
+import { withMacosDevSigning } from "./macos-dev-signing.mjs";
+import { dataRootsFor } from "./reset-app-data-plan.mjs";
 import {
   isControlledBackendFinalShutdown,
   isControlledBackendRestart,
@@ -153,7 +157,9 @@ const imageInputControlledRestart = Boolean(
   && /^[0-9a-f]{24}$/.test(imageInputRunId ?? "")
 );
 const environment = {
-  ...devChildEnvironment({ buildEnvironment: windowsNativeBuildEnvironment() }),
+  ...devChildEnvironment({
+    buildEnvironment: withMacosDevSigning(withCefBuildEnvironment(windowsNativeBuildEnvironment()))
+  }),
   MEWORK_BROWSER_DEV_ADDRESS: `127.0.0.1:${backendPort}`,
   MEWORK_BROWSER_DEV_ORIGIN: origin,
   MEWORK_BROWSER_DEV_TOKEN: token,
@@ -253,10 +259,9 @@ function cleanupOwnedDataDirectories() {
     return;
   }
 
-  for (const [label, directory] of [
-    ["APPDATA", process.env.APPDATA],
-    ["LOCALAPPDATA", process.env.LOCALAPPDATA]
-  ]) {
+  // Every root Tauri may have put this identifier's directories in on this host
+  // (AppData on Windows, Application Support / Caches / Logs on macOS).
+  for (const { label, directory } of dataRootsFor(process.platform, process.env, homedir())) {
     if (!directory) continue;
     const parent = path.resolve(directory);
     const target = path.resolve(parent, dataIdentifier);

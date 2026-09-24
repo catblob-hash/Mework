@@ -35,6 +35,10 @@ export interface DocumentStore {
   /** Synchronous authoritative snapshot. After `await`, asynchronous flows must
    * reread it instead of using a rendered snapshot captured in a closure. */
   current(): AppDocument | null;
+  /** Snapshot the writer most recently accepted: the loaded document, then each
+   * save that succeeded. It lags `current()` by whatever is still debouncing or
+   * in flight. */
+  persisted(): AppDocument | null;
 
   subscribeSaveStatus(listener: () => void): () => void;
   getSaveStatus(): DocumentSaveStatus;
@@ -71,6 +75,7 @@ export function createDocumentStore(options: DocumentStoreOptions = {}): Documen
   const debounceMs = options.debounceMs ?? 420;
 
   let document: AppDocument | null = null;
+  let persisted: AppDocument | null = null;
   let loaded = false;
   let disposed = false;
   let saveStatus: DocumentSaveStatus = "idle";
@@ -110,7 +115,11 @@ export function createDocumentStore(options: DocumentStoreOptions = {}): Documen
           immutableSnapshot: true,
           ...(saveOptions.durable ? { durable: true } : {})
         })
-      );
+      )
+      .then(() => {
+        // Writes are serialized, so the last one to succeed is the newest accepted.
+        persisted = snapshot;
+      });
     saveQueue = queued.catch(() => undefined);
     return queued;
   };
@@ -143,6 +152,7 @@ export function createDocumentStore(options: DocumentStoreOptions = {}): Documen
     },
     getSnapshot: () => document,
     current: () => document,
+    persisted: () => persisted,
 
     subscribeSaveStatus(listener) {
       statusListeners.add(listener);
@@ -156,6 +166,7 @@ export function createDocumentStore(options: DocumentStoreOptions = {}): Documen
 
     load(next) {
       document = next;
+      persisted = next;
       loaded = true;
       notifyDocument();
       // Loading may migrate the schema, so persist its result without waiting for

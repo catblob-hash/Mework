@@ -35,7 +35,7 @@ The conversation drawer's **Hooks** page lists every handler with its event, and
     ],
     "PreToolUse": [
       {
-        "matcher": "^(bash|powershell)$",
+        "matcher": "^(bash|zsh|sh|powershell)$",
         "hooks": [
           { "type": "command", "name": "No force push", "command": "python hooks/no_force_push.py" }
         ]
@@ -134,7 +134,7 @@ Two guarantees that follow from "classify what will actually run": an `allow` ne
 
 ## Examples
 
-Block dangerous git commands (`PreToolUse`, matcher `^(bash|powershell)$`), in Python:
+Block dangerous git commands (`PreToolUse`, matcher `^(bash|zsh|sh|powershell)$`), in Python:
 
 ```python
 import json, sys, re

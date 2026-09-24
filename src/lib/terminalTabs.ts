@@ -11,6 +11,9 @@ import type { TerminalLaunchChoice } from "./terminal";
  * Live session state is not here: `terminalController` holds that, and it drops a session the
  * moment it stops being live. A tab has to outlive its session — a shell that failed sits on
  * screen with its verdict until the user retries or closes it — so the two are separate.
+ *
+ * A conversation has no terminal until one is asked for: the first is made when the pane opens
+ * with nothing in it, in whatever shell the caller chose for it.
  */
 
 export interface TerminalTab {
@@ -18,16 +21,21 @@ export interface TerminalTab {
   id: string;
   /**
    * Creation order within the conversation. Ids are minted from it and never reused, so a
-   * torn-down shell's address can never come back; the derived name's number is not this —
-   * it is the tab's place in the strip, and a closed shell's number goes back into the pool.
+   * torn-down shell's address can never come back. The derived name's number is not this:
+   * that is `number`, counted per shell.
    */
   ordinal: number;
+  /**
+   * The number the derived name carries: how many terminals of this tab's shell the
+   * conversation had opened when this one was, itself included. Each shell counts on its own and
+   * never counts down, so `zsh 2` stays `zsh 2` whatever else opens or closes.
+   */
+  number: number;
   /** The user's name for this terminal; null follows the derived one. */
   name: string | null;
   /**
    * The workspace and shell this tab's terminal was asked for. `null` leaves both
-   * to the host — workspace 1 and its machine's default shell — which is what a
-   * tab nobody chose for (the one every conversation starts with) gets.
+   * to the host — workspace 1 and its machine's default shell.
    */
   launch: TerminalLaunchChoice | null;
 }
@@ -37,6 +45,8 @@ export interface TerminalTabsLayout {
   activeId: string | null;
   /** Monotonic: an ordinal is spent when its tab is created and never minted again. */
   nextOrdinal: number;
+  /** The number each shell's next tab takes, by `terminalShellKey`; absent is 1. */
+  nextNumbers: Readonly<Record<string, number>>;
 }
 
 export interface TerminalTabsState {
@@ -44,14 +54,12 @@ export interface TerminalTabsState {
 }
 
 export type TerminalTabsAction =
-  /** Gives the conversation a tab if it has none; the way opening the pane finds something to show. */
-  | { type: "ensure"; conversationId: string }
-  | { type: "add"; conversationId: string; launch?: TerminalLaunchChoice | null }
   /**
-   * Gives a tab that has not started a shell yet the workspace and shell it should start. The
-   * way a menu choice lands in the tab every conversation starts with instead of beside it.
+   * Gives the conversation a tab, started with `launch`, if it has none; the way opening the
+   * pane finds something to show.
    */
-  | { type: "configure"; conversationId: string; terminalId: string; launch: TerminalLaunchChoice }
+  | { type: "ensure"; conversationId: string; launch?: TerminalLaunchChoice | null }
+  | { type: "add"; conversationId: string; launch?: TerminalLaunchChoice | null }
   | { type: "close"; conversationId: string; terminalId: string }
   | { type: "activate"; conversationId: string; terminalId: string }
   | { type: "rename"; conversationId: string; terminalId: string; name: string }
@@ -66,27 +74,24 @@ export function terminalTabId(ordinal: number): string {
   return `${ID_PREFIX}${ordinal}`;
 }
 
-/**
- * What a conversation starts with. Every conversation has one terminal before anyone asks for
- * it, so the pane has something to park: the panel renders its region — and so keeps a stable
- * element to reopen into — long before it is ever expanded into a live shell.
- */
-const FIRST_LAYOUT: TerminalTabsLayout = {
-  tabs: [{ id: terminalTabId(1), ordinal: 1, name: null, launch: null }],
-  activeId: terminalTabId(1),
-  nextOrdinal: 2
+/** What a conversation starts with: no terminal until one is asked for. */
+const EMPTY_LAYOUT: TerminalTabsLayout = {
+  tabs: [],
+  activeId: null,
+  nextOrdinal: 1,
+  nextNumbers: {}
 };
-Object.freeze(FIRST_LAYOUT.tabs[0]);
-Object.freeze(FIRST_LAYOUT.tabs);
-Object.freeze(FIRST_LAYOUT);
+Object.freeze(EMPTY_LAYOUT.tabs);
+Object.freeze(EMPTY_LAYOUT.nextNumbers);
+Object.freeze(EMPTY_LAYOUT);
 
 export function terminalTabsFor(
   state: TerminalTabsState,
   conversationId: string | null
 ): TerminalTabsLayout {
-  if (!conversationId) return FIRST_LAYOUT;
+  if (!conversationId) return EMPTY_LAYOUT;
   return Object.prototype.hasOwnProperty.call(state.byConversation, conversationId)
-    ? state.byConversation[conversationId] : FIRST_LAYOUT;
+    ? state.byConversation[conversationId] : EMPTY_LAYOUT;
 }
 
 export function activeTerminalTab(layout: TerminalTabsLayout): TerminalTab | null {
@@ -94,13 +99,11 @@ export function activeTerminalTab(layout: TerminalTabsLayout): TerminalTab | nul
 }
 
 /**
- * The number a tab shows when the user has not named it: its place in the strip, as the
- * reference shell numbers its tabs. Not the ordinal — that is spent the moment a shell is
- * torn down and never minted again, which keeps ids unique but would make every closed
- * terminal cost its number forever.
+ * Which count a tab's number is drawn from: its shell's, or — for a tab that left the shell to
+ * the host — the count of those.
  */
-export function terminalDisplayNumber(layout: TerminalTabsLayout, terminalId: string): number {
-  return layout.tabs.findIndex((tab) => tab.id === terminalId) + 1;
+export function terminalShellKey(launch: TerminalLaunchChoice | null | undefined): string {
+  return launch?.shell ?? "";
 }
 
 function withLayout(
@@ -118,10 +121,13 @@ function added(
 ): TerminalTabsLayout {
   const ordinal = layout.nextOrdinal;
   const id = terminalTabId(ordinal);
+  const key = terminalShellKey(launch);
+  const number = layout.nextNumbers[key] ?? 1;
   return {
-    tabs: [...layout.tabs, { id, ordinal, name: null, launch }],
+    tabs: [...layout.tabs, { id, ordinal, number, name: null, launch }],
     activeId: id,
-    nextOrdinal: ordinal + 1
+    nextOrdinal: ordinal + 1,
+    nextNumbers: { ...layout.nextNumbers, [key]: number + 1 }
   };
 }
 
@@ -133,20 +139,11 @@ export function terminalTabsReducer(
   const layout = terminalTabsFor(state, conversationId);
   switch (action.type) {
     case "ensure":
-      return layout.tabs.length > 0 ? state : withLayout(state, conversationId, added(layout));
+      return layout.tabs.length > 0
+        ? state
+        : withLayout(state, conversationId, added(layout, action.launch ?? null));
     case "add":
       return withLayout(state, conversationId, added(layout, action.launch ?? null));
-    case "configure": {
-      const tab = layout.tabs.find((candidate) => candidate.id === action.terminalId);
-      if (!tab) return state;
-      return withLayout(state, conversationId, {
-        ...layout,
-        activeId: tab.id,
-        tabs: layout.tabs.map((candidate) => (
-          candidate.id === action.terminalId ? { ...candidate, launch: action.launch } : candidate
-        ))
-      });
-    }
     case "close": {
       const index = layout.tabs.findIndex((tab) => tab.id === action.terminalId);
       if (index < 0) return state;

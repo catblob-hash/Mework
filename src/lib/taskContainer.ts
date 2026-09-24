@@ -423,7 +423,8 @@ function previewServerItem(
     kind: "preview",
     id: `preview-server:${server.serverId}`,
     label: server.name,
-    detail: `${server.status === "starting" ? messages.previewStarting : messages.previewRunning} · ${address}`,
+    // A server on another machine says which: its address is that machine's `localhost`.
+    detail: `${server.status === "starting" ? messages.previewStarting : messages.previewRunning} · ${address}${server.machine ? ` · ${server.machine}` : ""}`,
     state: "running",
     server,
     address,

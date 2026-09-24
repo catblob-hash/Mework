@@ -6,7 +6,7 @@ import {
   focusedPane, defaultSideFlexForKind, sidePaneDomId, previewTabSessionId,
   expandedPane,
   previewSessionBelongsToConversation, isPrimaryPreviewSession,
-  loadSidePanesState, persistSidePanesState
+  loadSidePanesState, persistSidePanesState, newPreviewPageSessionId, previewWorkspaceOf
 } from "./sidePanes";
 import type { SidePaneId, SidePaneKind, SidePanesAction, SidePanesState } from "./sidePanes";
 
@@ -327,13 +327,25 @@ describe("sidePanesReducer", () => {
   });
 
   it("drops a preview pane while adopting, so a draft-minted session id cannot follow", () => {
-    // The draft can never reach a workspace, so such a pane addresses a page that
-    // does not exist; carrying it would leave a tile pointing at a dead session.
+    // A page named after the placeholder id belongs to no conversation, so carrying its pane
+    // would leave a tile pointing at a session nothing owns.
     const state = open(open(initialSidePanesState, "settings", "__draft__"), "preview:__draft__#1", "__draft__");
     const next = apply(state, { type: "adopt_conversation", conversationId, from: "__draft__" });
     expect(layout(next).panes).toEqual(["settings"]);
     expect(layout(next).focused).toBe("settings");
     expect(layout(next).expanded).toBeNull();
+    expect(next.previewSessions).toEqual({});
+  });
+
+  it("carries the draft's own preview page, which is already named after the conversation", () => {
+    // The draft opens its page under the id it will materialize as, so the page and its roster
+    // entry are the conversation's the moment it is real.
+    const state = open(initialSidePanesState, previewPaneId(conversationId), "__draft__");
+    expect(previewSessionsFor(state, "__draft__")).toEqual([conversationId]);
+    const next = apply(state, { type: "adopt_conversation", conversationId, from: "__draft__" });
+    expect(layout(next).panes).toEqual([previewPaneId(conversationId)]);
+    expect(previewSessionsFor(next, conversationId)).toEqual([conversationId]);
+    expect(next.previewSessions).not.toHaveProperty("__draft__");
   });
 });
 
@@ -429,5 +441,53 @@ describe("side pane persistence", () => {
     vi.stubGlobal("localStorage", undefined);
     expect(loadSidePanesState()).toEqual(initialSidePanesState);
     expect(() => persistSidePanesState(initialSidePanesState)).not.toThrow();
+  });
+});
+
+describe("preview pages across workspaces", () => {
+  it("files each page under the workspace it was opened for, and forgets it with the page", () => {
+    let state = apply(initialSidePanesState, {
+      type: "register_preview", conversationId, sessionId: conversationId, workspace: 2
+    });
+    state = apply(state, {
+      type: "register_preview", conversationId, sessionId: `${conversationId}#tab_a`, workspace: 3
+    });
+    expect(previewSessionsFor(state, conversationId)).toEqual([conversationId, `${conversationId}#tab_a`]);
+    expect(previewWorkspaceOf(state, conversationId)).toBe(2);
+    expect(previewWorkspaceOf(state, `${conversationId}#tab_a`)).toBe(3);
+    // A page nobody placed is workspace 1's, and re-registering without a workspace keeps the one it has.
+    expect(previewWorkspaceOf(state, "unknown")).toBe(1);
+    expect(apply(state, { type: "register_preview", conversationId, sessionId: conversationId })).toBe(state);
+
+    state = apply(state, { type: "forget_preview", conversationId, sessionId: conversationId });
+    expect(previewSessionsFor(state, conversationId)).toEqual([`${conversationId}#tab_a`]);
+    expect(previewWorkspaceOf(state, conversationId)).toBe(1);
+    expect(Object.keys(state.previewWorkspaces)).toEqual([`${conversationId}#tab_a`]);
+  });
+
+  it("moves a page to another workspace, and refuses a number that names none", () => {
+    const state = apply(initialSidePanesState, {
+      type: "register_preview", conversationId, sessionId: conversationId, workspace: 1
+    });
+    const moved = apply(state, { type: "set_preview_workspace", conversationId, sessionId: conversationId, workspace: 2 });
+    expect(previewWorkspaceOf(moved, conversationId)).toBe(2);
+    expect(apply(moved, { type: "set_preview_workspace", conversationId, sessionId: conversationId, workspace: 2 })).toBe(moved);
+    expect(apply(moved, { type: "set_preview_workspace", conversationId, sessionId: conversationId, workspace: 0 })).toBe(moved);
+    expect(apply(moved, { type: "set_preview_workspace", conversationId, sessionId: conversationId, workspace: 1.5 })).toBe(moved);
+  });
+
+  it("drops a removed conversation's page placements with its roster", () => {
+    let state = apply(initialSidePanesState, {
+      type: "register_preview", conversationId, sessionId: conversationId, workspace: 2
+    });
+    state = apply(state, { type: "register_preview", conversationId: "other", sessionId: "other", workspace: 3 });
+    state = apply(state, { type: "remove_conversation", conversationId });
+    expect(state.previewWorkspaces).toEqual({ other: 3 });
+  });
+
+  it("fills the conversation's own page first, and opens every further page as a tab", () => {
+    expect(newPreviewPageSessionId([], "conv", "tab_x")).toBe("conv");
+    expect(newPreviewPageSessionId(["conv#tab_a"], "conv", "tab_x")).toBe("conv");
+    expect(newPreviewPageSessionId(["conv"], "conv", "tab_x")).toBe("conv#tab_x");
   });
 });

@@ -12,7 +12,7 @@ API Key 或订阅由你自己提供，其余一切都在你的机器上运行和
 
 ## 你能得到什么
 
-**能把活干完的 Agent。** 带语言服务器代码导航的文件工具、PowerShell 与 Bash（本机、WSL 或 SSH 远程）、网页搜索与抓取、长期记忆、待办清单，以及先出方案再动手的计划模式。日常编程场景下功能与 Claude Code 基本相当，尚有的差距见下文。
+**能把活干完的 Agent。** 带语言服务器代码导航的文件工具、每台机器上可用的 shell——PowerShell、Bash、zsh、sh（本机、WSL 或 SSH 远程）、网页搜索与抓取、长期记忆、待办清单，以及先出方案再动手的计划模式。日常编程场景下功能与 Claude Code 基本相当，尚有的差距见下文。
 
 **后台子代理与脚本化工作流。** 最多 8 个子代理并行，回合结束后继续跑，应用重启也不丢。可以定义命名角色——用哪个模型、给哪些工具、走哪个搜索后端——让模型按名字调用。更大的任务可以写一段 JavaScript 工作流脚本编排多个代理，带检查点和崩溃恢复。
 
@@ -67,7 +67,7 @@ npm run tauri:build
 
 安装器产出在 `src-tauri/target/release/bundle/nsis/`；`npm run package:portable` 从同一产物打出便携版。`npm test` 与 `npm run test:rust` 运行检查。
 
-在 macOS（11 及以上，Apple 芯片或 Intel）上，前置要求是 Xcode Command Line Tools、nodejs.org 的 Node.js ≥ 22.12 和稳定版 Rust。`bash scripts/setup-macos-dev.sh` 会检查它们并准备好检出目录；之后 `npm test`、`npm run test:rust`、`npm run tauri:dev` 都可用，`npm run tauri:build` 会在 `src-tauri/target/release/bundle/` 下产出 `Mework.app` 和 `.dmg`。产物没有整体签名，其中的可执行文件只带 ad-hoc 签名，在构建它的那台 Mac 上足够用；要分发给别人，需要 Developer ID 签名和公证，并且在 hardened runtime 下 Node 侧车需要 `com.apple.security.cs.allow-jit` 权限。Mac 上没有 PowerShell：所有工作区都是 POSIX，shell 工具运行登录 shell `PATH` 里排在最前的 `bash`（即使从 Finder 启动，应用也会采用这份 `PATH`），内置终端可以用登录方式打开 zsh、bash 或 fish，Key 保存在 macOS 钥匙串。
+在 macOS（13 及以上——内嵌 Chromium 的最低要求，Apple 芯片或 Intel）上，前置要求是 Xcode Command Line Tools、nodejs.org 的 Node.js ≥ 22.12 和稳定版 Rust。`bash scripts/setup-macos-dev.sh` 会检查它们并准备好检出目录；之后 `npm test`、`npm run test:rust`、`npm run tauri:dev` 都可用，`npm run tauri:build` 会在 `src-tauri/target/release/bundle/` 下产出 `Mework.app` 和 `.dmg`。产物没有整体签名，其中的可执行文件只带 ad-hoc 签名，在构建它的那台 Mac 上足够用；要分发给别人，需要 Developer ID 签名（`APPLE_SIGNING_IDENTITY`）和公证。侧车与 Chromium 在 hardened runtime 下需要的 entitlements 写在 `src-tauri/Entitlements.plist`，macOS 为 Mework 及其运行的程序弹出隐私权限时显示的说明写在 `src-tauri/Info.plist`（本地化文本在 `src-tauri/InfoPlist/`）。macOS 把钥匙串和隐私权限的授权绑定到代码签名上，而开发构建每次重新编译都会得到新的 ad-hoc 签名；把 `MEWORK_DEV_SIGNING_IDENTITY` 设为登录钥匙串里的一个代码签名身份（Xcode 里的 *Apple Development* 证书，或用“钥匙串访问”创建的自签名代码签名证书），`npm run tauri:dev` / `npm run dev:browser` 就会用它重新签名每次构建，“始终允许”在重新编译后依然有效。Mac 上没有 PowerShell：所有工作区都是 POSIX，shell 工具运行登录 shell `PATH` 里排在最前的 `bash`（即使从 Finder 启动，应用也会采用这份 `PATH`），内置终端可以用登录方式打开本机探测到的 zsh 或 bash，Key 加密保存在 `~/.mework/credential-vault`，钥匙串里只有一项 *Mework Safe Storage* 主密钥，所以 macOS 每个构建最多询问一次钥匙串密码，而不是每个 Key 各问一次。`npm run reset:data` 在 macOS 上同样可用；加 `--keys` 会一并删除这个凭据库和 Mework 的钥匙串项。
 
 在 Linux 上开发（容器、WSL 或 CI worker）：`bash scripts/setup-linux-dev.sh` 会装好工具链，并准备好 Rust 构建脚本需要的前端产物与 AI SDK 侧车。之后上面的检查都可用；只有两个例外：`npm run tauri:build` 面向 WebView2 与 NSIS 打包，`npm run prob:fetch` 钉的是 Windows 版 ProB 制品。
 

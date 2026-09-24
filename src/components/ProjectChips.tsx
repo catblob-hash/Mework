@@ -4,6 +4,7 @@ import {
   FolderClock,
   FolderKanban,
   FolderPlus,
+  PanelRight,
   Server,
   Settings,
   SquareTerminal
@@ -242,12 +243,18 @@ export function WorkspaceMemberSelector({
   );
 }
 
-/** The menu of shells a terminal can start with, for a workspace on one machine. */
+/**
+ * The menu of shells a terminal can start with, for a workspace on one machine: the ones its
+ * probe found, most preferred first. A machine with none gets a row that says so, so a menu
+ * never opens empty.
+ */
 export function terminalShellMenuItems(
   shells: readonly TerminalShell[],
   onSelect: (shell: TerminalShell) => void,
+  emptyLabel: string,
   disabled = false
 ): PopoverMenuItem[] {
+  if (!shells.length) return [{ id: "none", label: emptyLabel, icon: <SquareTerminal size={14} />, disabled: true }];
   return shells.map((shell) => ({
     id: shell,
     label: terminalShellLabel(shell),
@@ -258,22 +265,91 @@ export function terminalShellMenuItems(
 }
 
 /**
+ * The conversation's workspaces as a menu, each opening its machine's shells beside it — the
+ * top-right terminal button's menu once there is more than one place a terminal could start.
+ * `member` is the conversation's 1-based workspace number, the address a terminal is opened by.
+ */
+export function terminalWorkspaceMenuItems({
+  workspaces,
+  sshMachines,
+  shellsFor,
+  emptyLabel,
+  disabled = false,
+  onSelect
+}: {
+  workspaces: readonly AttachedWorkspace[];
+  sshMachines: readonly SshMachineConfig[];
+  shellsFor: (machine: RunTarget | null) => readonly TerminalShell[];
+  emptyLabel: string;
+  disabled?: boolean;
+  onSelect: (member: number, shell: TerminalShell) => void;
+}): PopoverMenuItem[] {
+  return workspaces.map((workspace, index) => ({
+    id: `workspace-${index + 1}`,
+    label: workspaceDirectoryLabel(workspace.path),
+    title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
+    icon: machineIcon(workspace.machine, 14),
+    hint: String(index + 1),
+    disabled,
+    children: terminalShellMenuItems(
+      shellsFor(workspace.machine ?? null),
+      (shell) => onSelect(index + 1, shell),
+      emptyLabel
+    )
+  }));
+}
+
+/**
+ * The conversation's workspaces as a menu of places a preview page can be opened for — the top
+ * bar's preview button and the preview pane's `+` once there is more than one. A page belongs to
+ * the workspace it was opened for: its start page lists that workspace's `.mework/launch.json`,
+ * and a server it runs runs on that workspace's machine.
+ */
+export function previewWorkspaceMenuItems({
+  workspaces,
+  sshMachines,
+  disabled = false,
+  onSelect
+}: {
+  workspaces: readonly AttachedWorkspace[];
+  sshMachines: readonly SshMachineConfig[];
+  disabled?: boolean;
+  onSelect: (member: number) => void;
+}): PopoverMenuItem[] {
+  return workspaces.map((workspace, index) => ({
+    id: `workspace-${index + 1}`,
+    label: workspaceDirectoryLabel(workspace.path),
+    title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
+    icon: machineIcon(workspace.machine, 14),
+    hint: String(index + 1),
+    disabled,
+    onSelect: () => onSelect(index + 1)
+  }));
+}
+
+/**
  * The composer's terminal button: opens a new terminal in the selected workspace, in the shell
- * picked from its menu. Which shells are offered follows that workspace's machine.
+ * picked from its menu. Which shells are offered follows what that workspace's machine was
+ * probed to have. The row after them shows or hides the pane, whose terminals are already open.
  */
 export function TerminalShellButton({
   workspaceLabel,
   shells,
+  paneOpen,
   disabled = false,
   disabledReason,
-  onSelect
+  onSelect,
+  onTogglePane
 }: {
   /** The directory the shell will start in, for the button's name. */
   workspaceLabel: string;
   shells: readonly TerminalShell[];
+  /** Whether the terminal pane is on screen, which decides what its row says. */
+  paneOpen: boolean;
   disabled?: boolean;
   disabledReason?: string;
   onSelect: (shell: TerminalShell) => void;
+  onTogglePane: () => void;
 }) {
   const { t } = useI18n();
   const label = t("在 {name} 打开终端", "Open a terminal in {name}", { name: workspaceLabel });
@@ -288,7 +364,27 @@ export function TerminalShellButton({
       menuLabel={t("用哪个 shell", "Which shell")}
       menuWidth={200}
       dense
-      sections={[{ id: "shells", items: terminalShellMenuItems(shells, onSelect) }]}
+      sections={[
+        {
+          id: "shells",
+          items: terminalShellMenuItems(
+            shells,
+            onSelect,
+            t("未探测到可用的 shell", "No shells detected")
+          )
+        },
+        {
+          id: "pane",
+          items: [{
+            id: "toggle",
+            label: paneOpen
+              ? t("收起终端面板", "Hide the terminal pane")
+              : t("打开终端面板", "Open the terminal pane"),
+            icon: <PanelRight size={14} />,
+            onSelect: onTogglePane
+          }]
+        }
+      ]}
     />
   );
 }

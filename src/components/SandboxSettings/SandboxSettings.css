@@ -1,0 +1,80 @@
+.sandbox-settings-page {
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.sandbox-settings-page .settings-card:first-of-type { margin-top: 0; }
+
+.sandbox-settings-page__row {
+  min-height: 48px;
+  padding: 9px 0;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  border-top: 1px solid var(--subtle);
+}
+
+.sandbox-settings-page__row:first-child { border-top: 0; }
+
+.sandbox-settings-page__row--vertical {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.sandbox-settings-page__copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sandbox-settings-page__copy strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sandbox-settings-page__copy small {
+  margin-top: 3px;
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+/* `.input` fills its container; beside a row's copy the control keeps its own width. */
+.sandbox-settings-page__row > select.input {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 160px;
+}
+
+.sandbox-settings-page__row > .button { flex: 0 0 auto; }
+
+.sandbox-settings-page__status {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.sandbox-settings-page__status--unavailable { color: var(--danger, #b3261e); }
+
+.sandbox-settings-page__list {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.sandbox-settings-page__textarea {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  font-family: var(--mono-font, ui-monospace, monospace);
+  font-size: 10.5px;
+}
+
+.sandbox-settings-page__actions {
+  display: flex;
+  justify-content: flex-end;
+}

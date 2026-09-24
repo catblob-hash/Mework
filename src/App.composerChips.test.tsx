@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { GitWorkspaceSnapshot } from "./lib/git";
-import type { AppDocument } from "./types";
+import type { AppDocument, MachineShells, ShellBackend } from "./types";
 import { configureI18n } from "./i18n";
 import { documentWithModel, gitMocks, resetAppMocks, runtimeMocks, workspacePickerMocks } from "./test/appMocks";
 
@@ -26,6 +26,35 @@ vi.mock("./lib/git", async (importOriginal) => {
   return { ...await importOriginal<typeof import("./lib/git")>(), ...gitMocks };
 });
 vi.mock("./components/TerminalPanel", async () => (await import("./test/appMockInstances")).terminalPanelModuleMock());
+/** What the host's last probe of each machine found, as `list_machine_shells` answers it. */
+const machineShellProbes = vi.hoisted(() => ({ current: {} as Record<string, MachineShells> }));
+vi.mock("./lib/machineShells", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./lib/machineShells")>(),
+  listMachineShells: vi.fn(async () => machineShellProbes.current)
+}));
+
+function probe(os: MachineShells["os"], backends: ShellBackend[]): MachineShells {
+  return {
+    os,
+    shells: backends.map((backend) => ({ backend, path: `/usr/bin/${backend}` })),
+    probedAt: "2026-09-23T00:00:00Z"
+  };
+}
+
+/** A project whose second workspace is a WSL distribution's directory. */
+function documentWithWslWorkspace(): AppDocument {
+  const document = documentWithModel();
+  document.workspaces[0].additionalWorkspaces = [{
+    machine: { kind: "wsl", distro: "Ubuntu" },
+    path: "/home/dev/services"
+  }];
+  return document;
+}
+
+/** Items of an open menu by their visible text, in order. */
+function menuTexts(menu: HTMLElement): (string | null)[] {
+  return within(menu).getAllByRole("menuitem").map((item) => item.textContent);
+}
 
 afterEach(() => configureI18n("zh-CN"));
 
@@ -101,6 +130,7 @@ async function branchChip(branch: string) {
 describe("composer context chips", () => {
   beforeEach(() => {
     resetAppMocks();
+    machineShellProbes.current = {};
     // Git controls require the host runtime; otherwise the input header has no branch chip.
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
@@ -179,12 +209,91 @@ describe("composer context chips", () => {
     expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
   });
 
-  it("opens a terminal in the selected workspace with the shell picked from the menu", async () => {
+  it("reads the Git status of a workspace on an SSH machine the way it reads a local one", async () => {
     const document = documentWithModel();
-    document.workspaces[0].additionalWorkspaces = [{
-      machine: { kind: "wsl", distro: "Ubuntu" },
-      path: "/home/dev/services"
-    }];
+    document.globalSettings.executionEnvironments.sshMachines = [devbox()];
+    document.workspaces[0].machine = { kind: "ssh", machineId: "machine-devbox" };
+    document.workspaces[0].path = "/home/dev/app";
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    // The host reads the status on the machine; the renderer asks for it as for any checkout.
+    const chip = await branchChip("main");
+    expect(gitMocks.getGitWorkspaceSummary.mock.calls[0]?.[0]).toEqual({
+      kind: "conversation",
+      conversationId: document.workspaces[0].conversations[0].id
+    });
+    // Everything else the Git surface does acts on a checkout in this filesystem.
+    expect(chip).toBeDisabled();
+    expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
+    const card = await screen.findByRole("complementary", { name: "Git 状态" });
+    await user.click(within(card).getByRole("button", { name: "展开 Git 状态卡片" }));
+    expect(within(card).getByRole("button", { name: /^变更/ })).toBeDisabled();
+    expect(gitMocks.getGitBranches).not.toHaveBeenCalled();
+  });
+
+  it("reads the status of a project's further workspace on an SSH machine by its number", async () => {
+    const document = documentWithModel();
+    document.globalSettings.executionEnvironments.sshMachines = [devbox()];
+    document.workspaces[0].additionalWorkspaces = [
+      { machine: { kind: "ssh", machineId: "machine-devbox" }, path: "/srv/api" }
+    ];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    gitMocks.getGitWorkspaceSummary.mockImplementation(async (target: { kind: string; member?: number }) => (
+      summaryResult(snapshot(target.kind === "workspace" && target.member === 2 ? "api-main" : "main"))
+    ));
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    expect(await branchChip("main")).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: /^工作区：/ }));
+    const menu = await screen.findByRole("menu", { name: "选择工作区" });
+    await user.click(within(menu).getByRole("menuitemradio", { name: /^api/ }));
+
+    await waitFor(() => expect(gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target))
+      .toContainEqual({ kind: "workspace", workspaceId: document.workspaces[0].id, member: 2 }));
+    expect(await branchChip("api-main")).toBeDisabled();
+  });
+
+  it("opens a terminal in the selected workspace with a shell its machine was probed to have", async () => {
+    machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["bash", "zsh", "sh"]) };
+    const document = documentWithWslWorkspace();
+    document.globalSettings.executionEnvironments.shellPriority = { wsl: ["zsh"] };
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    // The terminal button under the input is gone; this one, beside the workspace chip, is it.
+    expect(screen.queryAllByRole("button", { name: "终端" })
+      .filter((button) => button.classList.contains("composer-option"))).toEqual([]);
+
+    await user.click(screen.getByRole("button", { name: /^工作区：/ }));
+    await user.click(within(await screen.findByRole("menu", { name: "选择工作区" }))
+      .getByRole("menuitemradio", { name: /^services/ }));
+
+    // The distribution's probed shells, in WSL's priority order, then the pane — and nothing in
+    // the menu opens a menu of its own.
+    await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
+    const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
+    await waitFor(() => expect(menuTexts(menu)).toEqual(["zsh", "bash", "sh", "打开终端面板"]));
+    expect(within(menu).queryAllByRole("menuitem")
+      .filter((item) => item.hasAttribute("aria-haspopup"))).toEqual([]);
+    await user.click(within(menu).getByRole("menuitem", { name: "sh" }));
+
+    const conversationId = document.workspaces[0].conversations[0].id;
+    const panel = window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`);
+    expect(panel).toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "sh" }));
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh 1"]);
+  });
+
+  it("opens the pane on the selected workspace's most preferred shell when it has no terminal", async () => {
+    machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["bash", "zsh"]) };
+    const document = documentWithWslWorkspace();
+    document.globalSettings.executionEnvironments.shellPriority = { wsl: ["zsh", "bash"] };
     runtimeMocks.loadDocument.mockResolvedValue(document);
     const user = userEvent.setup();
     render(<App />);
@@ -193,19 +302,23 @@ describe("composer context chips", () => {
     await user.click(screen.getByRole("button", { name: /^工作区：/ }));
     await user.click(within(await screen.findByRole("menu", { name: "选择工作区" }))
       .getByRole("menuitemradio", { name: /^services/ }));
-
-    // A workspace on a POSIX machine offers the POSIX shells, whatever the host is.
     await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
     const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
-    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
-      .toEqual(["zsh", "bash", "fish"]);
-    await user.click(within(menu).getByRole("menuitem", { name: "fish" }));
+    await waitFor(() => expect(menuTexts(menu)[0]).toBe("zsh"));
+    await user.click(within(menu).getByRole("menuitem", { name: "打开终端面板" }));
 
+    // No default "Terminal" page: the pane opens on a real shell, in the workspace chosen.
     const conversationId = document.workspaces[0].conversations[0].id;
-    const panel = window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`);
-    // The tab every conversation starts with takes the choice instead of gaining a sibling.
-    expect(panel).toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "fish" }));
-    expect(screen.getByRole("tab", { name: "fish" })).toBeInTheDocument();
+    expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
+      .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "zsh" }));
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["zsh 1"]);
+
+    // The same row now puts the pane away rather than adding a terminal.
+    await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
+    await user.click(within(await screen.findByRole("menu", { name: "用哪个 shell" }))
+      .getByRole("menuitem", { name: "收起终端面板" }));
+    expect(screen.queryAllByRole("tab")).toEqual([]);
+    expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-2`)).toBeNull();
   });
 
   it("offers PowerShell and Git Bash for a workspace on a Windows host", async () => {
@@ -218,14 +331,13 @@ describe("composer context chips", () => {
       const project = document_workspaceName();
       await user.click(screen.getByRole("button", { name: `在 ${project} 打开终端` }));
       const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
-      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
-        .toEqual(["PowerShell", "bash"]);
+      expect(menuTexts(menu)).toEqual(["PowerShell", "bash", "打开终端面板"]);
     } finally {
       platform.mockRestore();
     }
   });
 
-  it("gives the top-right terminal button the same shell menu", async () => {
+  it("gives the top-right terminal button the same shell menu for a lone workspace", async () => {
     const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("MacIntel");
     try {
       const document = documentWithModel();
@@ -237,17 +349,83 @@ describe("composer context chips", () => {
       const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
       await user.click(within(toolbar).getByRole("button", { name: "终端" }));
       const menu = await screen.findByRole("menu", { name: "新建终端" });
+      expect(menuTexts(menu)).toEqual(["zsh", "bash", "显示终端面板"]);
       await user.click(within(menu).getByRole("menuitem", { name: "zsh" }));
 
       const conversationId = document.workspaces[0].conversations[0].id;
       expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
         .toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "zsh" }));
 
-      // A second choice opens a second terminal beside the first.
+      // A second choice opens a second terminal beside the first, numbered within its shell.
       await user.click(within(toolbar).getByRole("button", { name: "终端" }));
       await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
         .getByRole("menuitem", { name: "bash" }));
-      expect(screen.queryAllByRole("tab").map((tab) => tab.textContent)).toEqual(["zsh 1", "bash 2"]);
+      await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+      await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
+        .getByRole("menuitem", { name: "zsh" }));
+      expect(screen.queryAllByRole("tab").map((tab) => tab.textContent)).toEqual(["zsh 1", "bash 1", "zsh 2"]);
+
+      // The pane's + offers the same shells, without the row that shows or hides the pane.
+      await user.click(screen.getByRole("button", { name: "新建终端" }));
+      const paneMenu = await screen.findByRole("menu", { name: "新建终端" });
+      expect(menuTexts(paneMenu)).toEqual(["zsh", "bash"]);
+      await user.click(within(paneMenu).getByRole("menuitem", { name: "bash" }));
+      expect(screen.queryAllByRole("tab").map((tab) => tab.textContent))
+        .toEqual(["zsh 1", "bash 1", "zsh 2", "bash 2"]);
+    } finally {
+      platform.mockRestore();
+    }
+  });
+
+  it("makes the top-right terminal button pick a workspace, then one of its machine's shells", async () => {
+    const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("MacIntel");
+    try {
+      machineShellProbes.current = {
+        local: probe("macos", ["zsh", "bash", "sh"]),
+        "wsl:Ubuntu": probe("wsl", ["bash", "sh"])
+      };
+      const document = documentWithWslWorkspace();
+      runtimeMocks.loadDocument.mockResolvedValue(document);
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByLabelText("向 Agent 发送消息");
+
+      const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
+      await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+      const menu = await screen.findByRole("menu", { name: "新建终端" });
+      const workspaces = within(menu).getAllByRole("menuitem")
+        .filter((item) => item.getAttribute("aria-haspopup") === "menu");
+      expect(workspaces.map((item) => item.textContent)).toEqual(["Mework1", "services2"]);
+
+      // The machine's shells open beside the workspace; nothing is opened until one is picked.
+      await user.click(within(menu).getByRole("menuitem", { name: /^services/ }));
+      const shells = await screen.findByRole("menu", { name: "services" });
+      await waitFor(() => expect(menuTexts(shells)).toEqual(["bash", "sh"]));
+      expect(screen.queryAllByRole("tab")).toEqual([]);
+
+      await user.click(within(shells).getByRole("menuitem", { name: "sh" }));
+      const conversationId = document.workspaces[0].conversations[0].id;
+      expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
+        .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "sh" }));
+      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh 1"]);
+
+      // This machine's workspace offers this machine's shells, without the sh it cannot run.
+      await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+      await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
+        .getByRole("menuitem", { name: /^Mework/ }));
+      expect(menuTexts(await screen.findByRole("menu", { name: "Mework" }))).toEqual(["zsh", "bash"]);
+      await user.keyboard("{Escape}");
+
+      // The pane's + asks the same two questions, without the row that shows or hides the pane.
+      await user.click(screen.getByRole("button", { name: "新建终端" }));
+      const paneMenu = await screen.findByRole("menu", { name: "新建终端" });
+      expect(menuTexts(paneMenu)).toEqual(["Mework1", "services2"]);
+      await user.click(within(paneMenu).getByRole("menuitem", { name: /^services/ }));
+      await user.click(within(await screen.findByRole("menu", { name: "services" }))
+        .getByRole("menuitem", { name: "bash" }));
+      expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-2`))
+        .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "bash" }));
+      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh 1", "bash 1"]);
     } finally {
       platform.mockRestore();
     }
@@ -506,9 +684,12 @@ describe("composer context chips", () => {
       expect(project?.machine).toEqual({ kind: "ssh", machineId: "machine-devbox" });
       expect(project?.name).toBe("services");
     });
-    // No checkout exists on this machine, so nothing asks the host for Git facts.
-    expect(gitMocks.getGitWorkspaceSummary).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: /^分支：/ })).not.toBeInTheDocument();
+    // The draft asks for the new project's Git status, which the host reads on the machine; the
+    // branch can only be switched there.
+    const project = lastSaved()?.workspaces.find((entry) => entry.path === "/home/dev/services");
+    await waitFor(() => expect(gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target))
+      .toContainEqual({ kind: "workspace", workspaceId: project?.id }));
+    expect(await branchChip("main")).toBeDisabled();
   });
 
   it("creates a project of several workspaces, each picked on its own machine", async () => {

@@ -1368,7 +1368,10 @@ fn spawn_remote(
     config: &LspServerConfig,
     root: &Path,
 ) -> Result<ShellChild, String> {
-    let script = remote_launch_script(config, root)?;
+    let script = match runner.script_dialect() {
+        crate::shell_backend::ScriptDialect::Posix => remote_launch_script(config, root)?,
+        crate::shell_backend::ScriptDialect::PowerShell => remote_launch_powershell(config, root)?,
+    };
     let failed = |error: String| {
         format!(
             "Could not start the language server '{}' ({}) on the remote machine: {error}",
@@ -1378,10 +1381,11 @@ fn spawn_remote(
     // An SSH machine the agent serves runs the server itself: the server then
     // belongs to the machine's agent, not to an SSH session, and a dropped
     // link pauses its conversation instead of ending it.
-    let argv = ["bash", "--noprofile", "--norc", "-c", script.as_str()]
-        .iter()
-        .map(|part| (*part).to_owned())
-        .collect();
+    let argv = runner
+        .agent_shell()
+        .cloned()
+        .unwrap_or_default()
+        .script_argv(&script);
     if let Some(spawned) = crate::remote_link::spawn(
         runner,
         argv,
@@ -1465,6 +1469,38 @@ pub fn remote_launch_script(config: &LspServerConfig, root: &Path) -> Result<Str
     }
     script.push('\n');
     Ok(script)
+}
+
+/// [`remote_launch_script`] for a Windows machine whose agent shell is
+/// PowerShell, with the same checks on everything a repository's `lsp.json`
+/// supplies and the same exit codes (64, 127).
+pub fn remote_launch_powershell(config: &LspServerConfig, root: &Path) -> Result<String, String> {
+    let root = root.to_string_lossy();
+    for (text, label) in [(root.as_ref(), "workspace root"), (config.command.as_str(), "command")] {
+        if text.trim().is_empty() {
+            return Err(format!("The language server's {label} is empty"));
+        }
+        if text.chars().any(char::is_control) {
+            return Err(format!("The language server's {label} contains control characters"));
+        }
+    }
+    let mut env = Vec::with_capacity(config.env.len());
+    for (name, value) in &config.env {
+        crate::run_environment::validate_env_var_name(name)?;
+        if value.chars().any(char::is_control) {
+            return Err("The language server's environment values contain control characters".into());
+        }
+        env.push((name.clone(), value.clone()));
+    }
+    if config.args.iter().any(|argument| argument.chars().any(char::is_control)) {
+        return Err("The language server's arguments contain control characters".into());
+    }
+    Ok(crate::remote_powershell::lsp_launch(
+        root.trim(),
+        &config.command,
+        &config.args,
+        &env,
+    ))
 }
 
 fn handshake(
@@ -2430,6 +2466,7 @@ process.stderr.write("fake server up\n");
     fn fake_host() -> ServerHost {
         ServerHost::Remote {
             runner: ShellRunner::Ssh {
+                agent_shell: Default::default(),
                 host: "fake".into(),
                 port: 0,
                 identity_file: String::new(),

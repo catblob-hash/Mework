@@ -54,13 +54,22 @@ export interface TerminalLaunchChoice {
   shell: TerminalShell | null;
 }
 
+/**
+ * Opens (or reattaches to) a terminal.
+ *
+ * `draftWorkspaceId` is set only for the draft — a new task the host has no row for yet — and
+ * names the project it is aimed at, the temporary one included. Its terminals are opened under
+ * `conversationId`, the id it will materialize as, so they are that conversation's once it is
+ * real; the host ignores the project from then on.
+ */
 export async function openTerminal(
   conversationId: string,
   terminalId: string,
   cols: number,
   rows: number,
   onEvent: (event: TerminalEvent) => void,
-  launch: TerminalLaunchChoice = { workspace: null, shell: null }
+  launch: TerminalLaunchChoice = { workspace: null, shell: null },
+  draftWorkspaceId: string | null = null
 ): Promise<OpenTerminalResult> {
   requireDesktopRuntime();
   const channel = new Channel<TerminalEvent>();
@@ -72,6 +81,7 @@ export async function openTerminal(
     rows,
     workspace: launch.workspace,
     shell: launch.shell,
+    draftWorkspaceId,
     onEvent: channel
   });
 }
@@ -109,4 +119,13 @@ export async function detachTerminal(
 export async function closeTerminal(conversationId: string, terminalId: string): Promise<void> {
   requireDesktopRuntime();
   return invoke<void>("close_terminal", { conversationId, terminalId });
+}
+
+/**
+ * How many of a conversation's terminals still have a shell running at the host, whether or not
+ * the renderer is looking at them. A draft's are counted under the id it will materialize as.
+ */
+export async function liveTerminalCount(conversationId: string): Promise<number> {
+  requireDesktopRuntime();
+  return invoke<number>("live_terminal_count", { conversationId });
 }

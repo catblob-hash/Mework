@@ -107,6 +107,17 @@ pub enum AppPushEvent {
         state: RemoteLinkState,
         detail: Option<String>,
     },
+    /// A machine was probed for its shell backends ([`crate::machine_shells`]):
+    /// at startup for this machine, on first connecting to an SSH machine, on
+    /// first use of a WSL distribution, or from a machine's settings. `key` is
+    /// the machine's environment key (`local`, `wsl:<distro>`, `ssh:<id>`).
+    /// The renderer lists shell tools and agent-shell choices from these, and
+    /// records a new machine's agent shell on its first probe. The backlog
+    /// keeps only each machine's latest probe.
+    MachineShellsChanged {
+        key: String,
+        shells: crate::machine_shells::MachineShells,
+    },
     /// A background task (subagent, shell, or workflow) produced a deliverable
     /// completed, failed, or round-limit result for a conversation without an
     /// active model run. The renderer starts a message-free wake run so the
@@ -221,6 +232,7 @@ impl AppPushEvent {
             | AppPushEvent::DocumentWriteRecovered
             | AppPushEvent::PreviewServersChanged { .. }
             | AppPushEvent::RemoteLinkChanged { .. }
+            | AppPushEvent::MachineShellsChanged { .. }
             | AppPushEvent::ToolContextsQuarantined { .. } => None,
         }
     }
@@ -295,6 +307,12 @@ impl AppEventHub {
                 }
                 return;
             }
+        }
+        // A machine's probe only matters as its latest value.
+        if let AppPushEvent::MachineShellsChanged { key, .. } = &event {
+            inner.backlog.retain(|queued| {
+                !matches!(queued, AppPushEvent::MachineShellsChanged { key: queued_key, .. } if queued_key == key)
+            });
         }
         // A machine's link state only matters as its latest value.
         if let AppPushEvent::RemoteLinkChanged { host, .. } = &event {

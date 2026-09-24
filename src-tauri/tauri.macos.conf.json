@@ -1,5 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBundleCommand": "node scripts/stage-macos-cef.mjs"
+  },
   "bundle": {
     "targets": ["app", "dmg"],
     "icon": ["icons/icon.icns", "icons/icon.png"],
@@ -9,7 +12,20 @@
       "../THIRD-PARTY-LICENSES.md": "THIRD-PARTY-LICENSES.md"
     },
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "13.0",
+      "entitlements": "Entitlements.plist",
+      "files": {
+        "Resources/en.lproj/InfoPlist.strings": "InfoPlist/en.lproj/InfoPlist.strings",
+        "Resources/zh-Hans.lproj/InfoPlist.strings": "InfoPlist/zh-Hans.lproj/InfoPlist.strings",
+        "Resources/CHROMIUM-CREDITS.html": "target/cef-bundle/CHROMIUM-CREDITS.html",
+        "Resources/CEF-LICENSE.txt": "target/cef-bundle/CEF-LICENSE.txt",
+        "Frameworks/Chromium Embedded Framework.framework": "target/cef-bundle/Chromium Embedded Framework.framework",
+        "Frameworks/Mework Helper.app": "target/cef-bundle/Mework Helper.app",
+        "Frameworks/Mework Helper (GPU).app": "target/cef-bundle/Mework Helper (GPU).app",
+        "Frameworks/Mework Helper (Renderer).app": "target/cef-bundle/Mework Helper (Renderer).app",
+        "Frameworks/Mework Helper (Plugin).app": "target/cef-bundle/Mework Helper (Plugin).app",
+        "Frameworks/Mework Helper (Alerts).app": "target/cef-bundle/Mework Helper (Alerts).app"
+      }
     }
   }
 }

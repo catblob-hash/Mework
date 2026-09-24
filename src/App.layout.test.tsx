@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import App from "./App";
 import { configureI18n } from "./i18n";
 import type {
@@ -28,6 +28,22 @@ vi.mock("./lib/git", async (importOriginal) => {
 vi.mock("./components/TerminalPanel", async () => (await import("./test/appMockInstances")).terminalPanelModuleMock());
 
 afterEach(() => configureI18n("zh-CN"));
+
+/** Runs the test on a Mac host, whose most preferred shell is zsh, until it finishes. */
+function onMacHost() {
+  const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("MacIntel");
+  onTestFinished(() => platform.mockRestore());
+}
+
+/** Shows or hides the terminal pane from the composer's terminal button: the row after its shells. */
+async function toggleTerminalPane(
+  user: ReturnType<typeof userEvent.setup>,
+  name: "打开终端面板" | "收起终端面板"
+) {
+  await user.click(screen.getByRole("button", { name: /打开终端$/ }));
+  await user.click(within(await screen.findByRole("menu", { name: "用哪个 shell" }))
+    .getByRole("menuitem", { name }));
+}
 
 describe("App model run flow — layout", () => {
   /**
@@ -283,6 +299,7 @@ describe("App model run flow — layout", () => {
    * reports the session idle, and a still-running shell would vanish from the task rows.
    */
   it("keeps the terminal mounted while its pane is closed and reopens the same element", async () => {
+    onMacHost();
     const document = documentWithModel();
     const conversationId = document.workspaces[0].conversations[0].id;
     runtimeMocks.loadDocument.mockResolvedValue(document);
@@ -291,29 +308,26 @@ describe("App model run flow — layout", () => {
     await screen.findByLabelText("向 Agent 发送消息");
 
     const domId = `conversation-terminal-${conversationId}-terminal-1`;
-    // The pane toolbar carries a toggle of the same name; this is the composer's own.
-    const toggle = () => screen.getAllByRole("button", { name: "终端" })
-      .filter((button) => button.classList.contains("composer-option"))[0]!;
-    // Parked out of sight from the start: the pane has never been opened.
-    const parked = window.document.getElementById(domId);
-    expect(parked).not.toBeNull();
-    expect(parked?.closest(".pane-tiles__tile")).toHaveAttribute("hidden");
+    // Nothing is opened before anyone asks for a terminal.
+    expect(window.document.getElementById(domId)).toBeNull();
 
-    await user.click(toggle());
+    await toggleTerminalPane(user, "打开终端面板");
     const opened = window.document.getElementById(domId);
-    expect(opened).toBe(parked);
+    expect(opened).not.toBeNull();
     expect(opened?.closest(".pane-tiles__tile")).not.toHaveAttribute("hidden");
 
-    await user.click(toggle());
+    await toggleTerminalPane(user, "收起终端面板");
     const hidden = window.document.getElementById(domId);
-    expect(hidden).toBe(parked);
+    expect(hidden).toBe(opened);
     const tile = hidden?.closest(".pane-tiles__tile");
     expect(tile).toHaveAttribute("hidden");
     expect(tile).toHaveAttribute("inert");
 
-    await user.click(toggle());
-    expect(window.document.getElementById(domId)).toBe(parked);
-    expect(parked?.closest(".pane-tiles__tile")).not.toHaveAttribute("hidden");
+    await toggleTerminalPane(user, "打开终端面板");
+    expect(window.document.getElementById(domId)).toBe(opened);
+    expect(opened?.closest(".pane-tiles__tile")).not.toHaveAttribute("hidden");
+    // Reopening shows the terminals there are rather than adding one.
+    expect(screen.getAllByRole("tab")).toHaveLength(1);
   });
 
   /**
@@ -322,6 +336,7 @@ describe("App model run flow — layout", () => {
    * last tab leaving is what takes the pane with it.
    */
   it("gives the terminal pane a tab per shell and ends them one at a time", async () => {
+    onMacHost();
     const document = documentWithModel();
     const conversationId = document.workspaces[0].conversations[0].id;
     runtimeMocks.loadDocument.mockResolvedValue(document);
@@ -336,21 +351,21 @@ describe("App model run flow — layout", () => {
     const closeControl = (name: string) => within(
       screen.getByRole("tab", { name }).closest(".terminal-tab") as HTMLElement
     ).getByRole("button", { name: "关闭终端" });
-    // The pane toolbar carries a toggle of the same name; this is the composer's own.
-    const toggle = () => screen.getAllByRole("button", { name: "终端" })
-      .filter((button) => button.classList.contains("composer-option"))[0]!;
 
-    await user.click(toggle());
-    // A lone terminal is named after the thing itself; a second one numbers them both apart.
-    expect(tabNames()).toEqual(["终端"]);
+    // The pane opening with nothing in it starts the most preferred shell this machine has.
+    await toggleTerminalPane(user, "打开终端面板");
+    expect(tabNames()).toEqual(["zsh 1"]);
+    expect(panel("terminal-1")).toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "zsh" }));
     await user.click(screen.getByRole("button", { name: "新建终端" }));
-    expect(tabNames()).toEqual(["终端 1", "终端 2"]);
+    await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
+      .getByRole("menuitem", { name: "zsh" }));
+    expect(tabNames()).toEqual(["zsh 1", "zsh 2"]);
 
     // Both shells stay mounted; only the tab in use is on screen, so switching back to the
     // other is a repaint rather than a new shell.
     expect(panel("terminal-2")).not.toBeNull();
     expect(panel("terminal-1")).toHaveAttribute("inert");
-    await user.click(screen.getByRole("tab", { name: "终端 1" }));
+    await user.click(screen.getByRole("tab", { name: "zsh 1" }));
     expect(panel("terminal-1")).not.toHaveAttribute("inert");
     expect(panel("terminal-2")).toHaveAttribute("inert");
 
@@ -360,25 +375,26 @@ describe("App model run flow — layout", () => {
     expect(tabNames()).toEqual([]);
     expect(panel("terminal-1")).not.toBeNull();
 
-    await user.click(toggle());
-    expect(tabNames()).toEqual(["终端 1", "终端 2"]);
+    await toggleTerminalPane(user, "打开终端面板");
+    expect(tabNames()).toEqual(["zsh 1", "zsh 2"]);
 
-    // A tab's × ends that shell, and only that one. The survivor takes the number back: it
-    // is the tab's place in the strip, not the shell's creation order.
-    await user.click(closeControl("终端 2"));
+    // A tab's × ends that shell, and only that one. The survivor keeps its number: each shell
+    // counts the terminals it has had, not the ones still open.
+    await user.click(closeControl("zsh 2"));
     await waitFor(() => expect(panel("terminal-2")).toBeNull());
     expect(terminalMocks.closeTerminal).toHaveBeenCalledExactlyOnceWith(conversationId, "terminal-2");
-    expect(tabNames()).toEqual(["终端"]);
+    expect(tabNames()).toEqual(["zsh 1"]);
 
     // The last tab leaving takes the pane with it.
-    await user.click(closeControl("终端"));
+    await user.click(closeControl("zsh 1"));
     await waitFor(() => expect(panel("terminal-1")).toBeNull());
     expect(terminalMocks.closeTerminal).toHaveBeenLastCalledWith(conversationId, "terminal-1");
     expect(screen.queryByRole("button", { name: "关闭面板" })).not.toBeInTheDocument();
 
-    // Asking for the pane again asks for a terminal to put in it, on an id never used before.
-    await user.click(toggle());
-    expect(tabNames()).toEqual(["终端"]);
+    // Asking for the pane again asks for a terminal to put in it, on an id never used before,
+    // and the count goes on from where it was.
+    await toggleTerminalPane(user, "打开终端面板");
+    expect(tabNames()).toEqual(["zsh 3"]);
     expect(panel("terminal-3")).not.toBeNull();
   });
 
@@ -387,6 +403,7 @@ describe("App model run flow — layout", () => {
    * report, and keeps a failing one on screen. Only the clean exit reaches here.
    */
   it("folds away the tab whose shell exited cleanly, wherever it was", async () => {
+    onMacHost();
     const document = documentWithModel();
     const conversationId = document.workspaces[0].conversations[0].id;
     runtimeMocks.loadDocument.mockResolvedValue(document);
@@ -403,17 +420,17 @@ describe("App model run flow — layout", () => {
     );
     const tabNames = () => screen.queryAllByRole("tab").map((element) => element.textContent);
 
-    await user.click(screen.getAllByRole("button", { name: "终端" })
-      .filter((button) => button.classList.contains("composer-option"))[0]!);
+    await toggleTerminalPane(user, "打开终端面板");
     await user.click(screen.getByRole("button", { name: "新建终端" }));
-    expect(tabNames()).toEqual(["终端 1", "终端 2"]);
+    await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
+      .getByRole("menuitem", { name: "zsh" }));
+    expect(tabNames()).toEqual(["zsh 1", "zsh 2"]);
 
     // A shell that ends behind the tab the user is looking at still takes its own tab with it,
-    // and nothing else: the pane and the terminal in front of it stay put. The survivor is
-    // renumbered to the front of the strip.
+    // and nothing else: the pane and the terminal in front of it stay put, under its own name.
     exitCleanly("terminal-1");
     await waitFor(() => expect(panel("terminal-1")).toBeNull());
-    expect(tabNames()).toEqual(["终端"]);
+    expect(tabNames()).toEqual(["zsh 2"]);
     expect(screen.getByRole("button", { name: "关闭面板" })).toBeInTheDocument();
 
     // The last one ending takes the pane with it.

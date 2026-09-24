@@ -10,6 +10,10 @@
 
 `text` 是元素的 `innerText`，截断到 500 字符；`className` 截断到 200。只有元素带着非空 `value` 属性时 `value` 才会出现。`boundingBox` 是内容盒，以 `x`、`y`、`width` 和 `height` 给出。元素位于 React 树内时，会从它的 fiber 补上 `reactComponent` 和 `reactProps`。DOM 与 CSS 域在每条退出路径上都会释放。调用以 30 秒为限。
 
+## 决策模型参数
+
+在对话设置的预览工具窗口里为它打开决策模型选项后，可以不给 `selector`，改用 `query` 描述要检查的元素：宿主列出页面元素（和 [preview_snapshot](preview_snapshot.html) 同一套 `[uid] role: "name"` 行），并总是在最后附上一个「以上皆非」选项，让 TypeSafe Jev 决策模型从中选出所指的那一个。这是选择而不是打分，所以没有 `threshold`。选中某个元素就读取它的样式，结果会写明选中了哪个元素、把握多大以及其他候选；选了「以上皆非」则按未找到回答，报出最接近的几个元素，并附上决策模型看过的全部元素行，下一步不必再读一次页面。在同一处再打开**未命中时逐个打分**，选了「以上皆非」后这些元素行会先逐个对照描述打分（每行一次请求），再按分数从高到低连同分数一起返回。**加上决策模型参数**时 `selector` 与 `query` 二选一，两个都给会被拒绝；**只用决策模型**时不再接受 `selector`，每次都必须带上 `query`。元素行会发送到 TypeSafe 的 API，需要先在「全局设置 → 决策模型提供商」里填好密钥。
+
 ## 相关
 
 - [preview_snapshot](preview_snapshot.html) —— 用于找出值得检查的选择器

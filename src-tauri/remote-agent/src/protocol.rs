@@ -40,7 +40,13 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever a message changes shape. The two ends refuse each other
 /// rather than guess: the host uploads the agent it was built with, so a
 /// mismatch only ever means a stale daemon is still answering.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// `argv[0]` naming the agent's own executable. The host cannot know where the
+/// build it uploaded sits on the machine, and its helpers — `net`, above all —
+/// are part of that build, so a spawn asks for them by this name and the agent
+/// runs itself.
+pub const SELF_PROGRAM: &str = "@mework-remote";
 
 /// Largest header either end accepts. Headers are small descriptive JSON; a
 /// larger one is a corrupt stream, not a large request.
@@ -94,7 +100,41 @@ pub enum Message {
     /// The host is leaving on purpose. With `release`, every session it owns
     /// is ended now instead of waiting out its orphan time.
     Bye { release: bool },
+    /// From an agent that has no network of its own — a sandboxed cell (see
+    /// [`SandboxSpec`]) — to the side that started it: open a connection to
+    /// `host:port` for one of its processes. That side decides by the cell's
+    /// [`NetworkPolicy`] and answers with [`Message::Dialed`]. `conn` is the
+    /// asker's own number for the connection.
+    Dial { conn: u64, host: String, port: u16 },
+    /// The answer to [`Message::Dial`]: connected when `error` is `None`.
+    /// `refused` says the policy refused the destination, rather than the
+    /// network failing to reach it.
+    Dialed {
+        conn: u64,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        refused: bool,
+    },
+    /// Bytes of a dialed connection, in either direction; the body is the
+    /// bytes. A side never has more than [`TUNNEL_WINDOW`] bytes out that the
+    /// other has not acknowledged.
+    Tunnel { conn: u64 },
+    /// The receiver delivered `bytes` more of a connection's bytes where they
+    /// were going, and has room for as many again.
+    TunnelAck { conn: u64, bytes: u64 },
+    /// The sender has nothing more to send on this connection; what it
+    /// receives still arrives.
+    TunnelEnd { conn: u64 },
+    /// The connection is over in both directions.
+    TunnelClose { conn: u64 },
 }
+
+/// Bytes of one tunnelled connection that may be in flight, unacknowledged, in
+/// each direction. Large enough that a download is not held up by the round
+/// trip of a local pipe, small enough that a hundred stalled connections are
+/// not a memory problem.
+pub const TUNNEL_WINDOW: u64 = 512 * 1024;
 
 /// How the host introduces itself.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -161,6 +201,10 @@ pub struct AgentInfo {
     /// Digest of the agent's own executable, so the host can tell a daemon
     /// started from an older upload apart from the one it just uploaded.
     pub build: String,
+    /// [`crate::SOURCE_ID`] of the agent's build. `None` from an agent older
+    /// than source identities.
+    #[serde(default)]
+    pub source: Option<String>,
     pub pid: u32,
     /// `std::env::consts::OS` and `ARCH` of the machine.
     pub os: String,
@@ -169,6 +213,9 @@ pub struct AgentInfo {
     /// The account's login shell, as its environment names it.
     pub shell: Option<String>,
     pub started_unix_ms: u64,
+    /// Whether the agent can run sandboxed sessions here.
+    #[serde(default)]
+    pub sandbox: SandboxSupport,
 }
 
 /// An operation the host asks for. The tag is `op`.
@@ -232,6 +279,96 @@ pub struct SpawnSpec {
     /// Shown by `mework-remote status` on the machine.
     #[serde(default)]
     pub label: Option<String>,
+    /// Runs the process in a sandbox rather than as the account itself.
+    #[serde(default)]
+    pub sandbox: Option<SandboxSpec>,
+}
+
+/// Where a sandboxed process runs: in a *cell*, one sandboxed agent process
+/// that starts the sessions given to it. Every session of one conversation
+/// names the same cell, so what the conversation starts can see and stop what
+/// it started before, and nothing else — not the agent, not other
+/// conversations' processes, not the account's own.
+///
+/// The agent starts a cell the first time a spawn names it and keeps it while
+/// it has sessions. A cell is its name *and* its policy: a spawn that names a
+/// running cell with a different policy starts a new cell, and the old one
+/// leaves once its sessions have ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxSpec {
+    pub cell: String,
+    pub policy: SandboxPolicy,
+}
+
+/// What a cell may touch. Paths are the machine's own, absolute, with a
+/// leading `~` expanded there. The agent adds its own protections on top — the
+/// account's credential stores are never readable, and files that something
+/// outside the sandbox would later execute are never writable (see
+/// `agent::sandbox`) — so a policy can only open less than it says, not more.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxPolicy {
+    /// Directories the cell may change: the conversation's workspaces on this
+    /// machine. Everything else is read-only, apart from the cell's own
+    /// temporary and cache directories.
+    pub writable: Vec<String>,
+    /// Paths the cell may not read, beyond the agent's own list.
+    #[serde(default)]
+    pub deny_read: Vec<String>,
+    /// Paths inside unreadable ones that are readable after all.
+    #[serde(default)]
+    pub readable: Vec<String>,
+    /// Paths inside writable ones that stay read-only, beyond the agent's own
+    /// list.
+    #[serde(default)]
+    pub deny_write: Vec<String>,
+    #[serde(default)]
+    pub network: NetworkPolicy,
+}
+
+/// Which hosts a cell's processes may connect to. A cell has no network of its
+/// own: its processes reach the network through a proxy the agent runs
+/// outside the sandbox (`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` point at
+/// it), which applies this policy to every connection. Whatever the policy, the
+/// proxy never connects to a loopback, private, link-local or cloud metadata
+/// address unless an allowed entry names that address itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkPolicy {
+    pub mode: NetworkMode,
+    /// Host patterns: `example.com`, `*.example.com` (its subdomains, not
+    /// itself), or `*`; each optionally with `:port`. Only read in
+    /// [`NetworkMode::Allowlist`].
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Host patterns refused in every mode, checked first.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// No connection leaves the cell.
+    #[default]
+    Off,
+    /// Connections to the hosts [`NetworkPolicy::allow`] names.
+    Allowlist,
+    /// Connections to any public host.
+    Open,
+}
+
+/// Whether the agent can run cells on its machine, and with what.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxSupport {
+    /// The mechanism: `seatbelt`, `bubblewrap`, `srt-win`; empty when none.
+    pub backend: String,
+    pub available: bool,
+    /// Why it is not available, or a note about it.
+    #[serde(default)]
+    pub detail: String,
+    /// Not available until the machine is set up for it, once, with
+    /// administrator rights (Windows: `mework-remote sandbox-setup`).
+    #[serde(default)]
+    pub setup: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

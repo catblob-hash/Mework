@@ -367,8 +367,29 @@ fn run_command(
     // side would turn that accidental round-trip into visible corruption.
     #[cfg(windows)]
     let spawned_command = crate::powershell_host::wrap_command(command);
+    // `bash -l` runs `/etc/profile`, whose `path_helper` on macOS moves the
+    // system directories ahead of the Homebrew, nvm and pyenv ones the
+    // application's `PATH` lists first, so a hook would get Apple's `python3`,
+    // `git` and `java` stubs instead of the ones the user runs. The login stays
+    // for what the profile sets up beyond `PATH`; only the order is put back,
+    // exactly as the shell tool's login legs do. A `PATH` in `environment` is
+    // the one the hook starts with, so it is the order restored.
     #[cfg(not(windows))]
-    let spawned_command = command.to_owned();
+    let application_path =
+        crate::shell_snapshot::in_application_path_order(command).and_then(|repaired| {
+            environment
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var_os("PATH"))
+                .map(|path| (repaired, path))
+        });
+    #[cfg(not(windows))]
+    let spawned_command = match &application_path {
+        Some((repaired, _)) => repaired.clone(),
+        None => command.to_owned(),
+    };
     let mut last_not_found = None;
     for (executable, arguments) in candidates {
         let mut process = Command::new(executable);
@@ -382,6 +403,13 @@ fn run_command(
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(not(windows))]
+        if let Some((_, path)) = &application_path {
+            process.env(
+                crate::shell_snapshot::APPLICATION_PATH_ENVIRONMENT_NAME,
+                path,
+            );
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -1003,6 +1031,46 @@ mod tests {
         assert_eq!(
             executions[0].decision.additional_context.as_deref(),
             Some("managed-dependency-visible")
+        );
+    }
+
+    /// `bash -l` runs `/etc/profile`, and on macOS its `path_helper` puts the
+    /// system directories first; the hook still sees the application's order,
+    /// and never the variable that carried it. An empty home keeps the user's
+    /// own profile out of the test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hooks_keep_the_application_path_order_on_macos() {
+        let directory = tempfile::tempdir().unwrap();
+        let command =
+            "cat >/dev/null; printf '%s|%s' \"$PATH\" \"${MEWORK_APPLICATION_PATH-unset}\"";
+        let application_path = "/mework-test/first:/usr/bin:/bin";
+        let environment = vec![
+            (OsString::from("PATH"), OsString::from(application_path)),
+            (
+                OsString::from("HOME"),
+                directory.path().as_os_str().to_owned(),
+            ),
+        ];
+        let executions = execute_event_with_environment(
+            directory.path(),
+            &[hook(HookEvent::UserPromptSubmit, command)],
+            HookEvent::UserPromptSubmit,
+            None,
+            &json!({"prompt":"test"}),
+            &mut HookBudget::default(),
+            &environment,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        let reported = executions[0]
+            .decision
+            .additional_context
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            reported.starts_with(&format!("{application_path}:")) && reported.ends_with("|unset"),
+            "{reported}"
         );
     }
 

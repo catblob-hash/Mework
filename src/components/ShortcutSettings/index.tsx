@@ -11,6 +11,7 @@ import { useI18n } from "../../i18n";
 import {
   bindingsConflict,
   bindingFromEvent,
+  isImeKeyEvent,
   isShortcutModified,
   isValidBinding,
   keyTokenLabel,
@@ -187,7 +188,7 @@ export function ShortcutSettings({
   ) => {
     event.preventDefault();
     event.stopPropagation();
-    if (event.nativeEvent.isComposing || event.key === "Process") return;
+    if (isImeKeyEvent(event.nativeEvent)) return;
 
     const escapeAlone = event.key === "Escape"
       && !event.ctrlKey

@@ -101,6 +101,49 @@ fn random_suffix() -> String {
         .collect()
 }
 
+/// The variable a login shell is handed the application's `PATH` in, for
+/// [`in_application_path_order`] to restore after the profile has run.
+pub(crate) const APPLICATION_PATH_ENVIRONMENT_NAME: &str = "MEWORK_APPLICATION_PATH";
+
+/// Puts `PATH` back in the application's order after a login shell's profile has
+/// run, then forgets the handoff so the command never sees it.
+///
+/// macOS's `/etc/profile` and `/etc/zprofile` run `path_helper`, which moves the
+/// system directories to the front of `PATH`: `/usr/bin/git`, `/usr/bin/python3`,
+/// the `java` stub and `/bin/bash` would then shadow the Homebrew, nvm and pyenv
+/// builds the user runs in their own terminal. The application's `PATH` already
+/// has the login shell's order (`child_environment::adopt_login_shell_path`), so
+/// it leads, and only what the profile added follows.
+///
+/// One line of plain POSIX, because the same clause runs in `bash` (3.2
+/// included), `zsh` and `sh`: zsh does not split an unquoted `$PATH` on `IFS`,
+/// so the entries are peeled off with `%%`/`#` instead. An empty entry would put
+/// the working directory on `PATH` and is dropped.
+const RESTORE_APPLICATION_PATH_ORDER: &str = concat!(
+    r#"if [ -n "${MEWORK_APPLICATION_PATH-}" ]; then "#,
+    r#"__mework_path="$MEWORK_APPLICATION_PATH"; __mework_rest="$PATH:"; "#,
+    r#"while [ -n "$__mework_rest" ]; do "#,
+    r#"__mework_entry="${__mework_rest%%:*}"; __mework_rest="${__mework_rest#*:}"; "#,
+    r#"case ":$__mework_path:" in *":$__mework_entry:"*) ;; "#,
+    r#"*) [ -z "$__mework_entry" ] || __mework_path="$__mework_path:$__mework_entry" ;; "#,
+    r#"esac; done; PATH="$__mework_path"; export PATH; fi; "#,
+    "unset MEWORK_APPLICATION_PATH __mework_path __mework_rest __mework_entry;",
+);
+
+/// `script` for a login shell (`-l`) on this host, preceded by the clause that
+/// repairs `PATH` after `path_helper` where login shells run it (macOS), or
+/// `None` where they do not and the script needs nothing.
+///
+/// The caller hands the shell the `PATH` it starts it with under
+/// [`APPLICATION_PATH_ENVIRONMENT_NAME`]; without it the clause does nothing.
+/// The clause shares the script's first line, so a syntax error the shell
+/// reports in the caller's own command keeps its line number.
+pub(crate) fn in_application_path_order(script: &str) -> Option<String> {
+    host_platform()
+        .is_macos()
+        .then(|| format!("{RESTORE_APPLICATION_PATH_ORDER} {script}"))
+}
+
 /// Quotes a path for a POSIX single-quoted shell word.
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
@@ -132,31 +175,12 @@ pub(crate) fn bash_path(path: &Path) -> String {
 /// would fail.
 fn generator_script(snapshot_file: &Path, rc_file: Option<&Path>) -> String {
     let target = quote(&bash_path(snapshot_file));
-    // macOS's `/etc/profile` runs `path_helper`, which moves the system
-    // directories to the front of `PATH`: `/usr/bin/git`, `/usr/bin/python3` and
-    // `/bin/bash` would then shadow the Homebrew builds the user runs in their
-    // own terminal. The application's `PATH` already has the login shell's order
-    // (`child_environment::adopt_login_shell_path`), so it leads here, and only
-    // what the profile added follows.
+    // The generator is a login shell, so on macOS `path_helper` has reordered
+    // `PATH` by the time it is written down; see `in_application_path_order`.
     let restore_path_order = if host_platform().is_macos() {
-        r#"
-if [ -n "${MEWORK_APPLICATION_PATH-}" ]; then
-  __mework_path="$MEWORK_APPLICATION_PATH"
-  __mework_ifs="$IFS"
-  set -f
-  IFS=:
-  for __mework_entry in $PATH; do
-    case ":$__mework_path:" in
-      *":$__mework_entry:"*) ;;
-      *) __mework_path="$__mework_path:$__mework_entry" ;;
-    esac
-  done
-  IFS="$__mework_ifs"
-  set +f
-  PATH="$__mework_path"
-fi"#
+        format!("\n{RESTORE_APPLICATION_PATH_ORDER}")
     } else {
-        ""
+        String::new()
     };
     let source_rc = match rc_file {
         Some(rc) => format!("source {} < /dev/null", quote(&bash_path(rc))),
@@ -248,7 +272,7 @@ pub(crate) fn build(app_data: &Path, shell_path: &str) -> Option<PathBuf> {
         .stderr(Stdio::null());
     if host_platform().is_macos() {
         command.env(
-            "MEWORK_APPLICATION_PATH",
+            APPLICATION_PATH_ENVIRONMENT_NAME,
             std::env::var_os("PATH").unwrap_or_default(),
         );
     }
@@ -389,6 +413,88 @@ mod tests {
             body.contains("export PATH='/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/profile/added'"),
             "{body}"
         );
+    }
+
+    /// Runs the repair clause in each POSIX shell this host has: zsh does not
+    /// split `$PATH` the way bash and sh do, so the clause must not rely on it.
+    #[cfg(unix)]
+    #[test]
+    fn the_path_repair_works_in_every_posix_shell() {
+        assert!(RESTORE_APPLICATION_PATH_ORDER.contains(APPLICATION_PATH_ENVIRONMENT_NAME));
+        assert!(!RESTORE_APPLICATION_PATH_ORDER.contains('\n'));
+        let report = r#"printf '%s|%s\n' "$PATH" "${MEWORK_APPLICATION_PATH-unset}""#;
+        // Even `zsh -c` reads `~/.zshenv`, which may add to `PATH` on its own.
+        let home = tempfile::tempdir().unwrap();
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/zsh"] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let run = |application_path: Option<&str>| {
+                let mut command = Command::new(shell);
+                command
+                    .args(["-c", &format!("{RESTORE_APPLICATION_PATH_ORDER} {report}")])
+                    .env("PATH", "/usr/bin:/bin:/usr/sbin::/profile/added:/usr/bin")
+                    .env("HOME", home.path())
+                    .env("ZDOTDIR", home.path())
+                    .env_remove(APPLICATION_PATH_ENVIRONMENT_NAME)
+                    .stdin(Stdio::null());
+                if let Some(path) = application_path {
+                    command.env(APPLICATION_PATH_ENVIRONMENT_NAME, path);
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{shell}: {output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            assert_eq!(
+                run(Some("/opt/homebrew/bin:/usr/bin:/bin")),
+                "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/profile/added|unset\n",
+                "{shell}"
+            );
+            // No handoff, nothing to restore: PATH is left exactly as it was.
+            assert_eq!(
+                run(None),
+                "/usr/bin:/bin:/usr/sbin::/profile/added:/usr/bin|unset\n",
+                "{shell}"
+            );
+        }
+    }
+
+    /// The real thing: a login zsh and a login bash run `/etc/zprofile` and
+    /// `/etc/profile`, whose `path_helper` puts the system directories first.
+    /// The user's own startup files are kept out with an empty home.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_shells_keep_the_application_path_order_on_macos() {
+        let home = tempfile::tempdir().unwrap();
+        let application_path = "/mework-test/first:/usr/bin:/bin";
+        let report = r#"printf '%s\n' "$PATH""#;
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            let run = |script: String| {
+                let output = Command::new(shell)
+                    .args(["-l", "-c", &script])
+                    .env("PATH", application_path)
+                    .env(APPLICATION_PATH_ENVIRONMENT_NAME, application_path)
+                    .env("HOME", home.path())
+                    .env("ZDOTDIR", home.path())
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{shell}: {output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            if Path::new("/usr/libexec/path_helper").is_file() {
+                let reordered = run(report.to_owned());
+                assert!(
+                    !reordered.starts_with(application_path),
+                    "{shell}: path_helper no longer reorders PATH: {reordered}"
+                );
+            }
+            let repaired = run(in_application_path_order(report).expect("macOS repairs PATH"));
+            assert!(
+                repaired.starts_with(&format!("{application_path}:")),
+                "{shell}: {repaired}"
+            );
+        }
     }
 
     /// One `eval` per function: a body that stopped parsing must not take the

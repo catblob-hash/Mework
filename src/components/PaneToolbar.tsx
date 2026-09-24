@@ -22,9 +22,10 @@ export interface PaneToolbarButton {
   /**
    * Turns the button into a menu: a pane whose contents are made from a choice — which shell a
    * new terminal runs — asks for it on the button itself, and `onToggle` is left for a row of
-   * the menu to call.
+   * the menu to call. `flyout` opens a row's children beside it: a choice made in two steps,
+   * such as which workspace and then which of its shells.
    */
-  menu?: { label: string; sections: PopoverMenuSection[] };
+  menu?: { label: string; sections: PopoverMenuSection[]; submenu?: "inline" | "flyout" };
 }
 
 export interface PaneToolbarMenuItem {
@@ -78,6 +79,7 @@ export function PaneToolbar({ buttons, menuItems, menuLabel }: PaneToolbarProps)
               menuLabel={button.menu.label}
               align="end"
               dense
+              submenu={button.menu.submenu}
               sections={button.menu.sections}
             />
           );

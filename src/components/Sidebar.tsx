@@ -31,6 +31,7 @@ import {
   workspaceLocationTitle
 } from "../lib/workspaces";
 import type { NewConversationSource } from "../lib/workspaces";
+import { isImeKeyEvent } from "../lib/shortcuts";
 import { isBrowserDevRuntime } from "../lib/backend";
 import { usePointerDrag } from "./usePointerDrag";
 import type { DragPoint } from "./usePointerDrag";
@@ -510,7 +511,7 @@ export function Sidebar({
                     onFocus={(event) => event.currentTarget.select()}
                     onBlur={finishRename}
                     onKeyDown={(event) => {
-                      if (event.nativeEvent.isComposing) return;
+                      if (isImeKeyEvent(event.nativeEvent)) return;
                       if (event.key === "Enter") {
                         event.preventDefault();
                         event.currentTarget.blur();

@@ -35,6 +35,26 @@
       "usageGuidance": ""
     },
     {
+      "toolName": "zsh",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "sh",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "zsh_find_output",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "sh_find_output",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
       "toolName": "write",
       "schemaNotes": "",
       "usageGuidance": ""
@@ -160,27 +180,7 @@
       "usageGuidance": ""
     },
     {
-      "toolName": "preview_find_element",
-      "schemaNotes": "",
-      "usageGuidance": ""
-    },
-    {
       "toolName": "preview_find_logs",
-      "schemaNotes": "",
-      "usageGuidance": ""
-    },
-    {
-      "toolName": "preview_click_by_description",
-      "schemaNotes": "",
-      "usageGuidance": ""
-    },
-    {
-      "toolName": "preview_fill_by_description",
-      "schemaNotes": "",
-      "usageGuidance": ""
-    },
-    {
-      "toolName": "preview_inspect_by_description",
       "schemaNotes": "",
       "usageGuidance": ""
     },

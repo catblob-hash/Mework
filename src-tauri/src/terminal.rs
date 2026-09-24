@@ -180,11 +180,14 @@ impl ControlReply {
 
 /// The shell a terminal runs, as the renderer's shell menu names it.
 ///
-/// Which shells are offered depends on the machine the workspace is on: a
-/// Windows host offers PowerShell and Git Bash; a Mac, a Linux host, a WSL
-/// distribution and an SSH machine offer zsh, bash and fish. `None` wherever an
-/// `Option<TerminalShell>` is taken means that machine's default: PowerShell on
-/// a Windows host, zsh everywhere else.
+/// The renderer offers the shells the machine's probe found
+/// ([`crate::machine_shells`]) that a terminal there can start: a Windows host
+/// runs PowerShell and Git Bash; a Mac or Linux host zsh, bash and fish, never
+/// `sh`, whose line editor cannot hold the Git mutex; a WSL distribution and an
+/// SSH machine any of zsh, bash, fish and sh, and an SSH machine running
+/// Windows PowerShell too. `None` wherever an `Option<TerminalShell>` is taken
+/// means that machine's default: PowerShell on a Windows host, zsh everywhere
+/// else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalShell {
@@ -192,6 +195,7 @@ pub enum TerminalShell {
     Bash,
     Zsh,
     Fish,
+    Sh,
 }
 
 impl TerminalShell {
@@ -202,6 +206,7 @@ impl TerminalShell {
             Self::Bash => "bash",
             Self::Zsh => "zsh",
             Self::Fish => "fish",
+            Self::Sh => "sh",
         }
     }
 }
@@ -270,8 +275,11 @@ impl TerminalLaunch {
         use crate::run_environment::{self as run_env, ShellRunner};
         let chosen = match shell {
             None => None,
+            // PowerShell is what an SSH machine's agent starts on Windows when
+            // nothing is chosen, and there is no POSIX login line for it.
+            Some(TerminalShell::PowerShell) if matches!(runner, ShellRunner::Ssh { .. }) => None,
             Some(TerminalShell::PowerShell) => {
-                return Err("WSL 与 SSH 终端不提供 PowerShell；请选择 zsh、bash 或 fish".into());
+                return Err("WSL 终端不提供 PowerShell；请选择 zsh、bash、fish 或 sh".into());
             }
             Some(shell) => Some(shell.program_name()),
         };
@@ -641,10 +649,39 @@ impl TerminalKey {
 }
 
 impl TerminalSession {
-    /// Kills the shell. The sink stays attached so the waiter can still report
+    /// Ends the shell without holding up the caller, which for a closed tab is
+    /// the UI thread. The sink stays attached so the waiter can still report
     /// the exit: a panel that did not ask for this close — the task list did,
     /// or a workspace closing — has no other way to learn its shell is gone.
+    ///
+    /// On Windows the tree is killed at once, as it always was.
+    #[cfg(windows)]
     fn terminate(mut self) {
+        self.stop_answering();
+        self.kill_now();
+    }
+
+    /// Ends the shell without holding up the caller, which for a closed tab is
+    /// the UI thread. The sink stays attached so the waiter can still report
+    /// the exit: a panel that did not ask for this close — the task list did,
+    /// or a workspace closing — has no other way to learn its shell is gone.
+    ///
+    /// The shell is asked to hang up first, the way closing a Terminal window
+    /// asks it: zsh, bash and fish write `$HISTFILE` on SIGHUP, where SIGKILL
+    /// lost every command typed in the tab. Whatever is still in the group
+    /// after a short grace is killed as before, on a thread of its own.
+    #[cfg(unix)]
+    fn terminate(mut self) {
+        self.stop_answering();
+        match self.hang_up() {
+            Ok(shell) => shell.finish_in_background(),
+            Err(session) => session.kill_now(),
+        }
+    }
+
+    /// The part of a close that is the same however the shell is then ended:
+    /// nothing it prints is forwarded and nothing it asks is answered.
+    fn stop_answering(&mut self) {
         {
             let mut output = lock(&self.output);
             output.closed = true;
@@ -657,6 +694,10 @@ impl TerminalSession {
         if let Some(mut writer) = lock(&self.writer).take() {
             let _ = writer.flush();
         }
+    }
+
+    /// Kills the shell's tree now and closes the pseudo console.
+    fn kill_now(mut self) {
         if !kill_process_tree(self.process_id, self.process_group_id) {
             if let Err(error) = self.killer.kill() {
                 eprintln!("关闭终端 {} 的 shell 失败：{error}", self.session_id);
@@ -664,6 +705,99 @@ impl TerminalSession {
         }
         // Closing the pseudo console after terminating the shell wakes the blocking reader. The
         // waiter thread owns and reaps the child handle.
+        drop(lock(&self.master).take());
+    }
+
+    /// Sends SIGHUP to the shell's process group. The session comes back when
+    /// there is no group to signal, for the caller to kill it the old way.
+    #[cfg(unix)]
+    fn hang_up(self) -> Result<HangingUpShell, Self> {
+        match hang_up_process_group(self.process_group_id) {
+            Some(process_group_id) => Ok(HangingUpShell {
+                process_group_id,
+                master: self.master.clone(),
+            }),
+            None => Err(self),
+        }
+    }
+
+    /// Ends every shell in `sessions` before returning, for teardown, where a
+    /// thread left to finish the job would not outlive the process. They are
+    /// all asked to hang up at once and share one grace period, so closing many
+    /// costs no longer than closing one.
+    fn terminate_before_returning(sessions: impl IntoIterator<Item = Self>) {
+        #[cfg(windows)]
+        sessions.into_iter().for_each(Self::terminate);
+        #[cfg(unix)]
+        {
+            let hanging_up = sessions
+                .into_iter()
+                .filter_map(|mut session| {
+                    session.stop_answering();
+                    match session.hang_up() {
+                        Ok(shell) => Some(shell),
+                        Err(session) => {
+                            session.kill_now();
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            let deadline = std::time::Instant::now() + SHELL_HANGUP_GRACE;
+            for shell in hanging_up {
+                shell.finish_by(deadline);
+            }
+        }
+    }
+}
+
+/// How long a closed shell has to exit on its own after SIGHUP — ample for
+/// zsh, bash or fish to write its history file — before its group is killed.
+#[cfg(unix)]
+const SHELL_HANGUP_GRACE: Duration = Duration::from_millis(300);
+#[cfg(unix)]
+const SHELL_HANGUP_POLL: Duration = Duration::from_millis(10);
+
+/// A closed shell that has been sent SIGHUP and is being given a moment to
+/// exit before its process group is killed.
+#[cfg(unix)]
+struct HangingUpShell {
+    process_group_id: i32,
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+}
+
+#[cfg(unix)]
+impl HangingUpShell {
+    /// Waits out the grace on a thread of its own, so the close that asked for
+    /// it returns at once.
+    fn finish_in_background(self) {
+        let process_group_id = self.process_group_id;
+        let master = self.master.clone();
+        let spawned = thread::Builder::new()
+            .name(format!("terminal-hangup-{process_group_id}"))
+            .spawn(move || self.finish_by(std::time::Instant::now() + SHELL_HANGUP_GRACE));
+        if spawned.is_err() {
+            // With nothing to wait on the shell, end it the way a close always
+            // did rather than block the caller for the grace.
+            kill_process_tree(None, Some(process_group_id));
+            drop(lock(&master).take());
+        }
+    }
+
+    /// Waits until the group is empty or `deadline` passes, then kills
+    /// whatever is left so nothing in it outlives the terminal.
+    fn finish_by(self, deadline: std::time::Instant) {
+        while process_group_exists(self.process_group_id) {
+            if std::time::Instant::now() >= deadline {
+                kill_process_tree(None, Some(self.process_group_id));
+                break;
+            }
+            thread::sleep(SHELL_HANGUP_POLL);
+        }
+        // The pseudo console stays open until now so the reader drains what the
+        // shell prints on its way out instead of the shell writing into a
+        // hung-up terminal. The waiter thread owns and reaps the child handle,
+        // and usually has closed this already.
         drop(lock(&self.master).take());
     }
 }
@@ -761,6 +895,15 @@ fn wait_for_confirmed_terminal_exit(
 #[derive(Default)]
 pub struct TerminalManager {
     sessions: Mutex<HashMap<TerminalKey, TerminalSession>>,
+    /// Terminal owners that are drafts rather than conversations, each mapped to
+    /// the id of the project (workspace row) its shells were opened in.
+    ///
+    /// A draft is the renderer's new task before it has a row in the document.
+    /// Its shells are opened under the id it will materialize as, so becoming a
+    /// real conversation hands them over without moving anything; until then no
+    /// conversation in the document owns them, and this map is what tells a save
+    /// they are not strays. Always locked after `sessions`.
+    drafts: Mutex<HashMap<String, String>>,
 }
 
 /// One terminal as the task tools see it. Read-only: `task_wait` and
@@ -1416,7 +1559,12 @@ impl TerminalManager {
     }
 
     pub fn close(&self, conversation_id: &str, terminal_id: &str) -> bool {
-        let session = lock(&self.sessions).remove(&TerminalKey::new(conversation_id, terminal_id));
+        let session = {
+            let mut sessions = lock(&self.sessions);
+            let session = sessions.remove(&TerminalKey::new(conversation_id, terminal_id));
+            forget_idle_draft(&sessions, &mut lock(&self.drafts), conversation_id);
+            session
+        };
         if let Some(session) = session {
             session.terminate();
             true
@@ -1431,6 +1579,7 @@ impl TerminalManager {
             .collect::<std::collections::HashSet<_>>();
         let removed = {
             let mut sessions = lock(&self.sessions);
+            lock(&self.drafts).retain(|owner, _| retained.contains(owner.as_str()));
             remove_matching_sessions(&mut sessions, |key| {
                 !retained.contains(key.conversation_id.as_str())
             })
@@ -1445,6 +1594,7 @@ impl TerminalManager {
         }
         let removed = {
             let mut sessions = lock(&self.sessions);
+            lock(&self.drafts).retain(|owner, _| !conversations.contains(owner.as_str()));
             remove_matching_sessions(&mut sessions, |key| {
                 conversations.contains(key.conversation_id.as_str())
             })
@@ -1455,12 +1605,91 @@ impl TerminalManager {
     pub fn close_all(&self) {
         let removed = {
             let mut sessions = lock(&self.sessions);
+            lock(&self.drafts).clear();
             sessions
                 .drain()
                 .map(|(_, session)| session)
                 .collect::<Vec<_>>()
         };
+        TerminalSession::terminate_before_returning(removed);
+    }
+
+    /// Records that `owner` — the id a renderer draft will materialize as — is
+    /// opening a shell in the project `workspace_id`.
+    ///
+    /// Call it before `open`, under the same storage lock the launch was
+    /// resolved under, so no save can see the shell before it sees the binding.
+    /// A draft aimed somewhere else now is a different task as far as its shells
+    /// are concerned: the ones it opened for the other project are closed here
+    /// rather than handed to this one.
+    pub fn bind_draft(&self, owner: &str, workspace_id: &str) {
+        let removed = {
+            let mut sessions = lock(&self.sessions);
+            let mut drafts = lock(&self.drafts);
+            let removed = match drafts.get(owner) {
+                Some(bound) if bound != workspace_id => {
+                    remove_matching_sessions(&mut sessions, |key| key.conversation_id == owner)
+                }
+                _ => Vec::new(),
+            };
+            drafts.insert(owner.to_owned(), workspace_id.to_owned());
+            removed
+        };
         removed.into_iter().for_each(TerminalSession::terminate);
+    }
+
+    /// Every draft that has a shell open, mapped to its project.
+    pub fn draft_bindings(&self) -> HashMap<String, String> {
+        lock(&self.drafts).clone()
+    }
+
+    /// Stops tracking `owner` as a draft when it has no shell left, as after an
+    /// open that failed before its shell existed.
+    pub fn release_idle_draft(&self, owner: &str) {
+        let sessions = lock(&self.sessions);
+        forget_idle_draft(&sessions, &mut lock(&self.drafts), owner);
+    }
+
+    /// Brings the draft bindings up to date with a document that is about to
+    /// become the authority, and returns the ones still standing.
+    ///
+    /// An owner the document now holds as a conversation has materialized: from
+    /// here on its conversation's binding governs its shells, so it stops being
+    /// a draft. An owner whose project `project_gone` reports removed, or moved
+    /// to another kind or path, loses its shells with it — the same rule a
+    /// conversation's shells follow.
+    pub fn settle_drafts(
+        &self,
+        is_conversation: impl Fn(&str) -> bool,
+        project_gone: impl Fn(&str) -> bool,
+    ) -> HashMap<String, String> {
+        let (removed, standing) = {
+            let mut sessions = lock(&self.sessions);
+            let mut drafts = lock(&self.drafts);
+            drafts.retain(|owner, _| !is_conversation(owner));
+            let gone = drafts
+                .iter()
+                .filter(|(_, workspace_id)| project_gone(workspace_id))
+                .map(|(owner, _)| owner.clone())
+                .collect::<HashSet<_>>();
+            drafts.retain(|owner, _| !gone.contains(owner));
+            let removed =
+                remove_matching_sessions(&mut sessions, |key| gone.contains(&key.conversation_id));
+            (removed, drafts.clone())
+        };
+        removed.into_iter().for_each(TerminalSession::terminate);
+        standing
+    }
+}
+
+/// Drops `owner`'s draft binding once none of its shells is left.
+fn forget_idle_draft<T>(
+    sessions: &HashMap<TerminalKey, T>,
+    drafts: &mut HashMap<String, String>,
+    owner: &str,
+) {
+    if !sessions.keys().any(|key| key.conversation_id == owner) {
+        drafts.remove(owner);
     }
 }
 
@@ -1499,9 +1728,7 @@ impl Drop for TerminalManager {
             .sessions
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        sessions
-            .drain()
-            .for_each(|(_, session)| session.terminate());
+        TerminalSession::terminate_before_returning(sessions.drain().map(|(_, session)| session));
     }
 }
 
@@ -1883,6 +2110,22 @@ fn kill_process_tree(_process_id: Option<u32>, process_group_id: Option<i32>) ->
     false
 }
 
+/// Asks the shell's process group to hang up, as closing a terminal window
+/// does. The group comes back when the signal went out.
+#[cfg(unix)]
+fn hang_up_process_group(process_group_id: Option<i32>) -> Option<i32> {
+    let process_group_id = process_group_id.filter(|process_group_id| *process_group_id > 0)?;
+    (unsafe { libc::kill(-process_group_id, libc::SIGHUP) } == 0).then_some(process_group_id)
+}
+
+/// Whether anything is left in the process group. Signal 0 only checks; EPERM
+/// means a member exists that Mework may not signal (a `sudo`), which counts.
+#[cfg(unix)]
+fn process_group_exists(process_group_id: i32) -> bool {
+    let signalled = unsafe { libc::kill(-process_group_id, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// What a host terminal starts: the program, its arguments, the label a tab
 /// shows, and how its command barrier is answered.
 type HostShell = (OsString, Vec<OsString>, String, ShellControl);
@@ -1893,7 +2136,7 @@ fn host_shell(shell: Option<TerminalShell>) -> Result<HostShell, String> {
     match shell {
         None | Some(TerminalShell::PowerShell) => Ok(powershell()),
         Some(TerminalShell::Bash) => git_bash(),
-        Some(other @ (TerminalShell::Zsh | TerminalShell::Fish)) => Err(format!(
+        Some(other @ (TerminalShell::Zsh | TerminalShell::Fish | TerminalShell::Sh)) => Err(format!(
             "Windows 本机终端不提供 {}；请选择 PowerShell 或 Git Bash",
             other.program_name()
         )),
@@ -1967,6 +2210,11 @@ fn host_shell(shell: Option<TerminalShell>) -> Result<HostShell, String> {
         TerminalShell::PowerShell => {
             return Err("本机终端不提供 PowerShell；请选择 zsh、bash 或 fish".into());
         }
+        TerminalShell::Sh => {
+            return Err(
+                "本机终端不提供 sh：它无法与 Git 操作严格互斥；请选择 zsh、bash 或 fish".into(),
+            );
+        }
         TerminalShell::Zsh => (ShellControl::Zsh, &["-l", "-i"]),
         // `-l` is emulated by the rcfile: a login bash reads no rcfile.
         TerminalShell::Bash => (ShellControl::Bash, &["-i"]),
@@ -2017,7 +2265,7 @@ fn posix_shell_program(shell: TerminalShell) -> Option<OsString> {
             "/usr/bin/fish",
             "/bin/fish",
         ],
-        TerminalShell::PowerShell => &[],
+        TerminalShell::PowerShell | TerminalShell::Sh => &[],
     };
     let name = shell.program_name();
     let is_shell = |path: &Path| {
@@ -2128,6 +2376,11 @@ mod tests {
             .err()
             .expect("no PowerShell on a Mac or Linux host");
         assert!(error.contains("PowerShell"), "{error}");
+        // sh has no line editor to hold a line for the Git mutex.
+        let error = TerminalLaunch::host(&cwd, Some(TerminalShell::Sh))
+            .err()
+            .expect("no sh terminal on the host");
+        assert!(error.contains("sh"), "{error}");
 
         let default = TerminalLaunch::host(&cwd, None).unwrap();
         if default.control != ShellControl::Unsupported {
@@ -2160,11 +2413,68 @@ mod tests {
         }
     }
 
+    /// Closing a shell hangs it up before anything is killed, so one that
+    /// handles SIGHUP — zsh, bash and fish write their history there — gets to
+    /// finish, and one that ignores it is still killed once the grace is over.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_shell_is_hung_up_before_its_group_is_killed() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use std::time::Instant;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let spawn_group = |trap: &str, marker: &Path| {
+            let script = format!("{trap}; : > \"$1.ready\"; while :; do sleep 0.05; done");
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("sh")
+                .arg(marker)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let ready = marker.with_extension("ready");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "the script never installed its trap");
+            let process_group_id = i32::try_from(child.id()).unwrap();
+            // A real shell is reaped by its terminal's waiter thread.
+            (process_group_id, thread::spawn(move || child.wait().unwrap()))
+        };
+        let close = |process_group_id: i32| {
+            assert_eq!(
+                hang_up_process_group(Some(process_group_id)),
+                Some(process_group_id)
+            );
+            HangingUpShell {
+                process_group_id,
+                master: Arc::new(Mutex::new(None)),
+            }
+            .finish_by(Instant::now() + SHELL_HANGUP_GRACE);
+        };
+
+        let written = scratch.path().join("history");
+        let (group, reaper) = spawn_group("trap 'echo saved > \"$1\"; exit 0' HUP", &written);
+        close(group);
+        assert!(reaper.join().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&written).unwrap().trim(), "saved");
+
+        let stubborn = scratch.path().join("stubborn");
+        let (group, reaper) = spawn_group("trap '' HUP", &stubborn);
+        let started = Instant::now();
+        close(group);
+        assert!(started.elapsed() >= SHELL_HANGUP_GRACE);
+        assert_eq!(reaper.join().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(!stubborn.exists());
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_windows_host_offers_powershell_and_git_bash() {
         let cwd = std::env::current_dir().unwrap();
-        for shell in [TerminalShell::Zsh, TerminalShell::Fish] {
+        for shell in [TerminalShell::Zsh, TerminalShell::Fish, TerminalShell::Sh] {
             let error = TerminalLaunch::host(&cwd, Some(shell)).err().unwrap();
             assert!(error.contains(shell.program_name()), "{error}");
         }
@@ -2184,6 +2494,7 @@ mod tests {
 
     fn wsl_runner(env: &[(&str, &str)]) -> crate::run_environment::ShellRunner {
         crate::run_environment::ShellRunner::Wsl {
+            agent_shell: Default::default(),
             distro: "Ubuntu".into(),
             env: env
                 .iter()
@@ -2194,6 +2505,7 @@ mod tests {
 
     fn ssh_runner(env: &[(&str, &str)]) -> crate::run_environment::ShellRunner {
         crate::run_environment::ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host: "ada@build".into(),
             port: 2222,
             identity_file: String::new(),
@@ -2204,8 +2516,12 @@ mod tests {
         }
     }
 
-    const REMOTE_SHELLS: [TerminalShell; 3] =
-        [TerminalShell::Zsh, TerminalShell::Bash, TerminalShell::Fish];
+    const REMOTE_SHELLS: [TerminalShell; 4] = [
+        TerminalShell::Zsh,
+        TerminalShell::Bash,
+        TerminalShell::Fish,
+        TerminalShell::Sh,
+    ];
 
     #[test]
     fn a_wsl_terminal_starts_the_chosen_shell_through_sh() {
@@ -2337,13 +2653,21 @@ mod tests {
                 )
             );
         }
-        assert!(TerminalLaunch::remote(
+        // PowerShell is the Windows agent's own default, so it asks for no
+        // shell: the fallback line is the plain one, and the agent is told
+        // nothing to look for.
+        let powershell = TerminalLaunch::remote(
             &ssh_runner(&[]),
             "~/project",
             &local,
-            Some(TerminalShell::PowerShell)
+            Some(TerminalShell::PowerShell),
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(remote_command(&powershell), remote_command(&plain));
+        assert_eq!(
+            powershell.agent.as_ref().unwrap().windows_shell,
+            None::<String>
+        );
     }
 
     /// The remote command as a remote login shell would run it, here, with a
@@ -2428,6 +2752,62 @@ mod tests {
             buffer.iter().rev().take(4).copied().collect::<Vec<_>>(),
             b"liat"
         );
+    }
+
+    #[test]
+    fn a_draft_binding_lasts_while_its_owner_has_a_shell() {
+        let sessions = HashMap::from([(TerminalKey::new("conv-draft", "terminal-1"), ())]);
+        let mut drafts = HashMap::from([
+            ("conv-draft".to_owned(), "ws-a".to_owned()),
+            ("conv-gone".to_owned(), "ws-a".to_owned()),
+        ]);
+
+        forget_idle_draft(&sessions, &mut drafts, "conv-draft");
+        forget_idle_draft(&sessions, &mut drafts, "conv-gone");
+
+        assert_eq!(
+            drafts,
+            HashMap::from([("conv-draft".to_owned(), "ws-a".to_owned())])
+        );
+    }
+
+    #[test]
+    fn settling_drafts_drops_materialized_owners_and_those_whose_project_went() {
+        let manager = TerminalManager::default();
+        manager.bind_draft("conv-materialized", "ws-a");
+        manager.bind_draft("conv-orphaned", "ws-removed");
+        manager.bind_draft("conv-waiting", "ws-a");
+
+        let standing = manager.settle_drafts(
+            |owner| owner == "conv-materialized",
+            |workspace_id| workspace_id == "ws-removed",
+        );
+
+        assert_eq!(
+            standing,
+            HashMap::from([("conv-waiting".to_owned(), "ws-a".to_owned())])
+        );
+        assert_eq!(*lock(&manager.drafts), standing);
+    }
+
+    #[test]
+    fn rebinding_a_draft_moves_it_and_closing_every_owner_forgets_it() {
+        let manager = TerminalManager::default();
+        manager.bind_draft("conv-draft", "ws-a");
+        manager.bind_draft("conv-draft", "ws-b");
+        assert_eq!(
+            *lock(&manager.drafts),
+            HashMap::from([("conv-draft".to_owned(), "ws-b".to_owned())])
+        );
+
+        manager.close_missing(["conv-draft"]);
+        assert_eq!(lock(&manager.drafts).len(), 1);
+        manager.close_missing(std::iter::empty());
+        assert!(lock(&manager.drafts).is_empty());
+
+        manager.bind_draft("conv-draft", "ws-a");
+        manager.release_idle_draft("conv-draft");
+        assert!(lock(&manager.drafts).is_empty());
     }
 
     #[test]

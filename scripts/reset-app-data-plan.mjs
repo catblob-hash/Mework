@@ -43,6 +43,14 @@ export const KEYRING_SERVICES = [
   "com.mework.memory.v1"
 ];
 
+/**
+ * The one login-keychain item Mework writes on macOS: the master key that seals
+ * every other credential in `~/.mework/credential-vault` (src-tauri/src/credential_vault.rs).
+ * Builds before that store wrote one item per credential under KEYRING_SERVICES,
+ * so `--keys` plans both.
+ */
+export const MACOS_VAULT_KEY_SERVICE = "Mework Safe Storage";
+
 /** Scope selectors accepted on the command line. */
 export const SCOPES = ["prod", "dev", "all"];
 
@@ -179,4 +187,94 @@ export function summarizeCredentials(targets) {
   return [...counts.entries()]
     .map(([service, count]) => ({ service, count }))
     .sort((left, right) => (left.service < right.service ? -1 : left.service > right.service ? 1 : 0));
+}
+
+/**
+ * Where Tauri keeps `app_data_dir`, `app_local_data_dir` and `app_cache_dir` on
+ * each host, as `[{ label, directory }]` for `planDataDirectories`.
+ */
+export function dataRootsFor(platform, environment, home) {
+  if (platform === "win32") {
+    return [
+      { label: "APPDATA", directory: environment.APPDATA },
+      { label: "LOCALAPPDATA", directory: environment.LOCALAPPDATA }
+    ];
+  }
+  if (!home) return [];
+  if (platform === "darwin") {
+    return [
+      { label: "Application Support", directory: path.join(home, "Library", "Application Support") },
+      { label: "Caches", directory: path.join(home, "Library", "Caches") },
+      { label: "Logs", directory: path.join(home, "Library", "Logs") }
+    ];
+  }
+  return [
+    { label: "XDG_DATA_HOME", directory: environment.XDG_DATA_HOME || path.join(home, ".local", "share") },
+    { label: "XDG_CONFIG_HOME", directory: environment.XDG_CONFIG_HOME || path.join(home, ".config") },
+    { label: "XDG_CACHE_HOME", directory: environment.XDG_CACHE_HOME || path.join(home, ".cache") }
+  ];
+}
+
+/** Whether an executable path from the process table is a Mework instance. */
+export function isMeworkExecutable(executable) {
+  const name = executable.trim().split(/[\\/]/u).pop() ?? "";
+  return /^mework(-browser-dev)?(\.exe)?$/iu.test(name);
+}
+
+function keychainAttribute(line, name) {
+  const prefix = `"${name}"<blob>=`;
+  const start = line.indexOf(prefix);
+  if (start < 0) return undefined;
+  const value = line.slice(start + prefix.length).trim();
+  if (value.startsWith("\"") && value.endsWith("\"") && value.length >= 2) {
+    return value.slice(1, -1);
+  }
+  // Non-ASCII values are printed as hex, sometimes followed by a quoted preview.
+  const hex = /^0x([0-9A-Fa-f]+)/u.exec(value);
+  if (hex && hex[1].length % 2 === 0) {
+    return Buffer.from(hex[1], "hex").toString("utf8");
+  }
+  return undefined;
+}
+
+/**
+ * Extracts the generic-password items this app owns from `security dump-keychain`
+ * output (attributes only — the command never prints or unlocks secrets without
+ * `-d`). An item belongs to the app only when its service is exactly one of the
+ * services the app writes; the account is kept so each item can be deleted by
+ * its full `(service, account)` pair and nothing else.
+ */
+export function planKeychainItems(dumpOutput) {
+  const services = new Set([...KEYRING_SERVICES, MACOS_VAULT_KEY_SERVICE]);
+  const items = [];
+  const seen = new Set();
+  let current = null;
+  const finish = () => {
+    if (!current || current.class !== "genp") return;
+    const { service, account } = current;
+    if (service === undefined || account === undefined || !services.has(service)) return;
+    const key = `${service}\u0000${account}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({ service, account });
+  };
+  for (const line of dumpOutput.split(/\r?\n/u)) {
+    if (line.startsWith("keychain: ")) {
+      finish();
+      current = {};
+      continue;
+    }
+    if (!current) continue;
+    const itemClass = /^class: "([^"]*)"/u.exec(line);
+    if (itemClass) {
+      current.class = itemClass[1];
+      continue;
+    }
+    const service = keychainAttribute(line, "svce");
+    if (service !== undefined) current.service = service;
+    const account = keychainAttribute(line, "acct");
+    if (account !== undefined) current.account = account;
+  }
+  finish();
+  return items;
 }

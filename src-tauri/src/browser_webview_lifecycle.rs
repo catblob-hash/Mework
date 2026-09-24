@@ -190,7 +190,7 @@ fn validate_timeout(timeout: Duration) -> Result<(), String> {
 /// the caller must conservatively count the page as awake, even though WebView2
 /// may finish suspending it later (showing it will automatically resume it).
 pub(crate) fn try_suspend(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     timeout: Duration,
 ) -> Result<bool, String> {
@@ -204,7 +204,7 @@ pub(crate) fn try_suspend(
 /// page resumed while its caller still treats it as sleeping. If the WebView
 /// thread begins `Resume` first, this waits for and returns that actual result.
 pub(crate) fn resume(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -214,7 +214,7 @@ pub(crate) fn resume(
 
 #[cfg(windows)]
 fn try_suspend_platform(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     timeout: Duration,
 ) -> Result<bool, String> {
@@ -291,7 +291,7 @@ fn try_suspend_platform(
 
 #[cfg(windows)]
 fn resume_platform(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -327,18 +327,41 @@ fn resume_platform(
     }
 }
 
-#[cfg(not(windows))]
+/// CEF has no sleeping-tab state; telling Chromium the page is hidden throttles its renderer
+/// the way a background tab is, which is the resource half of what WebView2's sleep buys. The
+/// page keeps its exact state, as a WebView2 sleeping tab does.
+#[cfg(target_os = "macos")]
 fn try_suspend_platform(
-    _page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
+    tail_permit: WebView2Permit,
+    _timeout: Duration,
+) -> Result<bool, String> {
+    let _tail_permit = tail_permit;
+    page.set_sleeping(true).map(|_| true)
+}
+
+#[cfg(target_os = "macos")]
+fn resume_platform(
+    page: &crate::browser::PageWebview,
+    tail_permit: WebView2Permit,
+    _timeout: Duration,
+) -> Result<(), String> {
+    let _tail_permit = tail_permit;
+    page.set_sleeping(false)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn try_suspend_platform(
+    _page: &crate::browser::PageWebview,
     _tail_permit: WebView2Permit,
     _timeout: Duration,
 ) -> Result<bool, String> {
     Err("当前平台不支持 WebView2 原生睡眠".to_owned())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn resume_platform(
-    _page: &tauri::Webview,
+    _page: &crate::browser::PageWebview,
     _tail_permit: WebView2Permit,
     _timeout: Duration,
 ) -> Result<(), String> {

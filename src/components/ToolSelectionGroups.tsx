@@ -8,13 +8,27 @@ import {
   Lock,
   Minus,
   Plug,
-  Plus
+  Plus,
+  Settings2
 } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { isFoldedPreviewToolName, isHostDerivedToolName } from "../lib/taskTools";
-import type { ToolDescriptor } from "../types";
+import {
+  type DecisionToolSettings,
+  switchToolsOff,
+  switchToolsOn
+} from "../lib/decisionParameters";
+import { isDecisionToolName, isHostDerivedToolName } from "../lib/taskTools";
+import type { DecisionParameterModes, RememberedDecisionForms, ToolDescriptor } from "../types";
 import { ToolDocsLink } from "./DocsLink";
+import {
+  familyRowCounts,
+  familyVariantNames,
+  TOOL_FAMILIES,
+  ToolFamilySettingsDialog,
+  type ToolFamily,
+  type ToolFamilyId
+} from "./ToolFamilySettings";
 
 export type ToolCategory = ToolDescriptor["category"];
 
@@ -40,23 +54,32 @@ const NESTED_TOOLS: Record<string, readonly string[]> = {
 const NESTED_TOOL_NAMES: ReadonlySet<string> = new Set(Object.values(NESTED_TOOLS).flat());
 
 /**
- * The one name the preview tools are picked under.
+ * A tool family as this picker's catalog has it: the members it found, and the
+ * names its one row stands for.
  *
- * They are a single capability — a page and the servers behind it — split into
- * fifteen calls for the model's benefit, not the reader's, and turning half of
- * them on produces an agent that can click a page it cannot open. So the picker
- * shows one switch and the stored list keeps the real names: nothing downstream
- * of this component has ever heard of `preview`.
+ * The files, the shells and the preview are each a single capability split into
+ * many calls for the model's benefit, not the reader's. So the picker shows one
+ * row per family, and that row opens the family's own settings window. The
+ * stored list keeps the real names: nothing downstream of this component has
+ * ever heard of `files`, `shell` or `preview`.
  */
-const MERGED_PREVIEW_NAME = "preview";
+interface PresentFamily {
+  family: ToolFamily;
+  members: ToolDescriptor[];
+  names: string[];
+  nameSet: ReadonlySet<string>;
+  /** What the row switches on in bulk: every member but the variants, which are
+   * choices made in the window rather than tools of their own. */
+  baseNames: string[];
+}
 
-function mergedPreviewDescriptor(): ToolDescriptor {
+function familyDescriptor({ family, members }: PresentFamily): ToolDescriptor {
   return {
-    name: MERGED_PREVIEW_NAME,
-    label: MERGED_PREVIEW_NAME,
+    name: family.name,
+    label: family.name,
     description: "",
-    category: "web",
-    dangerous: true,
+    category: family.category,
+    dangerous: members.some((tool) => tool.dangerous),
     parameters: []
   };
 }
@@ -88,7 +111,12 @@ export function ToolSelectionGroups({
   enabledTools,
   onChange,
   expansionKey,
-  lockedTools = []
+  lockedTools = [],
+  decisionParameterModes,
+  lockedDecisionParameterModes,
+  decisionMissScoring,
+  rememberedDecisionForms,
+  onToolSettingsChange
 }: {
   tools: ToolDescriptor[];
   enabledTools: string[];
@@ -97,30 +125,97 @@ export function ToolSelectionGroups({
   /**
    * Tools a run has already put in front of the model. They leave the picker for
    * a single collapsed bar, so what remains below is exactly the surface still
-   * free to move.
+   * free to move. A family's tools are the exception: its row stays, and the
+   * window it opens draws each spent tool as a switch that cannot be turned off.
    */
   lockedTools?: readonly string[];
+  /**
+   * The conversation's decision-parameter modes, edited in the family windows.
+   * Omitted — together with `onToolSettingsChange` — where the owner has no
+   * modes of its own, such as a role's tool list, which hides those options
+   * and keeps no choices for tools switched off.
+   */
+  decisionParameterModes?: DecisionParameterModes;
+  lockedDecisionParameterModes?: DecisionParameterModes;
+  /** The element tools whose misses the conversation scores, edited beside the modes. */
+  decisionMissScoring?: readonly string[];
+  /** The sub-option choices the conversation keeps for its switched-off tools. */
+  rememberedDecisionForms?: RememberedDecisionForms;
+  /**
+   * A tool-list change with the modes, miss scoring and remembered choices
+   * that go with it, written as one edit. Without it, only the list is written.
+   */
+  onToolSettingsChange?: (next: DecisionToolSettings) => void;
 }) {
   const { t } = useI18n();
   const instanceId = useId().replace(/:/g, "");
-  const previewNames = useMemo(
-    () => uniqueTools(tools).filter((tool) => isFoldedPreviewToolName(tool.name)).map((tool) => tool.name),
-    [tools]
+  const [openFamily, setOpenFamily] = useState<ToolFamilyId | null>(null);
+  const families = useMemo((): PresentFamily[] => {
+    const catalog = uniqueTools(tools);
+    return TOOL_FAMILIES.flatMap((family) => {
+      const members = catalog.filter((tool) => family.owns(tool.name));
+      if (!members.length) return [];
+      const names = members.map((tool) => tool.name);
+      const variants = familyVariantNames(family);
+      return [{
+        family,
+        members,
+        names,
+        nameSet: new Set(names),
+        baseNames: names.filter((name) => !variants.has(name))
+      }];
+    });
+  }, [tools]);
+  const familyByRow = useMemo(
+    () => new Map(families.map((present) => [present.family.name, present])),
+    [families]
   );
-  const previewNameSet = useMemo(() => new Set(previewNames), [previewNames]);
-  /** A stored list as the picker shows it: the preview names stand for one row. */
+  /** A stored list as the picker shows it: a family's names stand for its one row. */
   const fold = useCallback((names: readonly string[]): string[] => {
-    const folded = names.filter((name) => !previewNameSet.has(name));
-    if (names.some((name) => previewNameSet.has(name))) folded.push(MERGED_PREVIEW_NAME);
+    const folded = names.filter((name) => !families.some((present) => present.nameSet.has(name)));
+    for (const present of families) {
+      if (names.some((name) => present.nameSet.has(name))) folded.push(present.family.name);
+    }
     return folded;
-  }, [previewNameSet]);
+  }, [families]);
   const foldedEnabled = useMemo(() => fold(enabledTools), [enabledTools, fold]);
-  /** The picker's one row for the preview tools, back as the names it stands for. */
-  const expandNames = useCallback((candidates: readonly string[]): string[] => candidates.flatMap(
-    (candidate) => (candidate === MERGED_PREVIEW_NAME ? previewNames : [candidate])
-  ), [previewNames]);
-  const lockedNames = useMemo(() => new Set(fold(lockedTools)), [fold, lockedTools]);
+  /**
+   * A family's one row, back as the names it stands for: the base tools when
+   * switching on, every member when switching off.
+   */
+  const expandNames = useCallback((candidates: readonly string[], removing = false): string[] => candidates.flatMap(
+    (candidate) => {
+      const present = familyByRow.get(candidate);
+      if (!present) return [candidate];
+      return removing ? present.names : present.baseNames;
+    }
+  ), [familyByRow]);
+  /* A family's row never moves to the lock bar: it is how the family's spent
+     tools are seen at all, and how the ones still free are reached. */
+  const lockedNames = useMemo(
+    () => new Set(fold(lockedTools).filter((name) => !familyByRow.has(name))),
+    [familyByRow, fold, lockedTools]
+  );
   const lockedRealNames = useMemo(() => new Set(lockedTools), [lockedTools]);
+  const availableNames = useMemo(() => new Set(tools.map((tool) => tool.name)), [tools]);
+  const settings: DecisionToolSettings = {
+    enabledTools,
+    decisionParameterModes: decisionParameterModes ?? {},
+    decisionMissScoring: [...(decisionMissScoring ?? [])],
+    rememberedDecisionForms: rememberedDecisionForms ?? {}
+  };
+  const write = (next: DecisionToolSettings) => {
+    if (onToolSettingsChange) onToolSettingsChange(next);
+    else onChange(next.enabledTools);
+  };
+  /**
+   * Writes a narrowed tool list. A decision tool that leaves keeps its form and
+   * miss scoring among the remembered choices, so switching it back on returns
+   * to them.
+   */
+  const removeTools = (removed: ReadonlySet<string>) => write(switchToolsOff(settings, removed));
+  /** Writes a widened tool list, each row coming back to the choices it was switched off with. */
+  const addTools = (rows: readonly string[]) => write(switchToolsOn(settings, rows, availableNames));
   const groupedTools = useMemo(() => {
     const deduplicated = uniqueTools(tools).filter(
       // Memory, task-runtime, and skill tools are host-derived and cannot be
@@ -128,10 +223,15 @@ export function ToolSelectionGroups({
       // `isHostDerivedToolName`.
       (tool) => tool.category !== "memory" && !isHostDerivedToolName(tool.name)
     );
-    const pickable = [
-      ...deduplicated.filter((tool) => !isFoldedPreviewToolName(tool.name)),
-      ...(deduplicated.some((tool) => isFoldedPreviewToolName(tool.name)) ? [mergedPreviewDescriptor()] : [])
-    ];
+    // A family's row takes the place of the first of its members the catalog lists.
+    const drawn = new Set<ToolFamilyId>();
+    const pickable = deduplicated.flatMap((tool): ToolDescriptor[] => {
+      const present = families.find((candidate) => candidate.nameSet.has(tool.name));
+      if (!present) return [tool];
+      if (drawn.has(present.family.id)) return [];
+      drawn.add(present.family.id);
+      return [familyDescriptor(present)];
+    });
     return (Object.keys(groupMeta) as ToolCategory[])
       .filter((category) => category !== "memory")
       .map((category) => ({
@@ -142,7 +242,7 @@ export function ToolSelectionGroups({
         ),
         allTools: pickable.filter((tool) => tool.category === category)
       })).filter((group) => group.tools.length > 0);
-  }, [tools]);
+  }, [families, tools]);
   /** Locked rows keep catalog order so the bar reads like the picker it left. */
   const lockedRows = useMemo(
     () => groupedTools.flatMap((group) => group.allTools.filter((tool) => lockedNames.has(tool.name))),
@@ -163,17 +263,17 @@ export function ToolSelectionGroups({
 
   const toggleTool = (name: string, checked: boolean) => {
     if (checked) {
-      onChange(Array.from(new Set([...enabledTools, ...expandNames([name])])));
+      addTools(expandNames([name]));
       return;
     }
     // Disabling a parent also removes dependents so no unreachable toggle or
     // inaccurate count remains. Locked names survive either way: the model has
     // already been handed them and the transcript may already call them.
     const removed = new Set(
-      expandNames([name, ...(NESTED_TOOLS[name] ?? [])]).filter((tool) => !lockedRealNames.has(tool))
+      expandNames([name, ...(NESTED_TOOLS[name] ?? [])], true).filter((tool) => !lockedRealNames.has(tool))
     );
     if (!removed.size) return;
-    onChange(enabledTools.filter((tool) => !removed.has(tool)));
+    removeTools(removed);
   };
 
   /**
@@ -187,9 +287,8 @@ export function ToolSelectionGroups({
   const setGroupEnabled = (category: ToolCategory, enabled: boolean) => {
     const group = groupedTools.find((candidate) => candidate.category === category);
     if (!group) return;
-    const names = expandNames(
-      group.allTools.filter((tool) => !lockedNames.has(tool.name)).map((tool) => tool.name)
-    );
+    const candidates = group.allTools.filter((tool) => !lockedNames.has(tool.name)).map((tool) => tool.name);
+    const names = expandNames(candidates, !enabled);
     if (enabled) {
       // Turning a group on is also a way of asking to see it: a collapsed
       // group would otherwise report a new count with nothing to show for it.
@@ -199,16 +298,19 @@ export function ToolSelectionGroups({
         next.delete(category);
         return next;
       });
-      onChange(Array.from(new Set([...enabledTools, ...names])));
+      addTools(names);
       return;
     }
     // Turning one off has no second job, so it leaves the disclosure alone.
     const removed = new Set(names.filter((name) => !lockedRealNames.has(name)));
     if (!removed.size) return;
-    onChange(enabledTools.filter((tool) => !removed.has(tool)));
+    removeTools(removed);
   };
 
   const lockedRegionId = `tool-lock-${instanceId}`;
+  /* A family can leave the catalog while its window is open — a workspace moves
+     to a machine without that shell — and the window goes with it. */
+  const openPresent = families.find((present) => present.family.id === openFamily);
   return (
     <div className="tool-settings-groups">
       {lockedRows.length > 0 && (
@@ -254,7 +356,7 @@ export function ToolSelectionGroups({
                   <ToolDocsLink name={tool.name} label={tool.label} />
                   <div className="tool-toggle-row tool-toggle-row--locked" data-tool-name={tool.name}>
                     <span><strong>{tool.label}</strong></span>
-                    {tool.dangerous && <em>{t("需审查", "Reviewed")}</em>}
+                    <ToolMarks tool={tool} />
                     <Lock className="tool-toggle-row__mark" size={14} aria-hidden="true" />
                   </div>
                 </div>
@@ -334,23 +436,122 @@ export function ToolSelectionGroups({
               inert={!expanded || undefined}
             >
               <div className="collapse-region__inner">
-                {groupTools.map((tool) => (
-                  <ToolToggle
-                    key={tool.name}
-                    tool={tool}
-                    enabledTools={foldedEnabled}
-                    lockedNames={lockedNames}
-                    onToggle={toggleTool}
-                    nested={allTools.filter((candidate) =>
-                      (NESTED_TOOLS[tool.name] ?? []).includes(candidate.name))}
-                  />
-                ))}
+                {groupTools.map((tool) => {
+                  const present = familyByRow.get(tool.name);
+                  if (!present) {
+                    return (
+                      <ToolToggle
+                        key={tool.name}
+                        tool={tool}
+                        enabledTools={foldedEnabled}
+                        lockedNames={lockedNames}
+                        onToggle={toggleTool}
+                        nested={allTools.filter((candidate) =>
+                          (NESTED_TOOLS[tool.name] ?? []).includes(candidate.name))}
+                      />
+                    );
+                  }
+                  const counts = familyRowCounts(
+                    present.family,
+                    present.nameSet,
+                    (name) => enabledTools.includes(name) || lockedRealNames.has(name)
+                  );
+                  return (
+                    <ToolFamilyRow
+                      key={tool.name}
+                      family={present.family}
+                      dangerous={tool.dangerous}
+                      enabledCount={counts.enabled}
+                      total={counts.total}
+                      onOpen={() => setOpenFamily(present.family.id)}
+                    />
+                  );
+                })}
               </div>
             </div>
           </div>
         );
       })}
+      {openPresent && (
+        <ToolFamilySettingsDialog
+          family={openPresent.family}
+          tools={openPresent.members}
+          enabledTools={enabledTools}
+          lockedTools={lockedTools}
+          decisionParameterModes={onToolSettingsChange ? decisionParameterModes ?? {} : undefined}
+          lockedDecisionParameterModes={lockedDecisionParameterModes}
+          decisionMissScoring={decisionMissScoring ?? []}
+          rememberedDecisionForms={rememberedDecisionForms}
+          onChange={write}
+          onClose={() => setOpenFamily(null)}
+        />
+      )}
     </div>
+  );
+}
+
+/**
+ * A tool family's row. It holds no switch of its own: the tools behind it are
+ * chosen one by one in the window its trailing settings button opens, so the
+ * row reports how many of that window's rows are on and is otherwise the way in.
+ */
+function ToolFamilyRow({
+  family,
+  dangerous,
+  enabledCount,
+  total,
+  onOpen
+}: {
+  family: ToolFamily;
+  dangerous: boolean;
+  enabledCount: number;
+  total: number;
+  onOpen: () => void;
+}) {
+  const { t } = useI18n();
+  const on = enabledCount > 0;
+  const Icon = family.icon;
+  return (
+    <div className="tool-pick-row">
+      {/* The documentation link's slot, kept so the label reads down the same
+          column as every other tool's; the family's tools link their own pages
+          from the window. */}
+      <span className="tool-docs-link" aria-hidden="true"><Icon size={14} /></span>
+      <button
+        type="button"
+        className={`tool-toggle-row tool-toggle-row--pick${on ? " tool-toggle-row--on" : ""}`}
+        data-tool-name={family.name}
+        aria-haspopup="dialog"
+        aria-label={t(
+          "{settings}，已启用 {enabled} / {total}",
+          "{settings}, {enabled} of {total} enabled",
+          { settings: family.settingsLabel(t), enabled: enabledCount, total }
+        )}
+        onClick={onOpen}
+      >
+        <span><strong>{family.name}</strong></span>
+        <small className="tool-toggle-row__count">{enabledCount} / {total}</small>
+        {dangerous && <em>{t("需审查", "Reviewed")}</em>}
+        <Settings2 className="tool-toggle-row__mark" size={14} aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The marks a tool row carries before its trailing sign: a blue one when the
+ * tool runs through the decision model — its calls send content to the
+ * decision model provider — and the amber one when its calls are reviewed.
+ */
+function ToolMarks({ tool }: { tool: ToolDescriptor }) {
+  const { t } = useI18n();
+  return (
+    <>
+      {isDecisionToolName(tool.name) && (
+        <em className="tool-toggle-row__decision">{t("决策模型", "Decision model")}</em>
+      )}
+      {tool.dangerous && <em>{t("需审查", "Reviewed")}</em>}
+    </>
   );
 }
 
@@ -424,7 +625,7 @@ function ToolPickRow({
         onClick={() => onToggle(tool.name, !enabled)}
       >
         <span><strong>{tool.label}</strong></span>
-        {tool.dangerous && <em>{t("需审查", "Reviewed")}</em>}
+        <ToolMarks tool={tool} />
         <Mark className="tool-toggle-row__mark" size={14} aria-hidden="true" />
       </button>
     </div>

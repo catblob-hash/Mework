@@ -19,6 +19,7 @@ import { hasUsableAgentDefinition } from "../lib/agentDefinitions";
 import { useCatalogOrder } from "../lib/catalogOrder";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
+import { isImeKeyEvent } from "../lib/shortcuts";
 import type {
   ContextItem,
   ConversationPreset,
@@ -465,7 +466,7 @@ export function AgentRolesPage({
     () => hasUsableAgentDefinition(settings.agentDefinitions, globalSettings.apiProviders),
     [settings.agentDefinitions, globalSettings.apiProviders]
   );
-  /* What a role bound to "inherit" will run on, so its template window knows
+  /* What a role bound to "inherit" will run on, so its template page knows
      whether a message written there may carry an image. */
   const conversationImageInputSupported = useMemo(() => {
     const model = modelChoiceOf(globalSettings).model;
@@ -608,7 +609,7 @@ export function ConversationPresetsPage({
                   onFocus={(event) => event.currentTarget.select()}
                   onBlur={finishRename}
                   onKeyDown={(event) => {
-                    if (event.nativeEvent.isComposing) return;
+                    if (isImeKeyEvent(event.nativeEvent)) return;
                     if (event.key === "Enter") {
                       event.preventDefault();
                       event.currentTarget.blur();

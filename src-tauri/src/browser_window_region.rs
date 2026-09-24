@@ -13,8 +13,7 @@
 
 use std::time::Duration;
 
-use tauri::Webview;
-
+use crate::browser::PageWebview;
 use crate::chromium_capability::WebView2Permit;
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -27,7 +26,7 @@ const PAGE_STACKING_TIMEOUT: Duration = Duration::from_secs(2);
 /// while Chromium still sees an on-screen window and keeps compositing frames for it. That is
 /// what lets a page the user is not looking at keep answering the Agent's input at full speed.
 pub(crate) fn set_page_stacking(
-    page: &Webview,
+    page: &PageWebview,
     tail_permit: WebView2Permit,
     parked: bool,
 ) -> Result<(), String> {
@@ -56,7 +55,15 @@ pub(crate) fn set_page_stacking(
         })
     }
 
-    #[cfg(not(windows))]
+    // On macOS the page is a CEF view beside the React WKWebView in the window's content view;
+    // the same covering is a sibling-order question there.
+    #[cfg(target_os = "macos")]
+    {
+        let _tail_permit = tail_permit;
+        page.set_stacking(parked)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (page, tail_permit, parked);
         Ok(())
@@ -65,7 +72,7 @@ pub(crate) fn set_page_stacking(
 
 #[cfg(windows)]
 fn with_parent_hwnd(
-    page: &Webview,
+    page: &PageWebview,
     tail_permit: WebView2Permit,
     operation: impl FnOnce(windows_sys::Win32::Foundation::HWND) -> Result<(), String> + Send + 'static,
 ) -> Result<(), String> {

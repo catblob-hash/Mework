@@ -8,6 +8,15 @@ import type {
   ResolvedAppLanguage,
   ToolDescriptor
 } from "../types";
+import {
+  decisionMissScoringFor,
+  decisionModesFor,
+  flooredDecisionParameterModes,
+  normalizeDecisionMissScoring,
+  normalizeDecisionParameterModes,
+  sameDecisionMissScoring,
+  sameDecisionParameterModes
+} from "./decisionParameters";
 import { defaultConversationWebSearchSettings } from "./runtime";
 import { isHostDerivedToolName } from "./taskTools";
 import { toolLockOf } from "./toolLock";
@@ -29,24 +38,25 @@ export function emptyConversationPresetSettings(): ConversationPresetSettings {
     globalMemoryEnabled: false,
     projectMemoryEnabled: false,
     skillToolEnabled: false,
-    mcpToolDiscoveryEnabled: false
+    mcpToolDiscoveryEnabled: false,
+    decisionParameterModes: {},
+    decisionMissScoring: []
   };
 }
 
-export function preferredShellToolName(platform: string): "powershell" | "bash" {
-  return /^win/i.test(platform.trim()) ? "powershell" : "bash";
-}
-
-function browserPlatform(): string {
-  return typeof navigator === "undefined" ? "" : navigator.platform;
-}
+/**
+ * The shell command tools the implicit preset turns on: every backend's. Which
+ * of them a conversation actually offers follows its machines — the host
+ * withdraws a shell no machine has — so enabling them all is what lets each
+ * machine's shells work without a trip to the settings. The scoring variants
+ * stay off, as the seeded presets keep every decision tool off.
+ */
+const IMPLICIT_SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", "powershell"]);
 
 export function implicitConversationPreset(
   tools: readonly ToolDescriptor[] = [],
-  resolvedLanguage: ResolvedAppLanguage = "zh-CN",
-  platform: string = browserPlatform()
+  resolvedLanguage: ResolvedAppLanguage = "zh-CN"
 ): ConversationPreset {
-  const shellToolName = preferredShellToolName(platform);
   // Memory tools derive from their two layer switches and remain disabled by
   // default because they read and write user-disk files. The web tools derive
   // from `webSearchEnabled` for the same reason, so this list names neither of
@@ -54,7 +64,7 @@ export function implicitConversationPreset(
   const enabledTools = tools
     .filter((tool) => tool.category === "filesystem")
     .map((tool) => tool.name);
-  if (tools.some((tool) => tool.name === shellToolName)) enabledTools.push(shellToolName);
+  enabledTools.push(...tools.filter((tool) => IMPLICIT_SHELL_TOOLS.has(tool.name)).map((tool) => tool.name));
   return {
     id: IMPLICIT_CONVERSATION_PRESET_ID,
     name: resolvedLanguage === "zh-CN"
@@ -114,6 +124,10 @@ function copyWebSearchSettings(
 export function captureConversationPresetSettings(
   settings: ConversationSettings
 ): ConversationPresetSettings {
+  const decisionParameterModes = decisionModesFor(
+    normalizeDecisionParameterModes(settings.decisionParameterModes),
+    settings.enabledTools
+  );
   return {
     enabledTools: [...settings.enabledTools],
     toolDescriptionFileId: settings.toolDescriptionFileId,
@@ -128,7 +142,15 @@ export function captureConversationPresetSettings(
     globalMemoryEnabled: settings.globalMemoryEnabled,
     projectMemoryEnabled: settings.projectMemoryEnabled,
     skillToolEnabled: settings.skillToolEnabled === true,
-    mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled === true
+    mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled === true,
+    /* Only the tools the body enables: a form on a tool that is off says nothing. */
+    decisionParameterModes,
+    /* Likewise only the tools with a form: one on its direct form never misses. */
+    decisionMissScoring: decisionMissScoringFor(
+      normalizeDecisionMissScoring(settings.decisionMissScoring),
+      decisionParameterModes,
+      settings.enabledTools
+    )
   };
 }
 
@@ -176,22 +198,25 @@ export function sameConversationPresetSettings(
     && sameIdSet(a.skillIds, b.skillIds)
     && sameIdSet(a.mcpIds, b.mcpIds)
     && equalValues(a.agentDefinitions, b.agentDefinitions)
-    && equalValues(a.webSearch, b.webSearch);
+    && equalValues(a.webSearch, b.webSearch)
+    && sameDecisionParameterModes(
+      decisionModesFor(a.decisionParameterModes, a.enabledTools),
+      decisionModesFor(b.decisionParameterModes, b.enabledTools)
+    )
+    && sameDecisionMissScoring(
+      decisionMissScoringFor(a.decisionMissScoring, a.decisionParameterModes, a.enabledTools),
+      decisionMissScoringFor(b.decisionMissScoring, b.decisionParameterModes, b.enabledTools)
+    );
 }
 
 export function defaultConversationPreset(
   settings: GlobalSettings,
   tools: readonly ToolDescriptor[] = [],
-  resolvedLanguage: ResolvedAppLanguage = "zh-CN",
-  platform: string = browserPlatform()
+  resolvedLanguage: ResolvedAppLanguage = "zh-CN"
 ): ConversationPreset {
   return settings.conversationPresets.find(
     (preset) => preset.id === settings.defaultConversationPresetId
-  ) ?? settings.conversationPresets[0] ?? implicitConversationPreset(
-    tools,
-    resolvedLanguage,
-    platform
-  );
+  ) ?? settings.conversationPresets[0] ?? implicitConversationPreset(tools, resolvedLanguage);
 }
 
 /**
@@ -202,12 +227,11 @@ export function conversationPresetById(
   settings: GlobalSettings,
   presetId: string,
   tools: readonly ToolDescriptor[] = [],
-  resolvedLanguage: ResolvedAppLanguage = "zh-CN",
-  platform: string = browserPlatform()
+  resolvedLanguage: ResolvedAppLanguage = "zh-CN"
 ): ConversationPreset | null {
   if (!presetId) return null;
   if (presetId === IMPLICIT_CONVERSATION_PRESET_ID) {
-    return implicitConversationPreset(tools, resolvedLanguage, platform);
+    return implicitConversationPreset(tools, resolvedLanguage);
   }
   return settings.conversationPresets.find((preset) => preset.id === presetId) ?? null;
 }
@@ -240,9 +264,13 @@ export function cloneConversationSettings(
     globalMemoryEnabled: snapshot.globalMemoryEnabled === true,
     projectMemoryEnabled: snapshot.projectMemoryEnabled === true,
     skillToolEnabled: snapshot.skillToolEnabled === true,
-    mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true
+    mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true,
+    decisionParameterModes: normalizeDecisionParameterModes(snapshot.decisionParameterModes),
+    decisionMissScoring: normalizeDecisionMissScoring(snapshot.decisionMissScoring)
     // `toolLock` is deliberately absent: the new conversation has run nothing
     // yet, so it has exposed nothing and every setting is still free to move.
+    // `rememberedDecisionForms` is absent too: the choices a conversation kept
+    // for the tools it switched off belong to that conversation.
   };
 }
 
@@ -260,10 +288,27 @@ export function applyConversationPresetSettings(
 ): ConversationSettings {
   const lock = toolLockOf(current);
   const webSearch = copyWebSearchSettings(preset.webSearch);
+  const enabledTools = Array.from(new Set([...lock.tools, ...preset.enabledTools])).filter(
+    (name) => (!knownToolNames || knownToolNames.has(name)) && !isHostDerivedToolName(name)
+  );
+  /* A form widens over what the transcript holds rather than replacing it:
+     a preset asking for `replace` on a tool whose selector calls already went
+     out gets `augment`, which accepts both. */
+  const decisionParameterModes = flooredDecisionParameterModes(
+    lock,
+    normalizeDecisionParameterModes(preset.decisionParameterModes),
+    enabledTools
+  );
   return {
     ...current,
-    enabledTools: Array.from(new Set([...lock.tools, ...preset.enabledTools])).filter(
-      (name) => (!knownToolNames || knownToolNames.has(name)) && !isHostDerivedToolName(name)
+    enabledTools,
+    decisionParameterModes,
+    /* Miss scoring changes no schema, so the preset's answer simply applies,
+       kept to the tools that come out with a form. */
+    decisionMissScoring: decisionMissScoringFor(
+      normalizeDecisionMissScoring(preset.decisionMissScoring),
+      decisionParameterModes,
+      enabledTools
     ),
     toolDescriptionFileId: preset.toolDescriptionFileId,
     agentDefinitions: copyAgentDefinitions(preset.agentDefinitions),

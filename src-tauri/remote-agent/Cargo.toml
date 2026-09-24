@@ -25,7 +25,9 @@ bench = false
 default = ["agent", "client"]
 # The remote side: daemon, proxy, process and terminal sessions. The host does
 # not link it, so none of its platform calls reach the shipped app.
-agent = ["dep:portable-pty", "dep:sha2", "dep:getrandom"]
+# Cells (sandboxed sessions) are reached through a link of their own, so the
+# agent carries the client half too.
+agent = ["client", "dep:portable-pty", "dep:sha2", "dep:getrandom"]
 # The host side: one multiplexed, self-healing link per machine.
 client = []
 
@@ -38,6 +40,10 @@ serde_json = "1"
 portable-pty = { version = "0.9", optional = true }
 sha2 = { version = "0.10", optional = true }
 getrandom = { version = "0.3", optional = true }
+
+[build-dependencies]
+# The digest behind `SOURCE_ID` (build.rs).
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

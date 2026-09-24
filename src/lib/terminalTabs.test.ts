@@ -2,14 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   activeTerminalTab,
   initialTerminalTabsState,
-  terminalDisplayNumber,
+  terminalShellKey,
   terminalTabId,
   terminalTabsFor,
   terminalTabsReducer
 } from "./terminalTabs";
 import type { TerminalTabsAction, TerminalTabsState } from "./terminalTabs";
+import type { TerminalLaunchChoice } from "./terminal";
 
 const conversationId = "conversation-1";
+const zsh: TerminalLaunchChoice = { workspace: 1, shell: "zsh" };
+const bash: TerminalLaunchChoice = { workspace: 1, shell: "bash" };
 
 function apply(state: TerminalTabsState, ...actions: TerminalTabsAction[]): TerminalTabsState {
   return actions.reduce(terminalTabsReducer, state);
@@ -20,24 +23,28 @@ function layout(state: TerminalTabsState, id = conversationId) {
 function ids(state: TerminalTabsState, id = conversationId) {
   return layout(state, id).tabs.map((tab) => tab.id);
 }
-function add(state: TerminalTabsState, id = conversationId) {
-  return apply(state, { type: "add", conversationId: id });
+function add(state: TerminalTabsState, launch: TerminalLaunchChoice | null = zsh, id = conversationId) {
+  return apply(state, { type: "add", conversationId: id, launch });
 }
 function close(state: TerminalTabsState, terminalId: string, id = conversationId) {
   return apply(state, { type: "close", conversationId: id, terminalId });
 }
+/** Each tab's shell and number, which is what its derived name is made of. */
+function numbered(state: TerminalTabsState, id = conversationId) {
+  return layout(state, id).tabs.map((tab) => `${tab.launch?.shell ?? "?"} ${tab.number}`);
+}
 
 describe("terminal tabs", () => {
-  it("shares one frozen opening layout across conversations and null", () => {
+  it("shares one frozen, empty opening layout across conversations and null", () => {
     const first = layout(initialTerminalTabsState);
     expect(first).toBe(terminalTabsFor(initialTerminalTabsState, "other"));
     expect(first).toBe(terminalTabsFor(initialTerminalTabsState, null));
     expect(Object.isFrozen(first)).toBe(true);
     expect(Object.isFrozen(first.tabs)).toBe(true);
-    // Every conversation has a terminal before anyone asks for one, so the pane always has
-    // something to park and the panel keeps a stable element to reopen into.
-    expect(ids(initialTerminalTabsState)).toEqual([terminalTabId(1)]);
-    expect(activeTerminalTab(first)?.id).toBe(terminalTabId(1));
+    expect(Object.isFrozen(first.nextNumbers)).toBe(true);
+    // No conversation has a terminal until one is asked for.
+    expect(ids(initialTerminalTabsState)).toEqual([]);
+    expect(activeTerminalTab(first)).toBeNull();
   });
 
   it("does not resolve prototype properties as layouts", () => {
@@ -46,7 +53,7 @@ describe("terminal tabs", () => {
   });
 
   it("numbers new tabs monotonically and never mints an ordinal twice", () => {
-    const three = add(add(initialTerminalTabsState));
+    const three = add(add(add(initialTerminalTabsState)));
     expect(ids(three)).toEqual([terminalTabId(1), terminalTabId(2), terminalTabId(3)]);
     // A reused id would address a shell the host is still tearing down, and a stale receipt
     // would reach the wrong one.
@@ -55,19 +62,19 @@ describe("terminal tabs", () => {
   });
 
   it("selects the tab it just created", () => {
-    const two = add(initialTerminalTabsState);
+    const two = add(add(initialTerminalTabsState));
     expect(layout(two).activeId).toBe(terminalTabId(2));
   });
 
   it("keeps conversations apart", () => {
     const state = add(initialTerminalTabsState);
-    expect(ids(state, "conversation-2")).toEqual([terminalTabId(1)]);
-    expect(layout(state, "conversation-2").nextOrdinal).toBe(2);
+    expect(ids(state, "conversation-2")).toEqual([]);
+    expect(layout(state, "conversation-2").nextOrdinal).toBe(1);
   });
 
   describe("closing", () => {
     it("moves the selection right, and off the end to the left", () => {
-      const three = add(add(initialTerminalTabsState));
+      const three = add(add(add(initialTerminalTabsState)));
       const middle = close(
         apply(three, { type: "activate", conversationId, terminalId: terminalTabId(2) }),
         terminalTabId(2)
@@ -77,12 +84,12 @@ describe("terminal tabs", () => {
     });
 
     it("leaves the selection alone when another tab closes", () => {
-      const three = add(add(initialTerminalTabsState));
+      const three = add(add(add(initialTerminalTabsState)));
       expect(layout(close(three, terminalTabId(1))).activeId).toBe(terminalTabId(3));
     });
 
     it("empties the conversation once the last tab goes", () => {
-      const empty = close(initialTerminalTabsState, terminalTabId(1));
+      const empty = close(add(initialTerminalTabsState), terminalTabId(1));
       expect(ids(empty)).toEqual([]);
       expect(layout(empty).activeId).toBeNull();
       expect(activeTerminalTab(layout(empty))).toBeNull();
@@ -97,36 +104,54 @@ describe("terminal tabs", () => {
   describe("ensure", () => {
     it("is a no-op while the conversation still has a tab", () => {
       const state = add(initialTerminalTabsState);
-      expect(apply(state, { type: "ensure", conversationId })).toBe(state);
-      expect(apply(initialTerminalTabsState, { type: "ensure", conversationId }))
-        .toBe(initialTerminalTabsState);
+      expect(apply(state, { type: "ensure", conversationId, launch: bash })).toBe(state);
+    });
+
+    it("gives a conversation with no terminal one started as asked", () => {
+      const state = apply(initialTerminalTabsState, { type: "ensure", conversationId, launch: bash });
+      expect(ids(state)).toEqual([terminalTabId(1)]);
+      expect(layout(state).tabs[0].launch).toEqual(bash);
+      expect(layout(state).activeId).toBe(terminalTabId(1));
     });
 
     it("gives an emptied conversation a fresh terminal, keeping the spent ordinals", () => {
-      const emptied = close(add(initialTerminalTabsState), terminalTabId(2));
-      const reopened = apply(
-        close(emptied, terminalTabId(1)),
-        { type: "ensure", conversationId }
-      );
+      const emptied = close(close(add(add(initialTerminalTabsState)), terminalTabId(2)), terminalTabId(1));
+      const reopened = apply(emptied, { type: "ensure", conversationId, launch: zsh });
       expect(ids(reopened)).toEqual([terminalTabId(3)]);
       expect(layout(reopened).activeId).toBe(terminalTabId(3));
     });
   });
 
   describe("naming", () => {
-    it("numbers a tab by its place in the strip, so a closed one gives its number back", () => {
-      const three = add(add(initialTerminalTabsState));
-      expect(three.byConversation[conversationId].tabs.map(
-        (tab) => terminalDisplayNumber(layout(three), tab.id)
-      )).toEqual([1, 2, 3]);
-      const two = close(three, terminalTabId(2));
-      expect(two.byConversation[conversationId].tabs.map(
-        (tab) => terminalDisplayNumber(layout(two), tab.id)
-      )).toEqual([1, 2]);
+    it("counts each shell on its own", () => {
+      const state = add(add(add(initialTerminalTabsState, zsh), bash), zsh);
+      expect(numbered(state)).toEqual(["zsh 1", "bash 1", "zsh 2"]);
+    });
+
+    it("never gives a closed terminal's number back", () => {
+      const two = add(add(initialTerminalTabsState, zsh), zsh);
+      const reopened = add(close(two, terminalTabId(1)), zsh);
+      expect(numbered(reopened)).toEqual(["zsh 2", "zsh 3"]);
+      // Not even once every terminal of that shell is gone.
+      const emptied = close(close(reopened, terminalTabId(2)), terminalTabId(3));
+      expect(numbered(apply(emptied, { type: "ensure", conversationId, launch: zsh })))
+        .toEqual(["zsh 4"]);
+    });
+
+    it("counts the terminals that left the shell to the host together", () => {
+      const state = add(add(add(initialTerminalTabsState, null), zsh), { workspace: 2, shell: null });
+      expect(numbered(state)).toEqual(["? 1", "zsh 1", "? 2"]);
+      expect(terminalShellKey(null)).toBe(terminalShellKey({ workspace: 2, shell: null }));
+    });
+
+    it("counts a shell across workspaces", () => {
+      const state = add(add(initialTerminalTabsState, zsh), { workspace: 2, shell: "zsh" });
+      expect(numbered(state)).toEqual(["zsh 1", "zsh 2"]);
     });
 
     it("keeps a trimmed name and drops an empty one back to the derived name", () => {
-      const named = apply(initialTerminalTabsState, {
+      const state = add(initialTerminalTabsState);
+      const named = apply(state, {
         type: "rename", conversationId, terminalId: terminalTabId(1), name: "  build  "
       });
       expect(layout(named).tabs[0].name).toBe("build");
@@ -137,7 +162,7 @@ describe("terminal tabs", () => {
     });
 
     it("ignores a rename that changes nothing or names no tab", () => {
-      const named = apply(initialTerminalTabsState, {
+      const named = apply(add(initialTerminalTabsState), {
         type: "rename", conversationId, terminalId: terminalTabId(1), name: "build"
       });
       expect(apply(named, {
@@ -151,7 +176,7 @@ describe("terminal tabs", () => {
 
   describe("activate", () => {
     it("ignores an unknown tab and a selection that is already current", () => {
-      const state = add(initialTerminalTabsState);
+      const state = add(add(initialTerminalTabsState));
       expect(apply(state, { type: "activate", conversationId, terminalId: "terminal-9" }))
         .toBe(state);
       expect(apply(state, { type: "activate", conversationId, terminalId: terminalTabId(2) }))
@@ -159,29 +184,11 @@ describe("terminal tabs", () => {
     });
   });
 
-  describe("launch choices", () => {
-    it("records the workspace and shell a new tab was asked for", () => {
-      const launch = { workspace: 2, shell: "fish" as const };
-      const state = apply(initialTerminalTabsState, { type: "add", conversationId, launch });
-      const layout = terminalTabsFor(state, conversationId);
-      expect(layout.tabs.map((tab) => tab.launch)).toEqual([null, launch]);
-      expect(layout.activeId).toBe(terminalTabId(2));
-    });
-
-    it("gives an existing tab its launch choice and brings it forward", () => {
-      const launch = { workspace: 1, shell: "zsh" as const };
-      const state = apply(
-        initialTerminalTabsState,
-        { type: "add", conversationId },
-        { type: "configure", conversationId, terminalId: terminalTabId(1), launch }
-      );
-      const layout = terminalTabsFor(state, conversationId);
-      expect(layout.tabs[0].launch).toEqual(launch);
-      expect(layout.activeId).toBe(terminalTabId(1));
-      expect(apply(state, {
-        type: "configure", conversationId, terminalId: "terminal-9", launch
-      })).toBe(state);
-    });
+  it("records the workspace and shell a new tab was asked for", () => {
+    const launch = { workspace: 2, shell: "sh" as const };
+    const state = add(add(initialTerminalTabsState), launch);
+    expect(layout(state).tabs.map((tab) => tab.launch)).toEqual([zsh, launch]);
+    expect(layout(state).activeId).toBe(terminalTabId(2));
   });
 
   it("forgets a conversation, and says nothing changed when it never knew it", () => {

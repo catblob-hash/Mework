@@ -96,7 +96,7 @@ fn validate_timeout(timeout: Duration) -> Result<(), String> {
 /// the completion callback. Returned errors contain an operation stage and an
 /// HRESULT, never a URL, profile path, cookie, or credential value.
 pub(crate) fn clear_browsing_data(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     kinds: &[BrowserProfileDataKind],
     timeout: Duration,
@@ -108,7 +108,7 @@ pub(crate) fn clear_browsing_data(
 /// Clears every browsing-data category associated with this WebView2 profile
 /// and returns only after WebView2 invokes its completion handler.
 pub(crate) fn clear_all_browsing_data(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -123,7 +123,7 @@ enum ClearOperation {
 
 #[cfg(windows)]
 fn clear_profile_data(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     operation: ClearOperation,
     timeout: Duration,
@@ -200,9 +200,70 @@ fn clear_profile_data(
         })?
 }
 
-#[cfg(not(windows))]
+/// CEF clears through the page's DevTools channel. Each tab's profile is single-use and deleted
+/// with the tab, so what outlives a clear here is at most the non-web state WebView2 also
+/// tracks (autofill, download and browsing history), which a CEF page never records.
+#[cfg(target_os = "macos")]
 fn clear_profile_data(
-    _page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
+    tail_permit: WebView2Permit,
+    operation: ClearOperation,
+    timeout: Duration,
+) -> Result<(), String> {
+    use BrowserProfileDataKind as Kind;
+
+    validate_timeout(timeout)?;
+    let _tail_permit = tail_permit;
+    let selected = |kind: Kind| match operation {
+        ClearOperation::All => true,
+        ClearOperation::Selected(mask) => mask & kind.mask() != 0,
+    };
+    let mut calls: Vec<(&str, String)> = Vec::new();
+    if selected(Kind::Cookies) || selected(Kind::AllSiteData) {
+        calls.push(("Network.clearBrowserCookies", "{}".to_owned()));
+    }
+    if selected(Kind::DiskCache) || selected(Kind::AllSiteData) {
+        calls.push(("Network.clearBrowserCache", "{}".to_owned()));
+    }
+    let storage_types = if selected(Kind::AllSiteData) {
+        vec!["all"]
+    } else {
+        [
+            (Kind::FileSystems, "file_systems"),
+            (Kind::IndexedDb, "indexeddb"),
+            (Kind::LocalStorage, "local_storage"),
+            (Kind::WebSql, "websql"),
+            (Kind::CacheStorage, "cache_storage"),
+            (Kind::ServiceWorkers, "service_workers"),
+        ]
+        .into_iter()
+        .filter(|(kind, _)| selected(*kind) || selected(Kind::AllDomStorage))
+        .map(|(_, name)| name)
+        .collect()
+    };
+    if !storage_types.is_empty() {
+        // Site storage is cleared per origin; the page's own is the one it can have written.
+        if let Ok(url) = page.url() {
+            let origin = url.origin().ascii_serialization();
+            if origin != "null" {
+                calls.push((
+                    "Storage.clearDataForOrigin",
+                    serde_json::json!({ "origin": origin, "storageTypes": storage_types.join(",") })
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    for (method, parameters) in calls {
+        page.call_devtools_blocking(method, &parameters, timeout)
+            .map_err(|error| format!("清除浏览数据失败（{method}）: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn clear_profile_data(
+    _page: &crate::browser::PageWebview,
     _tail_permit: WebView2Permit,
     _operation: ClearOperation,
     timeout: Duration,
@@ -216,7 +277,7 @@ fn clear_profile_data(
 /// The access kind is `DENY`, which Microsoft documents as the level of access *from other sites*;
 /// the mapping still serves this WebView's own top-level navigation to the host.
 pub(crate) fn map_virtual_host_folder(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     host: &str,
     folder: &std::path::Path,
@@ -237,7 +298,7 @@ pub(crate) fn map_virtual_host_folder(
 
 /// Releases a mapping added by [`map_virtual_host_folder`].
 pub(crate) fn clear_virtual_host_folder(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     host: &str,
 ) -> Result<(), String> {
@@ -269,7 +330,7 @@ impl VirtualHostOperation {
 /// from the queued main-thread task itself rather than from a completion handler.
 #[cfg(windows)]
 fn virtual_host_operation(
-    page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
     tail_permit: WebView2Permit,
     operation: VirtualHostOperation,
 ) -> Result<(), String> {
@@ -325,9 +386,26 @@ fn virtual_host_operation(
         })?
 }
 
-#[cfg(not(windows))]
+/// CEF serves the folder through a scheme handler registered on the page's own request context,
+/// so the mapping is as private to the tab as WebView2's.
+#[cfg(target_os = "macos")]
 fn virtual_host_operation(
-    _page: &tauri::Webview,
+    page: &crate::browser::PageWebview,
+    tail_permit: WebView2Permit,
+    operation: VirtualHostOperation,
+) -> Result<(), String> {
+    let _tail_permit = tail_permit;
+    match operation {
+        VirtualHostOperation::Map { host, folder } => {
+            page.map_virtual_host_folder(&host, std::path::Path::new(&folder))
+        }
+        VirtualHostOperation::Clear { host } => page.clear_virtual_host_folder(&host),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn virtual_host_operation(
+    _page: &crate::browser::PageWebview,
     _tail_permit: WebView2Permit,
     _operation: VirtualHostOperation,
 ) -> Result<(), String> {

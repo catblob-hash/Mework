@@ -10,7 +10,7 @@ use std::{
 use serde::Serialize;
 use wait_timeout::ChildExt;
 
-use crate::path_guard;
+use crate::{host_platform::host_platform, path_guard};
 
 const MAX_WORKSPACE_FILE_BYTES: u64 = 1_048_576;
 /// 图片预览整份过 IPC，base64 还要再涨 4/3，所以这道闸比文本那道低得多也严得多：
@@ -426,7 +426,18 @@ struct GitCandidates {
 /// 让调用方回退到目录遍历。命令直接 spawn 且只读，不取 git.rs 的
 /// repository 锁；超时、输出超帽或退出失败一律按失败回退。
 fn collect_git_search_candidates(root: &Path) -> Option<GitCandidates> {
-    let mut child = Command::new("git")
+    // Resolved here instead of by the OS's own PATH lookup: on a Mac without
+    // the command line tools the first `git` on PATH can be the `/usr/bin`
+    // stand-in, which opens the install dialog on every search. Skipping it
+    // still finds a real git further down PATH, and with none the search walks
+    // the directory as it does wherever git is missing. Windows keeps the
+    // lookup it always had.
+    let git = if host_platform().is_windows() {
+        PathBuf::from("git")
+    } else {
+        crate::environment_tools::resolve_on_path("git")?
+    };
+    let mut child = Command::new(git)
         .arg("--literal-pathspecs")
         .arg("-C")
         .arg(root)

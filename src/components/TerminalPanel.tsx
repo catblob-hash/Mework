@@ -72,6 +72,18 @@ export interface TerminalPanelProps {
    * change here does not restart a running shell.
    */
   launch?: TerminalLaunchChoice;
+  /**
+   * Set only while the terminal belongs to the draft: the project the draft is aimed at, which the
+   * host resolves the shell's directory from because it has no conversation to read it off yet.
+   * Read when the panel opens its session, like `launch`; the draft becoming real does not
+   * restart a running shell.
+   */
+  draftWorkspaceId?: string | null;
+  /**
+   * Awaited before every open, for whatever the host must already know when the open reaches it —
+   * a project the draft was just aimed at, say, that is still on its way to the host.
+   */
+  beforeOpen?: () => Promise<void>;
   initialState?: TerminalSessionState;
   inputDisabledReason?: string | null;
   onCommandStart?: () => boolean;
@@ -120,6 +132,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
       label,
       open,
       launch,
+      draftWorkspaceId = null,
+      beforeOpen,
       initialState,
       inputDisabledReason = null,
       onCommandStart = () => true,
@@ -140,6 +154,10 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
     const terminalIdRef = useRef(terminalId);
     const launchRef = useRef(launch);
     launchRef.current = launch;
+    const draftWorkspaceIdRef = useRef(draftWorkspaceId);
+    draftWorkspaceIdRef.current = draftWorkspaceId;
+    const beforeOpenRef = useRef(beforeOpen);
+    beforeOpenRef.current = beforeOpen;
     const sessionIdRef = useRef<string | null>(null);
     const attemptRef = useRef(0);
     /** The open still in flight, so a close can wait for the host to have a session to kill. */
@@ -387,6 +405,18 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
       )
         return;
 
+      if (beforeOpenRef.current) {
+        // A failure here is the open's to report: the host names what it could not find.
+        await beforeOpenRef.current().catch(() => undefined);
+        if (
+          attemptRef.current !== attempt ||
+          conversationIdRef.current !== expectedConversationId ||
+          terminalIdRef.current !== expectedTerminalId ||
+          !mountedRef.current
+        )
+          return;
+      }
+
       try {
         fitAddonRef.current?.fit();
       } catch {
@@ -418,6 +448,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
           Math.max(1, terminal.rows),
           onEvent,
           launchRef.current,
+          draftWorkspaceIdRef.current,
         );
         if (
           attemptRef.current !== attempt ||

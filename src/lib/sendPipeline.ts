@@ -12,6 +12,7 @@ import {
   type ToolExposureContext
 } from "./toolLock";
 import { findConversation, modelChoiceForConversation } from "./documentUpdates";
+import { isDraftConversationId } from "./draftConversation";
 import {
   contextsContainProjectedImages,
   MAX_COMPOSER_IMAGE_BYTES,
@@ -117,6 +118,9 @@ export interface SendPipelineHost {
   openProviderSettings(): void;
   activeWorkspaceId(): string | null;
   activeConversationId(): string | null;
+  /** Whether the renderer-held draft is still waiting to be sent. It is in no workspace, yet
+   * images added to it are real uploads, carried into the conversation it materializes as. */
+  draftIsOpen(): boolean;
   /** Localized tool catalog for the active document, using the same derivation as App rendering. */
   activeConversationTools(): ToolDescriptor[];
   /** Names enabled for the active conversation and present in the catalog. */
@@ -965,11 +969,15 @@ export function createSendPipeline(
   const addComposerImages = (conversationId: string, files: File[]): Promise<ImageAttachment[]> => {
     if (!files.length) return Promise.resolve([]);
     return composerController.enqueueImageUpload(conversationId, async (uploadStillCurrent) => {
+      // A draft that materialized mid-upload has handed its images on already, so an upload still
+      // addressed to it is as stale as one for a deleted conversation.
       const uploadTargetIsCurrent = () => (
         uploadStillCurrent()
-        && Boolean(documentStore.current()?.workspaces.some((workspace) => (
-          workspace.conversations.some((conversation) => conversation.id === conversationId)
-        )))
+        && (isDraftConversationId(conversationId)
+          ? host().draftIsOpen()
+          : Boolean(documentStore.current()?.workspaces.some((workspace) => (
+            workspace.conversations.some((conversation) => conversation.id === conversationId)
+          ))))
       );
       if (!uploadTargetIsCurrent()) return [];
       const latest = documentStore.current();

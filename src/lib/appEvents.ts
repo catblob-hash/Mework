@@ -9,6 +9,7 @@ import type {
   ContextItem,
   ConversationPlan,
   ForkDecisionRecord,
+  MachineShells,
   PendingForkRequest,
   PendingToolPrompt,
   SecurityLevel
@@ -63,6 +64,10 @@ export type AppPushEvent =
       state: "connecting" | "connected" | "reconnecting" | "lost" | "unavailable";
       detail: string | null;
     }
+  // A machine was probed for its shell backends: this machine at startup, an
+  // SSH machine when this session first reaches it, a WSL distribution on first
+  // use, or from a machine's settings. `key` is the machine's environment key.
+  | { type: "machineShellsChanged"; key: string; shells: MachineShells }
   // A terminal background-task result without an active model run requires a message-less wake run to fold it into the first round boundary. Every terminal result qualifies, a task the user closed included.
   | { type: "taskSettled"; conversationId: string }
   // Background tasks can require dangerous-tool approval when no unsettled run can carry its card. Deliver the prompt through this push event and resolve it with `resolveToolPrompt`.

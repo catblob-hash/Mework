@@ -17,7 +17,7 @@ import {
 } from "./BrowserPanel";
 import { previewBodyState, previewServerRows } from "./PreviewPane";
 
-const workspaceTarget = { kind: "workspace", workspaceId: "workspace-1" } as const;
+const workspaceTarget = { conversationId: "conversation-1" } as const;
 /** The pane the browser draws: its title bar is the browser's own toolbar. */
 const pane = { paneId: "preview:test-session" as const, onPaneClose: () => undefined };
 
@@ -343,6 +343,49 @@ describe("BrowserPanel", () => {
     await user.type(reopened, "throwaway.example{Escape}");
     await waitFor(() => expect(screen.queryByLabelText("页面网址")).not.toBeInTheDocument());
     expect(navigate).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A tab whose page never opened still has an address bar. Typing into it opens the page the way
+   * selecting the tab does and then goes where the user asked; an open that fails says why,
+   * rather than leaving the navigation to fail against a page that is not there.
+   */
+  it("gives a tab without a page one before navigating it, and says why when it cannot", async () => {
+    const user = userEvent.setup();
+    const pageless = { ...openStatus(), hasPage: false, open: false };
+    const status = vi.spyOn(browserApi, "getBrowserStatus").mockResolvedValue(pageless);
+    const navigate = vi.spyOn(browserApi, "navigateBrowser")
+      .mockResolvedValue(openStatus("https://google.com/"));
+    const onOpenPage = vi.fn(async () => {
+      status.mockResolvedValue(openStatus());
+    });
+
+    const { unmount } = render(
+      <BrowserPanel {...pane} native active sessionId="conversation-pageless" onOpenPage={onOpenPage} />
+    );
+    await user.click(await screen.findByRole("button", { name: "输入网址" }));
+    await user.type(screen.getByLabelText("页面网址"), "google.com{Enter}");
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith(
+      "conversation-pageless",
+      expect.stringContaining("google.com")
+    ));
+    expect(onOpenPage).toHaveBeenCalledTimes(1);
+    expect(onOpenPage.mock.invocationCallOrder[0]).toBeLessThan(navigate.mock.invocationCallOrder[0]);
+    unmount();
+
+    navigate.mockClear();
+    status.mockResolvedValue(pageless);
+    const failingOpen = vi.fn(async () => {
+      status.mockResolvedValue({ ...pageless, error: "CEF refused the page's proxy settings" });
+    });
+    render(
+      <BrowserPanel {...pane} native active sessionId="conversation-pageless-failed" onOpenPage={failingOpen} />
+    );
+    await user.click(await screen.findByRole("button", { name: "输入网址" }));
+    await user.type(screen.getByLabelText("页面网址"), "google.com{Enter}");
+    expect(await screen.findByText(/CEF refused the page's proxy settings/)).toBeInTheDocument();
+    expect(failingOpen).toHaveBeenCalledTimes(1);
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("keeps browser ownership controls out of the chrome while agent activity is active", async () => {
@@ -894,7 +937,7 @@ describe("BrowserPanel", () => {
     });
     const target = { kind: "workspace", workspaceId: "workspace-open-file" } as const;
 
-    render(<BrowserPanel {...pane} native sessionId="conversation-open-file" target={target} />);
+    render(<BrowserPanel {...pane} native sessionId="conversation-open-file" fileTarget={target} />);
     const trigger = screen.getByRole("button", { name: "服务器与设置" });
     await waitFor(() => expect(trigger).toBeEnabled());
     await user.click(trigger);
@@ -1133,6 +1176,34 @@ describe("BrowserPanel dev servers", () => {
       .toEqual({ kind: "start-page" });
   });
 
+  it("opens a server on another machine only once the host says it answers", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(previewApi, "listPreviewConfigurations")
+      .mockResolvedValue(configuration([configuredServer("web", 5173)]));
+    const listed = vi.spyOn(previewApi, "listPreviewServers").mockResolvedValue([]);
+    const starting = { ...runningServer("web", 5173), status: "starting" as const, machine: "devbox" };
+    vi.spyOn(previewApi, "startPreviewServer").mockImplementation(async () => {
+      listed.mockResolvedValue([starting]);
+      return { server: starting, reused: false };
+    });
+    render(<BrowserPanel {...pane} native sessionId="conversation-remote" target={{ conversationId: "c", workspace: 2 }} />);
+    const trigger = screen.getByRole("button", { name: "Servers & settings" });
+    await waitFor(() => expect(trigger).toBeEnabled());
+    await user.click(trigger);
+    await user.click(within(await screen.findByRole("menu", { name: "Browser menu" }))
+      .getByRole("menuitemradio", { name: "Run web" }));
+
+    // Started there, still being waited out: the starting card, and no page yet.
+    expect(await screen.findByText("Starting server")).toBeInTheDocument();
+    expect(browserApi.navigateBrowser).not.toHaveBeenCalledWith("conversation-remote", expect.anything());
+
+    listed.mockResolvedValue([{ ...starting, status: "running" }]);
+    await waitFor(() => expect(browserApi.navigateBrowser).toHaveBeenCalledWith(
+      "conversation-remote",
+      "http://localhost:5173/"
+    ), { timeout: 4000 });
+  });
+
   it("lists every configuration in the overflow menu with the row itself as the run control", async () => {
     const user = userEvent.setup();
     vi.spyOn(previewApi, "listPreviewConfigurations")
@@ -1168,6 +1239,36 @@ describe("BrowserPanel dev servers", () => {
     await waitFor(() => expect(browserApi.navigateBrowser).toHaveBeenCalledWith(
       "conversation-servers",
       "http://localhost:5173/"
+    ));
+  });
+
+  it("starts a server for the owner it was given, which is how a new task claims its own", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(previewApi, "listPreviewConfigurations")
+      .mockResolvedValue(configuration([configuredServer("web", 5173)]));
+    vi.spyOn(previewApi, "listPreviewServers").mockResolvedValue([]);
+    const start = vi.spyOn(previewApi, "startPreviewServer").mockResolvedValue({
+      server: { ...runningServer("web", 5173), sessionId: "conv_draft" },
+      reused: false
+    });
+    render(
+      <BrowserPanel
+        {...pane}
+        native
+        sessionId="conv_draft"
+        target={{ conversationId: "conv_draft", draftWorkspaceId: "workspace-1" }}
+      />
+    );
+    const trigger = screen.getByRole("button", { name: "Servers & settings" });
+    await waitFor(() => expect(trigger).toBeEnabled());
+    await user.click(trigger);
+    await user.click(within(await screen.findByRole("menu", { name: "Browser menu" }))
+      .getByRole("menuitemradio", { name: "Run web" }));
+
+    // The draft's servers are its own by the id it will materialize as, which is the target's.
+    await waitFor(() => expect(start).toHaveBeenCalledWith(
+      { conversationId: "conv_draft", draftWorkspaceId: "workspace-1" },
+      "web"
     ));
   });
 

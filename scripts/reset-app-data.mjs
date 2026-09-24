@@ -9,14 +9,18 @@
 import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
 import {
+  dataRootsFor,
   INTERACTIVE_DEV_IDENTIFIER,
+  isMeworkExecutable,
   parseResetArguments,
   planCredentialTargets,
   planDataDirectories,
+  planKeychainItems,
   summarizeCredentials
 } from "./reset-app-data-plan.mjs";
 
@@ -37,7 +41,19 @@ try {
 // The app holds document.v1.json under an exclusive instance lock; deleting the
 // directory underneath a live process leaves it writing into an unlinked file.
 function runningApplications() {
-  if (process.platform !== "win32") return [];
+  if (process.platform !== "win32") {
+    try {
+      const output = execFileSync("ps", ["-axo", "comm="], { encoding: "utf8" });
+      return [...new Set(
+        output
+          .split(/\r?\n/)
+          .filter((line) => line.trim() && isMeworkExecutable(line))
+          .map((line) => path.basename(line.trim()))
+      )];
+    } catch {
+      return [];
+    }
+  }
   try {
     const output = execFileSync(
       "tasklist.exe",
@@ -107,10 +123,8 @@ function formatSize(bytes) {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
-const roots = [
-  { label: "APPDATA", directory: process.env.APPDATA },
-  { label: "LOCALAPPDATA", directory: process.env.LOCALAPPDATA }
-];
+const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
+const roots = dataRootsFor(process.platform, process.env, home);
 for (const root of roots) root.entries = listEntries(root.directory);
 
 let directories;
@@ -120,10 +134,30 @@ try {
   fail(error.message);
 }
 
+// On macOS every credential lives in ~/.mework/credential-vault, sealed under
+// one login-keychain item (src-tauri/src/credential_vault.rs); older builds
+// wrote one keychain item per credential. `--keys` removes the vault and every
+// item of either kind.
 let credentials = [];
-if (options.keys) {
+let keychainItems = [];
+const credentialVaultDirectory = home && fs.existsSync(path.join(home, ".mework", "credential-vault"))
+  ? path.join(home, ".mework", "credential-vault")
+  : null;
+if (options.keys && process.platform === "darwin") {
+  try {
+    // Attributes only: without `-d` the dump neither prints nor unlocks secrets.
+    const output = execFileSync("security", ["dump-keychain"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024
+    });
+    keychainItems = planKeychainItems(output);
+    credentials = keychainItems;
+  } catch (error) {
+    fail(`无法读取 macOS 钥匙串: ${error.message}`);
+  }
+} else if (options.keys) {
   if (process.platform !== "win32") {
-    fail("--keys 目前只支持 Windows 凭据管理器");
+    fail("--keys 目前只支持 Windows 凭据管理器与 macOS 钥匙串");
   }
   try {
     const output = execFileSync("cmdkey.exe", ["/list"], {
@@ -141,15 +175,17 @@ console.log(`${label} 清理范围：${scopeNames[options.scope]}`);
 
 // src-tauri/src/mework_memory.rs keeps the global memory tier under the home
 // directory, deliberately outside both AppData roots.
-const homeMemory = process.env.USERPROFILE || process.env.HOME;
-const memoryDirectory = homeMemory && fs.existsSync(path.join(homeMemory, ".mework", "memory"))
-  ? path.join(homeMemory, ".mework", "memory")
+const memoryDirectory = home && fs.existsSync(path.join(home, ".mework", "memory"))
+  ? path.join(home, ".mework", "memory")
   : null;
-const codexOauthDirectory = homeMemory && fs.existsSync(path.join(homeMemory, ".mework", "codex-oauth"))
-  ? path.join(homeMemory, ".mework", "codex-oauth")
+const codexOauthDirectory = home && fs.existsSync(path.join(home, ".mework", "codex-oauth"))
+  ? path.join(home, ".mework", "codex-oauth")
   : null;
+const keyDirectories = options.keys
+  ? [codexOauthDirectory, credentialVaultDirectory].filter(Boolean)
+  : [];
 
-if (directories.length === 0 && credentials.length === 0) {
+if (directories.length === 0 && credentials.length === 0 && keyDirectories.length === 0) {
   console.log(`${label} 没有需要清理的内容。`);
   process.exit(0);
 }
@@ -168,6 +204,9 @@ for (const { service, count } of summarizeCredentials(credentials)) {
 }
 if (options.keys && codexOauthDirectory) {
   console.log(`${label}   ${codexOauthDirectory}（ChatGPT 登录令牌，随凭据一起清理）`);
+}
+if (options.keys && credentialVaultDirectory) {
+  console.log(`${label}   ${credentialVaultDirectory}（macOS 凭据库，随钥匙串主密钥一起清理）`);
 }
 
 // Global memory is plain Markdown the user wrote by hand and carries no schema
@@ -210,7 +249,17 @@ for (const directory of directories) {
   }
 }
 
-for (const { target } of credentials) {
+for (const { service, account } of keychainItems) {
+  try {
+    execFileSync("security", ["delete-generic-password", "-s", service, "-a", account], { stdio: "ignore" });
+    console.log(`${label} 已删除钥匙串项 ${service} / ${account}`);
+  } catch (error) {
+    failed += 1;
+    console.error(`${label} 无法删除钥匙串项 ${service} / ${account}: ${error.message}`);
+  }
+}
+
+for (const { target } of process.platform === "win32" ? credentials : []) {
   try {
     execFileSync("cmdkey.exe", [`/delete:${target}`], { stdio: "ignore", windowsHide: true });
     console.log(`${label} 已删除凭据 ${target}`);
@@ -221,15 +270,16 @@ for (const { target } of credentials) {
 }
 
 // src-tauri/src/codex_oauth.rs keeps the ChatGPT OAuth tokens as files encrypted
-// under master keys that live in the credentials just deleted. Without those
+// under master keys that live in the credentials just deleted, and on macOS the
+// credential vault is sealed under the keychain item just deleted. Without those
 // keys the files are unreadable, so `--keys` removes them as well.
-if (options.keys && codexOauthDirectory) {
+for (const directory of keyDirectories) {
   try {
-    fs.rmSync(codexOauthDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 120 });
-    console.log(`${label} 已删除 ${codexOauthDirectory}`);
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 120 });
+    console.log(`${label} 已删除 ${directory}`);
   } catch (error) {
     failed += 1;
-    console.error(`${label} 无法删除 ${codexOauthDirectory}: ${error.message}`);
+    console.error(`${label} 无法删除 ${directory}: ${error.message}`);
   }
 }
 

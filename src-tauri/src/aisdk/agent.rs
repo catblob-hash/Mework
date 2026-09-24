@@ -34,7 +34,10 @@ const SESSION_DIR: &str = "claude-agent";
 /// login (`~/.claude`). The sidecar spawns with a cleared environment and the
 /// SDK replaces the CLI environment wholesale, so these must be carried
 /// explicitly. Credentials are deliberately absent: this family has none — the
-/// CLI authenticates with the user's own `claude auth login`.
+/// CLI authenticates with the user's own `claude auth login`. Process-level
+/// variables (`PATH`, the temp directories, the locale) are not repeated here:
+/// the sidecar copies its own inherited environment (`process::INHERITED_ENV`)
+/// into the CLI's, so they arrive by that route.
 const CLAUDE_AGENT_ENV: &[&str] = &[
     "USERPROFILE",
     "HOMEDRIVE",
@@ -273,6 +276,10 @@ const PROBE_ENV: &[&str] = &[
     "PATH",
     "TEMP",
     "TMP",
+    // The POSIX spelling. On macOS it names a per-user private directory under
+    // /var/folders; without it the CLI falls back to the shared, world-writable
+    // /tmp for whatever it stages while answering.
+    "TMPDIR",
 ];
 
 /// Values pinned for the probe: it must answer from local state only, and must
@@ -471,7 +478,14 @@ const LOGIN_STRIPPED_ENV: &[&str] = &[
 /// How long a freshly started terminal or CLI gets to fail. A launcher that
 /// exits non-zero inside this window never showed a window at all; one that is
 /// still running, or handed off to a terminal server and exited zero, did.
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 const LOGIN_LAUNCH_GRACE: Duration = Duration::from_millis(600);
+
+/// How long `open` may take to hand the login script to Terminal. It exits as
+/// soon as LaunchServices has delivered the document, launching Terminal first
+/// if needed, which is seconds even on a cold start; past this it is stuck.
+#[cfg(target_os = "macos")]
+const LOGIN_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Environment for the interactive login. Unlike the probe this is the user's
 /// own environment: a terminal needs the display, session bus and locale
@@ -492,6 +506,7 @@ fn login_env() -> BTreeMap<String, String> {
 /// Waits out the launch grace window and reports a launcher that already died.
 /// `Ok(true)` means the process is still alive or exited cleanly (a terminal
 /// server hand-off); `Ok(false)` means it failed before it could show anything.
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 fn launched(child: &mut std::process::Child) -> Result<bool, String> {
     std::thread::sleep(LOGIN_LAUNCH_GRACE);
     match child.try_wait() {
@@ -507,8 +522,8 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// The shell command Terminal runs for the login. `do script` starts a fresh
-/// shell from Terminal's own environment, not from ours, so the config
+/// The shell command Terminal runs for the login. Terminal starts the script
+/// from a fresh shell with its own environment, not ours, so the config
 /// directory and the stripped authentication variables have to travel inside
 /// the command text: `unset` first, then the directory the probe and the
 /// runtime use, then the CLI.
@@ -525,10 +540,105 @@ fn macos_login_shell_command(executable: &Path, config_dir: Option<&str>) -> Str
     command
 }
 
-/// AppleScript string literal: only the backslash and the double quote need escaping.
+/// The `.command` file Terminal runs for the login. It deletes itself and its
+/// private directory before anything else: `sh` keeps reading from the open
+/// descriptor, and the executable and config paths it names do not outlive the
+/// start. `rmdir` only ever removes an empty directory, so a `$0` that is not
+/// the path Mework wrote cannot take anything else with it.
 #[cfg(target_os = "macos")]
-fn applescript_literal(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+fn macos_login_script(executable: &Path, config_dir: Option<&str>) -> String {
+    format!(
+        "#!/bin/sh\nrm -f \"$0\"\nrmdir \"${{0%/*}}\" 2>/dev/null\n{}\n",
+        macos_login_shell_command(executable, config_dir)
+    )
+}
+
+/// Write the login script into a fresh directory of its own under the user's
+/// temp directory (`$TMPDIR`, per-user and private on macOS). The directory is
+/// created 0700 without `-p`, and the file with `create_new`, so neither can be
+/// a name someone planted in advance, even if the temp directory falls back to
+/// the shared /tmp.
+#[cfg(target_os = "macos")]
+fn write_macos_login_script(contents: &str) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let dir = std::env::temp_dir().join(format!(
+        "mework-claude-login-{}",
+        Uuid::new_v4().simple()
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|error| {
+            format!("无法创建 claude auth login 的临时目录 {}：{error}", dir.display())
+        })?;
+    let script = dir.join("claude-auth-login.command");
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&script)
+        .and_then(|mut file| {
+            // `mode` above passes through the umask; the execute bit is what lets
+            // Terminal run the file at all, so it is set outright.
+            file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            file.write_all(contents.as_bytes())
+        });
+    if let Err(error) = written {
+        remove_macos_login_script(&script);
+        return Err(format!("无法写入 claude auth login 的临时脚本：{error}"));
+    }
+    Ok(script)
+}
+
+/// Best-effort removal of a login script Terminal never started, and of its
+/// directory. Either may already be gone: the script removes both itself.
+#[cfg(target_os = "macos")]
+fn remove_macos_login_script(script: &Path) {
+    let _ = std::fs::remove_file(script);
+    if let Some(dir) = script.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Hand the login script to Terminal through LaunchServices. Opening a
+/// `.command` document is not an Apple Event, unlike `osascript … do script`:
+/// no Automation prompt, no -1743 under the hardened runtime, and no "Don't
+/// Allow" that sticks until the user digs through System Settings. `-a` pins
+/// Terminal even where another app is the `.command` handler. `open` exits once
+/// the document is delivered, so its status is the verdict; no grace window.
+#[cfg(target_os = "macos")]
+fn open_macos_login_script(script: &Path, env: &BTreeMap<String, String>) -> Result<(), String> {
+    let mut child = Command::new("/usr/bin/open")
+        .args(["-a", "Terminal"])
+        .arg(script)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法打开终端运行 claude auth login：{error}"))?;
+    let status = child
+        .wait_timeout(LOGIN_OPEN_TIMEOUT)
+        .map_err(|error| format!("无法确认登录终端是否启动：{error}"))?;
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("等待 Terminal 打开 claude auth login 超时，请手动运行它".into());
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("无法确认登录终端是否启动：{error}"))?;
+    let message = match status.code() {
+        Some(code) => format!("无法让 Terminal 运行 claude auth login，请手动运行它（退出码 {code}）"),
+        None => "无法让 Terminal 运行 claude auth login，请手动运行它".to_owned(),
+    };
+    Err(with_stderr_tail(&message, &output.stderr))
 }
 
 /// Terminal emulators tried in order on Linux, with the flag each one uses to
@@ -578,26 +688,15 @@ pub(crate) fn open_login() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let config_dir = env.get("CLAUDE_CONFIG_DIR").map(String::as_str);
-        let script = applescript_literal(&macos_login_shell_command(&executable, config_dir));
-        let mut child = Command::new("osascript")
-            .arg("-e")
-            .arg(format!(
-                "tell application \"Terminal\" to do script \"{script}\""
-            ))
-            .arg("-e")
-            .arg("tell application \"Terminal\" to activate")
-            .env_clear()
-            .envs(&env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("无法打开终端运行 claude auth login：{error}"))?;
-        return if launched(&mut child)? {
-            Ok(())
-        } else {
-            Err("无法让 Terminal 运行 claude auth login，请手动运行它".into())
-        };
+        let script = write_macos_login_script(&macos_login_script(&executable, config_dir))?;
+        let opened = open_macos_login_script(&script, &env);
+        if opened.is_err() {
+            // The script only deletes itself once Terminal runs it, which a failed
+            // (or timed-out) hand-off gives no reason to expect; one Terminal did
+            // start is already gone, and the removal is then a no-op.
+            remove_macos_login_script(&script);
+        }
+        return opened;
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -796,6 +895,10 @@ mod tests {
         if std::env::var("PATH").is_ok() {
             assert!(env.contains_key("PATH"));
         }
+        // macOS's per-user temp directory, not the shared /tmp.
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            assert_eq!(env.get("TMPDIR"), Some(&tmpdir));
+        }
         if host_platform().is_windows() {
             assert!(
                 env.contains_key("SYSTEMROOT") || env.contains_key("SystemRoot"),
@@ -865,7 +968,75 @@ mod tests {
             "{plain}"
         );
         assert!(!plain.contains("CLAUDE_CONFIG_DIR"), "{plain}");
-        assert_eq!(applescript_literal(r#"say "a\b""#), r#"say \"a\\b\""#);
+    }
+
+    /// The `.command` file is the same command behind a self-removing prologue.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_login_script_removes_itself_before_the_command() {
+        let executable = Path::new("/Applications/Mework.app/Contents/MacOS/claude");
+        let script = macos_login_script(executable, Some("/Users/me/.claude"));
+        assert_eq!(
+            script,
+            format!(
+                "#!/bin/sh\nrm -f \"$0\"\nrmdir \"${{0%/*}}\" 2>/dev/null\n{}\n",
+                macos_login_shell_command(executable, Some("/Users/me/.claude"))
+            )
+        );
+    }
+
+    /// End to end through `sh`, as Terminal runs it: hostile characters in both
+    /// interpolated paths stay data, the authentication overrides are gone, the
+    /// CLI gets `auth login`, and nothing is left on disk afterwards.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_login_script_is_private_quoted_and_self_removing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("it's a \"claude\" $HOME `id`");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s|%s|%s' \"$CLAUDE_CONFIG_DIR\" \"$*\" \"${ANTHROPIC_API_KEY-unset}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_dir = "/tmp/it's $(id) `id` \\ \"dir\"";
+
+        let script = write_macos_login_script(&macos_login_script(&fake, Some(config_dir))).unwrap();
+        let dir = script.parent().unwrap().to_owned();
+        assert_eq!(script.extension().and_then(|value| value.to_str()), Some("command"));
+        for path in [&dir, &script] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{} 必须只有属主可访问", path.display());
+        }
+
+        let output = Command::new(&script)
+            .env("ANTHROPIC_API_KEY", "sk-ant-should-never-reach-login")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{config_dir}|auth login|unset")
+        );
+        assert!(!script.exists(), "脚本启动后必须删掉自己");
+        assert!(!dir.exists(), "脚本的私有目录也必须一起删掉");
+    }
+
+    /// The fallback cleanup for a hand-off that failed removes both the script
+    /// and its directory.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unopened_macos_login_script_is_cleaned_up() {
+        let script = write_macos_login_script("#!/bin/sh\n").unwrap();
+        let dir = script.parent().unwrap().to_owned();
+        remove_macos_login_script(&script);
+        assert!(!script.exists());
+        assert!(!dir.exists());
+        // Already gone: still quiet.
+        remove_macos_login_script(&script);
     }
 
     #[test]

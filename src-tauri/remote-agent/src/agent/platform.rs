@@ -554,15 +554,18 @@ impl ProcessTree {
     /// ending a session ends its tree, but a session released after its
     /// process exited leaves alone what that process deliberately left
     /// running — a server started in the background with its output
-    /// redirected — just as a Unix process group outlives its leader. For the
-    /// same reason a process may break away from the job on purpose.
+    /// redirected — just as a Unix process group outlives its leader.
+    ///
+    /// Nothing may break away from it, though. Cygwin, and with it MSYS2 and
+    /// Git Bash, starts every Windows program with `CREATE_BREAKAWAY_FROM_JOB`
+    /// whenever its own job allows that: under a job that did, every `node`
+    /// or `python` a Bash session ran would be outside the tree, and stopping
+    /// the session — a dev server, a command that timed out — would stop
+    /// Bash and leave the program running.
     #[cfg(windows)]
     pub fn adopt(pid: u32, process: windows_sys::Win32::Foundation::HANDLE) -> Self {
         use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS};
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-        };
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         let own = {
             let mut copy = std::ptr::null_mut();
@@ -580,18 +583,10 @@ impl ProcessTree {
             (duplicated != 0 && !copy.is_null()).then_some(copy)
         };
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        // A new job has no limits, and none are set: in particular neither
+        // breakaway limit.
         let job = (!job.is_null()).then_some(job).and_then(|job| {
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-            let assigned = unsafe {
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::addr_of!(limits).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                );
-                AssignProcessToJobObject(job, process)
-            };
+            let assigned = unsafe { AssignProcessToJobObject(job, process) };
             if assigned == 0 {
                 unsafe { CloseHandle(job) };
                 return None;

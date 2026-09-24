@@ -6,6 +6,8 @@ mod api;
 // This layer owns the NDJSON protocol, lifecycle, and event translation.
 mod aisdk;
 mod app_exit;
+#[cfg(target_os = "macos")]
+mod app_menu;
 mod app_tray;
 mod app_update;
 mod approval;
@@ -28,10 +30,14 @@ mod cancel;
 mod capabilities;
 mod capability_seed;
 mod catalog;
+#[cfg(target_os = "macos")]
+mod cef_host;
 mod child_environment;
 mod chromium_capability;
 mod codex_oauth;
 mod compaction;
+#[cfg(target_os = "macos")]
+mod credential_vault;
 mod console_text;
 mod conversation_fork;
 mod conversation_store;
@@ -60,6 +66,7 @@ mod lsp;
 mod lsp_config;
 /// Language-server processes and the LSP base protocol.
 mod lsp_servers;
+mod machine_shells;
 mod mcp;
 mod mcp_config;
 mod memory_archive_file;
@@ -80,8 +87,14 @@ mod preview;
 /// items are allowed rather than deleted and re-ported.
 #[allow(dead_code)]
 mod preview_launch_config;
+/// Dev servers of a workspace on an SSH machine, run there through its agent.
+mod preview_remote;
+/// The network a page of a remote workspace uses: its machine's, tunnelled over the agent link.
+mod preview_tunnel;
 #[allow(dead_code)]
 mod preview_servers;
+#[cfg(unix)]
+mod process_groups;
 mod project_import_trust;
 mod project_memory;
 mod prompt_profile;
@@ -89,14 +102,17 @@ mod prompt_profile_files;
 mod push_events;
 mod remote_directory;
 mod remote_files;
+mod remote_git;
 mod remote_link;
 mod remote_lsp;
+mod remote_powershell;
 mod remote_shell;
 mod remote_terminal;
 mod reveal_path;
 mod run_environment;
 mod run_stream;
 mod security;
+mod shell_backend;
 mod shell_snapshot;
 mod shell_task_store;
 mod shell_tasks;
@@ -596,7 +612,13 @@ fn load_document(
     let app_data = path
         .parent()
         .ok_or_else(|| "数据文档没有应用数据父目录".to_owned())?;
-    if let Err(error) = workspace_dirs::reconcile_temporary_workspaces(app_data, &document) {
+    // A load is also how a live renderer refetches the authority, so a draft's
+    // shell may still be sitting in its scratch directory.
+    if let Err(error) = workspace_dirs::reconcile_temporary_workspaces(
+        app_data,
+        &document,
+        &state.terminals.draft_bindings(),
+    ) {
         eprintln!("加载文档时同步临时工作区失败，将在下次保存或加载时重试：{error}");
     }
     Ok(document)
@@ -1173,8 +1195,8 @@ fn save_document_blocking(
     // This non-blocking reservation is taken while document authority is
     // locked, so workspace-bound operations cannot cross a transition that
     // invalidates an existing owner. Purely adding a conversation to an
-    // unchanged workspace has no existing owner to invalidate and deliberately
-    // stays concurrent with unrelated runs.
+    // unchanged workspace, or adding a new workspace, has no existing owner to
+    // invalidate and deliberately stays concurrent with unrelated runs.
     let _workspace_lifecycle_operation = workspace_lifecycle_requires_exclusive
         .then(|| state.begin_mutation())
         .transpose()
@@ -1255,6 +1277,8 @@ fn save_document_blocking(
         != canonical.global_settings.resolved_app_language
     {
         app_tray::apply_language(&app, canonical.global_settings.resolved_app_language);
+        #[cfg(target_os = "macos")]
+        app_menu::apply_language(&app, canonical.global_settings.resolved_app_language);
     }
     // The snapshot that dropped these cards is now authoritative, so say so.
     // Publishing before the commit would announce a loss that a later failure
@@ -1334,14 +1358,33 @@ fn save_document_blocking(
             .iter()
             .map(String::as_str),
     );
+    // A draft's shells — the renderer's new task, opened under the id it will materialize as —
+    // belong to no conversation here yet. They leave with their project when it is removed or
+    // moved, and are otherwise kept until the conversation they are waiting to become arrives.
+    let conversation_ids = canonical
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.conversations.iter())
+        .map(|conversation| conversation.id.as_str())
+        .collect::<HashSet<_>>();
+    let rebound_projects = terminal_lifecycle::rebound_workspaces(&previous, &canonical);
+    let draft_terminals = state.terminals.settle_drafts(
+        |owner| conversation_ids.contains(owner),
+        |workspace_id| {
+            rebound_projects.contains(workspace_id)
+                || !canonical
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == workspace_id)
+        },
+    );
     // Defense in depth for malformed legacy documents: no process-local terminal may outlive its
     // owning conversation even if a future binding projection fails to classify that removal.
     state.terminals.close_missing(
-        canonical
-            .workspaces
+        conversation_ids
             .iter()
-            .flat_map(|workspace| workspace.conversations.iter())
-            .map(|conversation| conversation.id.as_str()),
+            .copied()
+            .chain(draft_terminals.keys().map(String::as_str)),
     );
     // Finished shell commands are retained so the task sidebar can answer "did that build pass".
     // A conversation that no longer exists is the one thing that makes that question meaningless.
@@ -1373,7 +1416,7 @@ fn save_document_blocking(
     );
 
     let temporary_workspace_result =
-        workspace_dirs::reconcile_temporary_workspaces(app_data, &canonical);
+        workspace_dirs::reconcile_temporary_workspaces(app_data, &canonical, &draft_terminals);
     for provider_id in removed {
         if let Err(error) = api::delete_api_key(&provider_id) {
             eprintln!("提供商已删除，但清理其 API Key 失败（{provider_id}）：{error}");
@@ -1457,10 +1500,16 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
         .flush(std::time::Duration::from_secs(30))?;
     state.clear_receipts();
     app_tray::apply_language(&app, document.global_settings.resolved_app_language);
+    #[cfg(target_os = "macos")]
+    app_menu::apply_language(&app, document.global_settings.resolved_app_language);
     let image_attachment_result =
         image_attachments::ImageAttachmentStore::new(app_data).purge_all();
-    let temporary_workspace_result =
-        workspace_dirs::reconcile_temporary_workspaces(app_data, &document);
+    // `close_all` above took every draft's shells too.
+    let temporary_workspace_result = workspace_dirs::reconcile_temporary_workspaces(
+        app_data,
+        &document,
+        &std::collections::HashMap::new(),
+    );
     if let Some(previous) = previous {
         let retained = document
             .assets
@@ -1819,6 +1868,26 @@ async fn list_wsl_distros() -> Result<Vec<run_environment::WslDistro>, String> {
     tauri::async_runtime::spawn_blocking(run_environment::list_wsl_distros)
         .await
         .map_err(|error| format!("枚举 WSL 发行版的后台任务失败: {error}"))
+}
+
+/// Whether this computer can run conversations' commands in a sandbox, as the
+/// agent Mework runs here reports it; starting that agent if it is not running.
+#[cfg(not(test))]
+#[tauri::command]
+async fn local_sandbox_support() -> Result<remote_agent::protocol::SandboxSupport, String> {
+    tauri::async_runtime::spawn_blocking(remote_link::local_sandbox_support)
+        .await
+        .map_err(|error| format!("查询沙箱可用性的后台任务失败: {error}"))?
+}
+
+/// Sets this computer up for the sandbox (Windows only, one UAC prompt) and
+/// returns what the agent reports afterwards.
+#[cfg(not(test))]
+#[tauri::command]
+async fn setup_local_sandbox() -> Result<remote_agent::protocol::SandboxSupport, String> {
+    tauri::async_runtime::spawn_blocking(remote_link::setup_local_sandbox)
+        .await
+        .map_err(|error| format!("设置沙箱的后台任务失败: {error}"))?
 }
 
 /// Probes environment dependencies from built-in presets and persisted custom
@@ -2445,6 +2514,70 @@ async fn list_remote_directory(
     .map_err(|error| format!("读取远端目录失败: {error}"))?
 }
 
+/// Every machine's last shell probe, keyed by its environment key (`local`,
+/// `wsl:<distro>`, `ssh:<id>`). This machine is probed first if nothing has
+/// asked yet, so the answer always covers it.
+#[cfg(not(test))]
+#[tauri::command]
+async fn list_machine_shells(
+) -> Result<std::collections::BTreeMap<String, machine_shells::MachineShells>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        machine_shells::local();
+        machine_shells::all()
+    })
+    .await
+    .map_err(|error| format!("读取机器的 shell 探测结果失败: {error}"))
+}
+
+/// Probes one machine for its shell backends now — the button in a machine's
+/// settings, and what the renderer calls right after a machine is added — and
+/// records the answer. `machine` absent is this machine. The machine is looked
+/// up in the persisted catalog, like every other remote operation, so the
+/// renderer cannot name an endpoint that is not registered.
+#[cfg(not(test))]
+#[tauri::command]
+async fn probe_machine_shells(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    machine: Option<model::RunTarget>,
+) -> Result<machine_shells::MachineShells, String> {
+    let assets = execution_environment_assets(&app, state.inner())?;
+    let runner = run_environment::resolve_shell_runner(&assets, machine.as_ref(), None)?;
+    tauri::async_runtime::spawn_blocking(move || machine_shells::probe(machine.as_ref(), &runner))
+        .await
+        .map_err(|error| format!("探测机器的 shell 失败: {error}"))?
+}
+
+/// Probes every registered SSH machine behind `runner`'s endpoint: what the
+/// link hub asks for the first time this process reaches it.
+#[cfg(not(test))]
+fn probe_ssh_endpoint(app: &AppHandle, runner: &run_environment::ShellRunner) {
+    let run_environment::ShellRunner::Ssh {
+        host,
+        port,
+        identity_file,
+        ..
+    } = runner
+    else {
+        return;
+    };
+    let Ok(assets) = execution_environment_assets(app, app.state::<AppState>().inner()) else {
+        return;
+    };
+    for machine in assets.ssh_machines.iter().filter(|machine| {
+        machine.host == *host && machine.port == *port && machine.identity_file == *identity_file
+    }) {
+        let target = model::RunTarget::Ssh {
+            machine_id: machine.id.clone(),
+        };
+        let probed = run_environment::resolve_shell_runner(&assets, Some(&target), None)
+            .and_then(|runner| machine_shells::probe(Some(&target), &runner));
+        if let Err(error) = probed {
+            eprintln!("[machine-shells] {}: probe failed: {error}", machine.name);
+        }
+    }
+}
+
 /// Confirms a directory on another machine and records it as granted this
 /// session, returning the path that machine's shell resolved.
 ///
@@ -2606,6 +2739,7 @@ async fn reveal_search_api_key(
             .storage_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        api::allow_credential_prompt();
         web_search::reveal_provider_api_key(&provider_kind, &slot)
     })
     .await
@@ -2681,6 +2815,7 @@ async fn reveal_decision_api_key(
             .storage_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        api::allow_credential_prompt();
         decision_model::reveal_provider_api_key(&provider_kind)
     })
     .await
@@ -2756,6 +2891,7 @@ async fn reveal_api_key(
             .find(|stored| stored.id == provider.id)
             .ok_or_else(|| format!("API 提供商 {} 尚未保存", provider.id))?;
         api::refuse_api_key_command(stored.family, api::ApiKeyCommand::Reveal)?;
+        api::allow_credential_prompt();
         api::reveal_api_key(&stored.id)
     })
     .await
@@ -3979,10 +4115,13 @@ async fn browser_navigate(
     .map_err(|error| format!("浏览器导航后台任务失败: {error}"))?
 }
 
-/// Returns the visible page as a base64 PNG so the pane can draw on it.
+/// Returns the visible page as a base64 PNG so the pane can paint or draw on it.
 ///
-/// This is a trusted-chrome action, so it claims the page for the user the way the toolbar's
-/// screenshot entry does rather than taking Agent control.
+/// This leaves page ownership alone. The projection loop calls it every second or so while the
+/// pane is visible, so claiming the page for the user here kept every agent preview tool waiting
+/// for a permission the user never meant to withhold. Annotate needs no claim of its own either:
+/// its drawing layer covers the pane, and covering already holds the page for the user until it
+/// closes.
 #[cfg(not(test))]
 #[tauri::command]
 async fn browser_capture_page(
@@ -3996,8 +4135,7 @@ async fn browser_capture_page(
     tauri::async_runtime::spawn_blocking(move || {
         mounts
             .with_validated_mutation(&renderer_mount_id, renderer_mount_generation, || {
-                let session = runtime.session(&session_id)?;
-                session.with_user_control(|| session.capture_page())
+                runtime.session(&session_id)?.capture_page()
             })
             .map_err(browser_renderer_mount_error)?
     })
@@ -4487,6 +4625,64 @@ fn reject_git_write_during_model_run(
     Ok(())
 }
 
+/// A workspace on another machine whose Git status is read there.
+#[cfg(not(test))]
+struct RemoteGitWorkspace {
+    runner: run_environment::ShellRunner,
+    /// `run_environment::env_key` of the machine.
+    machine_key: String,
+    /// The root as the workspace records it, on that machine.
+    root: String,
+}
+
+/// The remote workspace a Git status read addresses, or `None` when it is a
+/// checkout on this host, which the caller reads under a lease as before.
+///
+/// Only the status reads come here. Everything else the Git pane does — diffs,
+/// branches, writes, worktrees — still acts on this filesystem alone and keeps
+/// refusing a workspace on another machine
+/// (`trusted_target_workspace_operation`).
+#[cfg(not(test))]
+fn remote_git_workspace(
+    app: &AppHandle,
+    state: &AppState,
+    target: &GitTarget,
+    request_label: &str,
+) -> Result<Option<RemoteGitWorkspace>, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let document = state.document_store.read(&document_path(app)?)?;
+    let resolved = workspace_lookup::resolve_git_target(&document, target, request_label)?;
+    // A conversation on another machine has no worktree of its own — those
+    // are checked out on this host — so its checkout is the workspace root.
+    let (machine, root) = match resolved {
+        workspace_lookup::ResolvedGitTarget::Conversation { workspace, .. }
+        | workspace_lookup::ResolvedGitTarget::Workspace {
+            workspace,
+            member: None,
+        } => (workspace.machine.as_ref(), &workspace.path),
+        workspace_lookup::ResolvedGitTarget::Workspace {
+            member: Some(member),
+            ..
+        } => (member.machine.as_ref(), &member.path),
+    };
+    let Some(machine) = machine else {
+        return Ok(None);
+    };
+    let runner = run_environment::resolve_shell_runner(
+        &document.assets.execution_environments,
+        Some(machine),
+        Some(root),
+    )?;
+    Ok(Some(RemoteGitWorkspace {
+        runner,
+        machine_key: run_environment::env_key(Some(machine)),
+        root: root.clone(),
+    }))
+}
+
 #[cfg(not(test))]
 #[tauri::command]
 async fn get_git_workspace_snapshot(
@@ -4496,6 +4692,13 @@ async fn get_git_workspace_snapshot(
 ) -> Result<Option<git::GitWorkspaceSnapshot>, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if let Some(remote) = remote_git_workspace(&app, &state, &target, "Git 状态请求")? {
+            return remote_git::workspace_snapshot(
+                &remote.runner,
+                &remote.machine_key,
+                &remote.root,
+            );
+        }
         let operation = trusted_git_workspace_operation(
             &app,
             &state,
@@ -4519,6 +4722,14 @@ async fn get_git_workspace_summary(
 ) -> Result<git::GitWorkspaceSummaryResult, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if let Some(remote) = remote_git_workspace(&app, &state, &target, "Git 摘要请求")? {
+            return remote_git::workspace_summary(
+                &remote.runner,
+                &remote.machine_key,
+                &remote.root,
+                known_revision,
+            );
+        }
         let operation = trusted_git_workspace_operation(
             &app,
             &state,
@@ -4675,15 +4886,122 @@ async fn search_workspace_files(
     .map_err(|error| format!("读取工作区文件的后台任务失败: {error}"))?
 }
 
-/// A dev server owned by one chat, for the conflict messages that say so. A
-/// workspace-addressed request has no chat, and the registry treats an ownerless
-/// server as anybody's.
+/// Where a preview target's workspace is: a directory on this computer, held
+/// shared for as long as the command runs so a Git write or a worktree release
+/// cannot cross it, or a directory on an SSH machine, reached through its agent.
 #[cfg(not(test))]
-fn preview_session_id(target: &GitTarget) -> Option<String> {
-    match target {
-        GitTarget::Conversation { conversation_id } => Some(conversation_id.clone()),
-        GitTarget::Workspace { .. } => None,
+enum PreviewPlace {
+    Local {
+        root: PathBuf,
+        _lease: Box<dyn Send>,
+    },
+    Remote {
+        machine: preview_remote::RemoteMachine,
+        root: String,
+    },
+}
+
+/// The conversation a preview target addresses, with every workspace it can
+/// address, numbered the way the model and the terminal number them.
+///
+/// Resolved from the trusted document exactly as a terminal is — a draft by the
+/// project it is aimed at, a conversation by its own workspace set — so a
+/// preview page and a terminal opened for "workspace 2" are the same directory
+/// on the same machine.
+#[cfg(not(test))]
+fn preview_workspaces(
+    app: &AppHandle,
+    state: &AppState,
+    target: &preview::PreviewTarget,
+) -> Result<crate::workspace_set::WorkspaceSet, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let document = state.document_store.read(&document_path(app)?)?;
+    let owner = TerminalOwner::resolve(
+        &document,
+        &target.conversation_id,
+        target.draft_workspace_id.as_deref(),
+    )?;
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    let anchor = owner.anchor(&app_data)?;
+    owner.workspace_set(&document, &anchor)
+}
+
+/// One workspace of the target, where it is. A workspace on a WSL distribution
+/// has no preview yet: its servers would need a way into the distribution's
+/// network this host does not have.
+#[cfg(not(test))]
+fn preview_place(
+    state: &AppState,
+    target: &preview::PreviewTarget,
+    entry: &crate::workspace_set::ResolvedWorkspace,
+    request_label: &str,
+    lease: bool,
+) -> Result<PreviewPlace, String> {
+    match &entry.machine {
+        None => {
+            let root = PathBuf::from(&entry.root);
+            let lease: Box<dyn Send> = if lease {
+                let canonical = std::fs::canonicalize(&root).map_err(|error| {
+                    format!(
+                        "{request_label}的工作区路径不存在或无法访问（{}）: {error}",
+                        root.display()
+                    )
+                })?;
+                Box::new(state.operation_gate().begin_workspace_operation(
+                    WorkspaceKey::new(canonical),
+                    Some(target.conversation_id.clone()),
+                )?)
+            } else {
+                Box::new(())
+            };
+            Ok(PreviewPlace::Local {
+                root,
+                _lease: lease,
+            })
+        }
+        Some(machine @ model::RunTarget::Ssh { .. }) => Ok(PreviewPlace::Remote {
+            machine: preview_remote::RemoteMachine::new(
+                entry.runner.clone(),
+                run_environment::env_key(Some(machine)),
+                if entry.machine_label.trim().is_empty() {
+                    "the remote machine".to_owned()
+                } else {
+                    entry.machine_label.clone()
+                },
+            ),
+            root: entry.root.clone(),
+        }),
+        Some(model::RunTarget::Wsl { distro }) => Err(format!(
+            "{request_label}：工作区 {} 在 WSL（{distro}）上，预览暂不支持 WSL 工作区",
+            entry.index
+        )),
     }
+}
+
+/// The one workspace a target names — workspace 1 when it names none.
+#[cfg(not(test))]
+fn preview_target_place(
+    app: &AppHandle,
+    state: &AppState,
+    target: &preview::PreviewTarget,
+    request_label: &str,
+    lease: bool,
+) -> Result<PreviewPlace, String> {
+    let workspaces = preview_workspaces(app, state, target)?;
+    let entry = workspaces.select(target.workspace).map_err(|_| {
+        format!(
+            "{request_label}的对话没有工作区 {}（共 {} 个）",
+            target.workspace.unwrap_or(1),
+            workspaces.len()
+        )
+    })?;
+    preview_place(state, target, entry, request_label, lease)
 }
 
 /// Everything `.mework/launch.json` configures, and what is wrong with it.
@@ -4692,92 +5010,157 @@ fn preview_session_id(target: &GitTarget) -> Option<String> {
 /// exists to stop a native child WebView outliving the renderer document that
 /// asked for it; a dev server is an OS process keyed by worktree that is supposed
 /// to survive a renderer reload, and binding it to a mount generation would kill
-/// it on every reload — the opposite of what the list is for. They do take the
-/// workspace-trust guard, because launch.json is workspace data and spawning a
-/// process out of it is privileged.
+/// it on every reload — the opposite of what the list is for. A workspace on this
+/// computer is held shared while it is read, because launch.json is workspace
+/// data and spawning a process out of it is privileged; one on an SSH machine is
+/// read there, and a machine that is away is reported rather than waited on — the
+/// pane asks again on its next tick.
 #[cfg(not(test))]
 #[tauri::command]
 async fn preview_list_configurations(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
+    target: preview::PreviewTarget,
 ) -> Result<preview::PreviewConfigurationList, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "预览服务器配置",
-            TrustedWorkspaceAccess::Shared,
-            None,
-        )?;
-        Ok(preview::configurations(&operation.workspace_path))
+        match preview_target_place(&app, &state, &target, "预览服务器配置", true)? {
+            PreviewPlace::Local { root, _lease } => Ok(preview::configurations(&root)),
+            PreviewPlace::Remote { machine, root } => preview::remote_configurations(
+                &machine.with_patience(preview_remote::POLL_PATIENCE),
+                &root,
+            ),
+        }
     })
     .await
     .map_err(|error| format!("读取预览服务器配置的后台任务失败: {error}"))?
 }
 
-/// The dev servers running for this workspace, whichever chat started them.
+/// The dev servers running for one workspace, whichever chat started them — or,
+/// with no workspace in the target, for every workspace of the conversation, each
+/// carrying its number. Read from this host's registry alone, so a machine that
+/// is away does not hold the list up: its servers are listed as they were last
+/// known, and one that ended while the link was down leaves once the link says so.
 #[cfg(not(test))]
 #[tauri::command]
 async fn preview_list_servers(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
+    target: preview::PreviewTarget,
 ) -> Result<Vec<preview_servers::PreviewServerSnapshot>, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "预览服务器列表",
-            TrustedWorkspaceAccess::Shared,
-            None,
-        )?;
-        Ok(state
-            .preview_servers
-            .servers_for_worktree(&operation.workspace_path))
+        let workspaces = preview_workspaces(&app, &state, &target)?;
+        let entries: Vec<&crate::workspace_set::ResolvedWorkspace> = match target.workspace {
+            Some(index) => vec![workspaces.select(Some(index))?],
+            None => workspaces.entries().iter().collect(),
+        };
+        let spans = target.workspace.is_none();
+        let mut servers = Vec::new();
+        for entry in entries {
+            let listed = match &entry.machine {
+                None => state
+                    .preview_servers
+                    .servers_for_worktree(Path::new(&entry.root)),
+                Some(machine @ model::RunTarget::Ssh { .. }) => state
+                    .preview_servers
+                    .servers_for_worktree(
+                        &preview_remote::RemoteMachine::new(
+                            entry.runner.clone(),
+                            run_environment::env_key(Some(machine)),
+                            entry.machine_label.clone(),
+                        )
+                        .worktree_key(&entry.root),
+                    ),
+                Some(model::RunTarget::Wsl { .. }) => Vec::new(),
+            };
+            servers.extend(listed.into_iter().map(|mut server| {
+                if spans {
+                    server.workspace = Some(entry.index);
+                }
+                server
+            }));
+        }
+        Ok(servers)
     })
     .await
     .map_err(|error| format!("读取预览服务器列表的后台任务失败: {error}"))?
 }
 
 /// Starts the configured server `name` addresses, or returns the one already
-/// answering it.
+/// answering it — on whichever machine the target's workspace is.
 ///
 /// Shared rather than exclusive workspace access: a dev server reads the checkout
 /// and serves it, it does not write it, and demanding exclusivity would refuse
 /// every start made while a model run holds the same workspace — which is exactly
 /// when a preview is wanted.
+///
+/// The server belongs to the target's conversation — for the draft, the id it
+/// will materialize as, the one its shells are opened under — so its servers
+/// carry over to the conversation it becomes.
 #[cfg(not(test))]
 #[tauri::command]
 async fn preview_start_server(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
+    target: preview::PreviewTarget,
     name: Option<String>,
 ) -> Result<preview::PreviewStartOutcome, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "启动预览服务器",
-            TrustedWorkspaceAccess::Shared,
-            None,
-        )?;
-        preview::start(
-            &state.preview_servers,
-            &operation.workspace_path,
-            name.as_deref(),
-            preview_session_id(&target).as_deref(),
-        )
+        let owner = Some(target.conversation_id.as_str());
+        match preview_target_place(&app, &state, &target, "启动预览服务器", true)? {
+            PreviewPlace::Local { root, _lease } => {
+                preview::start(&state.preview_servers, &root, name.as_deref(), owner)
+            }
+            PreviewPlace::Remote { machine, root } => preview::start_remote(
+                &state.preview_servers,
+                &machine,
+                &root,
+                name.as_deref(),
+                owner,
+            ),
+        }
     })
     .await
     .map_err(|error| format!("启动预览服务器的后台任务失败: {error}"))?
+}
+
+/// Puts a preview page on the network of the workspace it belongs to.
+///
+/// A page of a workspace on an SSH machine opens every connection from that
+/// machine — its `localhost` is the machine's, and so is every name it resolves —
+/// through the machine's tunnel ([`preview_tunnel`]); a page of a workspace here,
+/// or with no workspace at all, uses this computer's own network. The renderer
+/// binds a page before it opens it, so its first request already leaves from the
+/// right machine, and again whenever the page moves to another workspace.
+///
+/// No renderer-mount lease: this creates no native surface, it only decides what
+/// network the next one — or the live one — uses.
+#[cfg(not(test))]
+#[tauri::command]
+async fn browser_set_page_network(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    target: Option<preview::PreviewTarget>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let network = match target {
+            None => None,
+            Some(target) => match preview_target_place(&app, &state, &target, "预览页面网络", false)? {
+                PreviewPlace::Local { .. } => None,
+                PreviewPlace::Remote { machine, .. } => Some(browser::PageNetwork {
+                    proxy: preview_tunnel::proxy_for(&machine)?,
+                    machine: machine.key().to_owned(),
+                }),
+            },
+        };
+        state.browser.set_network(&session_id, network)
+    })
+    .await
+    .map_err(|error| format!("设置预览页面网络的后台任务失败: {error}"))?
 }
 
 /// Stops one dev server and forgets it, buffered output included.
@@ -4823,26 +5206,31 @@ fn preview_server_logs(
 ///
 /// The only preview command that writes, so it takes the workspace exclusively.
 /// `false` for every reason the write did not happen — a project with no
-/// launch.json has nowhere to keep the preference.
+/// launch.json has nowhere to keep the preference, and a workspace on another
+/// machine is not written from here.
 #[cfg(not(test))]
 #[tauri::command]
 async fn preview_set_auto_verify(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
+    target: preview::PreviewTarget,
     enabled: bool,
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "预览自动验证设置",
-            TrustedWorkspaceAccess::Exclusive,
-            None,
-        )?;
-        Ok(preview::set_auto_verify(&operation.workspace_path, enabled))
+        match preview_target_place(&app, &state, &target, "预览自动验证设置", false)? {
+            PreviewPlace::Local { root, .. } => {
+                let canonical = std::fs::canonicalize(&root).map_err(|error| {
+                    format!("预览自动验证设置的工作区路径不存在或无法访问（{}）: {error}", root.display())
+                })?;
+                let _lease = state.operation_gate().begin_workspace_mutation(
+                    WorkspaceKey::new(canonical),
+                    Some(target.conversation_id.clone()),
+                )?;
+                Ok(preview::set_auto_verify(&root, enabled))
+            }
+            PreviewPlace::Remote { .. } => Ok(false),
+        }
     })
     .await
     .map_err(|error| format!("写入预览自动验证设置的后台任务失败: {error}"))?
@@ -5278,6 +5666,12 @@ async fn execute_github_action(
 /// numbering the model's tools use: workspace 1, the project's further
 /// workspaces, then the conversation's attached ones. Absent means workspace 1.
 /// `shell` picks the shell program; absent is that machine's default.
+///
+/// `draft_workspace_id` is present when the renderer is asking for its draft —
+/// a new task that has no row yet — and names the project the draft is aimed
+/// at, the temporary one included. The draft's shells are opened under
+/// `conversation_id`, the id it will materialize as. Once the document holds
+/// that conversation the parameter is ignored.
 // The arguments are the IPC contract's named fields, not a grouping choice.
 #[allow(clippy::too_many_arguments)]
 #[cfg(not(test))]
@@ -5291,61 +5685,263 @@ fn open_terminal(
     rows: u16,
     workspace: Option<u32>,
     shell: Option<terminal::TerminalShell>,
+    draft_workspace_id: Option<String>,
     on_event: Channel<terminal::TerminalEvent>,
 ) -> Result<terminal::TerminalOpenResponse, String> {
-    if let Some(index) = workspace.filter(|index| *index != 1) {
-        let (launch, startup_lease, command_lease_factory) =
-            workspace_terminal_launch(&app, state.inner(), &conversation_id, index, shell)?;
-        return state.terminals.open(
-            &conversation_id,
-            &terminal_id,
-            launch,
-            cols,
-            rows,
-            on_event,
-            startup_lease,
-            command_lease_factory,
-        );
-    }
-    // A conversation whose workspace is on another machine gets a shell on that
-    // machine. There is no host checkout under it, so no workspace lease is
-    // taken and the command lease is a no-op: the mutex those guard exists for
-    // Git operations on this filesystem.
-    if let Some(launch) = remote_terminal_launch(&app, state.inner(), &conversation_id, shell)? {
-        return state.terminals.open(
-            &conversation_id,
-            &terminal_id,
-            launch,
-            cols,
-            rows,
-            on_event,
-            Box::new(()),
-            no_op_terminal_command_leases(),
-        );
-    }
-    let operation = trusted_workspace_operation(
+    let plan = terminal_launch_plan(
         &app,
         state.inner(),
         &conversation_id,
-        "终端请求",
-        TrustedWorkspaceAccess::Shared,
+        draft_workspace_id.as_deref(),
+        workspace,
+        shell,
     )?;
-    let launch = terminal::TerminalLaunch::host(&operation.workspace_path, shell)?;
-    let command_lease_factory = terminal_command_leases(
-        state.inner(),
-        operation.workspace_key,
-        conversation_id.clone(),
-    );
-    state.terminals.open(
+    let opened = state.terminals.open(
         &conversation_id,
         &terminal_id,
-        launch,
+        plan.launch,
         cols,
         rows,
         on_event,
-        operation.lease,
-        command_lease_factory,
-    )
+        plan.startup_lease,
+        plan.command_leases,
+    );
+    if opened.is_err() && plan.draft {
+        state.terminals.release_idle_draft(&conversation_id);
+    }
+    opened
+}
+
+/// Whose terminal is being opened, resolved from the trusted document.
+#[cfg(not(test))]
+enum TerminalOwner<'a> {
+    Conversation {
+        project: &'a Workspace,
+        conversation: &'a Conversation,
+    },
+    /// The renderer's draft: no conversation yet, only the project it is aimed
+    /// at and the id it will materialize as. It has no worktree — one is made
+    /// only once it is real — and no attached workspaces the host knows of.
+    Draft { project: &'a Workspace, id: &'a str },
+}
+
+#[cfg(not(test))]
+impl<'a> TerminalOwner<'a> {
+    fn resolve(
+        document: &'a AppDocument,
+        conversation_id: &'a str,
+        draft_workspace_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let materialized = document.workspaces.iter().any(|workspace| {
+            workspace
+                .conversations
+                .iter()
+                .any(|conversation| conversation.id == conversation_id)
+        });
+        if let Some(workspace_id) = draft_workspace_id.filter(|_| !materialized) {
+            let project = document
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .ok_or_else(|| "终端请求的项目不在后端已保存文档中".to_owned())?;
+            if project.kind == WorkspaceKind::Unsupported {
+                return Err("终端请求的项目类型不受支持".into());
+            }
+            return Ok(Self::Draft {
+                project,
+                id: conversation_id,
+            });
+        }
+        let (project, conversation) =
+            trusted_workspace_and_conversation(document, conversation_id, "终端请求")?;
+        Ok(Self::Conversation {
+            project,
+            conversation,
+        })
+    }
+
+    fn project(&self) -> &'a Workspace {
+        match self {
+            Self::Conversation { project, .. } | Self::Draft { project, .. } => project,
+        }
+    }
+
+    /// The directory workspace 1 runs in: the conversation's effective one, or
+    /// for a draft the one its conversation will have before any worktree.
+    fn anchor(&self, app_data: &Path) -> Result<String, String> {
+        match self {
+            Self::Conversation {
+                project,
+                conversation,
+            } => effective_workspace_path(app_data, project, conversation),
+            Self::Draft { project, id } => workspace_anchor_path(app_data, project, id, None),
+        }
+    }
+
+    fn workspace_set(
+        &self,
+        document: &AppDocument,
+        anchor: &str,
+    ) -> Result<crate::workspace_set::WorkspaceSet, String> {
+        match self {
+            Self::Conversation {
+                project,
+                conversation,
+            } => conversation_workspace_set(document, project, conversation, anchor),
+            Self::Draft { project, .. } => {
+                project_workspace_set(document, project, project.member_workspaces(), anchor)
+            }
+        }
+    }
+}
+
+/// A terminal's launch and leases, resolved from one read of the document.
+#[cfg(not(test))]
+struct TerminalLaunchPlan {
+    launch: terminal::TerminalLaunch,
+    startup_lease: terminal::TerminalCommandLease,
+    command_leases: terminal::TerminalCommandLeaseFactory,
+    /// The owner is a draft, now bound to its project in `state.terminals`.
+    draft: bool,
+}
+
+/// Resolves where a terminal runs and what it holds while it does.
+///
+/// Workspace `index >= 2` is an entry of the owner's trusted workspace set — a
+/// project's further workspace, or one the conversation attached — resolved
+/// from the same document read a model run resolves its own set from, so
+/// terminal workspace 3 is the directory the model's workspace 3 is. Otherwise
+/// it is workspace 1: on another machine, that machine's shell anchored locally
+/// at the owner's own directory; on this one, the owner's effective directory.
+///
+/// A directory on this machine gets a startup lease, taken before the storage
+/// lock is released, which binds the resolved directory to the coordinator
+/// acquisition the way `trusted_target_workspace_operation` does; every command
+/// then holds the workspace shared, attributed to the owner, so a Git write or a
+/// worktree release cannot cross it. A remote directory has no checkout here,
+/// so its leases are no-ops: the mutex they guard exists for Git operations on
+/// this filesystem.
+///
+/// A draft is bound to its project here, under the same lock, so no save can
+/// see its shell before it sees what the shell belongs to.
+#[cfg(not(test))]
+fn terminal_launch_plan(
+    app: &AppHandle,
+    state: &AppState,
+    conversation_id: &str,
+    draft_workspace_id: Option<&str>,
+    workspace: Option<u32>,
+    shell: Option<terminal::TerminalShell>,
+) -> Result<TerminalLaunchPlan, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let document = state.document_store.read(&document_path(app)?)?;
+    let owner = TerminalOwner::resolve(&document, conversation_id, draft_workspace_id)?;
+    let project = owner.project();
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    let anchor = owner.anchor(&app_data)?;
+    let (launch, startup_lease, command_leases) = if let Some(index) =
+        workspace.filter(|index| *index != 1)
+    {
+        let workspaces = owner.workspace_set(&document, &anchor)?;
+        let entry = workspaces.get(index).ok_or_else(|| {
+            format!(
+                "终端请求的对话没有工作区 {index}（共 {} 个）",
+                workspaces.len()
+            )
+        })?;
+        if entry.is_local() {
+            host_terminal_launch(
+                state,
+                conversation_id,
+                &PathBuf::from(&entry.root),
+                shell,
+                &format!("终端请求的工作区 {index} "),
+            )?
+        } else {
+            (
+                terminal::TerminalLaunch::remote(
+                    &entry.runner,
+                    &entry.root,
+                    Path::new(&anchor),
+                    shell,
+                )?,
+                Box::new(()) as terminal::TerminalCommandLease,
+                no_op_terminal_command_leases(),
+            )
+        }
+    } else if let Some(machine) = project
+        .machine
+        .as_ref()
+        .filter(|_| project.kind == WorkspaceKind::Directory)
+    {
+        let runner = crate::run_environment::resolve_shell_runner(
+            &document.assets.execution_environments,
+            Some(machine),
+            Some(&project.path),
+        )?;
+        (
+            terminal::TerminalLaunch::remote(&runner, &project.path, Path::new(&anchor), shell)?,
+            Box::new(()) as terminal::TerminalCommandLease,
+            no_op_terminal_command_leases(),
+        )
+    } else {
+        host_terminal_launch(
+            state,
+            conversation_id,
+            &PathBuf::from(&anchor),
+            shell,
+            "终端请求的工作区",
+        )?
+    };
+    let draft = matches!(owner, TerminalOwner::Draft { .. });
+    if draft {
+        state.terminals.bind_draft(conversation_id, &project.id);
+    }
+    Ok(TerminalLaunchPlan {
+        launch,
+        startup_lease,
+        command_leases,
+        draft,
+    })
+}
+
+/// A shell in `root`, a directory on this machine, with its startup lease and
+/// command leases attributed to `owner`.
+#[cfg(not(test))]
+fn host_terminal_launch(
+    state: &AppState,
+    owner: &str,
+    root: &Path,
+    shell: Option<terminal::TerminalShell>,
+    label: &str,
+) -> Result<
+    (
+        terminal::TerminalLaunch,
+        terminal::TerminalCommandLease,
+        terminal::TerminalCommandLeaseFactory,
+    ),
+    String,
+> {
+    let canonical = std::fs::canonicalize(root)
+        .map_err(|error| format!("{label}路径不存在或无法访问（{}）: {error}", root.display()))?;
+    let workspace_key = WorkspaceKey::new(canonical);
+    let startup_lease: terminal::TerminalCommandLease = Box::new(
+        state
+            .operation_gate()
+            .begin_workspace_operation(workspace_key.clone(), Some(owner.to_owned()))?,
+    );
+    let launch = terminal::TerminalLaunch::host(root, shell)?;
+    Ok((
+        launch,
+        startup_lease,
+        terminal_command_leases(state, workspace_key, owner.to_owned()),
+    ))
 }
 
 /// Command leases for a terminal whose directory is not a checkout on this
@@ -5371,118 +5967,6 @@ fn terminal_command_leases(
             .begin_workspace_operation(workspace_key.clone(), Some(conversation_id.clone()))
             .map(|operation| Box::new(operation) as terminal::TerminalCommandLease)
     })
-}
-
-/// The terminal launch for a conversation whose workspace is on another
-/// machine, or `None` when the workspace is on this one.
-#[cfg(not(test))]
-fn remote_terminal_launch(
-    app: &AppHandle,
-    state: &AppState,
-    conversation_id: &str,
-    shell: Option<terminal::TerminalShell>,
-) -> Result<Option<terminal::TerminalLaunch>, String> {
-    let _guard = state
-        .storage_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let document = state.document_store.read(&document_path(app)?)?;
-    let (workspace, conversation) =
-        trusted_workspace_and_conversation(&document, conversation_id, "终端请求")?;
-    let Some(machine) = workspace
-        .machine
-        .as_ref()
-        .filter(|_| workspace.kind == WorkspaceKind::Directory)
-    else {
-        return Ok(None);
-    };
-    let runner = crate::run_environment::resolve_shell_runner(
-        &document.assets.execution_environments,
-        Some(machine),
-        Some(&workspace.path),
-    )?;
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    let anchor = effective_workspace_path(&app_data, workspace, conversation)?;
-    terminal::TerminalLaunch::remote(&runner, &workspace.path, Path::new(&anchor), shell).map(Some)
-}
-
-/// The terminal launch, startup lease and command leases for a conversation's
-/// workspace `index` (`>= 2`): a project's further workspace or one the
-/// conversation attached.
-///
-/// The entry comes from the conversation's trusted workspace set, resolved from
-/// the same document read — under the storage lock — that a model run resolves
-/// its own set from, so terminal workspace 3 is the directory the model's
-/// workspace 3 is. The renderer names a number, never a path. The startup lease
-/// is taken before the lock is released, which binds the resolved directory to
-/// the coordinator acquisition the way `trusted_target_workspace_operation`
-/// does. An entry on another machine gets that machine's shell with no-op
-/// leases, anchored locally at the conversation's own effective directory.
-#[cfg(not(test))]
-fn workspace_terminal_launch(
-    app: &AppHandle,
-    state: &AppState,
-    conversation_id: &str,
-    index: u32,
-    shell: Option<terminal::TerminalShell>,
-) -> Result<
-    (
-        terminal::TerminalLaunch,
-        terminal::TerminalCommandLease,
-        terminal::TerminalCommandLeaseFactory,
-    ),
-    String,
-> {
-    let _guard = state
-        .storage_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let document = state.document_store.read(&document_path(app)?)?;
-    let (project, conversation) =
-        trusted_workspace_and_conversation(&document, conversation_id, "终端请求")?;
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    let anchor = effective_workspace_path(&app_data, project, conversation)?;
-    let workspaces = conversation_workspace_set(&document, project, conversation, &anchor)?;
-    let entry = workspaces.get(index).ok_or_else(|| {
-        format!(
-            "终端请求的对话没有工作区 {index}（共 {} 个）",
-            workspaces.len()
-        )
-    })?;
-    if !entry.is_local() {
-        let launch = terminal::TerminalLaunch::remote(
-            &entry.runner,
-            &entry.root,
-            Path::new(&anchor),
-            shell,
-        )?;
-        return Ok((launch, Box::new(()), no_op_terminal_command_leases()));
-    }
-    let root = PathBuf::from(&entry.root);
-    let canonical = std::fs::canonicalize(&root).map_err(|error| {
-        format!(
-            "终端请求的工作区 {index} 路径不存在或无法访问（{}）: {error}",
-            root.display()
-        )
-    })?;
-    let workspace_key = WorkspaceKey::new(canonical);
-    let startup_lease: terminal::TerminalCommandLease = Box::new(
-        state
-            .operation_gate()
-            .begin_workspace_operation(workspace_key.clone(), Some(conversation_id.to_owned()))?,
-    );
-    let launch = terminal::TerminalLaunch::host(&root, shell)?;
-    Ok((
-        launch,
-        startup_lease,
-        terminal_command_leases(state, workspace_key, conversation_id.to_owned()),
-    ))
 }
 
 #[cfg(not(test))]
@@ -5535,6 +6019,21 @@ fn close_terminal(
     terminal_id: String,
 ) -> bool {
     state.terminals.close(&conversation_id, &terminal_id)
+}
+
+/// How many of a conversation's terminals still have a shell running — a
+/// draft's included, under the id it will materialize as. The renderer only
+/// observes the terminals on screen, so this is what it asks before ending the
+/// rest.
+#[cfg(not(test))]
+#[tauri::command]
+fn live_terminal_count(state: State<'_, AppState>, conversation_id: String) -> usize {
+    state
+        .terminals
+        .task_snapshots(&conversation_id)
+        .iter()
+        .filter(|terminal| terminal.alive)
+        .count()
 }
 
 /// Asks one running `bash` / `powershell` tool call to stop. Returns false when
@@ -6310,10 +6809,16 @@ fn environment_machine(
         }
         // The catalog name when the machine is still registered; the host
         // address is not a substitute, because a machine the user renamed
-        // is the one they recognize by its name.
-        Some(model::RunTarget::Ssh { .. }) => {
-            environment_prompt::EnvironmentMachine::Ssh(workspace.machine_label.clone())
-        }
+        // is the one they recognize by its name. Its OS follows once a probe
+        // has found it: the host's own platform, stated below, says nothing
+        // about a Windows machine reached over SSH, and which shell tools can
+        // name the workspace depends on it.
+        Some(model::RunTarget::Ssh { .. }) => environment_prompt::EnvironmentMachine::Ssh(
+            match workspace.os {
+                Some(os) => format!("{}, {}", workspace.machine_label, os.display_name()),
+                None => workspace.machine_label.clone(),
+            },
+        ),
     }
 }
 
@@ -6589,6 +7094,19 @@ fn trusted_run_request(
         Some(lock) if !lock.mcp_ids.is_empty() => lock.mcp_tool_discovery,
         _ => conversation.settings.mcp_tool_discovery_enabled,
     };
+    // Which tools take their decision parameters, and whether beside their direct parameters or
+    // instead of them. Widened by the lock rather than pinned: a schema the model has already
+    // been shown may grow, but never stop accepting calls the transcript holds.
+    request.decision_parameter_modes = decision_tools::effective_parameter_modes(
+        &conversation.settings,
+        &request.enabled_tools,
+    );
+    // Which of those tools score their misses. Kept to the tools with a mode: a tool on its
+    // direct form never asks the decision model, so there is no miss to score.
+    request.decision_miss_scoring = decision_tools::effective_miss_scoring(
+        &conversation.settings,
+        &request.decision_parameter_modes,
+    );
     // The file write guards are unconditional, so nothing is read from the
     // settings for them. What a run still resolves here is the read record it
     // consults: a top-level run's is the conversation's own scope.
@@ -6621,6 +7139,7 @@ fn trusted_run_request(
     // catalog and apply only the separately persisted model-facing description override; never
     // trust a renderer-supplied descriptor that could relabel PowerShell or change its schema.
     request.tools = tools;
+    decision_tools::inject_parameter_schemas(&mut request);
     Ok(request)
 }
 
@@ -6691,8 +7210,8 @@ enum TrustedWorkspaceAccess {
 struct TrustedWorkspaceOperation {
     git_network_policy: git::GitNetworkPolicy,
     workspace_path: PathBuf,
-    workspace_key: WorkspaceKey,
-    lease: Box<dyn Send>,
+    /// Held, never read: the operation owns the workspace for as long as it lives.
+    _lease: Box<dyn Send>,
 }
 
 #[cfg(not(test))]
@@ -6866,17 +7385,16 @@ fn trusted_target_workspace_operation(
     let operation_gate = state.operation_gate();
     let lease: Box<dyn Send> = match access {
         TrustedWorkspaceAccess::Shared => {
-            Box::new(operation_gate.begin_workspace_operation(workspace_key.clone(), attribution)?)
+            Box::new(operation_gate.begin_workspace_operation(workspace_key, attribution)?)
         }
         TrustedWorkspaceAccess::Exclusive => {
-            Box::new(operation_gate.begin_workspace_mutation(workspace_key.clone(), attribution)?)
+            Box::new(operation_gate.begin_workspace_mutation(workspace_key, attribution)?)
         }
     };
     Ok(TrustedWorkspaceOperation {
         git_network_policy,
         workspace_path,
-        workspace_key,
-        lease,
+        _lease: lease,
     })
 }
 
@@ -6984,6 +7502,24 @@ fn effective_workspace_path(
     workspace: &Workspace,
     conversation: &Conversation,
 ) -> Result<String, String> {
+    workspace_anchor_path(
+        app_data,
+        workspace,
+        &conversation.id,
+        conversation.worktree.as_ref(),
+    )
+}
+
+/// [`effective_workspace_path`] for an owner that may not be a conversation yet:
+/// `owner_id` keys the scratch directories, and `worktree` is the owner's
+/// isolated checkout, if it has one.
+#[cfg(not(test))]
+fn workspace_anchor_path(
+    app_data: &Path,
+    workspace: &Workspace,
+    owner_id: &str,
+    worktree: Option<&model::ConversationWorktree>,
+) -> Result<String, String> {
     match workspace.kind {
         WorkspaceKind::Directory => {
             if workspace.path.trim().is_empty() {
@@ -6997,7 +7533,7 @@ fn effective_workspace_path(
             // A recorded worktree cannot exist for it: worktrees are Git
             // checkouts the host makes on this machine.
             if workspace.machine.is_some() {
-                return workspace_dirs::ensure_remote_workspace_anchor(app_data, &conversation.id)
+                return workspace_dirs::ensure_remote_workspace_anchor(app_data, owner_id)
                     .map(|path| path.to_string_lossy().into_owned());
             }
             // An isolated worktree is this conversation's trusted directory; all
@@ -7005,7 +7541,7 @@ fn effective_workspace_path(
             //
             // Fall back to the workspace root when a registered directory no
             // longer exists; stale records must not make conversations unusable.
-            if let Some(worktree) = &conversation.worktree {
+            if let Some(worktree) = worktree {
                 let path = Path::new(&worktree.path);
                 if path.is_dir() {
                     return Ok(worktree.path.clone());
@@ -7017,7 +7553,7 @@ fn effective_workspace_path(
             if workspace.id != "__temporary__" {
                 return Err("临时工作区对话不在保留临时工作区中".into());
             }
-            workspace_dirs::ensure_temporary_workspace(app_data, &conversation.id)
+            workspace_dirs::ensure_temporary_workspace(app_data, owner_id)
                 .map(|path| path.to_string_lossy().into_owned())
         }
         WorkspaceKind::Unsupported => Err(format!("工作区 {} 的类型不受支持", workspace.id)),
@@ -7058,18 +7594,45 @@ fn conversation_workspace_set(
     conversation: &model::Conversation,
     anchor: &str,
 ) -> Result<crate::workspace_set::WorkspaceSet, String> {
+    Ok(project_workspace_set(
+        document,
+        workspace,
+        &workspace.conversation_workspaces_after_primary(conversation),
+        anchor,
+    )?
+    .sandboxed(&document.assets.execution_environments.sandbox, &conversation.id))
+}
+
+/// [`conversation_workspace_set`] with the workspaces after workspace 1 given
+/// directly, for an owner that is not a conversation yet.
+#[cfg(not(test))]
+fn project_workspace_set(
+    document: &AppDocument,
+    workspace: &Workspace,
+    after_primary: &[model::AttachedWorkspace],
+    anchor: &str,
+) -> Result<crate::workspace_set::WorkspaceSet, String> {
     let primary = primary_workspace(workspace, anchor);
     let primary_env_path = if workspace.kind == WorkspaceKind::Directory {
         workspace.path.as_str()
     } else {
         primary.path.as_str()
     };
-    crate::workspace_set::WorkspaceSet::resolve_with_primary_env(
+    let set = crate::workspace_set::WorkspaceSet::resolve_with_primary_env(
         &document.assets.execution_environments,
         &primary,
         primary_env_path,
-        &workspace.conversation_workspaces_after_primary(conversation),
-    )
+        after_primary,
+    )?;
+    // A WSL distribution is probed for its shells the first time this process
+    // runs something for a workspace on it. SSH machines are probed when their
+    // link first connects; this machine at startup.
+    for entry in set.entries() {
+        if let Some(target @ model::RunTarget::Wsl { .. }) = &entry.machine {
+            machine_shells::refresh_in_background(Some(target.clone()), entry.runner.clone());
+        }
+    }
+    Ok(set)
 }
 
 #[cfg(not(test))]
@@ -7898,13 +8461,39 @@ fn finalize_app_shutdown(app_handle: &AppHandle, coordinator: &app_exit::AppExit
         return;
     }
     let state = app_handle.state::<AppState>();
+    // An exit that never passed the barrier still gets its writes, best effort,
+    // in the barrier's order. On macOS that is every quit no menu item sees —
+    // Dock → Quit, logout, an AppleScript `quit` — since tao reports
+    // `applicationWillTerminate:` only as this event, and nothing can keep the
+    // application open any more.
+    let bypassed_barrier = !coordinator.is_ready();
+    if bypassed_barrier {
+        if let Err(error) = state.prose_journals.flush_for_exit() {
+            eprintln!("退出前落盘文稿日志失败：{error}");
+        }
+        if let Err(error) = state.shell_tasks.flush() {
+            eprintln!("退出前落盘 Shell 任务失败：{error}");
+        }
+    }
     if let Err(error) = state
         .document_store
         .flush(std::time::Duration::from_secs(30))
     {
         eprintln!("退出前落盘文档失败：{error}");
     }
+    if bypassed_barrier {
+        let reconciled = document_path(app_handle)
+            .and_then(|anchor| conversation_store::store_for(&anchor))
+            .and_then(|store| store.reconcile_streaming());
+        if let Err(error) = reconciled {
+            eprintln!("退出前收尾流式会话失败：{error}");
+        }
+    }
     state.browser.shutdown_all();
+    // The pages are gone; now the Chromium they ran in. The engine only exists on macOS, and
+    // only once a page was opened.
+    #[cfg(target_os = "macos")]
+    cef_host::shutdown();
     state.terminals.close_all();
     // A dev server is a detached child in its own job object, so nothing else in
     // this teardown reaches it. Leaving one behind would hold its port against the
@@ -7920,6 +8509,11 @@ fn finalize_app_shutdown(app_handle: &AppHandle, coordinator: &app_exit::AppExit
     // The AI SDK sidecar is a resident Node process. Windows Job Objects only
     // cover forced parent termination, so normal exit must explicitly stop it.
     crate::aisdk::process::shutdown_sidecar();
+    // Whatever else Mework started as its own process group — the shell tool's
+    // commands, background ones included, and managed MCP servers — ends with
+    // it, as its kill-on-close job object ends it on Windows.
+    #[cfg(unix)]
+    process_groups::terminate_all();
 }
 
 /// The application's Tauri context, expanded once for the whole crate.
@@ -7944,6 +8538,12 @@ pub fn run() {
     // with, which is not the toolchain-first PATH cargo needed to build it.
     child_environment::restore_dev_application_path();
     child_environment::adopt_login_shell_path();
+    // Before the first `keyring::Entry` exists: on macOS every credential goes
+    // through one keychain item instead of one item (and one dialog) each.
+    #[cfg(target_os = "macos")]
+    credential_vault::install();
+    #[cfg(unix)]
+    restrict_user_data_directory();
     let exit_coordinator = app_exit::AppExitCoordinator::default();
     let tray_exit_coordinator = exit_coordinator.clone();
     let app = tauri::Builder::default()
@@ -8054,6 +8654,26 @@ pub fn run() {
                         });
                     })),
                 );
+                // Each machine's shell backends: this one now, an SSH machine
+                // the first time this process reaches it, a WSL distribution
+                // the first time something runs there.
+                let shells_events = app.state::<AppState>().push_events.clone();
+                machine_shells::install(
+                    app_data,
+                    Some(Box::new(move |key, shells| {
+                        shells_events.publish(push_events::AppPushEvent::MachineShellsChanged {
+                            key: key.to_owned(),
+                            shells: shells.clone(),
+                        });
+                    })),
+                );
+                std::thread::spawn(|| {
+                    machine_shells::local();
+                });
+                let reach_app = app.handle().clone();
+                remote_link::on_first_reach(Box::new(move |runner| {
+                    probe_ssh_endpoint(&reach_app, &runner);
+                }));
             }
             reconcile_image_attachments_on_startup(app.handle()).map_err(std::io::Error::other)?;
             install_background_write_failure_reporting(app.state::<AppState>().inner());
@@ -8119,6 +8739,22 @@ pub fn run() {
                 .current_snapshot(&path)
                 .map(|document| document.global_settings.resolved_app_language)
                 .unwrap_or_default();
+            // Cmd+Q must reach the same barrier as the tray's Quit; macOS would
+            // otherwise end the process without it (see app_menu).
+            #[cfg(target_os = "macos")]
+            {
+                let menu_coordinator = tray_exit_coordinator.clone();
+                if let Err(error) = app_menu::install(app.handle(), language, move |app_handle| {
+                    request_deferred_exit_with_barrier(
+                        app_handle.clone(),
+                        menu_coordinator.clone(),
+                        0,
+                        |_, code| code,
+                    );
+                }) {
+                    eprintln!("应用菜单不可用，Cmd+Q 将跳过退出前保存：{error}");
+                }
+            }
             let quit_coordinator = tray_exit_coordinator.clone();
             if let Err(error) = app_tray::install(
                 app.handle(),
@@ -8216,11 +8852,63 @@ pub fn run() {
     });
 }
 
+/// Keeps `~/.mework` owner-only.
+///
+/// It holds the global memory, skills, hooks and agent definitions the user
+/// wrote, beside the sealed credential and Codex stores. Created with the
+/// default umask it is readable by every local account in the user's group —
+/// `staff` on a Mac, whose home folder that group may traverse — so it is
+/// created, or narrowed, to 0700 before anything writes into it. Windows
+/// profile ACLs already keep it private.
+#[cfg(all(unix, not(test)))]
+fn restrict_user_data_directory() {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let Some(directory) = dirs::home_dir().map(|home| home.join(".mework")) else {
+        return;
+    };
+    let result = match std::fs::symlink_metadata(&directory) {
+        // Only a real directory that is ours; anything else is left for the
+        // modules that use it to refuse.
+        Ok(metadata)
+            if metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 != 0 =>
+        {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        eprintln!("无法将 {} 设为仅本人可访问：{error}", directory.display());
+    }
+}
+
+/// When this process is one of the built-in browser's Chromium helpers rather than Mework
+/// itself, runs it and returns its exit code. `main` asks before anything else starts.
+#[cfg(target_os = "macos")]
+pub fn cef_subprocess_main() -> Option<i32> {
+    cef_host::subprocess_main()
+}
+
+/// The whole of `Mework Helper`, the bundled Chromium subprocess executable on macOS.
+#[cfg(target_os = "macos")]
+pub fn cef_helper_main() -> i32 {
+    cef_host::helper_main()
+}
+
 #[cfg(all(feature = "browser-dev", not(test)))]
 pub fn run_browser_dev() -> i32 {
     // Same handoff as `run`, and for the same reason: `cargo run` builds and
     // executes under one environment, so only the application can split them.
     child_environment::restore_dev_application_path();
     child_environment::adopt_login_shell_path();
+    #[cfg(target_os = "macos")]
+    credential_vault::install();
+    #[cfg(unix)]
+    restrict_user_data_directory();
     browser_dev::run()
 }

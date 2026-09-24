@@ -39,6 +39,7 @@ use crate::{
     model::{ImageAttachment, JsonObject},
     prompt_profile::{PromptKey, PromptProfile},
     run_environment::{self, RemoteCommandOutput, ShellRunner},
+    shell_backend::ScriptDialect,
     tool_executor::{
         apply_edit, optional_bool, optional_string, optional_u64, parse_read_range,
         required_string, slice_text_lines, truncate_chars, unified_diff, write_receipt_note,
@@ -92,6 +93,12 @@ pub(crate) trait RemoteShell {
         timeout: Duration,
         cancel: &CancelSignal,
     ) -> Result<RemoteCommandOutput, String>;
+
+    /// The dialect the scripts sent through here must be written in: the
+    /// machine's agent shell's.
+    fn dialect(&self) -> ScriptDialect {
+        ScriptDialect::Posix
+    }
 }
 
 impl RemoteShell for ShellRunner {
@@ -104,6 +111,27 @@ impl RemoteShell for ShellRunner {
     ) -> Result<RemoteCommandOutput, String> {
         run_environment::run_remote_script(self, script, stdin, timeout, cancel)
     }
+
+    fn dialect(&self) -> ScriptDialect {
+        self.script_dialect()
+    }
+}
+
+/// The PowerShell form of a workspace's scripts, when its machine's agent
+/// shell is PowerShell ([`crate::remote_powershell`]); `None` for the POSIX
+/// scripts every other agent shell reads. The root is checked the way the
+/// POSIX quoting checks it.
+fn powershell<'a>(
+    target: &'a RemoteWorkspace<'_>,
+) -> Result<Option<crate::remote_powershell::Target<'a>>, String> {
+    if target.workspace.runner.script_dialect() != ScriptDialect::PowerShell {
+        return Ok(None);
+    }
+    check_operand(&target.workspace.root, "workspace root")?;
+    Ok(Some(crate::remote_powershell::Target {
+        root: &target.workspace.root,
+        confine: target.confinement == Confinement::Workspace,
+    }))
 }
 
 /// A search may walk a whole checkout over a link that is not fast; a file round
@@ -553,6 +581,10 @@ fn listing_script(
     depth: u64,
     limit: usize,
 ) -> Result<String, String> {
+    if let Some(ps) = powershell(target)? {
+        check_operand(path, "path")?;
+        return Ok(crate::remote_powershell::listing(&ps, path, depth + 1, limit + 1));
+    }
     let mut script = prologue(target, path, TargetMode::Existing)?;
     script.push_str(&format!("[ -d \"$C\" ] || exit {EXIT_WRONG_KIND}\n"));
     script.push_str(&format!(
@@ -677,6 +709,17 @@ fn grep_script(
     pattern: &str,
     case_sensitive: bool,
 ) -> Result<String, String> {
+    if let Some(ps) = powershell(target)? {
+        check_operand(path, "path")?;
+        quote_search_operand(pattern, "pattern")?;
+        return Ok(crate::remote_powershell::grep(
+            &ps,
+            path,
+            pattern,
+            case_sensitive,
+            MAX_SEARCH_MATCHES + 1,
+        ));
+    }
     let pattern = quote_search_operand(pattern, "pattern")?;
     let case = if case_sensitive { "" } else { " -i" };
     let mut script = prologue(target, path, TargetMode::Existing)?;
@@ -784,6 +827,16 @@ fn name_only_query(query: &str) -> bool {
 }
 
 fn find_script(target: &RemoteWorkspace<'_>, path: &str, query: &str) -> Result<String, String> {
+    if let Some(ps) = powershell(target)? {
+        check_operand(path, "path")?;
+        quote_search_operand(query, "query")?;
+        return Ok(crate::remote_powershell::find(
+            &ps,
+            path,
+            name_only_query(query).then_some(query),
+            MAX_SCANNED_ENTRIES + 1,
+        ));
+    }
     let filter = if name_only_query(query) {
         format!(" -name {}", quote_search_operand(query, "query")?)
     } else {
@@ -870,6 +923,10 @@ fn find_with(
 // ---------------------------------------------------------------------------
 
 fn read_script(target: &RemoteWorkspace<'_>, path: &str) -> Result<String, String> {
+    if let Some(ps) = powershell(target)? {
+        check_operand(path, "path")?;
+        return Ok(crate::remote_powershell::read(&ps, path, MAX_IMAGE_ATTACHMENT_BYTES));
+    }
     let mut script = prologue(target, path, TargetMode::Existing)?;
     script.push_str(&format!("[ -f \"$C\" ] || exit {EXIT_WRONG_KIND}\n"));
     script.push_str("MT=$(digits \"$(mtime \"$C\")\")\nSZ=$(digits \"$(fsize \"$C\")\")\n");
@@ -1041,6 +1098,10 @@ struct FileProbe {
 }
 
 fn probe_script(target: &RemoteWorkspace<'_>, path: &str) -> Result<String, String> {
+    if let Some(ps) = powershell(target)? {
+        check_operand(path, "path")?;
+        return Ok(crate::remote_powershell::probe(&ps, path, MAX_TEXT_FILE));
+    }
     let mut script = prologue(target, path, TargetMode::ForWrite)?;
     script.push_str(&format!(
         r#"if [ ! -e "$C" ]; then
@@ -1110,6 +1171,10 @@ fn cas_write_script(
     path: &str,
     fingerprint: &str,
 ) -> Result<String, String> {
+    if let Some(ps) = powershell(target)? {
+        check_operand(path, "path")?;
+        return Ok(crate::remote_powershell::cas_write(&ps, path, fingerprint));
+    }
     let mut script = prologue(target, path, TargetMode::ForWrite)?;
     script.push_str(&format!("FP={}\n", run_environment::sh_single_quote(fingerprint)));
     script.push_str(&format!(
@@ -1418,6 +1483,7 @@ pub(crate) mod tests {
         let app_data = tempfile::tempdir().unwrap();
         crate::remote_link::install(app_data.path(), Vec::new(), None);
         let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host,
             port: 0,
             identity_file: String::new(),
@@ -1475,6 +1541,118 @@ pub(crate) mod tests {
             .run(&format!("rm -rf -- {quoted} {beside}"), None, FILE_TIMEOUT, &cancel)
             .unwrap();
         assert_eq!(cleaned.status, Some(0));
+        crate::remote_link::shutdown();
+    }
+
+    /// The file tools against a real Windows machine whose agent shell is
+    /// PowerShell: the PowerShell scripts, run by the agent, keep the POSIX
+    /// scripts' contract — including confinement through a junction that leads
+    /// out of the root. Set `MEWORK_E2E_SSH_WINDOWS_HOST` and run with
+    /// `--ignored`; `MEWORK_E2E_POWERSHELL` picks the program (`powershell`,
+    /// Windows PowerShell 5.1, by default; `pwsh` for PowerShell 7).
+    #[test]
+    #[ignore]
+    fn over_real_ssh_the_powershell_agent_shell_runs_the_file_tools() {
+        use crate::shell_backend::{AgentShell, ShellBackend};
+        let host = std::env::var("MEWORK_E2E_SSH_WINDOWS_HOST").expect("MEWORK_E2E_SSH_WINDOWS_HOST");
+        let program = std::env::var("MEWORK_E2E_POWERSHELL").unwrap_or_else(|_| "powershell".into());
+        let app_data = tempfile::tempdir().unwrap();
+        crate::remote_link::install(app_data.path(), Vec::new(), None);
+        let runner = ShellRunner::Ssh {
+            agent_shell: AgentShell::new(ShellBackend::PowerShell, program),
+            host,
+            port: 0,
+            identity_file: String::new(),
+            env: Default::default(),
+        };
+        let cancel = CancelSignal::default();
+        let home = runner
+            .run("[Console]::Out.Write($HOME.Replace('\\', '/'))", None, FILE_TIMEOUT, &cancel)
+            .unwrap();
+        let home = String::from_utf8_lossy(&home.stdout).trim().to_owned();
+        assert!(home.contains(":/"), "{home}");
+        let root = format!("{home}/mework-e2e-ps-files");
+        let outside = format!("{home}/mework-e2e-ps-outside");
+        let reset = runner
+            .run(
+                &format!(
+                    "$ErrorActionPreference = 'Stop'\n\
+                     foreach ($p in @({root}, {outside})) {{ if (Test-Path -LiteralPath $p) {{ cmd /c rmdir /s /q ($p.Replace('/', '\\')) }} }}\n\
+                     New-Item -ItemType Directory -Path {root} | Out-Null\n\
+                     New-Item -ItemType Directory -Path {outside} | Out-Null\n\
+                     Set-Content -LiteralPath ({outside} + '/secret.txt') -Value 'secret'\n\
+                     New-Item -ItemType Junction -Path ({root} + '/link') -Target {outside} | Out-Null\n",
+                    root = crate::remote_shell::ps_single_quote(&root),
+                    outside = crate::remote_shell::ps_single_quote(&outside),
+                ),
+                None,
+                FILE_TIMEOUT,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(reset.status, Some(0), "{}", reset.stderr);
+
+        let set = WorkspaceSet::single(root.clone(), runner.clone());
+        let profile = PromptProfile::default();
+        let target = RemoteWorkspace {
+            workspace: set.primary().expect("one workspace"),
+            machine_key: "ssh:e2e".to_owned(),
+            confinement: Confinement::Workspace,
+            profile: &profile,
+            cancel: &cancel,
+        };
+        run_write(
+            &target,
+            &input(json!({"path": "notes/it's.txt", "content": "hello 中文\nsecond line\n"})),
+            None,
+        )
+        .unwrap();
+        let read = run_read(&target, &input(json!({"path": "notes/it's.txt"})), None, None).unwrap();
+        assert!(read.output.contains("hello 中文"), "{}", read.output);
+        let edited = run_edit(
+            &target,
+            &input(json!({"path": "notes/it's.txt", "find": "second", "replace": "2nd"})),
+            None,
+        )
+        .unwrap();
+        assert!(edited.diff.as_deref().is_some_and(|diff| diff.contains("+2nd line")), "{:?}", edited.diff);
+        // A second write against what the first left behind: the fingerprint
+        // round trip holds, and a file changed underneath is refused.
+        run_write(&target, &input(json!({"path": "notes/it's.txt", "content": "third\n"})), None).unwrap();
+        let listing = run_ls(&target, &input(json!({"depth": 2}))).unwrap();
+        assert!(listing.contains("notes/it's.txt") && listing.contains("link"), "{listing}");
+        assert!(!listing.contains("link/secret.txt"), "a junction is not descended into: {listing}");
+        let grep = run_grep(&target, &input(json!({"pattern": "th(i)rd"}))).unwrap();
+        assert!(grep.contains("notes/it's.txt:1:third"), "{grep}");
+        let bad = run_grep(&target, &input(json!({"pattern": "("}))).refusal();
+        assert!(bad.contains("Invalid regular expression"), "{bad}");
+        let found = run_find(&target, &input(json!({"query": "*.txt"}))).unwrap();
+        assert!(found.contains("notes/it's.txt"), "{found}");
+        let through_junction = run_read(&target, &input(json!({"path": "link/secret.txt"})), None, None).refusal();
+        assert!(through_junction.contains("outside workspace"), "{through_junction}");
+        let parent = run_read(&target, &input(json!({"path": "../mework-e2e-ps-outside/secret.txt"})), None, None).refusal();
+        assert!(parent.contains("outside workspace"), "{parent}");
+        // The Git Bash spelling of a path in the root names the same file.
+        let drive = root.chars().next().unwrap().to_ascii_lowercase();
+        let posix = format!("/{drive}{}/notes/it's.txt", &root[2..]);
+        let read = run_read(&target, &input(json!({"path": posix})), None, None).unwrap();
+        assert!(read.output.contains("third"), "{}", read.output);
+        let entries = list_entries(&target, ".", 3).unwrap();
+        assert!(entries.iter().any(|entry| entry == "notes/it's.txt"), "{entries:?}");
+
+        let cleaned = runner
+            .run(
+                &format!(
+                    "foreach ($p in @({}, {})) {{ cmd /c rmdir /s /q ($p.Replace('/', '\\')) }}",
+                    crate::remote_shell::ps_single_quote(&root),
+                    crate::remote_shell::ps_single_quote(&outside),
+                ),
+                None,
+                FILE_TIMEOUT,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(cleaned.status, Some(0), "{}", cleaned.stderr);
         crate::remote_link::shutdown();
     }
 
@@ -1718,16 +1896,39 @@ pub(crate) mod tests {
     /// machine. It stands in for the transport only: nothing about the scripts
     /// is host-specific, so a POSIX shell here answers what a POSIX shell there
     /// would.
+    /// A local POSIX shell standing in for a remote machine's agent shell,
+    /// started exactly as the agent starts one ([`AgentShell::script_argv`]).
+    ///
+    /// Bash by default. `MEWORK_TEST_AGENT_SHELL=zsh` or `=sh` runs the whole
+    /// suite through that backend instead, so every script is checked in each
+    /// dialect the combination table registers — zsh in `sh` emulation, and
+    /// `sh`, which on most machines is dash, BusyBox ash or bash in POSIX mode.
+    ///
+    /// [`AgentShell::script_argv`]: crate::shell_backend::AgentShell::script_argv
     pub(crate) struct LocalBash {
-        executable: String,
+        shell: crate::shell_backend::AgentShell,
     }
 
     impl LocalBash {
         pub(crate) fn find() -> Option<Self> {
-            run_environment::local_bash_candidates()
-                .into_iter()
-                .next()
-                .map(|executable| Self { executable })
+            let backend = std::env::var("MEWORK_TEST_AGENT_SHELL")
+                .ok()
+                .and_then(|name| crate::shell_backend::ShellBackend::parse(&name))
+                .unwrap_or(crate::shell_backend::ShellBackend::Bash);
+            Self::for_backend(backend)
+        }
+
+        pub(crate) fn for_backend(backend: crate::shell_backend::ShellBackend) -> Option<Self> {
+            let program = match backend {
+                crate::shell_backend::ShellBackend::Bash => {
+                    run_environment::local_bash_candidates().into_iter().next()?
+                }
+                crate::shell_backend::ShellBackend::PowerShell => return None,
+                other => run_environment::local_program_path(other.id())?,
+            };
+            Some(Self {
+                shell: crate::shell_backend::AgentShell::new(backend, program),
+            })
         }
     }
 
@@ -1739,8 +1940,9 @@ pub(crate) mod tests {
             _timeout: Duration,
             _cancel: &CancelSignal,
         ) -> Result<RemoteCommandOutput, String> {
-            let mut child = Command::new(&self.executable)
-                .args(["--noprofile", "--norc", "-c", script])
+            let argv = self.shell.script_argv(script);
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
                 .stdin(if stdin.is_some() {
                     Stdio::piped()
                 } else {
@@ -1749,7 +1951,7 @@ pub(crate) mod tests {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|error| format!("failed to start bash: {error}"))?;
+                .map_err(|error| format!("failed to start {}: {error}", self.shell.program))?;
             let writer = match (child.stdin.take(), stdin) {
                 (Some(mut pipe), Some(bytes)) => {
                     let bytes = bytes.to_vec();
@@ -1878,6 +2080,52 @@ pub(crate) mod tests {
             ls_with(&fixture.shell, &target, &input(json!({"path": "a.txt"}))).refusal();
         assert_eq!(not_a_directory, "ls target is not a directory: a.txt");
         assert!(ls_with(&fixture.shell, &target, &input(json!({"depth": 9}))).is_err());
+    }
+
+    /// Every POSIX agent shell the table registers runs the same scripts to
+    /// the same answers: bash with no startup files, zsh in `sh` emulation,
+    /// and plain `sh`. Each backend this machine has gets the round trip a
+    /// conversation makes — write, read, edit, list, search, find, and a
+    /// refused path outside the root.
+    #[cfg(unix)]
+    #[test]
+    fn every_posix_agent_shell_runs_the_file_tools_alike() {
+        use crate::shell_backend::ShellBackend;
+        for backend in [ShellBackend::Bash, ShellBackend::Zsh, ShellBackend::Sh] {
+            let Some(shell) = LocalBash::for_backend(backend) else {
+                continue;
+            };
+            let Some(fixture) = fixture() else { return };
+            write_fixture_file(&fixture, "sub/deep/c.txt", b"gamma\n");
+            let harness = Harness::new(&fixture);
+            let target = harness.target(Confinement::Workspace);
+            write_with(
+                &shell,
+                &target,
+                &input(json!({"path": "notes/it's.txt", "content": "hello 中文\nsecond line\n"})),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{backend}: write: {error}"));
+            let read = read_with(&shell, &target, &input(json!({"path": "notes/it's.txt"})), None, None)
+                .unwrap_or_else(|error| panic!("{backend}: read: {error}"));
+            assert!(read.output.contains("hello 中文"), "{backend}: {}", read.output);
+            let edited = edit_with(
+                &shell,
+                &target,
+                &input(json!({"path": "notes/it's.txt", "find": "second", "replace": "2nd"})),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{backend}: edit: {error}"));
+            assert!(edited.diff.as_deref().is_some_and(|diff| diff.contains("+2nd line")), "{backend}");
+            let listing = ls_with(&shell, &target, &input(json!({"depth": 2}))).unwrap();
+            assert_eq!(listing, "notes/\nnotes/it's.txt\nsub/\nsub/deep/\nsub/deep/c.txt", "{backend}");
+            let grep = grep_with(&shell, &target, &input(json!({"pattern": "2nd|gamma"}))).unwrap();
+            assert!(grep.contains("notes/it's.txt:2:2nd line") && grep.contains("sub/deep/c.txt:1:gamma"), "{backend}: {grep}");
+            let found = find_with(&shell, &target, &input(json!({"query": "*.txt"}))).unwrap();
+            assert_eq!(found, "notes/it's.txt\nsub/deep/c.txt", "{backend}");
+            let outside = read_with(&shell, &target, &input(json!({"path": "../outside.txt"})), None, None).refusal();
+            assert!(outside.contains("outside workspace") || outside.contains("No such file"), "{backend}: {outside}");
+        }
     }
 
     /// `find_files` walks with the same script and the same relative spelling, but takes the

@@ -40,7 +40,7 @@
     "test:e2e-fixture-surface": "node --test scripts/tests/e2e-fixture-surface.test.mjs",
     "test:frontend-csp": "node scripts/check-frontend-csp.mjs && node --test scripts/tests/frontend-csp-source.test.mjs scripts/tests/frontend-csp.test.mjs scripts/tests/frontend-csp-browser.test.mjs",
     "test:frontend-csp-browser": "node --test scripts/tests/frontend-csp-browser.test.mjs",
-    "test:native-build-tools": "node --test scripts/tests/windows-native-build-tools.test.mjs",
+    "test:native-build-tools": "node --test scripts/tests/windows-native-build-tools.test.mjs scripts/tests/macos-dev-signing.test.mjs",
     "test:dev-child-environment": "node --test scripts/tests/dev-child-environment.test.mjs",
     "test:dev-server-port": "node --test scripts/tests/dev-server-port.test.mjs",
     "test:browser-dev-lifecycle": "node --test scripts/tests/browser-dev-lifecycle.test.mjs",

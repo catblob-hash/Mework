@@ -80,6 +80,41 @@ const SCRIPT_OUTPUT_LIMIT: u64 = 48 << 20;
 /// Told about every link's state changes, by the machine's host name.
 pub type StatusObserver = Box<dyn Fn(&str, &LinkStatus) + Send + Sync>;
 
+/// Called, on a thread of its own, the first time this process reaches an SSH
+/// endpoint — its link connected, or the agent turned out not to serve it and
+/// the per-command transport took over — with the runner that reached it.
+/// This is when a machine's shell backends are probed each session.
+pub type FirstReachHook = Box<dyn Fn(ShellRunner) + Send + Sync>;
+
+static FIRST_REACH: OnceLock<FirstReachHook> = OnceLock::new();
+
+/// Installs the [`FirstReachHook`]. Once per process; later calls are ignored.
+pub fn on_first_reach(hook: FirstReachHook) {
+    let _ = FIRST_REACH.set(hook);
+}
+
+/// Hands `runner` to the hook unless its endpoint was already announced this
+/// process. On a fresh thread before anything is locked: link observers run
+/// inside the link's own machinery, some of them while the hub is locked.
+fn announce_reached(key: String, runner: ShellRunner) {
+    if FIRST_REACH.get().is_none() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("remote-first-reach".into())
+        .spawn(move || {
+            let Some(hub) = HUB.get() else {
+                return;
+            };
+            if !lock(&hub.state).announced.insert(key) {
+                return;
+            }
+            if let Some(hook) = FIRST_REACH.get() {
+                hook(runner);
+            }
+        });
+}
+
 struct Hub {
     observer: Option<StatusObserver>,
     client_id: String,
@@ -89,8 +124,30 @@ struct Hub {
     /// Builds for this host's own triple laid out without a triple directory,
     /// as `cargo build` leaves them.
     native_builds: Vec<PathBuf>,
-    catalog: OnceLock<Catalog>,
+    /// Found on first use, and again after a build is made here.
+    catalog: Mutex<Option<Arc<Catalog>>>,
+    /// One per platform a build is being made for, so machines of one platform connecting
+    /// together wait for a single build instead of each starting one.
+    building: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     state: Mutex<HubState>,
+}
+
+impl Hub {
+    fn catalog(&self) -> Arc<Catalog> {
+        lock(&self.catalog)
+            .get_or_insert_with(|| Arc::new(Catalog::discover(&self.agent_dirs, &self.native_builds)))
+            .clone()
+    }
+
+    fn rediscover(&self) -> Arc<Catalog> {
+        let fresh = Arc::new(Catalog::discover(&self.agent_dirs, &self.native_builds));
+        *lock(&self.catalog) = Some(fresh.clone());
+        fresh
+    }
+
+    fn building(&self, platform: &str) -> Arc<Mutex<()>> {
+        lock(&self.building).entry(platform.to_owned()).or_default().clone()
+    }
 }
 
 #[derive(Default)]
@@ -100,6 +157,8 @@ struct HubState {
     last_used: HashMap<String, Instant>,
     /// Endpoints the agent cannot serve, with why and since when.
     unavailable: HashMap<String, (String, Instant)>,
+    /// Endpoints handed to the [`FirstReachHook`] this process.
+    announced: std::collections::HashSet<String>,
 }
 
 static HUB: OnceLock<Hub> = OnceLock::new();
@@ -128,7 +187,8 @@ pub fn install(app_data: &Path, bundled_dirs: Vec<PathBuf>, observer: Option<Sta
         epoch: uuid::Uuid::new_v4().simple().to_string(),
         agent_dirs,
         native_builds,
-        catalog: OnceLock::new(),
+        catalog: Mutex::new(None),
+        building: Mutex::new(HashMap::new()),
         state: Mutex::new(HubState::default()),
     });
     if installed.is_ok() {
@@ -271,7 +331,13 @@ pub fn route(runner: &ShellRunner, patience: Duration) -> Route {
                 let config = LinkConfig::new(hub.client_id.clone(), hub.epoch.clone());
                 let link = Link::start(config, launcher);
                 let observed_host = host.clone();
-                link.set_observer(move |status| report_status(&observed_host, status));
+                let reached = (key.clone(), runner.clone());
+                link.set_observer(move |status| {
+                    report_status(&observed_host, status);
+                    if matches!(status, LinkStatus::Connected { .. }) {
+                        announce_reached(reached.0.clone(), reached.1.clone());
+                    }
+                });
                 state.links.insert(key.clone(), link.clone());
                 link
             }
@@ -284,9 +350,10 @@ pub fn route(runner: &ShellRunner, patience: Duration) -> Route {
             LinkStatus::Unavailable { error } => {
                 let mut state = lock(&hub.state);
                 state.links.remove(&key);
-                state.unavailable.insert(key, (error.clone(), Instant::now()));
+                state.unavailable.insert(key.clone(), (error.clone(), Instant::now()));
                 drop(state);
                 eprintln!("[remote-agent] {host}: using per-command SSH ({error})");
+                announce_reached(key, runner.clone());
                 Route::Legacy
             }
             LinkStatus::Closed => Route::Legacy,
@@ -310,10 +377,21 @@ fn report_status(host: &str, status: &LinkStatus) {
         observer(host, status);
     }
     match status {
-        LinkStatus::Connected { agent } => eprintln!(
-            "[remote-agent] {host}: connected to agent {} (pid {}, {}/{})",
-            agent.version, agent.pid, agent.os, agent.arch
-        ),
+        LinkStatus::Connected { agent } => {
+            eprintln!(
+                "[remote-agent] {host}: connected to agent {} (pid {}, {}/{})",
+                agent.version, agent.pid, agent.os, agent.arch
+            );
+            // Only builds of this host's own source are installed, so this is a daemon the host
+            // did not start from its catalog — worth a line when something misbehaves.
+            if agent.source.as_deref() != Some(remote_agent::SOURCE_ID) {
+                eprintln!(
+                    "[remote-agent] {host}: warning: the agent was built from other source ({}) than this Mework ({})",
+                    agent.source.as_deref().map_or("unknown", |source| &source[..source.len().min(12)]),
+                    &remote_agent::SOURCE_ID[..12]
+                );
+            }
+        }
         LinkStatus::Reconnecting { attempt, error } if *attempt > 0 || !error.is_empty() => {
             eprintln!("[remote-agent] {host}: reconnecting (attempt {attempt}): {error}")
         }
@@ -339,6 +417,25 @@ fn call_error(host: &str, error: CallError) -> String {
         CallError::Failed(failure) => failure.message,
         CallError::Timeout => format!("The SSH machine {host} did not answer in time"),
         CallError::Link(reason) => format!("Lost the link to the SSH machine {host}: {reason}"),
+    }
+}
+
+/// [`call_error`] for a spawn of `program`. The agent's own helpers are asked for by
+/// [`protocol::SELF_PROGRAM`]; an agent that answers that it cannot find such a program on `PATH`
+/// is a build from before it knew the name, which a host only reaches through a daemon it did not
+/// install itself — and saying so is the only useful thing to say.
+fn spawn_error(host: &str, program: &str, error: CallError) -> String {
+    match error {
+        CallError::Failed(failure)
+            if failure.kind == protocol::FailureKind::NotFound
+                && program == protocol::SELF_PROGRAM =>
+        {
+            format!(
+                "the Mework agent on {host} is an older build that lacks the helpers this needs; \
+                 restart Mework to have it replaced with this version's agent"
+            )
+        }
+        error => call_error(host, error),
     }
 }
 
@@ -398,10 +495,12 @@ pub fn run_script_on(
         output_limit: Some(SCRIPT_OUTPUT_LIMIT),
         orphan_ttl_secs: Some(timeout.as_secs().max(60)),
         label: Some("script".into()),
+        sandbox: None,
     };
+    let program = spec.argv.first().cloned().unwrap_or_default();
     let mut process = link
         .spawn(spec, stdin.unwrap_or_default(), REQUEST_TIMEOUT)
-        .map_err(|error| call_error(host, error))?;
+        .map_err(|error| spawn_error(host, &program, error))?;
     let stdout = drain(process.take_stdout());
     let stderr = drain(process.take_stderr());
     let deadline = Instant::now() + timeout;
@@ -483,12 +582,76 @@ pub fn spawn(
             output_limit: None,
             orphan_ttl_secs: None,
             label: Some(label.to_owned()),
+            sandbox: None,
         };
         let process = link
             .spawn(spec, b"", REQUEST_TIMEOUT)
             .map_err(|error| call_error(&host, error))?;
         Ok(AgentChild { process })
     })())
+}
+
+/// Starts `argv` in `cwd` over `link` as a long-lived service — a dev server — that outlives
+/// its link for `orphan_ttl` the way a terminal does, with `extra_env` on top of the runner's
+/// variables.
+pub fn spawn_service(
+    link: &Link,
+    runner: &ShellRunner,
+    argv: Vec<String>,
+    cwd: Option<&str>,
+    extra_env: &[(String, String)],
+    orphan_ttl: Duration,
+    label: &str,
+) -> Result<RemoteProcess, String> {
+    let host = host_label(runner).to_owned();
+    let mut env = process_env(runner)?;
+    for (name, value) in extra_env {
+        env.insert(name.clone(), value.clone());
+    }
+    let spec = SpawnSpec {
+        sid: link.new_sid(label),
+        argv,
+        cwd: cwd.filter(|cwd| !cwd.trim().is_empty()).map(str::to_owned),
+        env,
+        env_remove: Vec::new(),
+        terminal: None,
+        stdin: StdinMode::Null,
+        output_limit: None,
+        orphan_ttl_secs: Some(orphan_ttl.as_secs()),
+        label: Some(label.to_owned()),
+        sandbox: None,
+    };
+    link.spawn(spec, b"", REQUEST_TIMEOUT)
+        .map_err(|error| call_error(&host, error))
+}
+
+/// Output a relayed connection may keep on the machine while the link is down: enough for a
+/// dev server's biggest bundle, so a short drop does not cut a page load in half.
+const RELAY_OUTPUT_LIMIT: u64 = 32 << 20;
+/// How long a relayed connection outlives a dropped link. A browser gives up on a request far
+/// sooner; the connection only has to last as long as a reconnect plausibly takes.
+const RELAY_ORPHAN_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Starts one of the agent's own relays over `link` — a byte stream on standard input and output
+/// — with room for its output to wait out a short drop of the link.
+pub fn spawn_relay(link: &Link, runner: &ShellRunner, argv: Vec<String>) -> Result<RemoteProcess, String> {
+    let host = host_label(runner).to_owned();
+    let spec = SpawnSpec {
+        sid: link.new_sid("net"),
+        argv,
+        cwd: None,
+        env: process_env(runner)?,
+        env_remove: Vec::new(),
+        terminal: None,
+        stdin: StdinMode::Pipe,
+        output_limit: Some(RELAY_OUTPUT_LIMIT),
+        orphan_ttl_secs: Some(RELAY_ORPHAN_TTL.as_secs()),
+        label: Some("net".into()),
+        sandbox: None,
+    };
+    let program = spec.argv.first().cloned().unwrap_or_default();
+    link.spawn(spec, b"", REQUEST_TIMEOUT)
+        .map_err(|error| spawn_error(&host, &program, error))
 }
 
 /// Starts an interactive terminal over `link`: `argv` on a pseudo terminal of
@@ -517,6 +680,7 @@ pub fn spawn_terminal(
         output_limit: None,
         orphan_ttl_secs: Some(TERMINAL_ORPHAN_TTL.as_secs()),
         label: Some("terminal".into()),
+        sandbox: None,
     };
     let process = link
         .spawn(spec, b"", REQUEST_TIMEOUT)
@@ -527,6 +691,292 @@ pub fn spawn_terminal(
 /// How long a terminal waits for its machine's link before it falls back to
 /// an interactive `ssh` session.
 pub const TERMINAL_CONNECT_WAIT: Duration = FIRST_CONNECT_WAIT;
+
+/// What a sandboxed process is: its command line, where it starts, and the
+/// variables it gets on top of the machine's.
+pub struct SandboxedCommand {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub env_remove: Vec<String>,
+    pub label: String,
+}
+
+/// Starts `command` in the conversation's sandbox on the machine `runner`
+/// reaches: through Mework's agent on this machine or in the WSL
+/// distribution, or through the agent on the SSH machine.
+///
+/// Refuses rather than run anything unsandboxed: a machine whose agent cannot
+/// sandbox, or an SSH machine the agent does not serve, says why.
+pub fn spawn_in_sandbox(
+    runner: &ShellRunner,
+    sandbox: &protocol::SandboxSpec,
+    command: SandboxedCommand,
+) -> Result<AgentChild, String> {
+    let (link, agent, place) = match runner {
+        ShellRunner::Ssh { host, .. } => match route(runner, FIRST_CONNECT_WAIT) {
+            Route::Agent(link, agent) => (link, agent, format!("the SSH machine {host}")),
+            Route::Legacy => {
+                let why = HUB
+                    .get()
+                    .and_then(|hub| lock(&hub.state).unavailable.values().next().map(|(why, _)| why.clone()))
+                    .unwrap_or_else(|| "it is still being installed there, or it is switched off".into());
+                return Err(format!(
+                    "The sandbox needs Mework's agent on the SSH machine {host}, which is not running there ({why}); the command was not run"
+                ));
+            }
+            Route::Unreachable(error) => return Err(error),
+        },
+        _ => {
+            let (link, agent) = local_link(runner, FIRST_CONNECT_WAIT)?;
+            let place = match runner {
+                ShellRunner::Wsl { distro, .. } => format!("the WSL distribution {distro}"),
+                _ => "this computer".into(),
+            };
+            (link, agent, place)
+        }
+    };
+    if !agent.sandbox.available {
+        return Err(format!(
+            "The sandbox is not available on {place}: {}; the command was not run",
+            if agent.sandbox.detail.is_empty() {
+                "the machine has no sandbox Mework can use"
+            } else {
+                agent.sandbox.detail.as_str()
+            }
+        ));
+    }
+    let spec = SpawnSpec {
+        sid: link.new_sid(&command.label),
+        argv: command.argv,
+        cwd: command.cwd.filter(|cwd| !cwd.trim().is_empty()),
+        env: command.env,
+        env_remove: command.env_remove,
+        terminal: None,
+        stdin: StdinMode::Null,
+        output_limit: None,
+        orphan_ttl_secs: None,
+        label: Some(command.label.clone()),
+        sandbox: Some(sandbox.clone()),
+    };
+    let process = link
+        .spawn(spec, b"", FIRST_CONNECT_WAIT)
+        .map_err(|error| match error {
+            CallError::Failed(failure) => format!("{}; the command was not run", failure.message),
+            error => format!("The sandbox on {place} did not answer: {error}"),
+        })?;
+    Ok(AgentChild { process })
+}
+
+// ---------------------------------------------------------------------------
+// This computer and its WSL distributions, through the agent
+// ---------------------------------------------------------------------------
+
+/// What the agent on this computer says about sandboxing here.
+pub fn local_sandbox_support() -> Result<protocol::SandboxSupport, String> {
+    local_link(&ShellRunner::default(), FIRST_CONNECT_WAIT).map(|(_, agent)| agent.sandbox)
+}
+
+/// The link to the agent Mework runs on this computer — or inside a WSL
+/// distribution — for what has to run through one: sandboxed commands. The
+/// agent is a child of this process, speaking over its standard input and
+/// output, and ends with it.
+fn local_link(runner: &ShellRunner, patience: Duration) -> Result<(Link, AgentInfo), String> {
+    let hub = HUB.get().ok_or("Mework's agent is not available in this process")?;
+    let (key, place) = match runner {
+        ShellRunner::Local { .. } => ("local".to_owned(), "this computer".to_owned()),
+        ShellRunner::Wsl { distro, .. } => {
+            run_environment::validate_wsl_distro_name(distro)?;
+            (format!("wsl\u{0}{distro}"), format!("the WSL distribution {distro}"))
+        }
+        ShellRunner::Ssh { .. } => return Err("an SSH machine has no local agent".into()),
+    };
+    let link = {
+        let mut state = lock(&hub.state);
+        state.last_used.insert(key.clone(), Instant::now());
+        match state.links.get(&key) {
+            Some(link) if !matches!(link.status(), LinkStatus::Unavailable { .. } | LinkStatus::Closed) => link.clone(),
+            _ => {
+                let config = LinkConfig::new(hub.client_id.clone(), hub.epoch.clone());
+                let link = Link::start(config, LocalLauncher { runner: runner.clone() });
+                let label = place.clone();
+                link.set_observer(move |status| report_status(&label, status));
+                state.links.insert(key.clone(), link.clone());
+                link
+            }
+        }
+    };
+    match link.wait_ready(patience) {
+        Ok(agent) => Ok((link, agent)),
+        Err(CallError::Timeout) => Err(format!("Mework's agent on {place} did not start in time")),
+        Err(error) => {
+            // Not remembered: a build made meanwhile, or a WSL distribution
+            // started, is worth another try on the next command.
+            lock(&hub.state).links.remove(&key);
+            Err(format!("Mework's agent could not start on {place}: {error}"))
+        }
+    }
+}
+
+/// Starts `mework-remote serve --stdio`: the build for this computer, or the
+/// Linux build inside a WSL distribution through `wsl.exe`.
+struct LocalLauncher {
+    runner: ShellRunner,
+}
+
+impl Launcher for LocalLauncher {
+    fn launch(&self, nonce: &str) -> Result<Transport, LaunchError> {
+        let (os, arch) = match &self.runner {
+            ShellRunner::Wsl { .. } => ("Linux", std::env::consts::ARCH),
+            _ => (
+                match std::env::consts::OS {
+                    "macos" => "Darwin",
+                    "windows" => "Windows",
+                    _ => "Linux",
+                },
+                std::env::consts::ARCH,
+            ),
+        };
+        let executable = local_agent(os, arch)?;
+        let mut launcher = match &self.runner {
+            ShellRunner::Wsl { distro, .. } => {
+                let inside = wsl_path(&executable).ok_or_else(|| {
+                    LaunchError::Unavailable(format!(
+                        "the agent at {} is not on a drive WSL can see",
+                        executable.display()
+                    ))
+                })?;
+                remote_agent::client::ChildLauncher::new(
+                    "wsl.exe",
+                    vec![
+                        "-d".into(),
+                        distro.clone(),
+                        "--exec".into(),
+                        inside,
+                        "serve".into(),
+                        "--stdio".into(),
+                    ],
+                )
+            }
+            _ => remote_agent::client::ChildLauncher::new(&executable, vec!["serve".into(), "--stdio".into()]),
+        };
+        launcher.env_remove = crate::child_environment::private_child_environment_names()
+            .into_iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        launcher.stderr = Some(Arc::new(|line: &str| eprintln!("[local-agent] {line}")));
+        launcher.launch(nonce)
+    }
+}
+
+/// The agent build for `os`/`arch` — this computer's own, or the Linux one for WSL — as a file
+/// this computer can run; in a development build, built here if there is none.
+fn local_agent(os: &str, arch: &str) -> Result<PathBuf, LaunchError> {
+    let hub = HUB
+        .get()
+        .ok_or_else(|| LaunchError::Unavailable("the agent is not installed in this host".into()))?;
+    let catalog = hub.catalog();
+    let catalog = match catalog.for_machine(os, arch) {
+        Some(_) => catalog,
+        None => build_locally(os, arch)?,
+    };
+    let build = catalog
+        .for_machine(os, arch)
+        .ok_or_else(|| LaunchError::Unavailable(format!("no agent build for {os}/{arch}")))?;
+    local_executable(build)
+}
+
+/// Sets this computer up for the sandbox, once. Only Windows needs it: srt-win's hidden account
+/// and network fence, which the agent's `sandbox-setup` provisions after asking for
+/// administrator rights (one UAC prompt). Returns what the agent reports afterwards.
+pub fn setup_local_sandbox() -> Result<protocol::SandboxSupport, String> {
+    if !cfg!(windows) {
+        return Err("Only Windows needs the sandbox set up".into());
+    }
+    let executable = local_agent("Windows", std::env::consts::ARCH).map_err(|error| match error {
+        LaunchError::Unavailable(why) | LaunchError::Unreachable(why) => why,
+    })?;
+    let mut command = Command::new(&executable);
+    command.arg("sandbox-setup").stdin(Stdio::null());
+    for name in crate::child_environment::private_child_environment_names() {
+        command.env_remove(&name);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("Cannot run Mework's agent ({}): {error}", executable.display()))?;
+    if !output.status.success() {
+        let said = String::from_utf8_lossy(&output.stderr);
+        let said = said.trim();
+        return Err(said.strip_prefix("mework-remote: ").unwrap_or(said).to_owned());
+    }
+    // The running agent said what it could do when it started; a new one looks again.
+    let stale = HUB.get().and_then(|hub| lock(&hub.state).links.remove("local"));
+    if let Some(link) = stale {
+        link.close(true);
+    }
+    local_sandbox_support()
+}
+
+/// The build as a file this computer can execute. A bundled build may have
+/// lost its executable bit on the way into the application's resources; such
+/// a build is copied, once per build, to a directory of the user's own.
+fn local_executable(build: &Build) -> Result<PathBuf, LaunchError> {
+    // Windows has no executable bit, and a Linux build on a Windows drive is
+    // executable to WSL as it is.
+    if cfg!(windows) || is_executable(&build.path) {
+        return Ok(build.path.clone());
+    }
+    let base = dirs::cache_dir()
+        .or_else(dirs::data_local_dir)
+        .ok_or_else(|| LaunchError::Unavailable("this account has no cache directory".into()))?;
+    let directory = base.join("com.mework.app").join("agents").join(&build.tag);
+    let target = directory.join(agent_binary(&build.triple));
+    if !target.is_file() {
+        let bytes = std::fs::read(&build.path)
+            .map_err(|error| LaunchError::Unavailable(format!("cannot read {}: {error}", build.path.display())))?;
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| LaunchError::Unavailable(format!("cannot create {}: {error}", directory.display())))?;
+        let partial = directory.join(format!(".partial-{}", std::process::id()));
+        std::fs::write(&partial, &bytes)
+            .map_err(|error| LaunchError::Unavailable(format!("cannot write {}: {error}", partial.display())))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::rename(&partial, &target)
+            .map_err(|error| LaunchError::Unavailable(format!("cannot place {}: {error}", target.display())))?;
+    }
+    Ok(target)
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// `C:\Users\…` as WSL mounts it by default: `/mnt/c/Users/…`.
+fn wsl_path(path: &Path) -> Option<String> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let mut chars = text.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    Some(format!("/mnt/{}{}", drive.to_ascii_lowercase(), chars.as_str()))
+}
 
 /// Turns an agent exit into the `ExitStatus` local callers already handle.
 pub fn exit_status(exit: &protocol::ExitInfo) -> std::process::ExitStatus {
@@ -644,11 +1094,8 @@ impl SshLauncher {
         args
     }
 
-    fn catalog(&self) -> Option<&'static Catalog> {
-        HUB.get().map(|hub| {
-            hub.catalog
-                .get_or_init(|| Catalog::discover(&hub.agent_dirs, &hub.native_builds))
-        })
+    fn catalog(&self) -> Option<Arc<Catalog>> {
+        HUB.get().map(Hub::catalog)
     }
 
     /// One login that either becomes the proxy or reports what is missing.
@@ -723,12 +1170,20 @@ impl SshLauncher {
     }
 
     fn upload(&self, target: &Build, dialect: Dialect) -> Result<(), LaunchError> {
-        let bytes = std::fs::read(&target.path).map_err(|error| {
-            LaunchError::Unavailable(format!("cannot read the agent build {}: {error}", target.path.display()))
-        })?;
+        let read = |path: &Path| {
+            std::fs::read(path).map_err(|error| {
+                LaunchError::Unavailable(format!("cannot read the agent build {}: {error}", path.display()))
+            })
+        };
+        let bytes = read(&target.path)?;
+        let helper = target.helper.as_deref().map(read).transpose()?;
+        let sizes = UploadSizes {
+            agent: bytes.len() as u64,
+            helper: helper.as_ref().map(|helper| helper.len() as u64),
+        };
         let script = match dialect {
-            Dialect::Posix => upload_script(&target.tag),
-            Dialect::PowerShell => powershell_upload_script(&target.tag),
+            Dialect::Posix => upload_script(&target.tag, sizes),
+            Dialect::PowerShell => powershell_upload_script(&target.tag, sizes),
         };
         let mut args = self.connection_args();
         args.push(dialect.line(&script));
@@ -737,6 +1192,9 @@ impl SshLauncher {
         let mut stdin = process.stdin.take().expect("piped");
         let writer = std::thread::spawn(move || {
             let _ = stdin.write_all(&bytes);
+            if let Some(helper) = helper {
+                let _ = stdin.write_all(&helper);
+            }
             drop(stdin);
         });
         let mut stdout = process.stdout.take().expect("piped");
@@ -783,30 +1241,37 @@ impl Launcher for SshLauncher {
             Ok((shell, remembered)) => (Dialect::of(shell), remembered),
             Err(error) => return Err(LaunchError::Unreachable(error)),
         };
-        let Some(catalog) = self.catalog() else {
+        let Some(mut catalog) = self.catalog() else {
             return Err(LaunchError::Unavailable("the agent is not installed in this host".into()));
         };
-        if catalog.builds.is_empty() {
+        if catalog.builds.is_empty() && local_agent_builder().is_none() {
             return Err(LaunchError::Unavailable(
                 "this Mework has no agent builds to install on remote machines".into(),
             ));
         }
-        let (mut process, preamble) = self.start_proxy(nonce, catalog, &mut dialect, remembered)?;
+        let (mut process, preamble) = self.start_proxy(nonce, &catalog, &mut dialect, remembered)?;
         let (process, preamble) = match preamble {
             Preamble::Ready => (process, Preamble::Ready),
+            // The machine has no agent of this host's build: none at all, or another Mework's —
+            // older or newer. Either way it gets this host's own, which is the whole of updating
+            // it and of rolling it back.
             Preamble::Missing { os, arch } => {
                 process.finish(Duration::from_secs(5));
-                let Some(build) = catalog.for_machine(&os, &arch) else {
-                    return Err(LaunchError::Unavailable(format!(
-                        "there is no agent build for {os}/{arch}"
-                    )));
+                let build = match catalog.for_machine(&os, &arch) {
+                    Some(build) => build.clone(),
+                    None => {
+                        catalog = build_locally(&os, &arch)?;
+                        catalog.for_machine(&os, &arch).cloned().ok_or_else(|| {
+                            LaunchError::Unavailable(format!("there is no agent build for {os}/{arch}"))
+                        })?
+                    }
                 };
                 eprintln!(
                     "[remote-agent] {}: installing agent {} for {os}/{arch}",
                     self.label, build.tag
                 );
-                self.upload(build, dialect)?;
-                self.bootstrap(nonce, catalog, dialect)
+                self.upload(&build, dialect)?;
+                self.bootstrap(nonce, &catalog, dialect)
                     .map_err(|failure| failure.error)?
             }
         };
@@ -898,12 +1363,47 @@ fn bootstrap_script(nonce: &str, catalog: &Catalog) -> String {
     )
 }
 
+/// What an upload sends on standard input, in order: the agent, then (Windows) the sandbox
+/// helper.
+#[derive(Clone, Copy)]
+struct UploadSizes {
+    agent: u64,
+    helper: Option<u64>,
+}
+
 /// Receives a build on stdin, proves it runs here, and moves it into place.
 /// Other builds beyond the newest few are removed; one a daemon still runs
 /// from keeps running, since a Unix file outlives its name (and Windows
 /// refuses to remove it, which leaves it for a later upload).
-fn upload_script(tag: &str) -> String {
+///
+/// A Windows build (through Git Bash) brings the sandbox helper behind the
+/// agent. The two arrive as one stream, kept whole in a file and split there,
+/// and the helper is in place before the agent is: an agent in its directory
+/// means the build is complete.
+fn upload_script(tag: &str, sizes: UploadSizes) -> String {
     let tag = run_environment::sh_single_quote(tag);
+    let receive = match sizes.helper {
+        None => "trap 'rm -f \"$U\"' EXIT\n\
+                 cat > \"$U\"\n\
+                 chmod 700 \"$U\"\n\
+                 \"$U\" version --json\n"
+            .to_owned(),
+        Some(helper) => format!(
+            "H=\"$D/.upload.$$.{SANDBOX_HELPER}\"\n\
+             P=\"$D/.upload.$$.part\"\n\
+             trap 'rm -f \"$U\" \"$H\" \"$P\"' EXIT\n\
+             cat > \"$P\"\n\
+             head -c {agent} \"$P\" > \"$U\"\n\
+             tail -c +{after} \"$P\" > \"$H\"\n\
+             rm -f \"$P\"\n\
+             [ \"$(wc -c < \"$H\")\" -eq {helper} ] || {{ echo 'the sandbox helper arrived incomplete' >&2; exit 1; }}\n\
+             chmod 700 \"$U\" \"$H\"\n\
+             \"$U\" version --json\n\
+             [ -e \"$D/{SANDBOX_HELPER}\" ] || mv -f \"$H\" \"$D/{SANDBOX_HELPER}\"\n",
+            agent = sizes.agent,
+            after = sizes.agent + 1,
+        ),
+    };
     format!(
         "set -e\n\
          umask 077\n\
@@ -912,10 +1412,7 @@ fn upload_script(tag: &str) -> String {
          D=\"$R/bin/\"{tag}\n\
          mkdir -p \"$D\"\n\
          U=\"$D/.upload.$$$X\"\n\
-         trap 'rm -f \"$U\"' EXIT\n\
-         cat > \"$U\"\n\
-         chmod 700 \"$U\"\n\
-         \"$U\" version --json\n\
+         {receive}\
          mv -f \"$U\" \"$D/mework-remote$X\"\n\
          trap - EXIT\n\
          (cd \"$R/bin\" && ls -1t | sed -n '4,$p' | while IFS= read -r old; do\n\
@@ -964,18 +1461,30 @@ fn powershell_bootstrap_script(nonce: &str, catalog: &Catalog) -> String {
 }
 
 /// [`upload_script`] in PowerShell. A build already in place is the same
-/// bytes — its directory is named by its digest — and may be the one a daemon
-/// runs from, which Windows will not replace, so it is kept.
+/// bytes — its directory is named by their digest — and may be the one a
+/// daemon runs from, which Windows will not replace, so it is kept; so is a
+/// sandbox helper already there. The helper, when the build brings one, is in
+/// place before the agent is.
 ///
 /// The build arrives on standard input, read as bytes through a stream of the
-/// script's own on the input handle. Windows PowerShell's
-/// `[Console]::OpenStandardInput()` never returns when the input is already
-/// waiting in the pipe as it starts to read — which it is, for a build sent
-/// right behind the command. The handle comes from the runtime's own
-/// `GetStdHandle`, or where that is not to be found, from a declaration
-/// compiled on the spot.
-fn powershell_upload_script(tag: &str) -> String {
+/// script's own on the input handle, the agent's and then the helper's exact
+/// sizes. Windows PowerShell's `[Console]::OpenStandardInput()` never returns
+/// when the input is already waiting in the pipe as it starts to read — which
+/// it is, for a build sent right behind the command. The handle comes from the
+/// runtime's own `GetStdHandle`, or where that is not to be found, from a
+/// declaration compiled on the spot.
+fn powershell_upload_script(tag: &str, sizes: UploadSizes) -> String {
     let tag = remote_shell::ps_single_quote(tag);
+    let (receive_helper, place_helper) = match sizes.helper {
+        Some(helper) => (
+            format!("Receive $V {helper}\n"),
+            format!(
+                "$H = Join-Path $D '{SANDBOX_HELPER}'\n\
+                 if (-not (Test-Path -LiteralPath $H)) {{ Move-Item -LiteralPath $V -Destination $H }}\n"
+            ),
+        ),
+        None => (String::new(), String::new()),
+    };
     format!(
         "$ErrorActionPreference = 'Stop'\n\
          $ProgressPreference = 'SilentlyContinue'\n\
@@ -985,26 +1494,38 @@ fn powershell_upload_script(tag: &str) -> String {
          New-Item -ItemType Directory -Force -Path $D | Out-Null\n\
          $F = Join-Path $D 'mework-remote.exe'\n\
          $U = Join-Path $D ('.upload.' + $PID + '.exe')\n\
+         $V = Join-Path $D ('.upload.' + $PID + '.{SANDBOX_HELPER}')\n\
          $native = [Console].Assembly.GetType('Microsoft.Win32.Win32Native')\n\
          $get = if ($native) {{ $native.GetMethod('GetStdHandle', [Reflection.BindingFlags]'NonPublic, Static') }}\n\
          if ($get) {{ $handle = $get.Invoke($null, @([int]-10)) }} else {{\n\
          Add-Type -Namespace MeworkUpload -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetStdHandle(int n);'\n\
          $handle = [MeworkUpload.Native]::GetStdHandle(-10)\n\
          }}\n\
+         $buffer = New-Object byte[] 65536\n\
+         function Receive($path, [long]$left) {{\n\
+         $out = [IO.File]::Create($path)\n\
+         try {{ while ($left -gt 0) {{\n\
+         $n = $in.Read($buffer, 0, [Math]::Min(65536, $left))\n\
+         if ($n -le 0) {{ throw 'the upload ended early' }}\n\
+         $out.Write($buffer, 0, $n); $left -= $n\n\
+         }} }} finally {{ $out.Close() }}\n\
+         }}\n\
          try {{\n\
          $in = New-Object IO.FileStream((New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($handle, $false)), ([IO.FileAccess]::Read))\n\
-         $out = [IO.File]::Create($U)\n\
-         try {{ $in.CopyTo($out) }} finally {{ $out.Close() }}\n\
+         Receive $U {agent}\n\
+         {receive_helper}\
          $reply = & $U version --json\n\
          if ($LASTEXITCODE -ne 0) {{ throw \"the uploaded agent does not run on this machine (exit $LASTEXITCODE)\" }}\n\
          [Console]::Out.Write((($reply | Out-String).Trim()) + \"`n\")\n\
+         {place_helper}\
          if (-not (Test-Path -LiteralPath $F)) {{ Move-Item -LiteralPath $U -Destination $F }}\n\
          }} finally {{\n\
-         if (Test-Path -LiteralPath $U) {{ Remove-Item -LiteralPath $U -Force -ErrorAction SilentlyContinue }}\n\
+         foreach ($P in $U, $V) {{ if (Test-Path -LiteralPath $P) {{ Remove-Item -LiteralPath $P -Force -ErrorAction SilentlyContinue }} }}\n\
          }}\n\
          Get-ChildItem -LiteralPath $B -Directory | Where-Object {{ $_.Name -like '*-*' -and $_.Name -ne {tag} }} | \
          Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 | \
-         ForEach-Object {{ Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }}\n"
+         ForEach-Object {{ Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }}\n",
+        agent = sizes.agent,
     )
 }
 
@@ -1012,12 +1533,62 @@ fn powershell_upload_script(tag: &str) -> String {
 // Agent builds
 // ---------------------------------------------------------------------------
 
-/// One agent executable this host can install.
+/// The Windows sandbox's helper, which travels with a Windows build and lives beside it: the
+/// agent finds it next to its own executable (`build-remote-agents.mjs` stages the two
+/// together).
+const SANDBOX_HELPER: &str = "srt-win.exe";
+
+/// One agent executable this host can install, with the sandbox helper beside it on Windows.
+#[derive(Clone)]
 struct Build {
     triple: String,
     path: PathBuf,
+    /// The executable's SHA-256, which the agent reports as its `build`.
     digest: String,
+    /// The directory a machine keeps the build in: the version and a digest of everything
+    /// installed there, so a build whose helper changed is installed anew.
     tag: String,
+    helper: Option<PathBuf>,
+}
+
+impl Build {
+    /// The build at `path` for `triple`, if it was made from this host's agent source.
+    fn read(triple: &str, path: PathBuf) -> Option<Self> {
+        let bytes = std::fs::read(&path).ok()?;
+        match remote_agent::source_of_executable(&bytes) {
+            Some(source) if source == remote_agent::SOURCE_ID => {}
+            other => {
+                eprintln!(
+                    "[remote-agent] not using the {triple} build at {}: {}",
+                    path.display(),
+                    match other {
+                        Some(source) => format!(
+                            "it was built from other agent source ({} where this Mework has {})",
+                            &source[..12],
+                            &remote_agent::SOURCE_ID[..12]
+                        ),
+                        None => "it predates agent source identities".to_owned(),
+                    }
+                );
+                return None;
+            }
+        }
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let helper = Some(path.with_file_name(SANDBOX_HELPER))
+            .filter(|helper| triple.contains("-windows-") && helper.is_file());
+        let installed = match helper.as_ref().and_then(|helper| std::fs::read(helper).ok()) {
+            Some(helper) => format!("{:x}", Sha256::new().chain_update(&bytes).chain_update(&helper).finalize()),
+            None => digest.clone(),
+        };
+        Some(Self {
+            triple: triple.to_owned(),
+            tag: format!("{}-{}", remote_agent::AGENT_VERSION, &installed[..12]),
+            path,
+            digest,
+            helper,
+        })
+    }
 }
 
 /// Every agent build found, by target triple.
@@ -1075,37 +1646,45 @@ fn agent_binary(triple: &str) -> String {
 }
 
 impl Catalog {
+    /// Every build under `dirs` (and, for this host's own triple, `native`) that was made from
+    /// the agent source this host was compiled against ([`remote_agent::SOURCE_ID`]).
+    ///
+    /// Anything else is left out, however it got there — a build staged before the agent's
+    /// source last changed, one copied in from another checkout, one from before source
+    /// identities. A machine is only ever given the agent this host speaks for, so a machine
+    /// running any other one is moved to this one on its next connection, forward or back.
     fn discover(dirs: &[PathBuf], native: &[PathBuf]) -> Self {
         let mut builds = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (_, os, arch) in PLATFORMS {
             for triple in triples_for(os, arch) {
-                if seen.contains(*triple) {
+                if !seen.insert(*triple) {
                     continue;
                 }
                 let staged = dirs
                     .iter()
                     .map(|dir| dir.join(triple).join(agent_binary(triple)))
-                    .find(|path| path.is_file());
-                // This machine's own triple may also have a build straight out
-                // of `cargo build`; while developing the agent, the newer of
-                // the two is the one meant.
-                let own = (*triple == env!("MEWORK_TARGET_TRIPLE"))
-                    .then(|| newest(native.iter().filter(|path| path.is_file()).cloned()))
-                    .flatten();
-                let Some(path) = newest(staged.into_iter().chain(own)) else {
-                    continue;
-                };
-                let Ok(digest) = file_digest(&path) else {
-                    continue;
-                };
-                seen.insert(*triple);
-                builds.push(Build {
-                    triple: (*triple).to_owned(),
-                    tag: format!("{}-{}", remote_agent::AGENT_VERSION, &digest[..12]),
-                    path,
-                    digest,
+                    .filter(|path| path.is_file());
+                // This machine's own triple may also have a build straight out of `cargo build`.
+                let own = native
+                    .iter()
+                    .filter(|path| *triple == env!("MEWORK_TARGET_TRIPLE") && path.is_file())
+                    .cloned();
+                let mut candidates: Vec<Build> = staged
+                    .chain(own)
+                    .filter_map(|path| Build::read(triple, path))
+                    .collect();
+                // Of several builds from this source, the newest is the one meant — after one
+                // with the Windows sandbox helper beside it, which a bare `cargo build` lacks.
+                candidates.sort_by_key(|build| {
+                    (
+                        std::cmp::Reverse(build.helper.is_some()),
+                        std::cmp::Reverse(modified(&build.path)),
+                    )
                 });
+                if let Some(build) = candidates.into_iter().next() {
+                    builds.push(build);
+                }
             }
         }
         for build in &builds {
@@ -1145,18 +1724,10 @@ impl Catalog {
     }
 }
 
-fn newest(paths: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
-    paths.max_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    })
-}
-
-fn file_digest(path: &Path) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
 }
 
 /// Where a development build finds agents built from this source tree:
@@ -1177,6 +1748,84 @@ fn source_tree_agents() -> (Vec<PathBuf>, Vec<PathBuf>) {
         })
         .collect();
     (vec![manifest.join("remote-agents")], native)
+}
+
+/// How `build-remote-agents.mjs --only <triple>` says this computer has no way to build that
+/// triple at all, as opposed to trying and failing.
+const CANNOT_BUILD_HERE: i32 = 3;
+
+/// The repository root and the script that builds agents from it, in a development build. A
+/// release has neither, and needs neither: every build it carries was made from its own source,
+/// for every platform its release was built with.
+fn local_agent_builder() -> Option<(PathBuf, PathBuf)> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.to_path_buf();
+    let script = root.join("scripts").join("build-remote-agents.mjs");
+    script.is_file().then_some((root, script))
+}
+
+/// Builds the agent for a machine reporting `os`/`arch` on this computer, from the source this
+/// host was compiled from, and returns the catalog that has it.
+///
+/// The machine takes no part beyond saying what it is. The build is made here, with this
+/// computer's toolchain and network — an SSH machine being reachable says nothing about what it
+/// can reach — and gets to the machine the way every build does, over SSH.
+fn build_locally(os: &str, arch: &str) -> Result<Arc<Catalog>, LaunchError> {
+    let hub = HUB
+        .get()
+        .ok_or_else(|| LaunchError::Unavailable("the agent is not installed in this host".into()))?;
+    let missing = format!("this Mework has no agent build for {os}/{arch} made from its own source");
+    let Some((root, script)) = local_agent_builder() else {
+        return Err(LaunchError::Unavailable(missing));
+    };
+    let gate = hub.building(&format!("{os}/{arch}"));
+    let _building = lock(&gate);
+    // Another machine of this platform may have had one built while this one waited.
+    let catalog = hub.rediscover();
+    if catalog.for_machine(os, arch).is_some() {
+        return Ok(catalog);
+    }
+    let mut reasons = Vec::new();
+    for triple in triples_for(os, arch) {
+        eprintln!("[remote-agent] building the {triple} agent here for a {os}/{arch} machine");
+        let output = Command::new("node")
+            .arg(&script)
+            .args(["--only", triple])
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                reasons.push(format!("cannot run node to build it: {error}"));
+                break;
+            }
+        };
+        let said = String::from_utf8_lossy(&output.stdout);
+        eprint!("{said}");
+        match output.status.code() {
+            Some(0) => {
+                let catalog = hub.rediscover();
+                if catalog.for_machine(os, arch).is_some() {
+                    return Ok(catalog);
+                }
+                reasons.push(format!("the {triple} build made here is not usable"));
+            }
+            Some(CANNOT_BUILD_HERE) => reasons.extend(
+                said.lines()
+                    .filter_map(|line| line.strip_prefix("[remote-agents] skip "))
+                    .map(str::to_owned),
+            ),
+            status => reasons.push(format!("building {triple} failed (exit {status:?})")),
+        }
+    }
+    Err(LaunchError::Unavailable(format!(
+        "{missing}, and this computer could not build one: {}",
+        reasons.join("; ")
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,9 +1980,46 @@ mod tests {
                     path: PathBuf::from(format!("/builds/{triple}")),
                     digest: format!("{index:0>64}"),
                     tag: format!("0.1.0-{index:0>12}"),
+                    helper: None,
                 })
                 .collect(),
         }
+    }
+
+    fn sizes(agent: &[u8], helper: Option<&[u8]>) -> UploadSizes {
+        UploadSizes {
+            agent: agent.len() as u64,
+            helper: helper.map(|helper| helper.len() as u64),
+        }
+    }
+
+    /// A Windows build and its sandbox helper are installed as one: the directory a machine keeps
+    /// them in is named by both, so a changed helper is a new build there.
+    #[test]
+    fn a_windows_build_carries_the_sandbox_helper_beside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = format!("MZ fake agent mework-remote-source:{}", remote_agent::SOURCE_ID);
+        for triple in ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl"] {
+            let directory = root.path().join(triple);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(agent_binary(triple)), &agent).unwrap();
+        }
+        let windows = root.path().join("x86_64-pc-windows-msvc/mework-remote.exe");
+        let bare = Build::read("x86_64-pc-windows-msvc", windows.clone()).unwrap();
+        assert!(bare.helper.is_none());
+
+        std::fs::write(windows.with_file_name(SANDBOX_HELPER), "srt-win one").unwrap();
+        let with_helper = Build::read("x86_64-pc-windows-msvc", windows.clone()).unwrap();
+        assert_eq!(with_helper.helper.as_deref(), Some(windows.with_file_name(SANDBOX_HELPER).as_path()));
+        assert_eq!(with_helper.digest, bare.digest, "the agent reports the same build");
+        assert_ne!(with_helper.tag, bare.tag);
+        std::fs::write(windows.with_file_name(SANDBOX_HELPER), "srt-win two").unwrap();
+        assert_ne!(Build::read("x86_64-pc-windows-msvc", windows).unwrap().tag, with_helper.tag);
+
+        // Only Windows has one.
+        let linux = root.path().join("x86_64-unknown-linux-musl/mework-remote");
+        std::fs::write(linux.with_file_name(SANDBOX_HELPER), "stray").unwrap();
+        assert!(Build::read("x86_64-unknown-linux-musl", linux).unwrap().helper.is_none());
     }
 
     #[test]
@@ -1388,7 +2074,7 @@ mod tests {
         let fake = "#!/bin/sh\nprintf '{\"build\":\"abc\"}\\n'\n";
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(remote_shell::posix_line(&upload_script("0.1.0-abc")))
+            .arg(remote_shell::posix_line(&upload_script("0.1.0-abc", sizes(fake.as_bytes(), None))))
             .env("MEWORK_REMOTE_ROOT", root.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1406,7 +2092,7 @@ mod tests {
         // A build that cannot run here is never put in place.
         let broken = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(remote_shell::posix_line(&upload_script("0.1.0-bad")))
+            .arg(remote_shell::posix_line(&upload_script("0.1.0-bad", sizes(b"\x7fELF not really", None))))
             .env("MEWORK_REMOTE_ROOT", root.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1440,6 +2126,7 @@ mod tests {
         let app_data = tempfile::tempdir().unwrap();
         install(app_data.path(), Vec::new(), None);
         let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host,
             port,
             identity_file,
@@ -1501,11 +2188,13 @@ mod tests {
             stdout.read_line(&mut line).unwrap();
             lines.push(line.trim().to_owned());
         }
+        // Killing the link's ssh is what a dropped network looks like to sshd, whether the
+        // machine is this one or another: the session ends and its proxy with it.
         let killed = std::process::Command::new("pkill")
-            .args(["-f", "mework-remote proxy --sync"])
+            .args(["-KILL", "-P", &std::process::id().to_string(), "-x", "ssh"])
             .status()
             .unwrap();
-        assert!(killed.success(), "the proxy was running");
+        assert!(killed.success(), "the link's ssh was running");
         loop {
             line.clear();
             if stdout.read_line(&mut line).unwrap() == 0 {
@@ -1543,6 +2232,150 @@ mod tests {
         shutdown();
     }
 
+    /// Through this computer's own agent, the way the shell tool starts a
+    /// sandboxed command: the agent is started on first use, starts the
+    /// conversation's cell, and what runs in it is confined. Run with
+    /// `--ignored` (it installs the process-wide hub) after
+    /// `cargo build -p mework-remote-agent`, on a machine that can sandbox.
+    #[test]
+    #[ignore]
+    fn a_sandboxed_command_runs_through_this_computers_agent() {
+        let app_data = tempfile::tempdir().unwrap();
+        install(app_data.path(), Vec::new(), None);
+        let support = local_sandbox_support().expect("the local agent starts");
+        if !support.available {
+            eprintln!("skipped: {}", support.detail);
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let settings = crate::model::SandboxSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let set = crate::workspace_set::WorkspaceSet::local_root(workspace.to_string_lossy().into_owned())
+            .sandboxed(&settings, "conv-e2e");
+        let sandbox = set.primary().unwrap().sandbox.clone().expect("sandboxed");
+        let script = format!(
+            "echo inside > made.txt && echo wrote; echo x > '{}/escape' 2>/dev/null || echo outside-refused; echo \"[$MEWORK_SANDBOX]\"",
+            outside.display()
+        );
+        let mut child = spawn_in_sandbox(
+            &ShellRunner::default(),
+            &sandbox,
+            SandboxedCommand {
+                argv: vec!["/bin/sh".into(), "-c".into(), script],
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                env: Default::default(),
+                env_remove: Vec::new(),
+                label: "e2e".into(),
+            },
+        )
+        .unwrap();
+        let mut stdout = String::new();
+        child.process.take_stdout().unwrap().read_to_string(&mut stdout).unwrap();
+        assert_eq!(child.process.wait().unwrap().code, Some(0));
+        assert!(stdout.contains("wrote") && stdout.contains("outside-refused") && stdout.contains("[1]"), "{stdout}");
+        assert!(workspace.join("made.txt").is_file());
+        assert!(!outside.join("escape").exists());
+        drop(child);
+        shutdown();
+    }
+
+    /// The sandbox on a real Windows machine over SSH: the agent arrives with `srt-win.exe`
+    /// beside it, and a sandboxed command runs as the sandbox account, writing its workspace and
+    /// nothing else. Set `MEWORK_E2E_SSH_WINDOWS_HOST` (and `MEWORK_E2E_SSH_PORT`,
+    /// `MEWORK_E2E_SSH_KEY` as needed) and run with `--ignored`. The machine needs Git for
+    /// Windows and the sandbox set up (`mework-remote.exe sandbox-setup` as an administrator);
+    /// the agent is installed from `src-tauri/remote-agents/<windows triple>/`, or built there.
+    #[test]
+    #[ignore]
+    fn over_real_ssh_a_windows_machine_sandboxes_commands() {
+        let host = std::env::var("MEWORK_E2E_SSH_WINDOWS_HOST").expect("MEWORK_E2E_SSH_WINDOWS_HOST");
+        let port = std::env::var("MEWORK_E2E_SSH_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(0);
+        let identity_file = std::env::var("MEWORK_E2E_SSH_KEY").unwrap_or_default();
+        let app_data = tempfile::tempdir().unwrap();
+        install(app_data.path(), Vec::new(), None);
+        let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
+            host,
+            port,
+            identity_file,
+            env: Default::default(),
+        };
+        let script = |script: &str| {
+            let output =
+                run_environment::run_remote_script(&runner, script, None, Duration::from_secs(180), &CancelSignal::default())
+                    .unwrap();
+            assert_eq!(output.status, Some(0), "{}", output.stderr);
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        // A workspace on the machine, made outside the sandbox.
+        let base = script("d=$(mktemp -d) && mkdir \"$d/ws\" \"$d/outside\" && echo \"$d\"");
+        let windows_base = script(&format!("cygpath -w '{base}'"));
+        let Route::Agent(_, agent) = route(&runner, Duration::from_secs(5)) else {
+            panic!("the machine should be served by the agent")
+        };
+        assert!(agent.sandbox.available, "no sandbox on the machine: {}", agent.sandbox.detail);
+        assert!(agent.sandbox.detail.ends_with(SANDBOX_HELPER), "{}", agent.sandbox.detail);
+
+        let workspace = format!("{windows_base}\\ws");
+        let sandbox = protocol::SandboxSpec {
+            cell: "conv-ssh-windows".into(),
+            policy: protocol::SandboxPolicy {
+                writable: vec![workspace.clone()],
+                ..Default::default()
+            },
+        };
+        let command = format!(
+            "$ErrorActionPreference = 'Stop'
+             $null = New-PSDrive -Name MeworkWorkspace -PSProvider FileSystem -Root '{workspace}' -Scope Global
+             Set-Location -LiteralPath 'MeworkWorkspace:\\'
+             Set-Content -Path made.txt -Value inside; 'wrote'
+             try {{ Set-Content -Path '{windows_base}\\outside\\file' -Value x; 'OUTSIDE-WRITTEN' }} catch {{ 'outside-refused' }}
+             if ($env:MEWORK_SANDBOX) {{ 'knows-it-is-sandboxed' }}
+             'user=' + [Environment]::UserName"
+        );
+        let mut child = spawn_in_sandbox(
+            &runner,
+            &sandbox,
+            SandboxedCommand {
+                argv: remote_shell::powershell_argv(&command),
+                cwd: Some(workspace),
+                env: Default::default(),
+                env_remove: Vec::new(),
+                label: "e2e".into(),
+            },
+        )
+        .unwrap();
+        // Windows PowerShell writes errors in the console's code page.
+        let mut stdout = Vec::new();
+        child.process.take_stdout().unwrap().read_to_end(&mut stdout).unwrap();
+        let mut stderr = Vec::new();
+        child.process.take_stderr().unwrap().read_to_end(&mut stderr).unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
+        assert_eq!(child.process.wait().unwrap().code, Some(0), "{stdout}{stderr}");
+        for expected in ["wrote", "outside-refused", "knows-it-is-sandboxed"] {
+            assert!(stdout.contains(expected), "{expected} missing\nstdout: {stdout}\nstderr: {stderr}");
+        }
+        let login = script("whoami");
+        let login = login.rsplit('\\').next().unwrap_or_default();
+        let user = stdout.lines().find_map(|line| line.trim().strip_prefix("user=")).unwrap_or_default();
+        assert!(!user.is_empty() && !user.eq_ignore_ascii_case(login), "ran as {user}, the login is {login}");
+        drop(child);
+
+        let left = script(&format!("cat '{base}/ws/made.txt'; ls '{base}/outside' | wc -l; rm -rf '{base}'"));
+        assert_eq!(left.split_whitespace().collect::<Vec<_>>(), ["inside", "0"]);
+        shutdown();
+    }
+
     /// Against a real Windows machine over SSH, whatever its login shell:
     /// set `MEWORK_E2E_SSH_WINDOWS_HOST` (and `MEWORK_E2E_SSH_PORT`,
     /// `MEWORK_E2E_SSH_KEY` as needed) and run with `--ignored`. The machine
@@ -1561,6 +2394,7 @@ mod tests {
         let app_data = tempfile::tempdir().unwrap();
         install(app_data.path(), Vec::new(), None);
         let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host: host.clone(),
             port,
             identity_file: identity_file.clone(),
@@ -1669,8 +2503,9 @@ mod tests {
                 identity_file: identity_file.clone(),
                 created_at: String::new(),
                 updated_at: String::new(),
+                agent_shell: None,
             }],
-            env_vars: Default::default(),
+            ..Default::default()
         };
         let machine = crate::model::RunTarget::Ssh {
             machine_id: "win".into(),
@@ -1743,6 +2578,7 @@ mod tests {
         let app_data = tempfile::tempdir().unwrap();
         install(app_data.path(), Vec::new(), None);
         let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host,
             port: 0,
             identity_file: String::new(),
@@ -1823,6 +2659,69 @@ mod tests {
         assert!(catalog.uname_cases().iter().any(|(pattern, _)| pattern.starts_with("Windows/")));
     }
 
+    /// Only builds made from this host's own agent source are offered, whatever else is staged
+    /// and however new it is: a build from other source, older or newer, never reaches a
+    /// machine, so a machine running one is given this host's instead.
+    #[test]
+    fn only_builds_of_this_hosts_agent_source_are_offered() {
+        let staged = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let write = |dir: &Path, triple: &str, contents: &[u8]| {
+            let path = dir.join(triple).join(agent_binary(triple));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        let ours = |salt: &str| [b"\x7fELF".as_slice(), remote_agent::SOURCE_MARKER.as_bytes(), salt.as_bytes()].concat();
+        let foreign = format!("mework-remote-source:{}", "0".repeat(64)).into_bytes();
+
+        let linux = write(staged.path(), "x86_64-unknown-linux-musl", &ours("linux"));
+        write(staged.path(), "aarch64-apple-darwin", &foreign);
+        write(staged.path(), "x86_64-pc-windows-msvc", b"MZ an agent from before source identities");
+        // A newer build from other source does not displace an older one from this source.
+        let windows = write(other.path(), "x86_64-pc-windows-msvc", &ours("windows"));
+        std::thread::sleep(Duration::from_millis(20));
+        write(staged.path(), "x86_64-pc-windows-gnu", &foreign);
+
+        let catalog = Catalog::discover(&[staged.path().to_path_buf(), other.path().to_path_buf()], &[]);
+        let offered: Vec<(&str, &Path)> = catalog
+            .builds
+            .iter()
+            .map(|build| (build.triple.as_str(), build.path.as_path()))
+            .collect();
+        assert_eq!(
+            offered,
+            vec![
+                ("x86_64-unknown-linux-musl", linux.as_path()),
+                ("x86_64-pc-windows-msvc", windows.as_path()),
+            ]
+        );
+        assert!(catalog.for_machine("Darwin", "arm64").is_none());
+        assert_eq!(
+            catalog.for_machine("Windows", "AMD64").map(|build| build.triple.as_str()),
+            Some("x86_64-pc-windows-msvc")
+        );
+    }
+
+    /// An agent that looks its own name up on `PATH` predates its helpers; any other missing
+    /// program is the command's own problem and keeps the agent's words.
+    #[test]
+    fn a_self_spawn_the_agent_cannot_find_says_the_agent_is_stale() {
+        let not_found = |program: &str| {
+            CallError::Failed(protocol::Failure::new(
+                protocol::FailureKind::NotFound,
+                format!("{program} was not found on this machine's PATH"),
+            ))
+        };
+        let stale = spawn_error("windows", protocol::SELF_PROGRAM, not_found(protocol::SELF_PROGRAM));
+        assert!(stale.contains("older build"), "{stale}");
+        assert!(stale.contains("restart Mework"), "{stale}");
+        assert_eq!(
+            spawn_error("windows", "node", not_found("node")),
+            "node was not found on this machine's PATH"
+        );
+    }
+
     /// The PowerShell scripts cannot run here; what can be checked is that
     /// they name only the builds this host has, carry the nonce, and fit on
     /// the command line `cmd.exe` hands them to.
@@ -1835,11 +2734,27 @@ mod tests {
         assert!(script.contains("proxy --sync n0nce"), "{script}");
         assert!(script.contains(&format!("{} n0nce Windows $A", protocol::MISSING_MARKER)), "{script}");
         assert!(script.contains("Join-Path $env:USERPROFILE '.mework\\remote'"), "{script}");
-        let upload = powershell_upload_script("0.1.0-abc");
+        let upload = powershell_upload_script("0.1.0-abc", UploadSizes { agent: 2_107_904, helper: None });
         assert!(upload.contains("$D = Join-Path $B '0.1.0-abc'"), "{upload}");
         assert!(upload.contains("GetStdHandle"), "{upload}");
         assert!(!upload.contains("OpenStandardInput"), "{upload}");
-        for line in [remote_shell::powershell_line(&script), remote_shell::powershell_line(&upload)] {
+        assert!(upload.contains("Receive $U 2107904"), "{upload}");
+        assert!(!upload.contains("Receive $V"), "{upload}");
+        let with_helper = powershell_upload_script(
+            "0.1.0-abc",
+            UploadSizes {
+                agent: 2_107_904,
+                helper: Some(3_240_960),
+            },
+        );
+        assert!(with_helper.contains("Receive $V 3240960"), "{with_helper}");
+        // The helper is in place before the agent that says the build is complete.
+        assert!(with_helper.find("Destination $H").unwrap() < with_helper.find("Destination $F").unwrap());
+        for line in [
+            remote_shell::powershell_line(&script),
+            remote_shell::powershell_line(&upload),
+            remote_shell::powershell_line(&with_helper),
+        ] {
             assert!(line.len() < 8000, "{} characters", line.len());
         }
     }
@@ -1892,10 +2807,28 @@ mod tests {
 
         // The upload lands where the Windows agent looks, as an `.exe`.
         let fake = "#!/bin/sh\nif [ \"$1\" = version ]; then printf '{\"build\":\"abc\"}\\n'; else echo \"ran $*\"; fi\n";
-        let uploaded = run(&upload_script(&tag), fake.as_bytes());
+        // With the sandbox helper behind it on the same stream, which lands beside it.
+        let helper = b"srt-win helper bytes\n\0\xff".repeat(1000);
+        let stream = [fake.as_bytes(), &helper].concat();
+        let uploaded = run(&upload_script(&tag, sizes(fake.as_bytes(), Some(&helper))), &stream);
         assert!(uploaded.status.success(), "{}", String::from_utf8_lossy(&uploaded.stderr));
         let installed = profile.join(".mework/remote/bin").join(&tag).join("mework-remote.exe");
         assert_eq!(std::fs::read_to_string(&installed).unwrap(), fake);
+        assert_eq!(std::fs::read(installed.with_file_name(SANDBOX_HELPER)).unwrap(), helper);
+        let leftovers: Vec<_> = std::fs::read_dir(installed.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".upload"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A helper cut short installs nothing.
+        let short = run(
+            &upload_script("0.1.0-short", sizes(fake.as_bytes(), Some(&helper))),
+            &stream[..stream.len() - 10],
+        );
+        assert!(!short.status.success());
+        assert!(!profile.join(".mework/remote/bin/0.1.0-short/mework-remote.exe").exists());
 
         // And the next login runs it.
         let output = run(&bootstrap_script("n0nce", &catalog), b"");

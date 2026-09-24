@@ -36,6 +36,14 @@ path = "src/main.rs"
 test = false
 bench = false
 
+# The built-in browser's Chromium subprocess on macOS, bundled as `Mework Helper*.app`
+# (see src/cef_host); an empty program elsewhere.
+[[bin]]
+name = "mework-cef-helper"
+path = "src/cef_helper_main.rs"
+test = false
+bench = false
+
 [[bin]]
 name = "mework-browser-dev"
 path = "src/browser_dev_main.rs"
@@ -133,7 +141,24 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win3
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Holds exactly one login-keychain item, the master key of `src/credential_vault.rs`;
+# every other credential is sealed under it, so macOS asks about one item instead of
+# one per credential.
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# The built-in browser's page engine on macOS: Chromium, embedded through CEF as a
+# child view of the main window and driven over the DevTools protocol in-process —
+# the arrangement WebView2 already gives Windows. WKWebView, which Tauri would
+# otherwise supply, has no DevTools protocol, cannot be stacked beneath the
+# trusted renderer, and shares one cookie store across tabs. Pinned exactly:
+# the wrapper compiles against this CEF API version, and the framework loaded at
+# run time must be the same build (see `src/cef_host`).
+cef = { version = "=154.0.0", default-features = false, features = ["sandbox"] }
+# A direct dependency only so build.rs receives `DEP_CEF_DLL_WRAPPER_CEF_DIR`, the
+# directory the framework was fetched into, for development runs and bundling.
+cef-dll-sys = { version = "=154.0.0", features = ["sandbox"] }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSThread", "NSTimer", "NSRunLoop", "NSValue", "NSObject", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSEvent", "NSResponder", "NSView", "NSWindow", "NSGraphics"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }

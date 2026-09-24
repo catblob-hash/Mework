@@ -55,6 +55,216 @@ pub struct ExecutionEnvironmentAssets {
     /// does not invalidate the document.
     #[serde(default)]
     pub env_vars: BTreeMap<String, BTreeMap<String, String>>,
+    /// The agent shell each WSL distribution runs Mework's own scripts in,
+    /// keyed by distribution name. Distributions are found rather than
+    /// registered, so their one setting lives here instead of on a catalog row;
+    /// a missing entry is a distribution Mework has not set up yet, and a
+    /// stale one for a renamed or removed distribution is harmless.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "crate::model::lenient_backend_map"
+    )]
+    pub wsl_agent_shells: BTreeMap<String, crate::shell_backend::ShellBackend>,
+    /// One shell priority list per operating system. Its only use is choosing a
+    /// newly added machine's agent shell: the first backend in the machine's OS
+    /// list that the machine has.
+    #[serde(default)]
+    pub shell_priority: ShellPriority,
+    /// Whether conversations' commands run in the operating system's sandbox,
+    /// and what it lets through.
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
+}
+
+/// The sandbox a conversation's commands run in when it is on: one sandboxed
+/// agent process per conversation and machine (see
+/// `remote_agent::agent::sandbox`), which can write the conversation's
+/// workspaces and nothing that runs outside it later, cannot read the
+/// account's credentials, and reaches the network only through a proxy that
+/// applies [`SandboxNetworkSettings`].
+///
+/// A machine that cannot sandbox — no bubblewrap, WSL 1, an SSH machine the
+/// agent does not serve — refuses the command rather than running it
+/// unsandboxed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub network: SandboxNetworkSettings,
+    /// Further directories every sandbox may write, on whichever machine has
+    /// them: absolute, or starting with `~`.
+    #[serde(default)]
+    pub writable: Vec<String>,
+    /// Further paths no sandbox may read, besides the built-in credential
+    /// locations.
+    #[serde(default)]
+    pub deny_read: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxNetworkSettings {
+    #[serde(default = "default_sandbox_network_mode")]
+    pub mode: SandboxNetworkMode,
+    /// Host patterns reachable in [`SandboxNetworkMode::Allowlist`]:
+    /// `example.com`, `*.example.com` (its subdomains), optionally `:port`.
+    #[serde(default = "default_sandbox_allowlist")]
+    pub allow: Vec<String>,
+    /// Host patterns never reachable, in any mode.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl Default for SandboxNetworkSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_sandbox_network_mode(),
+            allow: default_sandbox_allowlist(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxNetworkMode {
+    /// No connection leaves the sandbox.
+    Off,
+    /// Only the hosts on the allowlist.
+    #[default]
+    Allowlist,
+    /// Any public host.
+    Open,
+}
+
+fn default_sandbox_network_mode() -> SandboxNetworkMode {
+    SandboxNetworkMode::Allowlist
+}
+
+/// Where packages and source come from, so installing dependencies and
+/// fetching code works out of the box. Every entry is a host a sandbox could
+/// also send data to; the list is the user's to shorten.
+pub const DEFAULT_SANDBOX_ALLOWLIST: &[&str] = &[
+    "github.com",
+    "*.github.com",
+    "*.githubusercontent.com",
+    "gitlab.com",
+    "*.gitlab.com",
+    "bitbucket.org",
+    "registry.npmjs.org",
+    "*.npmjs.org",
+    "registry.yarnpkg.com",
+    "*.yarnpkg.com",
+    "nodejs.org",
+    "pypi.org",
+    "*.pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "*.crates.io",
+    "static.rust-lang.org",
+    "proxy.golang.org",
+    "sum.golang.org",
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "plugins.gradle.org",
+    "services.gradle.org",
+    "rubygems.org",
+    "*.rubygems.org",
+    "api.nuget.org",
+    "*.nuget.org",
+    "pub.dev",
+    "*.pub.dev",
+    "repo.packagist.org",
+    "cdn.jsdelivr.net",
+];
+
+fn default_sandbox_allowlist() -> Vec<String> {
+    DEFAULT_SANDBOX_ALLOWLIST.iter().map(|host| (*host).to_owned()).collect()
+}
+
+impl SandboxSettings {
+    /// The network policy the agent applies.
+    pub fn network_policy(&self) -> remote_agent::protocol::NetworkPolicy {
+        use remote_agent::protocol::{NetworkMode, NetworkPolicy};
+        NetworkPolicy {
+            mode: match self.network.mode {
+                SandboxNetworkMode::Off => NetworkMode::Off,
+                SandboxNetworkMode::Allowlist => NetworkMode::Allowlist,
+                SandboxNetworkMode::Open => NetworkMode::Open,
+            },
+            allow: self.network.allow.clone(),
+            deny: self.network.deny.clone(),
+        }
+    }
+}
+
+/// Each operating system's shell backends, most preferred first. An empty list
+/// is the OS's default order ([`crate::shell_backend::backends_for`]); a list
+/// that leaves a registered backend out ranks it after the ones it names.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellPriority {
+    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
+    pub windows: Vec<crate::shell_backend::ShellBackend>,
+    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
+    pub macos: Vec<crate::shell_backend::ShellBackend>,
+    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
+    pub linux: Vec<crate::shell_backend::ShellBackend>,
+    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
+    pub wsl: Vec<crate::shell_backend::ShellBackend>,
+}
+
+impl ShellPriority {
+    /// The list as recorded for `os`, before normalization.
+    pub fn listed(&self, os: crate::shell_backend::MachineOs) -> &[crate::shell_backend::ShellBackend] {
+        use crate::shell_backend::MachineOs;
+        match os {
+            MachineOs::Windows => &self.windows,
+            MachineOs::Macos => &self.macos,
+            MachineOs::Linux => &self.linux,
+            MachineOs::Wsl => &self.wsl,
+        }
+    }
+}
+
+/// A backend identifier this build does not know — one a newer Mework wrote —
+/// is dropped instead of failing the whole document: it names a shell this
+/// build could not run anyway.
+fn lenient_backend<'de, D>(deserializer: D) -> Result<Option<crate::shell_backend::ShellBackend>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.as_deref().and_then(crate::shell_backend::ShellBackend::parse))
+}
+
+fn lenient_backends<'de, D>(deserializer: D) -> Result<Vec<crate::shell_backend::ShellBackend>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    Ok(values
+        .iter()
+        .filter_map(|value| crate::shell_backend::ShellBackend::parse(value))
+        .collect())
+}
+
+fn lenient_backend_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, crate::shell_backend::ShellBackend>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = BTreeMap::<String, String>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|(key, value)| {
+            crate::shell_backend::ShellBackend::parse(&value).map(|backend| (key, backend))
+        })
+        .collect())
 }
 
 /// A user-registered SSH execution machine.
@@ -77,6 +287,16 @@ pub struct SshMachineConfig {
     /// Empty delegates identity selection to OpenSSH defaults.
     #[serde(default)]
     pub identity_file: String,
+    /// The shell the machine's agent runs Mework's own scripts in — the remote
+    /// file tools and language servers. `None` until the machine is first
+    /// probed, when the renderer records its OS's preferred backend here; the
+    /// host reads a missing or no-longer-present choice the same way.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::model::lenient_backend"
+    )]
+    pub agent_shell: Option<crate::shell_backend::ShellBackend>,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -2250,6 +2470,22 @@ pub struct ConversationPresetSettings {
     /// schema up front.
     #[serde(default)]
     pub mcp_tool_discovery_enabled: bool,
+    /// Decision-parameter template copied into a new conversation. A missing
+    /// key leaves every tool with its direct parameters only.
+    #[serde(
+        default,
+        deserialize_with = "lenient_decision_parameter_modes",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub decision_parameter_modes: BTreeMap<String, DecisionParameterMode>,
+    /// Miss-scoring template copied into a new conversation. A missing key
+    /// scores no tool's misses.
+    #[serde(
+        default,
+        deserialize_with = "lenient_decision_miss_scoring",
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    pub decision_miss_scoring: BTreeSet<String>,
     // The five file write guards were preset templates here. They are
     // unconditional in the host now, so there is nothing left to copy into a
     // conversation. See [`FileGuard`].
@@ -2656,6 +2892,58 @@ pub struct ConversationSettings {
     /// purpose.
     #[serde(default)]
     pub mcp_tool_discovery_enabled: bool,
+    /// How each tool that has a decision-model form takes it, keyed by tool name
+    /// ([`crate::decision_tools::DECISION_PARAMETER_TOOLS`]).
+    ///
+    /// A tool with no entry keeps its direct parameters only. `Augment` adds its
+    /// decision parameters — `query`, and `threshold` where the tool scores —
+    /// beside them; `Replace` withdraws the direct targeting parameters, so
+    /// every call goes through the decision model. A
+    /// run widens the requested mode to cover whatever the tool lock says the
+    /// transcript already holds, so switching modes can never narrow a schema
+    /// the model has been shown.
+    ///
+    /// A missing key means no entries: sending page contents to the decision
+    /// provider is something a conversation should opt into.
+    #[serde(
+        default,
+        deserialize_with = "lenient_decision_parameter_modes",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub decision_parameter_modes: BTreeMap<String, DecisionParameterMode>,
+    /// The element tools ([`crate::decision_tools::MISS_SCORING_TOOLS`]) whose
+    /// "none of the above" goes on to score every element line the decision
+    /// model was shown, each against the description on its own, and hands the
+    /// lines back ranked by that score instead of as a plain list.
+    ///
+    /// Only a tool that has a decision-parameter mode can miss, so an entry for
+    /// one without is inert. The switch changes no schema — a miss answers with
+    /// the same lines either way — so the tool lock has no part in it.
+    ///
+    /// A missing key means no entries: a scored miss is one decision-model
+    /// request per element shown, which a conversation should opt into.
+    #[serde(
+        default,
+        deserialize_with = "lenient_decision_miss_scoring",
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    pub decision_miss_scoring: BTreeSet<String>,
+    /// The sub-option choices of the tools this conversation has switched off,
+    /// keyed by the row the settings draw for the tool (`preview_click`,
+    /// `preview_logs`, `bash`, …), so switching a tool back on returns it to the
+    /// decision-model form, and the miss scoring, it had.
+    ///
+    /// Renderer state: the host never reads it, since a tool that is off takes
+    /// no form, and [`Self::decision_parameter_modes`] with
+    /// [`Self::decision_miss_scoring`] stay the only answer for the tools that
+    /// are on. The field exists here so a settings round trip through the store
+    /// does not drop it.
+    #[serde(
+        default,
+        deserialize_with = "lenient_remembered_decision_forms",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub remembered_decision_forms: BTreeMap<String, RememberedDecisionForm>,
     /// What this conversation's runs have already put in front of the model.
     ///
     /// `None` until the first run. The host does not decide the contents — the
@@ -2663,6 +2951,16 @@ pub struct ConversationSettings {
     /// a settings round trip through the store does not drop it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_lock: Option<ConversationToolLock>,
+}
+
+/// One switched-off tool's sub-option choices. See
+/// [`ConversationSettings::remembered_decision_forms`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RememberedDecisionForm {
+    pub form: DecisionParameterMode,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub miss_scoring: bool,
 }
 
 /// The file guard a run executes under: the read-record scope it consults.
@@ -2738,6 +3036,102 @@ pub struct ConversationToolLock {
     /// The backend that has fetched pages for this conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_provider: Option<FetchProviderSelection>,
+    /// The decision-parameter mode each exposed tool's schema has covered so
+    /// far. A tool in [`Self::tools`] with no entry went out with its direct
+    /// parameters only. The floor only ever widens: once calls of one shape
+    /// are in the transcript, a later schema has to accept them too.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub decision_parameter_modes: BTreeMap<String, DecisionParameterMode>,
+}
+
+/// How a tool with a decision-model form takes its decision parameters: `query`, plus
+/// `threshold` on the tools that score rather than choose
+/// ([`crate::decision_tools::decision_parameters`]).
+///
+/// The two modes and "direct parameters only" form a small lattice ordered by
+/// what a schema accepts: `Augment` accepts every call the other two do, and
+/// the other two accept disjoint calls. [`DecisionParameterMode::join`] is its
+/// least upper bound.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DecisionParameterMode {
+    /// The direct parameters and the decision parameters side by side.
+    Augment,
+    /// The decision parameters only; the direct targeting parameters are withdrawn.
+    Replace,
+}
+
+impl DecisionParameterMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "augment" => Some(Self::Augment),
+            "replace" => Some(Self::Replace),
+            _ => None,
+        }
+    }
+
+    /// The narrowest mode whose schema accepts every call both arguments do.
+    /// `None` is "direct parameters only".
+    pub fn join(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            (None, None) => None,
+            (Some(Self::Replace), Some(Self::Replace)) => Some(Self::Replace),
+            _ => Some(Self::Augment),
+        }
+    }
+}
+
+/// Drops entries a newer or damaged renderer wrote with a mode this build does
+/// not know, instead of refusing the whole document over one of them.
+fn lenient_decision_parameter_modes<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, DecisionParameterMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|(tool, value)| {
+            value
+                .as_str()
+                .and_then(DecisionParameterMode::parse)
+                .map(|mode| (tool, mode))
+        })
+        .collect())
+}
+
+/// Drops entries a newer or damaged renderer wrote in a shape this build does
+/// not know, instead of refusing the whole document over one of them.
+fn lenient_remembered_decision_forms<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, RememberedDecisionForm>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|(tool, value)| {
+            serde_json::from_value::<RememberedDecisionForm>(value)
+                .ok()
+                .map(|remembered| (tool, remembered))
+        })
+        .collect())
+}
+
+/// Keeps the tool names out of whatever a newer or damaged renderer wrote, instead
+/// of refusing the whole document over one entry that is not a string.
+fn lenient_decision_miss_scoring<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Option::<Vec<Value>>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect())
 }
 
 /// Hand-written so a lock pinned by a build that still had the `auto` fetch
@@ -2790,6 +3184,8 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             search_provider: Option<SearchProviderSelection>,
             #[serde(default)]
             fetch_provider: Option<StoredFetchProvider>,
+            #[serde(default, deserialize_with = "lenient_decision_parameter_modes")]
+            decision_parameter_modes: BTreeMap<String, DecisionParameterMode>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -2822,6 +3218,7 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             prompt_skill_ids: raw.prompt_skill_ids,
             search_provider: raw.search_provider,
             fetch_provider,
+            decision_parameter_modes: raw.decision_parameter_modes,
         })
     }
 }
@@ -3653,6 +4050,22 @@ pub struct RunModelRequest {
     /// conversation's own setting, floored by its tool lock.
     #[serde(skip)]
     pub mcp_tool_discovery: bool,
+    /// The decision-parameter mode of each enabled tool that has one, already
+    /// widened by the tool lock; a tool with no entry takes its direct
+    /// parameters only.
+    ///
+    /// Host-only like the switch above: it decides which arguments a call may
+    /// carry, and page contents leave for the decision provider on the strength
+    /// of it. `trusted_run_request` reads it from the conversation's own
+    /// settings; a child inherits its parent's.
+    #[serde(skip)]
+    pub decision_parameter_modes: BTreeMap<String, DecisionParameterMode>,
+    /// The element tools whose misses this run scores: the conversation's
+    /// [`ConversationSettings::decision_miss_scoring`], kept to the tools that
+    /// have a mode above. Host-only for the same reason — every entry is
+    /// another batch of page contents sent to the decision provider.
+    #[serde(skip)]
+    pub decision_miss_scoring: BTreeSet<String>,
     /// The file write guards this run enforces and the read-record scope they
     /// consult. Host-only like the switches above: `trusted_run_request` reads
     /// the policy from the conversation's own settings, and the scope is a
@@ -5799,5 +6212,55 @@ mod tests {
             cell.set(level);
             assert_eq!(cell.get(), level);
         }
+    }
+
+    /// The choices kept for switched-off tools survive a round trip through the
+    /// store, lose only the entries this build cannot read, and stay off the
+    /// wire while there are none.
+    #[test]
+    fn remembered_decision_forms_round_trip_and_drop_unreadable_entries() {
+        let settings: ConversationSettings = serde_json::from_value(json!({
+            "enabledTools": [],
+            "rememberedDecisionForms": {
+                "preview_click": { "form": "replace", "missScoring": true },
+                "bash": { "form": "augment" },
+                "preview_fill": { "form": "sideways" },
+                "preview_inspect": "augment"
+            }
+        }))
+        .expect("settings with remembered forms");
+        assert_eq!(
+            settings.remembered_decision_forms,
+            BTreeMap::from([
+                (
+                    "bash".to_owned(),
+                    RememberedDecisionForm {
+                        form: DecisionParameterMode::Augment,
+                        miss_scoring: false,
+                    },
+                ),
+                (
+                    "preview_click".to_owned(),
+                    RememberedDecisionForm {
+                        form: DecisionParameterMode::Replace,
+                        miss_scoring: true,
+                    },
+                ),
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["rememberedDecisionForms"],
+            json!({
+                "bash": { "form": "augment" },
+                "preview_click": { "form": "replace", "missScoring": true }
+            })
+        );
+
+        let empty: ConversationSettings =
+            serde_json::from_value(json!({ "enabledTools": [] })).unwrap();
+        assert!(serde_json::to_value(&empty)
+            .unwrap()
+            .get("rememberedDecisionForms")
+            .is_none());
     }
 }

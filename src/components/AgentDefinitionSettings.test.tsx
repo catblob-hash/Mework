@@ -7,6 +7,7 @@ import type {
   ApiProvider,
   ContextItem,
   ConversationPreset,
+  ConversationTemplateSummary,
   ToolDescriptor,
   WebSearchAssets
 } from "../types";
@@ -190,7 +191,8 @@ function renderSettings(
   definitions: readonly AgentDefinition[] = [],
   onChange = vi.fn(),
   presets: readonly ConversationPreset[] = [],
-  listId = nextListId()
+  listId = nextListId(),
+  templates: ConversationTemplateSummary[] = []
 ) {
   render(
     <AgentDefinitionSettings
@@ -200,7 +202,7 @@ function renderSettings(
       tools={tools}
       conversationEnabledTools={conversationEnabledTools}
       webSearchAssets={webSearchAssets}
-      templates={[]}
+      templates={templates}
       presets={presets}
       onReadTemplate={readTemplate}
       onWriteTemplate={writeTemplate}
@@ -210,17 +212,36 @@ function renderSettings(
   return onChange;
 }
 
+/** Opens one of the role window's pages from its rail. */
+async function openPage(
+  user: ReturnType<typeof userEvent.setup>,
+  dialog: HTMLElement,
+  page: RegExp
+) {
+  const rail = within(dialog).getByRole("navigation", { name: "角色设置分类" });
+  await user.click(within(rail).getByRole("button", { name: page }));
+}
+
+function templateSummary(id: string, messageCount: number): ConversationTemplateSummary {
+  return { id, name: "", messageCount, createdAt: "", updatedAt: "" };
+}
+
+function userMessage(id: string, content: string): ContextItem {
+  return { id, kind: "user", content, createdAt: "2026-01-01T00:00:00.000Z" };
+}
+
 afterEach(() => {
   cleanup();
-  readTemplate.mockClear();
+  readTemplate.mockReset();
+  readTemplate.mockImplementation(async () => []);
   writeTemplate.mockClear();
   configureI18n("zh-CN");
 });
 
 describe("AgentDefinitionSettings", () => {
   it.each([
-    ["zh-CN" as const, "新建角色", "角色名称", "保存", "角色名称不能为空。", "请先修正标记的字段。"],
-    ["en-US" as const, "New role", "Role name", "Save", "A role name is required.", "Fix the marked fields before saving."]
+    ["zh-CN" as const, "新建角色", "角色名称", "保存角色", "角色名称不能为空。", "请先修正标记的字段。"],
+    ["en-US" as const, "New role", "Role name", "Save role", "A role name is required.", "Fix the marked fields before saving."]
   ])("the plus row opens a create dialog that asks for the name only on save (%s)", async (
     language,
     createLabel,
@@ -258,35 +279,118 @@ describe("AgentDefinitionSettings", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("edits the role's own conversation template in a window, with the presets beside it", async () => {
+  it("lays the role out as a preset's window is: three pages down a rail, the save under it", async () => {
     const user = userEvent.setup();
-    renderSettings([userDefinition()], vi.fn(), [{
+    renderSettings([userDefinition()]);
+
+    await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
+    // Named after the role, the way a preset's window is named after the preset.
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    const rail = within(dialog).getByRole("navigation", { name: "角色设置分类" });
+    expect(within(rail).getAllByRole("button").map((button) => button.textContent))
+      .toEqual(["角色设置", "工具", "对话模板0", "保存角色"]);
+    // It opens on the role's own settings, and only those: the tool surface is
+    // a page of its own.
+    expect(within(dialog).getByRole("textbox", { name: "角色名称" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("combobox", { name: "执行模型" })).toBeInTheDocument();
+    expect(within(dialog).queryByText("启用工具")).toBeNull();
+
+    await openPage(user, dialog, /^工具/);
+    expect(within(dialog).getByText("启用工具")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("textbox", { name: "角色名称" })).toBeNull();
+    // The conversation's own features page, minus what a role has no field for.
+    expect(within(dialog).queryByRole("switch", { name: /联网搜索/ })).toBeNull();
+    expect(within(dialog).queryByRole("switch", { name: /记忆/ })).toBeNull();
+    expect(within(dialog).queryByRole("switch", { name: /应用数据目录/ })).toBeNull();
+    expect(within(dialog).queryByRole("combobox", { name: "工具描述" })).toBeNull();
+  });
+
+  it("edits the role's template on its own page and slides the presets in under the rail", async () => {
+    const user = userEvent.setup();
+    const onChange = renderSettings([userDefinition()], vi.fn(), [{
       id: "conversation_default",
       name: "默认",
       description: "",
       templateId: "template_preset",
       settings: emptyConversationPresetSettings()
-    }]);
+    }, {
+      id: "conversation_blank",
+      name: "空白",
+      description: "",
+      templateId: "",
+      settings: emptyConversationPresetSettings()
+    }], nextListId(), [templateSummary("template_preset", 2)]);
+    readTemplate.mockImplementation(async (templateId: string) => (
+      templateId === "template_preset"
+        ? [userMessage("ctx_a", "预设的第一句"), userMessage("ctx_b", "预设的第二句")]
+        : []
+    ));
 
     await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
-    const editor = screen.getByRole("dialog", { name: "角色设置" });
-    // A role owns its template, so there is nothing to pick between — only a
-    // body to write, in a window that keeps the rest of the role behind it.
-    expect(within(editor).queryByRole("combobox", { name: "对话模板" })).not.toBeInTheDocument();
-    // Queried by its text: the button sits inside the field's label, so the
-    // field's own prose is what its accessible name resolves to.
-    await user.click(within(editor).getByText("编辑对话模板"));
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    // The presets belong to the template page, so they are not on the rail
+    // until that page is open.
+    expect(within(dialog).queryByText("从预设覆盖")).toBeNull();
 
-    const templateWindow = screen.getByRole("dialog", { name: "对话模板" });
-    const rail = within(templateWindow).getByRole("navigation", { name: "对话模板分类" });
-    expect(within(rail).getByRole("button", { name: /当前的对话模板/ })).toBeInTheDocument();
-    // The role's own body is the editable one; a preset's rides alongside so the
-    // opening history can be written next to what it will run beside.
-    expect(within(templateWindow).getByRole("button", { name: /保存模板/ })).toBeInTheDocument();
+    await openPage(user, dialog, /^对话模板/);
+    expect(within(dialog).getByText("从预设覆盖")).toBeInTheDocument();
+    const presets = within(dialog).getByRole("navigation", { name: "角色设置分类" });
+    // Edits are written as they land, as on a preset's page: no save of its own.
+    expect(within(dialog).queryByRole("button", { name: /保存模板/ })).toBeNull();
+    // A preset with no template has nothing to copy.
+    expect(within(presets).getByRole("button", { name: "用预设 空白 的对话模板覆盖" })).toBeDisabled();
 
-    await user.click(within(rail).getByRole("button", { name: /默认/ }));
+    // The role's template is empty, so there is nothing to lose and nothing to ask.
+    await user.click(within(presets).getByRole("button", { name: "用预设 默认 的对话模板覆盖" }));
+    expect(screen.queryByRole("dialog", { name: "覆盖对话模板？" })).toBeNull();
     expect(readTemplate).toHaveBeenCalledWith("template_preset");
-    expect(within(templateWindow).queryByRole("button", { name: /保存模板/ })).not.toBeInTheDocument();
+    expect(writeTemplate).toHaveBeenCalledWith("", [
+      userMessage("ctx_a", "预设的第一句"),
+      userMessage("ctx_b", "预设的第二句")
+    ]);
+    expect(await within(dialog).findByText("预设的第一句")).toBeInTheDocument();
+
+    // The minted id reaches the role through its draft, on Save.
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
+    expect(onChange.mock.calls.at(-1)![0][0].templateId).toBe("template_minted");
+  });
+
+  it("asks before a preset's template replaces one the role already has", async () => {
+    const user = userEvent.setup();
+    renderSettings([userDefinition({ templateId: "template_role" })], vi.fn(), [{
+      id: "conversation_default",
+      name: "默认",
+      description: "",
+      templateId: "template_preset",
+      settings: emptyConversationPresetSettings()
+    }], nextListId(), [templateSummary("template_role", 1), templateSummary("template_preset", 1)]);
+    readTemplate.mockImplementation(async (templateId: string) => (
+      templateId === "template_role"
+        ? [userMessage("ctx_own", "角色自己的开场")]
+        : [userMessage("ctx_preset", "预设的开场")]
+    ));
+
+    await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    await openPage(user, dialog, /^对话模板/);
+    expect(await within(dialog).findByText("角色自己的开场")).toBeInTheDocument();
+
+    const row = within(dialog).getByRole("button", { name: "用预设 默认 的对话模板覆盖" });
+    await user.click(row);
+    // Declining leaves the role's template exactly as it was.
+    await user.click(within(screen.getByRole("dialog", { name: "覆盖对话模板？" }))
+      .getByRole("button", { name: "取消" }));
+    expect(writeTemplate).not.toHaveBeenCalled();
+    expect(within(dialog).getByText("角色自己的开场")).toBeInTheDocument();
+
+    await user.click(row);
+    const confirm = screen.getByRole("dialog", { name: "覆盖对话模板？" });
+    expect(confirm).toHaveTextContent("已有 1 条消息");
+    await user.click(within(confirm).getByRole("button", { name: "覆盖" }));
+
+    expect(writeTemplate).toHaveBeenCalledWith("template_role", [userMessage("ctx_preset", "预设的开场")]);
+    expect(await within(dialog).findByText("预设的开场")).toBeInTheDocument();
+    expect(within(dialog).queryByText("角色自己的开场")).toBeNull();
   });
 
   it("does not dismiss an in-progress editor when its backdrop is clicked", async () => {
@@ -327,7 +431,7 @@ describe("AgentDefinitionSettings", () => {
     expect(within(dialog).queryByRole("combobox", { name: /独立记忆/ })).not.toBeInTheDocument();
     expect(within(dialog).queryByRole("textbox", { name: /最大轮数/ })).not.toBeInTheDocument();
 
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange).toHaveBeenCalledWith([{
       enabled: true,
@@ -409,7 +513,7 @@ describe("AgentDefinitionSettings", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "设置角色 gone-role" }));
-    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    const dialog = screen.getByRole("dialog", { name: "gone-role" });
     const select = within(dialog).getByRole("combobox", { name: "执行模型" }) as HTMLSelectElement;
     // Nothing is selected: the dead binding gets no option of its own, so the
     // dropdown cannot present it as a choice — and must not fall back to
@@ -450,7 +554,7 @@ describe("AgentDefinitionSettings", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "设置角色 paused-role" }));
-    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    const dialog = screen.getByRole("dialog", { name: "paused-role" });
     const select = within(dialog).getByRole("combobox", { name: "执行模型" }) as HTMLSelectElement;
     expect(select).toBeInvalid();
     // The provider's display name, never its raw ID: that ID is a random
@@ -464,7 +568,7 @@ describe("AgentDefinitionSettings", () => {
       within(dialog).getByRole("combobox", { name: "推理强度" }),
       within(dialog).getByRole("option", { name: "high" })
     );
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     const saved = onChange.mock.calls.at(-1)![0][0];
     expect(saved.modelSelection).toEqual({
@@ -485,7 +589,7 @@ describe("AgentDefinitionSettings", () => {
     })]);
 
     await user.click(screen.getByRole("button", { name: "设置角色 orphan-role" }));
-    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    const dialog = screen.getByRole("dialog", { name: "orphan-role" });
     expect(within(dialog).getByText("gpt-5.6-sol（不可用）")).toBeInTheDocument();
     expect(within(dialog).queryByText(/provider_a1b2c3/u)).toBeNull();
   });
@@ -501,12 +605,12 @@ describe("AgentDefinitionSettings", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "设置角色 gone-role" }));
-    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    const dialog = screen.getByRole("dialog", { name: "gone-role" });
     await user.selectOptions(
       within(dialog).getByRole("combobox", { name: "推理强度" }),
       within(dialog).getByRole("option", { name: "high" })
     );
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange).toHaveBeenCalled();
     const saved = onChange.mock.calls.at(-1)![0][0];
@@ -519,7 +623,8 @@ describe("AgentDefinitionSettings", () => {
     const existing = userDefinition({ tools: ["run_command"] });
     const onChange = renderSettings([existing]);
     await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
-    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    await openPage(user, dialog, /^工具/);
 
     /* The three bulk buttons that used to sit in this heading are gone. They
        acted on the whole catalogue at once, which is not how anyone picks a
@@ -537,7 +642,7 @@ describe("AgentDefinitionSettings", () => {
     await user.click(within(dialog).getByRole("button", { name: "全选文件与搜索" }));
     await user.click(within(dialog).getByRole("button", { name: "全选Shell" }));
     expect(within(dialog).getByText("2 / 2 个已选")).toBeInTheDocument();
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange).toHaveBeenCalledWith([{
       ...existing,
@@ -557,10 +662,11 @@ describe("AgentDefinitionSettings", () => {
       within(dialog).getByRole("textbox", { name: "角色名称" }),
       "runner"
     );
+    await openPage(user, dialog, /^工具/);
 
     expect(conversationEnabledTools).not.toContain("run_command");
     await user.click(within(dialog).getByRole("button", { name: "运行命令已关闭" }));
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     // Toggling a tool converts inherited settings to an explicit list.
     expect(onChange.mock.calls.at(-1)![0][0].tools).toEqual(["read_file", "run_command"]);
@@ -575,6 +681,7 @@ describe("AgentDefinitionSettings", () => {
       within(dialog).getByRole("textbox", { name: "角色名称" }),
       "searcher"
     );
+    await openPage(user, dialog, /^工具/);
 
     /* A menu, not a `<select>`: the same control the conversation uses, where
        the native row can open a second step. Its panel is portaled to the body,
@@ -594,7 +701,7 @@ describe("AgentDefinitionSettings", () => {
     // broke: this role simply does not search.
     expect(within(menu).getByRole("menuitemradio", { name: "不启用" })).toBeInTheDocument();
     await user.click(within(menu).getByRole("menuitemradio", { name: "Tavily" }));
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange.mock.calls.at(-1)![0][0].searchProvider)
       .toEqual({ kind: "explicit", providerKind: "tavily" });
@@ -613,6 +720,7 @@ describe("AgentDefinitionSettings", () => {
       within(dialog).getByRole("textbox", { name: "角色名称" }),
       "shaper"
     );
+    await openPage(user, dialog, /^工具/);
 
     const resultCount = within(dialog).getByRole("spinbutton", { name: "结果数" });
     const compression = within(dialog).getByRole("spinbutton", { name: "结果压缩" });
@@ -623,7 +731,7 @@ describe("AgentDefinitionSettings", () => {
     await user.type(resultCount, "12");
     await user.clear(compression);
     await user.type(compression, "0");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     const saved = onChange.mock.calls.at(-1)![0][0];
     expect(saved.maxResults).toBe(12);
@@ -635,6 +743,7 @@ describe("AgentDefinitionSettings", () => {
     renderSettings();
     await user.click(screen.getByRole("button", { name: "新建角色" }));
     const dialog = screen.getByRole("dialog", { name: "新建角色" });
+    await openPage(user, dialog, /^工具/);
 
     expect(within(dialog).getByText("读取文件")).toBeInTheDocument();
     expect(within(dialog).getByText("运行命令")).toBeInTheDocument();
@@ -668,14 +777,15 @@ describe("AgentDefinitionSettings", () => {
       onChange
     );
     await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
-    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    await openPage(user, dialog, /^工具/);
 
     expect(within(dialog).getByText("1 / 2 个已选")).toBeInTheDocument();
 
     // Changing a visible tool must preserve hidden stale names.
     await user.click(within(dialog).getByRole("button", { name: "运行命令已关闭" }));
     expect(within(dialog).getByText("2 / 2 个已选")).toBeInTheDocument();
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange.mock.calls.at(-1)![0][0].tools)
       .toEqual(["agent_spawn", "read_file", "run_command", "todo"]);
@@ -689,6 +799,7 @@ describe("AgentDefinitionSettings", () => {
 
     expect(within(dialog).getByRole("combobox", { name: "执行模型" })).toHaveValue("inherit");
     expect(within(dialog).getByRole("combobox", { name: "推理强度" })).toHaveValue("inherit");
+    await openPage(user, dialog, /^工具/);
     expect(within(dialog).getByRole("button", { name: "搜索提供商：跟随对话设置" }))
       .toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "抓取提供商：跟随对话设置" }))
@@ -704,7 +815,8 @@ describe("AgentDefinitionSettings", () => {
     const existing = userDefinition();
     const onChange = renderSettings([existing]);
     await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
-    const dialog = screen.getByRole("dialog", { name: "角色设置" });
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    await openPage(user, dialog, /^工具/);
 
     await user.click(within(dialog).getByRole("button", { name: "抓取提供商：跟随对话设置" }));
     await user.click(within(screen.getByRole("menu", { name: "抓取提供商" }))
@@ -713,7 +825,7 @@ describe("AgentDefinitionSettings", () => {
       within(dialog).getByRole("combobox", { name: "域名过滤" }),
       within(dialog).getByRole("option", { name: "启用白名单" })
     );
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     const saved = onChange.mock.calls.at(-1)![0][0];
     expect(saved.fetchProvider).toEqual({ kind: "explicit", providerKind: "jina" });
@@ -735,7 +847,7 @@ describe("AgentDefinitionSettings", () => {
     // way, and leaving to look at the conversation's own tools is not a
     // decision to throw the form away.
     await user.click(within(screen.getByRole("dialog", { name: "新建角色" }))
-      .getByRole("button", { name: "关闭（保留草稿）" }));
+      .getByRole("button", { name: "关闭" }));
     await user.click(screen.getByRole("button", { name: "新建角色" }));
     expect(within(screen.getByRole("dialog", { name: "新建角色" }))
       .getByRole("textbox", { name: "角色名称" })).toHaveValue("半成品");
@@ -754,7 +866,7 @@ describe("AgentDefinitionSettings", () => {
     await user.click(screen.getByRole("button", { name: "新建角色" }));
     const dialog = screen.getByRole("dialog", { name: "新建角色" });
     await user.type(within(dialog).getByRole("textbox", { name: "角色名称" }), "已保存");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
     expect(onChange).toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "新建角色" }));
@@ -773,7 +885,7 @@ describe("AgentDefinitionSettings", () => {
     await user.click(screen.getByRole("button", { name: "新建角色" }));
     const dialog = screen.getByRole("dialog", { name: "新建角色" });
     await user.type(within(dialog).getByRole("textbox", { name: "角色名称" }), "writer");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange).toHaveBeenCalledWith([
       managed,

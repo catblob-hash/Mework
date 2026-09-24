@@ -38,6 +38,12 @@ function renderDialog(props: Partial<ProjectDialogProps> = {}) {
     onSaveSshMachine: vi.fn(),
     onDeleteSshMachine: vi.fn(),
     machineUsage: vi.fn(() => ({ projects: 0, conversations: 0 })),
+    machineShells: {
+      probes: {},
+      environments: { sshMachines: [devbox], envVars: {} },
+      probe: vi.fn(() => Promise.reject(new Error("no host"))),
+      setAgentShell: vi.fn()
+    },
     onSubmit: vi.fn(),
     onClose: vi.fn()
   };

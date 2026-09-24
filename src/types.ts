@@ -365,6 +365,36 @@ export interface ConversationSettings {
    * schema when the model asks for one. Both paths dial the same `mcpIds`.
    */
   mcpToolDiscoveryEnabled: boolean;
+  /**
+   * How each tool with a decision-model form takes it, keyed by tool name
+   * (`DECISION_PARAMETER_TOOL_NAMES`). A tool with no entry keeps its direct
+   * parameters only; `augment` adds its decision parameters beside them —
+   * `query`, plus `threshold` on the tools that score rather than choose;
+   * `replace` withdraws the direct targeting parameters, so every call goes
+   * through the decision model. Absent on documents written before the field
+   * existed, which means no entries.
+   */
+  decisionParameterModes?: DecisionParameterModes;
+  /**
+   * The element tools (`MISS_SCORING_TOOL_NAMES`) whose "none of the above"
+   * goes on to score every element line the decision model was shown, each
+   * against the description on its own, and hands the lines back ranked by
+   * that score instead of as a plain list. Only a tool with a decision-
+   * parameter mode can miss, so an entry for one without is inert. No schema
+   * changes with it, so the tool lock has no part in it. Absent on documents
+   * written before the field existed, which means no entries.
+   */
+  decisionMissScoring?: string[];
+  /**
+   * The sub-option choices of the tools this conversation has switched off,
+   * keyed by the row the settings draw for the tool (`preview_click`,
+   * `preview_logs`, `bash`, …), so switching a tool back on returns it to the
+   * decision-model form, and the miss scoring, it had. Renderer state: the host
+   * never reads it, since a tool that is off takes no form, and
+   * `decisionParameterModes` with `decisionMissScoring` stay the only answer
+   * for the tools that are on. Absent means nothing is remembered.
+   */
+  rememberedDecisionForms?: RememberedDecisionForms;
   /* The five file write guards used to be switches here. They are now
    * unconditional in the host — every conversation, and every child of one,
    * runs with read-before-write, the stale-write refusal, external-change
@@ -377,6 +407,20 @@ export interface ConversationSettings {
    */
   toolLock?: ConversationToolLock;
 }
+
+/** How one tool takes its decision-model form. See `ConversationSettings.decisionParameterModes`. */
+export type DecisionParameterMode = "augment" | "replace";
+
+export type DecisionParameterModes = Partial<Record<string, DecisionParameterMode>>;
+
+/** One switched-off tool's sub-option choices. See `ConversationSettings.rememberedDecisionForms`. */
+export interface RememberedDecisionForm {
+  form: DecisionParameterMode;
+  /** Only on the element tools that score their misses (`MISS_SCORING_TOOL_NAMES`). */
+  missScoring?: boolean;
+}
+
+export type RememberedDecisionForms = Partial<Record<string, RememberedDecisionForm>>;
 
 /**
  * The tool surface a conversation has already exposed. Each run merges its own
@@ -432,6 +476,15 @@ export interface ConversationToolLock {
   searchProvider: SearchProviderSelection | null;
   /** The backend that has fetched pages here, pinned for the same reason. `null` while no run has granted `web_fetch` at all. */
   fetchProvider: FetchProviderSelection | null;
+  /**
+   * The decision-parameter mode each exposed tool's schema has covered so
+   * far. A tool in `tools` with no entry went out with its direct parameters
+   * only. A floor rather than a pin: it widens (direct and `replace` together
+   * make `augment`) but never narrows, because calls of every shape it covered
+   * may already be in the transcript. Absent on locks written before the field
+   * existed, which means no entries.
+   */
+  decisionParameterModes?: DecisionParameterModes;
 }
 
 /** The reusable subset of conversation settings owned by a conversation preset. */
@@ -463,6 +516,10 @@ export interface ConversationPresetSettings {
   skillToolEnabled: boolean;
   /** MCP tool-discovery template copied into conversations. */
   mcpToolDiscoveryEnabled: boolean;
+  /** Decision-parameter template copied into conversations; absent means no entries. */
+  decisionParameterModes?: DecisionParameterModes;
+  /** Miss-scoring template copied into conversations; absent means no entries. */
+  decisionMissScoring?: string[];
 }
 
 /**
@@ -1289,11 +1346,16 @@ export interface AppUpdateCheck {
     /** ISO 8601; empty when GitHub omits it. */
     publishedAt: string;
   };
-  /** The asset for this machine's flavor and architecture, when the release has one. */
+  /** The asset for this machine's flavor and architecture, when the release has one. Always null when `inAppInstall` is false. */
   asset: AppReleaseAsset | null;
   /** `SHA256SUMS` when the release publishes one. */
   checksumsAsset: AppReleaseAsset | null;
   checkedAt: string;
+  /**
+   * Whether this host can download and install the update in-app. Only Windows can: every
+   * release asset is a Windows build, so other hosts are sent to the release page.
+   */
+  inAppInstall: boolean;
 }
 
 /** Streamed while an update downloads. Mirrors Rust `app_update::DownloadEvent`. */
@@ -1436,9 +1498,44 @@ export interface SshMachineConfig {
   port: number;
   /** Private key path; empty uses OpenSSH's default resolution. */
   identityFile: string;
+  /**
+   * The shell the machine's agent runs Mework's own scripts in (the remote file
+   * tools and language servers). Absent until the machine is first probed, when
+   * the first backend of its OS's priority list that it has is recorded here.
+   */
+  agentShell?: ShellBackend;
   createdAt: string;
   updatedAt: string;
 }
+
+/**
+ * A shell Mework runs commands and its own scripts through. Mirrors the host's
+ * `shell_backend::ShellBackend`; which ones a machine has is found by probing it.
+ */
+export type ShellBackend = "bash" | "zsh" | "sh" | "powershell";
+
+/** A machine's operating system. WSL is one of them, not a kind of shell. */
+export type MachineOs = "windows" | "macos" | "linux" | "wsl";
+
+/** One backend a probe found, and where. */
+export interface DetectedShell {
+  backend: ShellBackend;
+  path: string;
+}
+
+/** What a probe learned about one machine. Mirrors `machine_shells::MachineShells`. */
+export interface MachineShells {
+  os: MachineOs;
+  shells: DetectedShell[];
+  probedAt: string;
+}
+
+/**
+ * Each operating system's shell backends, most preferred first. Its only use is
+ * choosing a newly added machine's agent shell. An absent or empty list is the
+ * OS's default order.
+ */
+export type ShellPriority = Partial<Record<MachineOs, ShellBackend[]>>;
 
 /**
  * Execution-environment assets. WSL distributions are machine state and are
@@ -1448,6 +1545,46 @@ export interface SshMachineConfig {
 export interface ExecutionEnvironmentAssets {
   sshMachines: SshMachineConfig[];
   envVars: Record<string, Record<string, string>>;
+  /** Each WSL distribution's agent shell, by distribution name. */
+  wslAgentShells?: Record<string, ShellBackend>;
+  /** One shell priority list per operating system. */
+  shellPriority?: ShellPriority;
+  /** Whether conversations' commands run in the operating system's sandbox. Absent is off. */
+  sandbox?: SandboxSettings;
+}
+
+/** Which hosts a sandbox's processes may connect to. */
+export type SandboxNetworkMode = "off" | "allowlist" | "open";
+
+/**
+ * The sandbox conversations' commands run in when it is on. Mirrors
+ * `model::SandboxSettings`: one sandboxed agent process per conversation and
+ * machine, which can write the conversation's workspaces (and nothing in them
+ * that runs outside the sandbox later), cannot read credentials, and reaches
+ * the network only through a proxy that applies `network`.
+ */
+export interface SandboxSettings {
+  enabled: boolean;
+  network: {
+    mode: SandboxNetworkMode;
+    /** `example.com`, `*.example.com` (subdomains only), optionally `:port`. */
+    allow: string[];
+    deny: string[];
+  };
+  /** Further directories every sandbox may write: absolute or `~/…`. */
+  writable: string[];
+  /** Further paths no sandbox may read, besides the built-in credential locations. */
+  denyRead: string[];
+}
+
+/** What a machine's agent reports about sandboxing there. Mirrors `protocol::SandboxSupport`. */
+export interface SandboxSupport {
+  /** `seatbelt`, `bubblewrap`, `srt-win`; empty when none. */
+  backend: string;
+  available: boolean;
+  detail: string;
+  /** Not available until the machine is set up for it once, with administrator rights (Windows). */
+  setup: boolean;
 }
 
 /** Installed WSL distribution enumerated live by `list_wsl_distros`. */
@@ -1804,6 +1941,8 @@ export type SettingsView =
   | "usage"
   | "execution_environments"
   | "dependencies"
+  | "shells"
+  | "sandbox"
   | "updates"
   | "web_search"
   | "memory"

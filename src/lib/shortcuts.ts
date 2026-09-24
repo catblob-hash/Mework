@@ -176,6 +176,18 @@ export function bindingFromEvent(event: KeyboardEvent): KeyToken[] | null {
   return orderBinding([...modifiers, code]);
 }
 
+/**
+ * Returns whether a keydown belongs to the input method rather than the page.
+ *
+ * WebView2 (Chromium) reports `isComposing` on the key that commits a
+ * composition. macOS WKWebView fires `compositionend` before that keydown, so it
+ * arrives with `isComposing: false` — Enter confirming Pinyin letters would
+ * otherwise read as a plain Enter — and only `keyCode` 229 still marks it.
+ */
+export function isImeKeyEvent(event: KeyboardEvent): boolean {
+  return event.isComposing || event.key === "Process" || event.keyCode === 229;
+}
+
 /** Returns whether a keydown event matches a binding. */
 export function matchesEvent(binding: readonly KeyToken[], event: KeyboardEvent): boolean {
   if (!binding.length) return false;

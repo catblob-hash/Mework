@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
 import { createId } from "../lib/id";
 import { acceptPastedImages } from "../lib/imagePaste";
@@ -60,8 +59,8 @@ function enableableToolNames(tools: readonly ToolDescriptor[]): Set<string> {
  * of the result, and normalizes the body on save so a card authored here is
  * exactly as trustworthy as one authored on a timeline, and no more.
  *
- * This is a page, not a window. Its owner — a preset's 对话模板 page, or the
- * window a role opens — supplies the chrome around it.
+ * This is a page, not a window. Its owner — the 对话模板 page of a preset's
+ * window or of a role's — supplies the chrome around it.
  */
 export function ConversationTemplateEditor({
   templateId,
@@ -71,7 +70,6 @@ export function ConversationTemplateEditor({
   editable = true,
   imageInputSupported = false,
   autosave = false,
-  aside,
   onSave,
   onEnableTools
 }: {
@@ -106,12 +104,6 @@ export function ConversationTemplateEditor({
    * so this is one write per act.
    */
   autosave?: boolean;
-  /**
-   * A rail down the left edge, for a surface that lets the user switch which
-   * template is open. It shares the page's grid so the save button below spans
-   * the full width rather than starting where the timeline does.
-   */
-  aside?: ReactNode;
   /** Resolves when the host has taken the body; rejects with the reason it did not. */
   onSave?: (contexts: ContextItem[]) => Promise<void>;
   /**
@@ -372,10 +364,8 @@ export function ConversationTemplateEditor({
 
   const toolLabel = (name: string) => tools.find((tool) => tool.name === name)?.label ?? name;
 
-  /* Saving belongs to the whole window rather than to the body on the right, so
-     where there is a rail it sits under the rail — the same corner, and the same
-     text button, as the pane this window is laid out after. Without one there is
-     nowhere else for it to go, and it takes a strip along the bottom. */
+  /* Without autosave the page has nowhere else to put its save, so it takes a
+     strip along the bottom. */
   const actions = editable && onSave && !autosave && (
     <div className="template-editor__actions">
       <button
@@ -397,16 +387,7 @@ export function ConversationTemplateEditor({
   );
 
   return (
-    <div className={aside ? "template-editor template-editor--railed" : "template-editor"}>
-      {/* The rail stays put while a body loads: it is how the user got here and
-          how they leave, so it must not blink out from under the pointer. */}
-      {aside && (
-        <div className="template-editor__aside">
-          {aside}
-          {actions}
-        </div>
-      )}
-
+    <div className="template-editor">
       {draft === null ? (
         <p className="template-preview__loading">{t("正在读取…", "Loading…")}</p>
       ) : (
@@ -455,7 +436,7 @@ export function ConversationTemplateEditor({
         />
       )}
 
-      {!aside && actions}
+      {actions}
 
       {/* With no action row there is no free space to report into, so a refused
           write takes a strip of its own rather than vanishing. */}

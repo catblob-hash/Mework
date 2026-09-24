@@ -29,12 +29,21 @@ macro_rules! app_command_names {
 const APP_COMMANDS: &[&str] = mework_app_commands!(app_command_names);
 
 fn main() {
+    // macOS only: the Chromium Embedded Framework distribution cef-dll-sys fetched and compiled
+    // this build against. A development run loads the built-in browser's engine from there;
+    // a bundle carries its own copy in Contents/Frameworks (see src/cef_host).
+    if let Ok(directory) = env::var("DEP_CEF_DLL_WRAPPER_CEF_DIR") {
+        println!("cargo:rustc-env=MEWORK_CEF_DIR={directory}");
+    }
     prefer_mingw_toolchain();
     stage_aisdk_sidecar();
     stage_claude_code();
     ensure_remote_agents_dir();
     println!("cargo:rerun-if-changed=../src/mework-icon.svg");
     println!("cargo:rerun-if-changed=../src/mework-icon-small.svg");
+    // `generate_context!` embeds Info.plist (its privacy usage strings) into the macOS
+    // binary, but the macro does not tell Cargo, so an edit would not reach a dev build.
+    println!("cargo:rerun-if-changed=Info.plist");
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let icon_path = output_dir.join("mework-icon.ico");
     let icon = generated_icon();

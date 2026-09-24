@@ -406,6 +406,7 @@ export function resetAppMocks() {
   runtimeMocks.reorderConversationsRemote.mockReset().mockResolvedValue(undefined);
   runtimeMocks.loadConversationRemote.mockReset().mockResolvedValue(null);
   terminalMocks.closeTerminal.mockReset().mockResolvedValue(undefined);
+  terminalMocks.liveTerminalCount.mockReset().mockResolvedValue(0);
   workspacePickerMocks.hasNativeWorkspacePicker.mockReset().mockReturnValue(true);
   workspacePickerMocks.pickWorkspaceDirectory.mockReset().mockResolvedValue(null);
   workspacePickerMocks.listRemoteDirectory.mockReset()
@@ -467,6 +468,7 @@ export function resetAppMocks() {
     zoom: 1,
     viewport: { width: 560, height: 720 }
   }));
+  browserMocks.setBrowserPageNetwork.mockReset().mockResolvedValue(undefined);
   browserMocks.setBrowserPanelBounds.mockReset().mockResolvedValue({
     hasPage: true,
     open: true,

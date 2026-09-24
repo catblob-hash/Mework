@@ -62,7 +62,8 @@ export const runtimeMocks = {
 };
 
 export const terminalMocks = {
-  closeTerminal: vi.fn()
+  closeTerminal: vi.fn(),
+  liveTerminalCount: vi.fn()
 };
 
 /** Stands in for the host's directory pickers, which reject outside Tauri: the
@@ -103,6 +104,7 @@ export const browserMocks = {
   getBrowserStatus: vi.fn(),
   openBrowser: vi.fn(),
   performBrowserAction: vi.fn(),
+  setBrowserPageNetwork: vi.fn(),
   setBrowserPanelBounds: vi.fn()
 };
 

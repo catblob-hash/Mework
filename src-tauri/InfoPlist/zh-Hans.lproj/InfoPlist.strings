@@ -1,0 +1,11 @@
+/* 隐私权限提示。与 src-tauri/Info.plist 中的英文文本一一对应。 */
+"NSDesktopFolderUsageDescription" = "Mework 需要访问“桌面”文件夹，以打开存放在其中的项目，并运行你在这些项目里启动的命令和智能体工具。";
+"NSDocumentsFolderUsageDescription" = "Mework 需要访问“文稿”文件夹，以打开存放在其中的项目，并运行你在这些项目里启动的命令和智能体工具。";
+"NSDownloadsFolderUsageDescription" = "Mework 需要访问“下载”文件夹，以打开存放在其中的项目，并运行你在这些项目里启动的命令和智能体工具。";
+"NSRemovableVolumesUsageDescription" = "Mework 需要访问可移动宗卷，以打开存放在其中的项目，并运行你在这些项目里启动的命令和智能体工具。";
+"NSNetworkVolumesUsageDescription" = "Mework 需要访问网络宗卷，以打开存放在其中的项目，并运行你在这些项目里启动的命令和智能体工具。";
+"NSLocalNetworkUsageDescription" = "Mework 需要连接本地网络中的 SSH 机器、Ollama / LM Studio 等模型服务，以及开发服务器。";
+"NSAppleEventsUsageDescription" = "你在 Mework 中运行的程序（例如终端里的脚本）可能会请求控制其他应用。";
+"NSMicrophoneUsageDescription" = "你在 Mework 中运行的程序可能会使用麦克风。";
+"NSCameraUsageDescription" = "你在 Mework 中运行的程序可能会使用摄像头。";
+"NSBluetoothAlwaysUsageDescription" = "你在 Mework 中运行的程序可能会使用蓝牙。";

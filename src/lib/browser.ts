@@ -1,6 +1,7 @@
 import { hasBackendRuntime, invoke, isTauriRuntime } from "./backend";
 import { browserRendererMutationAuthority } from "./browserRendererMount";
 import type { GitTarget } from "./git";
+import type { PreviewTarget } from "./preview";
 
 export type BrowserAction =
   | "back"
@@ -119,6 +120,11 @@ export interface BrowserStatus {
    * — never looks to the host like a dialog standing over the page.
    */
   projected?: boolean;
+  /**
+   * The machine whose network the page uses, by environment key (`ssh:<id>`), when that is not
+   * this computer: a page of a workspace on an SSH machine resolves `localhost` there.
+   */
+  networkMachine?: string | null;
 }
 
 export interface BrowserElementPicker {
@@ -354,6 +360,20 @@ export async function openLocalFileInBrowser(
     target,
     ...rendererAuthority
   });
+}
+
+/**
+ * Puts a page on the network of the workspace it belongs to: a page of a workspace on an SSH
+ * machine opens every connection from that machine — `localhost` in it is the machine's — and
+ * any other page uses this computer's own. Bound before the page is opened, so its first request
+ * already leaves from the right machine; `null` is this computer.
+ */
+export async function setBrowserPageNetwork(
+  sessionId: string,
+  target: PreviewTarget | null
+): Promise<void> {
+  requireDesktopRuntime();
+  await invoke<void>("browser_set_page_network", { sessionId, target });
 }
 
 /** Drains the element the user picked, if any. Separate from the poll: the crop is large. */

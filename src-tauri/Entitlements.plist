@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for Mework.app and the executables Tauri signs beside it (the Node AI SDK
+  sidecar and the bundled Claude Code CLI) when the bundle is signed with the hardened
+  runtime. The Chromium helper apps get their own, narrower sets from
+  scripts/stage-macos-cef.mjs.
+
+  - allow-jit / allow-unsigned-executable-memory: V8 in the sidecar, JavaScriptCore in the
+    Claude Code CLI, and Chromium's browser process all generate code at run time.
+  - disable-library-validation: the Chromium Embedded Framework is loaded from the bundle;
+    a signature without a Team ID (ad-hoc or self-signed) would otherwise refuse it.
+  - automation.apple-events, device.audio-input, device.camera: programs the user runs in
+    Mework ask for these as Mework; the hardened runtime denies them outright without the
+    entitlement, before macOS can ask the user. No App Sandbox: Mework is a development
+    environment and must reach the user's projects and tools.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <key>com.apple.security.device.camera</key>
+  <true/>
+</dict>
+</plist>

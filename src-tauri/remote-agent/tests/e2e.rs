@@ -22,7 +22,13 @@ use remote_agent::protocol::{
     self, ExitReason, Message, Op, Policy, Preamble, Reply, SpawnSpec, StdinMode, TerminalSize,
 };
 
-const AGENT: &str = env!("CARGO_BIN_EXE_mework-remote");
+/// The agent under test: the one Cargo built beside this suite, or, for a suite cross-compiled
+/// and copied to another machine to run there, the build named by `MEWORK_REMOTE_E2E_AGENT`.
+fn agent() -> PathBuf {
+    std::env::var_os("MEWORK_REMOTE_E2E_AGENT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mework-remote")))
+}
 
 /// A root short enough for a Unix socket path, removed with the test.
 #[cfg(unix)]
@@ -86,7 +92,7 @@ impl Launcher for DirectLauncher {
         if self.blocked.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(LaunchError::Unreachable("ssh: Network is unreachable".into()));
         }
-        let mut child = Command::new(AGENT)
+        let mut child = Command::new(agent())
             .args([
                 "proxy",
                 "--sync",
@@ -153,6 +159,7 @@ fn spec(sid: &str, argv: &[&str]) -> SpawnSpec {
         output_limit: None,
         orphan_ttl_secs: None,
         label: None,
+        sandbox: None,
     }
 }
 
@@ -599,7 +606,7 @@ fn an_idle_daemon_exits_and_removes_its_socket() {
 fn a_retransmitted_spawn_starts_one_process() {
     let root = scratch_root();
     let nonce = "abc123";
-    let mut child = Command::new(AGENT)
+    let mut child = Command::new(agent())
         .args(["proxy", "--sync", nonce, "--idle-exit", "2", "--tick-ms", "100"])
         .env("MEWORK_REMOTE_ROOT", root.path())
         .stdin(Stdio::piped())
@@ -924,6 +931,49 @@ mod windows {
         link.close(true);
     }
 
+    /// Git Bash starts every Windows program with `CREATE_BREAKAWAY_FROM_JOB` whenever its job
+    /// allows that — a dev server run by a Bash agent shell, or a command a Bash tool call ran —
+    /// and a program outside the job outlives the session that started it. The session's job
+    /// allows no such thing, so ending the session still ends the program.
+    #[test]
+    fn a_program_git_bash_starts_stays_in_its_sessions_tree() {
+        let root = scratch_root();
+        let link = Link::start(config("host-a", "e1"), DirectLauncher::new(root.path(), 3));
+        let Reply::Which { found } = link.call(Op::Which { names: vec!["bash".into()] }, b"", CALL).unwrap() else {
+            panic!("expected which")
+        };
+        if found["bash"].is_none() {
+            eprintln!("Git for Windows is not installed; nothing starts programs through Git Bash here");
+            link.close(true);
+            return;
+        }
+        let mut process = link
+            .spawn(
+                spec(
+                    "s1",
+                    &[
+                        "bash",
+                        "-c",
+                        "powershell.exe -NoProfile -Command '[Console]::Out.WriteLine($PID); Start-Sleep 60'",
+                    ],
+                ),
+                b"",
+                CALL,
+            )
+            .unwrap();
+        let mut stdout = BufReader::new(process.take_stdout().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let program: u32 = line.trim().parse().unwrap_or_else(|_| panic!("{line:?}"));
+        assert!(process_alive(program));
+        process.release();
+        assert!(
+            wait_until(Duration::from_secs(5), || !process_alive(program)),
+            "the program Git Bash started broke away from the session's job"
+        );
+        link.close(true);
+    }
+
     #[test]
     fn output_dropped_while_disconnected_is_counted_not_spliced() {
         let root = scratch_root();
@@ -1033,7 +1083,7 @@ mod windows {
             );
         }
         let nonce = "job1";
-        let mut proxy = Command::new(AGENT)
+        let mut proxy = Command::new(agent())
             .args(["proxy", "--sync", nonce, "--idle-exit", "3", "--tick-ms", "100"])
             .env("MEWORK_REMOTE_ROOT", root.path())
             .stdin(Stdio::piped())
@@ -1099,4 +1149,118 @@ mod windows {
     fn the_daemon_is_started_through_wmi_when_the_job_forbids_breaking_away() {
         the_daemon_outlives_a_killed_session_job(false);
     }
+}
+
+/// A connection to the machine's loopback, relayed by the agent's own `net
+/// connect`, carries bytes both ways and outlives the link dropping under it:
+/// the relay is an ordinary session, so its bytes resume by offset.
+#[test]
+fn a_loopback_connection_is_relayed_and_survives_a_dropped_link() {
+    use std::net::TcpListener;
+    let root = scratch_root();
+    let launcher = DirectLauncher::new(root.path(), 3);
+    let (current, _) = launcher.handle();
+    let link = Link::start(config("host-a", "e1"), launcher);
+    // An echo server that answers each line with it upper-cased.
+    let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = server.local_addr().unwrap().port();
+    let serving = std::thread::spawn(move || {
+        let (stream, _) = server.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            writer.write_all(line.to_uppercase().as_bytes()).unwrap();
+            line.clear();
+        }
+    });
+    let mut connect = spec_of(
+        "net1",
+        vec![
+            protocol::SELF_PROGRAM.into(),
+            "net".into(),
+            "connect".into(),
+            "127.0.0.1".into(),
+            port.to_string(),
+        ],
+    );
+    connect.stdin = StdinMode::Pipe;
+    let mut process = link.spawn(connect, b"", CALL).unwrap();
+    let mut status = BufReader::new(process.take_stderr().unwrap());
+    let mut line = String::new();
+    status.read_line(&mut line).unwrap();
+    assert_eq!(line, "ok\n");
+    let mut stdin = process.stdin();
+    let mut stdout = BufReader::new(process.take_stdout().unwrap());
+    stdin.write_all(b"hello\n").unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "HELLO\n");
+    kill_transport(&current);
+    stdin.write_all(b"again\n").unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "AGAIN\n");
+    process.close_stdin();
+    line.clear();
+    assert_eq!(stdout.read_line(&mut line).unwrap(), 0, "the server closing ends the relay");
+    assert_eq!(process.wait().unwrap().code, Some(0));
+    serving.join().unwrap();
+
+    // Nothing listens on a port the system just handed out: a refusal, said before any data.
+    let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+    let refused = spec_of(
+        "net2",
+        vec![protocol::SELF_PROGRAM.into(), "net".into(), "connect".into(), "127.0.0.1".into(), free.to_string()],
+    );
+    let mut process = link.spawn(refused, b"", CALL).unwrap();
+    let said = read_all(&mut process.take_stderr().unwrap());
+    assert!(said.starts_with("error refused "), "{said}");
+    assert_eq!(process.wait().unwrap().code, Some(2));
+
+    // The probe and the allocator answer in one line of JSON each.
+    let probe = spec_of(
+        "net3",
+        vec![protocol::SELF_PROGRAM.into(), "net".into(), "probe".into(), free.to_string()],
+    );
+    let mut process = link.spawn(probe, b"", CALL).unwrap();
+    let answer = read_all(&mut process.take_stdout().unwrap());
+    assert!(answer.contains("\"bindable\":true") && answer.contains("\"listening\":false"), "{answer}");
+    link.close(true);
+}
+
+/// A connector started ahead of time takes its target as a line on standard input, then relays
+/// the rest of that input exactly as a direct `net connect` does.
+#[test]
+fn a_ready_connector_takes_its_target_from_its_input() {
+    use std::net::TcpListener;
+    let root = scratch_root();
+    let link = Link::start(config("host-a", "e1"), DirectLauncher::new(root.path(), 3));
+    let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = server.local_addr().unwrap().port();
+    let serving = std::thread::spawn(move || {
+        let (mut stream, _) = server.accept().unwrap();
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request).unwrap();
+        stream.write_all(&request.map(|byte| byte.to_ascii_uppercase())).unwrap();
+    });
+    let mut ready = spec_of(
+        "warm1",
+        vec![protocol::SELF_PROGRAM.into(), "net".into(), "connect".into(), "-".into()],
+    );
+    ready.stdin = StdinMode::Pipe;
+    let mut process = link.spawn(ready, b"", CALL).unwrap();
+    let mut stdin = process.stdin();
+    // The target and the first bytes go out together, the way the host sends them.
+    stdin.write_all(format!("127.0.0.1 {port}\nping").as_bytes()).unwrap();
+    let mut status = BufReader::new(process.take_stderr().unwrap());
+    let mut line = String::new();
+    status.read_line(&mut line).unwrap();
+    assert_eq!(line, "ok\n");
+    let mut answer = String::new();
+    process.take_stdout().unwrap().read_to_string(&mut answer).unwrap();
+    assert_eq!(answer, "PING");
+    assert_eq!(process.wait().unwrap().code, Some(0));
+    serving.join().unwrap();
+    link.close(true);
 }

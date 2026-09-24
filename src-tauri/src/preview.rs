@@ -154,6 +154,23 @@ impl TryFrom<&ServerConfig> for PreviewServerConfig {
     }
 }
 
+/// One workspace of a conversation, as the renderer's preview pages address it: by
+/// the number the model addresses it with, exactly as a terminal is opened. A page
+/// belongs to one workspace; its start page reads that workspace's
+/// `.mework/launch.json` and the servers it runs run on that workspace's machine.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewTarget {
+    /// The conversation; for the renderer's draft, the id it will materialize as.
+    pub conversation_id: String,
+    /// Only for the draft: the project it is aimed at.
+    #[serde(default)]
+    pub draft_workspace_id: Option<String>,
+    /// 1-based. Absent is workspace 1 — or, where a command can span them, every workspace.
+    #[serde(default)]
+    pub workspace: Option<u32>,
+}
+
 /// Reads `.mework/launch.json` and reports what it configures.
 ///
 /// Never fails: an absent, unreadable, or broken file is a result the pane has to
@@ -164,6 +181,72 @@ pub fn configurations(workspace: &Path) -> PreviewConfigurationList {
     if let Some(warning) = preview_launch_config::discovery_warning(&found) {
         eprintln!("预览服务器配置（{}）：{warning}", workspace.display());
     }
+    configuration_list(&discovery, &found, workspace)
+}
+
+/// [`configurations`] for a workspace on another machine: the file is read there,
+/// and parsed here by the same parser. Only an unreachable machine is an error —
+/// the file's own problems are still a result to render.
+pub fn remote_configurations(
+    machine: &crate::preview_remote::RemoteMachine,
+    root: &str,
+) -> Result<PreviewConfigurationList, String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// How long a read stands in for the next. The pane asks every second and a half for as long
+    /// as it is open, and each read of another machine's file is a process started there; a file
+    /// edited on the machine still shows within a few seconds.
+    const FRESH_FOR: Duration = Duration::from_secs(5);
+    type Cache = Mutex<HashMap<String, (Instant, PreviewConfigurationList)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{}\n{root}", machine.key());
+    if let Some((read_at, list)) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        if read_at.elapsed() < FRESH_FOR {
+            return Ok(list.clone());
+        }
+    }
+    let (discovery, found) = remote_discovery(machine, root)?;
+    let list = configuration_list(&discovery, &found, discovery.working_directory());
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, (Instant::now(), list.clone()));
+    Ok(list)
+}
+
+/// Reads and parses a remote workspace's `launch.json`, keeping every entry.
+fn remote_discovery(
+    machine: &crate::preview_remote::RemoteMachine,
+    root: &str,
+) -> Result<(LaunchConfigDiscovery, preview_launch_config::LaunchDiscovery), String> {
+    use crate::preview_remote::RemoteLaunchJsonContent;
+    let read = machine.read_launch_json(root)?;
+    let discovery = LaunchConfigDiscovery::new(&read.root);
+    let found = match read.content {
+        RemoteLaunchJsonContent::Read(source) => discovery.parse_source(&source, None),
+        RemoteLaunchJsonContent::Missing => preview_launch_config::LaunchDiscovery::NotFound,
+        RemoteLaunchJsonContent::Unreadable(message) => {
+            preview_launch_config::LaunchDiscovery::Unreadable {
+                code: "EACCES".to_owned(),
+                message,
+            }
+        }
+    };
+    Ok((discovery, found))
+}
+
+fn configuration_list(
+    discovery: &LaunchConfigDiscovery,
+    found: &preview_launch_config::LaunchDiscovery,
+    workspace: &Path,
+) -> PreviewConfigurationList {
     let config = found.config();
     PreviewConfigurationList {
         launch_json_path: discovery.launch_json_path().to_string_lossy().into_owned(),
@@ -193,8 +276,8 @@ pub fn configurations(workspace: &Path) -> PreviewConfigurationList {
             })
             .collect(),
         auto_verify: config.is_some_and(|config| config.auto_verify),
-        problem: preview_launch_config::discovery_model_message(&found, workspace),
-        problem_reason: preview_launch_config::discovery_deny_reason(&found)
+        problem: preview_launch_config::discovery_model_message(found, workspace),
+        problem_reason: preview_launch_config::discovery_deny_reason(found)
             .map(|reason| reason.as_str().to_owned()),
     }
 }
@@ -283,6 +366,95 @@ pub fn start(
             reused: false,
         })
         .map_err(|error| error.message)
+}
+
+/// [`start`] for a workspace on another machine, through its agent.
+///
+/// The same order, the same decisions and the same messages; what changes is where
+/// each question is asked. The file is read there, the port is probed there, and
+/// the server runs there. An attach entry's url is handed back as the file wrote
+/// it: it names that machine's `localhost`, which is where a page of that
+/// workspace reaches.
+///
+/// `root` is the workspace directory as the conversation records it, which is also
+/// what the registry files the machine's servers under, so a listing never has to
+/// ask the machine where its root resolves to.
+pub fn start_remote(
+    registry: &PreviewServerRegistry,
+    machine: &crate::preview_remote::RemoteMachine,
+    root: &str,
+    requested_name: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<PreviewStartOutcome, String> {
+    let requested_name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let (discovery, found) = remote_discovery(machine, root)?;
+    let resolved_root = discovery.working_directory().to_path_buf();
+    let configured_server_count = found.config().map_or(0, |config| config.servers.len());
+    let selected = preview_launch_config::select_server(&found, &resolved_root, requested_name)
+        .map_err(|denial| denial.message)?;
+    if let (None, Some(url)) = (selected.command.as_deref(), selected.url.as_deref()) {
+        return attachment(&selected.name, url, selected.port, session_id)
+            .map(|attached| PreviewStartOutcome::Attached { attached });
+    }
+
+    let mut config = PreviewServerConfig::try_from(&selected)?;
+    let worktree = machine.worktree_key(root);
+    let running =
+        preview_servers::running_for_session(&registry.servers_for_worktree(&worktree), session_id);
+    if let PreviewStartAction::Reuse { server, .. } = preview_servers::decide_start_action(
+        &running,
+        &config.name,
+        config.port,
+        requested_name,
+        configured_server_count,
+    ) {
+        return match registry.get(&server.server_id).filter(|live| {
+            matches!(
+                live.status,
+                PreviewServerStatus::Running | PreviewServerStatus::Starting
+            )
+        }) {
+            Some(server) => Ok(PreviewStartOutcome::Server {
+                server,
+                reused: true,
+            }),
+            None => Err(preview_servers::dead_reuse_refusal_message(&server.name)),
+        };
+    }
+
+    registry
+        .ensure_capacity(&worktree, session_id)
+        .map_err(|error| error.message)?;
+    let port = registry
+        .select_remote_port(machine, config.port, config.auto_port, session_id)
+        .map_err(|error| error.message)?;
+    if port != config.port {
+        config.args = preview_servers::rewrite_port_arguments(&config.args, port);
+        config.port = port;
+    }
+    let host = crate::preview_remote::host(machine);
+    let display_root = resolved_root.to_string_lossy().into_owned();
+    let mut last = None;
+    for attempt in 1..=preview_servers::MAX_SPAWN_ATTEMPTS {
+        match registry.start_remote(&worktree, &display_root, host.clone(), &config, session_id) {
+            Ok(server) => {
+                return Ok(PreviewStartOutcome::Server {
+                    server,
+                    reused: false,
+                })
+            }
+            Err(error) if !error.is_retryable() || attempt == preview_servers::MAX_SPAWN_ATTEMPTS => {
+                return Err(error.message)
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.map_or_else(
+        || "Failed to start preview server after retries".to_owned(),
+        |error| error.message,
+    ))
 }
 
 /// The attach form's own checks, applied to an entry the parser already accepted.

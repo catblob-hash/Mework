@@ -96,6 +96,9 @@ impl AttestationKey {
     pub fn load_or_create(app_data: &Path) -> Result<Self, String> {
         let path = Self::path(app_data);
         if let Some(existing) = Self::read(&path) {
+            // Keys written before creation became owner-only keep working, and
+            // stop being readable by the other accounts on the machine.
+            Self::restrict(&path);
             return Ok(existing);
         }
         let secret = Self::random_secret();
@@ -107,9 +110,24 @@ impl AttestationKey {
                 .map_err(|error| format!("无法创建工具回执密钥目录: {error}"))?;
         }
         fs::write(&temporary, secret).map_err(|error| format!("无法写入工具回执密钥: {error}"))?;
+        // Anyone who can read the key can forge tool cards, and on macOS and
+        // Linux `fs::write` leaves a new file readable by every local account.
+        // Narrowed before the rename, so the key is never visible under its name.
+        Self::restrict(&temporary);
         fs::rename(&temporary, &path).map_err(|error| format!("无法提交工具回执密钥: {error}"))?;
         Ok(Self { secret })
     }
+
+    #[cfg(unix)]
+    fn restrict(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            eprintln!("无法将工具回执密钥设为仅本人可读：{error}");
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn restrict(_path: &Path) {}
 
     /// An ephemeral key, for tests and for any path with no app-data directory.
     /// Cards attested under it are valid for this process only.

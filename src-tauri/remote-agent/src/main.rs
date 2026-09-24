@@ -4,6 +4,12 @@
 //! mework-remote proxy --sync <nonce>   what an SSH session runs
 //! mework-remote daemon                 started by the first proxy, detached
 //! mework-remote version [--json]       what the host checks after an upload
+//! mework-remote net …                  the machine's loopback, for the host (see `agent::net`)
+//! mework-remote sandbox-setup          Windows: provisions the sandbox account (one UAC prompt)
+//! mework-remote serve --stdio          a daemon whose one connection is its own
+//!                                      standard input and output: Mework's agent on
+//!                                      its own machine, or with `--cell <config>` a
+//!                                      sandboxed cell (see `agent::cells`)
 //! ```
 //!
 //! `--idle-exit <seconds>` and `--tick-ms <milliseconds>` tune the daemon; a
@@ -21,8 +27,11 @@ fn main() {
         Some("proxy") => proxy(&arguments[1..]),
         Some("daemon") => daemon(&arguments[1..]),
         Some("version") => version(&arguments[1..]),
+        Some("net") => agent::net::run(&arguments[1..]),
+        Some("serve") => serve(&arguments[1..]),
+        Some("sandbox-setup") => agent::sandbox::windows::setup().map(|said| println!("{said}")),
         _ => Err(
-            "usage: mework-remote proxy --sync <nonce> | daemon | version [--json]".to_owned(),
+            "usage: mework-remote proxy --sync <nonce> | daemon | serve --stdio | version [--json] | net …".to_owned(),
         ),
     };
     if let Err(message) = result {
@@ -74,6 +83,41 @@ fn daemon(arguments: &[String]) -> Result<(), String> {
     agent::run_daemon(options)
 }
 
+fn serve(arguments: &[String]) -> Result<(), String> {
+    let mut stdio = false;
+    let mut cell = None;
+    let mut sync = None;
+    let mut options = DaemonOptions::default();
+    let mut iter = arguments.iter();
+    while let Some(argument) = iter.next() {
+        match argument.as_str() {
+            "--stdio" => stdio = true,
+            "--cell" => {
+                let config = iter.next().ok_or("missing value")?;
+                cell = Some(
+                    serde_json::from_str::<agent::sandbox::CellConfig>(config)
+                        .map_err(|error| format!("unreadable cell configuration: {error}"))?,
+                );
+            }
+            "--sync" => {
+                let nonce = iter.next().ok_or("missing value")?;
+                if nonce.is_empty() || !nonce.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    return Err("the sync nonce must be alphanumeric".into());
+                }
+                sync = Some(nonce.clone());
+            }
+            "--tick-ms" => {
+                options.tick = Duration::from_millis(number(iter.next())?.max(10));
+            }
+            other => return Err(format!("unknown serve argument {other}")),
+        }
+    }
+    if !stdio {
+        return Err("serve needs --stdio".into());
+    }
+    agent::run_stdio(options, cell, sync)
+}
+
 fn number(value: Option<&String>) -> Result<u64, String> {
     value
         .ok_or("missing value")?
@@ -89,6 +133,7 @@ fn version(arguments: &[String]) -> Result<(), String> {
             serde_json::json!({
                 "version": remote_agent::AGENT_VERSION,
                 "build": digest,
+                "source": remote_agent::marked_source_id(),
                 "tag": platform::build_tag(&digest),
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,

@@ -14,6 +14,8 @@ import { UsageSettings } from "./UsageSettings";
 import { UpdateSettings } from "./UpdateSettings";
 import { DecisionProviderSettings } from "./DecisionProviderSettings";
 import { WebSearchSettings } from "./WebSearchSettings";
+import { ShellPrioritySettings } from "./ShellPrioritySettings";
+import { SandboxSettings } from "./SandboxSettings";
 
 type GlobalSettingsChange = GlobalSettingsType | ((current: GlobalSettingsType) => GlobalSettingsType);
 type GlobalSettingsChangeHandler = (change: GlobalSettingsChange) => void;
@@ -87,6 +89,24 @@ export function GlobalSettings({
             <DependencySettings
               tools={settings.environmentTools}
               onChange={(environmentTools) => onChange((current) => ({ ...current, environmentTools }))}
+            />
+          )}
+          {view === "shells" && (
+            <ShellPrioritySettings
+              priority={settings.executionEnvironments.shellPriority}
+              onChange={(shellPriority) => onChange((current) => ({
+                ...current,
+                executionEnvironments: { ...current.executionEnvironments, shellPriority }
+              }))}
+            />
+          )}
+          {view === "sandbox" && (
+            <SandboxSettings
+              settings={settings.executionEnvironments.sandbox}
+              onChange={(sandbox) => onChange((current) => ({
+                ...current,
+                executionEnvironments: { ...current.executionEnvironments, sandbox }
+              }))}
             />
           )}
           {view === "updates" && <UpdateSettings />}

@@ -80,10 +80,7 @@ const MAX_FEEDBACK_CHARS: usize = 4_000;
 /// because "this class of call" is not a meaningful category when the class is
 /// "run anything".
 pub fn is_shell_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "bash" | "powershell" | "bash_find_output" | "powershell_find_output"
-    )
+    crate::shell_backend::ShellBackend::of_tool(tool_name).is_some()
 }
 
 /// Tools that may never carry a standing allowance, whatever the level says.

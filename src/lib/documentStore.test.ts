@@ -123,6 +123,32 @@ describe("createDocumentStore", () => {
     expect(order.slice(0, 2)).toEqual(["start-0", "start-1"]);
   });
 
+  it("persisted() trails current() until the writer accepts the snapshot", async () => {
+    const { save, calls } = deferredSave();
+    const store = createDocumentStore({ save, debounceMs: 420 });
+    const loaded = createTestDocument();
+    store.load(loaded);
+    expect(store.persisted()).toBe(loaded);
+
+    const edited = { ...loaded, schemaVersion: 70 };
+    store.update(() => edited);
+    expect(store.persisted()).toBe(loaded);
+
+    const failed = store.flush();
+    await tick();
+    calls[0].reject(new Error("io"));
+    await expect(failed).rejects.toThrow("io");
+    // A refused write leaves the writer on what it last accepted.
+    expect(store.persisted()).toBe(loaded);
+
+    const flushed = store.flush();
+    await tick();
+    calls[1].resolve();
+    await flushed;
+    expect(store.persisted()).toBe(edited);
+    store.dispose();
+  });
+
   it("flush cancels the pending debounce and saves the current snapshot", async () => {
     vi.useFakeTimers();
     try {

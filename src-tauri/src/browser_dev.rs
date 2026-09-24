@@ -867,6 +867,15 @@ async fn dispatch(
                 )
             }
         }
+        "list_machine_shells" => result_value(super::list_machine_shells().await),
+        "probe_machine_shells" => result_value(
+            super::probe_machine_shells(
+                app.clone(),
+                app.state::<AppState>(),
+                optional_arg(args, "machine")?,
+            )
+            .await,
+        ),
         "list_remote_directory" => result_value(
             super::list_remote_directory(
                 app.clone(),
@@ -1288,6 +1297,15 @@ async fn dispatch(
             )
             .await,
         ),
+        "browser_set_page_network" => result_value(
+            super::browser_set_page_network(
+                app.clone(),
+                app.state::<AppState>(),
+                arg(args, "sessionId")?,
+                optional_arg(args, "target")?,
+            )
+            .await,
+        ),
         "preview_stop_server" => result_value(
             super::preview_stop_server(app.state::<AppState>(), arg(args, "serverId")?).await,
         ),
@@ -1503,6 +1521,7 @@ async fn dispatch(
                 arg(args, "rows")?,
                 optional_arg(args, "workspace")?,
                 optional_arg(args, "shell")?,
+                optional_arg(args, "draftWorkspaceId")?,
                 channel,
             ))
         }
@@ -1531,6 +1550,10 @@ async fn dispatch(
             app.state::<AppState>(),
             arg(args, "conversationId")?,
             arg(args, "terminalId")?,
+        )),
+        "live_terminal_count" => value(super::live_terminal_count(
+            app.state::<AppState>(),
+            arg(args, "conversationId")?,
         )),
         "stop_shell_task" => value(super::stop_shell_task(
             app.state::<AppState>(),

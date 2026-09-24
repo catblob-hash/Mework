@@ -17,10 +17,19 @@
 //! closed after the client's silence timeout even when the socket itself
 //! looks healthy, so a proxy stranded behind a dead network does not hold the
 //! client's place.
+//!
+//! The same daemon also runs over its own standard input and output
+//! ([`run_stdio`]): as the agent Mework keeps on its own machine, started by
+//! the host for its sandboxed conversations, and as a *cell* — one sandboxed
+//! conversation — started by another daemon (see [`cells`]). Such a daemon
+//! has exactly one connection, its parent, and ends with it.
 
+pub mod cells;
+pub mod net;
 pub mod paths;
 pub mod platform;
 pub mod proxy;
+pub mod sandbox;
 pub mod session;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -36,6 +45,9 @@ use crate::protocol::{
 use paths::Paths;
 use platform::LocalStream;
 use session::{lock, Notifier, Owner, Session, SpawnContext};
+
+use std::io::Read;
+use std::sync::OnceLock;
 
 /// Knobs the daemon is started with. The defaults are what a real machine
 /// gets; the tests shorten them.
@@ -81,7 +93,9 @@ const PREFACE_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Connection {
     id: u64,
-    stream: LocalStream,
+    /// Ends the transport: shuts a socket down. A daemon on standard input
+    /// and output has nothing to shut; it ends when its input does.
+    shutdown: Box<dyn Fn() + Send + Sync>,
     last_inbound: Mutex<Instant>,
     closed: AtomicBool,
 }
@@ -89,9 +103,16 @@ struct Connection {
 impl Connection {
     fn close(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
-            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            (self.shutdown)();
         }
     }
+}
+
+/// What a daemon that is itself a cell holds: the connections its processes
+/// open, carried to its parent inside the link, and the proxy they use.
+struct CellRole {
+    tunnels: Arc<crate::tunnel::Tunnels>,
+    _proxy: Option<sandbox::proxy::Proxy>,
 }
 
 struct Client {
@@ -118,13 +139,21 @@ struct State {
 }
 
 pub struct Daemon {
-    paths: Paths,
+    /// `None` for a daemon on standard input and output, which has no socket,
+    /// lock or log of its own.
+    paths: Option<Paths>,
+    home: std::path::PathBuf,
+    tag: String,
     token: String,
     info: AgentInfo,
     options: DaemonOptions,
     state: Mutex<State>,
     next_connection: AtomicU64,
     stopping: AtomicBool,
+    /// The sandboxed cells this daemon runs sessions in.
+    cells: cells::Cells,
+    /// Set when this daemon is a cell.
+    cell: OnceLock<CellRole>,
 }
 
 /// Runs the daemon until it is idle long enough, asked to stop, or finds
@@ -157,40 +186,28 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
     let token = platform::random_hex(32);
     let listener = platform::LocalListener::bind(&paths, &token)
         .map_err(|error| format!("Cannot listen for proxies: {error}"))?;
+    let machine = cells::machine(paths.home.clone(), Some(paths.root.clone()), Some(paths.run_dir.clone()));
     let daemon = Arc::new(Daemon {
-        info: AgentInfo {
-            version: crate::AGENT_VERSION.to_owned(),
-            build: digest,
-            pid: std::process::id(),
-            os: std::env::consts::OS.to_owned(),
-            arch: std::env::consts::ARCH.to_owned(),
-            home: paths.home.to_string_lossy().into_owned(),
-            // Windows' sshd sets `SHELL` to its configured shell too; without
-            // it, `ComSpec` is what a Windows program would start.
-            shell: std::env::var("SHELL")
-                .ok()
-                .filter(|shell| !shell.is_empty())
-                .or_else(|| cfg!(windows).then(|| std::env::var("ComSpec").ok()).flatten()),
-            started_unix_ms: unix_ms(),
-        },
-        paths,
+        info: agent_info(digest, &paths.home),
+        home: paths.home.clone(),
+        tag: paths.tag.clone(),
+        paths: Some(paths),
         token,
         options,
         state: Mutex::new(State::default()),
         next_connection: AtomicU64::new(1),
         stopping: AtomicBool::new(false),
+        cells: cells::Cells::new(machine),
+        cell: OnceLock::new(),
     });
-    log(&format!(
-        "daemon {} started (pid {})",
-        daemon.paths.tag, daemon.info.pid
-    ));
+    log(&format!("daemon {} started (pid {})", daemon.tag, daemon.info.pid));
     let listener = Arc::new(listener);
     {
         let daemon = Arc::clone(&daemon);
         let listener = Arc::clone(&listener);
         std::thread::Builder::new()
             .name("janitor".into())
-            .spawn(move || daemon.janitor(&listener))
+            .spawn(move || daemon.janitor(Some(&listener)))
             .map_err(|error| format!("Cannot start the janitor: {error}"))?;
     }
     loop {
@@ -209,6 +226,140 @@ pub fn run_daemon(options: DaemonOptions) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+    }
+}
+
+/// What a daemon says about itself and its machine.
+fn agent_info(digest: String, home: &std::path::Path) -> AgentInfo {
+    AgentInfo {
+        version: crate::AGENT_VERSION.to_owned(),
+        build: digest,
+        source: Some(crate::marked_source_id().to_owned()),
+        pid: std::process::id(),
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+        home: home.to_string_lossy().into_owned(),
+        // Windows' sshd sets `SHELL` to its configured shell too; without
+        // it, `ComSpec` is what a Windows program would start.
+        shell: std::env::var("SHELL")
+            .ok()
+            .filter(|shell| !shell.is_empty())
+            .or_else(|| cfg!(windows).then(|| std::env::var("ComSpec").ok()).flatten()),
+        started_unix_ms: unix_ms(),
+        sandbox: sandbox::support(),
+    }
+}
+
+/// Runs a daemon whose one connection is its own standard input and output:
+/// the host's agent on its own machine, or — with `cell` — a sandboxed cell
+/// started by another daemon. Prints the sync line for `sync` once it is
+/// ready, and returns when its input ends, after ending every session.
+pub fn run_stdio(options: DaemonOptions, cell: Option<sandbox::CellConfig>, sync: Option<String>) -> Result<(), String> {
+    let digest = platform::self_digest()?;
+    let home = paths::home_dir().ok_or("The account on this machine has no home directory")?;
+    // The cell's proxy has to exist before the filter makes sockets harder
+    // to come by, and the filter before anything else runs.
+    let cell_listener = match &cell {
+        Some(config) => match config.proxy_port {
+            Some(port) => Some(
+                std::net::TcpListener::bind(("127.0.0.1", port))
+                    .map_err(|error| format!("Cannot listen for the sandbox's proxy: {error}"))?,
+            ),
+            None => None,
+        },
+        None => None,
+    };
+    if let Some(config) = &cell {
+        if config.seccomp {
+            #[cfg(target_os = "linux")]
+            {
+                sandbox::seccomp::install()?;
+                // Nothing the cell starts may read its memory or trace it.
+                unsafe {
+                    libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err("This machine has no seccomp".into());
+        }
+    }
+    #[cfg(unix)]
+    platform::install_daemon_signal_handlers();
+    platform::become_subreaper();
+    let machine = cells::machine(home.clone(), None, None);
+    let daemon = Arc::new(Daemon {
+        info: agent_info(digest.clone(), &home),
+        tag: platform::build_tag(&digest),
+        home,
+        paths: None,
+        token: String::new(),
+        options,
+        state: Mutex::new(State::default()),
+        next_connection: AtomicU64::new(1),
+        stopping: AtomicBool::new(false),
+        cells: cells::Cells::new(machine),
+        cell: OnceLock::new(),
+    });
+    if let Some(config) = cell {
+        let weak = Arc::downgrade(&daemon);
+        let tunnels = crate::tunnel::Tunnels::new(Arc::new(move |message: &Message, body: &[u8]| {
+            weak.upgrade().is_some_and(|daemon| daemon.queue_to_parent(message, body))
+        }));
+        let proxy = match cell_listener {
+            Some(listener) => Some(
+                sandbox::proxy::Proxy::start(
+                    listener,
+                    Some(config.proxy_token.clone()),
+                    Arc::new(CellDial(Arc::clone(&tunnels))),
+                )
+                .map_err(|error| format!("Cannot start the sandbox's proxy: {error}"))?,
+            ),
+            None => None,
+        };
+        let _ = daemon.cell.set(CellRole { tunnels, _proxy: proxy });
+    }
+    {
+        let daemon = Arc::clone(&daemon);
+        std::thread::Builder::new()
+            .name("janitor".into())
+            .spawn(move || daemon.janitor(None))
+            .map_err(|error| format!("Cannot start the janitor: {error}"))?;
+    }
+    let stdout = std::io::stdout();
+    if let Some(nonce) = sync {
+        use std::io::Write as _;
+        let mut out = stdout.lock();
+        out.write_all(protocol::sync_line(&nonce).as_bytes())
+            .and_then(|_| out.flush())
+            .map_err(|error| format!("Cannot write to standard output: {error}"))?;
+    }
+    let mut reader: Box<dyn Read + Send> = Box::new(std::io::stdin());
+    let hello = match protocol::read_frame(&mut reader) {
+        Ok(Some(protocol::Frame {
+            message: Message::Hello(hello),
+            ..
+        })) => hello,
+        _ => return Ok(()),
+    };
+    let writer: Box<dyn std::io::Write + Send> = Box::new(stdout);
+    if let Some(client) = Arc::clone(&daemon).serve_connection(hello, Vec::new(), reader, writer, Box::new(|| {})) {
+        daemon.release_client(&client, ExitReason::Shutdown);
+    }
+    daemon.stopping.store(true, Ordering::SeqCst);
+    daemon.cells.shutdown();
+    daemon.finish_sessions();
+    Ok(())
+}
+
+/// A cell's proxy dials through the link, which the parent answers by its
+/// policy.
+struct CellDial(Arc<crate::tunnel::Tunnels>);
+
+impl sandbox::proxy::Dial for CellDial {
+    fn dial(&self, host: &str, port: u16) -> Result<crate::tunnel::Upstream, sandbox::proxy::DialError> {
+        self.0
+            .dial(host, port)
+            .map_err(|(refused, message)| sandbox::proxy::DialError { refused, message })
     }
 }
 
@@ -235,8 +386,32 @@ impl Daemon {
             })) => hello,
             _ => return,
         };
+        let _ = stream.set_read_timeout(None);
+        let Ok(writer) = stream.try_clone() else {
+            return;
+        };
+        self.serve_connection(
+            hello,
+            local.env,
+            Box::new(reader),
+            Box::new(writer),
+            Box::new(move || {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }),
+        );
+    }
+
+    /// Serves one connection whose hello has been read, until it ends.
+    /// Returns its client, if it got as far as having one.
+    fn serve_connection(
+        self: Arc<Self>,
+        hello: Hello,
+        env: Vec<(String, String)>,
+        mut reader: Box<dyn Read + Send>,
+        mut writer: Box<dyn std::io::Write + Send>,
+        shutdown: Box<dyn Fn() + Send + Sync>,
+    ) -> Option<String> {
         if hello.protocol != PROTOCOL_VERSION {
-            let mut writer = &stream;
             let _ = protocol::write_frame(
                 &mut writer,
                 &Message::Refused {
@@ -247,20 +422,19 @@ impl Daemon {
                 },
                 &[],
             );
-            return;
+            return None;
         }
         if hello.client.is_empty() || hello.client.len() > 128 || hello.epoch.len() > 128 {
-            return;
+            return None;
         }
-        let _ = stream.set_read_timeout(None);
         let connection = Arc::new(Connection {
             id: self.next_connection.fetch_add(1, Ordering::SeqCst),
-            stream,
+            shutdown,
             last_inbound: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
         });
         let client_id = hello.client.clone();
-        let notifier = self.introduce(&connection, hello, local.env);
+        let notifier = self.introduce(&connection, hello, env);
         {
             let daemon = Arc::clone(&self);
             let writer_connection = Arc::clone(&connection);
@@ -268,7 +442,7 @@ impl Daemon {
             let notifier = Arc::clone(&notifier);
             let spawned = std::thread::Builder::new()
                 .name("writer".into())
-                .spawn(move || daemon.write_loop(&client_id, &writer_connection, &notifier));
+                .spawn(move || daemon.write_loop(&client_id, &writer_connection, &notifier, writer));
             if spawned.is_err() {
                 connection.close();
             }
@@ -290,6 +464,7 @@ impl Daemon {
             }
         }
         notifier.notify();
+        Some(client_id)
     }
 
     /// Registers a connection as its client's current one and queues the
@@ -394,7 +569,7 @@ impl Daemon {
         notifier
     }
 
-    fn read_loop(&self, client_id: &str, connection: &Arc<Connection>, reader: &mut LocalStream) {
+    fn read_loop(&self, client_id: &str, connection: &Arc<Connection>, reader: &mut Box<dyn Read + Send>) {
         loop {
             let frame = match protocol::read_frame(reader) {
                 Ok(Some(frame)) => frame,
@@ -420,6 +595,19 @@ impl Daemon {
                         self.release_client(client_id, ExitReason::Signalled);
                     }
                     return;
+                }
+                // A cell's parent answering the connections its processes
+                // asked for.
+                message @ (Message::Dialed { .. }
+                | Message::Tunnel { .. }
+                | Message::TunnelAck { .. }
+                | Message::TunnelEnd { .. }
+                | Message::TunnelClose { .. })
+                    if self.cell.get().is_some() =>
+                {
+                    if let Some(cell) = self.cell.get() {
+                        cell.tunnels.dispatch(&message, &frame.body);
+                    }
                 }
                 // Anything else is not the host's to send.
                 _ => return,
@@ -473,17 +661,27 @@ impl Daemon {
                 if self.stopping.load(Ordering::SeqCst) {
                     return Err(Failure::new(FailureKind::Unsupported, "The agent is shutting down"));
                 }
-                let session = session::spawn(
-                    &spec,
-                    body,
-                    SpawnContext {
-                        owner,
-                        notifier: Arc::clone(&notifier),
-                        base_env: &base_env,
-                        home: &self.paths.home,
-                        orphan_ttl: orphan_ttl.min(MAX_ORPHAN_TTL),
-                    },
-                )?;
+                let context = SpawnContext {
+                    owner,
+                    notifier: Arc::clone(&notifier),
+                    base_env: &base_env,
+                    home: &self.home,
+                    orphan_ttl: orphan_ttl.min(MAX_ORPHAN_TTL),
+                };
+                let session = match &spec.sandbox {
+                    Some(_) if self.cell.get().is_some() => {
+                        return Err(Failure::new(
+                            FailureKind::Invalid,
+                            "A sandboxed session cannot start another sandbox",
+                        ))
+                    }
+                    Some(sandbox) => {
+                        let env = session::session_env(&base_env, &[], &BTreeMap::new());
+                        let process = self.cells.spawn(client_id, &spec, sandbox, &body, &env)?;
+                        session::spawn_relayed(&spec, process, context)?
+                    }
+                    None => session::spawn(&spec, body, context)?,
+                };
                 let pid = session.pid;
                 {
                     // Stamped with whichever connection is current *now*: a
@@ -545,7 +743,7 @@ impl Daemon {
                     .into_iter()
                     .take(64)
                     .map(|name| {
-                        let path = session::resolve_program(&name, &env, &self.paths.home, &self.paths.home)
+                        let path = session::resolve_program(&name, &env, &self.home, &self.home)
                             .map(|path| path.to_string_lossy().into_owned());
                         (name, path)
                     })
@@ -558,14 +756,13 @@ impl Daemon {
     /// Sends everything owed to one connection: queued frames first, then each
     /// session's output a chunk at a time, round-robin, then exits whose output
     /// is complete. Never holds a lock while writing.
-    fn write_loop(&self, client_id: &str, connection: &Arc<Connection>, notifier: &Notifier) {
-        let mut writer = match connection.stream.try_clone() {
-            Ok(writer) => writer,
-            Err(_) => {
-                connection.close();
-                return;
-            }
-        };
+    fn write_loop(
+        &self,
+        client_id: &str,
+        connection: &Arc<Connection>,
+        notifier: &Notifier,
+        mut writer: Box<dyn std::io::Write + Send>,
+    ) {
         loop {
             if connection.closed.load(Ordering::SeqCst) {
                 return;
@@ -606,6 +803,23 @@ impl Daemon {
                 continue;
             }
             notifier.wait(Duration::from_millis(500));
+        }
+    }
+
+    /// Queues a frame for a cell's one connection, its parent. `false` when
+    /// there is none.
+    fn queue_to_parent(&self, message: &Message, body: &[u8]) -> bool {
+        let client = lock(&self.state)
+            .clients
+            .iter()
+            .find(|(_, client)| client.connection.is_some())
+            .map(|(id, _)| id.clone());
+        match client {
+            Some(client) => {
+                self.queue(&client, message, body);
+                true
+            }
+            None => false,
         }
     }
 
@@ -663,19 +877,23 @@ impl Daemon {
     /// Enforces every lifetime the daemon promises: silent connections are
     /// closed, orphaned sessions reclaimed, finished ones forgotten, and the
     /// daemon itself leaves once it has had nothing to do for long enough.
-    fn janitor(&self, listener: &platform::LocalListener) {
+    fn janitor(&self, listener: Option<&platform::LocalListener>) {
         loop {
             std::thread::sleep(self.options.tick);
             if platform::stop_requested() {
                 self.shutdown(listener, "asked to stop");
             }
+            self.cells.sweep();
             let now = Instant::now();
             let mut silent = Vec::new();
             let mut reclaim = Vec::new();
             let idle_for = {
                 let mut state = lock(&self.state);
                 let mut forget = Vec::new();
-                for client in state.clients.values() {
+                // A pipe cannot go half-open the way a network can: a daemon on
+                // standard input and output hears of its parent's end as
+                // the end of its input.
+                for client in state.clients.values().filter(|_| self.paths.is_some()) {
                     if let Some(connection) = &client.connection {
                         let quiet = now.duration_since(*lock(&connection.last_inbound));
                         if quiet >= Duration::from_secs(client.policy.silence_timeout_secs) {
@@ -730,7 +948,8 @@ impl Daemon {
                             .is_some_and(|since| now.duration_since(since) < Duration::from_secs(3600))
                 });
                 let busy = !state.sessions.is_empty()
-                    || state.clients.values().any(|client| client.connection.is_some());
+                    || state.clients.values().any(|client| client.connection.is_some())
+                    || self.cells.count() > 0;
                 if busy {
                     state.idle_since = None;
                     None
@@ -749,16 +968,28 @@ impl Daemon {
                 session.terminate(ExitReason::Reclaimed);
             }
             platform::reap_orphans();
-            if idle_for.is_some_and(|idle| idle >= self.options.idle_exit) {
+            // A daemon on standard input and output leaves when its input
+            // ends, not when it is idle: its parent decides.
+            if self.paths.is_some() && idle_for.is_some_and(|idle| idle >= self.options.idle_exit) {
                 self.shutdown(listener, "idle");
             }
         }
     }
 
     /// Ends every session, removes the socket and leaves.
-    fn shutdown(&self, listener: &platform::LocalListener, why: &str) -> ! {
+    fn shutdown(&self, listener: Option<&platform::LocalListener>, why: &str) -> ! {
         self.stopping.store(true, Ordering::SeqCst);
-        listener.remove_files();
+        if let Some(listener) = listener {
+            listener.remove_files();
+        }
+        self.cells.shutdown();
+        self.finish_sessions();
+        log(&format!("daemon {} exiting: {why}", self.tag));
+        std::process::exit(0)
+    }
+
+    /// Ends every session's processes: politely, then not.
+    fn finish_sessions(&self) {
         let sessions: Vec<Arc<Session>> = lock(&self.state).sessions.values().cloned().collect();
         for session in &sessions {
             if session.is_running() {
@@ -774,8 +1005,6 @@ impl Daemon {
                 session.signal(protocol::SignalKind::Kill, ExitReason::Shutdown);
             }
         }
-        log(&format!("daemon {} exiting: {why}", self.paths.tag));
-        std::process::exit(0)
     }
 }
 

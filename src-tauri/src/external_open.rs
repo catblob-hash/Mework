@@ -143,11 +143,20 @@ fn launch(url: &str) -> Result<(), String> {
     let opener = host_platform()
         .desktop_opener()
         .ok_or_else(|| "这个平台没有可用的外部链接打开方式".to_owned())?;
-    std::process::Command::new(opener)
+    let mut child = std::process::Command::new(opener)
         .arg(url)
         .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("无法打开外部链接: {error}"))
+        .map_err(|error| format!("无法打开外部链接: {error}"))?;
+    // A child nobody waits on stays a zombie for the life of Mework, one per
+    // link. `open` exits as soon as the browser has the URL, but `xdg-open` can
+    // stay in the foreground for as long as a browser it started, so the wait
+    // gets a thread of its own instead of holding up the caller.
+    let _ = std::thread::Builder::new()
+        .name("external-open-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(())
 }
 
 #[cfg(test)]

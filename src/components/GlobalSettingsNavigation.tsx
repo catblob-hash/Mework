@@ -6,6 +6,8 @@ import {
   Palette,
   Scale,
   Search,
+  ShieldCheck,
+  SquareTerminal,
   Terminal
 } from "lucide-react";
 import { Fragment } from "react";
@@ -50,6 +52,8 @@ export const globalSettingsNavigationGroups: Array<{
   {
     id: "system",
     items: [
+      { id: "shells", icon: SquareTerminal },
+      { id: "sandbox", icon: ShieldCheck },
       { id: "dependencies", icon: Terminal },
       { id: "updates", icon: Download }
     ]
@@ -78,6 +82,8 @@ export function GlobalSettingsNavigation({
     decision_providers: t("决策模型提供商", "Decision model providers"),
     shortcuts: t("快捷键", "Keyboard shortcuts"),
     usage: t("用量统计", "Usage statistics"),
+    shells: t("Shell 优先级", "Shell priority"),
+    sandbox: t("沙箱", "Sandbox"),
     dependencies: t("环境依赖", "Dependencies"),
     updates: t("版本更新", "Updates")
   };

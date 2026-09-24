@@ -4,8 +4,7 @@ import {
   Box,
   FileText,
   FolderCog,
-  SlidersHorizontal,
-  Wrench
+  SlidersHorizontal
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
@@ -13,6 +12,7 @@ import {
   captureConversationPresetSettings,
   implicitConversationPreset
 } from "../lib/conversationPresets";
+import { normalizeRememberedDecisionForms } from "../lib/decisionParameters";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
 import type {
@@ -30,15 +30,12 @@ import type {
   ToolDescriptor
 } from "../types";
 import { Dialog, Switch } from "./Common";
-import { DocsLink } from "./DocsLink";
 import { editableUserAgentDefinition } from "../lib/agentDefinitions";
 import { isHostDerivedToolName } from "../lib/taskTools";
 import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/webSearch";
 import { toolLockOf } from "../lib/toolLock";
 import { ConversationTemplateEditor } from "./ConversationTemplateEditor";
-import { ToolDescriptionSelectRow } from "./PresetComposition";
-import { ToolSelectionGroups } from "./ToolSelectionGroups";
-import { WebSearchBehaviorSettings } from "./WebSearchBehaviorSettings";
+import { FeaturesPage } from "./FeaturesPage";
 import {
   AgentRolesPage,
   CapabilitySelectionPage,
@@ -75,7 +72,7 @@ export type ConversationSettingsView =
  */
 export type ConversationSettingsMode = "conversation" | "preset";
 
-const NAVIGATION: Array<{ id: ConversationSettingsView; icon: typeof Wrench }> = [
+const NAVIGATION: Array<{ id: ConversationSettingsView; icon: typeof SlidersHorizontal }> = [
   { id: "features", icon: SlidersHorizontal },
   { id: "skills", icon: Box },
   { id: "mcp", icon: Blocks },
@@ -469,123 +466,60 @@ export function ConversationSettings({
             ? "conversation-settings__page-stack conversation-settings__page-stack--flush"
             : "conversation-settings__page-stack"}>
             {view === "features" && (
-              <>
-                <section className="conversation-settings__field">
-                  <div className="settings-section__heading settings-section__heading--split">
-                    <div><Wrench size={15} /><span><strong>{t("启用工具", "Enabled tools")}</strong><small>{t(
-                      "{enabled} / {total} 个已选",
-                      "{enabled} / {total} selected",
-                      { enabled: validEnabledToolCount, total: toolNames.length }
-                    )}</small></span></div>
-                    <DocsLink page="features" />
-                  </div>
-                  <ToolSelectionGroups
-                    tools={tools}
-                    enabledTools={settings.enabledTools}
-                    lockedTools={lock.tools}
-                    onChange={(enabledTools) => update({ enabledTools })}
-                    expansionKey={conversation.id}
-                  />
-                </section>
-
-                {/* Web access is one switch, not two tool checkboxes. Upstreams do not
-                    agree on how many web tools there are — Anthropic exposes search
-                    and fetch separately, DeepSeek and OpenAI expose search alone and
-                    keep page retrieval inside it — so the host derives the pair from
-                    this switch and the resolved backend rather than letting the picker
-                    promise a shape the upstream may not have. */}
-                <section className="conversation-settings__field">
-                  <div className={`tool-toggle-row${lock.webSearch ? " tool-toggle-row--locked" : ""}`}>
-                    <span><strong>{t("启用联网搜索", "Enable web search")}</strong><small>{t(
-                      "这个对话能不能联网。具体拿到哪几个联网工具，由下面的搜索后端与抓取后端各自决定——两者可以分别指定，也可以分别关掉。",
-                      "Whether this conversation can reach the web at all. Which web tools it actually gets is decided by the search and fetch backends below: each names its own, and each can be turned off on its own."
-                    )}</small>{lock.webSearch && <small>{lockedHint}</small>}</span>
-                    <Switch
-                      checked={Boolean(settings.webSearchEnabled)}
-                      disabled={lock.webSearch}
-                      onChange={(webSearchEnabled) => update({ webSearchEnabled })}
-                      label={settings.webSearchEnabled
-                        ? t("联网搜索已开启", "Web search enabled")
-                        : t("联网搜索已关闭", "Web search disabled")}
-                    />
-                  </div>
-                  {settings.webSearchEnabled ? (
-                    <div className="web-search-provider-field">
-                      <WebSearchBehaviorSettings
-                        value={settings.webSearch}
-                        onChange={updateWebSearch}
-                        webSearchAssets={globalSettings.webSearch}
-                        nativeFetchAvailable={nativeFetchAvailable}
-                        nativeToolTypeSelectable={nativeToolTypeSelectable}
-                        lockedHint={settledBackendHint(t)}
-                        searchLocked={lock.searchProvider !== null}
-                        fetchLocked={lock.fetchProvider !== null}
-                      />
-                    </div>
-                  ) : null}
-                </section>
-
-                <section className="conversation-settings__field">
-                  <div className={`tool-toggle-row${lock.globalMemory ? " tool-toggle-row--locked" : ""}`}>
-                    <span><strong>{t("启用全局记忆", "Enable global memory")}</strong><small>{t(
-                      "开启后，~/.mework 的 MEWORK.md 常驻指令与 MEMORY.md 记忆索引拼进上下文，读取/创建/编辑全局记忆三个工具随之可用。",
-                      "When enabled, ~/.mework's MEWORK.md instructions and MEMORY.md index join the context, and the read/create/edit global memory tools become available."
-                    )}</small>{lock.globalMemory && <small>{lockedHint}</small>}</span>
-                    <Switch
-                      checked={Boolean(settings.globalMemoryEnabled)}
-                      disabled={lock.globalMemory}
-                      onChange={(globalMemoryEnabled) => update({ globalMemoryEnabled })}
-                      label={settings.globalMemoryEnabled
-                        ? t("全局记忆已开启", "Global memory enabled")
-                        : t("全局记忆已关闭", "Global memory disabled")}
-                    />
-                  </div>
-                  <div className={`tool-toggle-row${lock.projectMemory ? " tool-toggle-row--locked" : ""}`}>
-                    <span><strong>{t("启用项目记忆", "Enable project memory")}</strong><small>{t(
-                      "开启后，当前工作区 .mework 的 MEWORK.md 与 MEMORY.md 拼进上下文，读取/创建/编辑项目记忆三个工具随之可用。",
-                      "When enabled, this workspace's .mework MEWORK.md and MEMORY.md join the context, and the read/create/edit project memory tools become available."
-                    )}</small>{lock.projectMemory && <small>{lockedHint}</small>}</span>
-                    <Switch
-                      checked={Boolean(settings.projectMemoryEnabled)}
-                      disabled={lock.projectMemory}
-                      onChange={(projectMemoryEnabled) => update({ projectMemoryEnabled })}
-                      label={settings.projectMemoryEnabled
-                        ? t("项目记忆已开启", "Project memory enabled")
-                        : t("项目记忆已关闭", "Project memory disabled")}
-                    />
-                  </div>
-                  {/* Conversation-only, so a preset body has no room to carry it:
-                      drawing the switch there would promise a save that discards it. */}
-                  {editingPreset ? null : (
-                    <div className="tool-toggle-row">
-                      <span><strong>{t("拼接应用数据目录", "Include app data directory")}</strong><small>{t(
-                        "开启后，模型会在系统提示词中看到受信任的应用数据目录绝对路径。",
-                        "When enabled, the model sees the trusted app data directory's absolute path in the system prompt."
-                      )}</small></span>
-                      <Switch
-                        checked={Boolean(settings.includeAppDataPath)}
-                        onChange={(includeAppDataPath) => onChangeConversationOnly({ includeAppDataPath })}
-                        label={settings.includeAppDataPath
-                          ? t("拼接应用数据目录已开启", "App data directory enabled")
-                          : t("拼接应用数据目录已关闭", "App data directory disabled")}
-                      />
-                    </div>
-                  )}
-                </section>
-
-                {/* The five race-safe write guards used to be five switches
-                    here. They are unconditional now — every conversation runs
-                    with all five — so the section is gone rather than drawn as
-                    a row of controls nothing can move. */}
-
-                <section className="conversation-settings__field">
-                  <ToolDescriptionSelectRow
-                    resources={capabilities.toolDescriptionFiles}
-                    selectedId={settings.toolDescriptionFileId}
-                    onChange={(toolDescriptionFileId) => update({ toolDescriptionFileId })}
-                  />
-                </section>
-              </>
+              <FeaturesPage
+                picker={{
+                  tools,
+                  enabledTools: settings.enabledTools,
+                  lockedTools: lock.tools,
+                  onChange: (enabledTools) => update({ enabledTools }),
+                  expansionKey: conversation.id,
+                  decisionParameterModes: settings.decisionParameterModes ?? {},
+                  lockedDecisionParameterModes: lock.decisionParameterModes,
+                  decisionMissScoring: settings.decisionMissScoring ?? [],
+                  rememberedDecisionForms: normalizeRememberedDecisionForms(settings.rememberedDecisionForms),
+                  onToolSettingsChange: update
+                }}
+                pickerSummary={t(
+                  "{enabled} / {total} 个已选",
+                  "{enabled} / {total} selected",
+                  { enabled: validEnabledToolCount, total: toolNames.length }
+                )}
+                webAccess={{
+                  enabled: Boolean(settings.webSearchEnabled),
+                  locked: lock.webSearch,
+                  onChange: (webSearchEnabled) => update({ webSearchEnabled })
+                }}
+                web={{
+                  value: settings.webSearch,
+                  onChange: updateWebSearch,
+                  webSearchAssets: globalSettings.webSearch,
+                  nativeFetchAvailable,
+                  nativeToolTypeSelectable,
+                  lockedHint: settledBackendHint(t),
+                  searchLocked: lock.searchProvider !== null,
+                  fetchLocked: lock.fetchProvider !== null
+                }}
+                memory={{
+                  global: Boolean(settings.globalMemoryEnabled),
+                  project: Boolean(settings.projectMemoryEnabled),
+                  globalLocked: lock.globalMemory,
+                  projectLocked: lock.projectMemory,
+                  onChangeGlobal: (globalMemoryEnabled) => update({ globalMemoryEnabled }),
+                  onChangeProject: (projectMemoryEnabled) => update({ projectMemoryEnabled })
+                }}
+                /* Conversation-only, so a preset body has no room to carry it:
+                   drawing the switch there would promise a save that discards it. */
+                appDataPath={editingPreset ? undefined : {
+                  enabled: Boolean(settings.includeAppDataPath),
+                  onChange: (includeAppDataPath) => onChangeConversationOnly({ includeAppDataPath })
+                }}
+                toolDescription={{
+                  resources: capabilities.toolDescriptionFiles,
+                  selectedId: settings.toolDescriptionFileId,
+                  onChange: (toolDescriptionFileId) => update({ toolDescriptionFileId })
+                }}
+                lockedHint={lockedHint}
+              />
             )}
 
             {view === "skills" && (

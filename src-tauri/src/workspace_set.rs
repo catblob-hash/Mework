@@ -17,9 +17,10 @@
 //! conversation and the machine catalog; neither renderer input nor a tool
 //! argument can introduce a root or a machine that is not already recorded.
 
-use crate::host_platform::{host_platform, HostPlatform};
+use crate::machine_shells::DetectedShell;
 use crate::model::{AttachedWorkspace, ExecutionEnvironmentAssets, RunTarget};
 use crate::run_environment::{resolve_shell_runner, ShellRunner};
+use crate::shell_backend::{MachineOs, ShellBackend};
 
 /// The most workspaces one conversation may address: every workspace its
 /// project may hold, then every directory it may attach.
@@ -31,25 +32,6 @@ use crate::run_environment::{resolve_shell_runner, ShellRunner};
 /// model would never learn they were granted.
 pub const MAX_WORKSPACES: usize =
     crate::storage::MAX_PROJECT_WORKSPACES + crate::storage::MAX_ADDITIONAL_DIRECTORIES;
-
-/// Which family of shell a workspace's machine speaks.
-///
-/// This is the only thing the workspace list says about an operating system, and
-/// it exists for one question: whether `powershell` can run there. Mework's WSL
-/// and SSH legs both invoke `bash`, so every remote workspace is POSIX — an SSH
-/// endpoint that happens to be Windows is still reached through a POSIX shell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkspaceOs {
-    Windows,
-    Posix,
-}
-
-impl WorkspaceOs {
-    /// Whether the `powershell` tool can run in a workspace on this machine.
-    pub fn runs_powershell(self) -> bool {
-        matches!(self, Self::Windows)
-    }
-}
 
 /// One workspace, with everything a caller needs to act in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,11 +45,20 @@ pub struct ResolvedWorkspace {
     pub root: String,
     /// Trusted shell environment for that machine, including its variable table.
     pub runner: ShellRunner,
-    /// Shell family, which is what decides `powershell` availability.
-    pub os: WorkspaceOs,
+    /// The machine's operating system, or `None` for an SSH machine that has
+    /// not been probed yet.
+    pub os: Option<MachineOs>,
+    /// The shell backends a command can run in here, from the machine's last
+    /// probe ([`crate::machine_shells::known`]). This is what decides which
+    /// shell tools may name this workspace.
+    pub shells: Vec<DetectedShell>,
     /// Human-readable machine name, used when the list is stated to the model.
     /// Empty for the host machine, which needs no qualifier.
     pub machine_label: String,
+    /// The sandbox this workspace's commands run in, when sandboxing is on:
+    /// the conversation's cell on this workspace's machine (see
+    /// [`WorkspaceSet::sandboxed`]).
+    pub sandbox: Option<remote_agent::protocol::SandboxSpec>,
 }
 
 impl ResolvedWorkspace {
@@ -75,6 +66,16 @@ impl ResolvedWorkspace {
     /// act directly rather than through a shell transport.
     pub fn is_local(&self) -> bool {
         self.machine.is_none()
+    }
+
+    /// Where `backend` is on this workspace's machine, if it is there.
+    pub fn shell(&self, backend: ShellBackend) -> Option<&DetectedShell> {
+        self.shells.iter().find(|shell| shell.backend == backend)
+    }
+
+    /// Whether a command can run in `backend` here.
+    pub fn runs(&self, backend: ShellBackend) -> bool {
+        self.shell(backend).is_some()
     }
 }
 
@@ -123,13 +124,16 @@ impl WorkspaceSet {
                 workspace.path.as_str()
             };
             let runner = resolve_shell_runner(assets, workspace.machine.as_ref(), Some(env_path))?;
+            let (os, shells) = crate::machine_shells::known(workspace.machine.as_ref());
             entries.push(ResolvedWorkspace {
                 index: position as u32 + 1,
                 machine: workspace.machine.clone(),
                 root: workspace.path.clone(),
-                os: workspace_os(&runner),
+                os,
+                shells,
                 machine_label: machine_label(assets, workspace.machine.as_ref()),
                 runner,
+                sandbox: None,
             });
         }
         Ok(Self { entries })
@@ -151,14 +155,17 @@ impl WorkspaceSet {
     /// The shape every caller that predates machine-bound workspaces still wants:
     /// one local root, no catalog to consult.
     pub fn local_root(path: impl Into<String>) -> Self {
+        let (os, shells) = crate::machine_shells::known(None);
         Self {
             entries: vec![ResolvedWorkspace {
                 index: 1,
                 machine: None,
                 root: path.into(),
                 runner: ShellRunner::default(),
-                os: host_os(),
+                os,
+                shells,
                 machine_label: String::new(),
+                sandbox: None,
             }],
         }
     }
@@ -183,16 +190,66 @@ impl WorkspaceSet {
                 machine_id: String::new(),
             }),
         };
+        let (os, shells) = match &runner {
+            // An SSH runner's machine id is unrecoverable, so its last probe is
+            // too; it keeps what an unprobed machine is assumed to have.
+            ShellRunner::Ssh { .. } => crate::machine_shells::assumed(machine.as_ref()),
+            _ => crate::machine_shells::known(machine.as_ref()),
+        };
         Self {
             entries: vec![ResolvedWorkspace {
                 index: 1,
                 machine,
                 root: root.into(),
-                os: workspace_os(&runner),
+                os,
+                shells,
                 machine_label: String::new(),
                 runner,
+                sandbox: None,
             }],
         }
+    }
+
+    /// The same set with every workspace's commands confined to the sandbox
+    /// `settings` describe, when they are on.
+    ///
+    /// A conversation has one cell per machine, named for the conversation, and
+    /// each cell may write every workspace the conversation has on that
+    /// machine: one command may well build in workspace 1 and write its
+    /// output to workspace 2. A different conversation — or this one after its
+    /// workspaces or the settings changed — is a different cell.
+    pub fn sandboxed(mut self, settings: &crate::model::SandboxSettings, conversation_id: &str) -> Self {
+        if !settings.enabled {
+            return self;
+        }
+        let machine_of = |workspace: &ResolvedWorkspace| crate::run_environment::env_key(workspace.machine.as_ref());
+        let roots: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .map(|workspace| (machine_of(workspace), workspace.root.clone()))
+            .collect();
+        for workspace in &mut self.entries {
+            let machine = machine_of(workspace);
+            let mut writable: Vec<String> = roots
+                .iter()
+                .filter(|(other, _)| *other == machine)
+                .map(|(_, root)| root.clone())
+                .collect();
+            writable.extend(settings.writable.iter().cloned());
+            writable.sort();
+            writable.dedup();
+            workspace.sandbox = Some(remote_agent::protocol::SandboxSpec {
+                cell: format!("conversation-{conversation_id}"),
+                policy: remote_agent::protocol::SandboxPolicy {
+                    writable,
+                    deny_read: settings.deny_read.clone(),
+                    readable: Vec::new(),
+                    deny_write: Vec::new(),
+                    network: settings.network_policy(),
+                },
+            });
+        }
+        self
     }
 
     pub fn entries(&self) -> &[ResolvedWorkspace] {
@@ -269,23 +326,21 @@ impl WorkspaceSet {
             .collect()
     }
 
-    /// Addresses whose machine can run `powershell`.
+    /// Addresses whose machine has `backend`.
     ///
-    /// Empty means the tool has nowhere to run in this conversation, which is
-    /// what withdraws it from the wire entirely.
-    pub fn powershell_addresses(&self) -> Vec<u32> {
+    /// Empty means the backend's tools have nowhere to run in this
+    /// conversation, which is what withdraws them from the wire entirely.
+    pub fn shell_addresses(&self, backend: ShellBackend) -> Vec<u32> {
         self.entries
             .iter()
-            .filter(|workspace| workspace.os.runs_powershell())
+            .filter(|workspace| workspace.runs(backend))
             .map(|workspace| workspace.index)
             .collect()
     }
 
-    /// Whether any workspace can run `powershell`.
-    pub fn runs_powershell(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|workspace| workspace.os.runs_powershell())
+    /// Whether any workspace's machine has `backend`.
+    pub fn runs(&self, backend: ShellBackend) -> bool {
+        self.entries.iter().any(|workspace| workspace.runs(backend))
     }
 
     /// Roots on the host machine, which is the set the local path guard trusts.
@@ -299,22 +354,6 @@ impl WorkspaceSet {
             .filter(|workspace| workspace.is_local())
             .map(|workspace| workspace.root.clone())
             .collect()
-    }
-}
-
-/// The shell family of the machine a runner dispatches to.
-fn workspace_os(runner: &ShellRunner) -> WorkspaceOs {
-    match runner {
-        ShellRunner::Local { .. } => host_os(),
-        ShellRunner::Wsl { .. } | ShellRunner::Ssh { .. } => WorkspaceOs::Posix,
-    }
-}
-
-/// This machine's shell family, from the host platform resolved at startup.
-fn host_os() -> WorkspaceOs {
-    match host_platform() {
-        HostPlatform::Windows => WorkspaceOs::Windows,
-        HostPlatform::Macos | HostPlatform::Linux => WorkspaceOs::Posix,
     }
 }
 
@@ -338,6 +377,39 @@ fn machine_label(assets: &ExecutionEnvironmentAssets, machine: Option<&RunTarget
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandboxed_set_gives_each_machine_one_cell_writing_all_its_workspaces() {
+        let assets = assets();
+        let set = WorkspaceSet::resolve(
+            &assets,
+            &AttachedWorkspace { machine: None, path: "/work/a".into() },
+            &[
+                AttachedWorkspace { machine: None, path: "/work/b".into() },
+                AttachedWorkspace {
+                    machine: Some(RunTarget::Ssh { machine_id: "m1".into() }),
+                    path: "/home/dev/c".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(set.clone().sandboxed(&crate::model::SandboxSettings::default(), "c1").entries().iter().all(|w| w.sandbox.is_none()));
+        let settings = crate::model::SandboxSettings {
+            enabled: true,
+            writable: vec!["~/shared".into()],
+            ..Default::default()
+        };
+        let set = set.sandboxed(&settings, "c1");
+        let local = set.get(1).unwrap().sandbox.clone().unwrap();
+        assert_eq!(local.cell, "conversation-c1");
+        assert_eq!(local.policy.writable, vec!["/work/a".to_owned(), "/work/b".into(), "~/shared".into()]);
+        assert_eq!(set.get(2).unwrap().sandbox, Some(local.clone()));
+        let ssh = set.get(3).unwrap().sandbox.clone().unwrap();
+        assert_eq!(ssh.cell, "conversation-c1");
+        assert_eq!(ssh.policy.writable, vec!["/home/dev/c".to_owned(), "~/shared".into()]);
+        assert_eq!(ssh.policy.network.mode, remote_agent::protocol::NetworkMode::Allowlist);
+        assert!(ssh.policy.network.allow.iter().any(|host| host == "registry.npmjs.org"));
+    }
     use crate::model::SshMachineConfig;
 
     fn assets() -> ExecutionEnvironmentAssets {
@@ -408,27 +480,80 @@ mod tests {
         );
     }
 
+    /// A machine nobody has probed keeps what every remote leg ran before
+    /// machines had backends: bash, and nothing else.
     #[test]
-    fn remote_workspaces_are_posix_and_never_run_powershell() {
-        let set =
-            WorkspaceSet::resolve(&assets(), &remote("~/app"), &[remote("~/services")]).unwrap();
-        assert_eq!(set.get(1).unwrap().os, WorkspaceOs::Posix);
-        assert!(set.powershell_addresses().is_empty());
-        assert!(!set.runs_powershell());
+    fn an_unprobed_remote_machine_is_assumed_to_have_bash_only() {
+        let assets = ExecutionEnvironmentAssets {
+            ssh_machines: vec![SshMachineConfig {
+                id: "unprobed".into(),
+                name: "unprobed".into(),
+                host: "user@unprobed".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let workspace = AttachedWorkspace {
+            machine: Some(RunTarget::Ssh {
+                machine_id: "unprobed".into(),
+            }),
+            path: "~/app".into(),
+        };
+        let set = WorkspaceSet::resolve(&assets, &workspace, &[]).unwrap();
+        let entry = set.get(1).unwrap();
+        assert_eq!(entry.os, None);
+        assert!(entry.runs(ShellBackend::Bash));
+        assert!(!entry.runs(ShellBackend::PowerShell));
+        assert!(set.shell_addresses(ShellBackend::PowerShell).is_empty());
     }
 
+    /// A probed machine lists exactly what the probe found, and each shell's
+    /// addresses are the workspaces on machines that have it.
     #[test]
-    fn powershell_addresses_name_only_the_windows_workspaces() {
-        let set =
-            WorkspaceSet::resolve(&assets(), &local("C:/work/app"), &[remote("~/services")])
-                .unwrap();
-        if host_platform().is_windows() {
-            assert_eq!(set.powershell_addresses(), vec![1]);
-            assert!(set.runs_powershell());
-        } else {
-            // The host itself is POSIX, so no workspace in this set can run it.
-            assert!(set.powershell_addresses().is_empty());
-        }
+    fn shell_addresses_follow_each_machines_probe() {
+        use crate::machine_shells::{seed_for_test, MachineShells};
+        let assets = ExecutionEnvironmentAssets {
+            ssh_machines: vec![SshMachineConfig {
+                id: "winbox".into(),
+                name: "winbox".into(),
+                host: "user@winbox".into(),
+                agent_shell: Some(ShellBackend::PowerShell),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        seed_for_test(
+            "ssh:winbox",
+            MachineShells {
+                os: MachineOs::Windows,
+                shells: vec![DetectedShell {
+                    backend: ShellBackend::PowerShell,
+                    path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
+                }],
+                probed_at: String::new(),
+            },
+        );
+        let windows = AttachedWorkspace {
+            machine: Some(RunTarget::Ssh {
+                machine_id: "winbox".into(),
+            }),
+            path: "C:/work".into(),
+        };
+        let set = WorkspaceSet::resolve(&assets, &local("/work/app"), &[windows]).unwrap();
+        assert_eq!(set.get(2).unwrap().os, Some(MachineOs::Windows));
+        assert_eq!(set.shell_addresses(ShellBackend::PowerShell), {
+            let mut expected = Vec::new();
+            if set.get(1).unwrap().runs(ShellBackend::PowerShell) {
+                expected.push(1);
+            }
+            expected.push(2);
+            expected
+        });
+        assert!(!set.get(2).unwrap().runs(ShellBackend::Bash));
+        // The agent shell follows the machine's settings once the machine has it.
+        let shell = set.get(2).unwrap().runner.agent_shell().unwrap().clone();
+        assert_eq!(shell.backend, ShellBackend::PowerShell);
+        assert!(shell.program.ends_with("pwsh.exe"));
     }
 
     #[test]

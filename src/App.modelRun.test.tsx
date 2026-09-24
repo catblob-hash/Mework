@@ -390,6 +390,23 @@ describe("App model run flow — modelRun", () => {
     expect(await screen.findByRole("navigation", { name: "全局设置分类" })).toBeInTheDocument();
   });
 
+  it("does not send when Enter only commits an input-method composition", async () => {
+    runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
+
+    const user = userEvent.setup();
+    render(<App />);
+    const composer = await screen.findByLabelText("向 Agent 发送消息");
+    await user.type(composer, "ni");
+    // macOS WKWebView fires compositionend first, so the committing Enter reports isComposing false.
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter", keyCode: 229 });
+
+    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
+    expect(composer).toHaveValue("ni");
+
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
+  });
+
   it("keeps a persistent model error and retries without duplicating the user context", async () => {
     const document = documentWithModel();
     const retryModel: ModelProfile = {

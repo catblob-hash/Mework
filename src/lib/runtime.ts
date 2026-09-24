@@ -7,6 +7,7 @@ import {
   workspaceEnvKey
 } from "./workspaces";
 import { createSeedDocument } from "../seed";
+import { isRegistered, isShellBackend, MACHINE_OSES } from "./machineShells";
 import {
   emptyConversationPresetSettings
 } from "./conversationPresets";
@@ -15,6 +16,7 @@ import {
   isAgentToolNameList,
   validateAgentTypeName
 } from "./agentDefinitions";
+import type { SandboxSettings, SandboxSupport, ShellBackend, ShellPriority } from "../types";
 import type {
   AgentDefinition,
   AppLanguage,
@@ -367,7 +369,7 @@ function normalizeAttachedWorkspaces(value: unknown, legacy: unknown): AttachedW
     const path = rawPath.trim();
     if (!path || path.length > 4096) return;
     // One machine's `/srv/app` is not another's, so identity is the pair.
-    const key = `${machine ? runEnvKey(machine) : "local"} ${path}`;
+    const key = `${machine ? runEnvKey(machine) : "local"}\u0000${path}`;
     if (seen.has(key)) return;
     seen.add(key);
     entries.push(machine ? { machine, path } : { path });
@@ -456,7 +458,9 @@ function normalizeExecutionEnvironments(
       sshMachines: fallback.sshMachines.map((machine) => ({ ...machine })),
       envVars: Object.fromEntries(
         Object.entries(fallback.envVars).map(([key, table]) => [key, { ...table }])
-      )
+      ),
+      ...(fallback.wslAgentShells ? { wslAgentShells: { ...fallback.wslAgentShells } } : {}),
+      ...(fallback.shellPriority ? { shellPriority: normalizeShellPriority(fallback.shellPriority) } : {})
     };
   }
   const now = new Date().toISOString();
@@ -490,6 +494,7 @@ function normalizeExecutionEnvironments(
         host,
         port,
         identityFile,
+        ...(isShellBackend(machine.agentShell) ? { agentShell: machine.agentShell as ShellBackend } : {}),
         createdAt: typeof machine.createdAt === "string" && machine.createdAt ? machine.createdAt : now,
         updatedAt: typeof machine.updatedAt === "string" && machine.updatedAt ? machine.updatedAt : now
       }];
@@ -525,7 +530,118 @@ function normalizeExecutionEnvironments(
     }
     envVars[key] = normalized;
   }
-  return { sshMachines, envVars };
+  // Mirrors host validation: a WSL agent shell is one of WSL's registered backends.
+  const wslAgentShells: Record<string, ShellBackend> = {};
+  for (const [distro, backend] of Object.entries(record(input.wslAgentShells) ?? {}).slice(0, 256)) {
+    if (!WSL_DISTRO_NAME.test(distro) || !isShellBackend(backend) || !isRegistered("wsl", backend)) continue;
+    wslAgentShells[distro] = backend;
+  }
+  const shellPriority = normalizeShellPriority(input.shellPriority);
+  const sandbox = normalizeSandboxSettings(input.sandbox);
+  return {
+    sshMachines,
+    envVars,
+    ...(Object.keys(wslAgentShells).length ? { wslAgentShells } : {}),
+    ...(Object.keys(shellPriority).length ? { shellPriority } : {}),
+    ...(sandbox ? { sandbox } : {})
+  };
+}
+
+/**
+ * Mirrors the host's `DEFAULT_SANDBOX_ALLOWLIST`: where packages and source
+ * come from, so installing dependencies works out of the box.
+ */
+export const DEFAULT_SANDBOX_ALLOWLIST: readonly string[] = [
+  "github.com",
+  "*.github.com",
+  "*.githubusercontent.com",
+  "gitlab.com",
+  "*.gitlab.com",
+  "bitbucket.org",
+  "registry.npmjs.org",
+  "*.npmjs.org",
+  "registry.yarnpkg.com",
+  "*.yarnpkg.com",
+  "nodejs.org",
+  "pypi.org",
+  "*.pypi.org",
+  "files.pythonhosted.org",
+  "crates.io",
+  "*.crates.io",
+  "static.rust-lang.org",
+  "proxy.golang.org",
+  "sum.golang.org",
+  "repo.maven.apache.org",
+  "repo1.maven.org",
+  "plugins.gradle.org",
+  "services.gradle.org",
+  "rubygems.org",
+  "*.rubygems.org",
+  "api.nuget.org",
+  "*.nuget.org",
+  "pub.dev",
+  "*.pub.dev",
+  "repo.packagist.org",
+  "cdn.jsdelivr.net"
+];
+
+/** The settings a sandbox starts with when it is first switched on. */
+export function defaultSandboxSettings(): SandboxSettings {
+  return {
+    enabled: false,
+    network: { mode: "allowlist", allow: [...DEFAULT_SANDBOX_ALLOWLIST], deny: [] },
+    writable: [],
+    denyRead: []
+  };
+}
+
+/** Mirrors host validation of the sandbox's lists: bounded, no blanks or control characters. */
+function normalizeSandboxSettings(value: unknown): SandboxSettings | null {
+  const input = record(value);
+  if (!input) return null;
+  const controlChars = /[\u0000-\u001f\u007f]/;
+  const entries = (list: unknown, accept: (entry: string) => boolean): string[] => (
+    Array.isArray(list) ? list : []
+  )
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && entry.length <= 4096 && !controlChars.test(entry) && accept(entry))
+    .slice(0, 256);
+  const hostPattern = (entry: string) => !/[\s/]/.test(entry);
+  const absolutePath = (entry: string) => entry.startsWith("/") || entry.startsWith("~") || /^[A-Za-z]:/.test(entry);
+  const network = record(input.network);
+  const mode = network?.mode;
+  return {
+    enabled: input.enabled === true,
+    network: {
+      mode: mode === "off" || mode === "open" || mode === "allowlist" ? mode : "allowlist",
+      allow: network && Array.isArray(network.allow)
+        ? entries(network.allow, hostPattern)
+        : [...DEFAULT_SANDBOX_ALLOWLIST],
+      deny: entries(network?.deny, hostPattern)
+    },
+    writable: entries(input.writable, absolutePath),
+    denyRead: entries(input.denyRead, absolutePath)
+  };
+}
+
+/** Mirrors the host's `validate_wsl_distro_name`. */
+const WSL_DISTRO_NAME = /^[\p{L}\p{N}](?:[\p{L}\p{N}._ -]{0,62}[\p{L}\p{N}._-])?$/u;
+
+/** Each OS's list with only that OS's registered backends, each once. Mirrors host validation. */
+function normalizeShellPriority(value: unknown): ShellPriority {
+  const input = record(value);
+  const out: ShellPriority = {};
+  if (!input) return out;
+  for (const os of MACHINE_OSES) {
+    const listed = Array.isArray(input[os]) ? input[os] as unknown[] : [];
+    const kept: ShellBackend[] = [];
+    for (const backend of listed) {
+      if (isShellBackend(backend) && isRegistered(os, backend) && !kept.includes(backend)) kept.push(backend);
+    }
+    if (kept.length) out[os] = kept;
+  }
+  return out;
 }
 
 function normalizeAppLanguage(value: unknown, fallback: AppLanguage): AppLanguage {
@@ -2976,6 +3092,18 @@ export async function environmentToolSnapshots(): Promise<EnvironmentToolSnapsho
 export async function listWslDistros(): Promise<WslDistro[]> {
   if (!hasBackendRuntime()) return [];
   return invoke<WslDistro[]>("list_wsl_distros");
+}
+
+/** Whether this computer can sandbox commands, from the agent Mework runs here. */
+export async function localSandboxSupport(): Promise<SandboxSupport | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<SandboxSupport>("local_sandbox_support");
+}
+
+/** Sets this computer up for the sandbox (Windows: one administrator prompt); what it can do afterwards. */
+export async function setupLocalSandbox(): Promise<SandboxSupport> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法设置沙箱");
+  return invoke<SandboxSupport>("setup_local_sandbox");
 }
 
 export async function revealEnvironmentTool(executable: string): Promise<void> {

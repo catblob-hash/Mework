@@ -190,6 +190,25 @@ function targetSelector(item: ToolContext): string | undefined {
   return compact(inputString(item, "selector") ?? inputString(item, "ref"));
 }
 
+/** The decision-model form of a preview tool is the call that carries `query`. */
+function decisionQuery(item: ToolContext): string | undefined {
+  return compact(inputString(item, "query"));
+}
+
+/** An element tool names its target by selector, or — in its decision-model form — by query. */
+function targetSelectorOrQuery(item: ToolContext): string | undefined {
+  return targetSelector(item) ?? decisionQuery(item);
+}
+
+/**
+ * A preview tool's detail family, unless the call went through the decision model: that answer
+ * is a score report (or a "Chose …" line ahead of the base tool's own text), which only the raw
+ * view shows faithfully.
+ */
+function unlessDecision(family: ToolViewFamily): (item: ToolContext) => ToolViewFamily {
+  return (item) => (inputString(item, "query") === undefined ? family : "raw");
+}
+
 /**
  * The one line a call with no registry entry can show about itself. Arguments
  * arrive in the order the schema declares them, so the first scalar is the one
@@ -564,7 +583,11 @@ export const TOOL_VIEW_REGISTRY = {
   grep: { surface: "group", family: "grep", icon: Search, doneTitle: (t) => t("搜索了文件内容", "Searched file contents"), runningTitle: (t) => t("正在搜索文件内容", "Searching file contents"), failedTitle: (t) => t("搜索文件内容失败", "File-content search failed"), target: (item) => compact(inputString(item, "pattern")), stat: grepStat, summaryKind: "search" },
   powershell: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 PowerShell 命令", "Ran PowerShell command"), runningTitle: (t) => t("正在运行 PowerShell 命令", "Running PowerShell command"), failedTitle: (t) => t("PowerShell 命令失败", "PowerShell command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   bash: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 Bash 命令", "Ran Bash command"), runningTitle: (t) => t("正在运行 Bash 命令", "Running Bash command"), failedTitle: (t) => t("Bash 命令失败", "Bash command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
+  zsh: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 zsh 命令", "Ran zsh command"), runningTitle: (t) => t("正在运行 zsh 命令", "Running zsh command"), failedTitle: (t) => t("zsh 命令失败", "zsh command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
+  sh: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 sh 命令", "Ran sh command"), runningTitle: (t) => t("正在运行 sh 命令", "Running sh command"), failedTitle: (t) => t("sh 命令失败", "sh command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   bash_find_output: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 Bash 命令并筛选输出", "Ran Bash command and scored its output"), runningTitle: (t) => t("正在运行 Bash 命令并筛选输出", "Running Bash command and scoring its output"), failedTitle: (t) => t("Bash 命令筛选输出失败", "Failed to run Bash command and score its output"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
+  zsh_find_output: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 zsh 命令并筛选输出", "Ran zsh command and scored its output"), runningTitle: (t) => t("正在运行 zsh 命令并筛选输出", "Running zsh command and scoring its output"), failedTitle: (t) => t("zsh 命令筛选输出失败", "Failed to run zsh command and score its output"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
+  sh_find_output: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 sh 命令并筛选输出", "Ran sh command and scored its output"), runningTitle: (t) => t("正在运行 sh 命令并筛选输出", "Running sh command and scoring its output"), failedTitle: (t) => t("sh 命令筛选输出失败", "Failed to run sh command and score its output"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   powershell_find_output: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 PowerShell 命令并筛选输出", "Ran PowerShell command and scored its output"), runningTitle: (t) => t("正在运行 PowerShell 命令并筛选输出", "Running PowerShell command and scoring its output"), failedTitle: (t) => t("PowerShell 命令筛选输出失败", "Failed to run PowerShell command and score its output"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   write: { surface: "group", family: "diff", icon: FilePenLine, doneTitle: (t) => t("写入了文件", "Wrote file"), resolveTitle: writeTitle, target: (item) => compact(inputString(item, "path")), stat: diffStat, summaryKind: "fileChanges" },
   edit: { surface: "group", family: "diff", icon: FilePenLine, doneTitle: (t) => t("编辑了文件", "Edited file"), runningTitle: (t) => t("正在编辑文件", "Editing file"), failedTitle: (t) => t("编辑文件失败", "Failed to edit file"), target: (item) => compact(inputString(item, "path")), stat: diffStat, summaryKind: "fileChanges" },
@@ -597,15 +620,16 @@ export const TOOL_VIEW_REGISTRY = {
     return count === undefined ? browserDuration(item) : t("{count} 个服务器", "{count} servers", { count });
   }, summaryKind: "browser" },
   preview_logs: { surface: "group", family: "raw", icon: Logs, doneTitle: (t) => t("读取了服务器日志", "Read server logs"), runningTitle: (t) => t("正在读取服务器日志", "Reading server logs"), failedTitle: (t) => t("读取服务器日志失败", "Failed to read server logs"), target: (item) => compact(inputString(item, "search")), stat: previewEntryStat, keys: ["search", "level", "lines"], summaryKind: "browser" },
-  preview_console_logs: { surface: "group", family: "browser-console", icon: Logs, doneTitle: (t) => t("读取了 Console 日志", "Read Console logs"), runningTitle: (t) => t("正在读取 Console 日志", "Reading Console logs"), failedTitle: (t) => t("读取 Console 日志失败", "Failed to read Console logs"), target: (item) => compact(inputString(item, "level")), stat: previewEntryStat, summaryKind: "browser" },
+  preview_console_logs: { surface: "group", family: "browser-console", resolveFamily: unlessDecision("browser-console"), icon: Logs, doneTitle: (t) => t("读取了 Console 日志", "Read Console logs"), runningTitle: (t) => t("正在读取 Console 日志", "Reading Console logs"), failedTitle: (t) => t("读取 Console 日志失败", "Failed to read Console logs"), target: (item) => decisionQuery(item) ?? compact(inputString(item, "level")), stat: (item, t) => (decisionQuery(item) === undefined ? previewEntryStat(item, t) : browserDuration(item)), summaryKind: "browser" },
   preview_screenshot: { surface: "group", family: "browser-screenshot", icon: Image, doneTitle: (t) => t("截取了页面", "Captured page"), runningTitle: (t) => t("正在截取页面", "Capturing page"), failedTitle: (t) => t("页面截图失败", "Page capture failed"), stat: screenshotStat, summaryKind: "browser" },
-  preview_snapshot: { surface: "group", family: "browser-snapshot", icon: ScanSearch, doneTitle: (t) => t("读取了页面快照", "Read page snapshot"), runningTitle: (t) => t("正在读取页面快照", "Reading page snapshot"), failedTitle: (t) => t("读取页面快照失败", "Failed to read page snapshot"), stat: (item, t) => {
+  preview_snapshot: { surface: "group", family: "browser-snapshot", resolveFamily: unlessDecision("browser-snapshot"), icon: ScanSearch, doneTitle: (t) => t("读取了页面快照", "Read page snapshot"), runningTitle: (t) => t("正在读取页面快照", "Reading page snapshot"), failedTitle: (t) => t("读取页面快照失败", "Failed to read page snapshot"), target: decisionQuery, keys: ["query", "threshold"], stat: (item, t) => {
+    if (decisionQuery(item) !== undefined) return browserDuration(item);
     const count = outputLineCount(item);
     return count ? t("{count} 个节点", "{count} nodes", { count }) : browserDuration(item);
   }, summaryKind: "browser" },
-  preview_inspect: { surface: "group", family: "browser-json", icon: Crosshair, doneTitle: (t) => t("检查了页面元素", "Inspected page element"), runningTitle: (t) => t("正在检查页面元素", "Inspecting page element"), failedTitle: (t) => t("检查页面元素失败", "Failed to inspect page element"), target: targetSelector, stat: browserDuration, keys: ["selector", "styles"], summaryKind: "browser" },
-  preview_click: { surface: "group", family: "raw", icon: MousePointerClick, doneTitle: (t) => t("点击了页面元素", "Clicked page element"), runningTitle: (t) => t("正在点击页面元素", "Clicking page element"), failedTitle: (t) => t("点击页面元素失败", "Failed to click page element"), target: targetSelector, keys: ["selector", "doubleClick"], stat: (item, t) => (inputFlag(item, "doubleClick") ? t("双击", "Double-click") : browserDuration(item)), summaryKind: "browser" },
-  preview_fill: { surface: "group", family: "raw", icon: TextCursorInput, doneTitle: (t) => t("填写了页面输入", "Filled page input"), runningTitle: (t) => t("正在填写页面输入", "Filling page input"), failedTitle: (t) => t("填写页面输入失败", "Failed to fill page input"), target: targetSelector, keys: ["selector", "value"], stat: (item, t) => {
+  preview_inspect: { surface: "group", family: "browser-json", resolveFamily: unlessDecision("browser-json"), icon: Crosshair, doneTitle: (t) => t("检查了页面元素", "Inspected page element"), runningTitle: (t) => t("正在检查页面元素", "Inspecting page element"), failedTitle: (t) => t("检查页面元素失败", "Failed to inspect page element"), target: targetSelectorOrQuery, stat: browserDuration, keys: ["selector", "query", "styles"], summaryKind: "browser" },
+  preview_click: { surface: "group", family: "raw", icon: MousePointerClick, doneTitle: (t) => t("点击了页面元素", "Clicked page element"), runningTitle: (t) => t("正在点击页面元素", "Clicking page element"), failedTitle: (t) => t("点击页面元素失败", "Failed to click page element"), target: targetSelectorOrQuery, keys: ["selector", "query", "doubleClick"], stat: (item, t) => (inputFlag(item, "doubleClick") ? t("双击", "Double-click") : browserDuration(item)), summaryKind: "browser" },
+  preview_fill: { surface: "group", family: "raw", icon: TextCursorInput, doneTitle: (t) => t("填写了页面输入", "Filled page input"), runningTitle: (t) => t("正在填写页面输入", "Filling page input"), failedTitle: (t) => t("填写页面输入失败", "Failed to fill page input"), target: targetSelectorOrQuery, keys: ["selector", "query", "value"], stat: (item, t) => {
     const value = inputString(item, "value");
     return value === undefined ? browserDuration(item) : t("{count} 字", "{count} characters", { count: value.length });
   }, summaryKind: "browser" },
@@ -616,11 +640,7 @@ export const TOOL_VIEW_REGISTRY = {
   preview_dialog: { surface: "group", family: "browser-page", icon: CircleAlert, doneTitle: (t) => t("回答了页面对话框", "Answered page dialog"), runningTitle: (t) => t("正在回答页面对话框", "Answering page dialog"), failedTitle: (t) => t("回答页面对话框失败", "Failed to answer page dialog"), target: (item) => compact(inputString(item, "prompt_text")), stat: (item, t) => (
     item.input.accept === false ? t("取消", "Dismiss") : t("接受", "Accept")
   ), summaryKind: "browser" },
-  preview_find_element: { surface: "group", family: "raw", icon: ScanSearch, doneTitle: (t) => t("按描述查找了页面元素", "Found page elements by description"), runningTitle: (t) => t("正在按描述查找页面元素", "Finding page elements by description"), failedTitle: (t) => t("按描述查找页面元素失败", "Failed to find page elements by description"), target: (item) => compact(inputString(item, "query")), keys: ["query", "threshold"], stat: browserDuration, summaryKind: "browser" },
   preview_find_logs: { surface: "group", family: "raw", icon: Logs, doneTitle: (t) => t("按描述查找了日志", "Found log lines by description"), runningTitle: (t) => t("正在按描述查找日志", "Finding log lines by description"), failedTitle: (t) => t("按描述查找日志失败", "Failed to find log lines by description"), target: (item) => compact(inputString(item, "query")), keys: ["query", "threshold", "source"], stat: browserDuration, summaryKind: "browser" },
-  preview_click_by_description: { surface: "group", family: "raw", icon: MousePointerClick, doneTitle: (t) => t("按描述点击了元素", "Clicked element by description"), runningTitle: (t) => t("正在按描述点击元素", "Clicking element by description"), failedTitle: (t) => t("按描述点击元素失败", "Failed to click element by description"), target: (item) => compact(inputString(item, "description")), keys: ["description", "doubleClick"], stat: (item, t) => (inputFlag(item, "doubleClick") ? t("双击", "Double-click") : browserDuration(item)), summaryKind: "browser" },
-  preview_fill_by_description: { surface: "group", family: "raw", icon: TextCursorInput, doneTitle: (t) => t("按描述填写了元素", "Filled element by description"), runningTitle: (t) => t("正在按描述填写元素", "Filling element by description"), failedTitle: (t) => t("按描述填写元素失败", "Failed to fill element by description"), target: (item) => compact(inputString(item, "description")), keys: ["description", "value"], stat: browserDuration, summaryKind: "browser" },
-  preview_inspect_by_description: { surface: "group", family: "browser-json", icon: Crosshair, doneTitle: (t) => t("按描述检查了元素", "Inspected element by description"), runningTitle: (t) => t("正在按描述检查元素", "Inspecting element by description"), failedTitle: (t) => t("按描述检查元素失败", "Failed to inspect element by description"), target: (item) => compact(inputString(item, "description")), keys: ["description", "styles"], stat: browserDuration, summaryKind: "browser" },
 
   // Agent-protocol tools are ordinary rows inside the tool block: one uniform
   // disclosure per contiguous tool run, chevron → tailored detail. `agent-run`

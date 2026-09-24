@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged by Tauri into Mework.app's Info.plist and embedded in development binaries.
+
+  macOS attributes privacy requests to the app responsible for a process, so every
+  program Mework starts - the shell and agent tools, the integrated terminal, hooks,
+  MCP and language servers - asks as Mework. Without a usage string a request for the
+  microphone, camera or Bluetooth terminates the requesting process instead of asking,
+  and the folder prompts carry no explanation. Localized texts live in
+  InfoPlist/*.lproj/InfoPlist.strings (copied into the bundle by tauri.macos.conf.json).
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh-Hans</string>
+  </array>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Mework opens projects in your Desktop folder and runs the commands and agent tools you start there.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Mework opens projects in your Documents folder and runs the commands and agent tools you start there.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Mework opens projects in your Downloads folder and runs the commands and agent tools you start there.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Mework opens projects on removable volumes and runs the commands and agent tools you start there.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>Mework opens projects on network volumes and runs the commands and agent tools you start there.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Mework connects to SSH machines, model servers such as Ollama or LM Studio, and development servers on your local network.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Programs you run in Mework, such as scripts in the terminal, may ask to control other apps.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Programs you run in Mework may use the microphone.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Programs you run in Mework may use the camera.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Programs you run in Mework may use Bluetooth.</string>
+  <!-- Chromium, embedded for the built-in browser, runs its browser process here. -->
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+</dict>
+</plist>

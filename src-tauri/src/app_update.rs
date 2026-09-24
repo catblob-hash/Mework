@@ -14,6 +14,11 @@
 //! Installer hand-off mirrors tauri-plugin-updater: the downloaded NSIS installer is started
 //! through `ShellExecuteW` with `/P /UPDATE /R` (passive UI, keep user data and shortcuts,
 //! relaunch afterwards) and the running app exits so the installer can replace it.
+//!
+//! Every published asset is a Windows build, so only a Windows host downloads anything. Other
+//! hosts still run the check and learn the latest version and its release page, but the check
+//! selects no asset for them (see [`supports_in_app_install`]) and a download request is refused
+//! before any directory is touched.
 
 use std::{
     fmt, fs,
@@ -34,6 +39,8 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::host_platform::HostPlatform;
 
 /// Source repository as declared in Cargo.toml. Releases are read from its GitHub API.
 pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
@@ -74,6 +81,35 @@ pub fn detect_flavor(executable_dir: &Path) -> InstallFlavor {
         InstallFlavor::Installer
     } else {
         InstallFlavor::Portable
+    }
+}
+
+/// Whether `platform` can download and apply an update from inside the app.
+///
+/// Only Windows can: every release asset is a Windows build (the NSIS installer, the portable
+/// zip) and the hand-off is `ShellExecuteW`. Elsewhere `detect_flavor` finds no `uninstall.exe`
+/// and says "portable", which used to select the Windows portable zip and save it to
+/// `~/Downloads` — on macOS a privacy-protected folder, so the user met a permission prompt for
+/// an archive their machine cannot run. Those hosts are sent to the release page instead. No arm
+/// defaults, so a newly supported host has to decide here.
+pub fn supports_in_app_install(platform: HostPlatform) -> bool {
+    match platform {
+        HostPlatform::Windows => true,
+        HostPlatform::Macos | HostPlatform::Linux => false,
+    }
+}
+
+/// Refuses a download on a host that cannot install one. The check never offers such a host an
+/// asset, so a request reaching this point is stale or forged; it fails before anything is
+/// written.
+fn require_in_app_install(platform: HostPlatform) -> Result<(), String> {
+    if supports_in_app_install(platform) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} 暂不支持应用内更新，请到发布页下载新版本",
+            platform.display_name()
+        ))
     }
 }
 
@@ -282,11 +318,17 @@ pub struct UpdateCheck {
     pub latest_version: String,
     pub update_available: bool,
     pub release: ReleaseSummary,
-    /// The asset for this machine's flavor and architecture, when the release has one.
+    /// The asset for this machine's flavor and architecture, when the release has one. Always
+    /// `None` when `in_app_install` is false.
     pub asset: Option<ReleaseAsset>,
-    /// `SHA256SUMS` when the release publishes one.
+    /// `SHA256SUMS` when the release publishes one. Always `None` when `in_app_install` is
+    /// false, since there is nothing to verify.
     pub checksums_asset: Option<ReleaseAsset>,
     pub checked_at: String,
+    /// Whether this host can download and install an update in-app. When false the renderer
+    /// links to `release.html_url` instead of offering a download; the Windows renderer only
+    /// ever sees `true`, so its behaviour is unchanged.
+    pub in_app_install: bool,
 }
 
 /// The fields of GitHub's release object this module reads. Unknown fields are ignored.
@@ -331,17 +373,25 @@ fn name_tokens(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Picks the release file for `flavor` on `arch_token`.
+/// Picks the release file for `flavor` on `arch_token` for a host running on `platform`.
 ///
 /// Installer assets end in `-setup.exe`; portable ones are `.zip` files named `portable`.
 /// Among candidates the one carrying this machine's architecture token wins. A release that
 /// names no architecture at all with a single candidate is accepted too, so a future rename
 /// does not silently disable updates; two unlabelled candidates are ambiguous and match none.
+///
+/// Both kinds are Windows builds, so a host without in-app install gets nothing — whatever its
+/// flavor and architecture happen to match. `platform` is a parameter rather than read from the
+/// host so the tests cover every platform on every machine.
 pub fn select_asset(
     assets: &[ReleaseAsset],
+    platform: HostPlatform,
     flavor: InstallFlavor,
     arch_token: &str,
 ) -> Option<ReleaseAsset> {
+    if !supports_in_app_install(platform) {
+        return None;
+    }
     let arch_token = arch_token.to_ascii_lowercase();
     let candidates = assets
         .iter()
@@ -387,8 +437,12 @@ pub fn select_checksums_asset(assets: &[ReleaseAsset]) -> Option<ReleaseAsset> {
 }
 
 /// Pure half of the update check: everything after the HTTP response is parsed.
+///
+/// The version comparison and release summary are the same on every host; only whether a file
+/// is offered depends on `platform`.
 pub fn build_update_check(
     current_version: &str,
+    platform: HostPlatform,
     flavor: InstallFlavor,
     arch_token: &str,
     release: GithubRelease,
@@ -410,8 +464,13 @@ pub fn build_update_check(
         .into_iter()
         .map(ReleaseAsset::from)
         .collect::<Vec<_>>();
-    let asset = select_asset(&assets, flavor, arch_token);
-    let checksums_asset = select_checksums_asset(&assets);
+    let in_app_install = supports_in_app_install(platform);
+    let asset = select_asset(&assets, platform, flavor, arch_token);
+    let checksums_asset = if in_app_install {
+        select_checksums_asset(&assets)
+    } else {
+        None
+    };
     Ok(UpdateCheck {
         current_version: current.to_plain_string(),
         latest_version: latest.to_plain_string(),
@@ -429,6 +488,7 @@ pub fn build_update_check(
         asset,
         checksums_asset,
         checked_at,
+        in_app_install,
     })
 }
 
@@ -530,6 +590,7 @@ pub fn check_for_update(
     flavor: InstallFlavor,
 ) -> Result<UpdateCheck, String> {
     let (owner, repo) = repository_slug(REPOSITORY_URL)?;
+    let platform = crate::host_platform::host_platform();
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
     let client = client(API_TIMEOUT, current_version)?;
     let response = client
@@ -544,8 +605,15 @@ pub fn check_for_update(
     }
     if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
         if let Some(message) = rate_limit_message(&response) {
-            return check_via_release_redirects(&client, &owner, &repo, current_version, flavor)
-                .map_err(|fallback| format!("{message}；改走发布页也失败了：{fallback}"));
+            return check_via_release_redirects(
+                &client,
+                &owner,
+                &repo,
+                current_version,
+                platform,
+                flavor,
+            )
+            .map_err(|fallback| format!("{message}；改走发布页也失败了：{fallback}"));
         }
     }
     if !status.is_success() {
@@ -557,6 +625,7 @@ pub fn check_for_update(
         .map_err(|error| format!("GitHub 发布信息无法解析: {error}"))?;
     build_update_check(
         current_version,
+        platform,
         flavor,
         arch_token(),
         release,
@@ -629,6 +698,7 @@ fn check_via_release_redirects(
     owner: &str,
     repo: &str,
     current_version: &str,
+    platform: HostPlatform,
     flavor: InstallFlavor,
 ) -> Result<UpdateCheck, String> {
     let latest_url = format!("https://github.com/{owner}/{repo}/releases/latest");
@@ -646,15 +716,23 @@ fn check_via_release_redirects(
         .ok_or_else(|| format!("发布页没有跳转到某个标签页（停在 {}）", response.url()))?;
     let latest = Version::parse(&tag)
         .ok_or_else(|| format!("最新发布的标签 {tag} 不是 v<主>.<次>.<修订> 形式，无法比较版本"))?;
-    let (installer, portable, checksums) =
-        conventional_asset_names(&latest.to_plain_string(), arch_token());
-    let download_base = format!("https://github.com/{owner}/{repo}/releases/download/{tag}");
-    let wanted = match flavor {
-        InstallFlavor::Installer => installer,
-        InstallFlavor::Portable => portable,
+    // Every conventional name is a Windows build, so another host skips the probes: their
+    // answers would only be discarded by `build_update_check`.
+    let (asset, checksums_asset) = if supports_in_app_install(platform) {
+        let (installer, portable, checksums) =
+            conventional_asset_names(&latest.to_plain_string(), arch_token());
+        let download_base = format!("https://github.com/{owner}/{repo}/releases/download/{tag}");
+        let wanted = match flavor {
+            InstallFlavor::Installer => installer,
+            InstallFlavor::Portable => portable,
+        };
+        (
+            probe_asset(client, &format!("{download_base}/{wanted}"), &wanted),
+            probe_asset(client, &format!("{download_base}/{checksums}"), checksums),
+        )
+    } else {
+        (None, None)
     };
-    let asset = probe_asset(client, &format!("{download_base}/{wanted}"), &wanted);
-    let checksums_asset = probe_asset(client, &format!("{download_base}/{checksums}"), checksums);
     let release = GithubRelease {
         tag_name: tag.clone(),
         name: None,
@@ -674,6 +752,7 @@ fn check_via_release_redirects(
     };
     build_update_check(
         current_version,
+        platform,
         flavor,
         arch_token(),
         release,
@@ -926,6 +1005,9 @@ pub fn download_update(
     cancel: &AtomicBool,
     mut progress: impl FnMut(DownloadEvent),
 ) -> Result<DownloadedUpdate, String> {
+    // First, before `destination_dir` is created or probed: on macOS the portable destination is
+    // `~/Downloads`, and merely touching it raises the system's folder-access prompt.
+    require_in_app_install(crate::host_platform::host_platform())?;
     let url = validate_asset(&request.asset, request.flavor)?;
     let release_tag = validate_release_download_url(&url, &request.asset.name)?;
     fs::create_dir_all(&request.destination_dir).map_err(|error| {
@@ -1407,6 +1489,15 @@ mod tests {
         }
     }
 
+    /// Selection as a Windows host makes it, the only host that is offered an asset.
+    fn select_on_windows(
+        assets: &[ReleaseAsset],
+        flavor: InstallFlavor,
+        arch_token: &str,
+    ) -> Option<ReleaseAsset> {
+        select_asset(assets, HostPlatform::Windows, flavor, arch_token)
+    }
+
     #[test]
     fn repository_slug_comes_from_cargo_metadata() {
         assert_eq!(
@@ -1513,25 +1604,25 @@ mod tests {
             asset("Source code.zip"),
         ];
         assert_eq!(
-            select_asset(&assets, InstallFlavor::Installer, "x64")
+            select_on_windows(&assets, InstallFlavor::Installer, "x64")
                 .unwrap()
                 .name,
             "Mework_1.1.0_x64-setup.exe"
         );
         assert_eq!(
-            select_asset(&assets, InstallFlavor::Installer, "arm64")
+            select_on_windows(&assets, InstallFlavor::Installer, "arm64")
                 .unwrap()
                 .name,
             "Mework_1.1.0_arm64-setup.exe"
         );
         assert_eq!(
-            select_asset(&assets, InstallFlavor::Portable, "x64")
+            select_on_windows(&assets, InstallFlavor::Portable, "x64")
                 .unwrap()
                 .name,
             "Mework_1.1.0_x64_portable.zip"
         );
         // No asset for this architecture, and the labelled ones must not be misused.
-        assert!(select_asset(&assets, InstallFlavor::Installer, "x86").is_none());
+        assert!(select_on_windows(&assets, InstallFlavor::Installer, "x86").is_none());
         assert_eq!(select_checksums_asset(&assets).unwrap().name, "SHA256SUMS");
     }
 
@@ -1539,23 +1630,23 @@ mod tests {
     fn a_single_unlabelled_asset_is_accepted_but_two_are_ambiguous() {
         let single = vec![asset("Mework-setup.exe"), asset("Mework_portable.zip")];
         assert_eq!(
-            select_asset(&single, InstallFlavor::Installer, "x64")
+            select_on_windows(&single, InstallFlavor::Installer, "x64")
                 .unwrap()
                 .name,
             "Mework-setup.exe"
         );
         assert_eq!(
-            select_asset(&single, InstallFlavor::Portable, "x64")
+            select_on_windows(&single, InstallFlavor::Portable, "x64")
                 .unwrap()
                 .name,
             "Mework_portable.zip"
         );
         let ambiguous = vec![asset("Mework-a-setup.exe"), asset("Mework-b-setup.exe")];
-        assert!(select_asset(&ambiguous, InstallFlavor::Installer, "x64").is_none());
+        assert!(select_on_windows(&ambiguous, InstallFlavor::Installer, "x64").is_none());
         // The architecture label wins even when an unlabelled sibling exists.
         let mixed = vec![asset("Mework-setup.exe"), asset("Mework_x64-setup.exe")];
         assert_eq!(
-            select_asset(&mixed, InstallFlavor::Installer, "x64")
+            select_on_windows(&mixed, InstallFlavor::Installer, "x64")
                 .unwrap()
                 .name,
             "Mework_x64-setup.exe"
@@ -1568,7 +1659,7 @@ mod tests {
             asset("Mework_x64-setup.exe"),
         ];
         assert_eq!(
-            select_asset(&embedded, InstallFlavor::Installer, "x64")
+            select_on_windows(&embedded, InstallFlavor::Installer, "x64")
                 .unwrap()
                 .name,
             "Mework_x64-setup.exe"
@@ -1579,6 +1670,7 @@ mod tests {
     fn update_check_compares_versions_and_picks_assets() {
         let check = build_update_check(
             "1.0.0",
+            HostPlatform::Windows,
             InstallFlavor::Installer,
             "x64",
             release(
@@ -1600,9 +1692,11 @@ mod tests {
         assert_eq!(check.release.notes, "## Notes");
         assert_eq!(check.asset.unwrap().name, "Mework_1.1.0_x64-setup.exe");
         assert_eq!(check.checksums_asset.unwrap().name, "SHA256SUMS");
+        assert!(check.in_app_install);
 
         let same = build_update_check(
             "1.1.0",
+            HostPlatform::Windows,
             InstallFlavor::Portable,
             "x64",
             release("v1.1.0", &["Mework_1.1.0_x64_portable.zip"]),
@@ -1616,6 +1710,7 @@ mod tests {
         // Running a newer build than the latest release is not an update either.
         let ahead = build_update_check(
             "1.2.0",
+            HostPlatform::Windows,
             InstallFlavor::Portable,
             "x64",
             release("v1.1.0", &[]),
@@ -1627,9 +1722,126 @@ mod tests {
     }
 
     #[test]
+    fn only_windows_installs_updates_in_app() {
+        assert!(supports_in_app_install(HostPlatform::Windows));
+        assert!(!supports_in_app_install(HostPlatform::Macos));
+        assert!(!supports_in_app_install(HostPlatform::Linux));
+        require_in_app_install(HostPlatform::Windows).unwrap();
+        let refused = require_in_app_install(HostPlatform::Macos).unwrap_err();
+        assert!(refused.contains("macOS"), "{refused}");
+        assert!(require_in_app_install(HostPlatform::Linux).is_err());
+    }
+
+    /// A Mac has no `uninstall.exe`, so it detects as "portable" and, before the platform was
+    /// considered, was handed the Windows portable zip for its architecture.
+    #[test]
+    fn non_windows_hosts_are_never_offered_a_windows_asset() {
+        let assets = vec![
+            asset("Mework_1.1.0_x64-setup.exe"),
+            asset("Mework_1.1.0_arm64-setup.exe"),
+            asset("Mework_1.1.0_x64_portable.zip"),
+            asset("Mework_1.1.0_arm64_portable.zip"),
+            // Unlabelled candidates are accepted on Windows; they must not be here either.
+            asset("Mework-setup.exe"),
+            asset("Mework_portable.zip"),
+            asset("SHA256SUMS"),
+        ];
+        for platform in [HostPlatform::Macos, HostPlatform::Linux] {
+            for flavor in [InstallFlavor::Installer, InstallFlavor::Portable] {
+                for arch in ["x64", "arm64", "x86", "unknown"] {
+                    assert_eq!(
+                        select_asset(&assets, platform, flavor, arch),
+                        None,
+                        "{platform:?} {flavor:?} {arch}"
+                    );
+                }
+            }
+        }
+        // The same list still serves Windows.
+        assert_eq!(
+            select_on_windows(&assets, InstallFlavor::Portable, "arm64")
+                .unwrap()
+                .name,
+            "Mework_1.1.0_arm64_portable.zip"
+        );
+    }
+
+    #[test]
+    fn non_windows_update_check_reports_the_release_without_a_download() {
+        for platform in [HostPlatform::Macos, HostPlatform::Linux] {
+            let check = build_update_check(
+                "1.0.0",
+                platform,
+                InstallFlavor::Portable,
+                "arm64",
+                release(
+                    "v1.1.0",
+                    &[
+                        "Mework_1.1.0_x64-setup.exe",
+                        "Mework_1.1.0_arm64_portable.zip",
+                        "SHA256SUMS",
+                    ],
+                ),
+                "2026-09-05T01:00:00Z".to_owned(),
+            )
+            .unwrap();
+            // The version answer and the page to get it from are the same as on Windows.
+            assert!(check.update_available);
+            assert_eq!(check.latest_version, "1.1.0");
+            assert_eq!(
+                check.release.html_url,
+                "https://github.com/catblob-hash/Mework/releases/tag/v1.1.0"
+            );
+            assert_eq!(check.release.notes, "## Notes");
+            // Nothing to download, so nothing is written to `~/Downloads`.
+            assert!(!check.in_app_install);
+            assert!(check.asset.is_none());
+            assert!(check.checksums_asset.is_none());
+            let json = serde_json::to_value(&check).unwrap();
+            assert_eq!(json["inAppInstall"], false);
+            assert!(json["asset"].is_null());
+        }
+        let windows = build_update_check(
+            "1.0.0",
+            HostPlatform::Windows,
+            InstallFlavor::Portable,
+            "arm64",
+            release("v1.1.0", &["Mework_1.1.0_arm64_portable.zip"]),
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&windows).unwrap()["inAppInstall"],
+            true
+        );
+    }
+
+    /// The renderer never asks without an asset from the check, but a stale page or a forged
+    /// call must still be refused before the destination (on macOS, `~/Downloads`) is touched.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_download_request_on_a_non_windows_host_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination_dir = directory.path().join("Downloads");
+        let request = DownloadRequest {
+            asset: asset("Mework_1.1.0_x64_portable.zip"),
+            checksums_asset: Some(asset("SHA256SUMS")),
+            flavor: InstallFlavor::Portable,
+            destination_dir: destination_dir.clone(),
+            current_version: "1.0.0".to_owned(),
+        };
+        let mut events = 0;
+        let error = download_update(request, &AtomicBool::new(false), |_| events += 1).unwrap_err();
+        assert!(error.contains("暂不支持应用内更新"), "{error}");
+        assert!(!destination_dir.exists(), "目标目录不应被创建");
+        assert_eq!(events, 0);
+    }
+
+    #[test]
     fn update_check_rejects_unparseable_tags_and_drafts() {
         let error = build_update_check(
             "1.0.0",
+            HostPlatform::Windows,
             InstallFlavor::Installer,
             "x64",
             release("nightly", &[]),
@@ -1641,6 +1853,7 @@ mod tests {
         draft.draft = true;
         assert!(build_update_check(
             "1.0.0",
+            HostPlatform::Windows,
             InstallFlavor::Installer,
             "x64",
             draft,
@@ -1649,6 +1862,7 @@ mod tests {
         .is_err());
         assert!(build_update_check(
             "dev",
+            HostPlatform::Windows,
             InstallFlavor::Installer,
             "x64",
             release("v1.0.0", &[]),
@@ -1682,6 +1896,7 @@ mod tests {
         let release: GithubRelease = serde_json::from_value(json).unwrap();
         let check = build_update_check(
             "1.0.0",
+            HostPlatform::Windows,
             InstallFlavor::Installer,
             "x64",
             release,
@@ -2096,13 +2311,13 @@ mod tests {
         // the file and then refuse it.
         let assets = vec![asset(&installer), asset(&portable), asset(checksums)];
         assert_eq!(
-            select_asset(&assets, InstallFlavor::Installer, "x64")
+            select_on_windows(&assets, InstallFlavor::Installer, "x64")
                 .unwrap()
                 .name,
             installer
         );
         assert_eq!(
-            select_asset(&assets, InstallFlavor::Portable, "x64")
+            select_on_windows(&assets, InstallFlavor::Portable, "x64")
                 .unwrap()
                 .name,
             portable

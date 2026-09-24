@@ -8,7 +8,7 @@ A resize is classified as a local browser observation (`browser.local_observatio
 
 Like every page tool it needs a running dev server or a page the pane already holds, and is bounded at 30 seconds.
 
-Below 768 CSS pixels wide the emulation also makes the page believe it is a phone: device metrics carry `mobile: true` and a device pixel ratio of 2, the user agent becomes an Android Chrome string built from the WebView2 runtime's own Chromium major version, and touch emulation is enabled with five points and mouse-to-touch translation. Clearing the size takes all of that back.
+Below 768 CSS pixels wide the emulation also makes the page believe it is a phone: device metrics carry `mobile: true` and a device pixel ratio of 2, the user agent becomes an Android Chrome string built from the page engine's own Chromium major version (WebView2 on Windows, the embedded CEF on macOS), and touch emulation is enabled with five points and mouse-to-touch translation. Clearing the size takes all of that back.
 
 A call that sets neither a size nor `colorScheme` is an error, as are an unknown `preset` or `colorScheme` and a custom size missing one dimension. A size stays on the tab, scaled down to fit when it is larger than the pane, until a `desktop` call clears it; `desktop` leaves `colorScheme` alone. The answer is one sentence per override applied.
 

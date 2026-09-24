@@ -12,7 +12,6 @@ use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
-use crate::host_platform::host_platform;
 use crate::model::{RunModelRequest, ToolDescriptor, ToolParameterType};
 use crate::prompt_profile::PromptProfile;
 
@@ -33,27 +32,33 @@ pub(crate) fn enabled_tools(request: &RunModelRequest) -> Vec<&ToolDescriptor> {
         // host-side executor (Task*); subagent runs exclude them from this list.
         .filter(|tool| enabled.contains(&tool.name) || plan_tools.contains(&tool.name.as_str()))
         .filter(|tool| supports_vision || is_usable_without_vision(&tool.name))
-        // A conversation whose every workspace is on a POSIX machine — a Mac, a
-        // Linux host, WSL or SSH — has nowhere to run PowerShell. Withdrawing both
-        // PowerShell tools is the honest form: the user may well have them
-        // enabled, and advertising them would buy one wasted call and one error
-        // per turn until the model stopped trying.
+        // A shell tool is advertised only where its shell is: the tool list a
+        // conversation shows is the union of its machines' backends, and a
+        // backend none of this run's machines has — PowerShell on a Mac, zsh
+        // on Windows — has nowhere to run. Withdrawing it is the honest form:
+        // the user may well have it enabled, and advertising it would buy one
+        // wasted call and one error per turn until the model stopped trying.
         .filter(|tool| {
-            !crate::builtin_schemas::is_powershell_tool(&tool.name)
-                || runs_powershell(&request.workspaces)
+            crate::shell_backend::ShellBackend::of_tool(&tool.name)
+                .map_or(true, |backend| runs_backend(&request.workspaces, backend))
         })
         .collect()
 }
 
-/// Whether a run's workspaces include one PowerShell could run in.
+/// Whether a run's workspaces include one whose machine has `backend`.
 ///
 /// A run that resolved no workspace set predates machine-bound workspaces, so it
-/// is on the host machine and the host's own platform answers.
-fn runs_powershell(workspaces: &crate::workspace_set::WorkspaceSet) -> bool {
+/// is on the host machine and the host's own shells answer.
+fn runs_backend(
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    backend: crate::shell_backend::ShellBackend,
+) -> bool {
     if workspaces.is_empty() {
-        return host_platform().runs_powershell();
+        return crate::machine_shells::local()
+            .get(backend)
+            .is_some();
     }
-    workspaces.runs_powershell()
+    workspaces.runs(backend)
 }
 
 /// Whether a tool means anything to a model that cannot see images.
@@ -237,13 +242,14 @@ mod tests {
         }
     }
 
-    /// A conversation whose every workspace is POSIX has nowhere to run
-    /// PowerShell, and advertising it there buys one wasted call and one error
-    /// per turn until the model stops trying. The catalog stays complete either
-    /// way: withdrawal is a property of the run, not of the tool.
+    /// A conversation whose machines lack a shell has nowhere to run that
+    /// shell's tools, and advertising them there buys one wasted call and one
+    /// error per turn until the model stops trying. The catalog stays complete
+    /// either way: withdrawal is a property of the run, not of the tool.
     #[test]
-    fn powershell_is_offered_only_where_a_workspace_could_run_it() {
+    fn a_shell_is_offered_only_where_a_workspace_could_run_it() {
         use crate::model::{AttachedWorkspace, RunTarget, SshMachineConfig};
+        use crate::shell_backend::ShellBackend;
         use crate::workspace_set::WorkspaceSet;
 
         let assets = crate::model::ExecutionEnvironmentAssets {
@@ -262,20 +268,29 @@ mod tests {
             path: "~/app".into(),
         };
 
-        // Every workspace on a POSIX machine: nowhere to run it.
-        assert!(!runs_powershell(
-            &WorkspaceSet::resolve(&assets, &remote, &[]).unwrap()
-        ));
-        // A host workspace brings it back exactly where PowerShell exists.
+        // An unprobed SSH machine has bash and nothing else.
+        let set = WorkspaceSet::resolve(&assets, &remote, &[]).unwrap();
+        assert!(!runs_backend(&set, ShellBackend::PowerShell));
+        assert!(runs_backend(&set, ShellBackend::Bash));
+        // A host workspace brings back exactly the host's own shells.
+        let local = crate::machine_shells::local();
+        for backend in ShellBackend::ALL {
+            assert_eq!(
+                runs_backend(&WorkspaceSet::local_root("C:/work/app"), backend),
+                local.get(backend).is_some(),
+                "{backend}"
+            );
+            // A run that resolved no set predates machine-bound workspaces, so
+            // the host's own shells answer rather than a silent withdrawal.
+            assert_eq!(
+                runs_backend(&WorkspaceSet::default(), backend),
+                local.get(backend).is_some(),
+                "{backend}"
+            );
+        }
         assert_eq!(
-            runs_powershell(&WorkspaceSet::local_root("C:/work/app")),
-            host_platform().runs_powershell()
-        );
-        // A run that resolved no set predates machine-bound workspaces, so the
-        // host's own platform answers rather than a silent withdrawal.
-        assert_eq!(
-            runs_powershell(&WorkspaceSet::default()),
-            host_platform().runs_powershell()
+            runs_backend(&WorkspaceSet::default(), ShellBackend::PowerShell),
+            crate::host_platform::host_platform().is_windows()
         );
     }
 }

@@ -1,17 +1,17 @@
-//! `preview_find_element`, `preview_find_logs` and the `preview_*_by_description` variants:
-//! decision-model tools over the conversation's preview page.
+//! The decision model over the conversation's preview page: `preview_find_logs`; the scored
+//! `query`/`threshold` form of `preview_console_logs` and `preview_snapshot`; and the chosen
+//! `query` form of `preview_click`, `preview_fill` and `preview_inspect`, which asks the model to
+//! pick one element or "none of the above" (see [`super::decision_parameters`]).
 //!
-//! All five run **host-side**, outside the page's automation lock. `dispatch_preview_page_tool`
+//! All of it runs **host-side**, outside the page's automation lock. `dispatch_preview_page_tool`
 //! runs a page tool on its own thread under a 30 s wall clock while holding that lock, and a
 //! scoring pass is dozens of network round trips: running it there would hold the page for the
 //! whole pass and blow the clock. So the page is touched only for short reads — the element
 //! lines, one element's selector, the console buffer — the decision model is consulted between
-//! them, and the action itself is handed back to the existing `preview_click` / `preview_fill` /
-//! `preview_inspect` through the ordinary dispatcher. The `PreviewTool` variants for these names
-//! exist so the names are page tools everywhere a page tool is treated specially; their arms in
-//! `BrowserSession::execute_tool_blocking` are stubs that say so.
+//! them, and the action itself goes back to `preview_click` / `preview_fill` / `preview_inspect`
+//! through the ordinary dispatcher, carrying the selector of the element the model chose.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -30,7 +30,7 @@ use crate::decision_model::jev::{
     ChoiceAnswer, ELEMENT_RUBRIC, MAX_CHOICE_OPTIONS, RELEVANCE_RUBRIC,
 };
 use crate::decision_model::search::{render_report, search, Candidate, Scorer, SearchReport};
-use crate::decision_model::{parse_query, parse_threshold};
+use crate::decision_model::{parse_query, parse_threshold, DecisionError};
 use crate::model::{JsonObject, ToolExecutionRequest};
 use crate::state::AppState;
 use crate::tool_executor::{
@@ -57,12 +57,15 @@ const MAX_ELEMENT_CHOICES: usize = MAX_CHOICE_OPTIONS - 1;
 const CHOICE_INSTRUCTIONS: &str = "Which element in `elements` is the one that `description` \
 refers to? Every element line starts with its uid in square brackets; answer with that uid. \
 Answer none when no element on the page is the described one.";
-const NO_MATCH_OPTION: &str = "No element on the page matches the description";
+/// The way out the host always appends to an element choice, after every element it offers, so
+/// the model is never forced to name an element the description does not fit.
+const NO_MATCH_OPTION: &str = "None of the above: no element on the page matches the description";
 const NO_MATCH_CHOICE: &str = "none";
 
 const NO_ELEMENTS: &str =
     "No accessible content found on the preview page; there is nothing to score.";
 const NO_LOG_LINES: &str = "There are no console or server log lines to score.";
+const NO_CONSOLE_LINES: &str = "There are no console log lines to score.";
 /// A dev server is optional material for `preview_find_logs`, so its absence is reported in the
 /// answer rather than raised — unless the call asked for the server logs and nothing else.
 const NO_RUNNING_SERVER: &str =
@@ -70,14 +73,18 @@ const NO_RUNNING_SERVER: &str =
 const NO_SERVER_LOGS: &str = "No dev server is running for this workspace, so there are no server \
 logs to score. Start one with preview_start, or search the page console with source \"console\".";
 
+/// The most console entries `lines` can ask for: the page keeps no more than this many, and the
+/// plain listing clamps to the same number.
+const MAX_CONSOLE_LINES: u64 = 200;
+
 const SELECTOR_UNAVAILABLE: &str =
     "unavailable (the element is not reachable by CSS; use preview_snapshot)";
 
 // ----------------------------------------------------------------- Entry points
 
-/// `preview_find_element`: which elements of the page a description points at, each with the
-/// selector that addresses it.
-pub(crate) fn find_element(
+/// `preview_snapshot` with `query`: which elements of the page a description points at, each with
+/// the selector that addresses it, instead of the whole snapshot.
+fn find_element(
     request: &ToolExecutionRequest,
     state: &AppState,
     workspace: &Path,
@@ -89,7 +96,7 @@ pub(crate) fn find_element(
     // The key is read before the page is touched: a call that cannot score anything should not
     // cost a page read, and the hint the model relays must not arrive behind a page error.
     let scorer = jev_scorer(ELEMENT_RUBRIC)?;
-    let (lines, capped) = element_lines(state, &session_id)?;
+    let (lines, capped) = element_lines(state, &session_id, PreviewTool::Snapshot)?;
     if lines.is_empty() {
         return Ok(Outcome::success(NO_ELEMENTS.to_owned()));
     }
@@ -110,7 +117,7 @@ pub(crate) fn find_element(
         threshold,
         &lines,
         capped,
-        |line| selector_for(state, &session_id, line),
+        |line| selector_for(state, &session_id, PreviewTool::Snapshot, line),
     )))
 }
 
@@ -139,7 +146,7 @@ pub(crate) fn find_logs(
         }
     }
     let console = if source.reads_console() {
-        console_lines(state, &session_id)?
+        console_lines(state, &session_id, None)?
     } else {
         Vec::new()
     };
@@ -170,38 +177,98 @@ pub(crate) fn find_logs(
     Ok(Outcome::success(text.join("\n")))
 }
 
-pub(crate) fn click_by_description(
+/// `preview_console_logs` with `query`: which of the console entries that pass `level` say what
+/// the query asks about.
+///
+/// `level` filters exactly as the plain listing's does, so the only difference is where the
+/// entries go. `lines` narrows them to the most recent ones; without it every entry that passes
+/// the filter is scored, because the point of asking the decision model is not having to guess
+/// how far back the answer is.
+fn score_console_logs(
     request: &ToolExecutionRequest,
     state: &AppState,
     workspace: &Path,
     cancel: &CancelSignal,
 ) -> Result<Outcome, String> {
-    act_by_description(request, state, workspace, cancel, DescribedAction::Click)
+    let query = parse_query(&request.input, "query")?;
+    let threshold = parse_threshold(&request.input)?;
+    let level = parse_console_level(&request.input)?;
+    let limit = parse_console_lines(&request.input)?;
+    let session_id = resolve_preview_page_session(request, state, workspace)?;
+    let scorer = jev_scorer(RELEVANCE_RUBRIC)?;
+
+    let mut console = console_lines(state, &session_id, level)?;
+    if let Some(limit) = limit {
+        let skip = console.len().saturating_sub(limit);
+        console.drain(..skip);
+    }
+    let plan = chunk_lines(&console.join("\n"));
+    let (coarse, by_label) = chunk_candidates("console", &plan.chunks);
+    let mut text = vec![scored_console_line(console.len())];
+    if coarse.is_empty() {
+        text.push(NO_CONSOLE_LINES.to_owned());
+        return Ok(Outcome::success(text.join("\n")));
+    }
+    let report = search(
+        scorer,
+        &query,
+        threshold,
+        coarse,
+        |candidate| refine_line_chunk("console", &by_label, candidate),
+        cancel,
+    )
+    .map_err(failure)?;
+    text.push(render_report(&report, &query, threshold, "chunks of console logs", true));
+    Ok(Outcome::success(text.join("\n")))
 }
 
-pub(crate) fn fill_by_description(
-    request: &ToolExecutionRequest,
-    state: &AppState,
-    workspace: &Path,
-    cancel: &CancelSignal,
-) -> Result<Outcome, String> {
-    act_by_description(request, state, workspace, cancel, DescribedAction::Fill)
-}
-
-pub(crate) fn inspect_by_description(
-    request: &ToolExecutionRequest,
-    state: &AppState,
-    workspace: &Path,
-    cancel: &CancelSignal,
-) -> Result<Outcome, String> {
-    act_by_description(request, state, workspace, cancel, DescribedAction::Inspect)
-}
-
-// ----------------------------------------------------------------- The choice variants
-
-/// Which base tool a `_by_description` call ends in, and what it carries over to it.
+/// The decision-model form one decision-parameter tool's call runs as, for the executor's single
+/// arm over [`super::DECISION_PARAMETER_TOOLS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DescribedAction {
+pub(crate) enum Decision {
+    ConsoleLogs,
+    Snapshot,
+    Act(DescribedAction),
+}
+
+impl Decision {
+    pub(crate) fn of(tool: &str) -> Option<Self> {
+        match tool {
+            "preview_console_logs" => Some(Self::ConsoleLogs),
+            "preview_snapshot" => Some(Self::Snapshot),
+            "preview_click" => Some(Self::Act(DescribedAction::Click)),
+            "preview_fill" => Some(Self::Act(DescribedAction::Fill)),
+            "preview_inspect" => Some(Self::Act(DescribedAction::Inspect)),
+            _ => None,
+        }
+    }
+
+    /// `score_misses` is whether this run scores the element lines behind a "none of the above"
+    /// (`RunModelRequest::decision_miss_scoring`); only the choice forms can miss, so the
+    /// scoring forms ignore it.
+    pub(crate) fn run(
+        self,
+        request: &ToolExecutionRequest,
+        state: &AppState,
+        workspace: &Path,
+        cancel: &CancelSignal,
+        score_misses: bool,
+    ) -> Result<Outcome, String> {
+        match self {
+            Self::ConsoleLogs => score_console_logs(request, state, workspace, cancel),
+            Self::Snapshot => find_element(request, state, workspace, cancel),
+            Self::Act(action) => {
+                act_by_query(request, state, workspace, cancel, action, score_misses)
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------- The choice forms
+
+/// Which base tool a `query` call ends in, and what it carries over to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescribedAction {
     Click,
     Fill,
     Inspect,
@@ -217,11 +284,7 @@ impl DescribedAction {
     }
 
     fn name(self) -> &'static str {
-        match self {
-            Self::Click => "preview_click_by_description",
-            Self::Fill => "preview_fill_by_description",
-            Self::Inspect => "preview_inspect_by_description",
-        }
+        self.tool().as_str()
     }
 
     /// The base tool's own parameters, handed over untouched.
@@ -240,53 +303,68 @@ impl DescribedAction {
     }
 }
 
-/// Lists the page's elements, asks the decision model which one the description names, and hands
-/// that element's selector to the base tool.
-fn act_by_description(
+/// Lists the page's elements, asks the decision model which one `query` names — or "none of the
+/// above", the option the host always appends — and hands that element's selector to the base
+/// tool.
+///
+/// This is a choice, not a score: there is no threshold to cut at. "None of the above" is how the
+/// model declines, and it is a miss reported with the elements it nearly chose and every element
+/// line it was shown, so the caller can sharpen the query or fall back to a selector without
+/// reading the page again. With `score_misses` those lines are first scored against the
+/// description one by one and listed highest first — a second opinion on the same material, from
+/// a question that cannot decline.
+fn act_by_query(
     request: &ToolExecutionRequest,
     state: &AppState,
     workspace: &Path,
     cancel: &CancelSignal,
     action: DescribedAction,
+    score_misses: bool,
 ) -> Result<Outcome, String> {
-    let description = parse_query(&request.input, "description")?;
+    let description = parse_query(&request.input, "query")?;
     if action == DescribedAction::Fill && !request.input.contains_key("value") {
         return Err("Missing parameter value".to_owned());
     }
     let session_id = resolve_preview_page_session(request, state, workspace)?;
     let jev = jev_client()?;
-    let (lines, _) = element_lines(state, &session_id)?;
-    if lines.is_empty() {
-        return missed(action, &description, &no_answer(), &HashMap::new())
+    let (lines, capped) = element_lines(state, &session_id, action.tool())?;
+    let candidates = narrow_candidates(&lines, &description, cancel)?;
+    let shown = Shown::new(&candidates, lines.len(), capped);
+    if candidates.is_empty() {
+        return missed(action, &description, None, &shown, &MissListing::Plain)
             .map(Outcome::success);
     }
-    let candidates = narrow_candidates(&lines, &description, cancel)?;
     let options = choice_options(&candidates);
     let answer = jev
         .choose(
             json!({
                 "description": description,
-                "elements": render_lines(&candidates).join("\n"),
+                "elements": shown.text(),
             }),
             CHOICE_INSTRUCTIONS,
             &options,
         )
         .map_err(failure)?;
-    let by_uid = candidates
-        .iter()
-        .map(|line| (line.uid, line))
-        .collect::<HashMap<_, _>>();
+    let by_uid = uid_index(&candidates);
     let Some(chosen) = answer
         .choice
         .parse::<u64>()
         .ok()
         .and_then(|uid| by_uid.get(&uid).copied())
     else {
-        return missed(action, &description, &answer, &by_uid).map(Outcome::success);
+        let listing = if score_misses {
+            score_shown(jev_scorer(ELEMENT_RUBRIC), &shown, &description, cancel)?
+        } else {
+            MissListing::Plain
+        };
+        return missed(action, &description, Some(&answer), &shown, &listing)
+            .map(Outcome::success);
     };
     let selector = chosen
         .backend_node_id
-        .map(|backend_node_id| selector_for_blocking(state, &session_id, backend_node_id))
+        .map(|backend_node_id| {
+            selector_for_blocking(state, &session_id, action.tool(), backend_node_id)
+        })
         .transpose()?
         .flatten()
         .ok_or_else(|| {
@@ -324,44 +402,217 @@ fn act_by_description(
     )))
 }
 
-/// The answer when the decision model named no element of the page. `Ok` is a tool result the
-/// model reads; `Err` is a failed call.
+/// What one choice question showed the decision model, kept so that a miss can hand the very same
+/// element lines back: the caller reads what the model read, and can judge the page or take its
+/// next step without another snapshot.
+struct Shown<'a> {
+    /// The element lines the question offered, in page order.
+    elements: &'a [AxLine],
+    /// Those lines exactly as the question's `elements` carried them, one entry per line.
+    rendered: Vec<String>,
+    /// How many element lines the page read gave before they were narrowed to fit the question.
+    page_elements: usize,
+    /// Whether that read stopped at [`PREVIEW_ELEMENT_LINES_CAP`].
+    capped: bool,
+}
+
+impl<'a> Shown<'a> {
+    fn new(elements: &'a [AxLine], page_elements: usize, capped: bool) -> Self {
+        Self {
+            elements,
+            rendered: render_lines(elements),
+            page_elements,
+            capped,
+        }
+    }
+
+    /// The question's `elements`.
+    fn text(&self) -> String {
+        self.rendered.join("\n")
+    }
+
+    fn narrowed(&self) -> bool {
+        self.elements.len() < self.page_elements
+    }
+
+    /// Which lines the decision model chose among — all of the page, or the shortlist a long page
+    /// was narrowed to — with no punctuation after it, so each listing ends it in its own way.
+    fn header(&self) -> String {
+        let count = self.elements.len();
+        if self.narrowed() {
+            format!(
+                "The page has {} element lines; the decision model was shown the {count} in the \
+                 runs that scored best against the description",
+                self.page_elements
+            )
+        } else if count == 1 {
+            "The decision model was shown the page's only element line".to_owned()
+        } else {
+            format!("The decision model was shown all {count} element lines of the page")
+        }
+    }
+
+    /// The header, the note on a read that stopped short, and then `lines`.
+    fn listing(&self, header: String, lines: impl IntoIterator<Item = String>) -> String {
+        let mut text = vec![header];
+        if self.capped {
+            text.push(format!(
+                "(Only the first {PREVIEW_ELEMENT_LINES_CAP} element lines of the page were read; \
+                 the page has more.)"
+            ));
+        }
+        text.extend(lines);
+        text.join("\n")
+    }
+
+    /// The lines the decision model chose among, as it read them.
+    fn render(&self) -> String {
+        if self.elements.is_empty() {
+            return NO_CHOICE_ELEMENTS.to_owned();
+        }
+        let order = if self.narrowed() { ", in page order" } else { "" };
+        self.listing(format!("{}{order}:", self.header()), self.rendered.clone())
+    }
+
+    /// The same lines after each was scored against the description on its own: highest first,
+    /// each with its score, and any a failed request left unscored at the end in page order.
+    fn render_scored(&self, report: &SearchReport) -> String {
+        let by_uid = uid_index(self.elements);
+        let mut scored = HashSet::new();
+        let mut lines = report
+            .hits
+            .iter()
+            .filter_map(|hit| {
+                let line = by_uid.get(&uid_from_element_label(&hit.candidate.label)?)?;
+                scored.insert(line.uid);
+                Some(format!(
+                    "{} (score {:.3})",
+                    render_ax_line(line, false),
+                    hit.score
+                ))
+            })
+            .collect::<Vec<_>>();
+        lines.extend(
+            self.elements
+                .iter()
+                .filter(|line| !scored.contains(&line.uid))
+                .map(|line| format!("{} (unscored)", render_ax_line(line, false))),
+        );
+        let mut header = format!(
+            "{}. Each was then scored against the description on its own ({}), highest first:",
+            self.header(),
+            counted_requests(report.requests)
+        );
+        if report.failed_requests > 0 {
+            header.push_str(&format!(
+                "\n{} of those requests failed; the elements they left unscored are listed last.",
+                report.failed_requests
+            ));
+        }
+        self.listing(header, lines)
+    }
+
+    /// One scoring candidate per line, labelled by uid and carrying the two lines on either side,
+    /// the same shape `preview_snapshot`'s refinement scores.
+    fn candidates(&self) -> Vec<Candidate> {
+        self.elements
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                Candidate::new(element_label(line.uid), self.rendered[index].clone())
+                    .with_context(line_context(&self.rendered, index))
+            })
+            .collect()
+    }
+}
+
+fn counted_requests(count: usize) -> String {
+    format!("{count} request{}", if count == 1 { "" } else { "s" })
+}
+
+const NO_CHOICE_ELEMENTS: &str =
+    "No accessible content found on the preview page; there was nothing to choose among.";
+
+/// How a miss lists the element lines the decision model was shown.
+enum MissListing {
+    /// As they went into the question.
+    Plain,
+    /// Each scored against the description on its own, highest first.
+    Scored(SearchReport),
+    /// Scoring was asked for and could not be done; the lines follow as the question had them.
+    ScoringFailed(String),
+}
+
+/// Scores every line a choice question showed, one request per line, for a miss's listing.
+///
+/// Threshold zero and no refinement: every line is its own candidate and every score is wanted,
+/// so the listing can rank them all. Cancellation stops the call; any other failure is reported
+/// in the listing, because the miss itself is still worth answering.
+fn score_shown(
+    scorer: Result<Arc<dyn Scorer>, String>,
+    shown: &Shown<'_>,
+    description: &str,
+    cancel: &CancelSignal,
+) -> Result<MissListing, String> {
+    let scorer = match scorer {
+        Ok(scorer) => scorer,
+        Err(error) => return Ok(MissListing::ScoringFailed(error)),
+    };
+    match search(scorer, description, 0.0, shown.candidates(), |_| Vec::new(), cancel) {
+        Ok(report) => Ok(MissListing::Scored(report)),
+        Err(DecisionError::Cancelled) => Err(failure(DecisionError::Cancelled)),
+        Err(error) => Ok(MissListing::ScoringFailed(failure(error))),
+    }
+}
+
+/// The answer when the decision model named no element of the page — or was never asked, because
+/// the page offered none: a headline with the model's ranking, then every element line it was
+/// shown. `Ok` is a tool result the model reads; `Err` is a failed call.
 fn missed(
     action: DescribedAction,
     description: &str,
-    answer: &ChoiceAnswer,
-    by_uid: &HashMap<u64, &AxLine>,
+    answer: Option<&ChoiceAnswer>,
+    shown: &Shown<'_>,
+    listing: &MissListing,
 ) -> Result<String, String> {
-    if !action.misses_are_errors() {
-        return Ok(format!("Element not found: {description}"));
+    let mut headline = if action.misses_are_errors() {
+        format!("No element on the page matched the description {description:?}")
+    } else {
+        format!("Element not found: {description}")
+    };
+    if let Some(answer) = answer {
+        headline.push(' ');
+        headline.push_str(&miss_ranking(answer, &uid_index(shown.elements)));
     }
-    Err(no_match_message(description, answer, by_uid))
+    let body = match listing {
+        MissListing::Plain => shown.render(),
+        MissListing::Scored(report) => shown.render_scored(report),
+        MissListing::ScoringFailed(error) => format!(
+            "Scoring the elements one by one failed, so they follow unscored: {error}\n{}",
+            shown.render()
+        ),
+    };
+    let text = format!("{headline}\n{body}");
+    if action.misses_are_errors() {
+        Err(text)
+    } else {
+        Ok(text)
+    }
 }
 
-/// The stand-in for an answer never asked for, when the page offered nothing to choose among.
-fn no_answer() -> ChoiceAnswer {
-    ChoiceAnswer {
-        choice: NO_MATCH_CHOICE.to_owned(),
-        confidence: 0.0,
-        probabilities: Vec::new(),
-    }
-}
-
-fn no_match_message(
-    description: &str,
-    answer: &ChoiceAnswer,
-    by_uid: &HashMap<u64, &AxLine>,
-) -> String {
-    let mut text = format!(
-        "No element on the page matched the description {description:?} (confidence {:.2}",
-        answer.confidence
-    );
+/// How sure the model was that nothing matched, and the elements it came closest to choosing.
+fn miss_ranking(answer: &ChoiceAnswer, by_uid: &HashMap<u64, &AxLine>) -> String {
+    let mut text = format!("(confidence {:.2}", answer.confidence);
     let closest = ranked_elements(answer, by_uid, NO_MATCH_CHOICE);
     if !closest.is_empty() {
         text.push_str(&format!("; closest: {}", closest.join(", ")));
     }
     text.push(')');
     text
+}
+
+fn uid_index(lines: &[AxLine]) -> HashMap<u64, &AxLine> {
+    lines.iter().map(|line| (line.uid, line)).collect()
 }
 
 /// The one line that precedes the base tool's own text: which element was chosen, how sure the
@@ -572,7 +823,7 @@ fn report_summary(report: &SearchReport, query: &str, threshold: f64, subject: &
         .join("\n")
 }
 
-/// `preview_find_element`'s answer: the summary, then each hit as its own snapshot line with the
+/// `preview_snapshot`'s answer to a `query`: the summary, then each hit as its own snapshot line with the
 /// selector that addresses it, or — for a run that never got refined — the run itself.
 fn render_element_report(
     report: &SearchReport,
@@ -619,6 +870,13 @@ fn render_element_report(
     text.join("\n")
 }
 
+fn scored_console_line(console: usize) -> String {
+    format!(
+        "Scored {console} console line{}.",
+        if console == 1 { "" } else { "s" }
+    )
+}
+
 fn scored_lines_line(console: usize, server: usize) -> String {
     format!(
         "Scored {console} console line{} and {server} server line{}.",
@@ -660,6 +918,36 @@ fn parse_source(input: &JsonObject) -> Result<LogSource, String> {
         other => Err(format!(
             "Parameter source must be one of \"all\", \"console\", \"server\"; got {other:?}"
         )),
+    }
+}
+
+/// `preview_console_logs`'s `level`, checked the way the plain listing checks it. `None` is
+/// `all`, which filters nothing.
+fn parse_console_level(input: &JsonObject) -> Result<Option<String>, String> {
+    let value = match input.get("level") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| "Parameter level must be a string".to_owned())?,
+    };
+    match value.trim() {
+        "all" => Ok(None),
+        level @ ("error" | "warn") => Ok(Some(level.to_owned())),
+        other => Err(format!(
+            "Parameter level must be one of \"all\", \"error\", \"warn\"; got {other:?}"
+        )),
+    }
+}
+
+/// `preview_console_logs`'s `lines`, clamped to the same ceiling the plain listing uses. `None`
+/// scores every entry the level filter kept.
+fn parse_console_lines(input: &JsonObject) -> Result<Option<usize>, String> {
+    match input.get("lines") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(|lines| Some(lines.clamp(1, MAX_CONSOLE_LINES) as usize))
+            .ok_or_else(|| "Parameter lines must be a non-negative integer".to_owned()),
     }
 }
 
@@ -748,12 +1036,18 @@ where
 /// and it repeats a name the element line already carries. Left in, the decision model — like
 /// any reader — picks "the Email textbox" out of the `InlineTextBox: "Email "` line as readily
 /// as out of the textbox itself, and the call then fails on a node nobody can act on.
-fn element_lines(state: &AppState, session_id: &str) -> Result<(Vec<AxLine>, bool), String> {
+fn element_lines(
+    state: &AppState,
+    session_id: &str,
+    tool: PreviewTool,
+) -> Result<(Vec<AxLine>, bool), String> {
     let (lines, capped) = page_read(
         state,
         session_id,
         "Reading the preview page's elements",
-        |runtime: &BrowserRuntime, session_id: &str| runtime.element_lines_blocking(session_id),
+        move |runtime: &BrowserRuntime, session_id: &str| {
+            runtime.element_lines_blocking(session_id, tool)
+        },
     )?;
     Ok((actionable_lines(lines), capped))
 }
@@ -769,6 +1063,7 @@ fn actionable_lines(lines: Vec<AxLine>) -> Vec<AxLine> {
 fn selector_for_blocking(
     state: &AppState,
     session_id: &str,
+    tool: PreviewTool,
     backend_node_id: i64,
 ) -> Result<Option<String>, String> {
     page_read(
@@ -776,7 +1071,7 @@ fn selector_for_blocking(
         session_id,
         "Resolving the element's selector",
         move |runtime: &BrowserRuntime, session_id: &str| {
-            runtime.selector_for_blocking(session_id, backend_node_id)
+            runtime.selector_for_blocking(session_id, tool, backend_node_id)
         },
     )
 }
@@ -784,18 +1079,29 @@ fn selector_for_blocking(
 /// The selector for one hit, or `None` when the page cannot give one. A transport failure is not
 /// worth failing the whole listing over: the hit is reported without a selector like any other
 /// element the page will not address.
-fn selector_for(state: &AppState, session_id: &str, line: &AxLine) -> Option<String> {
-    selector_for_blocking(state, session_id, line.backend_node_id?)
+fn selector_for(
+    state: &AppState,
+    session_id: &str,
+    tool: PreviewTool,
+    line: &AxLine,
+) -> Option<String> {
+    selector_for_blocking(state, session_id, tool, line.backend_node_id?)
         .ok()
         .flatten()
 }
 
-fn console_lines(state: &AppState, session_id: &str) -> Result<Vec<String>, String> {
+fn console_lines(
+    state: &AppState,
+    session_id: &str,
+    level: Option<String>,
+) -> Result<Vec<String>, String> {
     page_read(
         state,
         session_id,
         "Reading the preview page's console",
-        |runtime: &BrowserRuntime, session_id: &str| runtime.console_log_lines_blocking(session_id),
+        move |runtime: &BrowserRuntime, session_id: &str| {
+            runtime.console_log_lines_blocking(session_id, level)
+        },
     )
 }
 
@@ -905,10 +1211,7 @@ mod tests {
             line(7, "link", "Save draft"),
             line(9, "button", "Cancel"),
         ];
-        let by_uid = elements
-            .iter()
-            .map(|element| (element.uid, element))
-            .collect::<HashMap<_, _>>();
+        let by_uid = uid_index(&elements);
         let answered = answer(
             "42",
             0.81,
@@ -925,30 +1228,261 @@ mod tests {
              0.13, [9] button: \"Cancel\" 0.04) \u{2192} selector form > button:nth-of-type(2)"
         );
 
-        // Nothing matched: the same ranking, worded as the failure it is for click and fill.
+    }
+
+    fn shown(elements: &[AxLine], page_elements: usize, capped: bool) -> Shown<'_> {
+        Shown::new(elements, page_elements, capped)
+    }
+
+    /// "None of the above" hands back the ranking and then every element line the decision model
+    /// was shown, exactly as it went into the question — a failure for click and fill, an answer
+    /// for inspect.
+    #[test]
+    fn a_miss_hands_back_the_elements_the_model_was_shown() {
+        let elements = vec![
+            line(42, "button", "Save"),
+            line(7, "link", "Save draft"),
+            AxLine {
+                indent: 2,
+                ..line(9, "button", "Cancel")
+            },
+        ];
+        let whole_page = shown(&elements, 3, false);
         let nothing = answer("none", 0.92, &[("none", 0.92), ("7", 0.05)]);
-        let message = no_match_message("the save button", &nothing, &by_uid);
+        let plain = &MissListing::Plain;
+        let listing = "The decision model was shown all 3 element lines of the page:\n  \
+                       [42] button: \"Save\"\n  [7] link: \"Save draft\"\n    [9] button: \"Cancel\"";
+
+        let error = missed(
+            DescribedAction::Click,
+            "the save button",
+            Some(&nothing),
+            &whole_page,
+            plain,
+        )
+        .expect_err("clicking nothing is a failure");
         assert_eq!(
-            message,
-            "No element on the page matched the description \"the save button\" (confidence 0.92; \
-             closest: [7] link: \"Save draft\" 0.05)"
+            error,
+            format!(
+                "No element on the page matched the description \"the save button\" (confidence \
+                 0.92; closest: [7] link: \"Save draft\" 0.05)\n{listing}"
+            )
         );
+        // What comes back is what the question carried.
+        assert!(error.ends_with(&whole_page.text()), "{error}");
+        assert!(missed(DescribedAction::Fill, "x", Some(&nothing), &whole_page, plain).is_err());
         assert_eq!(
             missed(
                 DescribedAction::Inspect,
                 "the save button",
-                &nothing,
-                &by_uid
+                Some(&nothing),
+                &whole_page,
+                plain
             )
             .expect("inspect answers rather than fails"),
-            "Element not found: the save button"
+            format!(
+                "Element not found: the save button (confidence 0.92; closest: [7] link: \"Save \
+                 draft\" 0.05)\n{listing}"
+            )
         );
-        assert!(missed(DescribedAction::Click, "x", &nothing, &by_uid).is_err());
-        // A page with nothing to choose among is the same miss, without an answer behind it.
+
+        // A long page was narrowed before the question: the header says so, and says when the
+        // read itself stopped short.
+        let narrowed = missed(
+            DescribedAction::Inspect,
+            "x",
+            Some(&answer("none", 0.6, &[("none", 0.6)])),
+            &shown(&elements[..1], 2_400, true),
+            plain,
+        )
+        .unwrap();
         assert_eq!(
-            no_match_message("a button", &no_answer(), &HashMap::new()),
-            "No element on the page matched the description \"a button\" (confidence 0.00)"
+            narrowed,
+            format!(
+                "Element not found: x (confidence 0.60)\nThe page has 2400 element lines; the \
+                 decision model was shown the 1 in the runs that scored best against the \
+                 description, in page order:\n(Only the first {PREVIEW_ELEMENT_LINES_CAP} element \
+                 lines of the page were read; the page has more.)\n  [42] button: \"Save\""
+            )
         );
+        assert!(shown(&elements[..1], 1, false)
+            .render()
+            .starts_with("The decision model was shown the page's only element line:\n"));
+
+        // A page with nothing to choose among is the same miss, with no question behind it.
+        assert_eq!(
+            missed(
+                DescribedAction::Click,
+                "a button",
+                None,
+                &shown(&[], 0, false),
+                plain
+            )
+            .unwrap_err(),
+            format!(
+                "No element on the page matched the description \"a button\"\n{NO_CHOICE_ELEMENTS}"
+            )
+        );
+    }
+
+    fn scored(uid: u64, score: f64) -> Hit {
+        Hit {
+            candidate: Candidate::new(element_label(uid), "x"),
+            score,
+            refined: false,
+        }
+    }
+
+    /// A scored miss lists the same lines highest first, each with its own score; a line a failed
+    /// request left unscored still comes back, last, and the failure is counted.
+    #[test]
+    fn a_scored_miss_ranks_every_line_it_was_shown() {
+        let elements = vec![
+            line(42, "button", "Save"),
+            line(7, "link", "Save draft"),
+            AxLine {
+                indent: 2,
+                ..line(9, "button", "Cancel")
+            },
+        ];
+        let whole_page = shown(&elements, 3, false);
+        let nothing = answer("none", 0.9, &[("none", 0.9)]);
+        let report = SearchReport {
+            hits: vec![scored(7, 0.41), scored(9, 0.052)],
+            coarse_count: 3,
+            requests: 3,
+            failed_requests: 1,
+            ..SearchReport::default()
+        };
+        assert_eq!(
+            missed(
+                DescribedAction::Inspect,
+                "the publish button",
+                Some(&nothing),
+                &whole_page,
+                &MissListing::Scored(report),
+            )
+            .unwrap(),
+            "Element not found: the publish button (confidence 0.90)\nThe decision model was \
+             shown all 3 element lines of the page. Each was then scored against the description \
+             on its own (3 requests), highest first:\n1 of those requests failed; the elements \
+             they left unscored are listed last.\n[7] link: \"Save draft\" (score 0.410)\n[9] button: \
+             \"Cancel\" (score 0.052)\n[42] button: \"Save\" (unscored)"
+        );
+
+        // A shortlist says so and keeps the note on a read that stopped short.
+        let one = SearchReport {
+            hits: vec![scored(42, 1.0)],
+            requests: 1,
+            ..SearchReport::default()
+        };
+        assert_eq!(
+            shown(&elements[..1], 900, true).render_scored(&one),
+            format!(
+                "The page has 900 element lines; the decision model was shown the 1 in the runs \
+                 that scored best against the description. Each was then scored against the \
+                 description on its own (1 request), highest first:\n(Only the first \
+                 {PREVIEW_ELEMENT_LINES_CAP} element lines of the page were read; the page has \
+                 more.)\n[42] button: \"Save\" (score 1.000)"
+            )
+        );
+
+        // Scoring that could not be done still answers the miss, with the lines unscored.
+        let failed = missed(
+            DescribedAction::Click,
+            "x",
+            Some(&nothing),
+            &whole_page,
+            &MissListing::ScoringFailed("TypeSafe is unreachable".to_owned()),
+        )
+        .unwrap_err();
+        assert!(
+            failed.contains(
+                "\nScoring the elements one by one failed, so they follow unscored: TypeSafe is \
+                 unreachable\nThe decision model was shown all 3 element lines of the page:\n"
+            ),
+            "{failed}"
+        );
+        assert!(failed.ends_with(&whole_page.text()), "{failed}");
+    }
+
+    /// Every line is scored as its own candidate with its neighbours as context — nothing is cut,
+    /// nothing refined — and only cancellation turns a scoring failure into a failed call.
+    #[test]
+    fn a_miss_scores_each_shown_line_on_its_own() {
+        /// Scores by how close the candidate's uid is to the one named in the query, and records
+        /// what it was asked.
+        struct NearestElement(std::sync::Mutex<Vec<Candidate>>);
+        impl Scorer for NearestElement {
+            fn score(&self, query: &str, candidate: &Candidate) -> Result<f64, DecisionError> {
+                self.0.lock().unwrap().push(candidate.clone());
+                let wanted: f64 = query.parse().unwrap_or(0.0);
+                let uid = uid_from_element_label(&candidate.label).unwrap_or(0) as f64;
+                Ok(1.0 / (1.0 + (uid - wanted).abs()))
+            }
+        }
+
+        let page = lines(5);
+        let shown = shown(&page, 5, false);
+        let scorer = Arc::new(NearestElement(Default::default()));
+        let listing = score_shown(
+            Ok(scorer.clone() as Arc<dyn Scorer>),
+            &shown,
+            "4",
+            &CancelSignal::default(),
+        )
+        .expect("scored");
+        let MissListing::Scored(report) = listing else {
+            panic!("expected a scored listing");
+        };
+        assert_eq!(report.requests, 5);
+        let order = report
+            .hits
+            .iter()
+            .map(|hit| uid_from_element_label(&hit.candidate.label).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![4, 3, 5, 2, 1], "every line, highest first");
+        let mut asked = scorer.0.lock().unwrap().clone();
+        asked.sort_by_key(|candidate| uid_from_element_label(&candidate.label));
+        assert_eq!(asked.len(), 5, "one request per line, no refinement pass");
+        assert_eq!(asked[0].text, "  [1] button: \"Button 1\"");
+        assert_eq!(
+            asked[2].context.as_deref(),
+            Some(
+                "  [1] button: \"Button 1\"\n  [2] button: \"Button 2\"\n  [4] button: \
+                 \"Button 4\"\n  [5] button: \"Button 5\""
+            )
+        );
+
+        // A scorer that cannot be built, or a pass that fails outright, is reported in the listing.
+        assert!(matches!(
+            score_shown(Err("no key".to_owned()), &shown, "4", &CancelSignal::default()),
+            Ok(MissListing::ScoringFailed(error)) if error == "no key"
+        ));
+        struct Broken(DecisionError);
+        impl Scorer for Broken {
+            fn score(&self, _: &str, _: &Candidate) -> Result<f64, DecisionError> {
+                Err(self.0.clone())
+            }
+        }
+        let broken = |error| Ok(Arc::new(Broken(error)) as Arc<dyn Scorer>);
+        assert!(matches!(
+            score_shown(
+                broken(DecisionError::Transient("down".into())),
+                &shown,
+                "4",
+                &CancelSignal::default()
+            ),
+            Ok(MissListing::ScoringFailed(_))
+        ));
+        // A stopped turn is not a miss to answer.
+        assert!(score_shown(
+            broken(DecisionError::Cancelled),
+            &shown,
+            "4",
+            &CancelSignal::default()
+        )
+        .is_err());
     }
 
     /// A page with more elements than one choice question holds is shortlisted by run score, and
@@ -1230,12 +1764,29 @@ mod tests {
         assert!(parse_threshold(&input(&[("query", json!("q"))]))
             .unwrap_err()
             .contains("threshold"));
-        assert!(parse_query(&input(&[("description", json!("  "))]), "description").is_err());
+        assert!(parse_query(&input(&[("query", json!("  "))]), "query").is_err());
     }
 
-    /// Only the base tool's own parameters travel with the selector.
+    /// The console form filters by level exactly as the plain listing does, and `lines` is the
+    /// same ceiling.
     #[test]
-    fn each_variant_carries_its_own_base_parameters() {
+    fn console_arguments_follow_the_plain_listing() {
+        assert_eq!(parse_console_level(&input(&[])).unwrap(), None);
+        assert_eq!(parse_console_level(&input(&[("level", json!("all"))])).unwrap(), None);
+        assert_eq!(
+            parse_console_level(&input(&[("level", json!("warn"))])).unwrap(),
+            Some("warn".to_owned())
+        );
+        assert!(parse_console_level(&input(&[("level", json!("info"))])).is_err());
+        assert_eq!(parse_console_lines(&input(&[])).unwrap(), None);
+        assert_eq!(parse_console_lines(&input(&[("lines", json!(0))])).unwrap(), Some(1));
+        assert_eq!(parse_console_lines(&input(&[("lines", json!(5000))])).unwrap(), Some(200));
+        assert!(parse_console_lines(&input(&[("lines", json!("ten"))])).is_err());
+    }
+
+    /// Only the base tool's own parameters travel with the selector, under the base tool's name.
+    #[test]
+    fn each_form_carries_its_own_base_parameters() {
         assert_eq!(DescribedAction::Click.tool(), PreviewTool::Click);
         assert_eq!(DescribedAction::Fill.tool(), PreviewTool::Fill);
         assert_eq!(DescribedAction::Inspect.tool(), PreviewTool::Inspect);
@@ -1244,5 +1795,6 @@ mod tests {
         assert_eq!(DescribedAction::Inspect.pass_through(), ["styles"]);
         assert!(DescribedAction::Click.misses_are_errors());
         assert!(!DescribedAction::Inspect.misses_are_errors());
+        assert_eq!(DescribedAction::Fill.name(), "preview_fill");
     }
 }

@@ -3,11 +3,15 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  dataRootsFor,
   INTERACTIVE_DEV_IDENTIFIER,
+  isMeworkExecutable,
   KEYRING_SERVICES,
+  MACOS_VAULT_KEY_SERVICE,
   parseResetArguments,
   planCredentialTargets,
   planDataDirectories,
+  planKeychainItems,
   resolveDataDirectory,
   selectIdentifiers,
   summarizeCredentials
@@ -202,4 +206,94 @@ test("summarizes credentials per service in a stable order", () => {
     { service: "com.mework.web-search", count: 1 },
     { service: "com.naiword.agent-studio.api", count: 1 }
   ]);
+});
+
+// `security dump-keychain` without `-d`: attributes only. Accounts that are not
+// plain ASCII are printed as hex, and a quote inside a value is not escaped.
+const DUMP_KEYCHAIN_OUTPUT = [
+  'keychain: "/Users/tester/Library/Keychains/login.keychain-db"',
+  "version: 512",
+  'class: "genp"',
+  "attributes:",
+  '    0x00000007 <blob>="com.mework.api"',
+  '    "acct"<blob>="binding:v6:6e8e5f34"',
+  '    "cdat"<timedate>=0x32303236303932343033353734305A00  "20260924035740Z\\000"',
+  '    "svce"<blob>="com.mework.api"',
+  'keychain: "/Users/tester/Library/Keychains/login.keychain-db"',
+  'class: "genp"',
+  "attributes:",
+  '    "acct"<blob>="Mework"',
+  '    "svce"<blob>="Mework Safe Storage"',
+  'keychain: "/Users/tester/Library/Keychains/login.keychain-db"',
+  'class: "genp"',
+  "attributes:",
+  '    "acct"<blob>=0xE4B8ADE69687 ',
+  '    "svce"<blob>="com.mework.app.project-import-trust.v1"',
+  'keychain: "/Users/tester/Library/Keychains/login.keychain-db"',
+  'class: "genp"',
+  "attributes:",
+  '    "acct"<blob>="a b"c"',
+  '    "svce"<blob>="com.mework.api.vendor"',
+  'keychain: "/Users/tester/Library/Keychains/login.keychain-db"',
+  'class: "inet"',
+  "attributes:",
+  '    "acct"<blob>="someone"',
+  '    "svce"<blob>="com.mework.api"',
+  'keychain: "/Users/tester/Library/Keychains/login.keychain-db"',
+  'class: "genp"',
+  "attributes:",
+  '    "acct"<blob>="binding:v6:6e8e5f34"',
+  '    "svce"<blob>="com.mework.api"'
+].join("\n");
+
+test("plans only the generic passwords whose service Mework writes on macOS", () => {
+  assert.deepEqual(planKeychainItems(DUMP_KEYCHAIN_OUTPUT), [
+    { service: "com.mework.api", account: "binding:v6:6e8e5f34" },
+    { service: MACOS_VAULT_KEY_SERVICE, account: "Mework" },
+    { service: "com.mework.app.project-import-trust.v1", account: "中文" }
+  ]);
+});
+
+test("plans every declared keychain service and nothing without an account", () => {
+  const output = [...KEYRING_SERVICES, MACOS_VAULT_KEY_SERVICE]
+    .map((service, index) => [
+      'keychain: "/k"',
+      'class: "genp"',
+      `    "acct"<blob>="entry${index}"`,
+      `    "svce"<blob>="${service}"`
+    ].join("\n"))
+    .concat(['keychain: "/k"', 'class: "genp"', '    "svce"<blob>="com.mework.api"'])
+    .join("\n");
+  assert.deepEqual(
+    planKeychainItems(output).map((item) => item.service),
+    [...KEYRING_SERVICES, MACOS_VAULT_KEY_SERVICE]
+  );
+});
+
+test("names the data roots Tauri uses on each host", () => {
+  assert.deepEqual(
+    dataRootsFor("win32", { APPDATA: "A", LOCALAPPDATA: "L" }, "C:/Users/tester").map((root) => root.directory),
+    ["A", "L"]
+  );
+  assert.deepEqual(
+    dataRootsFor("darwin", {}, "/Users/tester").map((root) => root.directory),
+    [
+      path.join("/Users/tester", "Library", "Application Support"),
+      path.join("/Users/tester", "Library", "Caches"),
+      path.join("/Users/tester", "Library", "Logs")
+    ]
+  );
+  assert.equal(
+    dataRootsFor("linux", { XDG_DATA_HOME: "/data" }, "/home/tester")[0].directory,
+    "/data"
+  );
+  assert.deepEqual(dataRootsFor("darwin", {}, undefined), []);
+});
+
+test("recognizes a running Mework only by its executable name", () => {
+  assert.ok(isMeworkExecutable("/Applications/Mework.app/Contents/MacOS/mework"));
+  assert.ok(isMeworkExecutable("/repo/src-tauri/target/debug/mework-browser-dev"));
+  assert.ok(isMeworkExecutable("mework.exe"));
+  assert.ok(!isMeworkExecutable("/usr/local/bin/meworkd"));
+  assert.ok(!isMeworkExecutable("/Applications/Mework.app/Contents/Frameworks/Mework Helper.app/Contents/MacOS/Mework Helper"));
 });

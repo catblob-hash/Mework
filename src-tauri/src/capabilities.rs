@@ -109,9 +109,16 @@ impl ConfigLevel {
     }
 
     /// A workspace's level; `None` for the temporary workspace, which has no
-    /// directory of its own.
+    /// directory of its own, and for a workspace on another machine.
+    ///
+    /// Every level is read from this host's filesystem, and a remote
+    /// workspace's path names a directory over there: `/Users/me/Documents/x`
+    /// on an SSH machine is not the local folder of that spelling. Reading it
+    /// here would list (and let a run launch) whatever that local folder
+    /// happens to hold, and on macOS would raise a privacy prompt for a folder
+    /// the user never chose on this machine.
     pub fn workspace(workspace: &Workspace) -> Option<Self> {
-        if workspace.path.trim().is_empty() {
+        if workspace.machine.is_some() || workspace.path.trim().is_empty() {
             return None;
         }
         Some(Self {
@@ -164,8 +171,10 @@ pub(crate) fn relative_config_paths(kind: CapabilityKind) -> [String; 2] {
     ]
 }
 
-/// The global level plus every workspace of the document — what the catalog
-/// shows, so a preset can select from any of them.
+/// The global level plus every workspace of the document on this machine —
+/// what the catalog shows, so a preset can select from any of them. A
+/// workspace on another machine contributes no level (see
+/// [`ConfigLevel::workspace`]).
 pub fn all_levels(document: &AppDocument) -> Vec<ConfigLevel> {
     ConfigLevel::user()
         .into_iter()
@@ -867,12 +876,21 @@ pub(crate) fn capability_location_to_reveal(
     workspace_id: Option<&str>,
 ) -> Result<PathBuf, String> {
     let level = match workspace_id {
-        Some(workspace_id) => document
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .and_then(ConfigLevel::workspace)
-            .ok_or_else(|| "这个工作区没有可打开的目录".to_owned())?,
+        Some(workspace_id) => {
+            let workspace = document
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id);
+            // Said apart from "no directory": creating the `.mework` directory
+            // below at a remote path's spelling would litter this machine with
+            // a folder nothing ever reads.
+            if workspace.is_some_and(|workspace| workspace.machine.is_some()) {
+                return Err("这个工作区位于另一台机器上，无法在本机打开它的配置目录".to_owned());
+            }
+            workspace
+                .and_then(ConfigLevel::workspace)
+                .ok_or_else(|| "这个工作区没有可打开的目录".to_owned())?
+        }
         None => ConfigLevel::user().ok_or_else(|| "无法确定用户主目录".to_owned())?,
     };
     let existing = level.path_for(kind);
@@ -2313,6 +2331,75 @@ mod tests {
         assert!(levels
             .iter()
             .any(|level| level.workspace_id.as_deref() == Some("ws_project")));
+    }
+
+    /// A workspace on an SSH machine records a path on that machine. Even when
+    /// the same spelling is a local directory full of capabilities, the host
+    /// must not read it: not for the catalog, not for a run of the workspace's
+    /// conversations, and not for the reveal command, which would otherwise
+    /// create a local `.mework` there.
+    #[test]
+    fn a_remote_workspace_is_never_read_as_a_local_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".mework");
+        fs::create_dir_all(config.join("skills").join("local-only")).unwrap();
+        fs::write(
+            config
+                .join("skills")
+                .join("local-only")
+                .join(SKILL_MANIFEST),
+            "---\nname: Local Only\ndescription: Lives on this machine\n---\n\nBODY\n",
+        )
+        .unwrap();
+        fs::write(
+            config.join("mcp.json"),
+            r#"{"mcpServers":{"local":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            config.join("hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"npm test"}]}]}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(config.join("tool-descriptions")).unwrap();
+        fs::write(config.join("tool-descriptions").join("local.json"), "{}").unwrap();
+        let app_data = directory.path().join("app-data");
+        let mut document = crate::catalog::default_document();
+        document.workspaces[0].id = "ws_remote".into();
+        document.workspaces[0].path = directory.path().to_string_lossy().into_owned();
+        document.workspaces[0].machine = Some(crate::model::RunTarget::Ssh {
+            machine_id: "m1".into(),
+        });
+        let rows_of = |catalog: &CapabilityCatalog| {
+            catalog
+                .skills
+                .iter()
+                .chain(&catalog.mcps)
+                .chain(&catalog.hooks)
+                .chain(&catalog.lsps)
+                .chain(&catalog.tool_description_files)
+                .filter(|row| row.workspace_id.as_deref() == Some("ws_remote"))
+                .count()
+        };
+
+        assert!(ConfigLevel::workspace(&document.workspaces[0]).is_none());
+        assert!(all_levels(&document)
+            .iter()
+            .all(|level| level.workspace_id.is_none()));
+        assert_eq!(rows_of(&discover(&document, &app_data)), 0);
+        let conversation = &document.workspaces[0].conversations[0];
+        assert!(levels_for_conversation(&document, conversation)
+            .iter()
+            .all(|level| level.workspace_id.is_none()));
+        let error =
+            capability_location_to_reveal(&document, CapabilityKind::Skills, Some("ws_remote"))
+                .expect_err("a remote workspace has no local configuration directory");
+        assert!(error.contains("另一台机器"), "{error}");
+
+        // The fixture itself is readable: the same directory as a workspace on
+        // this machine yields every one of those rows.
+        document.workspaces[0].machine = None;
+        assert_eq!(rows_of(&discover(&document, &app_data)), 4);
     }
 
     /// Deleting through the catalog reaches the folder or the file entry the

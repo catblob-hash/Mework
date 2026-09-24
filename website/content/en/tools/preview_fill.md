@@ -12,6 +12,10 @@ One page-side script does the work. It focuses the element, then: for `select`, 
 
 The empty string is a legal value — that is how a field is cleared. `selector` is capped at 2,048 characters and may not be blank, `value` at 32,768 characters. The call gets 30 seconds, is refused while the page holds a dialog or file chooser, and answers with one line naming the selector rather than the state of the page.
 
+## Decision-model parameters
+
+Turn on its decision-model option in the conversation's preview tool window and `selector` can give way to `query`, a plain-language description of the input to fill: the host lists the page's elements (the same `[uid] role: "name"` lines as [preview_snapshot](preview_snapshot.html)), always adds a "none of the above" option after them, and has the TypeSafe Jev decision model choose. It is a choice, not a score, so there is no `threshold`. When the model names an element it is filled, and the result says which element, with the model's confidence and the runners-up; when it answers none of the above, nothing is filled, and the result reports the closest elements and then lists every element line the model was shown, so the next step needs no fresh snapshot. Turn on **Score each element on a miss** under the same option and, on a none-of-the-above, those lines are first scored against the description one by one — one request per line — and come back highest first with their scores. Under **Add decision-model parameters** a call gives `selector` or `query`, and one that gives both is refused; under **Decision model only** `selector` is no longer accepted and every call carries `query`. The element lines are sent to TypeSafe's API, which needs its key under Global settings → Decision model providers.
+
 ## Related
 
 - [preview_click](preview_click.html) — press the button after filling the form

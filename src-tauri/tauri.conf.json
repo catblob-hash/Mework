@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build && npm run build:sidecar && npm run build:remote-agents",
+    "beforeBuildCommand": "npm run build && npm run build:sidecar && npm run build:remote-agents -- --release",
     "frontendDist": "../dist"
   },
   "app": {

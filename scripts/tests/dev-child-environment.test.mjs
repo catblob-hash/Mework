@@ -117,14 +117,16 @@ test("both development launchers sanitize before they spawn anything", () => {
     );
     // The build environment is only ever consumed through the helper, so a
     // future edit cannot reintroduce a raw `windowsNativeBuildEnvironment()`
-    // spread into a child environment.
+    // spread into a child environment. Environment-shaping wrappers
+    // (`withCefBuildEnvironment`, `withMacosDevSigning`) may sit in between:
+    // what they return still goes through the helper.
     assert.match(
       source,
-      /devChildEnvironment\(\{\s*buildEnvironment: windowsNativeBuildEnvironment\(\)\s*\}\)/,
+      /devChildEnvironment\(\{\s*buildEnvironment: (?:\w+\()*windowsNativeBuildEnvironment\(\)\)*\s*\}\)/,
       relativePath
     );
     assert.equal(
-      /(?<!buildEnvironment: )windowsNativeBuildEnvironment\(\)/.test(
+      /(?<!buildEnvironment: (?:\w+\()*)windowsNativeBuildEnvironment\(\)/.test(
         source.replace(/^import .*$/gm, "")
       ),
       false,
@@ -239,7 +241,8 @@ test("the Rust entry points consume the handoff before anything is spawned", () 
   );
   const lib = readFileSync(path.join(root, "src-tauri", "src", "lib.rs"), "utf8");
   for (const entry of ["pub fn run\\(\\)", "pub fn run_browser_dev\\(\\) -> i32"]) {
-    const body = new RegExp(`${entry} \\{[\\s\\S]{0,400}?restore_dev_application_path\\(\\);`);
+    // Only commented, thread-free set-up may come first (the host-platform probe).
+    const body = new RegExp(`${entry} \\{[\\s\\S]{0,800}?restore_dev_application_path\\(\\);`);
     assert.match(lib, body, entry);
   }
 });

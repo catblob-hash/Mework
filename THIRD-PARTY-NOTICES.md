@@ -15,6 +15,57 @@ artifacts next to this file.
 
 ---
 
+## Chromium Embedded Framework and Chromium — BSD-3-Clause and others (macOS bundles)
+
+**Redistributed in:** `Mework.app/Contents/Frameworks/Chromium Embedded Framework.framework`
+
+On macOS the built-in browser's pages run in the
+[Chromium Embedded Framework](https://github.com/chromiumembedded/cef) (CEF), the
+binary distribution published at <https://cef-builds.spotifycdn.com>, copied into the
+bundle unmodified by [`scripts/stage-macos-cef.mjs`](scripts/stage-macos-cef.mjs).
+CEF is BSD-3-Clause (Copyright (c) 2012 Marshall A. Greenblatt, as its headers state);
+the notice ships in the bundle as `Contents/Resources/CEF-LICENSE.txt`. The Chromium it
+contains carries the licenses of Chromium and its third-party components, all listed in
+the distribution's `CREDITS.html`, which ships next to this file in the bundle as
+`Contents/Resources/CHROMIUM-CREDITS.html`.
+
+---
+
+## `tauri-apps/tauri` (`tauri-runtime-cef`) — Apache-2.0 OR MIT
+
+**Adapted file:**
+[`src-tauri/src/cef_host/pump.rs`](src-tauri/src/cef_host/pump.rs)
+
+The CEF external message pump is adapted from
+`crates/tauri-runtime-cef/src/external_message_pump/{mod,macos}.rs` in
+[tauri](https://github.com/tauri-apps/tauri), as published in `tauri-runtime-cef`
+3.0.0-alpha.2 — itself a port of cefclient's `main_message_loop_external_pump`.
+Copyright 2019-2024 Tauri Programme within The Commons Conservancy; used here under
+the MIT option. The scheduling and reentrancy logic is unchanged; the module was
+folded into one file and given a stop switch for shutdown.
+
+---
+
+## `anthropic-experimental/sandbox-runtime` — Apache-2.0
+
+**Adapted file:**
+[`src-tauri/remote-agent/src/agent/sandbox/seatbelt.rs`](src-tauri/remote-agent/src/agent/sandbox/seatbelt.rs)
+
+The macOS Seatbelt profile the agent's sandbox generates follows the one
+[sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) generates
+for Claude Code (v0.0.77, commit `ddbeb74`), itself based on Chromium's sandbox policy:
+its lists of allowed Mach services, sysctls, IOKit classes and device ioctls are taken
+from it, as are the path-to-rule conventions (subpaths for directories, anchored
+regular expressions for names protected at any depth, write denials on the ancestors of
+protected paths). Copyright Anthropic, PBC, licensed under the Apache License 2.0. The
+profile was rewritten rather than copied: the keychain services are left out, `/dev` is
+closed but for a short list, pseudo terminals are not allowed, and the protected names,
+the bare-repository rule and the hard-link denials are Mework's. The Linux side
+(bubblewrap arguments, the seccomp filter) follows the same project's approach without
+taking its code.
+
+---
+
 ## `obra/superpowers` — MIT
 
 **Vendored files:**

@@ -18,7 +18,7 @@ import { runEnvKey } from "../lib/workspaces";
 import type { MachineUsage } from "../lib/workspaces";
 import type { AttachedWorkspace, RunTarget, SshMachineConfig, WslDistro } from "../types";
 import { Dialog, IconButton } from "./Common";
-import { MachineSettingsDialog, SshMachineDialog } from "./MachineDialogs";
+import { MachineSettingsDialog, SshMachineDialog, type MachineShellsControl } from "./MachineDialogs";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuItem, PopoverPanelRect } from "./PopoverMenu";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
@@ -46,6 +46,8 @@ export interface ProjectDialogProps {
   onDeleteSshMachine: (machineId: string) => void;
   /** What has a workspace on a machine (`null` is this one), stated in its settings. */
   machineUsage: (machine: RunTarget | null) => MachineUsage;
+  /** Every machine's shells, shown and probed from its settings. */
+  machineShells: MachineShellsControl;
   /** `workspaces[0]` is the primary; the name is trimmed and may be empty. */
   onSubmit: (name: string, workspaces: AttachedWorkspace[]) => void;
   onClose: () => void;
@@ -111,6 +113,7 @@ export function ProjectDialog({
   onSaveSshMachine,
   onDeleteSshMachine,
   machineUsage,
+  machineShells,
   onSubmit,
   onClose
 }: ProjectDialogProps) {
@@ -495,6 +498,7 @@ export function ProjectDialog({
           machine={machineSettings.machine}
           sshMachines={machines}
           usage={machineUsage(machineSettings.machine)}
+          shells={machineShells}
           onSaveSshMachine={(machine) => {
             onSaveSshMachine(machine);
             setCreatedMachines((current) => current.map((entry) => (entry.id === machine.id ? machine : entry)));

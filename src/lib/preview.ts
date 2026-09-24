@@ -1,5 +1,23 @@
 import { hasBackendRuntime, invoke } from "./backend";
-import type { GitTarget } from "./git";
+
+/**
+ * Mirror of Rust `preview::PreviewTarget`: one workspace of a conversation, by the number the
+ * model addresses it with — workspace 1, the project's further workspaces, then the ones the
+ * conversation attached. The terminal addresses a shell the same way, so a preview page and a
+ * terminal opened for "workspace 2" are in the same directory, on the same machine.
+ */
+export interface PreviewTarget {
+  /** The conversation; for the draft, the id it will materialize as. */
+  conversationId: string;
+  /** Only for the draft: the project it is aimed at, which the host has no conversation for yet. */
+  draftWorkspaceId?: string | null;
+  /** 1-based. Absent is workspace 1. */
+  workspace?: number;
+}
+
+export function previewTargetKey(target: PreviewTarget): string {
+  return `${target.conversationId}\n${target.draftWorkspaceId ?? ""}\n${target.workspace ?? 1}`;
+}
 
 /** Mirror of Rust `preview_servers::PreviewServerStatus`. */
 export type PreviewServerStatus = "starting" | "running" | "stopped" | "failed";
@@ -46,6 +64,21 @@ export interface PreviewServerSnapshot {
   /** The worktree the server is registered under, not the process's own directory. */
   cwd: string;
   sessionId?: string | null;
+  /**
+   * The machine the server runs on, by name, when that is not this computer. Its port is that
+   * machine's; `url` is where this computer reaches it.
+   */
+  machine?: string | null;
+  /**
+   * Where the preview reaches the server from this computer, when that is not
+   * `http://localhost:<port>`: a server on another machine is forwarded to a local port.
+   */
+  url?: string | null;
+  /**
+   * Which of the conversation's workspaces the server belongs to. Only a conversation-wide list
+   * says so; a list for one workspace is all that workspace's.
+   */
+  workspace?: number | null;
 }
 
 /** Mirror of Rust `preview::PreviewAttachment` — a `url` entry with no command to run. */
@@ -55,6 +88,10 @@ export interface PreviewAttachment {
   name: string;
   /** `0` whenever the entry states no port, which a non-localhost url never does. */
   port: number;
+  /**
+   * Where the preview opens it. For a workspace on another machine a localhost url is that
+   * machine's, so this is the local address it was forwarded to.
+   */
   url: string;
 }
 
@@ -100,16 +137,22 @@ function requireDesktopRuntime(): void {
   if (!hasBackendRuntime()) throw new Error("开发服务器仅可在桌面应用中使用");
 }
 
-/** Everything `.mework/launch.json` says, including what is wrong with it. Never throws host-side. */
+/**
+ * Everything `.mework/launch.json` says, including what is wrong with it. A workspace on another
+ * machine is read there. Never throws for the file's own problems; an unreachable machine does.
+ */
 export async function listPreviewConfigurations(
-  target: GitTarget
+  target: PreviewTarget
 ): Promise<PreviewConfigurationList> {
   requireDesktopRuntime();
   return invoke<PreviewConfigurationList>("preview_list_configurations", { target });
 }
 
-/** The dev servers running for this workspace, whichever conversation started them. */
-export async function listPreviewServers(target: GitTarget): Promise<PreviewServerSnapshot[]> {
+/**
+ * The dev servers running for this workspace, whichever conversation started them. With no
+ * `workspace` in the target, every workspace of the conversation's, each carrying its number.
+ */
+export async function listPreviewServers(target: PreviewTarget): Promise<PreviewServerSnapshot[]> {
   requireDesktopRuntime();
   return invoke<PreviewServerSnapshot[]>("preview_list_servers", { target });
 }
@@ -118,14 +161,21 @@ export async function listPreviewServers(target: GitTarget): Promise<PreviewServ
  * Starts the configured server `name` addresses, or hands back the one already answering it.
  *
  * Blocks until the host has a running process or has given up, so a failure arrives as a rejected
- * promise carrying the spawn diagnosis — which is the text the failure card shows.
+ * promise carrying the spawn diagnosis — which is the text the failure card shows. A workspace on
+ * another machine starts the server there, and the outcome's address is the local port it was
+ * forwarded to.
+ *
+ * The server belongs to `target.conversationId` — for the draft, the conversation it will become.
  */
 export async function startPreviewServer(
-  target: GitTarget,
+  target: PreviewTarget,
   name?: string
 ): Promise<PreviewStartOutcome> {
   requireDesktopRuntime();
-  return invoke<PreviewStartOutcome>("preview_start_server", { target, name: name ?? null });
+  return invoke<PreviewStartOutcome>("preview_start_server", {
+    target,
+    name: name ?? null
+  });
 }
 
 /** Stops one dev server and forgets it, buffered output included. False means it was already gone. */
@@ -155,7 +205,7 @@ export async function readPreviewServerLogs(
  * to keep the preference — so callers re-read the configuration rather than trusting the request.
  */
 export async function setPreviewAutoVerify(
-  target: GitTarget,
+  target: PreviewTarget,
   enabled: boolean
 ): Promise<boolean> {
   requireDesktopRuntime();

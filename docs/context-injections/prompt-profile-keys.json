@@ -280,6 +280,26 @@
       "placeholders": []
     },
     {
+      "description": "Root description of the `zsh` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `zsh` overrides this key.",
+      "id": "tool.zsh.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `sh` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `sh` overrides this key.",
+      "id": "tool.sh.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `zsh_find_output` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `zsh_find_output` overrides this key.",
+      "id": "tool.zsh_find_output.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `sh_find_output` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `sh_find_output` overrides this key.",
+      "id": "tool.sh_find_output.description",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `web_search` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `web_search` overrides this key.",
       "id": "tool.web_search.description",
       "placeholders": []
@@ -365,28 +385,8 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `preview_find_element` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `preview_find_element` overrides this key.",
-      "id": "tool.preview_find_element.description",
-      "placeholders": []
-    },
-    {
       "description": "Root description of the `preview_find_logs` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `preview_find_logs` overrides this key.",
       "id": "tool.preview_find_logs.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `preview_click_by_description` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `preview_click_by_description` overrides this key.",
-      "id": "tool.preview_click_by_description.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `preview_fill_by_description` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `preview_fill_by_description` overrides this key.",
-      "id": "tool.preview_fill_by_description.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `preview_inspect_by_description` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `preview_inspect_by_description` overrides this key.",
-      "id": "tool.preview_inspect_by_description.description",
       "placeholders": []
     },
     {

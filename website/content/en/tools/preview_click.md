@@ -12,6 +12,10 @@ The element is found with `document.querySelector`, scrolled to the centre of th
 
 The call gets 30 seconds. A dialog or file chooser the page is already holding refuses the click and names the tool that clears it; one the click itself opens blocks the page mid-action, and the result becomes `{"interrupted": "modal-state"}`. Success is one line naming the selector, not a description of the page afterwards.
 
+## Decision-model parameters
+
+Turn on its decision-model option in the conversation's preview tool window and `selector` can give way to `query`, a plain-language description of the element to click: the host lists the page's elements (the same `[uid] role: "name"` lines as [preview_snapshot](preview_snapshot.html)), always adds a "none of the above" option after them, and has the TypeSafe Jev decision model choose. It is a choice, not a score, so there is no `threshold`. When the model names an element it is clicked, and the result says which element, with the model's confidence and the runners-up; when it answers none of the above, nothing is clicked, and the result reports the closest elements and then lists every element line the model was shown, so the next step needs no fresh snapshot. Turn on **Score each element on a miss** under the same option and, on a none-of-the-above, those lines are first scored against the description one by one — one request per line — and come back highest first with their scores. Under **Add decision-model parameters** a call gives `selector` or `query`, and one that gives both is refused; under **Decision model only** `selector` is no longer accepted and every call carries `query`. The element lines are sent to TypeSafe's API, which needs its key under Global settings → Decision model providers.
+
 ## Related
 
 - [preview_fill](preview_fill.html) — type into an input instead of clicking it

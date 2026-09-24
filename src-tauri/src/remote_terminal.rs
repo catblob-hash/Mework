@@ -540,6 +540,7 @@ mod tests {
     fn without_the_agent_the_fallback_runs_and_gets_early_input() {
         let spec = AgentTerminalSpec {
             runner: ShellRunner::Ssh {
+                agent_shell: Default::default(),
                 host: "fallback.invalid".into(),
                 port: 0,
                 identity_file: String::new(),

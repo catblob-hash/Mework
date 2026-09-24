@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{Read, Seek},
     path::{Path, PathBuf},
@@ -239,7 +240,16 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
     profile: &PromptProfile,
 ) -> VerifiedToolExecutionResponse {
     execute_with_scope_and_attachments_guarded(
-        request, state, scope, app_data, cancel, workspaces, handoff, profile, None,
+        request,
+        state,
+        scope,
+        app_data,
+        cancel,
+        workspaces,
+        handoff,
+        profile,
+        None,
+        &BTreeSet::new(),
     )
 }
 
@@ -247,6 +257,11 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
 /// guards this turn runs under. Only the run loop has a guard to pass; every
 /// other caller keeps the unguarded contract, where `read` records nothing and
 /// `write`/`edit` check nothing.
+///
+/// `decision_miss_scoring` is the run's `RunModelRequest::decision_miss_scoring`:
+/// the element tools whose "none of the above" goes on to score every element
+/// line. Every other caller passes an empty set, so a miss outside a model turn
+/// costs no more requests than the choice itself.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_with_scope_and_attachments_guarded(
     request: ToolExecutionRequest,
@@ -258,6 +273,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    decision_miss_scoring: &BTreeSet<String>,
 ) -> VerifiedToolExecutionResponse {
     let started = Instant::now();
     let attachment_store = app_data.map(ImageAttachmentStore::new);
@@ -272,6 +288,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
         handoff,
         profile,
         file_guard,
+        decision_miss_scoring,
     )
     .unwrap_or_else(|error| Outcome {
         success: false,
@@ -398,6 +415,7 @@ fn run_tool(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    decision_miss_scoring: &BTreeSet<String>,
 ) -> Result<Outcome, String> {
     // A caller that resolved no set is a caller with one workspace: its own
     // request path. Direct IPC, replayed timeline entries and tests all arrive
@@ -492,58 +510,27 @@ fn run_tool(
     match request.tool_name.as_str() {
         "ls" => run_ls(workspace, &request.input, scope, profile).map(Outcome::success),
         "grep" => run_grep(workspace, &request.input, scope, profile).map(Outcome::success),
-        "powershell" => run_shell(
-            selected,
-            anchor,
-            &request.input,
-            ShellKind::PowerShell,
-            &request.conversation_id,
-            state,
-            cancel,
-            app_data,
-            handoff,
-            profile,
-            file_guard,
-        ),
-        "bash" => run_shell(
-            selected,
-            anchor,
-            &request.input,
-            ShellKind::Bash,
-            &request.conversation_id,
-            state,
-            cancel,
-            app_data,
-            handoff,
-            profile,
-            file_guard,
-        ),
-        "bash_find_output" => run_shell_scored(
-            selected,
-            anchor,
-            &request.input,
-            ShellKind::Bash,
-            &request.conversation_id,
-            state,
-            cancel,
-            app_data,
-            handoff,
-            profile,
-            file_guard,
-        ),
-        "powershell_find_output" => run_shell_scored(
-            selected,
-            anchor,
-            &request.input,
-            ShellKind::PowerShell,
-            &request.conversation_id,
-            state,
-            cancel,
-            app_data,
-            handoff,
-            profile,
-            file_guard,
-        ),
+        name if ShellKind::of_tool(name).is_some() => {
+            let kind = ShellKind::of_tool(name).expect("guarded by the arm");
+            let run = if name == kind.tool_name() {
+                run_shell
+            } else {
+                run_shell_scored
+            };
+            run(
+                selected,
+                anchor,
+                &request.input,
+                kind,
+                &request.conversation_id,
+                state,
+                cancel,
+                app_data,
+                handoff,
+                profile,
+                file_guard,
+            )
+        }
         "write" => run_write(workspace, &request.input, scope, profile, file_guard),
         "edit" => run_edit(workspace, &request.input, scope, profile, file_guard),
         "find" => run_find(workspace, &request.input, scope, profile).map(Outcome::success),
@@ -574,27 +561,35 @@ fn run_tool(
         "find_output" => {
             crate::decision_tools::output::find_output(request, state, cancel).map(Outcome::success)
         }
-        // Twenty preview tools. Five run entirely host-side against the dev-server registry;
-        // the decision-model ones run host-side too, so their network calls never hold the
-        // page's automation lock or its 30 s clock — they touch the page only to read its
-        // elements and to hand the chosen action to the ordinary page tool; the rest resolve
-        // a target and act on the conversation's page.
+        // Sixteen preview tools. Four run entirely host-side against the dev-server registry, and
+        // so does `preview_find_logs`. A call that carries `query` to one of the
+        // decision-parameter tools runs host-side too, so the decision model's network calls
+        // never hold the page's automation lock or its 30 s clock — it touches the page only to
+        // read its elements or console and to hand the chosen action back to the ordinary page
+        // tool. Whether this conversation lets a call carry the pair at all was settled before
+        // execution (`decision_tools::parameter_mode_rejection`); the rest resolve a target and
+        // act on the conversation's page.
         "preview_find_logs" => {
             crate::decision_tools::preview::find_logs(request, state, workspace, cancel)
         }
-        "preview_find_element" => {
-            crate::decision_tools::preview::find_element(request, state, workspace, cancel)
+        name if crate::decision_tools::takes_decision_parameters(name)
+            && crate::decision_tools::carries_decision_parameters(name, &request.input) =>
+        {
+            let decision = crate::decision_tools::preview::Decision::of(name)
+                .ok_or_else(|| format!("Unknown tool: {name}"))?;
+            if let Some(direct) = crate::decision_tools::direct_parameters(name)
+                .iter()
+                .find(|key| request.input.contains_key(**key))
+            {
+                return Err(format!(
+                    "Pass {name} either {direct} or {}, not both.",
+                    crate::decision_tools::decision_parameters(name).join(" and ")
+                ));
+            }
+            let score_misses = decision_miss_scoring.contains(name);
+            decision.run(request, state, workspace, cancel, score_misses)
         }
-        "preview_click_by_description" => crate::decision_tools::preview::click_by_description(
-            request, state, workspace, cancel,
-        ),
-        "preview_fill_by_description" => crate::decision_tools::preview::fill_by_description(
-            request, state, workspace, cancel,
-        ),
-        "preview_inspect_by_description" => {
-            crate::decision_tools::preview::inspect_by_description(request, state, workspace, cancel)
-        }
-        "preview_start" => run_preview_start(request, state),
+        "preview_start" => run_preview_start(request, state, selected, workspace),
         "preview_stop" => run_preview_stop(request, state),
         "preview_list" => run_preview_list(request, state),
         "preview_logs" => run_preview_logs(request, state),
@@ -674,22 +669,40 @@ fn encode_browser_tool_result(value: &serde_json::Value) -> Result<Outcome, Stri
         .map_err(|error| format!("Failed to encode browser tool result: {error}"))
 }
 
-/// One dev server of this workspace that this conversation is allowed to address.
+/// Every dev server this conversation may address: the ones of this workspace, its own or nobody's,
+/// then the ones it started in its other workspaces — on this computer or on another machine —
+/// which only it may address.
+pub(crate) fn preview_servers_for_session(
+    state: &AppState,
+    workspace: &Path,
+    conversation_id: &str,
+) -> Vec<crate::preview_servers::PreviewServerSnapshot> {
+    let mut servers: Vec<_> = state
+        .preview_servers
+        .servers_for_worktree(workspace)
+        .into_iter()
+        .filter(|server| {
+            server.session_id.is_none() || server.session_id.as_deref() == Some(conversation_id)
+        })
+        .collect();
+    for server in state.preview_servers.servers_owned_by(conversation_id) {
+        if !servers.iter().any(|listed| listed.server_id == server.server_id) {
+            servers.push(server);
+        }
+    }
+    servers
+}
+
+/// One dev server that this conversation is allowed to address.
 pub(crate) fn preview_server_for_session(
     state: &AppState,
     workspace: &Path,
     conversation_id: &str,
     server_id: &str,
 ) -> Option<crate::preview_servers::PreviewServerSnapshot> {
-    state
-        .preview_servers
-        .servers_for_worktree(workspace)
+    preview_servers_for_session(state, workspace, conversation_id)
         .into_iter()
-        .find(|server| {
-            server.server_id == server_id
-                && (server.session_id.is_none()
-                    || server.session_id.as_deref() == Some(conversation_id))
-        })
+        .find(|server| server.server_id == server_id)
 }
 
 /// The server an absent `serverId` falls back to: the first one for this worktree that is running
@@ -700,7 +713,7 @@ pub(crate) fn first_running_preview_server(
     conversation_id: &str,
 ) -> Option<crate::preview_servers::PreviewServerSnapshot> {
     crate::preview_servers::running_for_session(
-        &state.preview_servers.servers_for_worktree(workspace),
+        &preview_servers_for_session(state, workspace, conversation_id),
         Some(conversation_id),
     )
     .into_iter()
@@ -836,27 +849,99 @@ fn preview_screenshot_outcome(
 /// The sentences are the source's, including the autoPort explanation and the attach report. What
 /// the source words through its tab machinery — which surface the preview landed on — Mework says
 /// in its own voice, because a page per conversation has no tab id to name.
-fn run_preview_start(request: &ToolExecutionRequest, state: &AppState) -> Result<Outcome, String> {
-    let workspace = Path::new(&request.workspace_path);
+fn run_preview_start(
+    request: &ToolExecutionRequest,
+    state: &AppState,
+    selected: &crate::workspace_set::ResolvedWorkspace,
+    workspace: &Path,
+) -> Result<Outcome, String> {
     let name = required_string(&request.input, "name", 256, false)?;
+    let session_id = crate::browser::preview_page_session_id(&request.conversation_id)?;
+    // A workspace on an SSH machine runs its server there, and the conversation's page moves onto
+    // that machine's network, so the `localhost` it opens is the machine's.
+    if let Some(machine) = &selected.machine {
+        let crate::model::RunTarget::Ssh { .. } = machine else {
+            return Err(format!(
+                "Workspace {} is on WSL, where previews are not supported yet.",
+                selected.index
+            ));
+        };
+        let remote = crate::preview_remote::RemoteMachine::new(
+            selected.runner.clone(),
+            crate::run_environment::env_key(Some(machine)),
+            if selected.machine_label.trim().is_empty() {
+                "the remote machine".to_owned()
+            } else {
+                selected.machine_label.clone()
+            },
+        );
+        let started = crate::preview::start_remote(
+            &state.preview_servers,
+            &remote,
+            &selected.root,
+            Some(&name),
+            Some(&request.conversation_id),
+        )?;
+        // Readiness is waited out on the machine; the page is pointed at the server once it
+        // answers there, so the first thing it loads is the app rather than a refused connection
+        // that raced the server a round trip early. A server slower than this is opened anyway,
+        // the way a local one is.
+        if let crate::preview::PreviewStartOutcome::Server { server, .. } = &started {
+            let deadline = std::time::Instant::now() + REMOTE_READY_WAIT;
+            while std::time::Instant::now() < deadline
+                && state.preview_servers.get(&server.server_id).is_some_and(|live| {
+                    live.status == crate::preview_servers::PreviewServerStatus::Starting
+                })
+            {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        }
+        let proxy = crate::preview_tunnel::proxy_for(&remote)?;
+        state.browser.set_network(
+            &session_id,
+            Some(crate::browser::PageNetwork {
+                proxy,
+                machine: remote.key().to_owned(),
+            }),
+        )?;
+        return preview_start_receipt(state, &session_id, started, None, Some(remote.label()));
+    }
     let started = crate::preview::start(
         &state.preview_servers,
         workspace,
         Some(&name),
         Some(&request.conversation_id),
     )?;
-    let session_id = crate::browser::preview_page_session_id(&request.conversation_id)?;
+    // Back on this computer's network, if the page was last on another machine's.
+    state.browser.set_network(&session_id, None)?;
+    preview_start_receipt(state, &session_id, started, Some(workspace), None)
+}
+
+/// How long `preview_start` waits for a server on another machine to answer before it points the
+/// page at it.
+const REMOTE_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What `preview_start` reports, and the page pointed at what it started. `workspace` is the
+/// directory whose configuration is re-read for the entry's url — a local one; a remote start
+/// passes `machine` instead, and its receipt says where the port is.
+fn preview_start_receipt(
+    state: &AppState,
+    session_id: &str,
+    started: crate::preview::PreviewStartOutcome,
+    workspace: Option<&Path>,
+    machine: Option<&str>,
+) -> Result<Outcome, String> {
+    let session_id = session_id.to_owned();
     let (server, reused) = match started {
         crate::preview::PreviewStartOutcome::Attached { attached } => {
             return preview_attach_outcome(state, &session_id, &attached);
         }
         crate::preview::PreviewStartOutcome::Server { server, reused } => (server, reused),
     };
-    let configured = crate::preview::configurations(workspace);
+    let configured = workspace.map(crate::preview::configurations);
     let entry = configured
-        .servers
-        .iter()
-        .find(|configured| configured.name == server.name);
+        .as_ref()
+        .and_then(|configured| configured.servers.iter().find(|configured| configured.name == server.name));
     let mut receipt = serde_json::to_value(&server)
         .map_err(|error| format!("Failed to encode preview server: {error}"))?;
     if let Value::Object(object) = &mut receipt {
@@ -876,6 +961,11 @@ fn run_preview_start(request: &ToolExecutionRequest, state: &AppState) -> Result
         ));
     } else {
         text.push_str(&format!("\nServer started successfully on port {port}."));
+    }
+    if let Some(machine) = machine {
+        text.push_str(&format!(
+            "\nThe server runs on {machine}. The preview page uses that machine's network, so http://localhost:{port} in the page is the server there."
+        ));
     }
 
     // A started server whose page still shows about:blank is a preview in name only, and this
@@ -957,15 +1047,7 @@ fn run_preview_stop(request: &ToolExecutionRequest, state: &AppState) -> Result<
 /// configuration file.
 fn run_preview_list(request: &ToolExecutionRequest, state: &AppState) -> Result<Outcome, String> {
     let workspace = Path::new(&request.workspace_path);
-    let servers = state
-        .preview_servers
-        .servers_for_worktree(workspace)
-        .into_iter()
-        .filter(|server| {
-            server.session_id.is_none()
-                || server.session_id.as_deref() == Some(request.conversation_id.as_str())
-        })
-        .collect::<Vec<_>>();
+    let servers = preview_servers_for_session(state, workspace, &request.conversation_id);
     encode_browser_tool_result(
         &serde_json::to_value(&servers)
             .map_err(|error| format!("Failed to encode preview server list: {error}"))?,
@@ -1894,27 +1976,47 @@ pub(crate) fn unified_diff(path: &str, before: &str, after: &str, created: bool)
     )
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ShellKind {
-    PowerShell,
-    Bash,
-}
+/// The shell a shell-tool call runs in: the backend its tool is named for.
+pub(crate) use crate::shell_backend::ShellBackend as ShellKind;
 
-impl ShellKind {
-    pub(crate) fn tool_name(self) -> &'static str {
-        match self {
-            ShellKind::PowerShell => "powershell",
-            ShellKind::Bash => "bash",
-        }
-    }
-
-    pub(crate) fn from_tool_name(name: &str) -> Option<Self> {
-        match name {
-            "powershell" => Some(ShellKind::PowerShell),
-            "bash" => Some(ShellKind::Bash),
-            _ => None,
-        }
-    }
+/// What a shell call in `workspace` starts for `kind`: the program the
+/// machine's probe found, or `None` on the host, whose own resolvers (with
+/// their fallbacks) pick the interpreter at launch.
+///
+/// A backend the machine does not have is refused here. The schema already
+/// lists only the workspaces whose machine has the tool's shell, so this is
+/// what a manual call, or a machine that lost the shell since, runs into.
+pub(crate) fn shell_program(
+    workspace: &crate::workspace_set::ResolvedWorkspace,
+    kind: ShellKind,
+) -> Result<Option<String>, String> {
+    let Some(shell) = workspace.shell(kind) else {
+        let machine = if workspace.machine_label.trim().is_empty() {
+            "this machine".to_owned()
+        } else {
+            workspace.machine_label.clone()
+        };
+        let others = workspace
+            .shells
+            .iter()
+            .map(|shell| shell.backend.tool_name())
+            .collect::<Vec<_>>();
+        return Err(if others.is_empty() {
+            format!(
+                "Workspace {} ({machine}) has no {} and no other shell Mework can run",
+                workspace.index,
+                kind.display_name()
+            )
+        } else {
+            format!(
+                "Workspace {} ({machine}) has no {}; use one of these tools there instead: {}",
+                workspace.index,
+                kind.display_name(),
+                others.join(", ")
+            )
+        });
+    };
+    Ok((!workspace.is_local()).then(|| shell.path.clone()))
 }
 
 /// Validates the one required shell parameter. Shared with the background leg
@@ -2149,6 +2251,36 @@ pub(crate) fn powershell_tool_script(command: &str, cwd_file: &Path) -> String {
     )
 }
 
+/// [`powershell_tool_script`] for the Windows sandbox, whose account cannot
+/// list the directories above a workspace in the user's profile. Windows
+/// PowerShell will not make a directory its location unless it can list
+/// every ancestor, so the script roots a drive of its own at the workspace
+/// and starts there; relative paths then resolve as they would anywhere else.
+/// The directory it reports is the provider's real path, not the drive's.
+fn sandboxed_powershell_tool_script(command: &str, cwd_file: &Path, workspace_root: &Path, start_dir: &Path) -> String {
+    let script = powershell_tool_script(command, cwd_file).replacen(
+        "(Get-Location).Path | Out-File",
+        "(Get-Location).ProviderPath | Out-File",
+        1,
+    );
+    // A script that must begin with its own statement (`using`, `param`)
+    // keeps the drive's root as its location rather than lose its lead.
+    if powershell_command_must_lead(command) {
+        return script;
+    }
+    let relative = start_dir
+        .strip_prefix(workspace_root)
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(
+        "$null = New-PSDrive -Name MeworkWorkspace -PSProvider FileSystem -Root {root} -Scope Global\n\
+         ; Set-Location -LiteralPath {location}\n\
+         ; {script}",
+        root = powershell_single_quote(&workspace_root.to_string_lossy()),
+        location = powershell_single_quote(&format!("MeworkWorkspace:\\{relative}")),
+    )
+}
+
 /// Quotes one fragment for a POSIX single-quoted shell word.
 fn posix_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
@@ -2216,6 +2348,57 @@ pub(crate) fn bash_tool_script(
         posix_single_quote(&bash_path(cwd_file))
     ));
     clauses.join(" && ")
+}
+
+/// The script the `zsh` and `sh` tools run on the host: the caller's command
+/// under `eval`, then the directory it ended in, joined with `&&` as the Bash
+/// script joins them so a failed command cannot move the session.
+///
+/// There is no snapshot to source: the snapshot is Bash's (its generator uses
+/// `declare` and `shopt`), so zsh runs as a login shell instead — the fallback
+/// Bash itself takes when it has none — and `sh` runs plain.
+pub(crate) fn posix_tool_script(command: &str, cwd_file: &Path) -> String {
+    let quoted_command = posix_single_quote(command);
+    let eval = if bash_command_reads_stdin(command) {
+        format!("eval {quoted_command}")
+    } else {
+        format!("eval {quoted_command} < /dev/null")
+    };
+    format!(
+        "{eval} && pwd -P >| {}",
+        posix_single_quote(&cwd_file.to_string_lossy())
+    )
+}
+
+/// A local login shell's script with `PATH` put back in the application's order
+/// once the profile has run (macOS), recording in `env` the order to restore.
+///
+/// Both login legs — Bash without a snapshot, and zsh — run `/etc/profile` or
+/// `/etc/zprofile`, and so `path_helper`, which would otherwise hand the command
+/// Apple's `/usr/bin/python3`, `git` and `java` stubs ahead of the Homebrew, nvm
+/// and pyenv builds the application's `PATH` lists first. `-l` itself stays:
+/// the profile also sets up what no inherited environment carries (functions,
+/// and on a machine whose login-shell probe failed, the `PATH` entries
+/// themselves), and dropping it would lose those to fix an order the repair
+/// already fixes. A `PATH` the run environment configures is the one the shell
+/// starts with, so it is the order restored.
+fn in_login_path_order(script: String, env: &mut Vec<(String, String)>) -> String {
+    let Some(repaired) = crate::shell_snapshot::in_application_path_order(&script) else {
+        return script;
+    };
+    let path = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("PATH").ok());
+    let Some(path) = path else {
+        return script;
+    };
+    env.push((
+        crate::shell_snapshot::APPLICATION_PATH_ENVIRONMENT_NAME.to_owned(),
+        path,
+    ));
+    repaired
 }
 
 /// Rewrites a Windows path into the `/c/...` form Git Bash understands. A
@@ -2295,8 +2478,16 @@ pub(crate) fn shell_call_context(
     conversation_id: &str,
     app_data: Option<&Path>,
     state: &AppState,
+    sandboxed: bool,
 ) -> ShellCallContext {
-    let cwd_file = std::env::temp_dir().join(format!(
+    // A sandboxed shell can write nowhere but its workspaces and a directory
+    // of its conversation's own, so that is where it reports its directory.
+    let directory = if sandboxed {
+        sandbox_exchange_dir(conversation_id).unwrap_or_else(std::env::temp_dir)
+    } else {
+        std::env::temp_dir()
+    };
+    let cwd_file = directory.join(format!(
         "mework-{}-{}-cwd",
         std::process::id(),
         SHELL_CWD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2319,6 +2510,28 @@ pub(crate) fn shell_call_context(
         cwd_file,
         temp_dir,
     }
+}
+
+/// The directory a conversation's sandboxed local shells share with the host:
+/// the one place outside its workspaces the sandbox lets them write, for the
+/// files the host reads back after a call. Private to the account, and one per
+/// conversation, so one conversation's sandbox cannot plant a file another's
+/// host call will read.
+fn sandbox_exchange_dir(conversation_id: &str) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(conversation_id.as_bytes()));
+    let directory = std::env::temp_dir().join(format!("mework-sandbox-{}", &digest[..16]));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&directory).ok()?;
+    // Canonical, because the sandbox's rules compare real paths (`/var` is
+    // `/private/var` on macOS).
+    std::fs::canonicalize(&directory).ok()
 }
 
 /// Distinguishes the cwd files of two calls in the same round and the same
@@ -2344,6 +2557,8 @@ struct ShellLaunchPlan {
 /// - Local: Claude Code's exact invocation. Bash gets `-c <script>` when a
 ///   snapshot exists and `-c -l <script>` when it does not — the login shell is
 ///   the fallback for the state the snapshot would otherwise have restored.
+///   Every login leg (that one and zsh's) repairs the `PATH` order `path_helper`
+///   breaks on macOS; see [`in_login_path_order`].
 ///   PowerShell gets `-NoProfile -NonInteractive -ExecutionPolicy Bypass
 ///   -Command <script>`. Note the absent `-NoLogo`: Claude Code does not pass
 ///   it to the tool, only to its static parser, and parity is the point here.
@@ -2365,18 +2580,22 @@ struct ShellLaunchPlan {
 fn shell_launch_plan(
     workspace_root: &str,
     kind: ShellKind,
+    program: Option<&str>,
     command: &str,
     runner: &crate::run_environment::ShellRunner,
     session: ShellSession<'_>,
 ) -> Result<ShellLaunchPlan, String> {
     use crate::run_environment::{self, ShellRunner};
+    use crate::shell_backend::{is_registered, remote_command_argv, MachineOs};
     let env = &runner.normalized_env()?;
+    let program = program.unwrap_or(kind.default_program());
     match runner {
         ShellRunner::Local { .. } => {
-            if matches!(kind, ShellKind::PowerShell) && !host_platform().is_windows() {
+            if !is_registered(MachineOs::host(), kind) {
                 return Err(format!(
-                    "This workspace is on {}, where the powershell tool is unavailable; use the bash tool instead",
-                    crate::environment_prompt::host_os_name()
+                    "This workspace is on {}, where the {} tool is unavailable; use another shell tool instead",
+                    crate::environment_prompt::host_os_name(),
+                    kind.tool_name()
                 ));
             }
             let candidates: Vec<String> = match kind {
@@ -2385,13 +2604,22 @@ fn shell_launch_plan(
                 // on Windows is either the WSL launcher or nothing at all. See
                 // `run_environment::local_bash_candidates`.
                 ShellKind::Bash => run_environment::local_bash_candidates(),
+                ShellKind::Zsh | ShellKind::Sh => run_environment::local_program_path(kind.id())
+                    .into_iter()
+                    .collect(),
             };
             if candidates.is_empty() {
                 return Err(match kind {
                     ShellKind::Bash => "No native Bash was found locally. Install Git for Windows or MSYS2, or change this conversation's run environment to WSL. The System32 WSL launcher is not used as local Bash because it executes commands in another machine's filesystem and network.".into(),
                     ShellKind::PowerShell => "No PowerShell was found locally. Install PowerShell 7 (https://aka.ms/powershell), or use the bash tool instead.".to_owned(),
+                    ShellKind::Zsh | ShellKind::Sh => format!(
+                        "No {} was found on this machine's PATH; use another shell tool instead",
+                        kind.display_name()
+                    ),
                 });
             }
+            let mut plan_env: Vec<(String, String)> =
+                env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let args: Vec<String> = match kind {
                 ShellKind::PowerShell => vec![
                     "-NoProfile".into(),
@@ -2415,27 +2643,46 @@ fn shell_launch_plan(
                     if session.snapshot.is_some() {
                         vec!["-c".into(), script]
                     } else {
-                        vec!["-c".into(), "-l".into(), script]
+                        vec![
+                            "-c".into(),
+                            "-l".into(),
+                            in_login_path_order(script, &mut plan_env),
+                        ]
                     }
                 }
+                ShellKind::Zsh => vec![
+                    "-l".into(),
+                    "-c".into(),
+                    in_login_path_order(
+                        posix_tool_script(command, session.cwd_file),
+                        &mut plan_env,
+                    ),
+                ],
+                ShellKind::Sh => vec!["-c".into(), posix_tool_script(command, session.cwd_file)],
             };
             Ok(ShellLaunchPlan {
                 candidates,
                 args,
-                env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                env: plan_env,
                 local_hardening: true,
             })
         }
         ShellRunner::Wsl { distro, .. } => {
-            if matches!(kind, ShellKind::PowerShell) {
-                return Err(
-                    "This conversation runs in WSL, where the powershell tool is unavailable; use the bash tool instead".into(),
-                );
+            if !is_registered(MachineOs::Wsl, kind) {
+                return Err(format!(
+                    "This workspace is in WSL, where the {} tool is unavailable; use another shell tool instead",
+                    kind.tool_name()
+                ));
             }
             run_environment::validate_wsl_distro_name(distro)?;
             Ok(ShellLaunchPlan {
                 candidates: vec!["wsl.exe".into()],
-                args: run_environment::wsl_shell_args(distro, workspace_root, env, command),
+                args: run_environment::wsl_exec_args(
+                    distro,
+                    workspace_root,
+                    env,
+                    remote_command_argv(kind, program, command),
+                ),
                 // Keep discovery and execution aligned. New WSL emits UTF-8, while
                 // older versions use this variable as a switch; command output bypasses it.
                 env: vec![("WSL_UTF8".into(), "1".into())],
@@ -2448,22 +2695,40 @@ fn shell_launch_plan(
             identity_file,
             ..
         } => {
-            if matches!(kind, ShellKind::PowerShell) {
-                return Err(
-                    "This conversation runs on an SSH remote machine, where the powershell tool is unavailable; use the bash tool instead"
-                        .into(),
-                );
-            }
-            Ok(ShellLaunchPlan {
-                candidates: run_environment::ssh_client_candidates(),
-                args: run_environment::ssh_shell_args(
+            let args = match kind.dialect() {
+                crate::shell_backend::ScriptDialect::Posix => run_environment::ssh_exec_args(
                     host,
                     *port,
                     identity_file,
                     workspace_root,
                     env,
-                    command,
+                    &remote_command_argv(kind, program, command),
                 ),
+                // `cmd.exe` or PowerShell answers the login, and both pass the
+                // base64 of `-EncodedCommand` through untouched; the directory
+                // and the variable table are set inside the script.
+                crate::shell_backend::ScriptDialect::PowerShell => {
+                    let mut args =
+                        run_environment::ssh_connection_args(host, *port, identity_file);
+                    let enter = if workspace_root.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "Set-Location -LiteralPath {}\n",
+                            crate::remote_shell::ps_single_quote(workspace_root)
+                        )
+                    };
+                    args.push(crate::remote_shell::powershell_line(&format!(
+                        "{}{enter}{}",
+                        run_environment::powershell_env_prologue(env),
+                        crate::shell_backend::remote_powershell_command(command)
+                    )));
+                    args
+                }
+            };
+            Ok(ShellLaunchPlan {
+                candidates: run_environment::ssh_client_candidates(),
+                args,
                 env: Vec::new(),
                 local_hardening: false,
             })
@@ -2486,15 +2751,18 @@ fn shell_launch_plan(
 /// `start_dir` is where this call begins. It is the workspace on the first call
 /// of a conversation and the directory the previous call reported afterwards,
 /// which is the whole of how `cd` persists — the shell itself does not.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_shell_process(
     anchor: &Path,
     workspace_root: &str,
     start_dir: &Path,
     kind: ShellKind,
+    program: Option<&str>,
     command: &str,
     runner: &crate::run_environment::ShellRunner,
     session: ShellSession<'_>,
     profile: &PromptProfile,
+    sandbox: Option<&remote_agent::protocol::SandboxSpec>,
 ) -> Result<SpawnedShell, String> {
     let anchor = canonical_workspace(anchor)?;
     // A start directory that has gone away must not fail the call: fall back to
@@ -2504,22 +2772,24 @@ pub(crate) fn spawn_shell_process(
     } else {
         anchor.clone()
     };
-    // An SSH machine the agent serves runs the command itself: the same bash
-    // invocation, started in the workspace by the agent rather than by a login
-    // shell, and not tied to any SSH connection's lifetime.
-    if matches!(runner, crate::run_environment::ShellRunner::Ssh { .. })
-        && matches!(kind, ShellKind::Bash)
-    {
-        let argv = ["bash", "--noprofile", "--norc", "-c", command]
-            .iter()
-            .map(|part| (*part).to_owned())
-            .collect();
+    if let Some(sandbox) = sandbox {
+        return spawn_sandboxed_shell(&start_dir, workspace_root, kind, program, command, runner, session, sandbox);
+    }
+    // An SSH machine the agent serves runs the command itself: the backend's
+    // own invocation, started in the workspace by the agent rather than by a
+    // login shell, and not tied to any SSH connection's lifetime.
+    if matches!(runner, crate::run_environment::ShellRunner::Ssh { .. }) {
+        let argv = crate::shell_backend::remote_command_argv(
+            kind,
+            program.unwrap_or(kind.default_program()),
+            command,
+        );
         if let Some(spawned) = crate::remote_link::spawn(
             runner,
             argv,
             Some(workspace_root),
             remote_agent::protocol::StdinMode::Null,
-            "bash",
+            kind.tool_name(),
         ) {
             return spawned.map(|child| SpawnedShell {
                 child: ShellChild::Remote {
@@ -2530,7 +2800,7 @@ pub(crate) fn spawn_shell_process(
             });
         }
     }
-    let plan = shell_launch_plan(workspace_root, kind, command, runner, session)?;
+    let plan = shell_launch_plan(workspace_root, kind, program, command, runner, session)?;
 
     let mut last_not_found = None;
     for executable in &plan.candidates {
@@ -2600,7 +2870,7 @@ pub(crate) fn spawn_shell_process(
                 // user's own functions and aliases, so pretending the environment
                 // is sterile would be theatre. `SHELL` and `GIT_EDITOR` are the
                 // two Claude Code does set.
-                ShellKind::Bash => {
+                ShellKind::Bash | ShellKind::Zsh | ShellKind::Sh => {
                     process.env("SHELL", executable).env("GIT_EDITOR", "true");
                 }
             }
@@ -2652,15 +2922,114 @@ pub(crate) fn spawn_shell_process(
     }
     Err(format!(
         "No usable {} executable found (tried: {}){}",
-        match kind {
-            ShellKind::PowerShell => "PowerShell",
-            ShellKind::Bash => "Bash",
-        },
+        kind.display_name(),
         profile.join_list(&plan.candidates),
         last_not_found
             .map(|error| format!(": {error}"))
             .unwrap_or_default()
     ))
+}
+
+/// [`spawn_shell_process`] in the conversation's sandbox: the same command
+/// line and variables a local call would have, or the backend's own
+/// invocation on a WSL or SSH machine, started by the agent on that machine
+/// inside the conversation's cell. It never falls back to running outside it.
+#[allow(clippy::too_many_arguments)]
+fn spawn_sandboxed_shell(
+    start_dir: &Path,
+    workspace_root: &str,
+    kind: ShellKind,
+    program: Option<&str>,
+    command: &str,
+    runner: &crate::run_environment::ShellRunner,
+    session: ShellSession<'_>,
+    sandbox: &remote_agent::protocol::SandboxSpec,
+) -> Result<SpawnedShell, String> {
+    use crate::run_environment::ShellRunner;
+    let mut sandbox = sandbox.clone();
+    let sandboxed = match runner {
+        ShellRunner::Local { .. } => {
+            let plan = shell_launch_plan(workspace_root, kind, program, command, runner, session)?;
+            let executable = plan
+                .candidates
+                .iter()
+                .find(|candidate| Path::new(candidate).is_file())
+                .or_else(|| plan.candidates.first())
+                .cloned()
+                .ok_or_else(|| format!("No usable {} executable found", kind.display_name()))?;
+            let mut env: std::collections::BTreeMap<String, String> = plan.env.iter().cloned().collect();
+            let mut env_remove: Vec<String> = crate::child_environment::private_child_environment_names()
+                .into_iter()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect();
+            match kind {
+                ShellKind::PowerShell => {
+                    for (key, value) in child_text_defaults(&plan.env, |name| std::env::var_os(name).is_some()) {
+                        env.insert(key.into(), value.into());
+                    }
+                    for (key, value) in [("GIT_TERMINAL_PROMPT", "0"), ("GIT_ASKPASS", ""), ("GCM_INTERACTIVE", "never")] {
+                        if !plan.env.iter().any(|(name, _)| name == key) && std::env::var_os(key).is_none() {
+                            env.insert(key.into(), value.into());
+                        }
+                    }
+                    env_remove.push("SHELL".into());
+                }
+                ShellKind::Bash | ShellKind::Zsh | ShellKind::Sh => {
+                    env.insert("SHELL".into(), executable.clone());
+                    env.insert("GIT_EDITOR".into(), "true".into());
+                }
+            }
+            // The call's own files: the directory it reports is written where
+            // the host reads it back, and the snapshot it sources lives in the
+            // host's data, which the sandbox otherwise cannot read.
+            if let Some(directory) = session.cwd_file.parent() {
+                sandbox.policy.writable.push(directory.to_string_lossy().into_owned());
+            }
+            // The one file, not its directory: that holds every conversation's.
+            if let Some(snapshot) = session.snapshot {
+                sandbox.policy.readable.push(snapshot.to_string_lossy().into_owned());
+            }
+            let mut argv = vec![executable];
+            match kind {
+                ShellKind::PowerShell if host_platform().is_windows() => {
+                    let root = canonical_workspace(Path::new(workspace_root))?;
+                    let mut args = plan.args;
+                    if let Some(script) = args.last_mut() {
+                        *script = sandboxed_powershell_tool_script(command, session.cwd_file, &root, start_dir);
+                    }
+                    argv.extend(args);
+                }
+                _ => argv.extend(plan.args),
+            }
+            crate::remote_link::SandboxedCommand {
+                argv,
+                cwd: Some(start_dir.to_string_lossy().into_owned()),
+                env,
+                env_remove,
+                label: kind.tool_name().to_owned(),
+            }
+        }
+        ShellRunner::Wsl { .. } | ShellRunner::Ssh { .. } => {
+            let mut env = runner.normalized_env()?;
+            env.retain(|name, _| !crate::run_environment::is_shell_startup_env_name(name));
+            crate::remote_link::SandboxedCommand {
+                argv: crate::shell_backend::remote_command_argv(
+                    kind,
+                    program.unwrap_or(kind.default_program()),
+                    command,
+                ),
+                cwd: Some(workspace_root.to_owned()),
+                env,
+                env_remove: Vec::new(),
+                label: kind.tool_name().to_owned(),
+            }
+        }
+    };
+    let child = crate::remote_link::spawn_in_sandbox(runner, &sandbox, sandboxed)?;
+    Ok(SpawnedShell {
+        child: ShellChild::Remote { child, killed: false },
+        job: ShellJob::create(),
+    })
 }
 
 /// Text defaults a local command gets when nobody set them: the model writes
@@ -2914,7 +3283,15 @@ fn run_shell(
     if cancel.cancelled() {
         return Err("The run or task was stopped, so the command did not start; do not retry directly, and first confirm the user's intent".into());
     }
-    let context = shell_call_context(kind, runner, conversation_id, app_data, state);
+    let program = shell_program(workspace, kind)?;
+    let context = shell_call_context(
+        kind,
+        runner,
+        conversation_id,
+        app_data,
+        state,
+        workspace.sandbox.is_some(),
+    );
     // `cd` only persists for local calls, and only inside the workspace that
     // recorded it. A remote call begins at its workspace root every time.
     let start_dir = if workspace.is_local() {
@@ -2937,10 +3314,12 @@ fn run_shell(
         &workspace.root,
         &start_dir,
         kind,
+        program.as_deref(),
         &command,
         runner,
         context.session(),
         profile,
+        workspace.sandbox.as_ref(),
     )?;
     // Registration starts here and not before: a command that never spawned is not a
     // task. The guard's `Drop` retires the row however this call ends; the wait below
@@ -3471,6 +3850,10 @@ pub(crate) fn kill_process_tree_or_child(child: &mut std::process::Child, job: &
 pub(crate) struct ShellJob {
     #[cfg(windows)]
     handle: Option<windows_sys::Win32::Foundation::HANDLE>,
+    /// The process group the assigned command leads, registered so that
+    /// quitting Mework ends it the way closing the job does on Windows.
+    #[cfg(unix)]
+    group: std::sync::OnceLock<crate::process_groups::GroupRegistration>,
 }
 
 // The handle is owned solely by this struct and only ever used from the thread running the
@@ -3510,12 +3893,21 @@ impl ShellJob {
             }
         }
         #[cfg(not(windows))]
-        Self {}
+        Self {
+            #[cfg(unix)]
+            group: std::sync::OnceLock::new(),
+        }
     }
 
     /// Puts a freshly spawned command in the job. Everything it starts afterwards is added by
     /// Windows automatically, which is what makes the later terminate cover the whole tree.
     pub(crate) fn assign(&self, _child: &std::process::Child) {
+        // Every local command Mework starts here leads its own process group
+        // (`setsid` before exec), which is also what the exit path ends.
+        #[cfg(unix)]
+        if let Some(registration) = crate::process_groups::register(_child.id()) {
+            let _ = self.group.set(registration);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
@@ -4076,6 +4468,96 @@ mod tests {
                 "a Git Bash `pwd -P` must survive the /c/ rewrite: {}",
                 reported.output
             );
+        }
+    }
+
+    /// On macOS both login legs — Bash without a snapshot, and zsh — restore the
+    /// application's `PATH` order after `path_helper`, starting from the
+    /// configured `PATH` when there is one. The snapshot leg and `sh` start no
+    /// login shell and are left exactly as they were.
+    #[test]
+    fn login_legs_restore_the_application_path_order() {
+        use crate::run_environment::ShellRunner;
+        use crate::shell_snapshot::APPLICATION_PATH_ENVIRONMENT_NAME;
+        let workspace = tempfile::tempdir().unwrap();
+        let cwd_file = workspace.path().join("cwd");
+        let snapshot = workspace.path().join("snap.sh");
+        let configured = "/configured/bin:/usr/bin";
+        let runner = ShellRunner::Local {
+            env: [("PATH".to_owned(), configured.to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        for (kind, snapshot, login) in [
+            (ShellKind::Bash, None, true),
+            (ShellKind::Zsh, None, true),
+            (ShellKind::Bash, Some(snapshot.as_path()), false),
+            (ShellKind::Sh, None, false),
+        ] {
+            let session = ShellSession {
+                snapshot,
+                cwd_file: &cwd_file,
+                temp_dir: None,
+            };
+            // A host without this shell has nothing to launch.
+            let Ok(plan) = shell_launch_plan(
+                &workspace.path().to_string_lossy(),
+                kind,
+                None,
+                "echo hi",
+                &runner,
+                session,
+            ) else {
+                continue;
+            };
+            let repaired = login && host_platform().is_macos();
+            let script = plan.args.last().unwrap();
+            assert_eq!(
+                script.contains(APPLICATION_PATH_ENVIRONMENT_NAME),
+                repaired,
+                "{kind:?}: {script}"
+            );
+            assert!(script.contains("eval 'echo hi'"), "{kind:?}: {script}");
+            let handoff = plan
+                .env
+                .iter()
+                .find(|(name, _)| name == APPLICATION_PATH_ENVIRONMENT_NAME)
+                .map(|(_, value)| value.as_str());
+            assert_eq!(handoff, repaired.then_some(configured), "{kind:?}");
+        }
+    }
+
+    /// zsh and sh keep the same session as bash: the directory a successful
+    /// `cd` ended in is where the next call starts, and a failed one moves
+    /// nothing.
+    #[cfg(not(windows))]
+    #[test]
+    fn zsh_and_sh_carry_the_directory_between_calls_too() {
+        let local = crate::machine_shells::local();
+        for tool in ["zsh", "sh"] {
+            if local.get(ShellKind::of_tool(tool).unwrap()).is_none() {
+                continue;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let app_data = directory.path().join("app-data");
+            fs::create_dir_all(&app_data).unwrap();
+            fs::create_dir_all(directory.path().join("nested")).unwrap();
+            let state = AppState::default();
+            let run = |command: &str| {
+                execute_with_scope_and_attachments(
+                    request(directory.path(), tool, json!({"command": command})),
+                    &state,
+                    ExecutionScope::workspace_only(directory.path()),
+                    Some(app_data.as_path()),
+                    &crate::workspace_set::WorkspaceSet::default(),
+                    &PromptProfile::builtin_english(),
+                )
+            };
+            assert!(run("cd nested").success, "{tool}");
+            let here = run("pwd -P");
+            assert!(here.output.ends_with("nested"), "{tool}: {}", here.output);
+            assert!(!run("cd nonexistent-directory-xyz").success, "{tool}");
+            assert!(run("pwd -P").output.ends_with("nested"), "{tool}");
         }
     }
 
@@ -4768,10 +5250,20 @@ mod tests {
             );
             assert!(!refused.success, "{}", refused.output);
             assert!(
-                refused.output.contains("use the bash tool"),
+                refused.output.contains("has no PowerShell"),
                 "{}",
                 refused.output
             );
+            // The host's other POSIX shells run commands the way bash does.
+            let local = crate::machine_shells::local();
+            for (tool, marker) in [("zsh", "MEWORK_ZSH_E2E"), ("sh", "MEWORK_SH_E2E")] {
+                if local.get(ShellKind::of_tool(tool).unwrap()).is_some() {
+                    assert!(
+                        run(tool, json!({"command": format!("printf {marker}")})).contains(marker),
+                        "{tool}"
+                    );
+                }
+            }
         }
         assert!(
             run("bash", json!({"command":"printf MEWORK_BASH_E2E"})).contains("MEWORK_BASH_E2E")
@@ -5034,6 +5526,7 @@ mod tests {
         match shell_launch_plan(
             &workspace.path().to_string_lossy(),
             ShellKind::Bash,
+            None,
             "echo hi",
             &runner,
             with_snapshot,
@@ -5077,6 +5570,7 @@ mod tests {
                 let fallback = shell_launch_plan(
                     &workspace.path().to_string_lossy(),
                     ShellKind::Bash,
+                    None,
                     "echo hi",
                     &runner,
                     bare,
@@ -5096,6 +5590,7 @@ mod tests {
         match shell_launch_plan(
             &workspace.path().to_string_lossy(),
             ShellKind::PowerShell,
+            None,
             "echo hi",
             &runner,
             with_snapshot,
@@ -5135,7 +5630,7 @@ mod tests {
                 // the machine and the tool to use instead, not an installer.
                 assert!(
                     error.contains(crate::environment_prompt::host_os_name())
-                        && error.contains("use the bash tool"),
+                        && error.contains("use another shell tool"),
                     "{error}"
                 );
             }
@@ -5372,10 +5867,12 @@ mod tests {
         let runners = [
             ShellRunner::Local { env: env.clone() },
             ShellRunner::Wsl {
+                agent_shell: Default::default(),
                 distro: "Ubuntu".into(),
                 env: env.clone(),
             },
             ShellRunner::Ssh {
+                agent_shell: Default::default(),
                 host: "user@host".into(),
                 port: 22,
                 identity_file: String::new(),
@@ -5386,6 +5883,7 @@ mod tests {
             let plan = shell_launch_plan(
                 &directory.path().to_string_lossy(),
                 ShellKind::Bash,
+                None,
                 "true",
                 runner,
                 bare,
@@ -5410,6 +5908,7 @@ mod tests {
         use crate::run_environment::ShellRunner;
         let workspace = tempfile::tempdir().unwrap();
         let runner = ShellRunner::Wsl {
+            agent_shell: Default::default(),
             distro: "Ubuntu".into(),
             env: [("FOO".to_owned(), "a b".to_owned())].into_iter().collect(),
         };
@@ -5425,6 +5924,7 @@ mod tests {
         let plan = shell_launch_plan(
             &workspace.path().to_string_lossy(),
             ShellKind::Bash,
+            None,
             "echo hi",
             &runner,
             bare,
@@ -5455,19 +5955,37 @@ mod tests {
         let error = shell_launch_plan(
             &workspace.path().to_string_lossy(),
             ShellKind::PowerShell,
+            None,
             "echo hi",
             &runner,
             bare,
         )
         .unwrap_err();
-        assert!(error.contains("bash"), "{error}");
+        assert!(error.contains("powershell") && error.contains("WSL"), "{error}");
+
+        // zsh and sh reach the distribution the same way, each with its own
+        // no-startup-files flags.
+        let plan = shell_launch_plan(
+            &workspace.path().to_string_lossy(),
+            ShellKind::Zsh,
+            Some("/usr/bin/zsh"),
+            "echo hi",
+            &runner,
+            bare,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.args[plan.args.len() - 4..],
+            ["/usr/bin/zsh", "-f", "-c", "echo hi"]
+        );
     }
 
     #[test]
-    fn ssh_launch_plan_wraps_the_command_and_rejects_powershell() {
+    fn ssh_launch_plan_wraps_the_command_in_each_backends_own_invocation() {
         use crate::run_environment::ShellRunner;
         let workspace = tempfile::tempdir().unwrap();
         let runner = ShellRunner::Ssh {
+            agent_shell: Default::default(),
             host: "user@devbox".into(),
             port: 0,
             identity_file: String::new(),
@@ -5483,6 +6001,7 @@ mod tests {
         let plan = shell_launch_plan(
             &workspace.path().to_string_lossy(),
             ShellKind::Bash,
+            None,
             "pwd",
             &runner,
             bare,
@@ -5496,14 +6015,28 @@ mod tests {
         assert_eq!(&plan.args[4..6], &["--", "user@devbox"]);
         assert!(!plan.local_hardening);
 
-        assert!(shell_launch_plan(
+        assert_eq!(
+            plan.args.last().unwrap(),
+            &crate::remote_shell::posix_line(&format!(
+                "cd {} || exit 1; exec bash --noprofile --norc -c 'pwd'",
+                crate::run_environment::quote_remote_path(&workspace.path().to_string_lossy())
+            ))
+        );
+
+        // A Windows machine's PowerShell travels base64-encoded, which its
+        // login shell — cmd.exe or PowerShell — passes through untouched.
+        let plan = shell_launch_plan(
             &workspace.path().to_string_lossy(),
             ShellKind::PowerShell,
-            "pwd",
+            None,
+            "Get-Location",
             &runner,
-            bare
+            bare,
         )
-        .is_err());
+        .unwrap();
+        let line = plan.args.last().unwrap();
+        assert!(line.starts_with("powershell -NoLogo"), "{line}");
+        assert!(line.contains("-EncodedCommand "), "{line}");
     }
 
     /// Configured variables must reach local commands. What the host no longer
@@ -6123,9 +6656,14 @@ mod tests {
         .unwrap();
         let state = AppState::default();
 
+        let local = crate::workspace_set::WorkspaceSet::local_root(
+            workspace.path().to_string_lossy().into_owned(),
+        );
         let started = run_preview_start(
             &request(workspace.path(), "preview_start", json!({"name": "docs"})),
             &state,
+            local.select(None).unwrap(),
+            workspace.path(),
         )
         .unwrap();
 

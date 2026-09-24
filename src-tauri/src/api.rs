@@ -744,7 +744,7 @@ pub fn save_api_key(provider_id: &str, api_key: &str) -> Result<ApiKeyStatus, St
 
     credential_entry(&identity)?
         .set_password(api_key)
-        .map_err(|_| "无法将 API Key 保存到操作系统凭据库".to_owned())?;
+        .map_err(|error| credential_store_error("无法将 API Key 保存到操作系统凭据库", error))?;
     if let Err(error) = bind_identity(provider_id, &identity) {
         // The old binding remains authoritative until this write succeeds. A
         // failed save may leave no reachable new secret or revision.
@@ -814,7 +814,10 @@ fn read_api_key_locked(provider_id: &str) -> Result<Option<String>, String> {
         Ok(password) if password.trim().is_empty() => Ok(None),
         Ok(password) => Ok(Some(password)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(_) => Err("无法读取操作系统凭据库中的 API Key".into()),
+        Err(error) => Err(credential_store_error(
+            "无法读取操作系统凭据库中的 API Key",
+            error,
+        )),
     }
 }
 
@@ -877,7 +880,10 @@ fn read_binding(provider_id: &str) -> Result<BindingRead, String> {
         Ok(identity) if is_credential_identity(&identity) => Ok(BindingRead::Valid(identity)),
         Ok(_) => Ok(BindingRead::Malformed),
         Err(keyring::Error::NoEntry) => Ok(BindingRead::Missing),
-        Err(_) => Err("无法读取操作系统凭据库中的 API Key 绑定信息".into()),
+        Err(error) => Err(credential_store_error(
+            "无法读取操作系统凭据库中的 API Key 绑定信息",
+            error,
+        )),
     }
 }
 
@@ -892,7 +898,7 @@ fn read_bound_identity(provider_id: &str) -> Result<Option<String>, String> {
 fn bind_identity(provider_id: &str, identity: &str) -> Result<(), String> {
     index_entry(provider_id)?
         .set_password(identity)
-        .map_err(|_| "无法在操作系统凭据库中绑定 API Key 端点".to_owned())
+        .map_err(|error| credential_store_error("无法在操作系统凭据库中绑定 API Key 端点", error))
 }
 
 fn delete_identity(identity: &str) -> Result<(), String> {
@@ -1052,8 +1058,31 @@ fn install_test_credential_builder() {
 fn delete_entry(entry: keyring::Entry, label: &str) -> Result<(), String> {
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err(format!("无法从操作系统凭据库删除{label}")),
+        Err(error) => Err(credential_store_error(
+            &format!("无法从操作系统凭据库删除{label}"),
+            error,
+        )),
     }
+}
+
+/// A credential-store failure as the user reads it. Only `NoStorageAccess`
+/// keeps its reason: on macOS that is the keychain dialog being refused, and
+/// the reason says how to get it back. Every other variant stays generic —
+/// `BadEncoding` in particular carries the stored secret's own bytes.
+fn credential_store_error(message: &str, error: keyring::Error) -> String {
+    match error {
+        keyring::Error::NoStorageAccess(reason) => format!("{message}：{reason}"),
+        _ => message.to_owned(),
+    }
+}
+
+/// Called before an action the user started that cannot work without a
+/// credential. On macOS a keychain dialog the user refused earlier in this
+/// process is then shown again; reads that only render status never call this,
+/// so a refusal is not answered with another dialog.
+pub(crate) fn allow_credential_prompt() {
+    #[cfg(target_os = "macos")]
+    crate::credential_vault::retry_after_refusal();
 }
 
 fn validate_provider_id(provider_id: &str) -> Result<(), String> {
@@ -1232,6 +1261,9 @@ pub(crate) fn initial_provider_key(
     provider: &ApiProvider,
     base_url: &Option<Url>,
 ) -> Result<Option<String>, String> {
+    // A run is the user asking for the credential, so a refused keychain
+    // dialog is worth raising again here.
+    allow_credential_prompt();
     if provider.family == ProviderFamily::OpenaiCodex {
         let credentials = crate::codex_oauth::host().credentials(&provider.id)?;
         return Ok(Some(credentials.access_token.to_string()));
@@ -1279,6 +1311,7 @@ pub(crate) fn step_credential(
 /// Fetches models using the provider-specific strategy in `model_discovery`.
 /// A generic `{base}/models` request is incomplete for several providers.
 pub fn fetch_models(provider: &ApiProvider) -> Result<Vec<ModelProfile>, String> {
+    allow_credential_prompt();
     crate::model_discovery::fetch_models(provider)
 }
 
@@ -3705,7 +3738,7 @@ fn run_model_inner(
                             &shadowed_approval,
                         ) {
                             failed_tool_execution(call, reason)
-                        } else if tool_executor::ShellKind::from_tool_name(&call.name).is_some()
+                        } else if tool_executor::ShellKind::of_command_tool(&call.name).is_some()
                             && tool_executor::shell_run_in_background_requested(&call.input)
                         {
                             // Consume approval before spawning the background shell
@@ -3806,7 +3839,7 @@ fn run_model_inner(
                             // Declared rather than built inline so the closure
                             // borrows the turn's state instead of moving it; it
                             // must not outlive this one call.
-                            let shell_kind = tool_executor::ShellKind::from_tool_name(&call.name);
+                            let shell_kind = tool_executor::ShellKind::of_command_tool(&call.name);
                             let shell_call_id = call.id.clone();
                             let shell_command =
                                 tool_executor::parse_shell_command(&call.input).unwrap_or_default();
@@ -5833,6 +5866,7 @@ fn execute_model_tool_with_scope(
         handoff,
         &request.prompt_profile,
         Some(file_guard_context(request, state)),
+        &request.decision_miss_scoring,
     );
     (
         execution.result,
@@ -6310,7 +6344,13 @@ fn automatic_tool_rejection_reason(
     if call.input.contains_key("_raw") {
         return Some("The model supplied tool arguments that are not a JSON object".to_owned());
     }
-    None
+    // The executor routes a decision-parameter tool on its arguments alone, so the
+    // conversation's choice of form is enforced here, before approval is even asked for.
+    crate::decision_tools::parameter_mode_rejection(
+        &request.decision_parameter_modes,
+        &call.name,
+        &call.input,
+    )
 }
 
 fn rejected_tool_execution(
@@ -6501,6 +6541,8 @@ fn web_search_request_template(
         skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
+            decision_parameter_modes: Default::default(),
+            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
         // A search call reports as prose, not through `structured_output`.
@@ -9207,6 +9249,10 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         // and never read those results, so `attach_mcp_tools` re-withholds
         // every one of them and the child searches for its own.
         mcp_tool_discovery: parent.mcp_tool_discovery,
+        // Inherited with the tool descriptors that carry the schemas: a child's `preview_click` is
+        // the parent's, so the arguments it may take are too.
+        decision_parameter_modes: parent.decision_parameter_modes.clone(),
+        decision_miss_scoring: parent.decision_miss_scoring.clone(),
         // The guards are inherited; the read record is not shared. A child gets
         // a scope of its own, seeded from the parent's on first use — the
         // parent's reads are what the child may edit, but what the child then
@@ -10762,7 +10808,7 @@ fn run_background_shell(
     hook_allows_permission: bool,
     round: usize,
 ) -> Result<ToolExecution, String> {
-    let kind = tool_executor::ShellKind::from_tool_name(&call.name)
+    let kind = tool_executor::ShellKind::of_command_tool(&call.name)
         .expect("dispatch guarantees a shell tool name");
     if parent.subagent_depth >= 1 {
         // Children cannot use `task_wait`; fold is their only delivery path, and
@@ -10867,12 +10913,17 @@ fn run_background_shell(
         Ok(selected) => selected,
         Err(error) => return Ok(failed_tool_execution(call, error)),
     };
+    let program = match tool_executor::shell_program(&selected, kind) {
+        Ok(program) => program,
+        Err(error) => return Ok(failed_tool_execution(call, error)),
+    };
     let shell_context = tool_executor::shell_call_context(
         kind,
         &selected.runner,
         &parent.conversation_id,
         Some(Path::new(&parent.app_data_path)),
         state,
+        selected.sandbox.is_some(),
     );
     let local_anchor = if selected.is_local() {
         PathBuf::from(&selected.root)
@@ -10901,10 +10952,12 @@ fn run_background_shell(
         &selected.root,
         &start_dir,
         kind,
+        program.as_deref(),
         &command,
         &selected.runner,
         shell_context.session(),
         &parent.prompt_profile,
+        selected.sandbox.as_ref(),
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -14499,7 +14552,6 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_platform::host_platform;
     use crate::{
         catalog,
         model::{HookDefinition, ImageAttachment, ModelProfile},
@@ -14807,6 +14859,8 @@ mod tests {
             skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
+            decision_parameter_modes: Default::default(),
+            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model: {
@@ -33908,8 +33962,9 @@ mod tests {
     #[test]
     fn the_main_agent_catalog_exposes_exactly_the_two_web_names() {
         let catalog = catalog::tool_catalog();
-        // The web group has exactly search, fetch, the fifteen preview tools and the five
-        // decision-model preview tools; `web_query` remains retired.
+        // The web group has exactly search, fetch, the fifteen preview tools and
+        // `preview_find_logs`; `web_query` remains retired, and so are the four
+        // `_by_description`/`find_element` tools the base tools' `query` form replaced.
         let web_names = catalog
             .iter()
             .filter(|tool| tool.category == ToolCategory::Web)
@@ -33935,11 +33990,7 @@ mod tests {
                 "preview_resize",
                 "preview_upload_image",
                 "preview_dialog",
-                "preview_find_element",
                 "preview_find_logs",
-                "preview_click_by_description",
-                "preview_fill_by_description",
-                "preview_inspect_by_description",
             ]
         );
 
@@ -33947,7 +33998,12 @@ mod tests {
         main.tools = catalog;
         main.enabled_tools = main.tools.iter().map(|tool| tool.name.clone()).collect();
         // A retired name must be unknown rather than an accessible no-prompt path.
-        for retired in ["web_query", "web_research"] {
+        for retired in [
+            "web_query",
+            "web_research",
+            "preview_find_element",
+            "preview_click_by_description",
+        ] {
             let call = ToolCall {
                 id: format!("call-main-{retired}"),
                 name: retired.into(),
@@ -33959,6 +34015,66 @@ mod tests {
                 "{retired} must be unreachable",
             );
         }
+    }
+
+    /// A conversation's decision-parameter modes reach the wire as the tool's own schema, and a
+    /// call that does not fit its tool's mode is refused before execution.
+    #[test]
+    fn decision_parameter_modes_shape_the_schema_and_gate_the_call() {
+        use crate::model::DecisionParameterMode;
+
+        let mut request = run_request(ProviderFamily::OpenaiResponses);
+        request.tools = catalog::tool_catalog();
+        request.enabled_tools = vec!["preview_click".into(), "preview_snapshot".into()];
+        request.decision_parameter_modes = BTreeMap::from([
+            ("preview_click".to_owned(), DecisionParameterMode::Replace),
+            ("preview_snapshot".to_owned(), DecisionParameterMode::Augment),
+        ]);
+        crate::decision_tools::inject_parameter_schemas(&mut request);
+
+        let schema_of = |name: &str| {
+            let tool = request.tools.iter().find(|tool| tool.name == name).unwrap();
+            crate::aisdk::tools::tool_schema(tool, &request.prompt_profile, &request.workspaces)
+        };
+        let click = schema_of("preview_click");
+        assert!(click["properties"].get("selector").is_none());
+        assert!(click["properties"].get("threshold").is_none());
+        assert_eq!(click["required"], json!(["query"]));
+        let snapshot = schema_of("preview_snapshot");
+        assert!(snapshot["properties"].get("query").is_some());
+        assert_eq!(snapshot["required"], json!([]));
+        // A tool the conversation left on its direct form keeps the catalog schema.
+        assert!(request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "preview_fill")
+            .unwrap()
+            .input_schema
+            .is_none());
+
+        let call = |name: &str, input: Value| ToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            input: input.as_object().unwrap().clone(),
+        };
+        assert!(automatic_tool_rejection_reason(
+            &request,
+            &call("preview_click", json!({"selector": "button"}))
+        )
+        .is_some());
+        assert_eq!(
+            automatic_tool_rejection_reason(&request, &call("preview_click", json!({"query": "save"}))),
+            None
+        );
+        assert!(automatic_tool_rejection_reason(
+            &request,
+            &call("preview_click", json!({"query": "save", "threshold": 0.6}))
+        )
+        .is_some());
+        assert_eq!(
+            automatic_tool_rejection_reason(&request, &call("preview_snapshot", json!({}))),
+            None
+        );
     }
 
     /// A cancellation signaled by the probe sink must propagate as `Cancelled`, not
@@ -34821,10 +34937,13 @@ mod tests {
         ] {
             assert!(exposed.contains(name), "{name} must be advertised");
         }
-        // PowerShell runs only on a Windows host; everywhere else both of its
-        // tools are withdrawn rather than advertised to fail.
-        for name in ["powershell", "powershell_find_output"] {
-            assert_eq!(exposed.contains(name), host_platform().runs_powershell(), "{name}");
+        // A shell's tools are advertised only where a machine has the shell;
+        // everywhere else they are withdrawn rather than advertised to fail.
+        let local = crate::machine_shells::local();
+        for backend in crate::shell_backend::ShellBackend::ALL {
+            for name in [backend.tool_name(), backend.find_output_tool_name()] {
+                assert_eq!(exposed.contains(name), local.get(backend).is_some(), "{name}");
+            }
         }
     }
 
@@ -34850,10 +34969,11 @@ mod tests {
                 .filter(|name| {
                     !matches!(name.as_str(), "preview_screenshot" | "preview_upload_image")
                 })
-                // A POSIX host withdraws both PowerShell tools.
+                // A shell tool is withdrawn where the host has no such shell.
                 .filter(|name| {
-                    host_platform().runs_powershell()
-                        || !crate::builtin_schemas::is_powershell_tool(name)
+                    crate::shell_backend::ShellBackend::of_tool(name).map_or(true, |backend| {
+                        crate::machine_shells::local().get(backend).is_some()
+                    })
                 })
                 .collect::<Vec<_>>();
             let step = step_request(&request);
@@ -35527,6 +35647,8 @@ mod tests {
             skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
+            decision_parameter_modes: Default::default(),
+            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model,

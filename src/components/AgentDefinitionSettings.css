@@ -42,52 +42,103 @@
   opacity: .5;
 }
 
-.agent-definition-editor {
+/* ---- The role editor ----
+
+   The window is the conversation-settings pane itself (`.conversation-settings`),
+   laid out as a preset's window is. These rules add only what a role's window
+   has and a preset's does not. */
+
+/* The three pages keep their own height, so the preset list that slides in
+   under them takes the space between the pages and the save — and scrolls in
+   it — rather than squeezing the pages. */
+.agent-definition-editor__nav .conversation-settings__nav-items { flex: 1 0 auto; }
+
+/* Drawn only while the template page is open, and it arrives from below: it is
+   the page's companion, not a fourth page. */
+.agent-definition-editor__presets {
+  flex: 0 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  animation: agent-definition-presets-in .2s cubic-bezier(.2, .8, .2, 1);
+}
+
+@keyframes agent-definition-presets-in { from { opacity: 0; transform: translateY(12px); } }
+
+.agent-definition-editor__presets-label {
+  flex: 0 0 auto;
+  padding: 0 7px;
+  color: var(--faint);
+  font-size: 8.5px;
+}
+
+.agent-definition-editor__presets-list {
+  flex: 0 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  overflow-y: auto;
 }
 
-/* Only the fields the editor stacks itself. The rows below are a `.field-row`
-   column and set their own spacing; matching on any descendant `.field` would
-   put a stacked field's margin back under every one of them. */
-.agent-definition-editor > .field {
-  margin-bottom: 12px;
+.agent-definition-editor__presets-empty {
+  margin: 0;
+  padding: 0 7px;
+  color: var(--faint);
+  font-size: 8.5px;
+  line-height: 1.45;
 }
 
-/* The rows share one left edge with the tool picker under them, so the whole
-   dialog reads as a single column rather than as panels with their own insets. */
-.agent-definition-editor__rows {
-  padding: 0;
-  margin-bottom: 4px;
+/* One line per preset, the whole line the button: the name on the left, the
+   arrow on the right pointing at the body it would replace. Metrics follow the
+   rail's own page entries so the two read as one column. */
+.agent-definition-editor__preset {
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 7px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10.5px;
+  text-align: left;
 }
 
-.agent-definition-editor__tools {
-  margin-top: 4px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
+.agent-definition-editor__preset span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* No scroller of its own. The dialog body already scrolls, and a second one
-   nested inside it means the picker can be scrolled to a place the page cannot
-   follow — a group heading stranded above its own rows. */
-.agent-definition-editor__tools .tool-settings-groups {
-  margin-top: 8px;
-}
+.agent-definition-editor__preset svg { flex: 0 0 auto; color: var(--faint); transition: transform .12s; }
+.agent-definition-editor__preset:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.agent-definition-editor__preset:hover:not(:disabled) svg { color: var(--text); transform: translateX(2px); }
+.agent-definition-editor__preset:disabled { opacity: .45; }
+
+/* The name and the description are stacked fields, not rows: both take prose
+   wider than a row's control slot. The page stack already spaces sections, so
+   the fields drop their own trailing margin. */
+.conversation-settings__field.agent-definition-editor__identity { gap: 12px; }
+.agent-definition-editor__identity .field { margin-bottom: 0; }
+
+/* The rows share one left edge with the stacked fields above them. */
+.agent-definition-editor__rows { padding: 0; }
 
 .agent-definition-editor__warning,
 .agent-definition-editor__error {
   margin: 0;
-  padding: 7px 0;
-  border-top: 1px solid var(--border);
-  font-size: 9.5px;
+  font-size: 9px;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
-.agent-definition-editor__warning {
-  color: var(--warning);
-}
-
-.agent-definition-editor__error {
-  color: var(--danger);
-}
+.agent-definition-editor__warning { color: var(--warning); }
+.agent-definition-editor__error { color: var(--danger); }

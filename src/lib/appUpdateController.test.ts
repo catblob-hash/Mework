@@ -39,7 +39,8 @@ const updateCheck: AppUpdateCheck = {
   },
   asset,
   checksumsAsset,
-  checkedAt: "2026-09-05T00:00:00Z"
+  checkedAt: "2026-09-05T00:00:00Z",
+  inAppInstall: true
 };
 
 const noUpdateCheck: AppUpdateCheck = {

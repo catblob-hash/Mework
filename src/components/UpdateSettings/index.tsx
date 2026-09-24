@@ -79,7 +79,11 @@ function VersionCard({
         </div>
         {info && (
           <div className="update-settings__badges">
-            <span className="update-settings__badge">{flavorLabel(info, t)}</span>
+            {/* Installer and portable are the two Windows editions; elsewhere the flavor only
+                says that no NSIS uninstaller was found. */}
+            {info.os === "windows" && (
+              <span className="update-settings__badge">{flavorLabel(info, t)}</span>
+            )}
             <span className="update-settings__badge update-settings__badge--mono">{info.arch}</span>
             {info.developmentBuild && (
               <span className="update-settings__badge update-settings__badge--warning">
@@ -164,13 +168,20 @@ function statusOf(
       const published = check.release.publishedAt
         ? t("，发布于 {date}", ", published {date}", { date: formatDate(check.release.publishedAt, locale) })
         : "";
-      const flavorNote = info && !check.asset
+      // A host without in-app install (anything but Windows) detects as "portable" only because
+      // it has no NSIS uninstaller, so naming that flavor here would blame the release instead.
+      const flavorNote = !check.inAppInstall
         ? t(
-          "这次发布没有提供{flavor}的安装文件，请到发布页手动下载。",
-          "This release has no file for the {flavor} flavor; download it from the release page.",
-          { flavor: flavorLabel(info, t) }
+          "当前平台暂不支持应用内更新，请到发布页下载新版本。",
+          "In-app updates are not available on this platform; download the new version from the release page."
         )
-        : "";
+        : info && !check.asset
+          ? t(
+            "这次发布没有提供{flavor}的安装文件，请到发布页手动下载。",
+            "This release has no file for the {flavor} flavor; download it from the release page.",
+            { flavor: flavorLabel(info, t) }
+          )
+          : "";
       return {
         tone: "accent",
         title: t("发现新版本 v{version}", "Version v{version} is available", { version: check.latestVersion }),

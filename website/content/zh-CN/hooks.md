@@ -35,7 +35,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(bash|powershell)$",
+        "matcher": "^(bash|zsh|sh|powershell)$",
         "hooks": [
           { "type": "command", "name": "No force push", "command": "python hooks/no_force_push.py" }
         ]
@@ -134,7 +134,7 @@
 
 ## 示例
 
-使用 Python 阻止危险的 git 命令（`PreToolUse`，匹配器 `^(bash|powershell)$`）：
+使用 Python 阻止危险的 git 命令（`PreToolUse`，匹配器 `^(bash|zsh|sh|powershell)$`）：
 
 ```python
 import json, sys, re

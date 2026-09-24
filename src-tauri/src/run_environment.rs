@@ -20,6 +20,7 @@ use wait_timeout::ChildExt;
 
 use crate::host_platform::host_platform;
 use crate::model::{ExecutionEnvironmentAssets, RunTarget};
+use crate::shell_backend::{AgentShell, ScriptDialect};
 
 /// Trusted shell environment resolved by the host. Only [`resolve_shell_runner`] may
 /// construct it from persisted data; neither renderer nor model input may do so.
@@ -31,6 +32,8 @@ pub enum ShellRunner {
     Wsl {
         distro: String,
         env: BTreeMap<String, String>,
+        /// The shell Mework's own scripts run in on the distribution.
+        agent_shell: AgentShell,
     },
     Ssh {
         /// `user@hostname`, `hostname`, or a `~/.ssh/config` Host alias.
@@ -40,6 +43,8 @@ pub enum ShellRunner {
         /// Empty delegates to OpenSSH's default resolution.
         identity_file: String,
         env: BTreeMap<String, String>,
+        /// The shell Mework's own scripts run in on the machine.
+        agent_shell: AgentShell,
     },
 }
 
@@ -69,6 +74,23 @@ impl ShellRunner {
         match self {
             Self::Local { env } | Self::Wsl { env, .. } | Self::Ssh { env, .. } => env,
         }
+    }
+
+    /// The shell Mework's own scripts run in on this machine. The host has
+    /// none: its file tools act on its own filesystem.
+    pub fn agent_shell(&self) -> Option<&AgentShell> {
+        match self {
+            Self::Local { .. } => None,
+            Self::Wsl { agent_shell, .. } | Self::Ssh { agent_shell, .. } => Some(agent_shell),
+        }
+    }
+
+    /// The dialect a script for this machine is written in: whatever its agent
+    /// shell reads. POSIX for the host, which runs no scripts.
+    pub fn script_dialect(&self) -> ScriptDialect {
+        self.agent_shell()
+            .map(AgentShell::dialect)
+            .unwrap_or(ScriptDialect::Posix)
     }
 
     /// Approval fingerprint over environment identity and variables. A manual-execution
@@ -160,6 +182,11 @@ pub fn resolve_shell_runner(
             Ok(ShellRunner::Wsl {
                 distro: distro.clone(),
                 env,
+                agent_shell: resolve_agent_shell(
+                    assets,
+                    target,
+                    assets.wsl_agent_shells.get(distro).copied(),
+                ),
             })
         }
         Some(RunTarget::Ssh { machine_id }) => {
@@ -183,9 +210,42 @@ pub fn resolve_shell_runner(
                 port: machine.port,
                 identity_file: machine.identity_file.clone(),
                 env,
+                agent_shell: resolve_agent_shell(assets, target, machine.agent_shell),
             })
         }
     }
+}
+
+/// The agent shell a machine's scripts run in: the one its settings chose when
+/// the machine still has it, otherwise the first backend in the OS's priority
+/// list that the last probe found. A machine never probed keeps its choice by
+/// name, or bash — what every remote script ran in before there was a choice.
+fn resolve_agent_shell(
+    assets: &ExecutionEnvironmentAssets,
+    target: Option<&RunTarget>,
+    configured: Option<crate::shell_backend::ShellBackend>,
+) -> AgentShell {
+    let Some(probed) = crate::machine_shells::get(&env_key(target)) else {
+        return configured
+            .map(|backend| AgentShell::new(backend, backend.default_program()))
+            .unwrap_or_default();
+    };
+    let available = probed.backends();
+    configured
+        .filter(|backend| available.contains(backend))
+        .or_else(|| {
+            crate::shell_backend::preferred_backend(
+                probed.os,
+                assets.shell_priority.listed(probed.os),
+                &available,
+            )
+        })
+        .and_then(|backend| {
+            probed
+                .get(backend)
+                .map(|shell| AgentShell::new(backend, shell.path.clone()))
+        })
+        .unwrap_or_default()
 }
 
 /// Validates WSL distribution names: alphanumeric leading character, then only
@@ -267,11 +327,32 @@ pub fn quote_remote_path(cwd: &str) -> String {
 /// attached on the distribution itself carries; environment variables are argv
 /// entries and the command is the single `bash -c` argument passed unchanged
 /// through `--exec`.
+#[cfg(test)]
 pub fn wsl_shell_args(
     distro: &str,
     workspace_root: &str,
     env: &BTreeMap<String, String>,
     command: &str,
+) -> Vec<String> {
+    wsl_exec_args(
+        distro,
+        workspace_root,
+        env,
+        crate::shell_backend::remote_command_argv(
+            crate::shell_backend::ShellBackend::Bash,
+            "bash",
+            command,
+        ),
+    )
+}
+
+/// [`wsl_shell_args`] for any program: `argv` runs under `/usr/bin/env` with
+/// the variable table, in `workspace_root`.
+pub fn wsl_exec_args(
+    distro: &str,
+    workspace_root: &str,
+    env: &BTreeMap<String, String>,
+    argv: Vec<String>,
 ) -> Vec<String> {
     let mut args = vec![
         "-d".into(),
@@ -286,13 +367,7 @@ pub fn wsl_shell_args(
             .filter(|(key, _)| !is_shell_startup_env_name(key))
             .map(|(key, value)| format!("{key}={value}")),
     );
-    args.extend([
-        "bash".into(),
-        "--noprofile".into(),
-        "--norc".into(),
-        "-c".into(),
-        command.to_owned(),
-    ]);
+    args.extend(argv);
     args
 }
 
@@ -336,6 +411,7 @@ pub fn ssh_connection_args(host: &str, port: u16, identity_file: &str) -> Vec<St
 /// it starts, which is the remote user's home.
 ///
 /// [`remote_shell::posix_line`]: crate::remote_shell::posix_line
+#[cfg(test)]
 pub fn ssh_shell_args(
     host: &str,
     port: u16,
@@ -344,8 +420,32 @@ pub fn ssh_shell_args(
     env: &BTreeMap<String, String>,
     command: &str,
 ) -> Vec<String> {
+    ssh_exec_args(
+        host,
+        port,
+        identity_file,
+        remote_cwd,
+        env,
+        &crate::shell_backend::remote_command_argv(
+            crate::shell_backend::ShellBackend::Bash,
+            "bash",
+            command,
+        ),
+    )
+}
+
+/// [`ssh_shell_args`] for any POSIX program: `argv` is `exec`ed by `sh` in
+/// `remote_cwd` with the variable table.
+pub fn ssh_exec_args(
+    host: &str,
+    port: u16,
+    identity_file: &str,
+    remote_cwd: &str,
+    env: &BTreeMap<String, String>,
+    argv: &[String],
+) -> Vec<String> {
     let mut args = ssh_connection_args(host, port, identity_file);
-    let script = ssh_bash_script(remote_cwd, env, command);
+    let script = ssh_exec_script(remote_cwd, env, argv);
     let line = crate::remote_shell::posix_line(&script);
     // The line is one argument to the login shell, and Linux refuses a single
     // argument over 128 KiB. A command dense enough in escaped bytes to cross
@@ -363,10 +463,9 @@ pub fn ssh_shell_args(
 /// (32 pages of 4 KiB) with room for its terminating NUL.
 const MAX_NEUTRAL_LINE_BYTES: usize = 128 * 1024 - 1;
 
-/// The `sh` script [`ssh_shell_args`] sends: enter the workspace, then hand the
-/// command to a bash that reads no startup files, with the variable table in
-/// its environment.
-fn ssh_bash_script(remote_cwd: &str, env: &BTreeMap<String, String>, command: &str) -> String {
+/// The `sh` script [`ssh_exec_args`] sends: enter the workspace, then `exec`
+/// the program with the variable table in its environment.
+fn ssh_exec_script(remote_cwd: &str, env: &BTreeMap<String, String>, argv: &[String]) -> String {
     let mut remote = String::new();
     if !remote_cwd.is_empty() {
         remote.push_str(&format!("cd {} || exit 1; ", quote_remote_path(remote_cwd)));
@@ -383,11 +482,38 @@ fn ssh_bash_script(remote_cwd: &str, env: &BTreeMap<String, String>, command: &s
             remote.push(' ');
         }
     }
-    remote.push_str(&format!(
-        "bash --noprofile --norc -c {}",
-        sh_single_quote(command)
-    ));
+    // The last word is the command or script itself, and stays quoted
+    // whatever it holds.
+    let last = argv.len().saturating_sub(1);
+    remote.push_str(
+        &argv
+            .iter()
+            .enumerate()
+            .map(|(position, part)| {
+                if position == last {
+                    sh_single_quote(part)
+                } else {
+                    sh_word(part)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     remote
+}
+
+/// One `sh` word for `text`: as itself when nothing in it is special to the
+/// shell, single-quoted otherwise.
+fn sh_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&byte));
+    if plain {
+        text.to_owned()
+    } else {
+        sh_single_quote(text)
+    }
 }
 
 /// SSH client executable candidates in priority order. On Windows, the system OpenSSH
@@ -469,19 +595,24 @@ pub struct RemoteCommandOutput {
 /// call keeps a child alive.
 const REMOTE_POLL: Duration = Duration::from_millis(100);
 
-/// Runs one host-authored `bash -c` script on the machine `runner` dispatches to,
-/// feeding `stdin` if given.
+/// Runs one host-authored script on the machine `runner` dispatches to, in that
+/// machine's agent shell, feeding `stdin` if given.
+///
+/// The script must be written in the runner's
+/// [`script_dialect`](ShellRunner::script_dialect): POSIX `sh` for bash, zsh
+/// and sh — zsh reads it in `sh` emulation — and PowerShell for PowerShell.
 ///
 /// The script is the only variable in the invocation and it is authored here, not
 /// by the model: every fragment a caller folds into it goes through
-/// [`sh_single_quote`] first. A `Local` runner is refused — this host's own
-/// filesystem is reached directly, and silently running a POSIX script through
-/// some local Bash would act on paths that mean something else here.
+/// [`sh_single_quote`] (or its PowerShell twin) first. A `Local` runner is
+/// refused — this host's own filesystem is reached directly, and silently
+/// running a script through some local shell would act on paths that mean
+/// something else here.
 ///
 /// An SSH machine the agent serves runs the script through it
-/// ([`crate::remote_link`]): the same `bash --noprofile --norc -c`, started by
-/// the agent directly instead of by the login shell, over the machine's one
-/// long-lived connection instead of a fresh SSH login.
+/// ([`crate::remote_link`]): the agent starts the shell directly instead of
+/// the login shell doing it, over the machine's one long-lived connection
+/// instead of a fresh SSH login.
 pub fn run_remote_script(
     runner: &ShellRunner,
     script: &str,
@@ -489,12 +620,12 @@ pub fn run_remote_script(
     timeout: Duration,
     cancel: &crate::cancel::CancelSignal,
 ) -> Result<RemoteCommandOutput, String> {
-    let argv = ["bash", "--noprofile", "--norc", "-c", script]
-        .iter()
-        .map(|part| (*part).to_owned())
-        .collect();
-    if let Some(result) = crate::remote_link::run_script(runner, argv, stdin, timeout, cancel) {
-        return result;
+    if let Some(shell) = runner.agent_shell() {
+        let argv = shell.script_argv(script);
+        if let Some(result) = crate::remote_link::run_script(runner, argv, stdin, timeout, cancel)
+        {
+            return result;
+        }
     }
     let child = spawn_remote_script(runner, script, stdin.is_some())?;
     pump_remote_child(child, runner, stdin, timeout, cancel)
@@ -513,26 +644,72 @@ pub fn remote_script_invocation(
         ShellRunner::Local { .. } => {
             Err("This machine's own filesystem is not reached through a remote shell".into())
         }
-        ShellRunner::Wsl { distro, .. } => {
+        ShellRunner::Wsl {
+            distro,
+            agent_shell,
+            ..
+        } => {
             validate_wsl_distro_name(distro)?;
+            if agent_shell.dialect() != ScriptDialect::Posix {
+                return Err(format!(
+                    "WSL runs POSIX shells only; {} cannot be its agent shell",
+                    agent_shell.backend
+                ));
+            }
             Ok((
                 vec!["wsl.exe".to_owned()],
                 // `--cd /` keeps the invocation independent of wherever the
                 // distribution would otherwise start; the script does its own
                 // `cd` to the workspace root it was built for.
-                wsl_shell_args(distro, "/", &env, script),
+                wsl_exec_args(distro, "/", &env, agent_shell.script_argv(script)),
             ))
         }
         ShellRunner::Ssh {
             host,
             port,
             identity_file,
+            agent_shell,
             ..
         } => Ok((
             ssh_client_candidates(),
-            ssh_shell_args(host, *port, identity_file, "", &env, script),
+            match agent_shell.dialect() {
+                ScriptDialect::Posix => ssh_exec_args(
+                    host,
+                    *port,
+                    identity_file,
+                    "",
+                    &env,
+                    &agent_shell.script_argv(script),
+                ),
+                // No login shell to get past but `cmd.exe` or PowerShell
+                // itself: the script travels base64-encoded, which both pass
+                // through untouched, with the variable table set inside it.
+                ScriptDialect::PowerShell => {
+                    let mut args = ssh_connection_args(host, *port, identity_file);
+                    args.push(crate::remote_shell::powershell_line(&format!(
+                        "{}{script}",
+                        powershell_env_prologue(&env)
+                    )));
+                    args
+                }
+            },
         )),
     }
+}
+
+/// PowerShell statements that put a runner's variable table into the
+/// environment of what the script starts.
+pub fn powershell_env_prologue(env: &BTreeMap<String, String>) -> String {
+    env.iter()
+        .filter(|(key, _)| !is_shell_startup_env_name(key))
+        .map(|(key, value)| {
+            format!(
+                "[Environment]::SetEnvironmentVariable({}, {})\n",
+                crate::remote_shell::ps_single_quote(key),
+                crate::remote_shell::ps_single_quote(value)
+            )
+        })
+        .collect()
 }
 
 /// Runs a POSIX `sh` script on the machine `runner` dispatches to, assuming
@@ -824,6 +1001,17 @@ pub fn local_bash_candidates() -> Vec<String> {
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| "bash".into())]
     }
+}
+
+/// Where a program the shell tool would start by name lives on this host, as
+/// an absolute path: the first match on `PATH`. The host's shell probe asks
+/// this, so what is listed is what a call would run.
+pub fn local_program_path(name: &str) -> Option<String> {
+    #[cfg(windows)]
+    let found = path_lookup(name);
+    #[cfg(not(windows))]
+    let found = unix_path_lookup(name);
+    found.map(|path| path.to_string_lossy().into_owned())
 }
 
 /// The first executable file called `name` in an absolute `PATH` directory.
@@ -1376,6 +1564,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -1432,7 +1621,7 @@ mod tests {
             Some("/home/dev/app"),
         )
         .unwrap();
-        let ShellRunner::Wsl { distro, env } = runner else {
+        let ShellRunner::Wsl { distro, env, .. } = runner else {
             panic!("expected wsl runner");
         };
         assert_eq!(distro, "Ubuntu");
@@ -1511,6 +1700,7 @@ mod tests {
             port,
             identity_file,
             env,
+            ..
         } = runner
         else {
             panic!("expected ssh runner");
@@ -1524,14 +1714,17 @@ mod tests {
     #[test]
     fn fingerprint_changes_with_identity_and_env() {
         let base = ShellRunner::Wsl {
+            agent_shell: Default::default(),
             distro: "Ubuntu".into(),
             env: BTreeMap::new(),
         };
         let other_distro = ShellRunner::Wsl {
+            agent_shell: Default::default(),
             distro: "Debian".into(),
             env: BTreeMap::new(),
         };
         let with_env = ShellRunner::Wsl {
+            agent_shell: Default::default(),
             distro: "Ubuntu".into(),
             env: [("A".to_owned(), "1".to_owned())].into_iter().collect(),
         };
@@ -1738,6 +1931,7 @@ mod tests {
     fn a_remote_script_invocation_is_the_shell_legs_argv() {
         let (programs, args) = remote_script_invocation(
             &ShellRunner::Wsl {
+                agent_shell: Default::default(),
                 distro: "Ubuntu".into(),
                 env: BTreeMap::new(),
             },
@@ -1752,6 +1946,7 @@ mod tests {
 
         let (programs, args) = remote_script_invocation(
             &ShellRunner::Ssh {
+                agent_shell: Default::default(),
                 host: "devbox".into(),
                 port: 2222,
                 identity_file: String::new(),

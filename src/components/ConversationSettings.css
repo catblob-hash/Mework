@@ -281,10 +281,7 @@
 .conversation-settings__page-body--flush { padding: 0; overflow: hidden; display: flex; }
 .conversation-settings__page-stack--flush { flex: 1; min-width: 0; min-height: 0; gap: 0; max-width: none; }
 
-/* One grid for both surfaces the template editor is mounted on. Without a rail
-   it is a single column, and the save row sits under the timeline; with one it
-   is two columns, and the save row still spans the full width — so the button
-   is in the window's own bottom-left corner rather than the timeline's. */
+/* The timeline, and under it the save row where there is one. */
 .template-editor {
   flex: 1;
   min-width: 0;
@@ -294,22 +291,6 @@
   grid-template-rows: minmax(0, 1fr) auto;
 }
 
-.template-editor--railed { grid-template-columns: 178px minmax(0, 1fr); }
-/* The rail is a column: the list of templates, and under it the one action that
-   belongs to the window rather than to the body on the right. The divider moves
-   here from the nav so it runs past the footer too. */
-.template-editor__aside {
-  grid-row: 1;
-  grid-column: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  border-right: 1px solid var(--border);
-  background: var(--color-f6f6f3);
-}
-.template-editor--railed .template-preview,
-.template-editor--railed .template-preview__loading { grid-row: 1; grid-column: 2; }
 .template-editor__actions { grid-column: 1 / -1; }
 
 .template-editor__error--strip {
@@ -329,22 +310,6 @@
   background: var(--color-fafaf8);
 }
 
-.template-window__nav { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; border-right: 0; }
-.template-window__nav-divider { margin: 6px 9px; border: 0; border-top: 1px solid var(--border); }
-
-/* Saving under the rail, drawn as the conversation-settings pane draws its own
-   save in the same corner: a bordered text button the width of the rail, not a
-   filled one on a bar of its own. */
-.template-editor__aside .template-editor__actions {
-  flex: 0 0 auto;
-  min-height: 0;
-  padding: 8px 9px 11px;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 5px;
-  background: transparent;
-}
-
 .template-editor__actions .text-button {
   min-height: 24px;
   padding: 0 4px;
@@ -362,14 +327,6 @@
   color: var(--text);
 }
 
-/* A refused write has a rail's width to say so in, so it wraps rather than
-   sharing the button's line the way the old bar let it. */
-.template-editor__aside .template-editor__error {
-  flex: 0 0 auto;
-  font-size: 9px;
-  overflow-wrap: anywhere;
-}
-
 /* The tools a save would leave uncallable, listed so the user can tell at a
    glance whether enabling them is what they meant. */
 .template-editor__missing-tools { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
@@ -379,10 +336,10 @@
 
 /* ---- Domain lists window ---- */
 
-/* The same shape as the template window above — a rail of pages on the left,
-   the body on the right — under its own names rather than a reuse of
-   `.template-editor`: nothing in here is a template, and sharing the class
-   would have made every later change to one land on the other. There are
+/* A rail of pages on the left, the body on the right — the shape of the
+   conversation-settings pane — under its own names: nothing in here is a
+   settings page, and sharing a class would have made every later change to one
+   land on the other. There are
    exactly two pages and no save button, because an edit lands on the
    conversation as it is typed. */
 .domain-rules {

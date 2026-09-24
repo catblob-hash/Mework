@@ -55,9 +55,21 @@ import {
   SIDEBAR_DEFAULT_WIDTH
 } from "./components/Sidebar";
 import { RemoteDirectoryPicker } from "./components/RemoteDirectoryPicker";
-import { ProjectSelector, TerminalShellButton, terminalShellMenuItems, WorkspaceMemberSelector } from "./components/ProjectChips";
+import {
+  machineIcon,
+  previewWorkspaceMenuItems,
+  ProjectSelector,
+  TerminalShellButton,
+  terminalShellMenuItems,
+  terminalWorkspaceMenuItems,
+  WorkspaceMemberSelector
+} from "./components/ProjectChips";
 import { ProjectDialog } from "./components/ProjectDialog";
-import { MachineSettingsDialog, WorkspaceEnvironmentDialog } from "./components/MachineDialogs";
+import {
+  MachineSettingsDialog,
+  WorkspaceEnvironmentDialog,
+  type MachineShellsControl
+} from "./components/MachineDialogs";
 import { ForkRequestTray } from "./components/ForkRequestTray";
 import { detachAbsentParents, reparentChildren } from "./lib/conversationTree";
 import { GitStatusCard } from "./components/GitStatusCard";
@@ -106,17 +118,25 @@ import {
   type ToolExposureMode
 } from "./lib/sendPipeline";
 import {
+  availableShellBackends,
+  knownShells,
+  listMachineShells,
+  probeMachineShells,
+  terminalShellsFor,
+  toolsForShellBackends,
+  withAgentShell,
+  withDefaultAgentShell
+} from "./lib/machineShells";
+import {
   conversationWorkspaces,
   hostIsWindows,
   isReservedWorkspace,
   machineUsage,
   projectWorkspaces,
   terminalShellLabel,
-  terminalShellsFor,
   runEnvKey,
   sameMachine,
   TEMPORARY_WORKSPACE_ID,
-  toolsForHost,
   withWorkspaceArgument,
   workspaceDirectoryLabel,
   workspaceEnvKey,
@@ -131,9 +151,9 @@ import { grantsWebFetch } from "./lib/webSearch";
 import type { NewConversationSource, TerminalShell } from "./lib/workspaces";
 import {
   draftAsConversation,
-  draftSlotOf,
   DRAFT_CONVERSATION_ID,
-  isDraftConversationId
+  isDraftConversationId,
+  isUnsentConversation
 } from "./lib/draftConversation";
 import type { DraftConversationState } from "./lib/draftConversation";
 import { listWslDistros } from "./lib/runtime";
@@ -161,7 +181,8 @@ import {
   isAgentRunTool
 } from "./lib/subagents";
 import type { SubagentView } from "./lib/subagents";
-import { BrowserPanel } from "./components/BrowserPanel";
+import { BrowserPanel, splitBrowserAddress } from "./components/BrowserPanel";
+import { PreviewPageTabs } from "./components/PreviewPageTabs";
 import { GitReviewPanel } from "./components/GitReviewPanel";
 import { ShellTaskPanel } from "./components/ShellTaskPanel";
 import { FilesPane } from "./components/FilesPane";
@@ -184,11 +205,11 @@ import {
 } from "./lib/backend";
 import { onAppPushEvent } from "./lib/appEvents";
 import { hasNativeWorkspacePicker, pickWorkspaceDirectory } from "./lib/workspacePicker";
-import { createTerminalController, terminalSessionKey } from "./lib/terminalController";
-import type { TerminalSessionState } from "./lib/terminal";
+import { createTerminalController, terminalSessionIsLive, terminalSessionKey } from "./lib/terminalController";
+import { liveTerminalCount } from "./lib/terminal";
+import type { TerminalLaunchChoice, TerminalSessionState } from "./lib/terminal";
 import {
   initialTerminalTabsState,
-  terminalDisplayNumber,
   terminalTabsFor,
   terminalTabsReducer
 } from "./lib/terminalTabs";
@@ -202,6 +223,7 @@ import {
   navigateBrowser,
   openBrowser,
   performBrowserAction,
+  setBrowserPageNetwork,
   setBrowserPanelBounds
 } from "./lib/browser";
 import {
@@ -214,7 +236,8 @@ import {
   previewServerAddress,
   previewUrlIsServedAt,
   stopPreviewServer,
-  type PreviewServerSnapshot
+  type PreviewServerSnapshot,
+  type PreviewTarget
 } from "./lib/preview";
 import type {
   GitBranch as GitBranchInfo,
@@ -246,6 +269,7 @@ import {
   focusedPane,
   isPrimaryPreviewSession,
   loadSidePanesState,
+  newPreviewPageSessionId,
   openPreviewSession,
   paneIsOpen,
   paneKind,
@@ -254,6 +278,7 @@ import {
   previewPaneId,
   previewSessionBelongsToConversation,
   previewSessionsFor,
+  previewWorkspaceOf,
   shellPaneId,
   sidePaneDomId,
   sidePaneLayoutFor,
@@ -268,6 +293,7 @@ import { configureApplicationAppearance } from "./theme";
 import { ZOOM_STEP, clampZoom, defaultAppearancePreferences } from "./lib/appearance";
 import {
   SHORTCUT_COMMANDS,
+  isImeKeyEvent,
   matchesEvent,
   resolveShortcut,
   shouldSuppressForFocus
@@ -282,6 +308,7 @@ import {
   type GlobalSettingsChange
 } from "./lib/documentUpdates";
 import { createDocumentStore } from "./lib/documentStore";
+import type { DocumentStore } from "./lib/documentStore";
 import { createConversationSync } from "./lib/conversationSync";
 import { createComposerController } from "./lib/composerController";
 import { createBrowserController } from "./lib/browserController";
@@ -358,6 +385,8 @@ import type {
   RunTarget as RunTargetType,
   SecurityLevel,
   SshMachineConfig as SshMachineConfigType,
+  MachineShells,
+  ShellBackend,
   SettingsView,
   ShortcutCommandId,
   SubagentLiveState,
@@ -614,6 +643,16 @@ function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
   textarea.style.height = `${Math.min(COMPOSER_TEXTAREA_MAX_HEIGHT, textarea.scrollHeight)}px`;
 }
 
+/**
+ * Resolves once the host's document holds `workspaceId`, sending the pending document save first
+ * when it does not. A project added in the same event reaches the host through the debounced
+ * save, later than a command that names it would; the host refuses what it cannot resolve.
+ */
+async function awaitWorkspaceAtHost(store: DocumentStore, workspaceId: string): Promise<void> {
+  const hostHolds = store.persisted()?.workspaces.some((workspace) => workspace.id === workspaceId);
+  if (!hostHolds) await store.flush();
+}
+
 function ErrorView({ message, onReset }: { message: string; onReset: () => void }) {
   const { t } = useI18n();
   return (
@@ -661,8 +700,62 @@ function App() {
     [documentStore]
   );
   /** The host exclusively writes conversation bodies; the renderer sends intents through this command channel. */
-  const [conversationSync] = useState(() => createConversationSync(applyAuthoritativeConversation));
+  const [conversationSync] = useState(() => createConversationSync(
+    applyAuthoritativeConversation,
+    // A project added in this same event — whose empty task slot is created right after it — is
+    // still waiting on the debounced document save. Send that save ahead of the conversation, or
+    // the host refuses a conversation in a workspace it has never heard of and the renderer is
+    // left holding one the host cannot find.
+    (workspaceId) => awaitWorkspaceAtHost(documentStore, workspaceId)
+  ));
   const document = useSyncExternalStore(documentStore.subscribe, documentStore.getSnapshot);
+  /**
+   * Every machine's last shell probe, keyed by environment key: this machine
+   * from startup, SSH machines from the first time this session reaches them,
+   * WSL distributions from first use, and any machine from its settings. The
+   * shell tools a conversation lists and the agent-shell choices a machine's
+   * settings offer are read from here.
+   */
+  const [machineShells, setMachineShells] = useState<Record<string, MachineShells>>({});
+  useEffect(() => {
+    if (!hasBackendRuntime()) return;
+    let cancelled = false;
+    void listMachineShells()
+      .then((probes) => {
+        if (!cancelled && probes && typeof probes === "object") {
+          setMachineShells((current) => ({ ...probes, ...current }));
+        }
+      })
+      .catch(() => undefined);
+    const unsubscribe = onAppPushEvent((event) => {
+      if (event.type !== "machineShellsChanged") return;
+      setMachineShells((current) => ({ ...current, [event.key]: event.shells }));
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+  /**
+   * A machine's first probe records its agent shell: the first backend of its
+   * OS's priority list that it has. That is the priority list's only use — a
+   * machine that already has a choice keeps it whatever the list says later.
+   */
+  const executionEnvironments = document?.globalSettings.executionEnvironments;
+  useEffect(() => {
+    if (!executionEnvironments) return;
+    const withDefaults = (environments: typeof executionEnvironments) => Object.entries(machineShells)
+      .reduce((next, [key, shells]) => withDefaultAgentShell(next, key, shells), environments);
+    if (withDefaults(executionEnvironments) === executionEnvironments) return;
+    documentStore.update((current) => {
+      if (!current) return current;
+      const environments = current.globalSettings.executionEnvironments;
+      const next = withDefaults(environments);
+      return next === environments
+        ? current
+        : { ...current, globalSettings: { ...current.globalSettings, executionEnvironments: next } };
+    });
+  }, [documentStore, executionEnvironments, machineShells]);
   /** Use factory preferences before the document loads so consumers always receive valid settings. */
   const appearance = document?.globalSettings.appearance ?? defaultAppearancePreferences();
   // StrictMode unmounts the shared store once during development; resume must pair with
@@ -728,6 +821,18 @@ function App() {
    * be null; sending then targets the temporary workspace.
    */
   const [draftConversation, setDraftConversation] = useState<DraftConversationState | null>(null);
+  /**
+   * Aiming the draft at another project would end shells and dev servers it still has running, so
+   * the move waits for the user. `ownerId` is the draft it was asked about: a draft that has since
+   * moved or been sent is no longer the one the answer is for.
+   */
+  const [draftRetargetPrompt, setDraftRetargetPrompt] = useState<{
+    ownerId: string;
+    workspaceId: string | null;
+    shells: number;
+    servers: number;
+    proceed: () => void;
+  } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
@@ -875,6 +980,33 @@ function App() {
   /** Event handlers read the draft ref because they cannot wait for the next render. */
   const draftConversationRef = useRef<DraftConversationState | null>(draftConversation);
   draftConversationRef.current = draftConversation;
+  /**
+   * The id the host knows a conversation's terminals and preview page by: its own, or for the
+   * draft the id it will materialize as. Terminal tabs, terminal sessions and browser sessions are
+   * keyed by it rather than by the draft's placeholder id, so the draft becoming real moves none
+   * of them. Pane layout is the exception: it follows the placeholder and is adopted on send.
+   */
+  const hostConversationId = useCallback((conversationId: string): string => (
+    isDraftConversationId(conversationId)
+      ? draftConversationRef.current?.materializesAs ?? conversationId
+      : conversationId
+  ), []);
+  /**
+   * Whether `ownerId` — a conversation, or the draft by the id it will materialize as — works in
+   * `workspace`. The draft is in no workspace's conversation list, yet its shells sit in the
+   * project it is aimed at like any conversation's, and Git has to see them there.
+   */
+  const ownerWorksIn = useCallback((ownerId: string, workspace: Workspace): boolean => {
+    if (workspace.conversations.some((conversation) => conversation.id === ownerId)) return true;
+    const draft = draftConversationRef.current;
+    return draft?.materializesAs === ownerId
+      && (draft.workspaceId ?? TEMPORARY_WORKSPACE_ID) === workspace.id;
+  }, []);
+  /** Whether the draft is aimed at `workspace`, where it shares the root checkout with its conversations. */
+  const draftWorksIn = useCallback((workspace: Workspace): boolean => {
+    const draft = draftConversationRef.current;
+    return Boolean(draft && (draft.workspaceId ?? TEMPORARY_WORKSPACE_ID) === workspace.id);
+  }, []);
   /** Keep this changing callback in a ref so startup effects do not rerun when the document changes. */
   const openDraftConversationRef = useRef<(
     workspaceId?: string,
@@ -885,6 +1017,12 @@ function App() {
   const terminalPanelHandlesRef = useRef(new Map<string, TerminalPanelHandle>());
   const sidePanesStateRef = useRef(sidePanesState);
   const terminalTabsStateRef = useRef(terminalTabsState);
+  /**
+   * What a terminal nobody chose a shell for starts: the workspace the composer has selected, in
+   * the most preferred shell its machine was probed to have. Kept current every render, so the
+   * pane opening with nothing in it reads the selection as it is now.
+   */
+  const defaultTerminalLaunchRef = useRef<TerminalLaunchChoice | null>(null);
   const modelStoppingIdsRef = useRef(new Set<string>());
   const browserAutomationStoppingIdsRef = useRef(new Set<string>());
   /** Update refs and state together so handlers immediately observe the current value. */
@@ -972,34 +1110,44 @@ function App() {
         conversation.id === conversationId
       ))?.worktree)
     };
+    // The draft aimed here is a peer at the root checkout too, though no list holds it.
+    const peers: Array<{ id: string; worktree: Conversation["worktree"] }> = [
+      ...workspace.conversations,
+      ...(draftWorksIn(workspace) ? [{ id: DRAFT_CONVERSATION_ID, worktree: null }] : [])
+    ];
     if (
-      workspace.conversations.some((conversation) => (
-        conversation.id !== conversationId
+      peers.some((peer) => (
+        peer.id !== conversationId
         && gitPeerBlocksMutation({
           acting,
           peer: {
-            snapshot: gitSnapshotForWorkspace(snapshots[conversation.id], workspace.id),
-            isolated: Boolean(conversation.worktree)
+            snapshot: gitSnapshotForWorkspace(snapshots[peer.id], workspace.id),
+            isolated: Boolean(peer.worktree)
           },
-          peerModelRunActive: conversationModelRunIsActive(conversation.id),
-          peerGitMutationActive: gitController.mutationIsActive(conversation.id)
+          peerModelRunActive: conversationModelRunIsActive(peer.id),
+          peerGitMutationActive: gitController.mutationIsActive(peer.id)
         })
       ))
       || Object.values(terminalController.current()).some((session) => (
-        session.busy
-        && workspace.conversations.some((conversation) => (
-          conversation.id === session.conversationId
-        ))
+        session.busy && ownerWorksIn(session.conversationId, workspace)
       ))
     ) return false;
     gitController.acquireMutationLease(
       conversationId,
-      // Include the draft because mutations must invalidate every in-flight poll for its workspace.
-      [...workspace.conversations.map((conversation) => conversation.id), conversationId]
+      // Every poll of this workspace must be invalidated, the draft's included.
+      [...new Set([...peers.map((peer) => peer.id), conversationId])]
     );
     clearPendingUndo(conversationId);
     return true;
-  }, [clearPendingUndo, contextMutationIsBlocked, conversationModelRunIsActive, gitController, terminalController]);
+  }, [
+    clearPendingUndo,
+    contextMutationIsBlocked,
+    conversationModelRunIsActive,
+    draftWorksIn,
+    gitController,
+    ownerWorksIn,
+    terminalController
+  ]);
   const endGitMutation = useCallback((conversationId: string) => {
     gitController.releaseMutationLease(conversationId);
   }, [gitController]);
@@ -1297,12 +1445,12 @@ function App() {
 
   /** Every native browser session of one conversation: its primary page plus any extra tabs. */
   const conversationBrowserSessionIds = useCallback((conversationId: string): string[] => {
-    const sessionIds = new Set<string>([conversationId]);
+    const sessionIds = new Set<string>([hostConversationId(conversationId)]);
     for (const sessionId of previewSessionsFor(sidePanesStateRef.current, conversationId)) {
       sessionIds.add(sessionId);
     }
     return [...sessionIds];
-  }, []);
+  }, [hostConversationId]);
 
   const issueBrowserIntent = browserController.issueIntent;
   const browserIntentIsCurrent = browserController.intentIsCurrent;
@@ -1319,9 +1467,14 @@ function App() {
       return next;
     });
     // The session id carries its owning conversation, so a page closed while the user is
-    // somewhere else still retires from the right roster.
-    for (const conversationId of Object.keys(sidePanesStateRef.current.previewSessions)) {
-      if (!previewSessionBelongsToConversation(sessionId, conversationId)) continue;
+    // somewhere else still retires from the right roster. The draft's roster is filed under its
+    // placeholder id while its page is named after the id it will materialize as, so a roster
+    // that lists the page is its owner too.
+    for (const [conversationId, sessions] of Object.entries(sidePanesStateRef.current.previewSessions)) {
+      if (
+        !previewSessionBelongsToConversation(sessionId, conversationId)
+        && !sessions.includes(sessionId)
+      ) continue;
       dispatchSidePanes({ type: "forget_preview", conversationId, sessionId });
     }
   }, [browserController, dispatchSidePanes]);
@@ -1335,9 +1488,13 @@ function App() {
       browserSessionDeletionIsActive(conversationId)
       || browserController.closeInFlight(sessionId)
       || !browserIntentIsCurrent(sessionId, intentEpoch, "open")
-      || !documentStore.current()?.workspaces.some((workspace) => (
-        workspace.conversations.some((conversation) => conversation.id === conversationId)
-      ))
+      // The host keys a page by its session id alone, so the draft's page needs no row of its own.
+      || !(
+        (isDraftConversationId(conversationId) && draftConversationRef.current)
+        || documentStore.current()?.workspaces.some((workspace) => (
+          workspace.conversations.some((conversation) => conversation.id === conversationId)
+        ))
+      )
     ) return false;
 
     const rawOpen = openBrowser(sessionId, null, intentEpoch);
@@ -1504,11 +1661,17 @@ function App() {
   const openPane = useCallback((pane: SidePaneId) => {
     const conversationId = activeConversationIdRef.current;
     if (!conversationId) return;
-    // A terminal pane with no tabs has nothing to show: the last tab leaving is what closed it,
-    // so asking for the pane again asks for a terminal to put in it.
-    if (pane === "terminal") dispatchTerminalTabs({ type: "ensure", conversationId });
+    // A terminal pane with no tabs has nothing to show — nothing was ever opened, or the last
+    // tab leaving is what closed it — so asking for the pane asks for a terminal to put in it.
+    if (pane === "terminal") {
+      dispatchTerminalTabs({
+        type: "ensure",
+        conversationId: hostConversationId(conversationId),
+        launch: defaultTerminalLaunchRef.current
+      });
+    }
     dispatchSidePanes({ type: "open", conversationId, pane });
-  }, [dispatchSidePanes, dispatchTerminalTabs]);
+  }, [dispatchSidePanes, dispatchTerminalTabs, hostConversationId]);
 
   /** Closing a preview pane releases the native surface; the session itself keeps running. */
   const closePane = useCallback((pane: SidePaneId) => {
@@ -1542,6 +1705,25 @@ function App() {
   const previewPageHeight = useCallback((sessionId: string, height: number) => (
     Math.max(1, height - (previewReservedBottomRef.current[sessionId] ?? 0))
   ), []);
+  /**
+   * The page each conversation last had on screen, so bringing the pane back brings back the page
+   * the user left rather than whichever happens to be first in the strip.
+   */
+  const lastPreviewPageRef = useRef<Record<string, string>>({});
+  /** Read by callbacks that must see the statuses as they are now, not as their closure saw them. */
+  const browserStatusesRef = useRef(browserStatuses);
+  browserStatusesRef.current = browserStatuses;
+  /**
+   * The workspace the composer's chip has selected, for the one preview action that has no
+   * workspace of its own to go by: showing the pane when there is no page yet. Assigned where the
+   * selection is resolved, further down the render.
+   */
+  const activeWorkspaceMemberRef = useRef(1);
+  /**
+   * The conversation as the preview commands address it (see `activePreviewOwnerTarget`), for the
+   * callbacks declared before it is resolved.
+   */
+  const previewOwnerTargetRef = useRef<PreviewTarget | null>(null);
 
   /**
    * Publishes a preview page's rectangle *before* its native page is created.
@@ -1584,12 +1766,13 @@ function App() {
    *
    * There is exactly one, and the host keys it by the conversation id, so `sessionId` only ever
    * names the page that already exists; omitting it opens that same page. The tab roster the Agent
-   * used to publish is gone with the tools that published it.
+   * used to publish is gone with the tools that published it. The draft's page is keyed by the id
+   * it will materialize as, which is what lets the page stay open across its first send.
    */
   const openBrowserTab = useCallback(async (sessionId?: string) => {
     if (!activeConversationId) return;
     const conversationId = activeConversationId;
-    const targetSessionId = sessionId ?? conversationId;
+    const targetSessionId = sessionId ?? hostConversationId(conversationId);
     if (
       browserSessionDeletionIsActive(conversationId)
       || browserController.closeInFlight(targetSessionId)
@@ -1605,6 +1788,7 @@ function App() {
     }
     const intentEpoch = issueBrowserIntent(targetSessionId, "open");
     browserController.setVisibleSession(targetSessionId);
+    lastPreviewPageRef.current = { ...lastPreviewPageRef.current, [conversationId]: targetSessionId };
     dispatchSidePanes({ type: "open", conversationId, pane: previewPaneId(targetSessionId) });
     if (hasBackendRuntime()) {
       await publishPreviewBounds(targetSessionId, intentEpoch);
@@ -1652,6 +1836,7 @@ function App() {
     browserSessionDeletionIsActive,
     dispatchSidePanes,
     hideBuiltInBrowser,
+    hostConversationId,
     issueBrowserIntent,
     openBuiltInBrowser,
     publishPreviewBounds,
@@ -1784,7 +1969,7 @@ function App() {
     const session = terminalController.current()[terminalSessionKey(conversationId, terminalId)];
     if (!session) return false;
     const workspace = documentStore.current()?.workspaces.find((candidate) => (
-      candidate.conversations.some((conversation) => conversation.id === session.conversationId)
+      ownerWorksIn(session.conversationId, candidate)
     ));
     if (
       !workspace
@@ -1792,9 +1977,10 @@ function App() {
       || workspace.conversations.some((conversation) => (
         gitController.mutationIsActive(conversation.id)
       ))
+      || (draftWorksIn(workspace) && gitController.mutationIsActive(DRAFT_CONVERSATION_ID))
     ) return false;
     return terminalController.markCommandStarted(conversationId, terminalId);
-  }, [browserSessionDeletionIsActive, gitController, terminalController]);
+  }, [browserSessionDeletionIsActive, draftWorksIn, gitController, ownerWorksIn, terminalController]);
 
   const requestTerminalSessionClose = useCallback((
     conversationId: string,
@@ -1827,22 +2013,25 @@ function App() {
    * straight to the session store.
    */
   const closeTerminalTab = useCallback((conversationId: string, terminalId: string) => {
-    const wasLast = terminalTabsFor(terminalTabsStateRef.current, conversationId).tabs.length <= 1;
+    // The pane belongs to the conversation on screen, the terminal to its host identity; for the
+    // draft the two differ.
+    const ownerId = hostConversationId(conversationId);
+    const wasLast = terminalTabsFor(terminalTabsStateRef.current, ownerId).tabs.length <= 1;
     const handle = terminalPanelHandlesRef.current.get(
-      terminalSessionKey(conversationId, terminalId)
+      terminalSessionKey(ownerId, terminalId)
     );
     const ended = handle
       ? handle.close()
-      : requestTerminalSessionClose(conversationId, terminalId).catch(() => undefined);
+      : requestTerminalSessionClose(ownerId, terminalId).catch(() => undefined);
     void Promise.resolve(ended).then(() => {
-      dispatchTerminalTabs({ type: "close", conversationId, terminalId });
+      dispatchTerminalTabs({ type: "close", conversationId: ownerId, terminalId });
       if (!wasLast) return;
       dispatchSidePanes({ type: "close", conversationId, pane: "terminal" });
       if (activeConversationIdRef.current === conversationId) {
         composerTextareaRef.current?.focus({ preventScroll: true });
       }
     });
-  }, [dispatchSidePanes, dispatchTerminalTabs, requestTerminalSessionClose]);
+  }, [dispatchSidePanes, dispatchTerminalTabs, hostConversationId, requestTerminalSessionClose]);
 
   /**
    * Opens the pane behind a task row. Subagents and workflows show a transcript instead and never
@@ -1885,7 +2074,7 @@ function App() {
     // page it serves, so the row opens the conversation's preview. When that page
     // is showing something else, the pane's own start page lists this server with
     // the button that points it here.
-    if (item.kind === "preview") await openBrowserTab(conversationId);
+    if (item.kind === "preview") await openBrowserTab();
   }, [documentStore, openBrowserTab, openPane, setActiveConversationId, setActiveWorkspaceId]);
 
   const openGlobalSettings = useCallback((view: SettingsView) => {
@@ -1927,6 +2116,84 @@ function App() {
     // one on screen — there is no neighbouring tab left to fall back along.
     dispatchSidePanes({ type: "forget_preview", conversationId, sessionId });
   }, [browserController, dispatchSidePanes, modelRunController, requestBrowserSessionClose]);
+
+  /**
+   * Opens a page for the conversation's workspace `member` (1-based) and shows it.
+   *
+   * A page with nothing loaded yet is that workspace's start page, which is exactly what a new page
+   * would be, so an idle one is brought forward rather than joined by a second copy of itself. The
+   * first page a conversation gets is its own page — the one the model's preview tools drive — and
+   * every further one is a tab of its own, with a Chromium profile of its own.
+   */
+  const openPreviewPage = useCallback((member: number) => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
+    const state = sidePanesStateRef.current;
+    const roster = previewSessionsFor(state, conversationId);
+    const statuses = browserStatusesRef.current;
+    const idle = roster.find((sessionId) => {
+      if (previewWorkspaceOf(state, sessionId) !== member) return false;
+      const url = statuses[sessionId]?.url;
+      return !url || url === "about:blank";
+    });
+    if (idle) {
+      void openBrowserTab(idle);
+      return;
+    }
+    const token = typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const sessionId = newPreviewPageSessionId(roster, hostConversationId(conversationId), `tab_${token}`);
+    dispatchSidePanes({ type: "register_preview", conversationId, sessionId, workspace: member });
+    const owner = previewOwnerTargetRef.current;
+    if (!owner || !hasBackendRuntime()) {
+      void openBrowserTab(sessionId);
+      return;
+    }
+    // The page's network is its workspace's machine, and it has to be that before the page
+    // exists: its first request must already leave from there. A binding that fails leaves the
+    // page on this computer, and the pane says why its machine cannot be reached.
+    void setBrowserPageNetwork(sessionId, member > 1 ? { ...owner, workspace: member } : owner)
+      .catch(() => undefined)
+      .then(() => {
+        if (activeConversationIdRef.current === conversationId) void openBrowserTab(sessionId);
+      });
+  }, [dispatchSidePanes, hostConversationId, openBrowserTab]);
+
+  /**
+   * Brings the preview pane up on the page the user last had there. With no page at all, the pane
+   * opens on the start page of the workspace the composer's chip has selected — the one place the
+   * conversation has already said it is working in.
+   */
+  const showPreviewPanel = useCallback(() => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
+    const roster = previewSessionsFor(sidePanesStateRef.current, conversationId);
+    if (!roster.length) {
+      openPreviewPage(activeWorkspaceMemberRef.current);
+      return;
+    }
+    const last = lastPreviewPageRef.current[conversationId];
+    void openBrowserTab(last && roster.includes(last) ? last : roster[0]);
+  }, [openBrowserTab, openPreviewPage]);
+
+  /**
+   * Closes one page from its tab. The neighbour takes its place first — to the right, as a
+   * browser's tabs do, and to the left off the end — so the pane moves to another page instead of
+   * blinking shut and open again; the last page closing is what takes the pane with it.
+   */
+  const closePreviewPage = useCallback(async (sessionId: string) => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
+    const state = sidePanesStateRef.current;
+    const roster = previewSessionsFor(state, conversationId);
+    const index = roster.indexOf(sessionId);
+    const remaining = roster.filter((candidate) => candidate !== sessionId);
+    if (openPreviewSession(sidePaneLayoutFor(state, conversationId)) === sessionId && remaining.length) {
+      await openBrowserTab(remaining[Math.min(Math.max(index, 0), remaining.length - 1)]);
+    }
+    await closePreviewSession(conversationId, sessionId);
+  }, [closePreviewSession, openBrowserTab]);
 
 
   /** Publish synchronously before awaiting persistence. Durable writes also await conversation commands so user messages reach disk before a run. */
@@ -2155,21 +2422,28 @@ function App() {
     [document, activeWorkspaceId, activeConversationId]
   );
   const activeConversation = draftActive ? draftConversationView : persisted.conversation;
+  /** See `hostConversationId`: what the active conversation's terminals and preview page are keyed by. */
+  const activeHostConversationId = draftActive
+    ? draftConversation?.materializesAs ?? null
+    : activeConversation?.id ?? null;
   const activeWorkspace = draftActive
     ? document?.workspaces.find((workspace) => workspace.id === draftConversation?.workspaceId) ?? null
     : persisted.workspace;
   /**
    * Whether the composer belongs to a task that has never been sent, which is where the cat
-   * loafs. The renderer draft is only one half of that state: picking a workspace — or opening
-   * a new task while one is already picked — turns the draft into a real conversation that is
-   * still unsent, still withheld from the sidebar, and still the same empty desk to the user.
-   * Keying the cat on the draft alone hid it from every install that has a workspace, which is
-   * every install after the first pick.
+   * loafs. That is mostly the renderer draft, but a real conversation can be just as empty — one
+   * whose first tool call was refused right after it materialized, or one left from before the
+   * draft was global — and it is still withheld from the sidebar and still the same empty desk.
    */
   const composerIsUnsentTask = draftActive || Boolean(
     activeConversation
     && activeWorkspace
-    && draftSlotOf(activeWorkspace.conversations)?.id === activeConversation.id
+    && isUnsentConversation(
+      activeConversation,
+      activeWorkspace.conversations.some((conversation) => (
+        conversation.parentConversationId === activeConversation.id
+      ))
+    )
   );
   /** The project's own workspaces as this conversation uses them: its worktree stands in for the first. */
   const activeProjectWorkspaces = useMemo(
@@ -2184,6 +2458,7 @@ function App() {
     const selected = activeConversation ? selectedWorkspaceMembers[activeConversation.id] ?? 1 : 1;
     return selected >= 1 && selected <= activeProjectWorkspaces.length ? selected : 1;
   })();
+  activeWorkspaceMemberRef.current = activeWorkspaceMember;
   const activeSelectedWorkspace = activeProjectWorkspaces[activeWorkspaceMember - 1] ?? null;
   /**
    * The key the Git snapshot of the selected workspace is stored under: the project id for its
@@ -2208,40 +2483,47 @@ function App() {
   const activeGitWorkspaceId = activeWorkspace?.id ?? null;
   const activeGitWorkspaceKind = activeWorkspace?.kind ?? null;
   /**
-   * Whether the active workspace's directory is on another machine. The Git
-   * surface, the worktree toggle and the file pane act on a checkout in this
+   * Whether the active workspace's directory is on another machine. The review
+   * pane, the worktree toggle and the file pane act on a checkout in this
    * filesystem; a remote workspace has none here, and the host refuses to
-   * resolve its path locally.
+   * resolve its path locally. Its Git status is still read — on its machine.
    */
   const activeWorkspaceIsRemote = Boolean(activeWorkspace?.machine);
   /**
-   * The conversation's own checkout — the project's first workspace, or its worktree. The file
-   * pane, previews and worktree bookkeeping act on this one whatever the chip has selected.
+   * The conversation's own checkout — the project's first workspace, or its worktree — wherever
+   * it is. Only its status is read through this; see `activePrimaryGitTarget`.
    */
-  const activePrimaryGitTarget = useMemo((): GitTarget | null => {
-    if (!activeGitConversationId || activeWorkspaceIsRemote) return null;
+  const activePrimaryGitCheckout = useMemo((): GitTarget | null => {
+    if (!activeGitConversationId) return null;
     if (!draftActive) return gitConversationTarget(activeGitConversationId);
     if (!activeGitWorkspaceId || activeGitWorkspaceKind !== "directory") return null;
     return gitWorkspaceTarget(activeGitWorkspaceId);
-  }, [activeGitConversationId, activeGitWorkspaceId, activeGitWorkspaceKind, activeWorkspaceIsRemote, draftActive]);
+  }, [activeGitConversationId, activeGitWorkspaceId, activeGitWorkspaceKind, draftActive]);
+  /**
+   * The conversation's own checkout when it is on this host. The file pane, previews and worktree
+   * bookkeeping act on this one whatever the chip has selected.
+   */
+  const activePrimaryGitTarget = activeWorkspaceIsRemote ? null : activePrimaryGitCheckout;
   /** Whether the selected workspace's directory is on another machine, where the host has no checkout. */
   const activeSelectedWorkspaceIsRemote = Boolean(activeSelectedWorkspace?.machine);
   /**
-   * The checkout the Git chip, the status card and the review pane describe: the selected
-   * workspace. Another workspace of the project is addressed by its number within the project,
-   * never by path, and a remote one has no Git surface here.
+   * The checkout the Git chip and the status card describe: the selected workspace, on whichever
+   * machine it is — the host reads a remote workspace's status there, the way it reads a local
+   * one here. Another workspace of the project is addressed by its number within the project,
+   * never by path.
    */
-  const activeGitTarget = useMemo((): GitTarget | null => {
-    if (activeWorkspaceMember === 1) return activePrimaryGitTarget;
-    if (!activeGitConversationId || !activeGitWorkspaceId || activeSelectedWorkspaceIsRemote) return null;
+  const activeGitStatusTarget = useMemo((): GitTarget | null => {
+    if (activeWorkspaceMember === 1) return activePrimaryGitCheckout;
+    if (!activeGitConversationId || !activeGitWorkspaceId) return null;
     return gitWorkspaceTarget(activeGitWorkspaceId, activeWorkspaceMember);
-  }, [
-    activeGitConversationId,
-    activeGitWorkspaceId,
-    activePrimaryGitTarget,
-    activeSelectedWorkspaceIsRemote,
-    activeWorkspaceMember
-  ]);
+  }, [activeGitConversationId, activeGitWorkspaceId, activePrimaryGitCheckout, activeWorkspaceMember]);
+  /**
+   * The checkout the review pane, the branch menu and the Git writes act on: the one the status
+   * describes, when it is on this host. A remote one has only its status here.
+   */
+  const activeGitTarget = activeWorkspaceMember === 1
+    ? activePrimaryGitTarget
+    : activeSelectedWorkspaceIsRemote ? null : activeGitStatusTarget;
   /**
    * Whether the conversation has started. The project it belongs to is settled from then on,
    * so the composer stops offering to change it.
@@ -2255,38 +2537,36 @@ function App() {
    * start after it.
    */
   const activeProjectWorkspaceCount = Math.max(1, activeProjectWorkspaces.length);
+  const shellPriority = document?.globalSettings.executionEnvironments.shellPriority;
+  /** The shells a terminal on `machine` can start, as its probe found them, most preferred first. */
+  const terminalShellsOn = useCallback(
+    (machine: RunTargetType | null | undefined) => terminalShellsFor(machine, machineShells, platform, shellPriority),
+    [machineShells, platform, shellPriority]
+  );
   /** The shells a terminal in the selected workspace can start, which follow its machine. */
   const activeTerminalShells = useMemo(
-    () => terminalShellsFor(activeSelectedWorkspace?.machine ?? activeWorkspace?.machine, platform),
-    [activeSelectedWorkspace?.machine, activeWorkspace?.machine, platform]
+    () => terminalShellsOn(activeSelectedWorkspace?.machine ?? activeWorkspace?.machine),
+    [activeSelectedWorkspace?.machine, activeWorkspace?.machine, terminalShellsOn]
   );
-  /**
-   * Opens a terminal in the workspace the composer has selected, in `shell`.
-   *
-   * The tab every conversation starts with is only a place for the pane to park until a shell is
-   * asked for; while it has never started one, the choice lands in it rather than beside it.
-   */
-  const openTerminalInSelectedWorkspace = useCallback((shell: TerminalShell) => {
-    const conversationId = activeConversationIdRef.current;
-    if (!conversationId || isDraftConversationId(conversationId)) return;
-    const launch = { workspace: activeWorkspaceMember, shell };
-    const layout = terminalTabsFor(terminalTabsStateRef.current, conversationId);
-    const [only] = layout.tabs;
-    const pristine = layout.tabs.length === 1
-      && layout.nextOrdinal === only.ordinal + 1
-      && only.launch === null
-      && !terminalController.current()[terminalSessionKey(conversationId, only.id)];
-    if (pristine) {
-      dispatchTerminalTabs({ type: "configure", conversationId, terminalId: only.id, launch });
-    } else {
-      dispatchTerminalTabs({ type: "add", conversationId, launch });
-    }
+  defaultTerminalLaunchRef.current = {
+    workspace: activeWorkspaceMember,
+    shell: activeTerminalShells[0] ?? null
+  };
+  /** Opens a new terminal in the conversation's workspace `member` (1-based), in `shell`. */
+  const openTerminalIn = useCallback((member: number, shell: TerminalShell) => {
+    const activeId = activeConversationIdRef.current;
+    if (!activeId) return;
+    dispatchTerminalTabs({
+      type: "add",
+      conversationId: hostConversationId(activeId),
+      launch: { workspace: member, shell }
+    });
     openPane("terminal");
-  }, [activeWorkspaceMember, dispatchTerminalTabs, openPane, terminalController]);
+  }, [dispatchTerminalTabs, hostConversationId, openPane]);
   useEffect(() => {
     const conversationId = activeConversation?.id;
     const workspaceId = activeGitSurfaceKey;
-    if (!conversationId || !workspaceId || !activeGitTarget || !hasBackendRuntime()) return;
+    if (!conversationId || !workspaceId || !activeGitStatusTarget || !hasBackendRuntime()) return;
     let cancelled = false;
     let inFlight = false;
     let refreshQueued = false;
@@ -2299,7 +2579,7 @@ function App() {
       }
       inFlight = true;
       try {
-        await refreshGitSnapshot(conversationId, workspaceId, activeGitTarget);
+        await refreshGitSnapshot(conversationId, workspaceId, activeGitStatusTarget);
       } finally {
         inFlight = false;
         if (refreshQueued && !cancelled) {
@@ -2324,7 +2604,7 @@ function App() {
       window.removeEventListener("focus", refreshWhenVisible);
       window.document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [activeConversation?.id, activeGitTarget, activeGitSurfaceKey, refreshGitSnapshot]);
+  }, [activeConversation?.id, activeGitStatusTarget, activeGitSurfaceKey, refreshGitSnapshot]);
   // A workspace that stopped being a Git repository has no review pane to show. Leaving it up
   // would strand the user on a pane whose panel has nothing to render.
   useEffect(() => {
@@ -2346,9 +2626,9 @@ function App() {
    * early when it was already open used to make a second click do nothing at all.
    */
   const openGitReview = useCallback(() => {
-    if (!activeConversation || !activeGitSnapshot) return;
+    if (!activeConversation || !activeGitSnapshot || !activeGitTarget) return;
     openPane("review");
-  }, [activeConversation, activeGitSnapshot, openPane]);
+  }, [activeConversation, activeGitSnapshot, activeGitTarget, openPane]);
   const activeComposerDraft = activeConversation ? composerDrafts[activeConversation.id] ?? "" : "";
   const activeComposerImages = activeConversation ? composerImageDrafts[activeConversation.id] ?? [] : [];
   const activeElementPicks = activeConversation ? composerElementPicks[activeConversation.id] ?? [] : [];
@@ -2380,36 +2660,53 @@ function App() {
   const activeWorkspaceDeletionRunning = Boolean(
     activeWorkspace && deletingWorkspaceIds.has(activeWorkspace.id)
   );
-  const activeWorkspaceGitMutationRunning = Boolean(
-    activeWorkspace && activeWorkspace.conversations.some((conversation) => (
-      gitMutationConversationIds.has(conversation.id)
-    ))
+  /**
+   * The draft, when it is aimed at the active workspace: it works at that root checkout like the
+   * workspace's own conversations, with shells and Git writes of its own, though no list holds it.
+   */
+  const activeWorkspaceDraft = activeWorkspace && draftConversation
+    && (draftConversation.workspaceId ?? TEMPORARY_WORKSPACE_ID) === activeWorkspace.id
+    ? draftConversation
+    : null;
+  /** The workspace's conversations and the draft aimed at it, as Git sees the root checkout. */
+  const activeWorkspacePeers = useMemo(
+    () => [
+      ...(activeWorkspace?.conversations ?? []),
+      ...(activeWorkspaceDraft ? [{ id: DRAFT_CONVERSATION_ID, worktree: null }] : [])
+    ],
+    [activeWorkspace, activeWorkspaceDraft]
   );
+  const activeWorkspaceGitMutationRunning = activeWorkspacePeers.some((peer) => (
+    gitMutationConversationIds.has(peer.id)
+  ));
   // Mirrors `beginGitMutation` through the same predicate, so a button never offers a write the
   // synchronous gate then refuses.
   const activeWorkspacePeerOperationRunning = Boolean(
-    activeWorkspace && activeConversation && activeWorkspace.conversations.some((conversation) => (
-      conversation.id !== activeConversation.id
+    activeConversation && activeWorkspacePeers.some((peer) => (
+      peer.id !== activeConversation.id
       && gitPeerBlocksMutation({
         acting: {
           snapshot: activeGitSnapshotState,
           isolated: Boolean(activeConversation.worktree)
         },
         peer: {
-          snapshot: gitSnapshotForWorkspace(gitSnapshots[conversation.id], activeGitSurfaceKey),
-          isolated: Boolean(conversation.worktree)
+          snapshot: gitSnapshotForWorkspace(gitSnapshots[peer.id], activeGitSurfaceKey),
+          isolated: Boolean(peer.worktree)
         },
-        peerModelRunActive: Boolean(modelRunSummaries[conversation.id]),
-        peerGitMutationActive: gitMutationConversationIds.has(conversation.id)
+        peerModelRunActive: Boolean(modelRunSummaries[peer.id]),
+        peerGitMutationActive: gitMutationConversationIds.has(peer.id)
       })
     ))
   );
   const activeWorkspaceTerminalBusy = Boolean(
     activeWorkspace && Object.values(terminalSessions).some((session) => (
       session.busy
-      && activeWorkspace.conversations.some((conversation) => (
-        conversation.id === session.conversationId
-      ))
+      && (
+        activeWorkspace.conversations.some((conversation) => (
+          conversation.id === session.conversationId
+        ))
+        || session.conversationId === activeWorkspaceDraft?.materializesAs
+      )
     ))
   );
   const activeWorkspaceLifecycleOperationRunning = activeWorkspaceDeletionRunning
@@ -2578,12 +2875,18 @@ function App() {
     ?? null;
   /** The directory a path written in this conversation's transcript is written against. */
   const timelinePathBaseDir = activeWorktree?.path
-    ?? (activeWorkspaceMember === 1 ? activeGitSnapshot?.worktreeRoot : undefined)
+    ?? (activeWorkspaceMember === 1 && !activeWorkspaceIsRemote ? activeGitSnapshot?.worktreeRoot : undefined)
     ?? activeWorkspace?.path
     ?? null;
   /** The checkout the file pane browses, which is what the pane can show a file from. */
   // A remote workspace has no host directory for the file pane or a timeline path click to open.
   const filesPaneRoot = activeWorkspaceIsRemote ? null : activeWorktree?.path ?? activeWorkspace?.path ?? null;
+  /**
+   * Whether the file pane has a checkout to browse. A draft browses its project's root, as its Git
+   * surface does; one aimed at no project has no directory until it is sent, and gets its own
+   * scratch one then.
+   */
+  const filesPaneAvailable = !activeWorkspaceIsRemote && (!draftActive || activePrimaryGitTarget !== null);
   const [filesPaneRequest, setFilesPaneRequest] = useState<
     (FilesPaneOpenRequest & { conversationId: string }) | null
   >(null);
@@ -2601,7 +2904,9 @@ function App() {
    */
   useEffect(() => {
     const conversationId = activeConversation?.id ?? null;
-    if (conversationId === null || filesPaneRoot === null) return;
+    // Without a checkout to browse — a draft aimed at no project — a path clicked goes to the file
+    // manager like any other path the pane cannot show.
+    if (conversationId === null || !filesPaneAvailable || filesPaneRoot === null) return;
     return setPathOpenHandler(({ path, baseDir, line }) => {
       const relative = workspaceRelativePath(path, baseDir ?? timelinePathBaseDir, filesPaneRoot);
       if (relative === null) return false;
@@ -2615,19 +2920,89 @@ function App() {
       openPane("files");
       return true;
     });
-  }, [activeConversation?.id, filesPaneRoot, openPane, timelinePathBaseDir]);
+  }, [activeConversation?.id, filesPaneAvailable, filesPaneRoot, openPane, timelinePathBaseDir]);
   const branchChipDisabled = Boolean(
     !activeGitSnapshot
+    || !activeGitTarget
     || activeModelRunning
     || activeWorkspaceLifecycleOperationRunning
     || (activeConversation && gitMutationConversationIds.has(activeConversation.id))
   );
   // Tool-description overrides are assembled by the backend from a trusted snapshot at runtime.
+  /**
+   * Every workspace the active conversation can address, project members
+   * included, in the host's numbering. Keyed on the two conversation fields
+   * that decide it, so a streaming turn does not rebuild it.
+   */
+  const activeAttachedWorkspaces = activeConversation?.attachedWorkspaces ?? null;
+  const activeConversationWorkspaces = useMemo(
+    () => conversationWorkspaces(
+      activeWorkspace,
+      activeAttachedWorkspaces
+        ? { worktree: activeWorktree, attachedWorkspaces: activeAttachedWorkspaces }
+        : null
+    ),
+    [activeWorkspace, activeAttachedWorkspaces, activeWorktree]
+  );
+  /**
+   * The workspaces a terminal can be opened in, in the conversation's numbering. The host knows
+   * a draft's project workspaces and nothing it attached, so those wait until it is sent.
+   */
+  const activeTerminalWorkspaces = useMemo(
+    () => (draftActive
+      ? activeConversationWorkspaces.slice(0, activeProjectWorkspaceCount)
+      : activeConversationWorkspaces),
+    [activeConversationWorkspaces, activeProjectWorkspaceCount, draftActive]
+  );
+  /**
+   * The conversation as the preview commands address it, before a workspace is picked: the host
+   * identity its pages and servers are filed under, and for the draft the project it is aimed at.
+   * A page adds the number of the workspace it belongs to; the task bar leaves it off to list the
+   * servers of every workspace. Preview addresses workspaces exactly as the terminal does, so the
+   * draft reaches only its project's.
+   */
+  const activePreviewDraftWorkspaceId = draftActive
+    ? draftConversation?.workspaceId ?? TEMPORARY_WORKSPACE_ID
+    : null;
+  const activePreviewOwnerTarget = useMemo((): PreviewTarget | null => {
+    if (!activeHostConversationId) return null;
+    return activePreviewDraftWorkspaceId
+      ? { conversationId: activeHostConversationId, draftWorkspaceId: activePreviewDraftWorkspaceId }
+      : { conversationId: activeHostConversationId };
+  }, [activeHostConversationId, activePreviewDraftWorkspaceId]);
+  previewOwnerTargetRef.current = activePreviewOwnerTarget;
+  /**
+   * Which machine a page is on, by environment key: its workspace's. A page reaches that machine's
+   * `localhost`, so a server and a page only belong together when their machines match.
+   */
+  const previewPageMachineKeyRef = useRef<(sessionId: string) => string>(() => runEnvKey(null));
+  previewPageMachineKeyRef.current = (sessionId) => runEnvKey(
+    activeTerminalWorkspaces[previewWorkspaceOf(sidePanesStateRef.current, sessionId) - 1]?.machine ?? null
+  );
+  /** Which machine a server runs on, by the same key. */
+  const previewServerMachineKeyRef = useRef<(server: PreviewServerSnapshot) => string>(() => runEnvKey(null));
+  previewServerMachineKeyRef.current = (server) => (
+    server.workspace
+      ? runEnvKey(activeTerminalWorkspaces[server.workspace - 1]?.machine ?? null)
+      : server.machine ? `machine:${server.machine}` : runEnvKey(null)
+  );
+  /** Where a page's start page reads its servers from and runs them: its own workspace. */
+  const previewTargetForPage = useCallback((sessionId: string): PreviewTarget | null => {
+    if (!activePreviewOwnerTarget) return null;
+    const workspace = previewWorkspaceOf(sidePanesState, sessionId);
+    return workspace > 1 ? { ...activePreviewOwnerTarget, workspace } : activePreviewOwnerTarget;
+  }, [activePreviewOwnerTarget, sidePanesState]);
+  /**
+   * The catalog as this conversation can use it: a shell tool is listed only
+   * when one of its machines has that shell, so the shell tools are the union
+   * of the backends its machines' probes found.
+   */
   const activeConversationTools = useMemo(() => {
     if (!document) return [];
-    return toolsForHost(document.tools, platform)
+    const backends = availableShellBackends(activeConversationWorkspaces, machineShells, platform);
+    return toolsForShellBackends(document.tools, backends)
       .map((tool) => localizeToolDescriptor(tool, resolvedLanguage));
-  }, [document, platform, resolvedLanguage]);
+  }, [document, activeConversationWorkspaces, machineShells, platform, resolvedLanguage]);
   /**
    * What the timeline's manual tool cards are edited against: the catalog plus
    * the `workspace` argument the host puts on the wire once the conversation
@@ -2637,20 +3012,14 @@ function App() {
    * so a streaming turn does not hand the timeline a fresh descriptor list on
    * every context row.
    */
-  const activeAttachedWorkspaces = activeConversation?.attachedWorkspaces ?? null;
   const activeTimelineTools = useMemo(
     () => withWorkspaceArgument(
       activeConversationTools,
-      conversationWorkspaces(
-        activeWorkspace,
-        activeAttachedWorkspaces
-          ? { worktree: activeWorktree, attachedWorkspaces: activeAttachedWorkspaces }
-          : null
-      ),
-      /^win/i.test(platform),
+      activeConversationWorkspaces,
+      (machine) => knownShells(machine, machineShells, platform).backends,
       t("工作区编号", "Workspace number")
     ),
-    [activeConversationTools, activeWorkspace, activeAttachedWorkspaces, activeWorktree, platform, t]
+    [activeConversationTools, activeConversationWorkspaces, machineShells, platform, t]
   );
   const activeEnabledTools = useMemo(() => {
     const available = new Set(activeConversationTools.map((tool) => tool.name));
@@ -2889,6 +3258,49 @@ function App() {
   const [previewServers, setPreviewServers] = useState<PreviewServerSnapshot[]>([]);
   const previewServersRef = useRef<PreviewServerSnapshot[]>([]);
   /**
+   * Each SSH machine's link to its agent, by host, as the host last reported it. A page served
+   * from a machine whose link is down keeps what it had on screen; this is what lets the pane say
+   * why nothing on it is answering, instead of leaving the user to read a timeout as a bug.
+   */
+  const [remoteLinks, setRemoteLinks] = useState<Record<string, { state: string; detail: string | null }>>({});
+  useEffect(() => onAppPushEvent((event) => {
+    if (event.type !== "remoteLinkChanged") return;
+    setRemoteLinks((current) => (
+      current[event.host]?.state === event.state && current[event.host]?.detail === event.detail
+        ? current
+        : { ...current, [event.host]: { state: event.state, detail: event.detail } }
+    ));
+  }), []);
+  const remoteLinkNotice = useCallback((machine: RunTargetType | null | undefined): string | null => {
+    if (machine?.kind !== "ssh") return null;
+    const config = document?.globalSettings.executionEnvironments.sshMachines.find((candidate) => (
+      candidate.id === machine.machineId
+    ));
+    if (!config) return null;
+    const link = remoteLinks[config.host];
+    const name = config.name || config.host;
+    switch (link?.state) {
+      case "reconnecting":
+        return t(
+          "与 {name} 的连接中断，正在重新连接；页面和服务器会在连接恢复后继续",
+          "Lost the connection to {name}; reconnecting. The page and its servers carry on once it is back",
+          { name }
+        );
+      case "lost":
+        return link.detail
+          ? t("无法连接到 {name}：{detail}", "Cannot reach {name}: {detail}", { name, detail: link.detail })
+          : t("无法连接到 {name}", "Cannot reach {name}", { name });
+      case "unavailable":
+        return t(
+          "{name} 上无法运行 Mework 的远程代理，这台机器上的预览不可用",
+          "Mework's remote agent cannot run on {name}, so previews there are unavailable",
+          { name }
+        );
+      default:
+        return null;
+    }
+  }, [document, remoteLinks, t]);
+  /**
    * Takes down every page of this conversation that `address` was serving.
    *
    * The page carries no binding to a server, so the committed origin is what says which pages a
@@ -2902,21 +3314,29 @@ function App() {
    * saying why. A page with no pane behind it has no such surface to return to and is closed — it
    * is a Chromium process the user would otherwise have no way to reach or shut down.
    */
-  const closePagesServedAt = useCallback(async (conversationId: string, address: string) => {
-    const doomed = activeBrowserSessionsRef.current.filter(
-      ({ status }) => previewUrlIsServedAt(status.url, address)
-    );
+  const closePagesServedAt = useCallback(async (
+    conversationId: string,
+    server: PreviewServerSnapshot
+  ): Promise<void> => {
+    const address = previewServerAddress(server);
+    const serverMachine = previewServerMachineKeyRef.current(server);
+    const doomed = activeBrowserSessionsRef.current.filter(({ sessionId, status }) => (
+      previewUrlIsServedAt(status.url, address)
+      // A page's `localhost` is its own machine's: a page of a workspace on an SSH machine reaches
+      // that machine's servers, so the same address on two machines is two different servers.
+      && previewPageMachineKeyRef.current(sessionId) === serverMachine
+    ));
     const layout = sidePaneLayoutFor(sidePanesStateRef.current, conversationId);
     for (const { sessionId } of doomed) {
-      if (paneIsOpen(layout, previewPaneId(sessionId))) {
-        // A refusal is not worth reporting: the page may already be gone, and the pane's own body
-        // reads the committed URL either way.
-        await navigateBrowser(sessionId, "about:blank").catch(() => undefined);
-        continue;
-      }
-      await closePreviewSession(conversationId, sessionId);
+      // Only the page on screen goes back to its start page. A page in another tab is still
+      // reachable from the strip, and waking it just to blank it would spend a live page slot on
+      // a page nobody is looking at; it shows the server gone when it is next opened.
+      if (!paneIsOpen(layout, previewPaneId(sessionId))) continue;
+      // A refusal is not worth reporting: the page may already be gone, and the pane's own body
+      // reads the committed URL either way.
+      await navigateBrowser(sessionId, "about:blank").catch(() => undefined);
     }
-  }, [closePreviewSession]);
+  }, []);
   const closePagesServedAtRef = useRef(closePagesServedAt);
   closePagesServedAtRef.current = closePagesServedAt;
   /**
@@ -2928,7 +3348,8 @@ function App() {
    */
   const refreshPreviewServers = useCallback(async (
     conversationId: string,
-    target: GitTarget,
+    ownerId: string,
+    target: PreviewTarget,
     stoppedIds: readonly string[]
   ): Promise<void> => {
     let listed: PreviewServerSnapshot[];
@@ -2939,7 +3360,7 @@ function App() {
       return;
     }
     const mine = listed.filter((server) => (
-      !server.sessionId || server.sessionId === conversationId
+      !server.sessionId || server.sessionId === ownerId
     ));
     const previous = previewServersRef.current;
     previewServersRef.current = mine;
@@ -2961,39 +3382,88 @@ function App() {
       stoppedIds.includes(server.serverId) && !mine.some((live) => live.serverId === server.serverId)
     ));
     for (const server of stopped) {
-      await closePagesServedAtRef.current(conversationId, previewServerAddress(server));
+      await closePagesServedAtRef.current(conversationId, server);
     }
   }, []);
   useEffect(() => {
     const conversationId = activeConversation?.id;
-    if (!conversationId || !activePrimaryGitTarget || !hasBackendRuntime()) {
+    if (!conversationId || !activePreviewOwnerTarget || !hasBackendRuntime()) {
       previewServersRef.current = [];
       setPreviewServers([]);
       return undefined;
     }
-    const target = activePrimaryGitTarget;
+    // Every workspace's servers, each carrying its number: a conversation that works on several
+    // machines has a dev server list on each, and the task bar is one list of all of them.
+    const target = activePreviewOwnerTarget;
+    // The host files the draft's servers under the id it will be sent as, not its placeholder.
+    const ownerId = activeHostConversationId ?? conversationId;
     // A conversation switch starts from nothing rather than from the previous conversation's list:
     // a server missing from *this* conversation's list was never this conversation's to close.
     previewServersRef.current = [];
     setPreviewServers([]);
-    void refreshPreviewServers(conversationId, target, []);
+    void refreshPreviewServers(conversationId, ownerId, target, []);
     return onAppPushEvent((event) => {
       if (event.type !== "previewServersChanged") return;
-      void refreshPreviewServers(conversationId, target, event.stopped);
+      void refreshPreviewServers(conversationId, ownerId, target, event.stopped);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeConversation?.id, JSON.stringify(activePrimaryGitTarget), refreshPreviewServers]);
+  }, [
+    activeConversation?.id,
+    activeHostConversationId,
+    JSON.stringify(activePreviewOwnerTarget),
+    refreshPreviewServers
+  ]);
+  /**
+   * Keeps each page filed under the workspace it is actually showing.
+   *
+   * The model's `preview_start` can point the conversation's own page at a server in any of its
+   * workspaces, and when that workspace is on another machine the host moves the page onto that
+   * machine's network as it does so. The page's network is the fact to go by: a page is moved to a
+   * workspace on the machine it now uses — the one whose server it is showing when one matches,
+   * the first on that machine otherwise. A page the user opened is already where it belongs and
+   * is left alone.
+   */
+  useEffect(() => {
+    const conversationId = activeConversationId;
+    if (!conversationId || activeTerminalWorkspaces.length < 2) return;
+    const machineOf = (member: number) => runEnvKey(activeTerminalWorkspaces[member - 1]?.machine ?? null);
+    for (const { sessionId, status } of activeBrowserSessions) {
+      if (!status.hasPage) continue;
+      const current = previewWorkspaceOf(sidePanesState, sessionId);
+      // Only another machine is ever reported; a page with none named is on this computer's
+      // network, or on one the host has not said — which is no reason to move it anywhere.
+      const reported = status.networkMachine ?? null;
+      const network = reported ?? runEnvKey(null);
+      const serving = previewServers.filter((server) => (
+        server.workspace
+        && machineOf(server.workspace) === network
+        && previewUrlIsServedAt(status.url, previewServerAddress(server))
+      ));
+      let next = current;
+      if (serving.length && !serving.some((server) => server.workspace === current)) {
+        next = serving[0].workspace ?? current;
+      } else if (reported && machineOf(current) !== reported) {
+        const index = activeTerminalWorkspaces.findIndex((workspace) => (
+          runEnvKey(workspace.machine ?? null) === network
+        ));
+        if (index >= 0) next = index + 1;
+      }
+      if (next !== current) {
+        dispatchSidePanes({ type: "set_preview_workspace", conversationId, sessionId, workspace: next });
+      }
+    }
+  }, [activeBrowserSessions, activeConversationId, activeTerminalWorkspaces, dispatchSidePanes, previewServers, sidePanesState]);
   const activeModelStopping = Boolean(
     activeConversation && modelStoppingIds.has(activeConversation.id)
   );
   const activeTaskTerminals = useMemo(() => {
-    if (!activeConversation) return [];
+    if (!activeHostConversationId) return [];
     return Object.values(terminalSessions).filter((session) => (
-      session.conversationId === activeConversation.id
+      session.conversationId === activeHostConversationId
       && session.phase === "running"
       && (session.busy || session.hasHistory)
     ));
-  }, [activeConversation, terminalSessions]);
+  }, [activeHostConversationId, terminalSessions]);
   // Push delivery is incremental, so reconcile the full task list when a conversation becomes active and after browser-dev reconnection.
   useEffect(() => {
     const conversationId = activeConversation?.id;
@@ -3931,7 +4401,47 @@ function App() {
     });
   }, [documentStore]);
 
+  /** Probes a machine now and keeps the answer; the saved catalog is what the host reads, so pending saves land first. */
+  const probeMachine = useCallback(async (machine: RunTargetType | null): Promise<MachineShells> => {
+    await documentStore.flush();
+    const shells = await probeMachineShells(machine);
+    setMachineShells((current) => ({ ...current, [runEnvKey(machine)]: shells }));
+    return shells;
+  }, [documentStore]);
+
+  const setMachineAgentShell = useCallback((machine: RunTargetType, backend: ShellBackend) => {
+    documentStore.update((current) => {
+      if (!current) return current;
+      const environments = current.globalSettings.executionEnvironments;
+      const next = withAgentShell(environments, machine, backend);
+      return next === environments
+        ? current
+        : { ...current, globalSettings: { ...current.globalSettings, executionEnvironments: next } };
+    });
+  }, [documentStore]);
+
+  const machineShellsControl = useMemo<MachineShellsControl | null>(() => document ? {
+    probes: machineShells,
+    environments: document.globalSettings.executionEnvironments,
+    probe: probeMachine,
+    setAgentShell: setMachineAgentShell
+  } : null, [document, machineShells, probeMachine, setMachineAgentShell]);
+
   const saveSshMachine = useCallback((machine: SshMachineConfigType) => {
+    const previous = documentStore.current()?.globalSettings.executionEnvironments.sshMachines
+      .find((item) => item.id === machine.id);
+    // A machine is probed as soon as it is added, which is when its first
+    // probe records its agent shell; and again when it now names another
+    // endpoint, whose shells the old answer says nothing about.
+    const endpointChanged = !previous
+      || previous.host !== machine.host
+      || previous.port !== machine.port
+      || previous.identityFile !== machine.identityFile;
+    if (endpointChanged) {
+      queueMicrotask(() => {
+        void probeMachine({ kind: "ssh", machineId: machine.id }).catch(() => undefined);
+      });
+    }
     documentStore.update((current) => {
       if (!current) return current;
       const machines = current.globalSettings.executionEnvironments.sshMachines;
@@ -3949,7 +4459,7 @@ function App() {
         }
       };
     });
-  }, [documentStore]);
+  }, [documentStore, probeMachine]);
 
   /**
    * Removes an SSH machine from the catalog, and the variables of every workspace on it with
@@ -3966,6 +4476,7 @@ function App() {
         globalSettings: {
           ...current.globalSettings,
           executionEnvironments: {
+            ...environments,
             sshMachines: environments.sshMachines.filter((machine) => machine.id !== machineId),
             envVars: Object.fromEntries(
               Object.entries(environments.envVars).filter(([key]) => !key.startsWith(prefix))
@@ -4191,8 +4702,7 @@ function App() {
     }
     setActiveWorkspaceId(workspaceId);
     setActiveConversationId(conversationId);
-    // Selecting a persisted conversation discards the unpersisted draft and its composer content.
-    discardDraftConversation();
+    // The draft, its composer text included, waits where it is: the next new task returns to it.
     setEditor(null);
     window.requestAnimationFrame(() => {
       const scroller = window.document.querySelector<HTMLElement>('[data-main-context-stream="true"]');
@@ -4244,8 +4754,7 @@ function App() {
         document.globalSettings,
         target.defaultConversationPresetId,
         document.tools,
-        resolvedLanguage,
-        platform
+        resolvedLanguage
       )
       : null;
     const remembered = source === "workspace" && target && !workspacePreset
@@ -4264,14 +4773,13 @@ function App() {
     const fallbackPreset = defaultConversationPreset(
       document.globalSettings,
       document.tools,
-      resolvedLanguage,
-      platform
+      resolvedLanguage
     );
     return {
       settings: applyConversationPresetSettings(blankSettings, fallbackPreset.settings, knownToolNames),
       presetId: fallbackPreset.id
     };
-  }, [documentStore, platform, resolvedLanguage]);
+  }, [documentStore, resolvedLanguage]);
 
   const createConversation = useCallback((
     workspaceId?: string,
@@ -4287,7 +4795,9 @@ function App() {
     /** Template whose queue the draft was showing; only a materialized draft supplies it. */
     templateIdOverride = "",
     /** Workspaces the draft was granted; only a materialized draft supplies them. */
-    attachedWorkspacesOverride: AttachedWorkspace[] = []
+    attachedWorkspacesOverride: AttachedWorkspace[] = [],
+    /** The id a materialized draft was minted with, which its terminals are already open under. */
+    conversationIdOverride?: string
   ): string | null => {
     // The store, not the rendered snapshot: a workspace registered in this same
     // event — the directory the user just picked — is in the store already and
@@ -4302,7 +4812,7 @@ function App() {
     const knownToolNames = new Set(document.tools.map((tool) => tool.name));
     const targetId = target.id;
     const now = new Date().toISOString();
-    const conversationId = createId("conv");
+    const conversationId = conversationIdOverride ?? createId("conv");
     let created: Conversation | null = null;
     // Materializing a draft preserves its exact settings; other creation paths resolve them now.
     const resolved = settingsOverride
@@ -4350,66 +4860,193 @@ function App() {
     }
     setActiveWorkspaceId(targetId);
     setActiveConversationId(conversationId);
-    // Clear a materialized draft so no stale draft can later regain the active view.
-    setDraftConversation(null);
     // A brand-new conversation starts on its own timeline; the per-conversation view state means
-    // this only has to clear a stale entry left by a conversation id that was reused.
+    // this only has to clear a stale entry left by a conversation id that was reused. A draft's
+    // terminal tabs are already filed under the id it materializes as, and are its own.
     dispatchSidePanes({ type: "remove_conversation", conversationId });
-    dispatchTerminalTabs({ type: "remove_conversation", conversationId });
+    if (!conversationIdOverride) dispatchTerminalTabs({ type: "remove_conversation", conversationId });
     return conversationId;
   }, [activeWorkspaceId, dispatchSidePanes, dispatchTerminalTabs, documentStore, resolveNewConversationSettings, t]);
 
-  const discardDraftConversation = useCallback(() => {
-    if (!draftConversationRef.current) return;
-    setDraftConversation(null);
-    // Panes are keyed by conversation id and the draft's is a constant, so a layout left
-    // under it would reopen itself in the next brand-new task.
-    dispatchSidePanes({ type: "remove_conversation", conversationId: DRAFT_CONVERSATION_ID });
-    composerController.invalidateImages([DRAFT_CONVERSATION_ID]);
-    composerController.updateDrafts((current) => {
-      if (current[DRAFT_CONVERSATION_ID] === undefined) return current;
+  /**
+   * The dev servers the draft started, in every workspace of its project and on whichever machine
+   * each is, which the host files under the id it will be sent as. A host that cannot be asked —
+   * or a machine that cannot be reached — answers with none.
+   */
+  const draftPreviewServers = useCallback(async (
+    draft: DraftConversationState
+  ): Promise<PreviewServerSnapshot[]> => {
+    if (!hasBackendRuntime()) return [];
+    const workspace = documentStore.current()?.workspaces.find((candidate) => (
+      candidate.id === draft.workspaceId
+    ));
+    if (!workspace || workspace.kind !== "directory") return [];
+    const listed = await listPreviewServers({
+      conversationId: draft.materializesAs,
+      draftWorkspaceId: workspace.id
+    }).catch((): PreviewServerSnapshot[] => []);
+    return listed.filter((server) => server.sessionId === draft.materializesAs);
+  }, [documentStore]);
+
+  /**
+   * Ends everything the draft opened against its project: its shells and dev servers are killed,
+   * its preview page closed, and the panes that showed them put away along with the workspace
+   * chip's selection and the Git snapshot, which described the old checkout; the new target's poll
+   * reads the next one. The draft then gets a fresh id to open its next ones under, so nothing the
+   * host still holds for the old project can be handed to the conversation it becomes in the new
+   * one.
+   *
+   * Conversation settings is the one pane that stays: the draft's settings come along.
+   */
+  const releaseDraftSurfaces = useCallback((): {
+    /** The id the draft's next shells and page are opened under. */
+    materializesAs: string;
+    /** Settles once the host has been asked to end each of them; never rejects. */
+    released: Promise<void>;
+  } | null => {
+    const draft = draftConversationRef.current;
+    if (!draft) return null;
+    const ownerId = draft.materializesAs;
+    const terminalIds = new Set([
+      ...terminalTabsFor(terminalTabsStateRef.current, ownerId).tabs.map((tab) => tab.id),
+      ...Object.values(terminalController.current())
+        .filter((session) => session.conversationId === ownerId)
+        .map((session) => session.terminalId)
+    ]);
+    const closing: Promise<void>[] = [...terminalIds].map((terminalId) => (
+      requestTerminalSessionClose(ownerId, terminalId)
+    ));
+    dispatchTerminalTabs({ type: "remove_conversation", conversationId: ownerId });
+    // Reads the project off this draft, before it is aimed anywhere else.
+    closing.push(draftPreviewServers(draft).then(async (servers) => {
+      await Promise.all(servers.map((server) => stopPreviewServer(server.serverId).catch(() => false)));
+    }));
+    // Reads the roster, so it goes before the roster is cleared below.
+    closing.push(requestConversationBrowserClose(DRAFT_CONVERSATION_ID));
+    for (const pane of sidePaneLayoutFor(sidePanesStateRef.current, DRAFT_CONVERSATION_ID).panes) {
+      if (paneKind(pane) === "settings") continue;
+      dispatchSidePanes({ type: "close", conversationId: DRAFT_CONVERSATION_ID, pane });
+    }
+    for (const sessionId of previewSessionsFor(sidePanesStateRef.current, DRAFT_CONVERSATION_ID)) {
+      dispatchSidePanes({ type: "forget_preview", conversationId: DRAFT_CONVERSATION_ID, sessionId });
+    }
+    setSelectedWorkspaceMembers((current) => {
+      if (!(DRAFT_CONVERSATION_ID in current)) return current;
       const next = { ...current };
       delete next[DRAFT_CONVERSATION_ID];
       return next;
     });
-  }, [composerController]);
+    updateGitSnapshots((current) => {
+      if (!current[DRAFT_CONVERSATION_ID]) return current;
+      const next = { ...current };
+      delete next[DRAFT_CONVERSATION_ID];
+      return next;
+    });
+    return {
+      materializesAs: createId("conv"),
+      released: Promise.allSettled(closing).then(() => undefined)
+    };
+  }, [
+    dispatchSidePanes,
+    dispatchTerminalTabs,
+    draftPreviewServers,
+    requestConversationBrowserClose,
+    requestTerminalSessionClose,
+    terminalController,
+    updateGitSnapshots
+  ]);
 
   /**
-   * Open a new task. A known workspace makes the conversation real at once, because a hand-built
-   * tool call needs an id the host recognizes; each workspace returns to its own single slot. With
-   * no workspace chosen there is nowhere to persist it yet, so it stays in the renderer until
-   * {@link setDraftWorkspace} or the first send picks one.
+   * Aims the draft at another project, or at none, ending what it had open against the old one.
+   * The result settles once the host has been asked to end each shell and page; it never rejects.
    */
-  const openDraftConversation = useCallback(async (
+  const retargetDraft = useCallback((workspaceId: string | null): Promise<void> => {
+    const draft = draftConversationRef.current;
+    if (!draft || draft.workspaceId === workspaceId) return Promise.resolve();
+    const release = releaseDraftSurfaces();
+    const next = { ...draft, workspaceId, materializesAs: release?.materializesAs ?? draft.materializesAs };
+    // Handlers that run before the next render must already see the new project and id.
+    draftConversationRef.current = next;
+    setDraftConversation(next);
+    return release?.released ?? Promise.resolve();
+  }, [releaseDraftSurfaces]);
+
+  /**
+   * Aims the draft at another project, asking first when that ends shells or dev servers it still
+   * has running. The renderer only sees the shells on screen, so the host is asked for the rest,
+   * and for the servers. `proceed` runs after the draft has moved, and not at all if the user keeps
+   * it where it is.
+   */
+  const requestDraftRetarget = useCallback(async (
+    workspaceId: string | null,
+    proceed: () => void = () => undefined
+  ) => {
+    const draft = draftConversationRef.current;
+    if (!draft) return;
+    if (draft.workspaceId === workspaceId) {
+      proceed();
+      return;
+    }
+    const ownerId = draft.materializesAs;
+    const onScreen = Object.values(terminalController.current()).filter((session) => (
+      session.conversationId === ownerId && terminalSessionIsLive(session)
+    )).length;
+    const [shells, servers] = await Promise.all([
+      hasBackendRuntime() ? liveTerminalCount(ownerId).catch(() => onScreen) : onScreen,
+      draftPreviewServers(draft).then((listed) => listed.length)
+    ]);
+    // The draft may have moved on, or become a conversation, while the host answered.
+    if (draftConversationRef.current?.materializesAs !== ownerId) return;
+    if (shells > 0 || servers > 0) {
+      setDraftRetargetPrompt({ ownerId, workspaceId, shells, servers, proceed });
+      return;
+    }
+    void retargetDraft(workspaceId);
+    proceed();
+  }, [draftPreviewServers, retargetDraft, terminalController]);
+
+  /**
+   * Open a new task: the one renderer-held draft, aimed at the requested project when there is one.
+   * There is a single draft for the whole app rather than one per project, because its project is
+   * still the user's to change; it becomes a real conversation, fixed in whichever project it then
+   * names, only when something needs the host to know it — see {@link redeemDraft}.
+   *
+   * An unsent draft outlives a visit to another conversation, so a new task returns to it — text,
+   * settings and all — aimed at the project the new task was asked for.
+   */
+  const openDraftConversation = useCallback((
     workspaceId?: string,
     source: NewConversationSource = "global"
   ) => {
     const current = documentStore.current();
     if (!current) return;
-    const requestedId = workspaceId ?? activeWorkspaceIdRef.current;
-    const target = current.workspaces.find((workspace) => (
-      workspace.id === requestedId && !deletingWorkspaceIdsRef.current.has(workspace.id)
+    const available = (id: string | null | undefined) => current.workspaces.find((workspace) => (
+      workspace.id === id && !deletingWorkspaceIdsRef.current.has(workspace.id)
     )) ?? null;
-    const resolved = resolveNewConversationSettings(target, source);
-    if (!resolved) return;
-    // Starting a new task discards any existing unsent draft composer content.
-    discardDraftConversation();
-    if (target) {
-      const slot = draftSlotOf(target.conversations);
-      if (slot) {
-        setActiveWorkspaceId(target.id);
-        setActiveConversationId(slot.id);
-      } else {
-        createConversation(target.id, source);
+    const target = available(workspaceId ?? activeWorkspaceIdRef.current);
+    const existing = draftConversationRef.current;
+    if (existing) {
+      // With no project asked for, the draft keeps its own — unless that one has since gone.
+      const aimedAt = target?.id ?? available(existing.workspaceId)?.id ?? null;
+      const show = () => {
+        setActiveWorkspaceId(aimedAt);
+        setActiveConversationId(DRAFT_CONVERSATION_ID);
+        setEditor(null);
+      };
+      if (existing.workspaceId !== null && !available(existing.workspaceId)) {
+        // Its project went, and its shells with it; there is nothing left to ask about.
+        void retargetDraft(aimedAt);
+        show();
+        return;
       }
-      setEditor(null);
-      // The host only recognizes a conversation it has saved; a hand-built tool call here must not
-      // outrun that write.
-      await flushLatestDocument({ durable: true });
+      void requestDraftRetarget(aimedAt, show);
       return;
     }
+    const resolved = resolveNewConversationSettings(target, source);
+    if (!resolved) return;
     setDraftConversation({
-      workspaceId: null,
+      workspaceId: target?.id ?? null,
+      materializesAs: createId("conv"),
       settings: resolved.settings,
       createdAt: new Date().toISOString(),
       worktreeRequested: false,
@@ -4419,22 +5056,25 @@ function App() {
       presetId: resolved.presetId,
       templateId: ""
     });
-    setActiveWorkspaceId(null);
+    setActiveWorkspaceId(target?.id ?? null);
     setActiveConversationId(DRAFT_CONVERSATION_ID);
     setEditor(null);
   }, [
-    createConversation,
-    discardDraftConversation,
     documentStore,
-    flushLatestDocument,
-    resolveNewConversationSettings
+    requestDraftRetarget,
+    resolveNewConversationSettings,
+    retargetDraft,
+    setActiveConversationId,
+    setActiveWorkspaceId
   ]);
   openDraftConversationRef.current = openDraftConversation;
 
   /**
    * Move everything the renderer keyed by the draft's placeholder id onto the real conversation:
-   * composer text, staged images, and the Git snapshot. A worktree is the one exception — creating
-   * it changes branch, HEAD, and modifications, so its snapshot must be re-read rather than carried.
+   * pane layout, composer text, staged images, the workspace chip's choice, and the Git snapshot.
+   * A worktree is the one exception — creating it changes branch, HEAD, and modifications, so its
+   * snapshot must be re-read rather than carried. Its terminals and preview page need nothing:
+   * they are already keyed by the id it became.
    */
   const adoptDraftConversationId = useCallback((
     conversationId: string,
@@ -4464,13 +5104,20 @@ function App() {
       delete next[DRAFT_CONVERSATION_ID];
       return next;
     });
+    // The workspace chip's choice is where the draft's terminals and Git surface were pointed.
+    setSelectedWorkspaceMembers((current) => {
+      if (!(DRAFT_CONVERSATION_ID in current)) return current;
+      const next = { ...current, [conversationId]: current[DRAFT_CONVERSATION_ID] };
+      delete next[DRAFT_CONVERSATION_ID];
+      return next;
+    });
     if (options.migrateGitSnapshot === false) return;
     updateGitSnapshots((current) => (
       gitSnapshotsAfterDraftRedemption(current, DRAFT_CONVERSATION_ID, conversationId)
     ));
   }, [composerController, updateGitSnapshots]);
 
-  /** Materialize the draft at send time, when no workspace was ever chosen for it. */
+  /** Turn the draft into a conversation in the project it names, or the temporary one when it names none. */
   const materializeDraft = useCallback((): {
     conversationId: string;
     workspaceId: string;
@@ -4479,8 +5126,12 @@ function App() {
     const draft = draftConversationRef.current;
     if (!draft) return null;
     const workspaceId = draft.workspaceId ?? TEMPORARY_WORKSPACE_ID;
-    const created = createConversation(workspaceId, "global", draft.settings, draft.runTarget, null, draft.contexts, draft.presetId, draft.templateId, draft.attachedWorkspaces);
+    const created = createConversation(workspaceId, "global", draft.settings, draft.runTarget, null, draft.contexts, draft.presetId, draft.templateId, draft.attachedWorkspaces, draft.materializesAs);
     if (!created) return null;
+    // The draft is this conversation now; clear it so it cannot regain the active view. The ref too:
+    // a new task opened before the next render must not find it still waiting.
+    draftConversationRef.current = null;
+    setDraftConversation(null);
     const worktreeRequested = draft.worktreeRequested
       && documentStore.current()?.workspaces.find(
         (workspace) => workspace.id === workspaceId
@@ -4493,6 +5144,45 @@ function App() {
       worktreeRequested
     };
   }, [adoptDraftConversationId, createConversation, documentStore]);
+
+  /**
+   * Make the draft a conversation the host can act on, fixed from then on in the project it names.
+   * This happens only when something needs the host to know it — the first send, or a tool the
+   * user runs or records on its timeline — so until then the draft's project stays the user's to
+   * change. A worktree the draft asked for is created here, before anything can run at the
+   * workspace root in its place; failing to create one throws, with the conversation already real.
+   *
+   * `persist` waits until the host holds the conversation. A send skips it only because the send
+   * persists the conversation together with its first message.
+   */
+  const redeemDraft = useCallback(async (
+    { persist }: { persist: boolean }
+  ): Promise<{ conversationId: string; workspaceId: string } | null> => {
+    const redeemed = materializeDraft();
+    if (!redeemed) return null;
+    if (!redeemed.worktreeRequested) {
+      if (persist) await flushLatestDocument({ durable: true });
+      return redeemed;
+    }
+    // The host resolves a conversation only from its saved document, worktree requests included.
+    await flushLatestDocument({ durable: true });
+    const worktree = await createConversationWorktree(redeemed.conversationId);
+    updateConversation(
+      redeemed.workspaceId,
+      redeemed.conversationId,
+      (conversation) => ({ ...conversation, worktree })
+    );
+    // The host also reads the persisted worktree record for trusted path resolution; without it,
+    // the work would run at the workspace root.
+    await flushLatestDocument({ durable: true });
+    // Refresh the Git snapshot after moving from the workspace root to a different worktree checkout.
+    void refreshGitSnapshot(
+      redeemed.conversationId,
+      redeemed.workspaceId,
+      gitConversationTarget(redeemed.conversationId)
+    );
+    return redeemed;
+  }, [flushLatestDocument, materializeDraft, refreshGitSnapshot, updateConversation]);
 
   /* Conversation templates.
    *
@@ -4522,26 +5212,17 @@ function App() {
    * Applies a preset's settings and, when it has one, the message queue it opens
    * with — in that order, onto a conversation the host can already see.
    *
-   * A draft is materialized and flushed FIRST, before either write. The host
-   * attests the copied tool cards against the TARGET conversation id, so the
-   * target has to be real; and once it is, both writes go through explicit ids
-   * rather than through `updateActiveConversation`, whose draft branch reads a
-   * ref that this tick's own materialization has already invalidated.
+   * Settings alone are a draft's own business, so a preset without a queue
+   * leaves a draft a draft. A queue is different: the host attests its copied
+   * tool cards against the TARGET conversation id, so a draft is redeemed FIRST,
+   * before either write, and is fixed in its project from then on. Once it is
+   * real, both writes go through explicit ids rather than through
+   * `updateActiveConversation`, whose target was read before the draft became real.
    */
   const applyPresetBody = useCallback(async (preset: ConversationPreset) => {
     setTemplateError(null);
-    let workspaceId = activeWorkspaceId;
-    let conversationId = activeConversationId;
-    if (isDraftConversationId(conversationId)) {
-      const redeemed = materializeDraft();
-      if (!redeemed) return;
-      workspaceId = redeemed.workspaceId;
-      conversationId = redeemed.conversationId;
-      await flushLatestDocument({ durable: true });
-    }
-    if (!workspaceId || !conversationId) return;
     const knownToolNames = new Set(documentStore.current()?.tools.map((tool) => tool.name) ?? []);
-    updateConversation(workspaceId, conversationId, (conversation) => ({
+    const withPreset = (conversation: Conversation): Conversation => ({
       ...conversation,
       settings: applyConversationPresetSettings(
         conversation.settings,
@@ -4549,7 +5230,25 @@ function App() {
         knownToolNames
       ),
       presetId: preset.id
-    }));
+    });
+    let workspaceId = activeWorkspaceId;
+    let conversationId = activeConversationId;
+    if (isDraftConversationId(conversationId)) {
+      if (!preset.templateId) {
+        updateActiveConversation(withPreset);
+        return;
+      }
+      try {
+        const redeemed = await redeemDraft({ persist: true });
+        if (!redeemed) return;
+        ({ workspaceId, conversationId } = redeemed);
+      } catch (reason) {
+        setTemplateError(failureMessage(reason, t("无法套用对话模板", "Could not apply the conversation template")));
+        return;
+      }
+    }
+    if (!workspaceId || !conversationId) return;
+    updateConversation(workspaceId, conversationId, withPreset);
     if (!preset.templateId) return;
     try {
       const contexts = await applyConversationTemplate({
@@ -4569,9 +5268,9 @@ function App() {
     activeConversationId,
     activeWorkspaceId,
     documentStore,
-    flushLatestDocument,
-    materializeDraft,
+    redeemDraft,
     t,
+    updateActiveConversation,
     updateConversation
   ]);
 
@@ -4609,7 +5308,7 @@ function App() {
     const current = documentStore.current();
     if (!current || !activeConversation) return;
     const preset = presetId === IMPLICIT_CONVERSATION_PRESET_ID
-      ? implicitConversationPreset(current.tools, resolvedLanguage, platform)
+      ? implicitConversationPreset(current.tools, resolvedLanguage)
       : current.globalSettings.conversationPresets.find((item) => item.id === presetId);
     if (!preset) return;
     if (preset.templateId && templateSwitchNeedsConfirmation()) {
@@ -4621,7 +5320,6 @@ function App() {
     activeConversation,
     applyPresetBody,
     documentStore,
-    platform,
     resolvedLanguage,
     templateSwitchNeedsConfirmation
   ]);
@@ -4792,67 +5490,20 @@ function App() {
   }, [handleGlobalSettingsChange]);
 
   /**
-   * Choosing a workspace for the renderer-held draft is what makes it real: the host can only
-   * accept contexts against a conversation that lives somewhere. Clearing the workspace leaves the
-   * draft where it is, since there is nothing to persist it into.
+   * Point the draft at another project, or at none. The draft stays a draft — settings, composer
+   * text and hand-written content all come along — because nothing the host would have to know
+   * about has happened in it yet; {@link redeemDraft} fixes it in a project once something has.
    */
-  const setDraftWorkspace = useCallback(async (workspaceId: string | null) => {
-    const draft = draftConversationRef.current;
-    if (!draft) return;
-    if (workspaceId === null) {
-      setDraftConversation((current) => (current ? { ...current, workspaceId: null } : current));
-      setActiveWorkspaceId(null);
-      return;
-    }
-    const target = documentStore.current()?.workspaces.find(
+  const setDraftWorkspace = useCallback((workspaceId: string | null) => {
+    if (!draftConversationRef.current || !isDraftConversationId(activeConversationIdRef.current)) return;
+    if (workspaceId !== null && !documentStore.current()?.workspaces.some(
       (workspace) => workspace.id === workspaceId
-    );
-    if (!target) return;
-    const slot = draftSlotOf(target.conversations);
-    // Reuse this workspace's own empty slot rather than stacking a second one beside it, carrying
-    // across whatever the user already set up on the draft.
-    let conversationId = slot?.id ?? null;
-    if (slot) {
-      updateConversation(workspaceId, slot.id, (conversation) => ({
-        ...conversation,
-        settings: draft.settings,
-        runTarget: draft.runTarget,
-        attachedWorkspaces: draft.attachedWorkspaces.length
-          ? draft.attachedWorkspaces
-          : conversation.attachedWorkspaces,
-        presetId: draft.presetId,
-        templateId: draft.templateId,
-        contexts: draft.contexts.length ? draft.contexts : conversation.contexts
-      }));
-    } else {
-      conversationId = createConversation(
-        workspaceId,
-        "global",
-        draft.settings,
-        draft.runTarget,
-        null,
-        draft.contexts,
-        draft.presetId,
-        draft.templateId,
-        draft.attachedWorkspaces
-      );
-    }
-    if (!conversationId) return;
-    adoptDraftConversationId(conversationId);
-    setActiveWorkspaceId(workspaceId);
-    setActiveConversationId(conversationId);
-    setDraftConversation(null);
-    // The host recognizes a conversation only from its own saved document, so anything the user
-    // does next — a worktree, a Git write, a hand-built tool call — has to wait for this barrier.
-    await flushLatestDocument({ durable: true });
-  }, [
-    adoptDraftConversationId,
-    createConversation,
-    documentStore,
-    flushLatestDocument,
-    setActiveWorkspaceId,
-    updateConversation
-  ]);
+    )) return;
+    void requestDraftRetarget(workspaceId, () => {
+      // Only while the draft is still what is on screen.
+      if (isDraftConversationId(activeConversationIdRef.current)) setActiveWorkspaceId(workspaceId);
+    });
+  }, [documentStore, requestDraftRetarget, setActiveWorkspaceId]);
 
   /** Set or clear the workspace default preset; it affects workspace-plus creation only, not global new-task creation. */
   const setWorkspaceDefaultPreset = useCallback((workspaceId: string, presetId: string) => {
@@ -4930,17 +5581,15 @@ function App() {
         if (last) handleContextEdit(last);
       },
       /**
-       * Toggles this conversation's preview pane.
-       *
-       * With no tab strip there is no creation entry point here: the shortcut opens the session the
-       * model already minted, or mints the primary one when there is none yet.
+       * Toggles this conversation's preview pane: on the page last seen there, or, with no page
+       * yet, on the start page of the workspace the composer's chip has selected.
        */
       "panel.browser.toggle": () => {
         if (openPreviewSessionId) {
           closePane(previewPaneId(openPreviewSessionId));
           return;
         }
-        void openBrowserTab(currentPreviewSessions.at(0));
+        showPreviewPanel();
       },
       "panel.close": () => closeLastPane()
     };
@@ -4950,7 +5599,7 @@ function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       // IME composition keystrokes are not shortcuts.
-      if (event.isComposing || event.key === "Process") return;
+      if (isImeKeyEvent(event)) return;
       for (const command of SHORTCUT_COMMANDS) {
         const preference = resolveShortcut(shortcutBindings ?? {}, command);
         if (!preference.enabled || !preference.binding.length) continue;
@@ -5009,8 +5658,12 @@ function App() {
       && normalizedWorkspacePath(workspace.path) === normalized
       && sameMembers(workspace)
     ));
-    // Drafts have no stored ownership; assign their workspace id directly when it exists, or after creation.
-    const assigningDraft = assignConversation && Boolean(draftConversationRef.current);
+    // Drafts have no stored ownership; assign their workspace id directly when it exists, or after
+    // creation. Only the draft on screen: one waiting behind another conversation is not the one
+    // the user is choosing a project for.
+    const assigningDraft = assignConversation
+      && Boolean(draftConversationRef.current)
+      && isDraftConversationId(movingConversationId);
     if (assigningDraft && existing) {
       setDraftWorkspace(existing.id);
       setWorkspaceDialogOpen(false);
@@ -5213,13 +5866,19 @@ function App() {
       const workspaceConversationIds = new Set(conversationIdsBeforeClose);
       const terminalSessions = Object.values(terminalController.current())
         .filter((session) => workspaceConversationIds.has(session.conversationId));
+      // The draft aimed here loses its project with everyone else: its shells and page end, and it
+      // is aimed at none. A running command of its own would otherwise hold up the deletion.
+      const draftReleased = draftConversationRef.current?.workspaceId === workspace.id
+        ? retargetDraft(null)
+        : Promise.resolve();
       const [browserResults, terminalResults] = await Promise.all([
         Promise.allSettled(conversationIdsBeforeClose.map((conversationId) => (
           requestConversationBrowserClose(conversationId)
         ))),
         Promise.allSettled(terminalSessions.map((session) => (
           requestTerminalSessionClose(session.conversationId, session.terminalId)
-        )))
+        ))),
+        draftReleased
       ]);
       if (
         browserResults.some((result) => result.status === "rejected")
@@ -5547,6 +6206,42 @@ function App() {
    * placed card is how a call with side effects gets into the transcript without
    * causing them.
    */
+  /**
+   * The conversation a tool the user runs or records on the timeline goes into, as the host knows
+   * it. A tool card belongs to a workspace, and the host executes and attests one only against a
+   * conversation it holds, so a draft materializes here and is fixed in its project from then on.
+   *
+   * Callers write through the returned ids, never through `updateActiveConversation`: its target
+   * was read at render time, before this call made the draft real.
+   */
+  const conversationForTimelineTool = async (): Promise<{
+    workspaceId: string;
+    conversationId: string;
+  }> => {
+    if (activeConversation && !isDraftConversationId(activeConversation.id)) {
+      if (!activeWorkspace) throw new Error(t("没有活动对话", "No active conversation"));
+      await flushLatestDocument();
+      return { workspaceId: activeWorkspace.id, conversationId: activeConversation.id };
+    }
+    // An upload still addressed to the draft would be dropped once the draft is gone.
+    if (composerController.current().imageLoadingIds.has(DRAFT_CONVERSATION_ID)) {
+      throw new Error(t(
+        "输入框里的图片还在上传，稍后再运行工具",
+        "Images in the composer are still uploading; run the tool once they finish"
+      ));
+    }
+    let redeemed: { workspaceId: string; conversationId: string } | null;
+    try {
+      redeemed = await redeemDraft({ persist: true });
+    } catch (reason) {
+      throw new Error(t("工具没有运行：{reason}", "The tool did not run: {reason}", {
+        reason: failureMessage(reason, t("原因不明", "unknown reason"))
+      }));
+    }
+    if (!redeemed) throw new Error(t("没有活动对话", "No active conversation"));
+    return redeemed;
+  };
+
   const saveToolContextEdit = async (input: JsonObject, output: string, images: ImageAttachment[]): Promise<void> => {
     if (!editor || !activeConversation) {
       throw new Error(t("没有活动对话", "No active conversation"));
@@ -5561,13 +6256,12 @@ function App() {
       if (editor.kind !== "tool" || !editor.toolName) {
         throw new Error(t("没有选择工具", "No tool was chosen"));
       }
-      const conversationId = activeConversation.id;
       const contextId = createId("ctx");
       const toolName = editor.toolName;
       const index = editor.index;
-      await flushLatestDocument();
+      const { workspaceId, conversationId } = await conversationForTimelineTool();
       const attested = await attestInsertedToolContext({ conversationId, contextId, toolName, input, output });
-      updateActiveConversation((conversation) => {
+      updateConversation(workspaceId, conversationId, (conversation) => {
         const contexts = [...conversation.contexts];
         contexts.splice(Math.min(index, contexts.length), 0, {
           id: contextId,
@@ -5578,7 +6272,7 @@ function App() {
           attestation: attested.attestation,
           createdAt: new Date().toISOString()
         });
-        return { ...conversation, contexts };
+        return { ...conversation, contexts, updatedAt: new Date().toISOString() };
       });
       setContextUsage((current) => {
         const next = { ...current };
@@ -5591,9 +6285,8 @@ function App() {
     if (editor.item.kind !== "tool") {
       throw new Error(t("没有活动对话", "No active conversation"));
     }
-    const conversationId = activeConversation.id;
     const contextId = editor.item.id;
-    await flushLatestDocument();
+    const { workspaceId, conversationId } = await conversationForTimelineTool();
     const attested = await attestEditedToolContext({
       conversationId,
       contextId,
@@ -5602,8 +6295,9 @@ function App() {
       output,
       images
     });
-    updateActiveConversation((conversation) => ({
+    updateConversation(workspaceId, conversationId, (conversation) => ({
       ...conversation,
+      updatedAt: new Date().toISOString(),
       contexts: conversation.contexts.map((item) => item.id === contextId && item.kind === "tool"
         ? {
           ...item,
@@ -5682,7 +6376,8 @@ function App() {
   };
 
   const saveToolContext = async (toolName: string, input: JsonObject): Promise<ToolResult> => {
-    if (!document || !editor || !activeWorkspace || !activeConversation) {
+    // A draft with no project runs its tool in the temporary workspace it materializes into.
+    if (!document || !editor || (!activeWorkspace && !draftActive) || !activeConversation) {
       throw new Error(t("没有活动对话", "No active conversation"));
     }
     if (contextMutationIsBlocked(activeConversation.id)) {
@@ -5727,25 +6422,28 @@ function App() {
       setEditor(null);
       return existingResult;
     }
-    await flushLatestDocument();
-    const request = { conversationId: activeConversation.id, workspacePath: activeWorkspace.path, toolName, input };
+    const { workspaceId, conversationId } = await conversationForTimelineTool();
+    const workspacePath = documentStore.current()?.workspaces
+      .find((workspace) => workspace.id === workspaceId)?.path ?? "";
+    const request = { conversationId, workspacePath, toolName, input };
     // Rust classifies every operation from the persisted security policy. Safe calls return
     // without a card; calls that need consent come back with a prompt to draw, and answering
     // it is what mints the single-use nonce — from the arguments Rust classified, not from
     // anything the renderer could substitute in between.
     const approval = await requestToolApproval(request);
     const granted = approval?.prompt
-      ? await awaitManualToolApproval(activeConversation.id, approval.prompt)
+      ? await awaitManualToolApproval(conversationId, approval.prompt)
       : approval;
     const execution = await executeTool(request, granted?.nonce);
+    const updatedAt = new Date().toISOString();
     if (editor.mode === "edit") {
       const id = editor.item.id;
-      updateActiveConversation((conversation) => {
+      updateConversation(workspaceId, conversationId, (conversation) => {
         const contexts = conversation.contexts
           .map((item) => item.id === id && item.kind === "tool"
             ? { ...item, requestedInput: undefined, input, result: execution }
             : item);
-        return { ...conversation, contexts };
+        return { ...conversation, contexts, updatedAt };
       });
     } else {
       const item: ContextItem = {
@@ -5754,17 +6452,17 @@ function App() {
         toolName,
         input,
         result: execution,
-        createdAt: new Date().toISOString()
+        createdAt: updatedAt
       };
-      updateActiveConversation((conversation) => {
+      updateConversation(workspaceId, conversationId, (conversation) => {
         const contexts = [...conversation.contexts];
         contexts.splice(editor.index, 0, item);
-        return { ...conversation, contexts };
+        return { ...conversation, contexts, updatedAt };
       });
     }
     setContextUsage((current) => {
       const next = { ...current };
-      delete next[activeConversation.id];
+      delete next[conversationId];
       return next;
     });
     setEditor(null);
@@ -5840,6 +6538,7 @@ function App() {
       openProviderSettings: () => openGlobalSettings("providers"),
       activeWorkspaceId: () => activeWorkspaceIdRef.current,
       activeConversationId: () => activeConversationIdRef.current,
+      draftIsOpen: () => draftConversationRef.current !== null,
       activeConversationTools: () => activeConversationTools,
       activeEnabledTools: () => activeEnabledTools,
       lockConversationTools,
@@ -5949,47 +6648,26 @@ function App() {
   ) => {
     if (isDraftConversationId(activeConversationIdRef.current)) {
       if (composerController.current().imageLoadingIds.has(DRAFT_CONVERSATION_ID)) return;
-      const redeemed = materializeDraft();
-      if (!redeemed) return;
-      if (redeemed.worktreeRequested) {
-        // Create the requested worktree before the first message so every tool call uses its isolated checkout; never silently fall back to the workspace root.
-        try {
-          // Persist the materialized conversation before requesting a worktree because the host resolves conversations from its saved document.
-          await flushLatestDocument({ durable: true });
-          const worktree = await createConversationWorktree(redeemed.conversationId);
-          updateConversation(
-            redeemed.workspaceId,
-            redeemed.conversationId,
-            (conversation) => ({ ...conversation, worktree })
-          );
-          // The host also reads the persisted worktree record for trusted path resolution; without it, this turn would run at the workspace root.
-          await flushLatestDocument({ durable: true });
-          // Refresh the Git snapshot after moving from the workspace root to a different worktree checkout.
-          void refreshGitSnapshot(
-            redeemed.conversationId,
-            redeemed.workspaceId,
-            gitConversationTarget(redeemed.conversationId)
-          );
-        } catch (reason) {
-          // Include send failure explicitly because `failureMessage` otherwise favors the host's Git detail.
-          setBranchChipError(t(
-            "无法建立隔离工作树，消息还没有发出：{reason}。取消勾选「工作树」可以直接在工作区根上开始。",
-            "The isolated worktree could not be created, so nothing was sent: {reason}. Clear the worktree checkbox to start on the workspace root instead.",
-            { reason: failureMessage(reason, t("原因不明", "unknown reason")) }
-          ));
-          return;
-        }
+      try {
+        // A requested worktree is created before the first message so every tool call uses its
+        // isolated checkout; never silently fall back to the workspace root.
+        if (!await redeemDraft({ persist: false })) return;
+      } catch (reason) {
+        // Include send failure explicitly because `failureMessage` otherwise favors the host's Git detail.
+        setBranchChipError(t(
+          "无法建立隔离工作树，消息还没有发出：{reason}。取消勾选「工作树」可以直接在工作区根上开始。",
+          "The isolated worktree could not be created, so nothing was sent: {reason}. Clear the worktree checkbox to start on the workspace root instead.",
+          { reason: failureMessage(reason, t("原因不明", "unknown reason")) }
+        ));
+        return;
       }
     }
     await sendComposer(overrideText, toolExposure);
   }, [
     composerController,
-    flushLatestDocument,
-    materializeDraft,
-    refreshGitSnapshot,
+    redeemDraft,
     sendComposer,
-    t,
-    updateConversation
+    t
   ]);
 
   // After loading, adopt host runs that are still live or awaiting settlement. Queue dispatch waits for adoption so both paths cannot race for one conversation. A ref latch allows only one adoption; failed adoption reopens it for retry.
@@ -6476,7 +7154,7 @@ function App() {
         await stopPreviewServer(item.server.serverId);
         // The host's own change event closes the page too, but not before this row has already
         // gone; closing here is what makes one click read as one action.
-        await closePagesServedAt(conversationId, item.address);
+        await closePagesServedAt(conversationId, item.server);
       } else if (item.kind === "terminal") {
         await destroyTerminalSession(item.terminal.conversationId, item.terminal.terminalId);
       } else if (item.kind === "shell") {
@@ -6505,6 +7183,44 @@ function App() {
   }
 
   /**
+   * Where a new terminal can start. With one workspace, the same choice as the composer's
+   * terminal button; with more, the workspace first and then, beside it, the shells its machine
+   * was probed to have. The top-right terminal button and the terminal pane's `+` both open it.
+   */
+  const newTerminalMenu: { sections: PopoverMenuSection[]; submenu?: "flyout" } = activeTerminalWorkspaces.length > 1
+    ? {
+      submenu: "flyout",
+      sections: [{
+        id: "workspaces",
+        label: t("在哪个工作区打开", "Open in which workspace"),
+        items: terminalWorkspaceMenuItems({
+          workspaces: activeTerminalWorkspaces,
+          sshMachines: document.globalSettings.executionEnvironments.sshMachines,
+          shellsFor: terminalShellsOn,
+          emptyLabel: t("未探测到可用的 shell", "No shells detected"),
+          disabled: activeWorkspaceLifecycleOperationRunning,
+          onSelect: openTerminalIn
+        })
+      }]
+    }
+    : {
+      sections: [{
+        id: "shells",
+        label: activeSelectedWorkspace
+          ? t("在 {name} 打开", "Open in {name}", {
+            name: workspaceDirectoryLabel(activeSelectedWorkspace.path)
+          })
+          : undefined,
+        items: terminalShellMenuItems(
+          activeTerminalShells,
+          (shell) => openTerminalIn(activeWorkspaceMember, shell),
+          t("未探测到可用的 shell", "No shells detected"),
+          activeWorkspaceLifecycleOperationRunning
+        )
+      }]
+    };
+
+  /**
    * Draws one open side pane.
    *
    * Every pane is a `SidePane` pseudo-window, so the title bar, the close button and the focus
@@ -6523,23 +7239,22 @@ function App() {
     const onToggleExpand = () => dispatchSidePanes({ type: "toggle_expand", conversationId, pane });
 
     if (kind === "terminal") {
-      const terminals = terminalTabsFor(terminalTabsState, conversationId);
-      // The reference shell names a lone terminal after the thing itself and numbers them only
-      // once there is more than one to tell apart. The number is the tab's place in the strip,
-      // so a closed terminal gives its number back to the next one.
-      // A tab opened for a particular shell is named after it, the way the reference shell names
-      // its tabs after the program running in them.
+      // Terminals are the host identity's; for the draft that is the id it will materialize as,
+      // and the host reads the shell's directory off the project it is aimed at.
+      const ownerId = activeHostConversationId ?? conversationId;
+      const draftWorkspaceId = draftActive
+        ? draftConversation?.workspaceId ?? TEMPORARY_WORKSPACE_ID
+        : null;
+      const terminals = terminalTabsFor(terminalTabsState, ownerId);
+      // A tab is named after the shell it runs, the way the reference shell names its tabs after
+      // the program running in them, and numbered by how many of that shell the conversation
+      // has opened: each shell counts on its own, and a closed one keeps its number.
       const tabLabel = (tab: TerminalTab) => {
         if (tab.name) return tab.name;
         const shell = tab.launch?.shell;
-        if (shell) {
-          return terminals.tabs.length > 1
-            ? `${terminalShellLabel(shell)} ${terminalDisplayNumber(terminals, tab.id)}`
-            : terminalShellLabel(shell);
-        }
-        return terminals.tabs.length > 1
-          ? t("终端 {n}", "Terminal {n}", { n: terminalDisplayNumber(terminals, tab.id) })
-          : t("终端", "Terminal");
+        return shell
+          ? `${terminalShellLabel(shell)} ${tab.number}`
+          : t("终端 {n}", "Terminal {n}", { n: tab.number });
       };
       return (
         <SidePane
@@ -6555,14 +7270,14 @@ function App() {
             <TerminalTabBar
               tabs={terminals.tabs.map((tab) => ({ id: tab.id, label: tabLabel(tab) }))}
               activeId={terminals.activeId}
-              panelId={(terminalId) => terminalPanelId(conversationId, terminalId)}
+              panelId={(terminalId) => terminalPanelId(ownerId, terminalId)}
               closingIds={new Set(terminals.tabs
                 .filter((tab) => (
-                  terminalSessions[terminalSessionKey(conversationId, tab.id)]?.phase === "closing"
+                  terminalSessions[terminalSessionKey(ownerId, tab.id)]?.phase === "closing"
                 ))
                 .map((tab) => tab.id))}
               onSelect={(terminalId) => dispatchTerminalTabs({
-                type: "activate", conversationId, terminalId
+                type: "activate", conversationId: ownerId, terminalId
               })}
               onClose={(terminalId) => closeTerminalTab(conversationId, terminalId)}
               onRename={(terminalId, name) => {
@@ -6571,17 +7286,12 @@ function App() {
                 // following the derived one, so it still loses its number when the others go.
                 dispatchTerminalTabs({
                   type: "rename",
-                  conversationId,
+                  conversationId: ownerId,
                   terminalId,
                   name: tab && name.trim() === tabLabel(tab) ? "" : name
                 });
               }}
-              // Another terminal like the one in front: same workspace, same shell.
-              onAdd={() => dispatchTerminalTabs({
-                type: "add",
-                conversationId,
-                launch: terminals.tabs.find((tab) => tab.id === terminals.activeId)?.launch ?? null
-              })}
+              add={newTerminalMenu}
             />
           )}
         >
@@ -6589,23 +7299,28 @@ function App() {
             <TerminalPanel
               key={tab.id}
               ref={(handle) => {
-                const key = terminalSessionKey(conversationId, tab.id);
+                const key = terminalSessionKey(ownerId, tab.id);
                 if (handle) terminalPanelHandlesRef.current.set(key, handle);
                 else terminalPanelHandlesRef.current.delete(key);
               }}
-              conversationId={conversationId}
+              conversationId={ownerId}
               terminalId={tab.id}
               label={tabLabel(tab)}
               launch={tab.launch ?? undefined}
+              draftWorkspaceId={draftWorkspaceId}
+              // A project the draft was just aimed at may still be on its way to the host.
+              beforeOpen={draftWorkspaceId
+                ? () => awaitWorkspaceAtHost(documentStore, draftWorkspaceId)
+                : undefined}
               // Every tab stays mounted; only the selected one is on screen. A hidden tab keeps
               // its shell, its scrollback and its box, so coming back to it is a repaint.
               open={terminalPaneOpen && tab.id === terminals.activeId}
-              initialState={terminalSessions[terminalSessionKey(conversationId, tab.id)]}
+              initialState={terminalSessions[terminalSessionKey(ownerId, tab.id)]}
               inputDisabledReason={terminalInputDisabledReason}
-              onCommandStart={() => beginTerminalCommand(conversationId, tab.id)}
+              onCommandStart={() => beginTerminalCommand(ownerId, tab.id)}
               onStateChange={updateTerminalSession}
               onClose={async () => {
-                await requestTerminalSessionClose(conversationId, tab.id);
+                await requestTerminalSessionClose(ownerId, tab.id);
               }}
               onCleanExit={() => closeTerminalTab(conversationId, tab.id)}
             />
@@ -6618,11 +7333,52 @@ function App() {
       // A session another conversation minted has no pane here; the registry is per conversation,
       // and this guard covers the window where the layout and the registry disagree.
       if (!target || !currentPreviewSessions.includes(target)) return null;
-      const automationHolds = isPrimaryPreviewSession(target, conversationId)
+      const automationHolds = isPrimaryPreviewSession(target, activeHostConversationId ?? conversationId)
         && (Boolean(activePreviewPageTool) || activeBrowserAutomationStopping);
+      const pageWorkspace = previewWorkspaceOf(sidePanesState, target);
+      const multipleWorkspaces = activeTerminalWorkspaces.length > 1;
+      const sshMachines = document.globalSettings.executionEnvironments.sshMachines;
+      // A page is named after what it shows — its title, or its host — and a page with nothing
+      // loaded after the workspace whose start page it is. The number the composer's chip carries
+      // marks which workspace a page belongs to once there is more than one to tell apart.
+      const pageTabs = currentPreviewSessions.map((sessionId) => {
+        const member = previewWorkspaceOf(sidePanesState, sessionId);
+        const workspace = activeTerminalWorkspaces[member - 1] ?? null;
+        const status = browserStatuses[sessionId];
+        const address = status?.url && status.url !== "about:blank" ? splitBrowserAddress(status.url) : null;
+        const directory = workspace ? workspaceDirectoryLabel(workspace.path) : t("预览", "Preview");
+        return {
+          id: sessionId,
+          label: address ? (status?.title?.trim() || address.host) : directory,
+          title: address
+            ? status?.url
+            : workspace
+              ? workspaceLocationTitle(workspace.path, workspace.machine, sshMachines)
+              : undefined,
+          icon: workspace?.machine ? machineIcon(workspace.machine, 11) : undefined,
+          badge: multipleWorkspaces ? String(member) : undefined
+        };
+      });
+      const pageMachine = activeTerminalWorkspaces[pageWorkspace - 1]?.machine ?? null;
       return (
         <BrowserPanel
           paneId={pane}
+          tabs={(
+            <PreviewPageTabs
+              tabs={pageTabs}
+              activeId={target}
+              onSelect={(sessionId) => void openBrowserTab(sessionId)}
+              onClose={(sessionId) => void closePreviewPage(sessionId)}
+              add={multipleWorkspaces
+                ? previewWorkspaceMenuItems({
+                  workspaces: activeTerminalWorkspaces,
+                  sshMachines,
+                  disabled: activeWorkspaceLifecycleOperationRunning,
+                  onSelect: openPreviewPage
+                })
+                : () => openPreviewPage(1)}
+            />
+          )}
           onPaneFocus={onFocus}
           onPaneClose={() => closePane(pane)}
           paneExpanded={expanded}
@@ -6671,8 +7427,13 @@ function App() {
           // measures. The host parks the page for the same reason, and the panel has to agree, or
           // it goes on reporting the page as covered and swapping in snapshots nobody can see.
           active={activeExpandedPane === null || expanded}
-          target={activePrimaryGitTarget}
+          // The page's own workspace, on whichever machine it is: its start page lists that
+          // workspace's servers and runs them there. The file picker only ever reads this computer.
+          target={previewTargetForPage(target)}
+          fileTarget={activePrimaryGitTarget}
+          linkNotice={remoteLinkNotice(pageMachine)}
           onReservedBottomChange={(reservedBottom) => reservePreviewBottom(target, reservedBottom)}
+          onOpenPage={() => openBrowserTab(target)}
         />
       );
     }
@@ -6700,8 +7461,9 @@ function App() {
               // A worktree only ever stands in for the project's first workspace, so every
               // conversation of the project shares the checkout of any other one.
               gitSnapshotBroadcastIds(
-                workspace.conversations.map((conversation) => (
-                  activeWorkspaceMember === 1 ? conversation : { ...conversation, worktree: null }
+                // The draft aimed here reads the same checkout, though no list holds it.
+                activeWorkspacePeers.map((peer) => (
+                  activeWorkspaceMember === 1 ? peer : { ...peer, worktree: null }
                 )),
                 conversationId,
                 activeWorkspaceMember === 1 && Boolean(activeWorktree)
@@ -6717,6 +7479,7 @@ function App() {
     }
 
     if (kind === "files") {
+      if (!filesPaneAvailable) return null;
       return (
         <FilesPane
           key={conversationId}
@@ -7048,33 +7811,16 @@ function App() {
                       icon: <SquareTerminal size={18} aria-hidden="true" />,
                       pressed: terminalPaneOpen,
                       activity: Object.values(terminalSessions).some((session) => (
-                        session.conversationId === activeConversation.id && session.busy
+                        session.conversationId === activeHostConversationId && session.busy
                       )),
-                      // A draft has no host conversation yet, so there is nothing to hang a PTY on.
-                      disabled: draftActive,
-                      title: draftActive
-                        ? t("先发送一条消息再打开", "Send a message first")
-                        : undefined,
                       onToggle: () => togglePane("terminal"),
-                      // The same choice as the composer's terminal button: a new shell in the
-                      // selected workspace. Showing or hiding the terminals already open is the
-                      // row after them.
+                      // A new shell, as the terminal pane's `+` offers it; showing or hiding
+                      // the terminals already open is the row after them.
                       menu: {
                         label: t("新建终端", "New terminal"),
+                        submenu: newTerminalMenu.submenu,
                         sections: [
-                          {
-                            id: "shells",
-                            label: activeSelectedWorkspace
-                              ? t("在 {name} 打开", "Open in {name}", {
-                                name: workspaceDirectoryLabel(activeSelectedWorkspace.path)
-                              })
-                              : undefined,
-                            items: terminalShellMenuItems(
-                              activeTerminalShells,
-                              openTerminalInSelectedWorkspace,
-                              activeWorkspaceLifecycleOperationRunning
-                            )
-                          },
+                          ...newTerminalMenu.sections,
                           {
                             id: "pane",
                             items: [{
@@ -7114,13 +7860,43 @@ function App() {
                       icon: <Globe size={18} aria-hidden="true" />,
                       pressed: browserPanelOpen,
                       activity: Boolean(activePreviewPageTool),
-                      disabled: draftActive,
-                      title: draftActive
-                        ? t("先发送一条消息再打开", "Send a message first")
-                        : undefined,
                       onToggle: () => (openPreviewSessionId
                         ? closePane(previewPaneId(openPreviewSessionId))
-                        : void openBrowserTab(currentPreviewSessions.at(0)))
+                        : showPreviewPanel()),
+                      // With one workspace the button is the pane's toggle. With more, a page is
+                      // opened for a workspace: the menu lists them — each opening that
+                      // workspace's start page — and the row after them shows or hides the pane,
+                      // on the page last seen or, with none yet, the chip-selected workspace's.
+                      menu: activeTerminalWorkspaces.length > 1
+                        ? {
+                          label: t("打开预览", "Open a preview"),
+                          sections: [
+                            {
+                              id: "workspaces",
+                              label: t("在哪个工作区打开", "Open in which workspace"),
+                              items: previewWorkspaceMenuItems({
+                                workspaces: activeTerminalWorkspaces,
+                                sshMachines: document.globalSettings.executionEnvironments.sshMachines,
+                                disabled: activeWorkspaceLifecycleOperationRunning,
+                                onSelect: openPreviewPage
+                              })
+                            },
+                            {
+                              id: "pane",
+                              items: [{
+                                id: "toggle",
+                                label: browserPanelOpen
+                                  ? t("收起预览面板", "Hide the preview pane")
+                                  : t("打开预览面板", "Open the preview pane"),
+                                icon: <PanelRight size={14} />,
+                                onSelect: () => (openPreviewSessionId
+                                  ? closePane(previewPaneId(openPreviewSessionId))
+                                  : showPreviewPanel())
+                              }]
+                            }
+                          ]
+                        }
+                        : undefined
                     }
                   ]}
                   menuItems={[
@@ -7129,10 +7905,12 @@ function App() {
                       label: t("文件", "Files"),
                       icon: <Folder size={14} aria-hidden="true" />,
                       checked: paneIsOpen(activeLayout, "files"),
-                      disabled: draftActive || activeWorkspaceIsRemote,
+                      disabled: !filesPaneAvailable,
                       title: activeWorkspaceIsRemote
                         ? t("工作区在另一台机器上，本机的文件面板不可用", "This workspace is on another machine; the host's file pane is unavailable")
-                        : undefined,
+                        : !filesPaneAvailable
+                          ? t("新任务还没选项目，没有可浏览的目录", "This new task has no project yet, so there is no directory to browse")
+                          : undefined,
                       onSelect: () => togglePane("files")
                     },
                     {
@@ -7140,7 +7918,6 @@ function App() {
                       label: t("任务", "Tasks"),
                       icon: <ListChecks size={14} aria-hidden="true" />,
                       checked: paneIsOpen(activeLayout, "tasks"),
-                      disabled: draftActive,
                       onSelect: () => togglePane("tasks")
                     },
                     {
@@ -7148,7 +7925,6 @@ function App() {
                       label: t("发出的请求", "Outgoing requests"),
                       icon: <History size={14} aria-hidden="true" />,
                       checked: paneIsOpen(activeLayout, "history"),
-                      disabled: draftActive,
                       onSelect: () => togglePane("history")
                     },
                     {
@@ -7189,7 +7965,7 @@ function App() {
                 // The terminal stays mounted while its pane is closed. Unmounting it would run the
                 // panel's teardown, which reports the session idle, and a still-running shell would
                 // vanish from the task rows and from every terminal-busy guard that reads them.
-                ...(!draftActive && !terminalPaneOpen
+                ...(!terminalPaneOpen
                   ? [{ id: "terminal" as SidePaneId, node: renderPane("terminal"), hidden: true }]
                   : [])
               ]}
@@ -7365,6 +8141,13 @@ function App() {
                           triggerLabel={t("分支：{name}", "Branch: {name}", {
                             name: activeBranchLabel ?? t("游离 HEAD", "Detached HEAD")
                           })}
+                          triggerTitle={activeGitTarget
+                            ? undefined
+                            : t(
+                              "分支：{name}（工作区在另一台机器上，只能在那台机器上切换分支）",
+                              "Branch: {name} (this workspace is on another machine; switch branches there)",
+                              { name: activeBranchLabel ?? t("游离 HEAD", "Detached HEAD") }
+                            )}
                           disabled={branchChipDisabled}
                           menuLabel={t("切换分支", "Switch branch")}
                           menuWidth={260}
@@ -7394,7 +8177,8 @@ function App() {
                             }))
                           }]}
                         />
-                        {activeWorkspaceMember === 1 && <>
+                        {/* Worktrees are checked out on this host, so a remote workspace has none to offer. */}
+                        {activeWorkspaceMember === 1 && !activeWorkspaceIsRemote && <>
                         <span className="composer-chip-group__divider" aria-hidden="true" />
                         <label
                           className="composer-worktree"
@@ -7469,18 +8253,17 @@ function App() {
                       </span>
                     ))}
                     {/* Opens a shell in the workspace selected to the left, so it sits with the
-                        chips that say where things run. Drafts have no host conversation to hang a
-                        PTY on until the first message materializes one. */}
+                        chips that say where things run. A draft's shells run in the project it is
+                        aimed at, and end if it is aimed somewhere else before it is sent. */}
                     <TerminalShellButton
                       workspaceLabel={activeSelectedWorkspace
                         ? workspaceDirectoryLabel(activeSelectedWorkspace.path)
                         : t("工作区", "the workspace")}
                       shells={activeTerminalShells}
-                      disabled={draftActive || activeWorkspaceLifecycleOperationRunning}
-                      disabledReason={draftActive
-                        ? t("先发送一条消息再打开终端", "Send a message before opening a terminal")
-                        : undefined}
-                      onSelect={(shell) => openTerminalInSelectedWorkspace(shell)}
+                      paneOpen={terminalPaneOpen}
+                      disabled={activeWorkspaceLifecycleOperationRunning}
+                      onSelect={(shell) => openTerminalIn(activeWorkspaceMember, shell)}
+                      onTogglePane={() => togglePane("terminal")}
                     />
                     {hasNativeWorkspacePicker() && (
                       <PopoverMenu
@@ -7530,6 +8313,9 @@ function App() {
                         git={activeGitSnapshot}
                         gitOpen={gitReviewPanelOpen}
                         onOpenGitReview={openGitReview}
+                        reviewUnavailableReason={activeGitTarget
+                          ? undefined
+                          : t("工作区在另一台机器上，本机的 Git 面板不可用", "This workspace is on another machine; the host's Git pane is unavailable")}
                       />
                     )}
                   </div>
@@ -7645,7 +8431,7 @@ function App() {
                       }}
                       onKeyDown={(event) => {
                         // Send and newline shortcuts are configurable but mutually exclusive, so checking send first cannot trigger both.
-                        if (event.nativeEvent.isComposing) return;
+                        if (isImeKeyEvent(event.nativeEvent)) return;
                         if (matchesEvent(appearance.sendShortcut, event.nativeEvent)) {
                           event.preventDefault();
                           void sendActiveComposer();
@@ -7732,21 +8518,6 @@ function App() {
                       imageUnavailableReason={activeComposerImageUnavailableReason}
                       onChooseImages={(files) => void addComposerImages(activeConversation.id, files)}
                     />
-                    {/* Drafts exist only in the renderer, so there is no host conversation to
-                        hang a PTY on until the first message materializes one. */}
-                    {!draftActive && (
-                      <button
-                        type="button"
-                        className="composer-option"
-                        aria-expanded={terminalPaneOpen}
-                        aria-controls={sidePaneDomId("terminal")}
-                        disabled={activeWorkspaceLifecycleOperationRunning}
-                        onClick={() => togglePane("terminal")}
-                      >
-                        <SquareTerminal size={14} />
-                        <span className="composer-option__label">{t("终端", "Terminal")}</span>
-                      </button>
-                    )}
                   </div>
                   <div className="composer__options">
                     <PopoverMenu
@@ -7914,6 +8685,65 @@ function App() {
           </Dialog>
         )}
 
+        {draftRetargetPrompt && (
+          <Dialog
+            title={t("把新任务换到别的项目？", "Move this new task to another project?")}
+            description={[
+              draftRetargetPrompt.shells === 0
+                ? null
+                : draftRetargetPrompt.shells === 1
+                  ? t(
+                    "它有 1 个终端还在运行 shell。",
+                    "One of its terminals still has a shell running."
+                  )
+                  : t(
+                    "它有 {count} 个终端还在运行 shell。",
+                    "{count} of its terminals still have a shell running.",
+                    { count: draftRetargetPrompt.shells }
+                  ),
+              draftRetargetPrompt.servers === 0
+                ? null
+                : draftRetargetPrompt.servers === 1
+                  ? t(
+                    "它启动的 1 个开发服务器还在运行。",
+                    "One dev server it started is still running."
+                  )
+                  : t(
+                    "它启动的 {count} 个开发服务器还在运行。",
+                    "{count} dev servers it started are still running.",
+                    { count: draftRetargetPrompt.servers }
+                  )
+            ].filter(Boolean).join(resolvedLanguage === "zh-CN" ? "" : " ")}
+            onClose={() => setDraftRetargetPrompt(null)}
+            width="420px"
+            footer={(
+              <>
+                <button type="button" className="button" onClick={() => setDraftRetargetPrompt(null)}>
+                  {t("取消", "Cancel")}
+                </button>
+                <button
+                  type="button"
+                  className="button button--primary"
+                  onClick={() => {
+                    const { ownerId, workspaceId, proceed } = draftRetargetPrompt;
+                    setDraftRetargetPrompt(null);
+                    // Only for the draft it asked about: one that has moved or been sent since is
+                    // not the one this answer is for.
+                    if (draftConversationRef.current?.materializesAs !== ownerId) return;
+                    void retargetDraft(workspaceId);
+                    proceed();
+                  }}
+                >{t("结束并换项目", "End them and move")}</button>
+              </>
+            )}
+          >
+            <p className="confirm-copy">{t(
+              "终端和开发服务器跟着项目走：换项目会结束这些 shell 进程和开发服务器，并关掉它的预览与审阅面板；Git 状态会按新项目重新读取。",
+              "Terminals and dev servers belong to the project: moving ends these shell processes and dev servers, and closes the task's preview and review panes. Git status is read again for the new project."
+            )}</p>
+          </Dialog>
+        )}
+
         {templateSwitchPrompt && (
           <Dialog
             title={t("套用这份预设？", "Apply this preset?")}
@@ -8009,6 +8839,7 @@ function App() {
           onSaveSshMachine={saveSshMachine}
           onDeleteSshMachine={deleteSshMachine}
           machineUsage={(machine) => machineUsage(document.workspaces, machine)}
+          machineShells={machineShellsControl!}
           onClose={() => { setWorkspaceDialogOpen(false); setAssignWorkspaceAfterAdd(false); }}
           onSubmit={(name, workspaces) => void addWorkspace(name, workspaces)}
         />}
@@ -8024,6 +8855,7 @@ function App() {
           onSaveSshMachine={saveSshMachine}
           onDeleteSshMachine={deleteSshMachine}
           machineUsage={(machine) => machineUsage(document.workspaces, machine)}
+          machineShells={machineShellsControl!}
           onClose={() => setProjectEditor(null)}
           onSubmit={(name, workspaces) => updateProject(editedProject.id, name, workspaces)}
         />}
@@ -8032,6 +8864,7 @@ function App() {
           machine={machineSettings.machine}
           sshMachines={document.globalSettings.executionEnvironments.sshMachines}
           usage={machineUsage(document.workspaces, machineSettings.machine)}
+          shells={machineShellsControl!}
           onSaveSshMachine={saveSshMachine}
           onDeleteSshMachine={deleteSshMachine}
           onClose={() => setMachineSettings(null)}

@@ -2,9 +2,10 @@ import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdtempSync, rmSync } from "node:fs";
 import http from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { dataRootsFor } from "./reset-app-data-plan.mjs";
 
 const DATA_IDENTIFIER_PREFIX = "com.mework.app.e2e.";
 const MODEL_API_KEY = "MEWORK_IMAGE_E2E_FAKE_MODEL_KEY_8f5c7d2a_not_real";
@@ -216,10 +217,7 @@ async function cleanupOwnedDataDirectories() {
     throw new Error("拒绝清理无法验证的图片输入 E2E 数据标识");
   }
   const targets = [];
-  for (const [label, directory] of [
-    ["APPDATA", process.env.APPDATA],
-    ["LOCALAPPDATA", process.env.LOCALAPPDATA]
-  ]) {
+  for (const { label, directory } of dataRootsFor(process.platform, process.env, homedir())) {
     if (!directory) continue;
     const parent = path.resolve(directory);
     const target = path.resolve(parent, dataIdentifier);
@@ -424,7 +422,14 @@ function openVisibleBrowser(url) {
         : undefined,
       process.env.LOCALAPPDATA
         ? path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe")
-        : undefined
+        : undefined,
+      ...(process.platform === "darwin"
+        ? [
+          "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+          "/Applications/Chromium.app/Contents/MacOS/Chromium"
+        ]
+        : [])
     ].filter((candidate, index, all) => candidate && all.indexOf(candidate) === index);
     browserCommand = configured
       || candidates.find((candidate) => path.isAbsolute(candidate) && existsSync(candidate));

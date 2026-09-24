@@ -2,8 +2,11 @@ import { useState } from "react";
 import { useI18n } from "../i18n";
 import type {
   ConversationWebSearchSettings,
+  FetchProviderSelection,
+  NativeFetchTool,
   NativeSearchTool,
   SearchDomainFilterMode,
+  SearchProviderSelection,
   WebSearchAssets
 } from "../types";
 import { NATIVE_SEARCH_TOOLS } from "../types";
@@ -12,9 +15,25 @@ import { SearchDomainFilterRow } from "./SearchDomainFilterRow";
 import { SearchProviderField } from "./SearchProviderField";
 import { SearchResultShapingFields } from "./SearchResultShapingFields";
 
-interface WebSearchBehaviorSettingsProps {
-  value: ConversationWebSearchSettings;
-  onChange: (patch: Partial<ConversationWebSearchSettings>) => void;
+/**
+ * The same four answers as a subagent role gives them, where each row that has
+ * a caller to follow may answer `null` — follow the calling conversation.
+ *
+ * Result shaping is the exception, and on purpose: 0 already means "no cap"
+ * there, leaving no value over to spell inheritance with, so a role always
+ * answers those two for itself.
+ */
+export interface InheritableWebSearchSettings {
+  provider: SearchProviderSelection | null;
+  fetchProvider: FetchProviderSelection | null;
+  maxResults: number;
+  compressionCutoff: number;
+  domainFilter: SearchDomainFilterMode | null;
+  includeDomains: string[];
+  excludeDomains: string[];
+}
+
+interface WebSearchBehaviorCommonProps {
   webSearchAssets: WebSearchAssets;
   /**
    * Whether this conversation's own model exposes page retrieval as a server
@@ -44,9 +63,34 @@ interface WebSearchBehaviorSettingsProps {
   fetchLocked?: boolean;
 }
 
+export type WebSearchBehaviorSettingsProps = WebSearchBehaviorCommonProps & (
+  | {
+    /** A conversation or a preset: there is no caller above it to follow. */
+    inheritOption?: false;
+    value: ConversationWebSearchSettings;
+    onChange: (patch: Partial<ConversationWebSearchSettings>) => void;
+  }
+  | {
+    /**
+     * A subagent role: every row that can follow the calling conversation
+     * offers to, and the hints speak about the role rather than about a
+     * conversation.
+     */
+    inheritOption: true;
+    value: InheritableWebSearchSettings;
+    onChange: (patch: Partial<InheritableWebSearchSettings>) => void;
+  }
+);
+
+/** Every field either shape can be patched with. */
+type AnyWebSearchPatch = Partial<InheritableWebSearchSettings> & {
+  nativeSearchTool?: NativeSearchTool;
+  nativeFetchTool?: NativeFetchTool;
+};
+
 /**
- * Search and fetch backend selection for conversations and presets, with the
- * result shaping and domain filtering that go with them.
+ * Search and fetch backend selection for conversations, presets and subagent
+ * roles, with the result shaping and domain filtering that go with them.
  *
  * The two selectors are independent because upstreams disagree about how many
  * web tools there are. Anthropic splits retrieval into a second server tool;
@@ -61,22 +105,30 @@ interface WebSearchBehaviorSettingsProps {
  * conversation whose settings say plainly that it has no web tools rather than
  * one whose menus are full of choices that do not work.
  *
- * Each of the four rows is its own component, shared with the subagent-role
- * editor, which asks the same four questions with a "follow the conversation"
- * answer added to each. One recipe per row is what keeps the two from drifting.
+ * A role asks the same four questions with a "follow the conversation" answer
+ * added to each, through this same component: one recipe for every surface is
+ * what keeps them from drifting.
  */
-export function WebSearchBehaviorSettings({
-  value,
-  onChange,
-  webSearchAssets,
-  nativeFetchAvailable = false,
-  nativeToolTypeSelectable = false,
-  lockedHint,
-  searchLocked = false,
-  fetchLocked = false
-}: WebSearchBehaviorSettingsProps) {
+export function WebSearchBehaviorSettings(props: WebSearchBehaviorSettingsProps) {
+  const {
+    webSearchAssets,
+    nativeFetchAvailable = false,
+    nativeToolTypeSelectable = false,
+    lockedHint,
+    searchLocked = false,
+    fetchLocked = false
+  } = props;
   const { t } = useI18n();
   const [domainWindowOpen, setDomainWindowOpen] = useState(false);
+  const inheritOption = props.inheritOption === true;
+  const value: InheritableWebSearchSettings = props.value;
+  /* One writer for both shapes. A `null` only ever comes from a "follow the
+     conversation" row, and those are only drawn with `inheritOption` — so the
+     conversation's shape, which has no such rows, is never handed one. */
+  const onChange = props.onChange as (patch: AnyWebSearchPatch) => void;
+  /* The version is a Messages spelling, carried by a conversation alone: a role
+     picks which backend searches, never how that backend's tool is spelled. */
+  const versions = props.inheritOption ? null : props.value;
   /* The fetch version is a Messages spelling, so it is offered only where it is
      sent — and only where the family actually grants a separate fetch tool for
      it to be written onto. */
@@ -86,16 +138,20 @@ export function WebSearchBehaviorSettings({
     <SearchProviderField
       value={value.provider}
       onChange={(provider) => {
-        // `inheritOption` is disabled, so `null` cannot reach this callback.
-        if (provider) onChange({ provider });
+        if (provider || inheritOption) onChange({ provider });
       }}
       webSearchAssets={webSearchAssets}
+      inheritOption={inheritOption}
+      hint={inheritOption ? t(
+        "这个角色的「联网搜索」用哪个后端。留在「跟随对话设置」就用调用方对话的选择。选「原生」时用的是这个角色自己的模型——它所在的协议家族如果不支持模型自带搜索，检索会以可修复的错误失败，而不会悄悄换一家。",
+        "Which backend this role's web search goes through. Leave it on \"follow the conversation\" to use the caller's choice. \"Native\" means this role's OWN model — if its protocol family has no built-in search, the search fails with a fixable error rather than quietly switching backends."
+      ) : undefined}
       disabled={searchLocked}
       disabledHint={searchLocked ? lockedHint : undefined}
-      nativeToolChoice={nativeToolTypeSelectable
+      nativeToolChoice={versions && nativeToolTypeSelectable
         ? {
           offered: NATIVE_SEARCH_TOOLS,
-          selected: value.nativeSearchTool,
+          selected: versions.nativeSearchTool,
           onSelect: (version: NativeSearchTool) => onChange({ nativeSearchTool: version })
         }
         : undefined}
@@ -104,15 +160,19 @@ export function WebSearchBehaviorSettings({
     <FetchProviderField
       value={value.fetchProvider}
       onChange={(fetchProvider) => {
-        // `inheritOption` is disabled, so `null` cannot reach this callback.
-        if (fetchProvider) onChange({ fetchProvider });
+        if (fetchProvider || inheritOption) onChange({ fetchProvider });
       }}
       webSearchAssets={webSearchAssets}
+      inheritOption={inheritOption}
+      hint={inheritOption ? t(
+        "这个角色抓取网页用哪个后端，和上面的搜索后端各答各的。留在「跟随对话设置」就用调用方对话的选择。这里选什么都不能让一个关掉联网的对话联网——联网与否由对话决定，这里只决定由谁去抓。",
+        "Which backend this role fetches pages with, answered separately from the search backend above. Leave it on \"follow the conversation\" to use the caller's choice. Nothing chosen here can put a conversation that is offline back on the network: whether to reach the web at all is the conversation's decision, and this one is only who does the fetching."
+      ) : undefined}
       disabled={fetchLocked}
       disabledHint={fetchLocked ? lockedHint : undefined}
-      nativeToolChoice={fetchVersionSelectable
+      nativeToolChoice={versions && fetchVersionSelectable
         ? {
-          selected: value.nativeFetchTool,
+          selected: versions.nativeFetchTool,
           onSelect: (version) => onChange({ nativeFetchTool: version })
         }
         : undefined}
@@ -129,17 +189,20 @@ export function WebSearchBehaviorSettings({
       mode={value.domainFilter}
       includeDomains={value.includeDomains}
       excludeDomains={value.excludeDomains}
+      inheritOption={inheritOption}
       windowOpen={domainWindowOpen}
       onOpenWindow={() => setDomainWindowOpen(true)}
       onCloseWindow={() => setDomainWindowOpen(false)}
       onChangeMode={(domainFilter) => {
-        // `inheritOption` is off here, so `null` cannot reach this callback.
-        if (domainFilter) onChange({ domainFilter: domainFilter as SearchDomainFilterMode });
+        if (domainFilter || inheritOption) onChange({ domainFilter });
       }}
       onChangeRules={(list, rules) => onChange(
         list === "include" ? { includeDomains: rules } : { excludeDomains: rules }
       )}
-      hint={t(
+      hint={inheritOption ? t(
+        "这个角色怎么按域名筛检索结果。留在「跟随对话设置」就连名单一起用调用方对话的；一旦自己选了模式，用的就只有下面这两份名单，不再叠加对话的。",
+        "How this role filters results by domain. Left on \"follow the conversation\" it uses the caller's mode AND the caller's lists; naming a mode of its own switches to these two lists alone, which are not layered onto the conversation's."
+      ) : t(
         "按域名筛掉检索结果。黑名单丢掉命中的，白名单只留下命中的，两者只有一个生效；关掉过滤不会清空已经写好的名单。",
         "Filters results by domain. A blocklist drops what it matches, an allowlist keeps only what it matches, and only one of them is ever in effect. Turning filtering off does not empty either list."
       )}

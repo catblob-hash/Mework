@@ -256,6 +256,53 @@ describe("App model run flow — images", () => {
     });
   });
 
+  it("keeps an image added to a new task's draft and sends it with the first message", async () => {
+    const document = documentWithModel();
+    document.globalSettings.apiProviders[0].models[0] = {
+      ...document.globalSettings.apiProviders[0].models[0],
+      capabilities: ["image_recognition"]
+    };
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.prepareImageAttachment.mockImplementation(async (name: string) => ({
+      id: `image-${name}`,
+      name,
+      mime: "image/png",
+      width: 10,
+      height: 10,
+      bytes: 4
+    }));
+    runtimeMocks.runModel.mockResolvedValue({
+      contexts: [],
+      usage: {},
+      model: model.id,
+      providerName: "OpenAI Responses",
+      durationMs: 2
+    });
+
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    // A new task is the draft, which lives in no workspace until it is sent.
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const image = new File([new Uint8Array([1, 2, 3, 4])], "draft.png", { type: "image/png" });
+    Object.defineProperty(image, "arrayBuffer", {
+      configurable: true,
+      value: async () => new Uint8Array([1, 2, 3, 4]).buffer
+    });
+    await user.upload(fileInput, image);
+    expect(await screen.findByRole("img", { name: "draft.png" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
+    const request = runtimeMocks.runModel.mock.calls[0][0] as ModelRunRequest;
+    expect(request.conversationId).not.toBe("__draft__");
+    expect(request.contexts.at(-1)).toMatchObject({
+      kind: "user",
+      images: [expect.objectContaining({ id: "image-draft.png" })]
+    });
+  });
+
   it("deletes and restores an image context without changing its attachment reference", async () => {
     const document = documentWithModel();
     const image = {

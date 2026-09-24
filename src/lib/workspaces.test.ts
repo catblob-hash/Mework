@@ -3,39 +3,14 @@ import type { AttachedWorkspace, ToolDescriptor } from "../types";
 import {
   conversationWorkspaces,
   createTemporaryWorkspace,
-  hostLacksPowerShell,
   isReservedWorkspace,
   isTemporaryWorkspace,
   machineUsage,
   projectWorkspaces,
-  terminalShellsFor,
-  toolsForHost,
   withWorkspaceArgument,
   workspaceDirectoryLabel,
   workspaceEnvKey
 } from "./workspaces";
-
-describe("PowerShell on the host", () => {
-  const names = (platform: string) => toolsForHost(
-    ["read", "bash", "powershell", "powershell_find_output", "bash_find_output"].map((name) => ({ name })),
-    platform
-  ).map((tool) => tool.name);
-
-  it("withdraws both PowerShell tools on a Mac or Linux host", () => {
-    for (const platform of ["MacIntel", "Linux x86_64"]) {
-      expect(hostLacksPowerShell(platform)).toBe(true);
-      expect(names(platform)).toEqual(["read", "bash", "bash_find_output"]);
-    }
-  });
-
-  it("keeps them on Windows and when the platform is unknown", () => {
-    for (const platform of ["Win32", ""]) {
-      expect(hostLacksPowerShell(platform)).toBe(false);
-      expect(names(platform)).toContain("powershell");
-      expect(names(platform)).toContain("powershell_find_output");
-    }
-  });
-});
 
 describe("workspace modes", () => {
   it("treats only the canonical temporary workspace as reserved", () => {
@@ -79,27 +54,30 @@ describe("withWorkspaceArgument", () => {
   const local: AttachedWorkspace = { machine: null, path: "C:\\src\\app" };
   const remote: AttachedWorkspace = { machine: { kind: "ssh", machineId: "m1" }, path: "/srv/app" };
   const parameterNames = (tool: ToolDescriptor) => tool.parameters.map((parameter) => parameter.name);
+  // This machine is Windows with PowerShell and Git Bash; the SSH machine has bash.
+  const windowsHost = (machine: AttachedWorkspace["machine"]) => machine ? ["bash"] : ["powershell", "bash"];
+  const posixHost = (machine: AttachedWorkspace["machine"]) => machine ? ["bash"] : ["zsh", "bash", "sh"];
 
   it("leaves every descriptor alone while the conversation has one workspace", () => {
-    expect(withWorkspaceArgument(tools, [local], true, "Workspace")).toBe(tools);
+    expect(withWorkspaceArgument(tools, [local], windowsHost, "Workspace")).toBe(tools);
   });
 
   it("offers the host's numbers to the workspace-scoped tools only", () => {
-    const [read, bash, powershell, fetch] = withWorkspaceArgument(tools, [local, remote], true, "Workspace");
+    const [read, bash, powershell, fetch] = withWorkspaceArgument(tools, [local, remote], windowsHost, "Workspace");
     expect(parameterNames(read!)).toEqual(["path", "workspace"]);
     expect(parameterNames(bash!)).toEqual(["path", "workspace"]);
     expect(parameterNames(fetch!)).toEqual(["path"]);
     const argument = read!.parameters.at(-1)!;
     expect(argument).toMatchObject({ type: "number", required: false, placeholder: "1 | 2" });
     expect(argument.defaultValue).toBeUndefined();
-    // PowerShell runs only on this machine's workspaces.
+    // PowerShell runs only where a machine has it: this one.
     expect(powershell!.parameters.at(-1)).toMatchObject({ name: "workspace", placeholder: "1" });
   });
 
-  it("withdraws the argument from powershell where nothing runs it", () => {
-    const [, , powershell] = withWorkspaceArgument(tools, [remote, remote], true, "Workspace");
+  it("withdraws the argument from a shell tool where no machine has the shell", () => {
+    const [, , powershell] = withWorkspaceArgument(tools, [remote, remote], windowsHost, "Workspace");
     expect(parameterNames(powershell!)).toEqual(["path"]);
-    const [, , onPosixHost] = withWorkspaceArgument(tools, [local, remote], false, "Workspace");
+    const [, , onPosixHost] = withWorkspaceArgument(tools, [local, remote], posixHost, "Workspace");
     expect(parameterNames(onPosixHost!)).toEqual(["path"]);
   });
 
@@ -108,7 +86,7 @@ describe("withWorkspaceArgument", () => {
       ...descriptor("read"),
       parameters: [{ name: "workspace", label: "ws", type: "number", required: false }]
     };
-    const [read] = withWorkspaceArgument([declared], [local, remote], true, "Workspace");
+    const [read] = withWorkspaceArgument([declared], [local, remote], windowsHost, "Workspace");
     expect(read).toBe(declared);
   });
 });
@@ -193,18 +171,5 @@ describe("workspace variables and machine usage", () => {
     expect(machineUsage(workspaces, null)).toEqual({ projects: 2, conversations: 1 });
     expect(machineUsage(workspaces, { kind: "ssh", machineId: "gone" })).toEqual({ projects: 0, conversations: 0 });
     expect(machineUsage(null, null)).toEqual({ projects: 0, conversations: 0 });
-  });
-});
-
-describe("terminalShellsFor", () => {
-  it("offers PowerShell and Git Bash only for a directory on a Windows host", () => {
-    expect(terminalShellsFor(null, "Win32")).toEqual(["powershell", "bash"]);
-    expect(terminalShellsFor({ kind: "wsl", distro: "Ubuntu" }, "Win32")).toEqual(["zsh", "bash", "fish"]);
-    expect(terminalShellsFor({ kind: "ssh", machineId: "m1" }, "Win32")).toEqual(["zsh", "bash", "fish"]);
-  });
-
-  it("offers the POSIX shells on a Mac or Linux host", () => {
-    expect(terminalShellsFor(null, "MacIntel")).toEqual(["zsh", "bash", "fish"]);
-    expect(terminalShellsFor(undefined, "Linux x86_64")).toEqual(["zsh", "bash", "fish"]);
   });
 });

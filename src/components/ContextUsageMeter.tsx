@@ -158,6 +158,7 @@ export function ContextUsageMeter({
             left: position?.left ?? 0,
             top: position?.top ?? 0,
             width: PANEL_WIDTH,
+            zIndex: position?.layer,
             visibility: position ? "visible" : "hidden"
           }}
         >

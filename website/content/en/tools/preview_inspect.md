@@ -10,6 +10,10 @@ Only the first match is inspected. No match is not an error: the result is the p
 
 `text` is the element's `innerText` truncated to 500 characters and `className` to 200; `value` appears only when the element carries a non-empty `value` attribute. `boundingBox` is the content box as `x`, `y`, `width` and `height`. When the element sits inside a React tree, `reactComponent` and `reactProps` are added from its fiber. The DOM and CSS domains are released on every exit path. The call is bounded at 30 seconds.
 
+## Decision-model parameters
+
+Turn on its decision-model option in the conversation's preview tool window and `selector` can give way to `query`, a plain-language description of the element to inspect: the host lists the page's elements (the same `[uid] role: "name"` lines as [preview_snapshot](preview_snapshot.html)), always adds a "none of the above" option after them, and has the TypeSafe Jev decision model choose. It is a choice, not a score, so there is no `threshold`. When the model names an element it is inspected, and the result says which element, with the model's confidence and the runners-up; when it answers none of the above, the answer is that the element was not found, with the closest ones and then every element line the model was shown, so the next step needs no fresh snapshot. Turn on **Score each element on a miss** under the same option and, on a none-of-the-above, those lines are first scored against the description one by one — one request per line — and come back highest first with their scores. Under **Add decision-model parameters** a call gives `selector` or `query`, and one that gives both is refused; under **Decision model only** `selector` is no longer accepted and every call carries `query`. The element lines are sent to TypeSafe's API, which needs its key under Global settings → Decision model providers.
+
 ## Related
 
 - [preview_snapshot](preview_snapshot.html) — to find the selector worth inspecting

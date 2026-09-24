@@ -4,8 +4,9 @@
 //! label to an application capability. Browser chrome lives in the trusted main React WebView;
 //! the desktop build only adds the remote page as a permissionless child WebView.
 // The DevTools-protocol half of this module (network log, cookies, screenshots,
-// dialogs, element picking) drives WebView2 and exists only on Windows.
-#![cfg_attr(not(windows), allow(dead_code))]
+// dialogs, element picking) needs a Chromium page: WebView2 on Windows, CEF on macOS
+// (`cef_host`). Elsewhere it compiles but is never reached.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -22,11 +23,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+#[cfg(not(target_os = "macos"))]
+use tauri::{webview::WebviewBuilder, Webview};
 use tauri::{
-    webview::{NewWindowResponse, PageLoadEvent, WebviewBuilder},
+    webview::{NewWindowResponse, PageLoadEvent},
     window::WindowBuilder,
     AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position,
-    Webview, WebviewUrl, Window, WindowEvent,
+    WebviewUrl, Window, WindowEvent,
 };
 use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
@@ -44,6 +47,83 @@ use crate::{
 
 #[cfg(all(windows, feature = "browser-dev"))]
 use crate::chromium_capability::WebView2ReleaseObserverPermit;
+
+/// The native page engine. Windows hosts pages in WebView2 through Tauri. On macOS Tauri's
+/// webview is WKWebView, which has no DevTools protocol, so pages run in Chromium embedded
+/// through CEF instead — the way Claude desktop's pane runs in Electron's Chromium — behind a
+/// handle that answers the same calls (see `cef_host::page`).
+#[cfg(not(target_os = "macos"))]
+pub(crate) type PageWebview = Webview;
+#[cfg(target_os = "macos")]
+pub(crate) type PageWebview = crate::cef_host::page::CefWebview;
+#[cfg(not(target_os = "macos"))]
+type PageBuilder = WebviewBuilder<tauri::Wry>;
+#[cfg(target_os = "macos")]
+type PageBuilder = crate::cef_host::page::CefPageBuilder;
+
+/// The switches a page's engine starts with. WebView2 takes its proxy per environment, and every
+/// tab has an environment of its own, so a page of a remote workspace carries its machine's proxy
+/// from birth; the bypass list turns off Chromium's implicit loopback exemption.
+fn page_browser_args(network_proxy: Option<&str>) -> String {
+    match network_proxy {
+        Some(proxy) => format!(
+            "{BROWSER_PAGE_BROWSER_ARGS} --proxy-server={proxy} --proxy-bypass-list=<-loopback>"
+        ),
+        None => BROWSER_PAGE_BROWSER_ARGS.to_owned(),
+    }
+}
+
+/// CEF has no per-page switches — they are process-wide — so its proxy is a preference of the
+/// tab's own request context, set when the page is created.
+#[cfg(target_os = "macos")]
+fn with_network_proxy(builder: PageBuilder, network_proxy: Option<&str>) -> PageBuilder {
+    builder.network_proxy(network_proxy.map(str::to_owned))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_network_proxy(builder: PageBuilder, _network_proxy: Option<&str>) -> PageBuilder {
+    builder
+}
+
+/// The page behind `label`, if its native surface still exists.
+#[cfg(not(target_os = "macos"))]
+fn page_webview(app: &AppHandle, label: &str) -> Option<PageWebview> {
+    app.get_webview(label)
+}
+
+#[cfg(target_os = "macos")]
+fn page_webview(_app: &AppHandle, label: &str) -> Option<PageWebview> {
+    crate::cef_host::page::get(label)
+}
+
+/// Creates the page as a child of `window`.
+#[cfg(not(target_os = "macos"))]
+fn add_page_child(
+    window: &Window,
+    builder: PageBuilder,
+    position: LogicalPosition<f64>,
+    size: LogicalSize<f64>,
+) -> Result<PageWebview, String> {
+    window
+        .add_child(builder, position, size)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn add_page_child(
+    window: &Window,
+    builder: PageBuilder,
+    position: LogicalPosition<f64>,
+    size: LogicalSize<f64>,
+) -> Result<PageWebview, String> {
+    crate::cef_host::page::add_child(window, builder, position, size)
+}
+
+/// Whether the page engine holds script dialogs open for `preview_dialog` to answer: WebView2's
+/// deferrals on Windows, CEF's dialog callbacks on macOS. Elsewhere the page intercepts them.
+fn page_engine_holds_dialogs() -> bool {
+    host_platform().is_windows() || host_platform().is_macos()
+}
 
 pub const BROWSER_WINDOW_LABEL: &str = "browser";
 pub const BROWSER_PAGE_LABEL: &str = "browser-page";
@@ -528,7 +608,7 @@ struct ActionAftermath {
     modal_states: Vec<ModalState>,
 }
 
-/// One of the fifteen preview tools that act on a page.
+/// One of the eleven preview tools that act on a page.
 ///
 /// `preview_start`, `preview_stop`, `preview_list` and `preview_logs` never reach a page, so they
 /// are not here. Security policy, executor dispatch and page implementation all match on this
@@ -547,15 +627,11 @@ pub(crate) enum PreviewTool {
     Resize,
     UploadImage,
     Dialog,
-    FindElement,
-    ClickByDescription,
-    FillByDescription,
-    InspectByDescription,
 }
 
 impl PreviewTool {
     /// Declaration order is the order the catalog lists the page tools in.
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::ConsoleLogs,
         Self::Screenshot,
         Self::Snapshot,
@@ -567,10 +643,6 @@ impl PreviewTool {
         Self::Resize,
         Self::UploadImage,
         Self::Dialog,
-        Self::FindElement,
-        Self::ClickByDescription,
-        Self::FillByDescription,
-        Self::InspectByDescription,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -586,10 +658,6 @@ impl PreviewTool {
             Self::Resize => "preview_resize",
             Self::UploadImage => "preview_upload_image",
             Self::Dialog => "preview_dialog",
-            Self::FindElement => "preview_find_element",
-            Self::ClickByDescription => "preview_click_by_description",
-            Self::FillByDescription => "preview_fill_by_description",
-            Self::InspectByDescription => "preview_inspect_by_description",
         }
     }
 
@@ -600,7 +668,7 @@ impl PreviewTool {
     }
 
     /// Whether the tool answers with the page's state after it. Only Mework's own two tools do:
-    /// the thirteen ported ones answer with the source's exact text and nothing else.
+    /// the nine ported ones answer with the source's exact text and nothing else.
     pub(crate) fn reports_page_after(self) -> bool {
         matches!(self, Self::UploadImage | Self::Dialog)
     }
@@ -727,6 +795,14 @@ impl Default for BrowserViewport {
     }
 }
 
+/// The network a page uses when that is not this computer's: the proxy that opens its
+/// connections on another machine, and that machine's environment key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PageNetwork {
+    pub proxy: String,
+    pub machine: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserStatus {
@@ -778,6 +854,10 @@ pub struct BrowserStatus {
     /// see all of it, and the Agent goes on driving it exactly as it would in front.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub projected: bool,
+    /// The machine whose network the page uses, by environment key (`ssh:<id>`), when that is
+    /// not this computer. A page of a remote workspace resolves `localhost` there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_machine: Option<String>,
 }
 
 /// The only part of a pick that is cheap enough to poll.
@@ -969,6 +1049,7 @@ impl Default for BrowserStatus {
             element_picker: None,
             occluded: false,
             projected: false,
+            network_machine: None,
         }
     }
 }
@@ -1165,6 +1246,13 @@ struct RuntimeState {
     hide_failure: Option<String>,
     status: BrowserStatus,
     host: Option<BrowserHost>,
+    /// The proxy every connection of this page goes through, when the page belongs to a workspace
+    /// on another machine: a SOCKS endpoint on this computer that opens each connection from that
+    /// machine ([`crate::preview_tunnel`]). `None` is this computer's own network.
+    ///
+    /// Loopback is proxied too — Chromium bypasses it by default — because a page of a remote
+    /// workspace means that machine's `localhost`: its dev server, and the API next to it.
+    network: Option<PageNetwork>,
     /// Page ownership as it stood before a trusted surface covered the page, restored when the
     /// surface goes away. Covering the page takes it out of agent automation for as long as the
     /// cover is up, and the user must get back exactly the owner they had before, not a default.
@@ -1333,7 +1421,7 @@ struct FilePreviewGrant {
 /// completions retain only a revocable callback token after registration, then reacquire a short
 /// permit if the callback is actually delivered.
 struct AttestedPage {
-    page: Webview,
+    page: PageWebview,
     _permit: WebView2Permit,
 }
 
@@ -1352,7 +1440,7 @@ impl AttestedPage {
     fn dispatch_mutation<T>(
         &self,
         stage: &'static str,
-        operation: impl FnOnce(&Webview) -> Result<T, String> + Send + 'static,
+        operation: impl FnOnce(&PageWebview) -> Result<T, String> + Send + 'static,
     ) -> Result<T, String>
     where
         T: Send + 'static,
@@ -1496,16 +1584,16 @@ impl AttestedPage {
 
     /// Native getters synchronously wait for Tauri's dispatcher, so the wrapper's original permit
     /// remains live until each observation completes.
-    fn url(&self) -> tauri::Result<Url> {
-        self.page.url()
+    fn url(&self) -> Result<Url, String> {
+        self.page.url().map_err(|error| error.to_string())
     }
 
-    fn size(&self) -> tauri::Result<PhysicalSize<u32>> {
-        self.page.size()
+    fn size(&self) -> Result<PhysicalSize<u32>, String> {
+        self.page.size().map_err(|error| error.to_string())
     }
 
-    fn position(&self) -> tauri::Result<PhysicalPosition<i32>> {
-        self.page.position()
+    fn position(&self) -> Result<PhysicalPosition<i32>, String> {
+        self.page.position().map_err(|error| error.to_string())
     }
 
     fn window(&self) -> Window {
@@ -1515,14 +1603,14 @@ impl AttestedPage {
     /// Supplies the raw handle only inside a closure that also receives an owned async-tail
     /// permit. This is the boundary for helpers that already retain that permit through native
     /// completion callbacks (CDP, suspend/resume, browsing-data clear, and window regions).
-    fn with_native_tail<T>(&self, operation: impl FnOnce(&Webview, WebView2Permit) -> T) -> T {
+    fn with_native_tail<T>(&self, operation: impl FnOnce(&PageWebview, WebView2Permit) -> T) -> T {
         operation(&self.page, self.tail_permit())
     }
 
     /// Controller close is authorized by a release-only teardown token, not a normal page permit.
     /// Consume the wrapper before invalidation so no general operation authority survives into the
     /// close/destroy phase.
-    fn into_native_for_teardown(self) -> Webview {
+    fn into_native_for_teardown(self) -> PageWebview {
         let Self { page, _permit } = self;
         drop(_permit);
         page
@@ -1634,6 +1722,11 @@ struct BrowserManagerState {
     /// Geometry may arrive before the matching explicit open. Keep it manager-side so publishing
     /// layout never has to allocate a BrowserSession and therefore cannot cross a close fence.
     pending_panel_bounds: HashMap<String, PendingBrowserPanelBounds>,
+    /// The proxy each page's network goes through, by session, for pages of a workspace on
+    /// another machine. Kept manager-side like the geometry above: a page is bound before it is
+    /// opened — so its first request already leaves from its machine — and a binding has to
+    /// survive the session being closed and opened again.
+    networks: HashMap<String, PageNetwork>,
     /// Renderer reloads may replay an old open/close completion after a newer UI intent. Track the
     /// exact conversation's monotonic lifecycle generation in the native authority boundary so a
     /// stale renderer can neither recreate nor destroy a newer page.
@@ -1785,6 +1878,7 @@ impl BrowserRuntime {
         // session: a WebView2 user-data folder is chosen when the controller is created, so the
         // only way out of a profile is closing the tab.
         let session = BrowserSession::new(session_id);
+        session.lock_state().network = lock_unpoison(&self.state).networks.get(session_id).cloned();
         if let Some(app) = app {
             session.attach_app(app)?;
         }
@@ -1852,17 +1946,18 @@ impl BrowserRuntime {
         result
     }
 
-    /// The page's accessibility snapshot as lines, for `preview_find_element` and the
-    /// `preview_*_by_description` variants. Same reservation, touch and page-preparation contract
-    /// as [`Self::execute_tool_blocking`]; the caller supplies the wall clock, because the
-    /// decision-model round trips that follow this read are not the page's to wait for.
+    /// The page's accessibility snapshot as lines, for the decision-model forms of
+    /// `preview_snapshot`, `preview_click`, `preview_fill` and `preview_inspect`; `tool` is the one
+    /// the model called, so a held modal is refused in its name. Same reservation, touch and
+    /// page-preparation contract as [`Self::execute_tool_blocking`]; the caller supplies the wall
+    /// clock, because the decision-model round trips that follow this read are not the page's to
+    /// wait for.
     pub(crate) fn element_lines_blocking(
         &self,
         session_id: &str,
+        tool: PreviewTool,
     ) -> Result<(Vec<AxLine>, bool), String> {
-        self.read_page_blocking(session_id, PreviewTool::FindElement, |session| {
-            session.preview_element_lines()
-        })
+        self.read_page_blocking(session_id, tool, |session| session.preview_element_lines())
     }
 
     /// A CSS selector for one element of the last `element_lines_blocking` read, or `None` when
@@ -1870,20 +1965,24 @@ impl BrowserRuntime {
     pub(crate) fn selector_for_blocking(
         &self,
         session_id: &str,
+        tool: PreviewTool,
         backend_node_id: i64,
     ) -> Result<Option<String>, String> {
-        self.read_page_blocking(session_id, PreviewTool::FindElement, |session| {
+        self.read_page_blocking(session_id, tool, |session| {
             session.unique_selector_for(backend_node_id)
         })
     }
 
-    /// Every console entry of the page as `[level] text`, for `preview_find_logs`.
+    /// The page's console entries as `[level] text`, for `preview_find_logs` and the
+    /// decision-model form of `preview_console_logs`. `level` is `preview_console_logs`'s own
+    /// filter; `None` keeps every entry.
     pub(crate) fn console_log_lines_blocking(
         &self,
         session_id: &str,
+        level: Option<String>,
     ) -> Result<Vec<String>, String> {
         self.read_page_blocking(session_id, PreviewTool::ConsoleLogs, |session| {
-            session.console_log_lines()
+            session.console_log_lines(level.as_deref())
         })
     }
 
@@ -1906,6 +2005,58 @@ impl BrowserRuntime {
         let result = session.read_page_blocking(tool, read);
         self.touch_session(&session_id);
         result
+    }
+
+    /// Puts a page on the network of the machine its workspace is on: `proxy` is the endpoint
+    /// that opens its connections there ([`crate::preview_tunnel`]), `None` this computer's own.
+    ///
+    /// A page not yet created gets it at birth. A live page on CEF is switched in place — new
+    /// connections go the new way at once. WebView2 fixes a page's proxy when its environment is
+    /// created, so a live page there is suspended and comes back on the new network when it is
+    /// next shown, at the address it had.
+    pub(crate) fn set_network(
+        &self,
+        session_id: &str,
+        network: Option<PageNetwork>,
+    ) -> Result<(), String> {
+        let session_id = validate_session_id(session_id)?.to_owned();
+        let session = {
+            let mut state = lock_unpoison(&self.state);
+            match &network {
+                Some(network) => {
+                    state.networks.insert(session_id.clone(), network.clone());
+                }
+                None => {
+                    state.networks.remove(&session_id);
+                }
+            }
+            state.sessions.get(&session_id).cloned()
+        };
+        let Some(session) = session else {
+            return Ok(());
+        };
+        let proxy = network.as_ref().map(|network| network.proxy.clone());
+        {
+            let mut state = session.lock_state();
+            if state.network.as_ref().map(|network| &network.proxy) == proxy.as_ref() {
+                state.network = network;
+                return Ok(());
+            }
+            state.network = network;
+        }
+        let status = session.status();
+        if !status.has_page || status.suspended {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let page = session.attested_page(true)?;
+            page.with_native_tail(|native, _| native.set_network_proxy(proxy))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.suspend(&session_id).map(|_| ())
+        }
     }
 
     /// Points the conversation's page at a dev server `preview_start` just started.
@@ -3689,27 +3840,6 @@ fn validate_preview_input(
             validate_preview_scale(optional_input_f64(input, "scale")?)?;
         }
         PreviewTool::Snapshot => {}
-        PreviewTool::FindElement => {
-            required_input_string(input, "query", 2_000, false)?;
-        }
-        PreviewTool::ClickByDescription => {
-            required_input_string(input, "description", 2_000, false)?;
-            optional_input_bool(input, "doubleClick", false)?;
-        }
-        PreviewTool::FillByDescription => {
-            required_input_string(input, "description", 2_000, false)?;
-            required_input_string(input, "value", MAX_TEXT_INPUT_CHARS, true)?;
-        }
-        PreviewTool::InspectByDescription => {
-            required_input_string(input, "description", 2_000, false)?;
-            if let Some(styles) = parse_preview_styles(input)? {
-                if styles.len() > MAX_PREVIEW_STYLES {
-                    return Err(format!(
-                        "preview_inspect_by_description styles accepts at most {MAX_PREVIEW_STYLES} properties"
-                    ));
-                }
-            }
-        }
         PreviewTool::Inspect => {
             validate_selector(&required_input_string(
                 input,
@@ -3970,7 +4100,7 @@ impl BrowserSession {
         self.lock_state()
             .app
             .as_ref()
-            .is_some_and(|app| app.get_webview(&self.labels.page).is_some())
+            .is_some_and(|app| page_webview(app, &self.labels.page).is_some())
     }
 
     fn try_suspend_for_capacity(&self) -> Result<bool, String> {
@@ -4077,7 +4207,7 @@ impl BrowserSession {
                 // cookies and cold-close the page.
                 let page = match self.attested_page(true) {
                     Ok(page) => page,
-                    Err(_) if app.get_webview(&self.labels.page).is_none() => return Ok(status),
+                    Err(_) if page_webview(&app, &self.labels.page).is_none() => return Ok(status),
                     Err(error) => return Err(error),
                 };
                 if let Err(error) = page.with_native_tail(|native, permit| {
@@ -4241,7 +4371,7 @@ impl BrowserSession {
         // never a reusable controller. The control is reset before every controller creation and
         // immediately after cold close, so only an independently attested live page reaches the
         // fast path below.
-        let native_page_exists = app.get_webview(&self.labels.page).is_some();
+        let native_page_exists = page_webview(&app, &self.labels.page).is_some();
         let detached_window_exists = app.get_window(&self.labels.window).is_some();
         if (native_page_exists && self.attested_page(true).is_err())
             || (!native_page_exists && detached_window_exists)
@@ -4249,7 +4379,7 @@ impl BrowserSession {
             self.discard_unattested_native_surface(&app)?;
         }
 
-        let page = if app.get_webview(&self.labels.page).is_some() {
+        let page = if page_webview(&app, &self.labels.page).is_some() {
             Some(self.attested_page(true)?)
         } else {
             None
@@ -4672,7 +4802,34 @@ impl BrowserSession {
             .map_err(|_| "验证标签页专属浏览器配置目录超时".to_owned())?
     }
 
-    #[cfg(not(windows))]
+    /// CEF states the profile directory the page's request context actually opened, which is
+    /// the same interrogation `ICoreWebView2Environment7::UserDataFolder` answers on Windows.
+    #[cfg(target_os = "macos")]
+    fn attest_tab_profile_directory(&self, app: &AppHandle) -> Result<(), String> {
+        let expected = std::fs::canonicalize(self.profile_directory(app)?)
+            .map_err(|error| format!("无法确认标签页专属浏览器配置目录的真实路径: {error}"))?;
+        let attestation_permit = self
+            .webview2_control()?
+            .begin_attestation()
+            .map_err(|error| format!("无法建立 Chromium Profile 验证屏障: {error}"))?;
+        let page = page_webview(app, &self.labels.page)
+            .ok_or_else(|| "无法验证标签页专属浏览器配置目录: 页面已丢失".to_owned())?;
+        page.hide()
+            .map_err(|error| format!("隐藏待验证的 Chromium 页面失败: {error}"))?;
+        let actual = std::fs::canonicalize(page.cache_path()?)
+            .map_err(|error| format!("无法确认 Chromium 实际配置目录的真实路径: {error}"))?;
+        if actual != expected {
+            return Err(
+                "Chromium 实际使用的配置目录不是这个标签页的专属 Profile，已拒绝打开该标签页"
+                    .into(),
+            );
+        }
+        attestation_permit
+            .verify_attested_user_data_folder(&actual)
+            .map_err(|error| format!("Chromium Profile 能力验证失败: {error}"))
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn attest_tab_profile_directory(&self, app: &AppHandle) -> Result<(), String> {
         // Off Windows there is no WebView2 environment to interrogate. The separate data directory
         // is still passed to the platform webview. Bind the requested canonical directory so
@@ -4803,6 +4960,11 @@ impl BrowserSession {
             (detached, BrowserHost::DetachedWindow)
         };
 
+        let network_proxy = self
+            .lock_state()
+            .network
+            .as_ref()
+            .map(|network| network.proxy.clone());
         let (layout_generation, page_generation, saved_zoom) = {
             let mut state = self.lock_state();
             let status_url = cold_resume_target.unwrap_or(&initial_url).to_string();
@@ -4847,9 +5009,11 @@ impl BrowserSession {
             let new_window_control = chromium_control.clone();
             let download_control = chromium_control.clone();
             let updates_window_title = host == BrowserHost::DetachedWindow;
-            let page_builder =
-                WebviewBuilder::new(&self.labels.page, WebviewUrl::External(initial_url.clone()))
-                    .data_directory(profile_directory);
+            let page_builder = with_network_proxy(
+                PageBuilder::new(&self.labels.page, WebviewUrl::External(initial_url.clone()))
+                    .data_directory(profile_directory),
+                network_proxy.as_deref(),
+            );
             let page_builder = page_builder
                 .initialization_script(browser_initialization_script())
                 // Pages are driven in the background, where Chromium would otherwise run timers
@@ -4857,7 +5021,7 @@ impl BrowserSession {
                 // input is the latency the model would then be waiting out. The first three
                 // switches keep a hidden page running like a visible tab; the feature list is
                 // wry's own default, which setting any argument replaces.
-                .additional_browser_args(BROWSER_PAGE_BROWSER_ARGS)
+                .additional_browser_args(&page_browser_args(network_proxy.as_deref()))
                 .zoom_hotkeys_enabled(true)
                 .devtools(true)
                 .general_autofill_enabled(true)
@@ -5055,8 +5219,7 @@ impl BrowserSession {
             };
             // Browser chrome stays in the main React WebView. This is the only native child: an
             // untrusted remote page with no application IPC capability.
-            let page = window
-                .add_child(page_builder, initial_position, initial_size)
+            let page = add_page_child(&window, page_builder, initial_position, initial_size)
                 .map_err(|error| format!("创建浏览器页面失败: {error}"))?;
             // The controller is clipped outside the visible parent (or its parent is hidden) and
             // its only document is network-inert. The builder's fixed document-created bootstrap
@@ -5264,7 +5427,7 @@ impl BrowserSession {
         teardown: Option<&WebView2TeardownPermit>,
     ) -> Result<(), String> {
         let mut errors = Vec::new();
-        let surface_exists = app.get_webview(&self.labels.page).is_some()
+        let surface_exists = page_webview(app, &self.labels.page).is_some()
             || (host == Some(BrowserHost::DetachedWindow)
                 && app.get_window(&self.labels.window).is_some());
         if surface_exists {
@@ -5282,7 +5445,7 @@ impl BrowserSession {
             return Err(errors.join("；"));
         }
         if request_page_close {
-            if let Some(page) = app.get_webview(&self.labels.page) {
+            if let Some(page) = page_webview(app, &self.labels.page) {
                 if let Err(error) = page.close() {
                     errors.push(format!("关闭 Chromium 页面失败: {error}"));
                 }
@@ -5298,7 +5461,7 @@ impl BrowserSession {
 
         let deadline = Instant::now() + BROWSER_DESTROY_TIMEOUT;
         loop {
-            let page_exists = app.get_webview(&self.labels.page).is_some();
+            let page_exists = page_webview(app, &self.labels.page).is_some();
             let window_exists = host == Some(BrowserHost::DetachedWindow)
                 && app.get_window(&self.labels.window).is_some();
             if !page_exists && !window_exists {
@@ -5324,6 +5487,7 @@ impl BrowserSession {
             let state = self.lock_state();
             let mut status = state.status.clone();
             status.element_picker = state.element_picker.snapshot(state.page_generation);
+            status.network_machine = state.network.as_ref().map(|network| network.machine.clone());
             #[cfg(test)]
             if state.synthetic_surface {
                 // A synthetic surface has no native page to observe, so the
@@ -5357,7 +5521,7 @@ impl BrowserSession {
         // Manager lookup alone does not touch the controller. URL/size observation is a native
         // operation and therefore goes through the same generation permit as every page command;
         // a concurrently creating, unattested surface remains completely unobserved here.
-        status.has_page = app.get_webview(&self.labels.page).is_some();
+        status.has_page = page_webview(&app, &self.labels.page).is_some();
         status.open = status.open && status.has_page;
         if !status.has_page {
             status.loading = false;
@@ -5597,7 +5761,7 @@ impl BrowserSession {
         }
         let app = self.app_handle()?;
         let host = self.lock_state().host;
-        let page = if app.get_webview(&self.labels.page).is_some() {
+        let page = if page_webview(&app, &self.labels.page).is_some() {
             Some(self.attested_page(true)?)
         } else {
             None
@@ -5669,7 +5833,7 @@ impl BrowserSession {
         let app =
             app.ok_or_else(|| "BrowserRuntime 尚未在 Tauri setup 中注入 AppHandle".to_owned())?;
         let host = host.ok_or_else(|| "内置浏览器尚未打开".to_owned())?;
-        let page = if app.get_webview(&self.labels.page).is_some() {
+        let page = if page_webview(&app, &self.labels.page).is_some() {
             self.attested_page(true)?
         } else {
             let mut state = self.lock_state();
@@ -5904,7 +6068,7 @@ impl BrowserSession {
         let Some(app) = app else {
             return Ok(());
         };
-        if app.get_webview(&self.labels.page).is_none() {
+        if page_webview(&app, &self.labels.page).is_none() {
             return Ok(());
         }
         let page = self.page()?;
@@ -6037,7 +6201,7 @@ impl BrowserSession {
     /// This deliberately reads only the count. Cookie names and values never leave the host here;
     /// the decision this feeds is "ask the user or not", which needs no cookie content.
     fn page_holds_cookies_for(&self, url: &Url) -> Result<bool, String> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let _automation = lock_unpoison(&self.automation);
             let page = match self.page() {
@@ -6065,7 +6229,7 @@ impl BrowserSession {
                 .and_then(Value::as_array)
                 .is_some_and(|cookies| !cookies.is_empty()))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = url;
             Ok(false)
@@ -6281,12 +6445,15 @@ impl BrowserSession {
         if !allow_suspended && self.lock_state().status.suspended {
             return Err("this browser task is suspended; call preview_start or restore it from the task card".into());
         }
+        // A tab with no page has no controller either; say which of the two is missing. Looking
+        // the label up is a registry read, not a native operation, so it needs no permit.
+        if page_webview(&self.app_handle()?, &self.labels.page).is_none() {
+            return Err("the embedded browser is not open".into());
+        }
         let permit = self.webview2_control()?.permit().map_err(|error| {
             format!("Chromium native control capability is unavailable: {error}")
         })?;
-        let page = self
-            .app_handle()?
-            .get_webview(&self.labels.page)
+        let page = page_webview(&self.app_handle()?, &self.labels.page)
             .ok_or_else(|| "the embedded browser is not open".to_owned())?;
         Ok(AttestedPage {
             page,
@@ -7154,7 +7321,7 @@ impl BrowserSession {
                 "preview_dialog prompt_text exceeds the {MAX_DIALOG_PROMPT_CHARS}-character limit"
             ));
         }
-        if !host_platform().is_windows() {
+        if !page_engine_holds_dialogs() {
             // Without native holding the page intercepts its own dialogs; this arms the answer
             // for the next confirm/prompt and reads the records, the pre-WebView2 contract.
             let arm = accept.is_some() || prompt_text.is_some();
@@ -7334,18 +7501,11 @@ impl BrowserSession {
                 PreviewTool::Screenshot => self
                     .preview_screenshot(optional_input_f64(input, "scale")?)
                     .map(PreviewToolOutput::Image),
+                // A call carrying `query` never gets here: the executor hands it to
+                // `decision_tools::preview`, which reads this page's elements host-side and comes
+                // back through this dispatcher with a selector, so the decision model's network
+                // round trips never run under this page's automation lock.
                 PreviewTool::Snapshot => self.preview_snapshot().map(PreviewToolOutput::Text),
-                // The decision-model page tools are dispatched host-side by
-                // `decision_tools::preview`, which reads this page's elements and then hands
-                // the chosen action to Click/Fill/Inspect above; their network calls must not
-                // run under this page's automation lock. The variants exist so the name is a
-                // page tool everywhere a page tool is treated specially.
-                PreviewTool::FindElement
-                | PreviewTool::ClickByDescription
-                | PreviewTool::FillByDescription
-                | PreviewTool::InspectByDescription => Err(format!(
-                    "{tool} is dispatched host-side by decision_tools::preview"
-                )),
                 PreviewTool::Inspect => {
                     let selector = selector()?;
                     let styles = parse_preview_styles(input)?;
@@ -7750,14 +7910,21 @@ return {
     /// `Ok(None)` is "there is nothing to capture" — no live page, a suspended one, or a platform
     /// without WebView2 — which the pane treats as the Annotate button simply having nothing to
     /// offer. A capture that was attempted and failed is still an error.
+    ///
+    /// Observation only: page ownership is left exactly as it was. The pane calls this every
+    /// second or so to paint its projection, so claiming the page for the user here would refuse
+    /// every agent tool for as long as the pane is on screen — the opposite of what
+    /// [`set_projected`](Self::set_projected) promises. The automation lock is still taken so a
+    /// capture never lands in the middle of an agent tool's page round trips.
     pub(crate) fn capture_page(&self) -> Result<Option<BrowserPageCapture>, String> {
+        let _automation = lock_unpoison(&self.automation);
         {
             let state = self.lock_state();
             if !state.status.has_page || state.status.suspended {
                 return Ok(None);
             }
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let capture = self.capture_screenshot_png(false)?;
             if capture.bytes.len() > MAX_INLINE_CAPTURE_BYTES {
@@ -7771,7 +7938,7 @@ return {
                 height: capture.height,
             }))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             Ok(None)
         }
@@ -7785,7 +7952,7 @@ return {
         // The trusted collaboration marker is for the human observer, not page evidence consumed
         // by the model or saved screenshots.
         self.hide_agent_pointer();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.with_composited_surface(|page| {
                 let mut params = json!({
@@ -7821,11 +7988,11 @@ return {
             })
         }
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (full_page, clip);
             Err(
-                "preview_screenshot is currently supported only by Windows WebView2 (CDP Page.captureScreenshot)"
+                "preview_screenshot needs the Chromium page engine (WebView2 on Windows, Chromium Embedded Framework on macOS)"
                     .into(),
             )
         }
@@ -7835,7 +8002,7 @@ return {
     /// defer `Page.captureScreenshot` while its controller or parent window is invisible, so a
     /// task-space page the user never opened is rendered offscreen without being focused, then
     /// restored to its exact hidden geometry.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn with_composited_surface<T>(
         &self,
         capture: impl FnOnce(&AttestedPage) -> Result<T, String>,
@@ -7982,7 +8149,7 @@ fn capture_cookies_for_cold_close(
     control: &WebView2Control,
     page: &AttestedPage,
 ) -> Result<ColdCloseCookieSnapshot, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let response =
             call_devtools_protocol(control, page, "Storage.getCookies", "{}", EVAL_TIMEOUT, &|| false)
@@ -8006,7 +8173,7 @@ fn capture_cookies_for_cold_close(
             format!("Cookie data cannot be preserved losslessly; cold suspension was refused to avoid losing sign-in state: {error}")
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (control, page);
         Err("this platform cannot safely preserve Chromium session cookies, so cold suspension was refused".into())
@@ -8019,7 +8186,7 @@ fn restore_cookies_after_cold_close(
     snapshot: &ColdCloseCookieSnapshot,
     now: f64,
 ) -> Result<ColdCloseCookieSnapshot, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let count = write_cookie_subset(control, page, snapshot.cookies.iter(), now)?;
 
@@ -8038,7 +8205,7 @@ fn restore_cookies_after_cold_close(
         )?;
         Ok(restored)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (control, page, snapshot, now);
         Err("this platform cannot safely restore Chromium session cookies".into())
@@ -8073,7 +8240,7 @@ fn verify_cookie_snapshot_contains(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn write_cookie_subset<'a>(
     control: &WebView2Control,
     page: &AttestedPage,
@@ -8562,7 +8729,7 @@ fn parse_cookie_partition_key(
 
 impl BrowserSession {
     fn cdp_call(&self, method: &str, params: &Value, timeout: Duration) -> Result<Value, String> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let control = self.webview2_control()?;
             let page = self.page()?;
@@ -8575,7 +8742,7 @@ impl BrowserSession {
                 &|| self.has_modal_state(),
             )
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (method, params, timeout);
             Err("the embedded browser on this platform does not support WebView2 CDP".into())
@@ -8771,6 +8938,61 @@ fn call_devtools_protocol(
     };
     serde_json::from_str(raw.as_str())
         .map_err(|error| format!("WebView2 CDP returned invalid JSON: {error}"))
+}
+
+/// The same call over CEF's in-process DevTools channel (`CefBrowserHost::SendDevToolsMessage`),
+/// which is what Electron's `webContents.debugger` is.
+#[cfg(target_os = "macos")]
+fn call_devtools_protocol(
+    control: &WebView2Control,
+    page: &AttestedPage,
+    method: &str,
+    parameters: &str,
+    timeout: Duration,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<Value, String> {
+    let dispatch_permit = control
+        .permit()
+        .map_err(|error| format!("Chromium native control rejected the CDP call: {error}"))?;
+    let callback_token = dispatch_permit.callback_token();
+    let (sender, receiver) = mpsc::sync_channel::<Result<Zeroizing<String>, String>>(1);
+    page.page.send_devtools_message(
+        method,
+        parameters,
+        Box::new(move |result| {
+            // A method that never completes must not keep a retired controller alive.
+            let Ok(_callback_permit) = callback_token.permit() else {
+                return;
+            };
+            let _ = sender.try_send(result.map(Zeroizing::new));
+        }),
+    );
+    drop(dispatch_permit);
+
+    let deadline = Instant::now() + timeout;
+    let raw = loop {
+        let slice = POST_ACTION_POLL.min(deadline.saturating_duration_since(Instant::now()));
+        match receiver.recv_timeout(slice) {
+            Ok(result) => {
+                break result.map_err(|error| format!("Chromium CDP call failed: {error}"))?
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Chromium CDP result channel closed".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if interrupted() {
+            return Err(MODAL_STATE_INTERRUPTED.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for Chromium CDP result ({} ms)",
+                timeout.as_millis()
+            ));
+        }
+    };
+    serde_json::from_str(raw.as_str())
+        .map_err(|error| format!("Chromium CDP returned invalid JSON: {error}"))
 }
 
 // ----- page activity observers ---------------------------------------------------------------
@@ -9100,7 +9322,156 @@ impl BrowserSession {
             .map_err(|_| "timed out installing WebView2 page observers".to_owned())?
     }
 
-    #[cfg(not(windows))]
+    /// The CEF counterpart: the same DevTools domains and events over the in-process channel,
+    /// script dialogs held through CEF's dialog callbacks, and renderer exits through its
+    /// request handler. Everything registered here runs on the main thread and is dropped
+    /// with the page.
+    #[cfg(target_os = "macos")]
+    fn install_page_activity_observers(
+        &self,
+        control: &WebView2Control,
+        page: &AttestedPage,
+        page_generation: u64,
+    ) -> Result<(), String> {
+        use crate::cef_host::page::{DialogDecision, PageDialog};
+
+        let callback_token = control
+            .permit()
+            .map_err(|error| format!("Chromium native control rejected observer setup: {error}"))?
+            .callback_token();
+        let state = self.state.clone();
+        let dismissed = || DialogDecision::Answer {
+            accept: false,
+            text: None,
+        };
+
+        let dialog_state = state.clone();
+        let dialog_token = callback_token.clone();
+        let dialog_handler = Arc::new(move |dialog: PageDialog| {
+            let Ok(_permit) = dialog_token.permit() else {
+                return dismissed();
+            };
+            // alert()/confirm() reach the host as prompts carrying the real kind in the default
+            // text (see the initialization script), exactly as on WebView2.
+            let (kind, default_text) = match dialog.default_text.strip_prefix(DIALOG_KIND_MARK) {
+                Some(real_kind) if dialog.kind == "prompt" => (real_kind.to_owned(), String::new()),
+                _ => (dialog.kind.to_owned(), dialog.default_text),
+            };
+            let mut state = lock_unpoison(&dialog_state);
+            if state.page_generation != page_generation || !state.status.has_page {
+                return dismissed();
+            }
+            state.activity.next_dialog_id = state.activity.next_dialog_id.wrapping_add(1);
+            let id = state.activity.next_dialog_id;
+            state.activity.pending_dialog = Some(PendingDialog {
+                id,
+                default_value: (kind == "prompt").then_some(default_text),
+                kind,
+                message: dialog.message.chars().take(4_000).collect(),
+                url: dialog.url,
+                opened_at_ms: Utc::now().timestamp_millis(),
+            });
+            DialogDecision::Hold(id)
+        });
+        page.page.set_dialog_handler(Some(dialog_handler));
+
+        let failure_state = state.clone();
+        let failure_token = callback_token.clone();
+        let crash_handler = Arc::new(move |description: &'static str| {
+            let Ok(_permit) = failure_token.permit() else {
+                return;
+            };
+            let mut state = lock_unpoison(&failure_state);
+            if state.page_generation != page_generation || !state.status.has_page {
+                return;
+            }
+            state.activity.crash = Some(description.to_owned());
+            state.status.loading = false;
+            state.status.error = Some(format!("browser page crashed: {description}"));
+        });
+        page.page.set_crash_handler(Some(crash_handler));
+
+        const OBSERVED_EVENTS: [&str; 10] = [
+            "Network.requestWillBeSent",
+            "Network.responseReceived",
+            "Network.loadingFinished",
+            "Network.loadingFailed",
+            "Page.domContentEventFired",
+            "Page.loadEventFired",
+            "Page.frameNavigated",
+            "Page.fileChooserOpened",
+            "Overlay.inspectNodeRequested",
+            "Overlay.inspectModeCanceled",
+        ];
+        let event_state = state.clone();
+        let event_token = callback_token.clone();
+        let event_listener = Arc::new(move |event: &str, parameters: &str| {
+            if !OBSERVED_EVENTS.contains(&event) {
+                return;
+            }
+            let Ok(_permit) = event_token.permit() else {
+                return;
+            };
+            let Ok(parameters) = serde_json::from_str::<Value>(parameters) else {
+                return;
+            };
+            let mut state = lock_unpoison(&event_state);
+            if state.page_generation != page_generation || !state.status.has_page {
+                return;
+            }
+            let picker = &mut state.element_picker;
+            record_element_picker_event(picker, page_generation, event, &parameters);
+            record_devtools_event(&mut state.activity, event, &parameters);
+        });
+        page.page.set_event_listener(Some(event_listener));
+
+        // The completion of an enable call carries nothing the host needs; the events
+        // themselves are the signal.
+        for (method, parameters) in [
+            ("Network.enable", "{}"),
+            ("Page.enable", "{}"),
+            ("Page.setInterceptFileChooserDialog", r#"{"enabled":true}"#),
+        ] {
+            page.page
+                .send_devtools_message(method, parameters, Box::new(|_| {}));
+        }
+        // The main frame id separates a navigation from a subframe's document load.
+        let frame_state = state.clone();
+        let frame_token = callback_token;
+        page.page.send_devtools_message(
+            "Page.getFrameTree",
+            "{}",
+            Box::new(move |result| {
+                let Ok(_permit) = frame_token.permit() else {
+                    return;
+                };
+                let Some(id) = result
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|payload| {
+                        payload
+                            .pointer("/frameTree/frame/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                else {
+                    return;
+                };
+                let mut state = lock_unpoison(&frame_state);
+                if state.page_generation == page_generation {
+                    state.activity.main_frame_id = Some(id);
+                }
+            }),
+        );
+
+        let mut state = lock_unpoison(&state);
+        if state.page_generation == page_generation {
+            state.activity.events_enabled = true;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn install_page_activity_observers(
         &self,
         _control: &WebView2Control,
@@ -9149,7 +9520,20 @@ impl BrowserSession {
             .map_err(|_| "timed out answering the dialog".to_owned())?
     }
 
-    #[cfg(not(windows))]
+    /// Answers the dialog `preview_dialog` named through the CEF callback holding it open.
+    #[cfg(target_os = "macos")]
+    fn answer_pending_dialog(
+        &self,
+        dialog_id: u64,
+        accept: bool,
+        prompt_text: Option<&str>,
+    ) -> Result<(), String> {
+        let page = self.page()?;
+        page.page
+            .answer_dialog(dialog_id, accept, prompt_text.map(str::to_owned))
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn answer_pending_dialog(
         &self,
         _dialog_id: u64,
@@ -10228,11 +10612,12 @@ const BROWSER_INITIALIZATION_SCRIPT: &str = r#"
 "#;
 
 /// The initialization script with its platform switches filled in. Native dialog holding exists
-/// only on Windows WebView2; elsewhere the in-page interception stays active.
+/// where the page engine is Chromium (WebView2, CEF); elsewhere the in-page interception stays
+/// active.
 fn browser_initialization_script() -> String {
     BROWSER_INITIALIZATION_SCRIPT.replace(
         "\"__MEWORK_NATIVE_DIALOGS__\" === \"true\"",
-        if host_platform().is_windows() { "true" } else { "false" },
+        if page_engine_holds_dialogs() { "true" } else { "false" },
     )
 }
 
@@ -11447,18 +11832,26 @@ impl BrowserSession {
             .map(str::to_owned))
     }
 
-    /// Every console entry as `[level] text`, for scoring. Unlike `preview_console_logs` there is
-    /// no level filter, no tail slice and no footer: the decision model chunks the whole buffer
-    /// and only the pieces that clear the threshold reach the conversation anyway.
-    pub(crate) fn console_log_lines(&self) -> Result<Vec<String>, String> {
+    /// The console entries as `[level] text`, for scoring. `level` filters exactly as
+    /// `preview_console_logs`'s does; beyond that there is no tail slice and no footer: the
+    /// decision model chunks what is left and only the pieces that clear the threshold reach the
+    /// conversation anyway.
+    pub(crate) fn console_log_lines(&self, level: Option<&str>) -> Result<Vec<String>, String> {
+        let level = js_string_literal(level.unwrap_or("all"))?;
         let payload = self.eval_value(
-            r#"
-const render = value => typeof value === "string" ? value : (() => { try { return JSON.stringify(value); } catch (_) { return String(value); } })();
-return __state.consoleEntries.map(entry => ({
+            &format!(
+                r#"
+const level = {level};
+const render = value => typeof value === "string" ? value : (() => {{ try {{ return JSON.stringify(value); }} catch (_) {{ return String(value); }} }})();
+let entries = __state.consoleEntries.map(entry => ({{
   level: String(entry.level || "log"),
   text: Array.isArray(entry.args) ? entry.args.map(render).join(" ") : String(entry.message || "")
-}));
-"#,
+}}));
+if (level === "error") entries = entries.filter(entry => entry.level === "error");
+else if (level === "warn") entries = entries.filter(entry => entry.level === "warn" || entry.level === "error");
+return entries;
+"#
+            ),
             EVAL_TIMEOUT,
         )?;
         Ok(payload
@@ -11985,13 +12378,13 @@ return __state.consoleEntries.map(entry => ({
 
     /// `preview_screenshot`: a JPEG clipped to at most 800 device pixels wide and returned base64
     /// inline. Mework's other screenshot path writes a PNG to a workspace path instead.
-    #[cfg_attr(not(windows), allow(unused_variables))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_variables))]
     pub(crate) fn preview_screenshot(
         &self,
         scale: Option<f64>,
     ) -> Result<PreviewScreenshot, String> {
         let scale = validate_preview_scale(scale)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.hide_agent_pointer();
             self.with_composited_surface(|page| {
@@ -12016,16 +12409,16 @@ return __state.consoleEntries.map(entry => ({
                 captured
             })
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             Err(
-                "preview_screenshot is currently supported only by Windows WebView2 (CDP Page.captureScreenshot)"
+                "preview_screenshot needs the Chromium page engine (WebView2 on Windows, Chromium Embedded Framework on macOS)"
                     .into(),
             )
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn capture_preview_jpeg(
         &self,
         page: &AttestedPage,
@@ -13248,10 +13641,6 @@ mod tests {
             PreviewTool::ConsoleLogs => json!({"level":"error", "lines":10}),
             PreviewTool::Screenshot => json!({"scale":0.5}),
             PreviewTool::Snapshot => json!({}),
-            PreviewTool::FindElement => json!({"query":"button"}),
-            PreviewTool::ClickByDescription => json!({"description":"the save button", "doubleClick":true}),
-            PreviewTool::FillByDescription => json!({"description":"the email field", "value":"hello"}),
-            PreviewTool::InspectByDescription => json!({"description":"the save button", "styles":["color"]}),
             PreviewTool::Inspect => json!({"selector":"button", "styles":["color"]}),
             PreviewTool::Click => json!({"selector":"button", "doubleClick":true}),
             PreviewTool::Fill => json!({"selector":"input", "value":"hello"}),
@@ -13267,7 +13656,7 @@ mod tests {
     fn every_preview_page_tool_has_a_runtime_dispatch_arm() {
         let session = BrowserSession::default();
 
-        assert_eq!(PreviewTool::ALL.len(), 15);
+        assert_eq!(PreviewTool::ALL.len(), 11);
         let catalog = crate::catalog::tool_catalog()
             .into_iter()
             .map(|tool| tool.name)
@@ -15474,6 +15863,26 @@ mod tests {
             .expect_err("test operation should fail");
         assert_eq!(error, "expected failure");
         assert_eq!(session.status().control.owner, BrowserControlOwner::User);
+    }
+
+    #[test]
+    fn pane_capture_leaves_page_ownership_alone() {
+        let session = BrowserSession::new("pane-capture-ownership");
+        // Once with nothing to capture and once past that early return, where the capture itself
+        // is attempted. Whether that attempt succeeds depends on the platform; ownership must not.
+        let _ = session.capture_page();
+        session.lock_state().status.has_page = true;
+        let _ = session.capture_page();
+
+        let status = session.status();
+        assert_eq!(status.control.owner, BrowserControlOwner::Available);
+        assert!(!status.control.handoff_requested);
+        assert!(!session.user_has_ever_controlled());
+
+        let _automation = lock_unpoison(&session.automation);
+        let _control = session
+            .begin_agent_control(PreviewTool::Screenshot)
+            .expect("a projected page must stay available to agent tools");
     }
 
     #[test]

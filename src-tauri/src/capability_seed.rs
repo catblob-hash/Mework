@@ -164,7 +164,7 @@ const BUILTIN_HOOKS: &[BuiltinHook] = &[
     },
     BuiltinHook {
         event: "PostToolUse",
-        matcher: Some("^(bash|powershell)$"),
+        matcher: Some("^(bash|zsh|sh|powershell)$"),
         name: "Mework built-in · shell command log",
         status_message: "Recording the command",
         // Append-only, inside the workspace, and silent: stdout stays empty so

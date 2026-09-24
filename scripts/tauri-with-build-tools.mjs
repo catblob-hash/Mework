@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { windowsNativeBuildEnvironment } from "./windows-native-build-tools.mjs";
+import { withCefBuildEnvironment } from "./cef-environment.mjs";
 import { devChildEnvironment } from "./dev-child-environment.mjs";
+import { withMacosDevSigning } from "./macos-dev-signing.mjs";
 import {
   DEFAULT_FRONTEND_PORT,
   chooseLoopbackPort,
@@ -12,7 +14,7 @@ import {
 const DEV_SERVER_PORT_ENVIRONMENT_NAME = "MEWORK_DEV_SERVER_PORT";
 
 const environment = devChildEnvironment({
-  buildEnvironment: windowsNativeBuildEnvironment()
+  buildEnvironment: withMacosDevSigning(withCefBuildEnvironment(windowsNativeBuildEnvironment()))
 });
 const tauriArguments = process.argv.slice(2);
 

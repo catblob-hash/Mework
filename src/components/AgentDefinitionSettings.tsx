@@ -1,5 +1,5 @@
-import { Bot, Plus, Settings2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ArrowRight, Bot, FileText, Plus, Settings2, Wrench } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import {
   AGENT_TOOL_WILDCARD,
@@ -34,13 +34,8 @@ import type {
 } from "../types";
 import { CatalogRow, useCatalogSort } from "./CatalogRow";
 import { ConfirmDeleteButton, Dialog, Field, IconButton, Switch } from "./Common";
-import { ConversationTemplateWindow } from "./ConversationTemplateWindow";
-import { DocsLink } from "./DocsLink";
-import { FetchProviderField } from "./FetchProviderField";
-import { SearchDomainFilterRow } from "./SearchDomainFilterRow";
-import { SearchProviderField } from "./SearchProviderField";
-import { SearchResultShapingFields } from "./SearchResultShapingFields";
-import { ToolSelectionGroups } from "./ToolSelectionGroups";
+import { ConversationTemplateEditor } from "./ConversationTemplateEditor";
+import { FeaturesPage } from "./FeaturesPage";
 import { reorderItems } from "./usePointerDrag";
 import "./AgentDefinitionSettings.css";
 
@@ -56,18 +51,19 @@ interface AgentDefinitionSettingsProps {
    * the set the picker shows while a role has no allowlist of its own. */
   conversationEnabledTools: readonly string[];
   /** Whether the conversation's own model reads images — what a role bound to
-   * "inherit" will run on, and so the answer its template window needs. */
+   * "inherit" will run on, and so the answer its template page needs. */
   conversationImageInputSupported?: boolean;
   /** The search-provider catalogue, so a role can pick its own backend. */
   webSearchAssets: WebSearchAssets;
-  /** Every stored template, for the message count a role's row reports. */
+  /** Every stored template, for the message counts the template page reports. */
   templates: ConversationTemplateSummary[];
-  /** Drawn read-only in the template window, beside the role's own body. */
+  /** Offered on the template page as bodies to copy over the role's own. */
   presets: readonly ConversationPreset[];
   onReadTemplate: (templateId: string) => Promise<ContextItem[]>;
   /** Writes a body and resolves with the id it landed under, minting when empty. */
   onWriteTemplate: (templateId: string, contexts: ContextItem[]) => Promise<string>;
-  /** Widens the conversation's enabled set when a template calls a tool it lacks. */
+  /** Widens the conversation's enabled set when a template calls a tool it lacks,
+   * for a role that follows that set rather than keeping a list of its own. */
   onEnableTools?: (names: string[]) => void;
   onChange: (definitions: AgentDefinition[]) => void;
 }
@@ -151,6 +147,23 @@ function rememberDraft(key: string, state: EditorState): void {
   }
 }
 
+/**
+ * The pages the role editor lists down its left edge.
+ *
+ * Laid out the way a preset's window is — a rail of pages on the left, the page
+ * on the right, the save under the rail — because it is the same kind of thing:
+ * one reusable body, opened to be edited. `role` is what the role is called and
+ * what it runs on; `tools` is the conversation's own features page with the
+ * sections a role cannot answer left out; `template` is the opening history.
+ */
+type RoleEditorPage = "role" | "tools" | "template";
+
+const ROLE_EDITOR_PAGES: ReadonlyArray<{ id: RoleEditorPage; icon: typeof Bot }> = [
+  { id: "role", icon: Bot },
+  { id: "tools", icon: Wrench },
+  { id: "template", icon: FileText }
+];
+
 const AGENT_EFFORTS: readonly ReasoningEffort[] = [
   "disabled",
   "low",
@@ -196,14 +209,29 @@ export function AgentDefinitionSettings({
   const { t } = useI18n();
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [editorError, setEditorError] = useState<string | null>(null);
-  /* The role's template, open in a window over the role editor. Its own state
-   * because the body is written straight to the host: the role editor's draft
-   * holds only the id, and only once there is one. */
-  const [templateWindowOpen, setTemplateWindowOpen] = useState(false);
-  /* The role's own domain lists, open in a window over the role editor. Its own
-   * state for the same reason the template window's is: the row that opens it
-   * is one field of the role, not a second editor. */
-  const [domainWindowOpen, setDomainWindowOpen] = useState(false);
+  /* Every role opens on its own settings page: the name is the one thing a
+   * new role cannot be saved without. */
+  const [page, setPage] = useState<RoleEditorPage>("role");
+  /* The role's template body, read the first time its page is opened. It lives
+   * here rather than in the template editor because the rail needs it too: a
+   * preset's body is only copied over this one after asking, and only when
+   * there is something here to lose. The body is written straight to the host
+   * as it is edited; the role's draft holds only the id, and only once there is
+   * one. */
+  const [templateBody, setTemplateBody] = useState<ContextItem[] | null>(null);
+  /* The id whose body `templateBody` already holds. A first save mints the id
+   * the draft then takes, and re-reading a body this editor just wrote would be
+   * a second chance to lose what was typed since, not a refresh. */
+  const heldTemplateId = useRef<string | null>(null);
+  /* Bumped when a body the template editor did not write lands under it — a
+   * preset's, copied over — so the editor starts again on that body instead of
+   * keeping the draft it was seeded with. */
+  const [templateGeneration, setTemplateGeneration] = useState(0);
+  /* A preset whose template is waiting on the user's word before it replaces
+   * the role's non-empty one. */
+  const [pendingOverwrite, setPendingOverwrite] = useState<ConversationPreset | null>(null);
+  const [overwriting, setOverwriting] = useState(false);
+  const [overwriteError, setOverwriteError] = useState<string | null>(null);
   /* Whether the name has been asked to be valid yet. A create dialog opens on an
    * empty name, and announcing "a role name is required" before the user has had
    * a chance to type one reads as a complaint about their not having typed it.
@@ -323,6 +351,17 @@ export function AgentDefinitionSettings({
     templateId: null
   });
 
+  /* Whatever the last role left on screen — the page it was on, the template
+   * body it read, a question it was asking — belongs to that role. */
+  const resetEditorChrome = () => {
+    setPage("role");
+    setTemplateBody(null);
+    heldTemplateId.current = null;
+    setTemplateGeneration((generation) => generation + 1);
+    setPendingOverwrite(null);
+    setOverwriteError(null);
+  };
+
   const beginCreate = () => {
     const key = draftKey(listId, null);
     const remembered = editorDrafts.get(key);
@@ -332,6 +371,7 @@ export function AgentDefinitionSettings({
       originalRevision: null,
       draft: blankDraft()
     });
+    resetEditorChrome();
     setEditorError(null);
     // A remembered draft has already been typed into, so its name may be
     // answered for; a fresh one has not been asked yet.
@@ -376,6 +416,7 @@ export function AgentDefinitionSettings({
         templateId: draft.templateId
       }
     });
+    resetEditorChrome();
     setEditorError(null);
     // An existing role arrives with a valid name, so validation has nothing to
     // withhold: any error from here on is one the user has just introduced.
@@ -404,8 +445,7 @@ export function AgentDefinitionSettings({
    * the role either way — Save is still the only thing that writes. */
   const closeEditor = () => {
     setEditor(null);
-    setTemplateWindowOpen(false);
-    setDomainWindowOpen(false);
+    setPendingOverwrite(null);
     setEditorError(null);
   };
 
@@ -473,6 +513,112 @@ export function AgentDefinitionSettings({
     return provider ? `${provider.name} · ${selection.modelId}` : selection.modelId;
   };
 
+  /* The template page. The body is read the first time the page is opened and
+   * only then — a template is big enough that reading it on the chance the page
+   * is opened would slow down opening every role — and kept across leaving the
+   * page and coming back, since every edit on it is already written through. */
+  const editorTemplateId = editor?.draft.templateId ?? "";
+  const templatePageOpen = editor !== null && page === "template";
+  useEffect(() => {
+    if (!templatePageOpen || heldTemplateId.current === editorTemplateId) return;
+    if (!editorTemplateId) {
+      heldTemplateId.current = "";
+      setTemplateBody([]);
+      return;
+    }
+    let abandoned = false;
+    setTemplateBody(null);
+    void (async () => {
+      let contexts: ContextItem[] = [];
+      try {
+        contexts = await onReadTemplate(editorTemplateId);
+      } catch {
+        // An unreadable body is an empty one to work from, as it is on a
+        // preset's page: the page still has to open, and the next save
+        // overwrites whatever is there regardless.
+      }
+      if (abandoned) return;
+      heldTemplateId.current = editorTemplateId;
+      setTemplateBody(contexts);
+    })();
+    return () => { abandoned = true; };
+  }, [editorTemplateId, onReadTemplate, templatePageOpen]);
+
+  /* How many messages the role's template holds right now: the body in hand
+   * when there is one, otherwise what the host's summary last said. */
+  const templateMessageCount = templateBody?.length
+    ?? templates.find((summary) => summary.id === editorTemplateId)?.messageCount
+    ?? 0;
+  const presetTemplateCount = (preset: ConversationPreset) => (preset.templateId
+    ? templates.find((summary) => summary.id === preset.templateId)?.messageCount ?? 0
+    : 0);
+
+  /* The tools the role can actually call, which is what its template may place.
+   * Drawn out of the same catalogue the tools page offers, so a template never
+   * holds a card for a tool the role could not be given. */
+  const roleToolNames = (editor?.draft.tools ?? inheritedToolNames)
+    .filter((name) => selectableToolNameSet.has(name));
+
+  /* Writes a body under the role's template and makes sure the draft cites it:
+   * the host mints the id on a first write, and the draft is the only place the
+   * role will ever learn it from. */
+  const writeRoleTemplate = async (templateId: string, contexts: ContextItem[]) => {
+    const savedId = await onWriteTemplate(templateId, contexts);
+    heldTemplateId.current = savedId;
+    setTemplateBody(contexts);
+    if (savedId !== templateId) replaceEditorDraft({ templateId: savedId });
+  };
+
+  /* Copies a preset's opening history over the role's own. The body is written
+   * at once, as every other edit on this page is; the editor then starts again
+   * on it, because the draft it was seeded with is no longer what is stored. */
+  const overwriteTemplate = async (preset: ConversationPreset) => {
+    setPendingOverwrite(null);
+    setOverwriteError(null);
+    setOverwriting(true);
+    try {
+      const contexts = await onReadTemplate(preset.templateId);
+      // The host refuses an empty body, and copying nothing over something is
+      // not what the arrow promised either.
+      if (!contexts.length) {
+        throw new Error(t("这份预设的对话模板是空的。", "This preset's conversation template is empty."));
+      }
+      await writeRoleTemplate(editorTemplateId, contexts);
+      setTemplateGeneration((generation) => generation + 1);
+    } catch (reason) {
+      setOverwriteError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setOverwriting(false);
+    }
+  };
+
+  /* Replacing an empty template loses nothing, so it just happens; replacing
+   * one that already says something asks first. */
+  const requestOverwrite = (preset: ConversationPreset) => {
+    if (templateMessageCount > 0) setPendingOverwrite(preset);
+    else void overwriteTemplate(preset);
+  };
+
+  const pageTitles: Record<RoleEditorPage, string> = {
+    role: t("角色设置", "Role settings"),
+    tools: t("工具", "Tools"),
+    template: t("对话模板", "Conversation template")
+  };
+  const pageBlurbs: Record<RoleEditorPage, string> = {
+    role: t(
+      "这个角色叫什么、主代理从描述里读到它是干什么的，以及它跑在哪个模型上。关掉窗口会保留草稿，点「保存角色」才会写入。",
+      "What this role is called, what the main agent reads about what it is for, and which model it runs on. Closing the window keeps the draft; nothing is written until Save role."
+    ),
+    tools: t(
+      "这个角色拿到的工具面与联网后端，和对话自己的功能页是同一页；联网开关、记忆与工具描述由调用它的对话决定，这里不出现。",
+      "The tool surface and web backends this role gets — the same page as the conversation's own features page. Web access, memory and tool descriptions are decided by the conversation that calls it, so they do not appear here."
+    ),
+    template: t(
+      "这个角色的开局历史。模板里的用户消息若恰好含一个 {input}，主代理给的输入会替换到那里；没有或有两个以上时，输入作为最后一条用户消息追加。左下方点一份预设，可以用它的对话模板覆盖这里。",
+      "This role's opening history. If the template's user messages contain exactly one {input}, the caller's input replaces it; with none or with two or more, the input is appended as a final user message. Pick a preset at the bottom left to copy its template over this one."
+    )
+  };
+
   const nameErrorText = () => {
     if (duplicateName) {
       return t("已有同名的角色。", "A role with this name already exists.");
@@ -525,6 +671,9 @@ export function AgentDefinitionSettings({
     // that is the enforcement, and it does not need a second one here.
     if (nameError || duplicateName) {
       setEditorError(t("请先修正标记的字段。", "Fix the marked fields before saving."));
+      // The marked field is on the role page; a refusal read from any other
+      // page would point at something the user cannot see.
+      setPage("role");
       return;
     }
 
@@ -572,8 +721,7 @@ export function AgentDefinitionSettings({
     editorDrafts.delete(draftKey(listId, editor.originalName));
     editorDrafts.delete(draftKey(listId, draftName));
     setEditor(null);
-    setTemplateWindowOpen(false);
-    setDomainWindowOpen(false);
+    setPendingOverwrite(null);
     setEditorError(null);
   };
 
@@ -717,346 +865,402 @@ export function AgentDefinitionSettings({
 
       {editor && (
         <Dialog
+          /* Named after the role, the way a preset's window is named after the
+             preset. The name as it was OPENED, not as it is being typed: the
+             title is how the user knows which role this window is, and it
+             should not change under them mid-rename. */
           title={editor.mode === "create"
             ? t("新建角色", "New role")
-            : t("角色设置", "Role settings")}
-          width="620px"
+            : editor.originalName ?? t("角色设置", "Role settings")}
+          width="1040px"
+          bodyClassName="dialog__body--flush"
           // Deliberately not dismissible: a stray click on the backdrop would
           // discard an in-progress role without asking. The header's own close
-          // button is unaffected — that one is a decision, not a slip.
+          // button is unaffected — that one is a decision, not a slip, and it
+          // keeps the draft rather than throwing it away.
           dismissible={false}
           onClose={closeEditor}
+        >
+          <div className="conversation-settings agent-definition-editor">
+            <nav
+              className="conversation-settings__nav settings-nav agent-definition-editor__nav"
+              aria-label={t("角色设置分类", "Role settings categories")}
+            >
+              <div className="conversation-settings__nav-items">
+                {ROLE_EDITOR_PAGES.map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <button
+                      type="button"
+                      key={item.id}
+                      aria-current={page === item.id || undefined}
+                      className={page === item.id
+                        ? "settings-nav__item settings-nav__item--active"
+                        : "settings-nav__item"}
+                      onClick={() => setPage(item.id)}
+                    >
+                      <Icon size={14} aria-hidden="true" />
+                      <span>{pageTitles[item.id]}</span>
+                      {item.id === "template" && (
+                        <small className="conversation-settings__nav-count">{templateMessageCount}</small>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Only while the template is on screen: copying a preset's body
+                  over the role's is an act on that page, and it is read against
+                  the body it would replace. One line per preset, the whole line
+                  the target, and the arrow pointing at where the body goes. */}
+              {page === "template" && (
+                <div className="agent-definition-editor__presets">
+                  <span className="agent-definition-editor__presets-label">
+                    {t("从预设覆盖", "Copy from a preset")}
+                  </span>
+                  <div className="agent-definition-editor__presets-list">
+                    {presets.map((preset) => {
+                      const name = preset.name || t("未命名预设", "Untitled preset");
+                      const empty = presetTemplateCount(preset) === 0;
+                      return (
+                        <button
+                          type="button"
+                          key={preset.id}
+                          className="agent-definition-editor__preset"
+                          aria-label={t(
+                            "用预设 {name} 的对话模板覆盖",
+                            "Copy preset {name}'s template over this one",
+                            { name }
+                          )}
+                          title={empty
+                            ? t("这份预设没有对话模板。", "This preset has no conversation template.")
+                            : name}
+                          disabled={empty || overwriting}
+                          onClick={() => requestOverwrite(preset)}
+                        >
+                          <span>{name}</span>
+                          <ArrowRight size={12} aria-hidden="true" />
+                        </button>
+                      );
+                    })}
+                    {presets.length === 0 && (
+                      <p className="agent-definition-editor__presets-empty">
+                        {t("还没有对话预设。", "No conversation presets yet.")}
+                      </p>
+                    )}
+                  </div>
+                  {overwriteError && (
+                    <p className="agent-definition-editor__error" role="alert">{overwriteError}</p>
+                  )}
+                </div>
+              )}
+
+              {/* Saving belongs to the whole window rather than to any one page,
+                  so it is the one thing under the list — the corner a preset's
+                  window keeps its own save in. */}
+              <div className="conversation-settings__nav-footer">
+                <div className="conversation-settings__preset-actions">
+                  <button
+                    type="button"
+                    className="text-button"
+                    // Not disabled on a blank name. A save greyed out with no
+                    // explanation is a puzzle; pressing it and being told what
+                    // is missing is an answer.
+                    onClick={saveEditor}
+                  >{t("保存角色", "Save role")}</button>
+                </div>
+                {editorError && (
+                  <p className="agent-definition-editor__error" role="alert">{editorError}</p>
+                )}
+              </div>
+            </nav>
+
+            <div className="conversation-settings__page">
+              <header className="conversation-settings__page-header">
+                <p>{pageBlurbs[page]}</p>
+              </header>
+              {/* The template page is a timeline, which brings its own scroller
+                  and its own edges, so it gets the body flush — as it does on a
+                  preset's page. */}
+              <div className={page === "template"
+                ? "conversation-settings__page-body conversation-settings__page-body--flush"
+                : "conversation-settings__page-body"}>
+                <div className={page === "template"
+                  ? "conversation-settings__page-stack conversation-settings__page-stack--flush"
+                  : "conversation-settings__page-stack"}>
+                  {page === "role" && (
+                    <>
+                      <section className="conversation-settings__field agent-definition-editor__identity">
+                        {/* No standing hint under it. A role name is free text, so
+                          * there is no shape to teach — the only thing left to say
+                          * about it is that a particular one was refused, and that
+                          * is what the line carries when there is one. */}
+                        <Field
+                          label={t("角色名称", "Role name")}
+                          hint={showNameError ? nameErrorText() ?? undefined : undefined}
+                          hintIsError
+                        >
+                          <input
+                            className={`input${showNameError ? " input--error" : ""}`}
+                            value={editor.draft.name}
+                            aria-label={t("角色名称", "Role name")}
+                            aria-invalid={showNameError}
+                            onChange={(event) => replaceEditorDraft({ name: event.target.value })}
+                            autoComplete="off"
+                            autoFocus
+                          />
+                        </Field>
+
+                        {/* Deliberately no character counter and no maximum. This
+                          * is the one field on this screen the model actually reads
+                          * as prose, and a budget shown next to it would push users
+                          * to write a label where a sentence belongs. The host
+                          * writes it through verbatim. */}
+                        <Field
+                          label={t("子代理描述", "Subagent description")}
+                          hint={t(
+                            "告诉主代理这个角色是干什么的。会拼进本对话「子代理」/「工作流」工具的描述里，每个角色一行；留空则这个角色不出现在那份说明里。",
+                            "Tells the main agent what this role is for. It is appended to this conversation's Subagent / Workflow tool description, one line per role; leave it empty and this role contributes no line."
+                          )}
+                        >
+                          <textarea
+                            className="input"
+                            rows={4}
+                            value={editor.draft.description}
+                            aria-label={t("子代理描述", "Subagent description")}
+                            onChange={(event) => replaceEditorDraft({ description: event.target.value })}
+                            placeholder={t(
+                              "对抗式审查：负责证伪既有结论、挑错，不产出主线方案。",
+                              "Adversarial review: refutes existing conclusions and finds faults; does not produce the main proposal."
+                            )}
+                          />
+                        </Field>
+
+                        {editor.mode === "edit" && editor.originalName !== draftName && (
+                          <p className="agent-definition-editor__warning">{t(
+                            "重命名会创建新的可信身份，正在运行的旧名称调用不会自动跟随。",
+                            "Renaming creates a new trusted identity; a run already using the old name does not follow it."
+                          )}</p>
+                        )}
+                      </section>
+
+                      {/* A row rather than a stacked form field: what it is called
+                        * and what it means on the left, the one control that sets
+                        * it on the right — the shape the features page uses for
+                        * the same kind of question. */}
+                      <section className="conversation-settings__field">
+                        <div className="agent-definition-editor__rows field-row">
+                          <Field
+                            label={t("执行模型", "Execution model")}
+                            hint={modelSelectionUnavailable
+                              ? selectedModelSelection?.kind === "explicit"
+                                ? t(
+                                    "这个模型现在取不到——提供商还没拉取模型、被停用，或者这一行已经不在了。角色暂时不能被调用，但绑定会一直留着，模型回来就自动恢复。",
+                                    "This model cannot be resolved right now — the provider has not fetched its models, is disabled, or the row is gone. The role cannot be called for now, but the binding is kept and recovers by itself once the model is back."
+                                  )
+                                : t(
+                                    "这条绑定是旧版本记下的「已失效」，模型 ID 当时就被丢掉了，找不回来；请选择跟随对话或另一个可用模型。",
+                                    "An older build recorded this binding as broken and discarded the model ID at the time, so it cannot be recovered. Choose the conversation's model or another available one."
+                                  )
+                              : t(
+                                  "只列出已启用提供商中的模型；保存精确 provider/model ID。",
+                                  "Only models from enabled providers are listed; exact provider/model IDs are saved."
+                                )}
+                          >
+                            <select
+                              className={`input${modelSelectionUnavailable ? " input--error" : ""}`}
+                              value={modelSelectionValue}
+                              aria-label={t("执行模型", "Execution model")}
+                              aria-invalid={modelSelectionUnavailable}
+                              onChange={(event) => {
+                                if (event.target.value === "inherit") {
+                                  replaceEditorDraft({ modelSelection: { kind: "inherit" } });
+                                  return;
+                                }
+                                const option = explicitModelOptions.find((candidate) => (
+                                  candidate.key === event.target.value
+                                ));
+                                if (!option) return;
+                                replaceEditorDraft({
+                                  modelSelection: {
+                                    kind: "explicit",
+                                    providerId: option.providerId,
+                                    modelId: option.modelId
+                                  }
+                                });
+                              }}
+                            >
+                              {/* `hidden` keeps this out of the dropdown list: it
+                                * exists only so the closed select does not fall
+                                * through to the first option and display a working
+                                * model the role does not have.
+                                *
+                                * A binding whose pair is still recorded but no longer
+                                * offered — its model has not been fetched, or the
+                                * provider is disabled — names the model the user
+                                * actually chose. It must never print the raw
+                                * `providerId`, which is a random per-installation
+                                * UUID and reads as a hash; the provider's own name
+                                * is the part a person can act on, and when its row
+                                * is gone entirely there is no name to give, so the
+                                * model ID stands alone. */}
+                              {modelSelectionUnavailable && (
+                                <option value="" disabled hidden>
+                                  {selectedModelSelection?.kind === "explicit"
+                                    ? t(
+                                        "{model}（不可用）",
+                                        "{model} (unavailable)",
+                                        { model: unavailableBindingLabel(selectedModelSelection) }
+                                      )
+                                    : t("请选择执行模型", "Choose an execution model")}
+                                </option>
+                              )}
+                              <option value="inherit">{t("跟随对话模型", "Follow the conversation's model")}</option>
+                              {explicitModelOptions.map((option) => (
+                                <option key={option.key} value={option.key}>
+                                  {option.providerName} · {option.modelId}
+                                </option>
+                              ))}
+                            </select>
+                          </Field>
+
+                          <Field
+                            label={t("推理强度", "Reasoning effort")}
+                            hint={t(
+                              "留空表示跟随对话的推理强度。",
+                              "Leave unset to follow the conversation's reasoning effort."
+                            )}
+                          >
+                            <select
+                              className="input"
+                              value={editor.draft.effort ?? "inherit"}
+                              aria-label={t("推理强度", "Reasoning effort")}
+                              onChange={(event) => replaceEditorDraft({
+                                effort: event.target.value === "inherit"
+                                  ? null
+                                  : (event.target.value as ReasoningEffort)
+                              })}
+                            >
+                              <option value="inherit">{t("跟随对话", "Follow the conversation")}</option>
+                              {AGENT_EFFORTS.map((effort) => (
+                                <option key={effort} value={effort}>{effort}</option>
+                              ))}
+                            </select>
+                          </Field>
+                        </div>
+                      </section>
+                    </>
+                  )}
+
+                  {/* The conversation's own features page, not a copy of it: a
+                      row added or reworded there lands here too. What a role
+                      leaves out is exactly what it has no field for — the web
+                      access switch (whether to reach the web at all is the
+                      caller's decision), the memory tiers (derived from the
+                      caller's switches and the role's memory binding, never from
+                      a tool list), the app-data path, and the tool-description
+                      profile. What it adds is a "follow the conversation" answer
+                      on every row that has a caller to follow. */}
+                  {page === "tools" && (
+                    <FeaturesPage
+                      picker={{
+                        tools: selectableTools as ToolDescriptor[],
+                        // While inheriting, the picker shows the conversation's
+                        // own set rather than an empty list: that IS what this
+                        // role will get, and drawing it as "nothing selected"
+                        // would misread as broken.
+                        enabledTools: editor.draft.tools ?? inheritedToolNames,
+                        onChange: (tools) => replaceEditorDraft({ tools }),
+                        expansionKey: editor.originalName ?? "new-role"
+                      }}
+                      pickerSummary={editor.draft.tools === null
+                        ? t(
+                            "跟随对话设置：本对话启用哪些，这个角色就有哪些",
+                            "Following the conversation: this role gets whatever the conversation enables"
+                          )
+                        : t(
+                            "{enabled} / {total} 个已选",
+                            "{enabled} / {total} selected",
+                            {
+                              enabled: visibleSelectedCount(editor.draft.tools),
+                              total: selectableToolNames.length
+                            }
+                          )}
+                      web={{
+                        inheritOption: true,
+                        value: {
+                          provider: editor.draft.searchProvider,
+                          fetchProvider: editor.draft.fetchProvider,
+                          maxResults: editor.draft.maxResults,
+                          compressionCutoff: editor.draft.compressionCutoff,
+                          domainFilter: editor.draft.domainFilter,
+                          includeDomains: editor.draft.includeDomains,
+                          excludeDomains: editor.draft.excludeDomains
+                        },
+                        onChange: ({ provider, ...rest }) => replaceEditorDraft(
+                          provider === undefined ? rest : { ...rest, searchProvider: provider }
+                        ),
+                        webSearchAssets
+                      }}
+                    />
+                  )}
+
+                  {/* The role's own message queue, edited on the same surface a
+                      preset's is. Each edit is written back as it lands, and the
+                      first write mints the id the draft then carries. */}
+                  {page === "template" && (
+                    <ConversationTemplateEditor
+                      key={templateGeneration}
+                      templateId={editorTemplateId}
+                      contexts={templateBody}
+                      tools={selectableTools as ToolDescriptor[]}
+                      enabledTools={roleToolNames}
+                      imageInputSupported={selectedModelReadsImages}
+                      autosave
+                      /* A role that follows the conversation's set is widened
+                         by widening that set; a role with a list of its own is
+                         widened on its own list, and only on Save. */
+                      onEnableTools={editor.draft.tools === null
+                        ? onEnableTools
+                        : (names) => replaceEditorDraft({
+                            tools: [...new Set([...(editor.draft.tools ?? []), ...names])]
+                          })}
+                      onSave={(contexts) => writeRoleTemplate(editorTemplateId, contexts)}
+                    />
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </Dialog>
+      )}
+
+      {pendingOverwrite && (
+        <Dialog
+          title={t("覆盖对话模板？", "Overwrite the conversation template?")}
+          description={t(
+            "这个角色的对话模板里已有 {count} 条消息，会被预设「{name}」的对话模板整个替换，替换后无法撤销。",
+            "This role's template already holds {count} messages. They will all be replaced by the template of preset \u201c{name}\u201d, and this cannot be undone.",
+            {
+              count: templateMessageCount,
+              name: pendingOverwrite.name || t("未命名预设", "Untitled preset")
+            }
+          )}
+          onClose={() => setPendingOverwrite(null)}
           footer={(
             <>
               <button
                 type="button"
                 className="button button--secondary"
-                onClick={closeEditor}
-              >
-                {/* Not "Cancel": closing keeps the draft, and a button that
-                    says it cancels while the edit survives is a lie about what
-                    just happened. The parenthesis is the only place the user is
-                    told the draft outlives the dialog, and it also keeps this
-                    button's name distinct from the header's own close. Save is
-                    still the only thing that writes to the role. */}
-                {t("关闭（保留草稿）", "Close (keep draft)")}
-              </button>
+                onClick={() => setPendingOverwrite(null)}
+              >{t("取消", "Cancel")}</button>
               <button
                 type="button"
-                className="button button--primary"
-                // Not disabled on a blank name. A dialog that opens with its
-                // save greyed out and no explanation is a puzzle; pressing it
-                // and being told what is missing is an answer.
-                onClick={saveEditor}
-              >
-                {t("保存", "Save")}
-              </button>
+                className="button button--danger"
+                onClick={() => void overwriteTemplate(pendingOverwrite)}
+              >{t("覆盖", "Overwrite")}</button>
             </>
           )}
-        >
-          <div className="agent-definition-editor">
-            {/* No standing hint under it any more. A role name is free text, so
-              * there is no shape to teach — the only thing left to say about it
-              * is that a particular one was refused, and that is what the line
-              * carries when there is one. */}
-            <Field
-              label={t("角色名称", "Role name")}
-              hint={showNameError ? nameErrorText() ?? undefined : undefined}
-              hintIsError
-            >
-              <input
-                className={`input${showNameError ? " input--error" : ""}`}
-                value={editor.draft.name}
-                aria-label={t("角色名称", "Role name")}
-                aria-invalid={showNameError}
-                onChange={(event) => replaceEditorDraft({ name: event.target.value })}
-                autoComplete="off"
-                autoFocus
-              />
-            </Field>
-
-            {/* Deliberately no character counter and no maximum. This is the one
-              * field on this screen the model actually reads as prose, and a
-              * budget shown next to it would push users to write a label where a
-              * sentence belongs. The host writes it through verbatim. */}
-            <Field
-              label={t("子代理描述", "Subagent description")}
-              hint={t(
-                "告诉主代理这个角色是干什么的。会拼进本对话「子代理」/「工作流」工具的描述里，每个角色一行；留空则这个角色不出现在那份说明里。",
-                "Tells the main agent what this role is for. It is appended to this conversation's Subagent / Workflow tool description, one line per role; leave it empty and this role contributes no line."
-              )}
-            >
-              <textarea
-                className="input"
-                rows={4}
-                value={editor.draft.description}
-                aria-label={t("子代理描述", "Subagent description")}
-                onChange={(event) => replaceEditorDraft({ description: event.target.value })}
-                placeholder={t(
-                  "对抗式审查：负责证伪既有结论、挑错，不产出主线方案。",
-                  "Adversarial review: refutes existing conclusions and finds faults; does not produce the main proposal."
-                )}
-              />
-            </Field>
-
-            {/* Everything below is a row rather than a stacked form field: what
-              * it is called and what it means on the left, the one control that
-              * sets it on the right. It is the shape the conversation's own
-              * settings page uses for the same kind of question, and it is the
-              * reason these four share a wrapper — `.field-row` is the recipe,
-              * and the column keeps one right edge whether the control is a
-              * picker or a way in. */}
-            <div className="agent-definition-editor__rows field-row">
-              <Field
-                label={t("执行模型", "Execution model")}
-                hint={modelSelectionUnavailable
-                  ? selectedModelSelection?.kind === "explicit"
-                    ? t(
-                        "这个模型现在取不到——提供商还没拉取模型、被停用，或者这一行已经不在了。角色暂时不能被调用，但绑定会一直留着，模型回来就自动恢复。",
-                        "This model cannot be resolved right now — the provider has not fetched its models, is disabled, or the row is gone. The role cannot be called for now, but the binding is kept and recovers by itself once the model is back."
-                      )
-                    : t(
-                        "这条绑定是旧版本记下的「已失效」，模型 ID 当时就被丢掉了，找不回来；请选择跟随对话或另一个可用模型。",
-                        "An older build recorded this binding as broken and discarded the model ID at the time, so it cannot be recovered. Choose the conversation's model or another available one."
-                      )
-                  : t(
-                      "只列出已启用提供商中的模型；保存精确 provider/model ID。",
-                      "Only models from enabled providers are listed; exact provider/model IDs are saved."
-                    )}
-              >
-                <select
-                  className={`input${modelSelectionUnavailable ? " input--error" : ""}`}
-                  value={modelSelectionValue}
-                  aria-label={t("执行模型", "Execution model")}
-                  aria-invalid={modelSelectionUnavailable}
-                  onChange={(event) => {
-                    if (event.target.value === "inherit") {
-                      replaceEditorDraft({ modelSelection: { kind: "inherit" } });
-                      return;
-                    }
-                    const option = explicitModelOptions.find((candidate) => (
-                      candidate.key === event.target.value
-                    ));
-                    if (!option) return;
-                    replaceEditorDraft({
-                      modelSelection: {
-                        kind: "explicit",
-                        providerId: option.providerId,
-                        modelId: option.modelId
-                      }
-                    });
-                  }}
-                >
-                  {/* `hidden` keeps this out of the dropdown list: it exists
-                    * only so the closed select does not fall through to the
-                    * first option and display a working model the role does
-                    * not have.
-                    *
-                    * A binding whose pair is still recorded but no longer offered — its model
-                    * has not been fetched, or the provider is disabled — names the model the
-                    * user actually chose. It must never print the raw `providerId`, which is a
-                    * random per-installation UUID and reads as a hash; the provider's own name
-                    * is the part a person can act on, and when its row is gone entirely there
-                    * is no name to give, so the model ID stands alone. */}
-                  {modelSelectionUnavailable && (
-                    <option value="" disabled hidden>
-                      {selectedModelSelection?.kind === "explicit"
-                        ? t(
-                            "{model}（不可用）",
-                            "{model} (unavailable)",
-                            { model: unavailableBindingLabel(selectedModelSelection) }
-                          )
-                        : t("请选择执行模型", "Choose an execution model")}
-                    </option>
-                  )}
-                  <option value="inherit">{t("跟随对话模型", "Follow the conversation's model")}</option>
-                  {explicitModelOptions.map((option) => (
-                    <option key={option.key} value={option.key}>
-                      {option.providerName} · {option.modelId}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-
-              <Field
-                label={t("推理强度", "Reasoning effort")}
-                hint={t(
-                  "留空表示跟随对话的推理强度。",
-                  "Leave unset to follow the conversation's reasoning effort."
-                )}
-              >
-                <select
-                  className="input"
-                  value={editor.draft.effort ?? "inherit"}
-                  aria-label={t("推理强度", "Reasoning effort")}
-                  onChange={(event) => replaceEditorDraft({
-                    effort: event.target.value === "inherit"
-                      ? null
-                      : (event.target.value as ReasoningEffort)
-                  })}
-                >
-                  <option value="inherit">{t("跟随对话", "Follow the conversation")}</option>
-                  {AGENT_EFFORTS.map((effort) => (
-                    <option key={effort} value={effort}>{effort}</option>
-                  ))}
-                </select>
-              </Field>
-
-              {/* The same four web questions the conversation's own settings
-                  page asks, in the same order and through the same components,
-                  with one answer added to each: follow the caller. A role that
-                  answered fewer of them than a conversation does would be a
-                  second, quietly narrower surface for the same subject. */}
-              <SearchProviderField
-                value={editor.draft.searchProvider}
-                onChange={(searchProvider) => replaceEditorDraft({ searchProvider })}
-                webSearchAssets={webSearchAssets}
-                inheritOption
-                hint={t(
-                  "这个角色的「联网搜索」用哪个后端。留在「跟随对话设置」就用调用方对话的选择。选「原生」时用的是这个角色自己的模型——它所在的协议家族如果不支持模型自带搜索，检索会以可修复的错误失败，而不会悄悄换一家。",
-                  "Which backend this role's web search goes through. Leave it on \"follow the conversation\" to use the caller's choice. \"Native\" means this role's OWN model — if its protocol family has no built-in search, the search fails with a fixable error rather than quietly switching backends."
-                )}
-              />
-
-              <FetchProviderField
-                value={editor.draft.fetchProvider}
-                onChange={(fetchProvider) => replaceEditorDraft({ fetchProvider })}
-                webSearchAssets={webSearchAssets}
-                inheritOption
-                hint={t(
-                  "这个角色抓取网页用哪个后端，和上面的搜索后端各答各的。留在「跟随对话设置」就用调用方对话的选择。这里选什么都不能让一个关掉联网的对话联网——联网与否由对话决定，这里只决定由谁去抓。",
-                  "Which backend this role fetches pages with, answered separately from the search backend above. Leave it on \"follow the conversation\" to use the caller's choice. Nothing chosen here can put a conversation that is offline back on the network: whether to reach the web at all is the conversation's decision, and this one is only who does the fetching."
-                )}
-              />
-
-              {/* The role's own result shaping. Unlike the backends above these
-                  do not offer "follow the conversation": 0 already means "no
-                  cap", so there is no value left over to spell inheritance
-                  with, and a role therefore always answers for itself. */}
-              <SearchResultShapingFields
-                maxResults={editor.draft.maxResults}
-                compressionCutoff={editor.draft.compressionCutoff}
-                onChangeMaxResults={(maxResults) => replaceEditorDraft({ maxResults })}
-                onChangeCompressionCutoff={(compressionCutoff) => replaceEditorDraft({
-                  compressionCutoff
-                })}
-              />
-
-              <SearchDomainFilterRow
-                mode={editor.draft.domainFilter}
-                includeDomains={editor.draft.includeDomains}
-                excludeDomains={editor.draft.excludeDomains}
-                inheritOption
-                windowOpen={domainWindowOpen}
-                onOpenWindow={() => setDomainWindowOpen(true)}
-                onCloseWindow={() => setDomainWindowOpen(false)}
-                onChangeMode={(domainFilter) => replaceEditorDraft({ domainFilter })}
-                onChangeRules={(list, rules) => replaceEditorDraft(
-                  list === "include" ? { includeDomains: rules } : { excludeDomains: rules }
-                )}
-                hint={t(
-                  "这个角色怎么按域名筛检索结果。留在「跟随对话设置」就连名单一起用调用方对话的；一旦自己选了模式，用的就只有下面这两份名单，不再叠加对话的。",
-                  "How this role filters results by domain. Left on \"follow the conversation\" it uses the caller's mode AND the caller's lists; naming a mode of its own switches to these two lists alone, which are not layered onto the conversation's."
-                )}
-              />
-
-              {/* Deliberately NOT a `Field`: that renders a `<label>`, which would
-                  make this whole row — the line under the name included — a click
-                  target for the one labelable thing inside it. A select could
-                  absorb that; a button that opens a window cannot. */}
-              <div className="field">
-                <span className="field__label">{t("对话模板", "Conversation template")}</span>
-                {/* A button rather than a picker: the role owns its template, so
-                    there is nothing to choose between — only a body to write. The
-                    window it opens draws the presets' templates alongside, so what
-                    this role opens with can be written next to what it will run
-                    beside. */}
-                <button
-                  type="button"
-                  className="button button--secondary"
-                  onClick={() => setTemplateWindowOpen(true)}
-                >{t("编辑对话模板", "Edit conversation template")}</button>
-                <span className="field__hint">{t(
-                  "这个角色的开局历史。模板里的用户消息若恰好含一个 {input}，主代理给的输入会替换到那里；没有或有两个以上时，输入作为最后一条用户消息追加。",
-                  "This role's opening history. If the template's user messages contain exactly one {input}, the caller's input replaces it; with none or with two or more, the input is appended as a final user message."
-                )}</span>
-              </div>
-            </div>
-
-            <section className="agent-definition-editor__tools">
-              <div className="settings-section__heading settings-section__heading--split">
-                <div><span><strong>{t("启用工具", "Enabled tools")}</strong><small>{editor.draft.tools === null
-                  ? t(
-                      "跟随对话设置：本对话启用哪些，这个角色就有哪些",
-                      "Following the conversation: this role gets whatever the conversation enables"
-                    )
-                  : t(
-                      "{enabled} / {total} 个已选",
-                      "{enabled} / {total} selected",
-                      {
-                        enabled: visibleSelectedCount(editor.draft.tools),
-                        total: selectableToolNames.length
-                      }
-                    )}</small></span></div>
-                {/* The same way out the conversation's own tool picker ends
-                    its heading with. The three bulk buttons that used to sit
-                    here are gone: every group below now carries its own pair,
-                    which says which tools are being moved instead of acting on
-                    the whole catalogue at once. */}
-                <DocsLink page="features" />
-              </div>
-              <ToolSelectionGroups
-                tools={selectableTools as ToolDescriptor[]}
-                // While inheriting, the picker shows the conversation's own set
-                // rather than an empty list: that IS what this role will get,
-                // and drawing it as "nothing selected" would misread as broken.
-                enabledTools={editor.draft.tools ?? inheritedToolNames}
-                onChange={(tools) => replaceEditorDraft({ tools })}
-                expansionKey={editor.originalName ?? "new-role"}
-              />
-            </section>
-
-            {editor.mode === "edit" && editor.originalName !== draftName && (
-              <p className="agent-definition-editor__warning">{t(
-                "重命名会创建新的可信身份，正在运行的旧名称调用不会自动跟随。",
-                "Renaming creates a new trusted identity; a run already using the old name does not follow it."
-              )}</p>
-            )}
-            {editorError && (
-              <p className="agent-definition-editor__error" role="alert">{editorError}</p>
-            )}
-          </div>
-        </Dialog>
-      )}
-
-      {/* Opened over the role editor rather than replacing it: the template is
-          one field of the role being edited, and coming back to the rest of that
-          role is the whole point of it being a window. */}
-      {editor && templateWindowOpen && (
-        <ConversationTemplateWindow
-          ownTemplateId={editor.draft.templateId ?? ""}
-          presets={presets.map((preset) => ({
-            id: preset.id,
-            name: preset.name,
-            templateId: preset.templateId
-          }))}
-          templates={templates}
-          tools={[...tools]}
-          /* The conversation's set, not the role's allowlist: enabling a tool
-             from here flips a switch on the page behind, and that page is the
-             conversation's tool picker. */
-          enabledTools={conversationEnabledTools}
-          imageInputSupported={selectedModelReadsImages}
-          onReadTemplate={onReadTemplate}
-          onSaveOwnTemplate={async (contexts) => {
-            const savedId = await onWriteTemplate(editor.draft.templateId ?? "", contexts);
-            // The role only ever learns its template's id here, so the draft has
-            // to take it before the window can be closed on a first save.
-            if (savedId !== editor.draft.templateId) replaceEditorDraft({ templateId: savedId });
-            return savedId;
-          }}
-          onEnableTools={onEnableTools}
-          onClose={() => setTemplateWindowOpen(false)}
         />
       )}
     </>

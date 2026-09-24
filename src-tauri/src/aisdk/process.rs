@@ -268,14 +268,21 @@ const INHERITED_ENV: &[&str] = &[
     "PATHEXT",
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
-    // Temporary directories used by Node and TLS.
+    // Temporary directories used by Node and TLS. `TEMP`/`TMP` are Windows' names; POSIX's is
+    // `TMPDIR`, which on macOS is a per-user private directory under /var/folders. Without it
+    // `os.tmpdir()` here, and the Claude Code CLI that copies this environment, fall back to the
+    // shared /tmp.
     "TEMP",
     "TMP",
+    "TMPDIR",
     // Equivalent required variables on Unix-like platforms.
     "PATH",
     "HOME",
     "LANG",
     "LC_ALL",
+    // The category that decides character encoding, completing `LANG`/`LC_ALL`: macOS Terminal
+    // commonly exports it alone (`LC_CTYPE=UTF-8`), leaving the other two unset.
+    "LC_CTYPE",
     "TZ",
 ];
 
@@ -875,6 +882,24 @@ mod reasoning_partial_tests {
                 }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod inherited_env_tests {
+    use super::*;
+
+    /// macOS gives each user a private `$TMPDIR`; the sidecar, and the CLI that inherits its
+    /// environment, must keep using it instead of the shared /tmp.
+    #[test]
+    fn the_posix_temp_directory_reaches_the_sidecar() {
+        let Ok(tmpdir) = std::env::var("TMPDIR") else {
+            return;
+        };
+        assert!(
+            inherited_env().contains(&("TMPDIR".to_owned(), tmpdir)),
+            "TMPDIR 必须继承给侧车"
+        );
     }
 }
 

@@ -9,13 +9,25 @@ import type {
 /**
  * Fixed ID for the renderer-owned draft conversation. It is never persisted or
  * sent to the host; a fixed value makes draft detection a string comparison.
+ * There is one draft for the whole app, not one per project: which project it
+ * belongs to is one of the things it leaves open.
  */
 export const DRAFT_CONVERSATION_ID = "__draft__";
 
 /** Renderer-owned draft state. See `draftConversation` in App. */
 export interface DraftConversationState {
-  /** Null until a workspace is selected; sending uses the temporary workspace. */
+  /** The project it would materialize into, freely changed until then. Null
+   * materializes into the temporary workspace. */
   workspaceId: string | null;
+  /**
+   * The conversation id the draft will materialize as, minted up front.
+   *
+   * What the draft opens at the host before then — its terminals and its preview page — is
+   * owned by this id from the start, so becoming a real conversation hands them over without
+   * moving anything. Aiming the draft at another project ends all of that and mints a new one:
+   * a shell opened in one project is never handed to a conversation in another.
+   */
+  materializesAs: string;
   settings: ConversationSettings;
   createdAt: string;
   /**
@@ -54,9 +66,10 @@ export function isDraftConversationId(conversationId: string | null | undefined)
 }
 
 /**
- * Whether a persisted conversation is still an unsent draft. Each workspace keeps at most one:
- * opening a new task there returns to it rather than stacking another, and the sidebar withholds
- * it until it holds something.
+ * Whether a persisted conversation holds nothing yet. New tasks start as the renderer draft, so
+ * this is the rare real conversation that is still empty — one that materialized for a tool call
+ * the host then refused, or one left from when every project kept an empty slot of its own. The
+ * sidebar withholds it until it holds something.
  *
  * Nesting counts as content because hiding a parent would orphan its children in the tree.
  */
@@ -66,17 +79,7 @@ export function isUnsentConversation(conversation: Conversation, hasChildren = f
     && conversation.queuedMessages.length === 0;
 }
 
-/** The workspace's unsent draft slot, if it currently holds one. */
-export function draftSlotOf(conversations: Conversation[]): Conversation | null {
-  const parentIds = new Set(
-    conversations.map((conversation) => conversation.parentConversationId).filter(Boolean)
-  );
-  return conversations.find(
-    (conversation) => isUnsentConversation(conversation, parentIds.has(conversation.id))
-  ) ?? null;
-}
-
-/** The workspace's conversations minus its unsent draft slot. */
+/** The workspace's conversations minus the ones that are still empty. */
 export function visibleConversations(conversations: Conversation[]): Conversation[] {
   const parentIds = new Set(
     conversations.map((conversation) => conversation.parentConversationId).filter(Boolean)
@@ -90,7 +93,7 @@ export function visibleConversations(conversations: Conversation[]): Conversatio
  * Project a draft as a `Conversation` so the normal timeline, composer,
  * workspace, model, reasoning, and security controls render unchanged. A draft
  * can already hold hand-written content; it materializes on the first request,
- * not on the first message.
+ * or on the first tool the user runs or records in it, not on the first message.
  */
 export function draftAsConversation(
   draft: DraftConversationState,

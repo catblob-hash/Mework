@@ -2,8 +2,10 @@ import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import net from "node:net";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { dataRootsFor } from "./reset-app-data-plan.mjs";
 import {
   cleanupMemoryE2eWorkspaceFixture,
   createMemoryE2eWorkspaceFixture
@@ -151,10 +153,7 @@ function cleanupOwnedDataIdentifier(dataIdentifier) {
   ) {
     throw new Error("拒绝清理无法验证的记忆 E2E 应用数据标识");
   }
-  for (const [label, directory] of [
-    ["APPDATA", process.env.APPDATA],
-    ["LOCALAPPDATA", process.env.LOCALAPPDATA]
-  ]) {
+  for (const { label, directory } of dataRootsFor(process.platform, process.env, homedir())) {
     if (!directory) continue;
     const parent = path.resolve(directory);
     const target = path.resolve(parent, dataIdentifier);
