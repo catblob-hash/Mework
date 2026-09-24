@@ -19,7 +19,7 @@ const REASONING_TEXT_MARKER = "reasoning_text";
  * terminates the stream. All other frames pass through unchanged so the SDK can
  * handle or ignore them.
  */
-export function translateReasoningTextSseLine(line: string): string {
+function translateReasoningTextSseLine(line: string): string {
   if (!line.startsWith("data:") || !line.includes(REASONING_TEXT_MARKER)) return line;
   const payload = line.slice("data:".length).trim();
   if (payload.length === 0 || payload === "[DONE]") return line;

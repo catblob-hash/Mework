@@ -114,12 +114,14 @@ pub fn fork_contexts(
             ContextItem::User {
                 content,
                 images,
+                files,
                 created_at,
                 ..
             } => ContextItem::User {
                 id,
                 content: content.clone(),
                 images: images.clone(),
+                files: files.clone(),
                 created_at: created_at.clone(),
             },
             ContextItem::Assistant {

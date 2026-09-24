@@ -5,7 +5,6 @@ import browserSource from "../../src-tauri/src/browser.rs?raw";
 import builtinSchemasSource from "../../src-tauri/src/builtin_schemas.rs?raw";
 import previewSource from "../../src-tauri/src/preview.rs?raw";
 import previewServersSource from "../../src-tauri/src/preview_servers.rs?raw";
-import { PREVIEW_VIEWPORT_PRESETS } from "../components/PreviewPane";
 import * as backend from "./backend";
 import {
   listPreviewConfigurations,
@@ -17,7 +16,6 @@ import {
   previewLogSeverity,
   previewServerAddress,
   readPreviewServerLogs,
-  setPreviewAutoVerify,
   startPreviewServer,
   stopPreviewServer
 } from "./preview";
@@ -40,7 +38,6 @@ describe("preview commands", () => {
     await stopPreviewServer("srv-1");
     await readPreviewServerLogs("srv-1", { errorsOnly: true, search: "vite", lines: 200 });
     await readPreviewServerLogs("srv-1");
-    await setPreviewAutoVerify(target, false);
 
     expect(invoke.mock.calls).toEqual([
       ["preview_list_configurations", { target }],
@@ -51,8 +48,7 @@ describe("preview commands", () => {
       ["preview_start_server", { target, name: null }],
       ["preview_stop_server", { serverId: "srv-1" }],
       ["preview_server_logs", { serverId: "srv-1", errorsOnly: true, search: "vite", lines: 200 }],
-      ["preview_server_logs", { serverId: "srv-1", errorsOnly: null, search: null, lines: null }],
-      ["preview_set_auto_verify", { target, enabled: false }]
+      ["preview_server_logs", { serverId: "srv-1", errorsOnly: null, search: null, lines: null }]
     ]);
   });
 
@@ -159,20 +155,6 @@ function hostEmptyLogReplies(): string[] {
   ];
 }
 
-/** `browser::preview_viewport_preset`'s sized arms, keyed by preset name. */
-function hostViewportPresets(): Map<string, [number, number]> {
-  const start = browserSource.indexOf("fn preview_viewport_preset(");
-  if (start < 0) throw new Error("browser.rs: `preview_viewport_preset` is gone");
-  const body = balancedBlock(browserSource, browserSource.indexOf("{", start));
-  const presets = new Map<string, [number, number]>();
-  for (const [, name, width, height] of body.matchAll(
-    /"([a-z]+)"\s*=>\s*Some\(\(\s*([0-9_]+)\s*,\s*([0-9_]+)\s*\)\)/gu
-  )) {
-    presets.set(name, [Number(width.replaceAll("_", "")), Number(height.replaceAll("_", ""))]);
-  }
-  return presets;
-}
-
 // Nothing else reconciles these two sides. The drawer decides it has no lines to show by
 // comparing the host's reply against text copied out of Rust by hand, and the limits below are
 // spelled out once per language — so rewording or renumbering one side alone compiles, passes
@@ -216,16 +198,5 @@ describe("preview constants pinned to the Rust that produces them", () => {
     expect(rustU32(builtinSchemasSource, "builtin_schemas.rs", "PREVIEW_MAX_VIEWPORT")).toBe(
       rustU32(browserSource, "browser.rs", "PREVIEW_VIEWPORT_MAX")
     );
-  });
-
-  it("offers exactly the sized viewport presets the host resizes to", () => {
-    // "responsive" is the pane's own reset row and has no size, so the host has no arm for it.
-    const paneSizes = new Map<string, [number, number]>();
-    for (const entry of PREVIEW_VIEWPORT_PRESETS) {
-      if (entry.size) paneSizes.set(entry.preset, [entry.size.width, entry.size.height]);
-    }
-
-    expect(paneSizes.size).toBeGreaterThan(0);
-    expect(paneSizes).toEqual(hostViewportPresets());
   });
 });

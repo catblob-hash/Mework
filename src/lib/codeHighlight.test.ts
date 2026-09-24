@@ -19,7 +19,23 @@ describe("highlightCodeLine", () => {
   });
 
   it("leaves a line with nothing to mark as a single plain token", () => {
-    expect(marked("typescript", "  foo(bar);")).toEqual([["plain:  foo(bar);"]]);
+    expect(marked("typescript", "  a + b;")).toEqual([["plain:  a + b;"]]);
+  });
+
+  it("marks a word directly before `(` as a call, and a capitalised one as a type", () => {
+    expect(marked("typescript", "  foo(bar); new Map<Key>()")).toEqual([[
+      "plain:  ",
+      "function:foo",
+      "plain:(bar); ",
+      "keyword:new",
+      "plain: ",
+      "type:Map",
+      "plain:<",
+      "type:Key",
+      "plain:>()"
+    ]]);
+    // A space between the name and the bracket is not a call.
+    expect(marked("typescript", "if (x) y")).toEqual([["keyword:if", "plain: (x) y"]]);
   });
 
   /** A block comment is the one thing on a line that outlives the line. */
@@ -69,20 +85,57 @@ describe("highlightCodeLine", () => {
 
   it("keeps a docstring open to its closing triple quote", () => {
     expect(marked("python", "def f():\n    \"\"\"one\n    two\"\"\"\n    return 1")).toEqual([
-      ["keyword:def", "plain: f():"],
+      ["keyword:def", "plain: ", "function:f", "plain:():"],
       ["plain:    ", "string:\"\"\"one"],
       ["string:    two\"\"\""],
       ["plain:    ", "keyword:return", "plain: ", "number:1"]
     ]);
   });
 
-  it("marks tag names in markup rather than reading `<` as an operator", () => {
+  it("marks tags and their attributes in markup rather than reading `<` as an operator", () => {
     expect(marked("xml", "<div class=\"a\">text</div>")).toEqual([[
-      "keyword:<div",
-      "plain: class=",
+      "tag:<div",
+      "plain: ",
+      "attribute:class",
+      "plain:=",
       "string:\"a\"",
-      "plain:>text",
-      "keyword:</div",
+      "tag:>",
+      "plain:text",
+      "tag:</div",
+      "tag:>"
+    ]]);
+  });
+
+  /** A tag whose attributes run onto the next line keeps reading them as attributes. */
+  it("carries an open tag across lines", () => {
+    expect(marked("xml", "<img\n  src=\"a.png\" />")).toEqual([
+      ["tag:<img"],
+      ["plain:  ", "attribute:src", "plain:=", "string:\"a.png\"", "plain: ", "tag:/>"]
+    ]);
+  });
+
+  it("reads JSX only where an expression may start, and not a comparison or a type argument", () => {
+    expect(marked("tsx", "return <Button onClick={() => go(1)} disabled>go</Button>;")).toEqual([[
+      "keyword:return",
+      "plain: ",
+      "tag:<Button",
+      "plain: ",
+      "attribute:onClick",
+      "plain:={() => ",
+      "function:go",
+      "plain:(",
+      "number:1",
+      "plain:)} ",
+      "attribute:disabled",
+      "tag:>",
+      "plain:go",
+      "tag:</Button",
+      "tag:>",
+      "plain:;"
+    ]]);
+    expect(marked("tsx", "a < b && list<Item>")).toEqual([[
+      "plain:a < b && list<",
+      "type:Item",
       "plain:>"
     ]]);
   });
@@ -112,6 +165,7 @@ describe("highlightCodeLine", () => {
       "number:40",
       "plain:px) { color: red; }"
     ]]);
+    expect(marked("css", "  color: #fff;")).toEqual([["plain:  ", "property:color", "plain:: ", "number:#fff", "plain:;"]]);
     expect(marked("typescript", "count-1")).toEqual([["plain:count-", "number:1"]]);
   });
 
@@ -129,5 +183,87 @@ describe("highlightCodeLine", () => {
     expect(highlightCodeLine(grammar, "", null)).toEqual({ tokens: [], block: null });
     const opened = highlightCodeLine(grammar, "/* open", null);
     expect(highlightCodeLine(grammar, "", opened.block).block).toEqual(opened.block);
+  });
+
+  it("tells a key from its value in configuration", () => {
+    expect(marked("json", "{ \"name\": \"mework\", \"n\": 1 }")).toEqual([[
+      "plain:{ ",
+      "property:\"name\"",
+      "plain:: ",
+      "string:\"mework\"",
+      "plain:, ",
+      "property:\"n\"",
+      "plain:: ",
+      "number:1",
+      "plain: }"
+    ]]);
+    expect(marked("yaml", "  - name: web # service")).toEqual([[
+      "plain:  - ",
+      "property:name",
+      "plain:: web ",
+      "comment:# service"
+    ]]);
+    expect(marked("toml", "[[bin]]\nname = \"x\"")).toEqual([
+      ["type:[[bin]]"],
+      ["property:name", "plain: = ", "string:\"x\""]
+    ]);
+  });
+
+  it("marks decorators, directives, attributes and macros as meta", () => {
+    expect(marked("python", "@dataclass(frozen=True)")).toEqual([[
+      "meta:@dataclass",
+      "plain:(frozen=",
+      "keyword:True",
+      "plain:)"
+    ]]);
+    expect(marked("c", "#include <stdio.h>")).toEqual([["meta:#include", "plain: ", "string:<stdio.h>"]]);
+    expect(marked("rust", "#[derive(Debug)]\nprintln!(\"{}\", x);")).toEqual([
+      ["meta:#[derive(Debug)]"],
+      ["function:println!", "plain:(", "string:\"{}\"", "plain:, x);"]
+    ]);
+  });
+
+  it("marks variables where a sigil introduces them", () => {
+    expect(marked("shell", "echo \"$HOME\" ${PATH} $1")).toEqual([[
+      "keyword:echo",
+      "plain: ",
+      "string:\"$HOME\"",
+      "plain: ",
+      "variable:${PATH}",
+      "plain: ",
+      "variable:$1"
+    ]]);
+    expect(marked("batch", "REM note\necho %PATH%")).toEqual([
+      ["comment:REM note"],
+      ["keyword:echo", "plain: ", "variable:%PATH%"]
+    ]);
+  });
+
+  it("colours a diff by its lines", () => {
+    expect(marked("diff", "--- a/x\n+++ b/x\n@@ -1 +1 @@ fn\n-old\n+new\n same")).toEqual([
+      ["meta:--- a/x"],
+      ["meta:+++ b/x"],
+      ["meta:@@ -1 +1 @@", "plain: fn"],
+      ["deleted:-old"],
+      ["inserted:+new"],
+      ["plain: same"]
+    ]);
+  });
+
+  it("marks a Markdown source's headings, fences and list markers", () => {
+    expect(marked("markdown", "# Title\n- `a`\n```ts\nconst a\n```")).toEqual([
+      ["keyword:# Title"],
+      ["meta:-", "plain: ", "string:`a`"],
+      ["string:```ts"],
+      ["string:const a"],
+      ["string:```"]
+    ]);
+  });
+
+  it("says how a script runs on its first line, whatever the language", () => {
+    expect(marked("javascript", "#!/usr/bin/env node\nlet a")).toEqual([
+      ["meta:#!/usr/bin/env node"],
+      ["keyword:let", "plain: a"]
+    ]);
   });
 });

@@ -3,7 +3,6 @@ import { createTestDocument as createSeedDocument } from "../test/fixtures";
 import type { ContextItem, Conversation } from "../types";
 import {
   contextBranchNavigations,
-  forkConversationAtUser,
   switchConversationBranch
 } from "./conversationBranches";
 
@@ -24,30 +23,71 @@ function ids(contexts: ContextItem[]): string[] {
   return contexts.map((context) => context.id);
 }
 
-describe("conversation branches", () => {
-  it("forks at an existing user without copying the common prefix", () => {
-    const source = conversation([
-      text("sys", "system"),
-      text("u1", "user"),
-      text("a1", "assistant"),
-      text("u2", "user"),
-      text("a2", "assistant")
-    ]);
-    const branchIds = ["old", "new"];
-    const result = forkConversationAtUser(source, "u1", () => branchIds.shift()!, "2026-07-20T01:00:00Z")!;
+/** Builds branch fixtures: creates a new active branch while retaining the previous suffix verbatim. */
+function forkConversationAtUser(
+  conversation: Conversation,
+  contextId: string,
+  createBranchId: () => string,
+  now: string
+): { conversation: Conversation; requestContexts: ContextItem[]; createdBranch: boolean } | null {
+  const index = conversation.contexts.findIndex((context) => context.id === contextId && context.kind === "user");
+  if (index < 0) return null;
 
-    expect(ids(result.requestContexts)).toEqual(["sys", "u1"]);
-    expect(ids(result.conversation.contexts)).toEqual(["sys", "u1"]);
-    expect(result.conversation.contexts.filter((item) => item.id === "u1")).toHaveLength(1);
-    expect(result.conversation.branches).toEqual([
-      expect.objectContaining({ id: "old", forkContextId: "u1", active: false }),
-      expect.objectContaining({ id: "new", forkContextId: "u1", active: true, contexts: [] })
-    ]);
-    expect(ids(result.conversation.branches[0].contexts)).toEqual(["a1", "u2", "a2"]);
-    expect(source.branches).toEqual([]);
-    expect(ids(source.contexts)).toEqual(["sys", "u1", "a1", "u2", "a2"]);
+  const requestContexts = conversation.contexts.slice(0, index + 1);
+  const suffix = conversation.contexts.slice(index + 1);
+  const siblings = conversation.branches.filter((branch) => branch.forkContextId === contextId);
+  const active = siblings.find((branch) => branch.active);
+
+  // A last, unanswered user message can be sent directly. Once a fork point
+  // exists, however, an empty suffix is still a meaningful branch (for
+  // example, a failed run) and must be retained before another run.
+  if (!suffix.length && !siblings.length) {
+    return { conversation, requestContexts, createdBranch: false };
+  }
+  if (siblings.length && !active) return null;
+
+  const archivedId = active?.id ?? createBranchId();
+  const nextActiveId = createBranchId();
+  if (archivedId === nextActiveId) return null;
+
+  const branches = conversation.branches.map((branch) => branch.id === active?.id ? {
+    ...branch,
+    active: false,
+    contexts: suffix,
+    updatedAt: now
+  } : branch);
+  if (!active) {
+    branches.push({
+      id: archivedId,
+      forkContextId: contextId,
+      active: false,
+      contexts: suffix,
+      createdAt: conversation.createdAt,
+      updatedAt: now
+    });
+  }
+  branches.push({
+    id: nextActiveId,
+    forkContextId: contextId,
+    active: true,
+    contexts: [],
+    createdAt: now,
+    updatedAt: now
   });
 
+  return {
+    conversation: {
+      ...conversation,
+      contexts: requestContexts,
+      branches,
+      updatedAt: now
+    },
+    requestContexts,
+    createdBranch: true
+  };
+}
+
+describe("conversation branches", () => {
   it("switches suffixes reversibly while branch positions stay stable", () => {
     const first = forkConversationAtUser(
       conversation([text("u1", "user"), text("old-answer", "assistant")]),
@@ -97,13 +137,6 @@ describe("conversation branches", () => {
     const child = switchConversationBranch(root, "u1", "child", "2026-07-20T04:00:00Z")!;
     expect(ids(child.contexts)).toContain("u3");
     expect(contextBranchNavigations(child).u3).toBeDefined();
-  });
-
-  it("sends an unanswered last user directly", () => {
-    const last = conversation([text("u1", "user")]);
-    const direct = forkConversationAtUser(last, "u1", () => "unused", "2026-07-20T01:00:00Z")!;
-    expect(direct.createdBranch).toBe(false);
-    expect(direct.conversation).toBe(last);
   });
 
 });

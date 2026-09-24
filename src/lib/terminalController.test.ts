@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createTerminalController,
-  terminalSessionIsEmpty,
   terminalSessionKey
 } from "./terminalController";
 import type { TerminalSessionState } from "./terminal";
@@ -30,15 +29,6 @@ function session(overrides: Partial<TerminalSessionState> = {}): TerminalSession
 
 beforeEach(() => {
   terminalMocks.closeTerminal.mockReset().mockResolvedValue(undefined);
-});
-
-describe("terminalSessionIsEmpty", () => {
-  it("treats missing, idle sessions as empty and busy or used ones as not", () => {
-    expect(terminalSessionIsEmpty(undefined)).toBe(true);
-    expect(terminalSessionIsEmpty(session())).toBe(true);
-    expect(terminalSessionIsEmpty(session({ busy: true }))).toBe(false);
-    expect(terminalSessionIsEmpty(session({ hasHistory: true }))).toBe(false);
-  });
 });
 
 describe("createTerminalController", () => {
@@ -137,29 +127,25 @@ describe("createTerminalController", () => {
     expect(controller.current()[KEY]).toMatchObject({ busy: true, hasHistory: true });
   });
 
-  it("removes the session and runs onClosed after a successful close", async () => {
+  it("removes the session after a successful close", async () => {
     const controller = createTerminalController();
     controller.register(session());
     controller.register(session({ conversationId: "conversation-2" }));
-    const onClosed = vi.fn();
-    await controller.requestClose("conversation-1", "terminal-1", { onClosed });
+    await controller.requestClose("conversation-1", "terminal-1");
     expect(terminalMocks.closeTerminal).toHaveBeenCalledWith("conversation-1", "terminal-1");
     expect(controller.current()[KEY]).toBeUndefined();
     expect(controller.current()[terminalSessionKey("conversation-2", "terminal-1")]).toBeDefined();
-    expect(onClosed).toHaveBeenCalledTimes(1);
   });
 
-  it("shares one in-flight close task and only honors the first caller's handlers", async () => {
+  it("shares one in-flight close task", async () => {
     const controller = createTerminalController();
     controller.register(session());
     let release!: () => void;
     terminalMocks.closeTerminal.mockImplementationOnce(() => new Promise<void>((resolve) => {
       release = resolve;
     }));
-    const firstClosed = vi.fn();
-    const secondClosed = vi.fn();
-    const first = controller.requestClose("conversation-1", "terminal-1", { onClosed: firstClosed });
-    const second = controller.requestClose("conversation-1", "terminal-1", { onClosed: secondClosed });
+    const first = controller.requestClose("conversation-1", "terminal-1");
+    const second = controller.requestClose("conversation-1", "terminal-1");
     expect(second).toBe(first);
     // Another conversation's terminal of the same id is a different close task.
     const other = controller.requestClose("conversation-2", "terminal-1");
@@ -171,19 +157,15 @@ describe("createTerminalController", () => {
     expect(terminalMocks.closeTerminal).toHaveBeenCalledTimes(2);
     expect(terminalMocks.closeTerminal).toHaveBeenNthCalledWith(1, "conversation-1", "terminal-1");
     expect(terminalMocks.closeTerminal).toHaveBeenNthCalledWith(2, "conversation-2", "terminal-1");
-    expect(firstClosed).toHaveBeenCalledTimes(1);
-    expect(secondClosed).not.toHaveBeenCalled();
   });
 
-  it("runs onError, keeps the session, rejects, and allows a retry after failure", async () => {
+  it("keeps the session, rejects, and allows a retry after failure", async () => {
     const controller = createTerminalController();
     controller.register(session());
     terminalMocks.closeTerminal.mockRejectedValueOnce(new Error("close failed"));
-    const onError = vi.fn();
     await expect(
-      controller.requestClose("conversation-1", "terminal-1", { onError })
+      controller.requestClose("conversation-1", "terminal-1")
     ).rejects.toThrow("close failed");
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "close failed" }));
     expect(controller.current()[KEY]).toBeDefined();
 
     await controller.requestClose("conversation-1", "terminal-1");

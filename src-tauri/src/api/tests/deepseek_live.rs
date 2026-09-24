@@ -85,6 +85,7 @@ fn live_request(
                   然后在最终回复里只写一行：MEWORK_E2E_OK <你看到的条目数>"
             .into(),
         images: Vec::new(),
+        files: Vec::new(),
         created_at: "2026-08-15T00:00:00Z".into(),
     }];
     request

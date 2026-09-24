@@ -32,7 +32,7 @@ export const INTERRUPTED_EXIT_CODE = 130;
 export const ABNORMAL_EXIT_CODE = 1;
 
 /** How long to wait for the child to disappear after the tree has been killed. */
-export const CLEANUP_TIMEOUT_MS = 15_000;
+const CLEANUP_TIMEOUT_MS = 15_000;
 
 function describe(child) {
   return child?.spawnfile ?? "cargo";

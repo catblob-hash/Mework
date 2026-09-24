@@ -46,24 +46,6 @@ export function redoHistory(history: SketchHistory): SketchHistory {
   return { past: [...history.past, history.present], present: next, future: rest };
 }
 
-/** Rewrites every entry through `map`, keeping shared strokes shared so identity survives. */
-export function mapHistory(history: SketchHistory, map: (stroke: SketchStroke) => SketchStroke): SketchHistory {
-  const seen = new Map<SketchStroke, SketchStroke>();
-  const once = (stroke: SketchStroke): SketchStroke => {
-    let mapped = seen.get(stroke);
-    if (mapped === undefined) {
-      mapped = map(stroke);
-      seen.set(stroke, mapped);
-    }
-    return mapped;
-  };
-  return {
-    past: history.past.map((entry) => entry.map(once)),
-    present: history.present.map(once),
-    future: history.future.map((entry) => entry.map(once))
-  };
-}
-
 export function historyState(history: SketchHistory): SketchHistoryState {
   return {
     count: history.present.length,

@@ -36,7 +36,6 @@ use std::{
 
 use jsonc_parser::{
     ast::{Object, ObjectPropName, Value as JsonValue},
-    common::Ranged,
     ParseOptions,
 };
 use regex::Regex;
@@ -406,46 +405,6 @@ impl LaunchConfigDiscovery {
             url: url.map(|url| url.as_str().to_owned()),
         }))
     }
-}
-
-/// Rewrites `autoVerify` in place, leaving every comment and every other byte of
-/// the file exactly where it was.
-///
-/// The source edits the text with `jsonc-parser`'s `modify` + `applyEdits`, which
-/// this crate has no equivalent of, so the property's own byte range is spliced
-/// instead. `None` when the text is not a JSON object: there is nothing to edit,
-/// and a preference toggle must never be the thing that replaces a file somebody
-/// is halfway through writing.
-pub fn set_auto_verify_source(source: &str, enabled: bool) -> Option<String> {
-    let parsed =
-        jsonc_parser::parse_to_ast(source, &Default::default(), &launch_json_parse_options())
-            .ok()?;
-    let JsonValue::Object(root) = parsed.value? else {
-        return None;
-    };
-    let literal = if enabled { "true" } else { "false" };
-    let mut updated = source.to_owned();
-    match root
-        .properties
-        .iter()
-        .find(|property| property_name(&property.name) == "autoVerify")
-    {
-        Some(property) => {
-            let range = property.value.range();
-            updated.replace_range(range.start..range.end, literal);
-        }
-        // Written first rather than last so the insertion never has to guess where
-        // a trailing comment ends.
-        None => {
-            let insertion = if root.properties.is_empty() {
-                format!("\n  \"autoVerify\": {literal}\n")
-            } else {
-                format!("\n  \"autoVerify\": {literal},")
-            };
-            updated.insert_str(root.range.start + 1, &insertion);
-        }
-    }
-    Some(updated)
 }
 
 /// `runtimeExecutable` wins; `program` alone runs under `node`. An empty string
@@ -2110,50 +2069,5 @@ mod tests {
             substitute_variables("nothing to do", Path::new("/project")),
             "nothing to do"
         );
-    }
-
-    #[test]
-    fn set_auto_verify_source_flips_an_existing_flag_and_keeps_the_comments() {
-        let source =
-            "{\n  // the dev server\n  \"autoVerify\": true,\n  \"configurations\": []\n}\n";
-
-        let updated = set_auto_verify_source(source, false).unwrap();
-
-        assert_eq!(
-            updated,
-            "{\n  // the dev server\n  \"autoVerify\": false,\n  \"configurations\": []\n}\n"
-        );
-        assert_eq!(set_auto_verify_source(&updated, true).unwrap(), source);
-    }
-
-    #[test]
-    fn set_auto_verify_source_adds_a_missing_flag_without_disturbing_the_rest() {
-        let source = "{\n  \"version\": \"0.0.1\",\n  \"configurations\": []\n}\n";
-
-        let updated = set_auto_verify_source(source, false).unwrap();
-
-        assert_eq!(
-            updated,
-            "{\n  \"autoVerify\": false,\n  \"version\": \"0.0.1\",\n  \"configurations\": []\n}\n"
-        );
-        assert!(matches!(
-            LaunchConfigDiscovery::new("/project").parse_source(&updated, None),
-            LaunchDiscovery::NoValidConfigs { .. }
-        ));
-    }
-
-    #[test]
-    fn set_auto_verify_source_writes_an_empty_object_without_a_trailing_comma() {
-        let updated = set_auto_verify_source("{}", true).unwrap();
-
-        assert_eq!(updated, "{\n  \"autoVerify\": true\n}");
-        assert!(!updated.contains(",}"));
-    }
-
-    #[test]
-    fn set_auto_verify_source_refuses_anything_that_is_not_an_object() {
-        assert_eq!(set_auto_verify_source("", true), None);
-        assert_eq!(set_auto_verify_source("[]", true), None);
-        assert_eq!(set_auto_verify_source("{\"a\":", true), None);
     }
 }

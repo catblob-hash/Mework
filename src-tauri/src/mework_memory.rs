@@ -550,31 +550,6 @@ pub fn edit_document(
     })
 }
 
-/// Deletes one topic document and removes its index entry.
-///
-/// The host settings UI may remove documents; model tools never expose this
-/// operation. The index is rewritten **before** the document is removed:
-/// a failure between the two steps then leaves an unlisted body file —
-/// invisible to the next run, recoverable by hand — rather than a dangling
-/// index entry that describes a document which no longer exists.
-pub fn delete_document(root: &MemoryRoot, raw_name: &str) -> Result<(), String> {
-    let name = normalize_document_name(raw_name)?;
-    // Deleting the body and rewriting the index is a cross-process critical section.
-    let _mutation_lock = acquire_mutation_lock(root)?;
-    let path = root.document_path(&name);
-    if fs::symlink_metadata(&path).is_err() {
-        return Err(format!(
-            "No memory document named {name} exists in {}",
-            root.tier().label()
-        ));
-    }
-    let mut entries = read_index(root);
-    entries.retain(|entry| entry.name != name);
-    write_index(root, &entries)?;
-    fs::remove_file(&path).map_err(|_| format!("Could not delete memory document {name}"))?;
-    Ok(())
-}
-
 fn validate_content(content: &str) -> Result<(), String> {
     if content.len() > MAX_DOCUMENT_BYTES {
         return Err(format!(
@@ -668,8 +643,8 @@ fn push_tier(out: &mut String, tier: MemoryTier, context: &TierContext, profile:
 ///
 /// Two verbs per tier, plus read. There is deliberately no list tool (the
 /// index is already in context), no search tool (the index is small enough to
-/// scan), and no delete tool (removing a memory is a user action in the
-/// settings UI, not something a model should do mid-turn).
+/// scan), and no delete tool (removing a memory is the user's call, made on
+/// the file itself, not something a model should do mid-turn).
 ///
 /// This is the *broad* list: stripping, redaction and UI exclusion all address
 /// memory as one family regardless of which tier a conversation turned on.
@@ -737,8 +712,7 @@ pub struct MemoryTierAccess {
 }
 
 impl MemoryTierAccess {
-    /// Both tiers open. The settings-page IPCs use this: they manage the
-    /// directories themselves and are not bound to any conversation's switches.
+    /// Both tiers open.
     pub const ALL: Self = Self {
         global: true,
         project: true,
@@ -769,12 +743,6 @@ pub struct MemoryRoots {
 }
 
 impl MemoryRoots {
-    /// Resolves both tiers with neither one gated. For the settings-page
-    /// directory management, which is not part of any conversation.
-    pub fn resolve(home: Option<&Path>, workspace: Option<&Path>) -> Self {
-        Self::resolve_enabled(home, workspace, MemoryTierAccess::ALL)
-    }
-
     /// Resolves both tiers from the trusted home and workspace directories,
     /// recording which of them the conversation actually enabled.
     pub fn resolve_enabled(
@@ -1116,17 +1084,6 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_document_removes_its_index_entry() {
-        let tree = TempTree::new("delete");
-        let root = tree.global();
-        create_document(&root, "notes", "body", "description").unwrap();
-        delete_document(&root, "notes").unwrap();
-        assert!(!root.memory_dir().join("notes.md").exists());
-        assert!(read_index(&root).is_empty());
-        assert!(delete_document(&root, "notes").is_err());
-    }
-
-    #[test]
     fn reading_a_missing_document_names_the_tier_without_leaking_a_path() {
         let tree = TempTree::new("read-missing");
         let root = tree.global();
@@ -1463,9 +1420,10 @@ mod tests {
     #[test]
     fn the_dispatcher_round_trips_create_read_and_edit_per_tier() {
         let tree = TempTree::new("dispatch");
-        let roots = MemoryRoots::resolve(
+        let roots = MemoryRoots::resolve_enabled(
             Some(&tree.root.join("home")),
             Some(&tree.root.join("workspace")),
+            MemoryTierAccess::ALL,
         );
         let profile = PromptProfile::builtin_english();
 
@@ -1540,7 +1498,11 @@ mod tests {
         let tree = TempTree::new("unavailable");
         let profile = PromptProfile::builtin_english();
         // No workspace: project memory is unavailable for the whole run.
-        let roots = MemoryRoots::resolve(Some(&tree.root.join("home")), None);
+        let roots = MemoryRoots::resolve_enabled(
+            Some(&tree.root.join("home")),
+            None,
+            MemoryTierAccess::ALL,
+        );
 
         let error = execute_tool(
             &roots,
@@ -1569,7 +1531,11 @@ mod tests {
         assert!(roots.render_context(&profile).is_none());
 
         // And the symmetric case: no home means no global tier.
-        let project_only = MemoryRoots::resolve(None, Some(&tree.root.join("workspace")));
+        let project_only = MemoryRoots::resolve_enabled(
+            None,
+            Some(&tree.root.join("workspace")),
+            MemoryTierAccess::ALL,
+        );
         let error = execute_tool(
             &project_only,
             "read_global_memory",
@@ -1583,7 +1549,11 @@ mod tests {
     #[test]
     fn the_dispatcher_rejects_missing_and_mistyped_arguments() {
         let tree = TempTree::new("arguments");
-        let roots = MemoryRoots::resolve(Some(&tree.root.join("home")), None);
+        let roots = MemoryRoots::resolve_enabled(
+            Some(&tree.root.join("home")),
+            None,
+            MemoryTierAccess::ALL,
+        );
         let profile = PromptProfile::builtin_english();
 
         assert!(execute_tool(&roots, "read_global_memory", &input(&[]), &profile).is_err());
@@ -1607,7 +1577,11 @@ mod tests {
     #[test]
     fn no_tool_can_address_the_host_owned_index() {
         let tree = TempTree::new("index-guard");
-        let roots = MemoryRoots::resolve(Some(&tree.root.join("home")), None);
+        let roots = MemoryRoots::resolve_enabled(
+            Some(&tree.root.join("home")),
+            None,
+            MemoryTierAccess::ALL,
+        );
         let profile = PromptProfile::builtin_english();
         execute_tool(
             &roots,

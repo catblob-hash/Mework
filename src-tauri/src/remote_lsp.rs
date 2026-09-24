@@ -124,7 +124,6 @@ pub(crate) fn run_with(
     let host = ServerHost::Remote {
         runner: target.workspace.runner.clone(),
         machine_key: target.machine_key.clone(),
-        machine_label: target.workspace.machine_label.clone(),
     };
     let files = RemoteFiles {
         shell,
@@ -739,7 +738,7 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("needs approval"), "{error}");
         assert!(error.contains(".mework/lsp.json"), "{error}");
-        assert!(registry.snapshot().is_empty(), "nothing was started");
+        assert!(!registry.has_running_servers(), "nothing was started");
         assert_eq!(
             declares_with(runner, &root, &|_| Some(0)),
             Some(true),

@@ -14,8 +14,8 @@ import {
 
 export const MAX_AGENT_TYPE_CHARS = 64;
 /** Mirrors the Rust `MAX_AGENT_DEFINITION_TOOL_NAMES` / `_TOOL_NAME_CHARS`. */
-export const MAX_AGENT_DEFINITION_TOOL_NAMES = 512;
-export const MAX_AGENT_DEFINITION_TOOL_NAME_CHARS = 256;
+const MAX_AGENT_DEFINITION_TOOL_NAMES = 512;
+const MAX_AGENT_DEFINITION_TOOL_NAME_CHARS = 256;
 /** An allowlist entry meaning "keep everything"; mirrors the Rust wildcard. */
 export const AGENT_TOOL_WILDCARD = "*";
 
@@ -231,7 +231,7 @@ export function userAgentDefinitionDraft(
   };
 }
 
-export function sameAgentModelSelection(
+function sameAgentModelSelection(
   left: AgentModelSelection,
   right: AgentModelSelection
 ): boolean {
@@ -243,7 +243,7 @@ export function sameAgentModelSelection(
   );
 }
 
-export function sameUserAgentConfiguration(
+function sameUserAgentConfiguration(
   definition: AgentDefinition,
   draft: UserAgentDefinitionDraft
 ): boolean {

@@ -1,11 +1,21 @@
 import { Bot, BrainCircuit, Check, Shield, UserRound, X } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { useAttachmentDropZone } from "../lib/attachmentDrop";
+import {
+  isLongPaste,
+  mergeFileAttachments,
+  pastedTextFile,
+  type AddMessageAttachments,
+  type AttachmentRejection
+} from "../lib/fileAttachments";
 import {
   textWithoutAppendedImagePlaceholders,
   withImagePlaceholders
 } from "../lib/imageShortIds";
-import type { ImageAttachment, InsertableContextKind } from "../types";
+import type { FileAttachment, ImageAttachment, InsertableContextKind } from "../types";
+import { AttachmentDropOverlay, AttachmentNotice } from "./AttachmentFeedback";
+import { ComposerAddFiles } from "./ComposerAddMenu";
 import { IconButton, PlainField } from "./Common";
 import { ImageStrip } from "./ImageStrip";
 
@@ -44,18 +54,17 @@ export interface InlineTextEditorProps {
   showKind?: boolean;
   content?: string;
   images?: ImageAttachment[];
+  files?: FileAttachment[];
   /**
-   * Takes images pasted into the box, alongside what this message already
-   * carries, and returns the ones that were accepted, numbered. Absent means
-   * this message's model has no image input, and the paste falls through to the
-   * browser as ordinary text.
+   * Attaches picked, pasted or dropped files to this user message, alongside
+   * what it already carries. Absent where nothing can be attached (a template
+   * that is read-only); what the message already has can still be removed.
    */
-  onPasteImages?: (
-    files: File[],
-    existing: readonly ImageAttachment[]
-  ) => Promise<ImageAttachment[]>;
+  onAddAttachments?: AddMessageAttachments;
+  /** Whether this message's model can see images; decides how a drag of pictures reads. */
+  imageInput?: boolean;
   onCancel: () => void;
-  onSave: (content: string, images?: ImageAttachment[]) => void;
+  onSave: (content: string, images?: ImageAttachment[], files?: FileAttachment[]) => void;
 }
 
 /** Replaces a text card's body while it is being edited, and stands in for a card while one is inserted. */
@@ -64,12 +73,17 @@ export function InlineTextEditor({
   showKind = false,
   content: initialContent = "",
   images: initialImages,
-  onPasteImages,
+  files: initialFiles,
+  onAddAttachments,
+  imageInput = false,
   onCancel,
   onSave
 }: InlineTextEditorProps) {
   const { t } = useI18n();
   const [images, setImages] = useState<ImageAttachment[]>(initialImages ?? []);
+  const [files, setFiles] = useState<FileAttachment[]>(initialFiles ?? []);
+  const [pending, setPending] = useState(0);
+  const [rejected, setRejected] = useState<readonly AttachmentRejection[]>([]);
   // `[Image #N]` is the model's way of pointing at a thumbnail this box already
   // shows, so the box never shows the token itself — it is put back on save.
   const [content, setContent] = useState(() => (
@@ -77,10 +91,36 @@ export function InlineTextEditor({
       ? textWithoutAppendedImagePlaceholders(initialContent, initialImages)
       : initialContent
   ));
+  // The latest attachments, for a batch that lands after others were added or removed.
+  const attachmentsRef = useRef({ images, files });
+  attachmentsRef.current = { images, files };
   const meta = textMeta[kind];
   const Icon = meta.icon;
-  const keepsImages = kind === "user" && images.length > 0;
-  const savable = Boolean(content.trim()) || keepsImages;
+  const acceptsAttachments = kind === "user" && Boolean(onAddAttachments);
+  const keepsAttachments = kind === "user" && (images.length > 0 || files.length > 0);
+  const savable = pending === 0 && (Boolean(content.trim()) || keepsAttachments);
+
+  const attach = (incoming: File[], preRejected: readonly AttachmentRejection[] = []) => {
+    if (!onAddAttachments || (!incoming.length && !preRejected.length)) return;
+    setPending((count) => count + 1);
+    void onAddAttachments(incoming, attachmentsRef.current, preRejected).then(
+      (result) => {
+        setImages((current) => {
+          const known = new Set(current.map((image) => image.id));
+          return [...current, ...result.images.filter((image) => !known.has(image.id))];
+        });
+        setFiles((current) => mergeFileAttachments(current, result.files));
+        setRejected(result.rejected);
+      },
+      () => setRejected(incoming.map((file) => ({ name: file.name || undefined, reason: "failed" as const })))
+    ).finally(() => setPending((count) => count - 1));
+  };
+
+  const drop = useAttachmentDropZone({
+    imageInput,
+    disabled: !acceptsAttachments,
+    onDrop: (dropped, preRejected) => attach(dropped, preRejected)
+  });
 
   const save = () => {
     if (!savable) return;
@@ -89,23 +129,33 @@ export function InlineTextEditor({
       onSave(text);
       return;
     }
-    onSave(withImagePlaceholders(text, images), images);
+    onSave(withImagePlaceholders(text, images), images, files);
   };
 
   return (
-    <div className={`inline-text-editor inline-text-editor--${kind}`}>
+    <div
+      ref={drop.ref}
+      className={`inline-text-editor inline-text-editor--${kind}`}
+      data-attachment-drop-ready={drop.dragging && !drop.over ? "true" : undefined}
+    >
       {showKind && (
         <div className={`editor-kind editor-kind--${kind}`}>
           <Icon size={16} />
           <span>{meta.title(t)}</span>
         </div>
       )}
-      {kind === "user" && images.length > 0 && (
+      {kind === "user" && (
+        <AttachmentNotice rejected={rejected} onDismiss={() => setRejected([])} />
+      )}
+      {kind === "user" && (images.length > 0 || files.length > 0 || pending > 0) && (
         <ImageStrip
           images={images}
+          files={files}
           compact
+          busy={pending > 0}
           className="context-editor__images"
           onRemove={(imageId) => setImages((current) => current.filter((image) => image.id !== imageId))}
+          onRemoveFile={(fileId) => setFiles((current) => current.filter((file) => file.id !== fileId))}
         />
       )}
       <PlainField
@@ -115,18 +165,19 @@ export function InlineTextEditor({
         label={meta.title(t)}
         placeholder={meta.placeholder(t)}
         onChange={setContent}
-        onPaste={onPasteImages ? (event) => {
-          const files = Array.from(event.clipboardData.files);
-          if (!files.length) return;
-          // A clipboard carrying both keeps its text; the image rides along.
-          if (!event.clipboardData.getData("text/plain")) event.preventDefault();
-          void onPasteImages(files, images).then((accepted) => {
-            if (!accepted.length) return;
-            setImages((current) => {
-              const known = new Set(current.map((image) => image.id));
-              return [...current, ...accepted.filter((image) => !known.has(image.id))];
-            });
-          });
+        onPaste={acceptsAttachments ? (event) => {
+          const pasted = Array.from(event.clipboardData.files);
+          const text = event.clipboardData.getData("text/plain");
+          if (pasted.length) {
+            // A clipboard carrying both keeps its text; the file rides along.
+            if (!text) event.preventDefault();
+            attach(pasted);
+            return;
+          }
+          if (text && isLongPaste(text)) {
+            event.preventDefault();
+            attach([pastedTextFile(text, files)]);
+          }
         } : undefined}
         onKeyDown={(event) => {
           if ((event.ctrlKey || event.metaKey) && event.key === "Enter") save();
@@ -134,9 +185,18 @@ export function InlineTextEditor({
         }}
       />
       <div className="inline-text-editor__footer">
+        {acceptsAttachments && (
+          <div className="inline-text-editor__attach">
+            <ComposerAddFiles
+              imageInput={imageInput}
+              onChooseFiles={(chosen) => attach(chosen)}
+            />
+          </div>
+        )}
         <IconButton label={t("取消", "Cancel")} onClick={onCancel}><X size={14} /></IconButton>
         <IconButton label={t("保存", "Save")} disabled={!savable} onClick={save}><Check size={14} /></IconButton>
       </div>
+      {kind === "user" && <AttachmentDropOverlay state={drop} imageInput={imageInput} />}
     </div>
   );
 }

@@ -291,7 +291,7 @@ function normalizeUsage(usage: {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
-  inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
+  inputTokenDetails?: { cacheReadTokens?: number };
   outputTokenDetails?: { reasoningTokens?: number };
 }): Usage {
   return {
@@ -300,7 +300,6 @@ function normalizeUsage(usage: {
     totalTokens: usage.totalTokens,
     reasoningTokens: usage.outputTokenDetails?.reasoningTokens,
     cacheReadTokens: usage.inputTokenDetails?.cacheReadTokens,
-    cacheWriteTokens: usage.inputTokenDetails?.cacheWriteTokens,
   };
 }
 
@@ -461,13 +460,12 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
   const calls: StepResult["calls"] = [];
   const sources: StepResult["sources"] = [];
   const sourceKeys = new Set<string>();
-  const addSource = (source: { sourceType: "url" | "document"; id: string; url?: string; title?: string }) => {
+  const addSource = (source: { id: string; url?: string; title?: string }) => {
     const bounded = { id: source.id.slice(0, 256), url: source.url?.slice(0, 2048), title: source.title?.slice(0, 512) };
     const key = bounded.url ?? `document:${bounded.id}`;
     if (sources.length >= MAX_SOURCES || sourceKeys.has(key)) return;
     sourceKeys.add(key);
     sources.push(bounded);
-    emit(id, { k: "source", sourceType: source.sourceType, ...bounded });
   };
   const addSearchUrl = (value: unknown) => {
     if (typeof value !== "string" || value.length > 2048) return;
@@ -476,7 +474,7 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
       if (url.protocol !== "http:" && url.protocol !== "https:") return;
       // A retrieved page is a source, not a claim that the answer cited it.
       // No invented title; the URL itself supplies stable identity.
-      addSource({ sourceType: "url", id: `search:${value}`, url: value });
+      addSource({ id: `search:${value}`, url: value });
     } catch { /* Provider output is untrusted; malformed URLs are not sources. */ }
   };
   const webDocuments: NonNullable<StepResult["webDocuments"]> = [];
@@ -563,14 +561,12 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
         );
         return undefined;
       } : undefined,
-      toolChoice: request.toolChoice,
       // Never begin another SDK request after consuming the finite call budget.
       stopWhen: [stepCountIs(Math.max(1, request.maxSteps)), ({ steps }) => {
         for (const step of steps) for (const call of step.toolCalls) countSearch(call);
         return searchLimit > 0 && searchIds.size >= searchLimit;
       }],
       maxOutputTokens: request.maxOutputTokens ?? defaultOutputTokens(request.family),
-      temperature: request.temperature,
       // Providers translate the shared reasoning profile to family-specific controls.
       reasoning: request.reasoning,
       providerOptions: request.providerOptions,
@@ -710,11 +706,11 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
             emit(id, { k: "tool-call-announced", callId: call.toolCallId, toolName: call.toolName });
           }
           calls.push({ callId: call.toolCallId, toolName: call.toolName, input: call.input });
-          emit(id, { k: "tool-call", callId: call.toolCallId, toolName: call.toolName, input: call.input });
+          emit(id, { k: "tool-call", callId: call.toolCallId, input: call.input });
           break;
         }
         case "source": {
-          addSource(part as unknown as { sourceType: "url" | "document"; id: string; url?: string; title?: string });
+          addSource(part as unknown as { id: string; url?: string; title?: string });
           break;
         }
         case "tool-result": {
@@ -742,14 +738,12 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
           // an error tool result. Preserve the failure so native search does not claim
           // completion; client tools have no `execute` and should not reach this path.
           const failure = part as unknown as {
-            toolCallId?: string;
             toolName?: string;
             providerExecuted?: boolean;
             error?: unknown;
           };
           if (failure.providerExecuted !== true) break;
           providerToolErrors.push({
-            callId: typeof failure.toolCallId === "string" ? failure.toolCallId : "",
             toolName: typeof failure.toolName === "string" ? failure.toolName : "",
             message: redactSecrets(describeProviderToolError(failure.error), secretsOf(request)),
           });
@@ -854,7 +848,6 @@ function handleFrame(frame: HostFrame): void {
       writeFrame({
         type: "ready",
         protocol: PROTOCOL_VERSION,
-        versions: { node: process.versions.node },
       });
       break;
     case "step":

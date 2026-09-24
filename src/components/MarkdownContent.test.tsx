@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MarkdownContent, normalizeMathDelimiters } from "./MarkdownContent";
 
@@ -33,12 +33,16 @@ const answer = 42;
     expect(screen.getByText("删除").tagName).toBe("DEL");
     expect(screen.getByRole("checkbox")).toBeChecked();
     expect(within(screen.getByRole("table")).getByText("A")).toBeInTheDocument();
-    expect(screen.getByText("const answer = 42;")).toHaveClass("language-ts");
+    const block = container.querySelector("pre > code.language-ts");
+    expect(block).toHaveTextContent("const answer = 42;");
+    // Coloured by the grammar the fence names, and copyable from its corner.
+    expect(block?.querySelector(".code-token--keyword")).toHaveTextContent("const");
+    expect(screen.getByRole("button", { name: /Copy code|复制代码/ })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "外部链接" })).toHaveAttribute("target", "_blank");
     expect(container.querySelector("script")).not.toBeInTheDocument();
   });
 
-  it("renders inline and display formulas with dollar and LaTeX delimiters", () => {
+  it("renders inline and display formulas with dollar and LaTeX delimiters", async () => {
     const { container } = render(
       <MarkdownContent content={`行内 $E=mc^2$ 与 \\(a^2+b^2=c^2\\)。
 
@@ -47,11 +51,28 @@ $$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$
 \\[\\sum_{i=1}^{n} i=\\frac{n(n+1)}{2}\\]`} />
     );
 
-    expect(container.querySelectorAll(".katex")).toHaveLength(4);
-    expect(container.querySelectorAll(".katex-display")).toHaveLength(2);
-    expect(container).toHaveTextContent("E=mc2");
-    expect(container).toHaveTextContent("∫");
-    expect(container).toHaveTextContent("∑");
+    await waitFor(() => expect(container.querySelectorAll(".math-formula[data-math-state='ready']")).toHaveLength(4));
+    expect(container.querySelectorAll(".math-formula--display")).toHaveLength(2);
+    expect(container.querySelectorAll(".math-formula svg")).toHaveLength(4);
+    // The drawing is announced by its source, and carries it for a copy.
+    expect(screen.getByRole("math", { name: "E=mc^2" })).toBeInTheDocument();
+    expect(container).toHaveTextContent("$E=mc^2$");
+    expect(container).toHaveTextContent("$$\\sum_{i=1}^{n} i=\\frac{n(n+1)}{2}$$");
+  });
+
+  it("renders a fence that says math as display math", async () => {
+    const { container } = render(<MarkdownContent content={"```math\n\\frac{a}{b}\n```"} />);
+    await waitFor(() => expect(container.querySelector(".math-formula--display[data-math-state='ready']")).toBeInTheDocument());
+    expect(container.querySelector("pre")).not.toBeInTheDocument();
+  });
+
+  it("shows a formula that does not parse as its source, with the reason", async () => {
+    const { container } = render(<MarkdownContent content={"未完 $\\frac{a}{$ 与 $x$"} />);
+    await waitFor(() => expect(container.querySelector(".math-formula[data-math-state='error']")).toBeInTheDocument());
+    const broken = container.querySelector(".math-formula[data-math-state='error']");
+    expect(broken).toHaveTextContent("\\frac{a}{");
+    expect(broken?.getAttribute("title")).toBeTruthy();
+    await waitFor(() => expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument());
   });
 
   it("does not rewrite math-like delimiters inside code", () => {
@@ -59,20 +80,22 @@ $$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$
     expect(normalizeMathDelimiters(source)).toBe("文本 $x$ `\\(inline\\)`\n\n```txt\n\\[block\\]\n```\n之后 \n$$\ny\n$$\n");
   });
 
-  it("renders Markdown and math throughout an incrementally updated stream", () => {
+  it("renders Markdown and math throughout an incrementally updated stream", async () => {
     const content = "## 流式标题\n\n$E=mc^2$";
     const { container, rerender } = render(<MarkdownContent content={content} streaming />);
 
     expect(screen.getByRole("heading", { name: "流式标题" })).toBeInTheDocument();
-    expect(container.querySelector(".katex")).toBeInTheDocument();
+    await waitFor(() => expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument());
 
     rerender(<MarkdownContent content={`${content}\n\n- 第一项\n- 第二项`} streaming />);
     expect(screen.getByRole("list")).toBeInTheDocument();
     expect(screen.getByText("第二项")).toBeInTheDocument();
+    // A formula already typeset is drawn again from the cache, not re-typeset.
+    expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument();
 
     rerender(<MarkdownContent content={`${content}\n\n- 第一项\n- 第二项`} />);
     expect(screen.getByRole("heading", { name: "流式标题" })).toBeInTheDocument();
-    expect(container.querySelector(".katex")).toBeInTheDocument();
+    expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument();
   });
 
   it("sweeps only the newly arrived tail, and stops marking settled text", () => {
@@ -169,5 +192,88 @@ describe("MarkdownContent path links", () => {
       <MarkdownContent content={"```\nsrc/App.tsx\n```"} linkifyPaths pathBaseDir={baseDir} />
     );
     expect(targets(container)).toEqual([]);
+  });
+});
+
+describe("MarkdownContent HTML", () => {
+  const html = `| a | b |
+| --- | --- |
+| 一<br>二 | <kbd>Ctrl</kbd> |
+
+<details><summary>更多</summary>
+
+内容 H<sub>2</sub>O
+
+</details>
+
+<p align="center" style="color: red" onclick="alert(1)">居中</p>
+
+<script>window.__unsafe = true</script><iframe src="https://example.com"></iframe>`;
+
+  it("shows HTML as the text it is unless the surface opts in", () => {
+    const { container } = render(<MarkdownContent content={html} />);
+    expect(container.querySelector("details")).not.toBeInTheDocument();
+    expect(container).toHaveTextContent("<kbd>Ctrl</kbd>");
+  });
+
+  it("renders the allowed HTML and drops everything that could run or restyle", () => {
+    const { container } = render(<MarkdownContent content={html} renderHtml />);
+    expect(container.querySelector("td br")).toBeInTheDocument();
+    expect(container.querySelector("kbd")).toHaveTextContent("Ctrl");
+    expect(container.querySelector("details summary")).toHaveTextContent("更多");
+    expect(container.querySelector("sub")).toHaveTextContent("2");
+    const centred = screen.getByText("居中");
+    expect(centred).toHaveAttribute("align", "center");
+    expect(centred).not.toHaveAttribute("style");
+    expect(centred).not.toHaveAttribute("onclick");
+    expect(container.querySelector("script, iframe")).not.toBeInTheDocument();
+  });
+
+  it("keeps math and detected paths working alongside HTML", async () => {
+    const { container } = render(
+      <MarkdownContent content={"见 `src/a.ts:3`<br>和 $x^2$"} renderHtml linkifyPaths pathBaseDir="/w" />
+    );
+    expect(container.querySelector("[data-mework-path='src/a.ts']")).toHaveAttribute("data-mework-path-line", "3");
+    await waitFor(() => expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument());
+  });
+});
+
+describe("MarkdownContent links", () => {
+  it("turns a link to a file into a path the file pane can open, line included", () => {
+    const { container } = render(
+      <MarkdownContent content={"打开 [App](src/App.tsx#L12) 或 [配置](file:///w/Cargo.toml:3)"} linkifyPaths pathBaseDir="/w" />
+    );
+    const links = [...container.querySelectorAll("a[data-mework-path]")];
+    expect(links.map((link) => [link.getAttribute("data-mework-path"), link.getAttribute("data-mework-path-line")])).toEqual([
+      ["src/App.tsx", "12"],
+      ["/w/Cargo.toml", "3"]
+    ]);
+    // A click nobody claims must not navigate the app to a relative address.
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+    links[0].dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(true);
+  });
+
+  it("leaves document links for the caller to resolve against the document", () => {
+    const { container } = render(
+      <MarkdownContent content={"[下一篇](other.md)"} linkifyPaths pathBaseDir="/w" documentLinks />
+    );
+    expect(container.querySelector("a")).toHaveAttribute("href", "other.md");
+    expect(container.querySelector("a")).not.toHaveAttribute("data-mework-path");
+  });
+
+  it("scrolls to the heading a fragment names, inside its own reply", () => {
+    const scrolled: string[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function scrollIntoView(this: Element) {
+      scrolled.push(this.textContent ?? "");
+    };
+    try {
+      render(<MarkdownContent content={"[跳到安装](#安装-步骤)\n\n## 安装 步骤\n\n正文"} />);
+      fireEvent.click(screen.getByRole("link", { name: "跳到安装" }));
+      expect(scrolled).toEqual(["安装 步骤"]);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
   });
 });

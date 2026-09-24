@@ -94,7 +94,6 @@ export interface RollingNumberProps {
   /** The already-formatted text. Digits roll; every other character is carried across unchanged. */
   value: string;
   className?: string;
-  title?: string;
 }
 
 /**
@@ -107,7 +106,7 @@ export interface RollingNumberProps {
  * CSS generated content on top of it, so they contribute no text of their own
  * and disappear again once the roll is over.
  */
-export function RollingNumber({ value, className, title }: RollingNumberProps) {
+export function RollingNumber({ value, className }: RollingNumberProps) {
   const [roll, setRoll] = useState<{ slots: Slot[]; armed: boolean } | null>(null);
   const settled = useRef(value);
 
@@ -140,7 +139,6 @@ export function RollingNumber({ value, className, title }: RollingNumberProps) {
   return (
     <span
       className={`rolling-number${roll ? " rolling-number--rolling" : ""}${className ? ` ${className}` : ""}`}
-      title={title}
     >
       <span className="rolling-number__value">{value}</span>
       {roll && (

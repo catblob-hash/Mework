@@ -172,7 +172,7 @@ impl WorkspaceSet {
 
     /// Builds a single-workspace set around a runner the caller already holds.
     ///
-    /// Tests and legacy callers carry a resolved `ShellRunner` rather than a
+    /// Tests carry a resolved `ShellRunner` rather than a
     /// machine record, and re-reading the catalog to reconstruct what the runner
     /// already encodes would only introduce a second way to disagree with it.
     /// The machine binding is therefore derived from the runner itself: a local
@@ -180,6 +180,7 @@ impl WorkspaceSet {
     /// cannot recover its machine id — its fingerprint is the host string, not
     /// the catalog row — so it gets a placeholder id and the guard-level facts
     /// (POSIX, no label) that do not depend on the catalog.
+    #[cfg(test)]
     pub fn single(root: impl Into<String>, runner: ShellRunner) -> Self {
         let machine = match &runner {
             ShellRunner::Local { .. } => None,

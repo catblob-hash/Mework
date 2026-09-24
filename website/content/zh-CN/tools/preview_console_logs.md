@@ -12,7 +12,7 @@
 
 ## 决策模型参数
 
-在对话设置的预览工具窗口里为它打开决策模型选项后，它多出 `query` 与 `threshold` 两个参数：`level` 照常过滤，留下的条目（给了 `lines` 就是最近的那么多条，否则全部）切块交给 TypeSafe Jev 决策模型打分，只返回分数不低于 `threshold` 的片段和它们的行号范围。**加上决策模型参数**保留原来的列表，两种调用都可以；**只用决策模型**则要求每次都带上这两个参数。条目会发送到 TypeSafe 的 API，需要先在「全局设置 → 决策模型提供商」里填好密钥。
+在对话设置的预览工具窗口里为它打开决策模型选项后，它多出 `query` 与 `threshold` 两个参数：`level` 照常过滤，留下的条目（给了 `lines` 就是最近的那么多条，否则全部）由 TypeSafe Jev 决策模型逐条单独打分、几条共用一次请求——一个条目不管跨多少行都不会被拆开——分数不低于 `threshold` 的每个条目都完整返回，编号是它在这份列表里的位置。**加上决策模型参数**保留原来的列表，两种调用都可以；**只用决策模型**则要求每次都带上这两个参数。条目会发送到 TypeSafe 的 API，需要先在「全局设置 → 决策模型提供商」里填好密钥。
 
 ## 相关
 
@@ -20,3 +20,4 @@
 - [preview_network](preview_network.html)
 - [preview_eval](preview_eval.html)
 - [使用 Mework](../working.html#the-built-in-browser)
+- [preview_find_logs](preview_find_logs.html) —— 把这个控制台和服务器输出放在一起打分

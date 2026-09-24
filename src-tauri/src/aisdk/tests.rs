@@ -135,10 +135,8 @@ fn request_for(upstream: &Upstream, model_id: &str) -> StepRequest {
         system_dynamic: None,
         messages: vec![json!({ "role": "user", "content": "hi" })],
         tools: Vec::new(),
-        tool_choice: None,
         max_steps: 1,
         max_output_tokens: None,
-        temperature: None,
         reasoning: None,
         reasoning_content: None,
         prompt_cache: None,
@@ -919,6 +917,7 @@ fn a_signed_thinking_block_is_replayed_verbatim_on_the_next_turn() {
             id: "ctx_u1".into(),
             content: "看看文件".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-09-03T00:00:00Z".into(),
         },
         crate::model::ContextItem::Reasoning {
@@ -949,6 +948,7 @@ fn a_signed_thinking_block_is_replayed_verbatim_on_the_next_turn() {
             id: "ctx_u2".into(),
             content: "然后呢".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-09-03T00:00:03Z".into(),
         },
     ];

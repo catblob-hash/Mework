@@ -13,12 +13,14 @@ pub mod files;
 pub mod listing;
 pub mod output;
 pub mod preview;
+pub mod symbols;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::decision_model::chunk::Blocks;
 use crate::decision_model::jev::{Jev, ScoreRubric};
-use crate::decision_model::search::{JevScorer, Scorer};
+use crate::decision_model::search::{Block, JevScorer, Scorer};
 use crate::decision_model::DecisionError;
 use crate::model::{ConversationSettings, DecisionParameterMode, JsonObject, RunModelRequest};
 
@@ -202,6 +204,54 @@ pub(crate) fn parameter_mode_rejection(
             )),
             _ => None,
         },
+    }
+}
+
+/// Line-addressed material as the decision model is shown it: one block per original block,
+/// labelled `{source} line 7` / `{source} lines 7-9` in the numbering that starts at
+/// `first_line`, and cut into parts when too long for one question.
+pub(crate) fn line_blocks(blocks: &Blocks, source: &str, first_line: usize) -> Vec<Block> {
+    let offset = first_line - 1;
+    blocks
+        .spans()
+        .iter()
+        .map(|&(first, last)| {
+            let parts = blocks
+                .parts(first, last)
+                .into_iter()
+                .map(|(text, start, end)| (text, start + offset, end + offset))
+                .collect();
+            Block::in_parts(
+                format!(
+                    "{source} {}",
+                    range_label("line", "lines", first + offset, last + offset)
+                ),
+                parts,
+            )
+        })
+        .collect()
+}
+
+/// A block of line-addressed material as the model reads it back: every line with its number,
+/// `cat -n` style — the number right-aligned in six columns, then a tab. The decision model is
+/// never shown the numbers; they would only be noise to it.
+pub(crate) fn numbered(blocks: &Blocks, span: (usize, usize), first_line: usize) -> String {
+    let offset = first_line - 1;
+    blocks
+        .lines(span.0, span.1)
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{:>6}\t{line}", span.0 + offset + index))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `line 5` / `lines 5-9`, and the same for any other unit.
+pub(crate) fn range_label(one: &str, many: &str, first: usize, last: usize) -> String {
+    if first == last {
+        format!("{one} {first}")
+    } else {
+        format!("{many} {first}-{last}")
     }
 }
 

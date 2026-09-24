@@ -181,5 +181,3 @@ export function SubagentPanel({
     </section>
   );
 }
-
-export { SubagentStatusBadge as AgentStatus };

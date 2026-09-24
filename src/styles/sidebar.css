@@ -11,9 +11,10 @@
 .sidebar-resize-handle:hover::after, .sidebar-resize-handle:focus-visible::after, .sidebar-resize-active .sidebar-resize-handle::after { opacity: .72; }
 .sidebar-resize-handle:focus-visible { outline-offset: -3px; }
 .sidebar-resize-active, .sidebar-resize-active * { cursor: col-resize !important; user-select: none !important; }
-.sidebar__brand { height: 40px; padding: 0 5px 8px; display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 650; }
-.sidebar__brand > span { flex: 1; }
-.brand-mark { width: 25px; height: 25px; display: block; flex: 0 0 25px; user-select: none; }
+.sidebar__brand { height: 40px; padding: 0 5px 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 9px; }
+/* Cap height 12px: the lockup's viewBox is 216 units tall around a 200-unit cap. */
+.brand-lockup { height: 13px; width: auto; display: block; flex: 0 0 auto; color: var(--text); user-select: none; }
+.mework-lockup__mark { fill: var(--color-c98a1b); }
 .new-task-button {
   width: 100%; height: 38px; display: flex; align-items: center; gap: 10px; padding: 0 10px; background: transparent;
   border: 0; border-radius: 8px; font-size: 13px; font-weight: 600;
@@ -95,9 +96,7 @@ button.sortable-surface:active,
    opens the entry, so hovering one must not promise a drag. An actual drag still
    shows `grabbing` through `.pointer-sort-active` below. */
 .provider-rail__row.sortable-surface,
-.provider-rail__row.sortable-surface:active,
-.mcp-row.sortable-surface,
-.mcp-row.sortable-surface:active { cursor: default; }
+.provider-rail__row.sortable-surface:active { cursor: default; }
 .sortable-surface--dragging { opacity: .38 !important; transform: scale(.985); }
 .pointer-sort-active, .pointer-sort-active * { cursor: grabbing !important; user-select: none !important; }
 .conversation-row--dragging, .workspace-group--dragging { opacity: .38; transform: scale(.985); }

@@ -11,10 +11,10 @@
  * failures rather than silent loss of reasoning and pause-turn data. Any
  * wire-shape change bumps this constant and the matching host-side literal.
  */
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 /** Maximum line size (16 MiB); mirrors the host constant `MAX_SSE_LINE`. */
-export const MAX_LINE_BYTES = 16 * 1024 * 1024;
+const MAX_LINE_BYTES = 16 * 1024 * 1024;
 
 /** Maximum accumulated visible text per request (16 MiB); mirrors the host constant `MAX_STREAM_TEXT`. */
 export const MAX_STREAM_TEXT = 16 * 1024 * 1024;
@@ -108,7 +108,6 @@ export interface StepRequest {
   /** AI SDK `ModelMessage[]` projected from the host canonical context. */
   messages: unknown[];
   tools?: ToolSpec[];
-  toolChoice?: "auto" | "none" | "required" | { type: "tool"; toolName: string };
   /**
    * Allowed model-step count. Ordinary rounds are always one because the host
    * owns the tool loop; only one-shot native-search requests may exceed one to
@@ -116,13 +115,12 @@ export interface StepRequest {
    */
   maxSteps: number;
   maxOutputTokens?: number;
-  temperature?: number;
   /**
    * Reasoning effort in the AI SDK 7 vocabulary, not a provider dialect. Each
    * provider maps it to its own controls, including unsupported-level fallback.
    * The host supplies only the level and never branches by model name.
    */
-  reasoning?: "provider-default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoning?: "none" | "low" | "medium" | "high" | "xhigh";
   /**
    * Reasoning representation for this model. The host resolves protocol defaults,
    * so this is determinate when present; absence means the family has no consumer.
@@ -155,7 +153,7 @@ export interface StepRequest {
 }
 
 /** Separator between the stable system prompt and its tail; mirrors the host's. */
-export const SYSTEM_SECTION_SEPARATOR = "\n\n";
+const SYSTEM_SECTION_SEPARATOR = "\n\n";
 
 /**
  * The whole system prompt a provider receives: the stable part followed by the
@@ -172,7 +170,7 @@ export function fullSystemPrompt(request: Pick<StepRequest, "system" | "systemDy
 // ----------------------------------------------------------------- Sidecar → host
 
 export type SidecarFrame =
-  | { v: number; type: "ready"; seq: number; protocol: number; versions: Record<string, string> }
+  | { v: number; type: "ready"; seq: number; protocol: number }
   | { v: number; type: "event"; seq: number; id: string; event: StepEvent }
   | { v: number; type: "done"; seq: number; id: string; result: StepResult }
   | { v: number; type: "error"; seq: number; id: string; error: StepError };
@@ -209,9 +207,8 @@ export type StepEvent =
    */
   | { k: "reasoning-done"; item: number; durationMs?: number }
   | { k: "tool-call-announced"; callId: string; toolName: string }
-  | { k: "tool-call"; callId: string; toolName: string; input: unknown }
+  | { k: "tool-call"; callId: string; input: unknown }
   | { k: "usage"; usage: Usage }
-  | { k: "source"; sourceType: "url" | "document"; id: string; url?: string; title?: string }
   | { k: "heartbeat" };
 
 export interface Usage {
@@ -220,7 +217,6 @@ export interface Usage {
   totalTokens?: number;
   reasoningTokens?: number;
   cacheReadTokens?: number;
-  cacheWriteTokens?: number;
 }
 
 export interface StepResult {
@@ -272,7 +268,7 @@ export interface StepResult {
    * must never execute them again. Native search consumes them to report search
    * failures rather than treating pause-period text as a successful result.
    */
-  providerToolErrors?: Array<{ callId: string; toolName: string; message: string }>;
+  providerToolErrors?: Array<{ toolName: string; message: string }>;
 }
 
 /**

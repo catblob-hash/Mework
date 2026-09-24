@@ -59,15 +59,6 @@ th, td { border: 1px solid var(--line); padding: 0.45rem 0.6rem; vertical-align:
 th { background: var(--code-bg); }
 .table-scroll { overflow-x: auto; }
 .key-table td:first-child { white-space: nowrap; }
-.key-table .key-text {
-  margin: 0;
-  padding: 0.4rem 0.5rem;
-  max-width: 28rem;
-  max-height: 12rem;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 0.85em;
-}
 hr { border: 0; border-top: 1px solid var(--line); margin: 2rem 0; }
 img { max-width: 100%; }
 
@@ -113,6 +104,8 @@ img { max-width: 100%; }
 .content h2 { font-size: 1.45rem; margin-top: 2.4rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--line); }
 .content h3 { font-size: 1.15rem; margin-top: 1.8rem; }
 .content h2 .anchor, .content h3 .anchor, .content h1 .anchor, .content h4 .anchor { color: inherit; }
+/* A jump to an anchor (the app links straight to a tool group's heading) stops below the sticky header. */
+.content [id] { scroll-margin-top: 4.5rem; }
 .content h2 .anchor:hover::after, .content h3 .anchor:hover::after { content: " #"; color: var(--muted); }
 .toc {
   position: sticky;

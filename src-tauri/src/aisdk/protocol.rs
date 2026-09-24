@@ -3,11 +3,6 @@
 //! This must exactly match `aisdk-service/src/protocol.ts`. Both sides restart on a
 //! `v` mismatch; they do not negotiate backward compatibility.
 
-// This file mirrors the wire contract rather than collecting ordinary data types.
-// Retain fields that the peer sends even before a local consumer needs them, so the
-// contract cannot silently narrow.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +12,7 @@ use serde_json::Value;
 ///
 /// Increment this when a stale sidecar could silently suppress required behavior;
 /// the generation gate turns that condition into an explicit startup failure.
-pub(crate) const PROTOCOL_VERSION: u32 = 11;
+pub(crate) const PROTOCOL_VERSION: u32 = 12;
 
 /// Maximum line size (16 MiB). Both sides enforce it because neither side trusts
 /// the other.
@@ -161,16 +156,12 @@ pub(crate) struct StepRequest {
     pub(crate) messages: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) tools: Vec<ToolSpec>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tool_choice: Option<Value>,
     /// Always 1 for ordinary turns; host-created one-shot native-search requests may exceed it.
     pub(crate) max_steps: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) temperature: Option<f64>,
-    /// Reasoning effort using the AI SDK 7 vocabulary (`provider-default`, `none`,
-    /// `minimal`, `low`, `medium`, `high`, or `xhigh`), not a provider dialect.
+    /// Reasoning effort using the AI SDK 7 vocabulary (`none`, `low`, `medium`,
+    /// `high`, or `xhigh`), not a provider dialect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<&'static str>,
     /// The model's reasoning response form: `"plaintext"` or `"encrypted"`.
@@ -201,23 +192,10 @@ pub(crate) struct StepRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum SidecarFrame {
-    Ready {
-        protocol: u32,
-        #[serde(default)]
-        versions: BTreeMap<String, String>,
-    },
-    Event {
-        id: String,
-        event: StepEvent,
-    },
-    Done {
-        id: String,
-        result: StepResult,
-    },
-    Error {
-        id: String,
-        error: StepError,
-    },
+    Ready { protocol: u32 },
+    Event { id: String, event: StepEvent },
+    Done { id: String, result: StepResult },
+    Error { id: String, error: StepError },
 }
 
 impl SidecarFrame {
@@ -272,13 +250,11 @@ pub(crate) enum StepEvent {
     #[serde(rename_all = "camelCase")]
     ToolCall {
         call_id: String,
-        tool_name: String,
         input: Value,
     },
     Usage {
         usage: SidecarUsage,
     },
-    Source(SidecarSource),
     /// Emitted every 500 ms. The host uses it as a cancellation probe.
     Heartbeat,
 }
@@ -291,7 +267,6 @@ pub(crate) struct SidecarUsage {
     pub(crate) total_tokens: Option<u64>,
     pub(crate) reasoning_tokens: Option<u64>,
     pub(crate) cache_read_tokens: Option<u64>,
-    pub(crate) cache_write_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -383,8 +358,6 @@ pub(crate) struct StepResult {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderToolError {
-    #[serde(default)]
-    pub(crate) call_id: String,
     #[serde(default)]
     pub(crate) tool_name: String,
     #[serde(default)]
@@ -530,7 +503,7 @@ mod tests {
         assert_eq!(parsed.native_search_call_ids, vec!["a", "b"]);
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":-1}"#).is_err());
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":1.5}"#).is_err());
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     /// Provider-executed tool failures use cross-language field names, so pin each
@@ -540,12 +513,11 @@ mod tests {
         let result: StepResult = serde_json::from_str(
             r#"{"text":"","reasoning":[],"calls":[],"usage":{},
                 "responseMessages":[],"sources":[],
-                "providerToolErrors":[{"callId":"srvtoolu_1","toolName":"web_search","message":"max_uses_exceeded"}]}"#,
+                "providerToolErrors":[{"toolName":"web_search","message":"max_uses_exceeded"}]}"#,
         )
         .unwrap();
         assert_eq!(result.provider_tool_errors.len(), 1);
         let failure = &result.provider_tool_errors[0];
-        assert_eq!(failure.call_id, "srvtoolu_1");
         assert_eq!(failure.tool_name, "web_search");
         assert_eq!(failure.message, "max_uses_exceeded");
     }
@@ -585,10 +557,8 @@ mod tests {
             system_dynamic: None,
             messages: vec![],
             tools: vec![],
-            tool_choice: None,
             max_steps: 1,
             max_output_tokens: None,
-            temperature: None,
             reasoning: None,
             reasoning_content: None,
             prompt_cache: None,
@@ -603,9 +573,7 @@ mod tests {
             "apiKey",
             "system",
             "systemDynamic",
-            "toolChoice",
             "maxOutputTokens",
-            "temperature",
             "reasoning",
             "reasoningContent",
             "promptCache",
@@ -638,10 +606,8 @@ mod tests {
                 description: "d".into(),
                 input_schema: serde_json::json!({}),
             }],
-            tool_choice: Some(Value::String("auto".into())),
             max_steps: 1,
             max_output_tokens: Some(8),
-            temperature: Some(0.5),
             reasoning: Some("high"),
             reasoning_content: Some("plaintext"),
             prompt_cache: Some(false),
@@ -671,10 +637,8 @@ mod tests {
             "systemDynamic",
             "messages",
             "tools",
-            "toolChoice",
             "maxSteps",
             "maxOutputTokens",
-            "temperature",
             // Pin this field to catch a spelling drift that would select the provider default.
             "reasoning",
             "reasoningContent",

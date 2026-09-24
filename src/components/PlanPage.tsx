@@ -50,7 +50,7 @@ export function PlanPane({ plan, dock }: PlanPaneProps) {
     <div className="plan-page">
       <div className="plan-page__body">
         {markdown.trim()
-          ? <MarkdownContent content={markdown} />
+          ? <MarkdownContent content={markdown} renderHtml />
           : (
             <p className="plan-page__empty">
               {t("模型还没有写下计划。", "The model has not written a plan yet.")}

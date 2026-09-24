@@ -70,23 +70,6 @@ export function constrainPoint(
   return point;
 }
 
-/** Moves a stroke into a canvas that changed size. Text scales on the vertical factor alone. */
-export function rescaleStroke(stroke: SketchStroke, scaleX: number, scaleY: number): SketchStroke {
-  if (stroke.kind === "freehand") {
-    return { ...stroke, points: stroke.points.map((point) => ({ ...point, x: point.x * scaleX, y: point.y * scaleY })) };
-  }
-  if (stroke.kind === "text") {
-    return { ...stroke, x: stroke.x * scaleX, y: stroke.y * scaleY, size: stroke.size * scaleY };
-  }
-  return {
-    ...stroke,
-    x1: stroke.x1 * scaleX,
-    y1: stroke.y1 * scaleY,
-    x2: stroke.x2 * scaleX,
-    y2: stroke.y2 * scaleY
-  };
-}
-
 export function drawStroke(context: CanvasRenderingContext2D, stroke: SketchStroke): void {
   context.lineCap = "round";
   context.lineJoin = "round";

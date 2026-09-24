@@ -149,12 +149,6 @@ pub enum LinkStatus {
     Closed,
 }
 
-impl LinkStatus {
-    pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected { .. })
-    }
-}
-
 /// Why a request got no reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallError {
@@ -212,8 +206,6 @@ struct LinkState {
     last_inbound: Instant,
     last_ping: Instant,
     ping_seq: u64,
-    outstanding_ping: Option<(u64, Instant)>,
-    rtt: Option<Duration>,
     closed: bool,
     /// Someone asked for another attempt after the link gave up.
     wake: bool,
@@ -274,8 +266,6 @@ impl Link {
                 last_inbound: now,
                 last_ping: now,
                 ping_seq: 0,
-                outstanding_ping: None,
-                rtt: None,
                 closed: false,
                 wake: false,
                 lost_count: 0,
@@ -301,10 +291,6 @@ impl Link {
 
     pub fn status(&self) -> LinkStatus {
         lock(&self.shared.state).status.clone()
-    }
-
-    pub fn round_trip(&self) -> Option<Duration> {
-        lock(&self.shared.state).rtt
     }
 
     /// Waits until the link is connected, or until it is clear it will not be.
@@ -696,14 +682,8 @@ impl Shared {
         let mut state = lock(&self.state);
         state.last_inbound = Instant::now();
         match frame.message {
-            Message::Pong { seq } => {
-                if let Some((expected, sent)) = state.outstanding_ping {
-                    if expected == seq {
-                        state.rtt = Some(sent.elapsed());
-                        state.outstanding_ping = None;
-                    }
-                }
-            }
+            // Any frame is a sign of life, which `last_inbound` has recorded.
+            Message::Pong { .. } => {}
             Message::Response { id, outcome } => {
                 if let Some(pending) = state.pending.get_mut(&id) {
                     if pending.detached {
@@ -904,7 +884,6 @@ impl Shared {
             let now = Instant::now();
             state.last_inbound = now;
             state.last_ping = now;
-            state.outstanding_ping = None;
 
             let known: HashMap<&str, &protocol::SessionInfo> = welcome
                 .sessions
@@ -1048,9 +1027,6 @@ fn supervise(shared: Arc<Shared>) {
                     state.ping_seq += 1;
                     state.last_ping = now;
                     let seq = state.ping_seq;
-                    if state.outstanding_ping.is_none() {
-                        state.outstanding_ping = Some((seq, now));
-                    }
                     Next::Ping(writer, generation, seq)
                 } else {
                     let until_ping = config.ping_interval.saturating_sub(now.duration_since(state.last_ping));

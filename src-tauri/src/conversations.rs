@@ -61,9 +61,9 @@ fn invalidate_rebound_conversations(state: &AppState, rebound: &HashSet<String>)
         .evict_conversations(rebound.iter().map(String::as_str));
 }
 
-/// Reclaims conversation-owned image attachments and workflow run directories.
-/// It must run at conversation write boundaries so deleted conversations do not
-/// retain their attachments or run records.
+/// Reclaims conversation-owned image and file attachments and workflow run
+/// directories. It must run at conversation write boundaries so deleted
+/// conversations do not retain their attachments or run records.
 fn reconcile_conversation_subdata(path: &Path, previous: &AppDocument, next: &AppDocument) {
     let Some(app_data) = path.parent() else {
         return;
@@ -82,12 +82,29 @@ fn reconcile_conversation_subdata(path: &Path, previous: &AppDocument, next: &Ap
             }
         }
     }
+    match template_file_ids(path) {
+        Err(error) => {
+            eprintln!("对话已更新，但无法读取模板文件附件引用，本次不回收文件附件：{error}");
+        }
+        Ok(pinned) => {
+            if let Err(error) = crate::file_attachments::FileAttachmentStore::new(app_data)
+                .reconcile_transition(previous, next, &pinned)
+            {
+                eprintln!("对话已更新，但文件附件隔离回收将在下次保存或启动时重试：{error}");
+            }
+        }
+    }
     crate::workflow_store::remove_removed_conversation_runs(app_data, previous, next);
 }
 
 /// Image ids held by stored conversation templates, which live outside the document.
 pub(crate) fn template_image_ids(path: &Path) -> Result<HashSet<String>, String> {
     store(path)?.template_image_ids()
+}
+
+/// File attachment ids held by stored conversation templates.
+pub(crate) fn template_file_ids(path: &Path) -> Result<HashSet<String>, String> {
+    store(path)?.template_file_ids()
 }
 
 /// Replaces, inserts, or removes a conversation in the memory document. Remove

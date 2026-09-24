@@ -25,24 +25,6 @@ export const ENDPOINT_TYPES: readonly EndpointType[] = [
   "openai_audio_transcription",
 ];
 
-/** Endpoints capable of a conversation. Image and audio models are excluded from the chat selector. */
-export const CHAT_ENDPOINT_TYPES: readonly EndpointType[] = [
-  "openai_chat_completions",
-  "openai_responses",
-  "anthropic_messages",
-  "google_generative",
-  "azure_openai",
-  "bedrock_converse",
-];
-
-/**
- * Endpoints with an implemented call path. Configurable-only endpoints must be
- * described accurately in settings rather than presented as usable.
- */
-export function isCallableEndpoint(endpoint: EndpointType): boolean {
-  return CHAT_ENDPOINT_TYPES.includes(endpoint);
-}
-
 /** Adapter family to chat endpoint type. Mirrors Rust `ProviderFamily::chat_endpoint`. */
 export function chatEndpointOf(family: ProviderFamily): EndpointType {
   switch (family) {

@@ -108,29 +108,19 @@ pub enum BoundaryNode {
     String(String),
     Array(Vec<NodeId>),
     Object(Vec<(String, NodeId)>),
-    /// Frozen host error record `{name, message, stack}`.
-    ///
-    /// This is not an ordinary object with a forgeable tag. The S18 sink
-    /// materializes it as a frozen null-prototype object, so `e instanceof Error`
-    /// is `false` in the script.
-    HostError {
-        name: String,
-        message: String,
-        stack: String,
-    },
 }
 
 /// A node store and its root node.
 ///
 /// Private fields ensure public construction always supplies a valid root and
-/// edges. [`BoundaryGraph::root`] and [`BoundaryGraph::node`] allow zero-copy
-/// reads.
+/// edges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundaryGraph {
     nodes: Vec<BoundaryNode>,
     root: NodeId,
 }
 
+#[cfg(test)]
 impl BoundaryGraph {
     /// Returns the graph root's index.
     pub fn root(&self) -> NodeId {
@@ -144,21 +134,6 @@ impl BoundaryGraph {
     /// create dangling indices.
     pub fn node(&self, id: NodeId) -> &BoundaryNode {
         &self.nodes[id]
-    }
-
-    /// Creates a graph containing only a host error record.
-    ///
-    /// A distinct node kind prevents scripts from forging an object tag to reach
-    /// the error-materialization path.
-    pub fn host_error(name: &str, message: &str, stack: &str) -> Self {
-        Self {
-            nodes: vec![BoundaryNode::HostError {
-                name: name.to_owned(),
-                message: message.to_owned(),
-                stack: stack.to_owned(),
-            }],
-            root: 0,
-        }
     }
 }
 
@@ -246,11 +221,6 @@ pub trait SinkBuilder {
         key: &str,
         value: &Self::Value,
     ) -> Result<(), String>;
-
-    /// Materializes a trusted host error record rather than a mutable ordinary
-    /// object.
-    fn host_error(&mut self, name: &str, message: &str, stack: &str)
-        -> Result<Self::Value, String>;
 }
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -432,15 +402,6 @@ fn allocate_sink<B: SinkBuilder>(
             (sink.empty_array().map_err(BoundaryError::Sink)?, true)
         }
         BoundaryNode::Object(_) => (sink.empty_object().map_err(BoundaryError::Sink)?, true),
-        BoundaryNode::HostError {
-            name,
-            message,
-            stack,
-        } => (
-            sink.host_error(name, message, stack)
-                .map_err(BoundaryError::Sink)?,
-            false,
-        ),
     };
     memo[id] = Some(value.clone());
     if fill_later {
@@ -457,9 +418,8 @@ fn allocate_sink<B: SinkBuilder>(
 /// Arrays are limited to [`crate::MAX_BOUNDARY_ITEMS`] on ingress as well. A
 /// `"__proto__"` property never reaches `set_property`, including in manually
 /// assembled graphs, providing defense in depth with the sink's null prototype.
-/// [`BoundaryNode::HostError`] uses only [`SinkBuilder::host_error`], all sink
-/// string errors become [`BoundaryError::Sink`], and traversal uses no native
-/// recursion.
+/// All sink string errors become [`BoundaryError::Sink`], and traversal uses no
+/// native recursion.
 pub fn clone_in<B: SinkBuilder>(
     graph: &BoundaryGraph,
     sink: &mut B,
@@ -630,9 +590,7 @@ fn json_number(value: f64) -> Value {
 ///
 /// Non-finite numbers become `Null` as in `JSON.stringify`. Finite integer values
 /// use JSON integer form when `fract() == 0` and their absolute value is at most
-/// `2^53`; other finite values use `from_f64`. [`BoundaryNode::HostError`] becomes
-/// an ordinary `{name, message, stack}` object because its special frozen form is
-/// only a script-sink concern. JSON expansion is limited by
+/// `2^53`; other finite values use `from_f64`. JSON expansion is limited by
 /// [`MAX_JSON_OUTPUT_NODES`] to prevent exponential output from shared diamonds.
 pub fn graph_to_json(graph: &BoundaryGraph) -> Result<Value, BoundaryError> {
     if graph.root >= graph.nodes.len() {
@@ -682,17 +640,6 @@ pub fn graph_to_json(graph: &BoundaryGraph) -> Result<Value, BoundaryError> {
                         for (_, child) in properties.iter().rev() {
                             actions.push(JsonOutputAction::Enter(*child));
                         }
-                    }
-                    BoundaryNode::HostError {
-                        name,
-                        message,
-                        stack,
-                    } => {
-                        let mut object = Map::new();
-                        object.insert("name".into(), Value::String(name.clone()));
-                        object.insert("message".into(), Value::String(message.clone()));
-                        object.insert("stack".into(), Value::String(stack.clone()));
-                        values.push(Value::Object(object));
                     }
                 }
             }
@@ -919,11 +866,6 @@ mod tests {
         String(String),
         Array(Vec<SinkValue>),
         Object(Vec<(String, SinkValue)>),
-        HostError {
-            name: String,
-            message: String,
-            stack: String,
-        },
     }
 
     type SinkValue = Rc<RefCell<SinkNode>>;
@@ -931,7 +873,6 @@ mod tests {
     #[derive(Default)]
     struct MockSink {
         property_calls: Vec<String>,
-        host_error_calls: Vec<(String, String, String)>,
     }
 
     impl SinkBuilder for MockSink {
@@ -989,21 +930,6 @@ mod tests {
                 }
                 _ => Err("target is not an object".into()),
             }
-        }
-
-        fn host_error(
-            &mut self,
-            name: &str,
-            message: &str,
-            stack: &str,
-        ) -> Result<Self::Value, String> {
-            self.host_error_calls
-                .push((name.into(), message.into(), stack.into()));
-            Ok(Rc::new(RefCell::new(SinkNode::HostError {
-                name: name.into(),
-                message: message.into(),
-                stack: stack.into(),
-            })))
         }
     }
 
@@ -1246,26 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn host_errors_use_the_dedicated_sink_and_become_plain_json_objects() {
-        let graph = BoundaryGraph::host_error("TypeError", "bad input", "line 1");
-        let mut sink = MockSink::default();
-        let value = clone_in(&graph, &mut sink).expect("host error clones inbound");
-        assert_eq!(
-            sink.host_error_calls,
-            vec![("TypeError".into(), "bad input".into(), "line 1".into())]
-        );
-        assert!(matches!(
-            &*value.borrow(),
-            SinkNode::HostError { name, message, stack }
-                if name == "TypeError" && message == "bad input" && stack == "line 1"
-        ));
-        assert_eq!(
-            graph_to_json(&graph).expect("host error converts to JSON"),
-            json!({"name": "TypeError", "message": "bad input", "stack": "line 1"})
-        );
-    }
-
-    #[test]
     fn a_nested_json_document_round_trips_with_integer_spelling_intact() {
         let document = json!({
             "object": {"integer": 42, "fraction": 1.25, "text": "猫", "none": null},
@@ -1347,9 +1253,6 @@ mod tests {
                 unreachable!()
             }
             fn set_property(&mut self, _: &(), _: &str, _: &()) -> Result<(), String> {
-                unreachable!()
-            }
-            fn host_error(&mut self, _: &str, _: &str, _: &str) -> Result<(), String> {
                 unreachable!()
             }
         }
@@ -1437,7 +1340,6 @@ mod tests {
         EmptyArray,
         PushElement,
         SetProperty,
-        HostError,
     }
 
     struct ContainerPathFailingSink {
@@ -1498,10 +1400,6 @@ mod tests {
         ) -> Result<(), String> {
             self.fail_if(FailingSinkMethod::SetProperty)
         }
-
-        fn host_error(&mut self, _: &str, _: &str, _: &str) -> Result<Self::Value, String> {
-            self.fail_if(FailingSinkMethod::HostError)
-        }
     }
 
     #[test]
@@ -1521,11 +1419,6 @@ mod tests {
                 graph_from_json(&json!({"value": null})).expect("object graph"),
                 FailingSinkMethod::SetProperty,
                 "set_property failed verbatim",
-            ),
-            (
-                BoundaryGraph::host_error("Error", "message", "stack"),
-                FailingSinkMethod::HostError,
-                "host_error failed verbatim",
             ),
         ];
 

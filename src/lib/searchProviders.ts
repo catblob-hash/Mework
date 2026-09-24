@@ -118,8 +118,3 @@ export function searchProviderCapability(
 export function searchProviderSupports(kind: SearchProviderKind, capability: SearchCapability): boolean {
   return searchProviderCapability(kind, capability) !== null;
 }
-
-/** Whether this capability requires a usable HTTP(S) endpoint. */
-export function capabilityNeedsApiHost(spec: SearchCapabilitySpec): boolean {
-  return spec.defaultApiHost.length > 0;
-}

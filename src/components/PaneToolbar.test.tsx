@@ -47,7 +47,6 @@ function renderToolbar(props: Partial<PaneToolbarProps> = {}) {
     <PaneToolbar
       buttons={props.buttons ?? makeButtons()}
       menuItems={props.menuItems ?? makeMenuItems()}
-      menuLabel={props.menuLabel}
     />
   );
 }

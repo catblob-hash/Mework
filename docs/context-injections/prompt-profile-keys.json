@@ -1,5 +1,5 @@
 {
-  "keyCount": 265,
+  "keyCount": 262,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -1124,19 +1124,6 @@
       ]
     },
     {
-      "description": "Heading of the source list appended to native web-search findings.",
-      "id": "web.sources_heading",
-      "placeholders": []
-    },
-    {
-      "description": "One row of the appended source list.",
-      "id": "web.source_row",
-      "placeholders": [
-        "label",
-        "url"
-      ]
-    },
-    {
       "description": "Line appended to native findings when the provider reported search failures.",
       "id": "web.search_warnings",
       "placeholders": [
@@ -1228,11 +1215,6 @@
       "placeholders": [
         "name"
       ]
-    },
-    {
-      "description": "Reason given to the model when a hook blocked an action and no hook name is available.",
-      "id": "hook.blocked_default",
-      "placeholders": []
     },
     {
       "description": "User context injected when a Stop hook asks to continue without giving a reason.",

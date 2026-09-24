@@ -165,8 +165,7 @@
 .conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) { flex-wrap: wrap; }
 .conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) > span:first-child { flex: 1 1 132px; }
 .conversation-settings__page .tool-toggle-row > .switch,
-.conversation-settings__page .tool-toggle-row > .input,
-.conversation-settings__page .tool-toggle-row > .tool-bulk-actions { margin-left: auto; }
+.conversation-settings__page .tool-toggle-row > .input { margin-left: auto; }
 
 /* The pane can be dragged down to the side column's 280px floor, far narrower than
    the 640px drawer this replaced. There the page list gives up its counts and

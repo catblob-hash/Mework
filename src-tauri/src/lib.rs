@@ -17,10 +17,11 @@ mod browser_dev;
 #[cfg(any(test, feature = "browser-dev"))]
 mod browser_dev_fixture;
 #[cfg(any(test, feature = "browser-dev"))]
-#[cfg_attr(not(feature = "browser-dev"), allow(dead_code))]
 mod browser_dev_lifecycle;
 mod browser_file_preview;
-#[allow(dead_code)]
+// Like `browser`, this needs a Chromium page (WebView2 or CEF); elsewhere it compiles but is
+// never reached.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod browser_profile_data;
 mod browser_renderer_mount;
 mod browser_webview_lifecycle;
@@ -35,10 +36,10 @@ mod cef_host;
 mod child_environment;
 mod chromium_capability;
 mod codex_oauth;
-mod compaction;
 #[cfg(target_os = "macos")]
 mod credential_vault;
 mod console_text;
+mod content_store;
 mod conversation_fork;
 mod conversation_store;
 mod conversation_template;
@@ -46,10 +47,12 @@ mod conversations;
 mod decision_model;
 mod decision_tools;
 mod document_store;
+mod dropped_files;
 mod environment_prompt;
 mod environment_tools;
 mod external_open;
 mod favicon;
+mod file_attachments;
 mod file_read_state;
 mod fork_requests;
 mod git;
@@ -82,17 +85,13 @@ mod plan_mode;
 mod powershell_host;
 /// Resolves a `.mework/launch.json` entry into a running dev server.
 mod preview;
-/// Reads and validates `.mework/launch.json`. Nothing consumes the whole surface
-/// yet — the `preview_*` model tools are a later stage — so the unused public
-/// items are allowed rather than deleted and re-ported.
-#[allow(dead_code)]
+/// Reads and validates `.mework/launch.json`.
 mod preview_launch_config;
 /// Dev servers of a workspace on an SSH machine, run there through its agent.
 mod preview_remote;
+mod preview_servers;
 /// The network a page of a remote workspace uses: its machine's, tunnelled over the agent link.
 mod preview_tunnel;
-#[allow(dead_code)]
-mod preview_servers;
 #[cfg(unix)]
 mod process_groups;
 mod project_import_trust;
@@ -189,404 +188,6 @@ const LEGACY_APP_IDENTIFIER: &str = "com.naiword.agentstudio";
 #[cfg(not(test))]
 fn is_memory_tool_name(name: &str) -> bool {
     mework_memory::is_memory_tool(name)
-}
-
-#[cfg(not(test))]
-fn trusted_memory_document(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-) -> Result<Arc<AppDocument>, String> {
-    let _guard = state
-        .storage_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.document_store.read(&document_path(app)?)
-}
-
-#[cfg(not(test))]
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MeworkMemoryFileSummary {
-    name: String,
-    path: String,
-    description: Option<String>,
-}
-
-#[cfg(not(test))]
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MeworkMemoryTierOverview {
-    tier: String,
-    available: bool,
-    root_path: Option<String>,
-    instructions: Option<MeworkMemoryFileSummary>,
-    index: Option<MeworkMemoryFileSummary>,
-    documents: Vec<MeworkMemoryFileSummary>,
-}
-
-#[cfg(not(test))]
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MeworkMemoryOverview {
-    global: MeworkMemoryTierOverview,
-    project: MeworkMemoryTierOverview,
-}
-
-#[cfg(not(test))]
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MeworkMemoryFile {
-    tier: String,
-    name: String,
-    path: String,
-    content: String,
-}
-
-#[cfg(not(test))]
-fn mework_memory_workspace_root(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    workspace_id: Option<&str>,
-) -> Result<Option<PathBuf>, String> {
-    let Some(workspace_id) = workspace_id.map(str::trim).filter(|id| !id.is_empty()) else {
-        return Ok(None);
-    };
-    let document = trusted_memory_document(app, state)?;
-    let workspace = document
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == workspace_id)
-        .ok_or_else(|| "找不到指定工作区，无法解析项目记忆目录".to_owned())?;
-    match workspace.kind {
-        WorkspaceKind::Directory if !workspace.path.trim().is_empty() => {
-            Ok(Some(PathBuf::from(&workspace.path)))
-        }
-        WorkspaceKind::Directory | WorkspaceKind::Temporary | WorkspaceKind::Unsupported => {
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(not(test))]
-fn mework_memory_roots(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    workspace_id: Option<&str>,
-) -> Result<mework_memory::MemoryRoots, String> {
-    let workspace = mework_memory_workspace_root(app, state, workspace_id)?;
-    Ok(mework_memory::MemoryRoots::resolve(
-        dirs::home_dir().as_deref(),
-        workspace.as_deref(),
-    ))
-}
-
-#[cfg(not(test))]
-fn mework_memory_tier(raw: &str) -> Result<mework_memory::MemoryTier, String> {
-    match raw {
-        "global" => Ok(mework_memory::MemoryTier::Global),
-        "project" => Ok(mework_memory::MemoryTier::Project),
-        _ => Err("记忆层级必须是 global 或 project".into()),
-    }
-}
-
-#[cfg(not(test))]
-fn mework_memory_root<'a>(
-    roots: &'a mework_memory::MemoryRoots,
-    tier: mework_memory::MemoryTier,
-) -> Result<&'a mework_memory::MemoryRoot, String> {
-    match tier {
-        mework_memory::MemoryTier::Global => roots
-            .global
-            .as_ref()
-            .ok_or_else(|| "全局记忆不可用：宿主没有解析到用户主目录".to_owned()),
-        mework_memory::MemoryTier::Project => roots
-            .project
-            .as_ref()
-            .ok_or_else(|| "项目记忆不可用：当前工作区没有可用的磁盘目录".to_owned()),
-    }
-}
-
-#[cfg(not(test))]
-fn display_path(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
-#[cfg(not(test))]
-fn mework_memory_tier_overview(
-    tier: mework_memory::MemoryTier,
-    root: Option<&mework_memory::MemoryRoot>,
-) -> MeworkMemoryTierOverview {
-    let Some(root) = root else {
-        return MeworkMemoryTierOverview {
-            tier: tier.as_str().to_owned(),
-            available: false,
-            root_path: None,
-            instructions: None,
-            index: None,
-            documents: Vec::new(),
-        };
-    };
-    let instructions_path = root.instructions_path();
-    let index_path = root.index_path();
-    let descriptions = mework_memory::read_index(root)
-        .into_iter()
-        .map(|entry| (entry.name, entry.description))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut names = std::fs::read_dir(root.memory_dir())
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            if !entry.file_type().ok()?.is_file() {
-                return None;
-            }
-            let raw = entry.file_name().to_string_lossy().into_owned();
-            let normalized = mework_memory::normalize_document_name(&raw).ok()?;
-            (normalized == raw).then_some(normalized)
-        })
-        .collect::<Vec<_>>();
-    names.sort_by_key(|name| name.to_lowercase());
-    names.dedup();
-    let documents = names
-        .into_iter()
-        .map(|name| MeworkMemoryFileSummary {
-            path: display_path(&root.memory_dir().join(&name)),
-            description: descriptions.get(&name).cloned(),
-            name,
-        })
-        .collect();
-    MeworkMemoryTierOverview {
-        tier: tier.as_str().to_owned(),
-        available: true,
-        root_path: instructions_path.parent().map(display_path),
-        instructions: Some(MeworkMemoryFileSummary {
-            name: mework_memory::INSTRUCTIONS_NAME.to_owned(),
-            path: display_path(&instructions_path),
-            description: None,
-        }),
-        index: Some(MeworkMemoryFileSummary {
-            name: mework_memory::INDEX_NAME.to_owned(),
-            path: display_path(&index_path),
-            description: None,
-        }),
-        documents,
-    }
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-fn mework_memory_overview(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    workspace_id: Option<String>,
-) -> Result<MeworkMemoryOverview, String> {
-    let roots = mework_memory_roots(&app, &state, workspace_id.as_deref())?;
-    Ok(MeworkMemoryOverview {
-        global: mework_memory_tier_overview(
-            mework_memory::MemoryTier::Global,
-            roots.global.as_ref(),
-        ),
-        project: mework_memory_tier_overview(
-            mework_memory::MemoryTier::Project,
-            roots.project.as_ref(),
-        ),
-    })
-}
-
-#[cfg(not(test))]
-fn mework_memory_named_path(
-    root: &mework_memory::MemoryRoot,
-    name: &str,
-) -> Result<(String, PathBuf), String> {
-    match name {
-        mework_memory::INSTRUCTIONS_NAME => Ok((name.to_owned(), root.instructions_path())),
-        mework_memory::INDEX_NAME => Ok((name.to_owned(), root.index_path())),
-        _ => {
-            let normalized = mework_memory::normalize_document_name(name)?;
-            Ok((normalized.clone(), root.memory_dir().join(normalized)))
-        }
-    }
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-fn mework_memory_read_file(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    workspace_id: Option<String>,
-    tier: String,
-    name: String,
-) -> Result<MeworkMemoryFile, String> {
-    let tier = mework_memory_tier(&tier)?;
-    let roots = mework_memory_roots(&app, &state, workspace_id.as_deref())?;
-    let root = mework_memory_root(&roots, tier)?;
-    let (name, path) = mework_memory_named_path(root, &name)?;
-    let maximum = if name == mework_memory::INSTRUCTIONS_NAME {
-        128 * 1024
-    } else if name == mework_memory::INDEX_NAME {
-        64 * 1024
-    } else {
-        mework_memory::MAX_DOCUMENT_BYTES
-    };
-    let bytes = memory_archive_file::read_bounded_nofollow(&path, maximum)
-        .map_err(|_| format!("无法读取记忆文件 {name}"))?;
-    let content =
-        String::from_utf8(bytes).map_err(|_| format!("记忆文件 {name} 不是有效的 UTF-8 文本"))?;
-    Ok(MeworkMemoryFile {
-        tier: tier.as_str().to_owned(),
-        name,
-        path: display_path(&path),
-        content,
-    })
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-fn mework_memory_write_file(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    workspace_id: Option<String>,
-    tier: String,
-    name: String,
-    content: String,
-) -> Result<MeworkMemoryFile, String> {
-    let tier = mework_memory_tier(&tier)?;
-    let roots = mework_memory_roots(&app, &state, workspace_id.as_deref())?;
-    let root = mework_memory_root(&roots, tier)?;
-    let (name, path) = mework_memory_named_path(root, &name)?;
-    let maximum = if name == mework_memory::INSTRUCTIONS_NAME {
-        128 * 1024
-    } else if name == mework_memory::INDEX_NAME {
-        64 * 1024
-    } else {
-        mework_memory::MAX_DOCUMENT_BYTES
-    };
-    if content.len() > maximum {
-        return Err(format!("记忆文件超过 {maximum} 字节上限"));
-    }
-    if content.contains('\0') {
-        return Err("记忆文件不能包含空字符".into());
-    }
-    if name == mework_memory::INSTRUCTIONS_NAME {
-        std::fs::create_dir_all(
-            path.parent()
-                .ok_or_else(|| "记忆指令文件没有父目录".to_owned())?,
-        )
-        .map_err(|_| "无法创建记忆目录".to_owned())?;
-        memory_archive_file::write_all_nofollow(&path, content.as_bytes(), maximum)
-            .map_err(|_| format!("无法写入记忆文件 {name}"))?;
-    } else if name == mework_memory::INDEX_NAME {
-        std::fs::create_dir_all(root.memory_dir()).map_err(|_| "无法创建记忆目录".to_owned())?;
-        memory_archive_file::write_all_nofollow(&path, content.as_bytes(), maximum)
-            .map_err(|_| format!("无法写入记忆文件 {name}"))?;
-    } else {
-        let existing = mework_memory::read_document(root, &name)?;
-        if existing.content.is_empty() {
-            return Err("空的主题记忆请先在外部编辑器中写入内容，再从设置中编辑".into());
-        }
-        let description = mework_memory::read_index(root)
-            .into_iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.description)
-            .filter(|description| !description.trim().is_empty())
-            .unwrap_or_else(|| name.trim_end_matches(".md").to_owned());
-        mework_memory::edit_document(root, &name, &existing.content, &content, &description)?;
-    }
-    Ok(MeworkMemoryFile {
-        tier: tier.as_str().to_owned(),
-        name,
-        path: display_path(&path),
-        content,
-    })
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-fn mework_memory_delete_document(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    workspace_id: Option<String>,
-    tier: String,
-    name: String,
-) -> Result<(), String> {
-    let tier = mework_memory_tier(&tier)?;
-    let roots = mework_memory_roots(&app, &state, workspace_id.as_deref())?;
-    mework_memory::delete_document(mework_memory_root(&roots, tier)?, &name)
-}
-
-#[cfg(not(test))]
-fn current_project_import_workspace_root(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    workspace_id: &str,
-) -> Result<Option<PathBuf>, String> {
-    let _guard = state
-        .storage_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let document = state.document_store.read(&document_path(app)?)?;
-    let Some(workspace) = document
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == workspace_id)
-    else {
-        // Orphaned decisions remain listable/revocable by their safe metadata.
-        return Ok(None);
-    };
-    match workspace.kind {
-        WorkspaceKind::Directory => {
-            Ok((!workspace.path.trim().is_empty()).then(|| PathBuf::from(workspace.path.clone())))
-        }
-        // Temporary workspace roots are conversation-specific. Their records
-        // are still visible and revocable, but cannot be labelled active from
-        // only a workspace ID.
-        WorkspaceKind::Temporary | WorkspaceKind::Unsupported => Ok(None),
-    }
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-fn project_memory_list_import_trust(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    workspace_id: String,
-) -> Result<Vec<project_import_trust::ProjectImportTrustSummary>, String> {
-    let workspace_root = current_project_import_workspace_root(&app, &state, &workspace_id)?;
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    let store = project_import_trust::EncryptedProjectImportTrustStore::open(app_data);
-    let _guard = state
-        .project_import_trust_lock
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    project_import_trust::list_project_import_trust(
-        &store,
-        &workspace_id,
-        workspace_root.as_deref(),
-    )
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-fn project_memory_revoke_import_trust(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    workspace_id: String,
-    record_id: String,
-) -> Result<(), String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    let store = project_import_trust::EncryptedProjectImportTrustStore::open(app_data);
-    let _guard = state
-        .project_import_trust_lock
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    project_import_trust::revoke_project_import_trust(&store, &workspace_id, &record_id)
 }
 
 #[cfg(not(test))]
@@ -973,41 +574,6 @@ fn load_conversation_plan(
     conversations::store(&path)?.conversation_plan(&conversation_id)
 }
 
-/// Lists the conversation's recorded timeline history, oldest first. Each entry is
-/// one moment the trunk changed: a settled backend request, or a change the
-/// renderer committed.
-#[cfg(not(test))]
-#[tauri::command]
-fn list_timeline_events(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    conversation_id: String,
-) -> Result<Vec<conversation_store::TimelineEvent>, String> {
-    let _guard = state
-        .storage_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = document_path(&app)?;
-    conversations::store(&path)?.timeline_events(&conversation_id)
-}
-
-/// Rebuilds the trunk as it stood once `seq` applied.
-#[cfg(not(test))]
-#[tauri::command]
-fn load_timeline_snapshot(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    conversation_id: String,
-    seq: i64,
-) -> Result<Vec<model::ContextItem>, String> {
-    let _guard = state
-        .storage_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = document_path(&app)?;
-    conversations::store(&path)?.timeline_snapshot(&conversation_id, seq)
-}
-
 /// Lists one ledger's recorded outgoing requests, oldest first. One entry is one
 /// payload this host handed to the model runner — a round, a retry of a round, or
 /// a host-minted native web-tool call.
@@ -1339,6 +905,18 @@ fn save_document_blocking(
             }
         }
     }
+    match conversations::template_file_ids(&path) {
+        Err(error) => {
+            eprintln!("文档已保存，但无法读取模板文件附件引用，本次不回收文件附件：{error}");
+        }
+        Ok(pinned) => {
+            if let Err(error) = file_attachments::FileAttachmentStore::new(app_data)
+                .reconcile_transition(&previous, &canonical, &pinned)
+            {
+                eprintln!("文档已保存，但文件附件隔离回收将在下次保存或启动时重试：{error}");
+            }
+        }
+    }
     state.retire_removed_conversation_tasks(&previous, &canonical);
     // Workflow records belong to their conversation; delete their directories
     // with removed conversations. Startup cleanup handles failed deletions.
@@ -1504,6 +1082,7 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
     app_menu::apply_language(&app, document.global_settings.resolved_app_language);
     let image_attachment_result =
         image_attachments::ImageAttachmentStore::new(app_data).purge_all();
+    let file_attachment_result = file_attachments::FileAttachmentStore::new(app_data).purge_all();
     // `close_all` above took every draft's shells too.
     let temporary_workspace_result = workspace_dirs::reconcile_temporary_workspaces(
         app_data,
@@ -1557,6 +1136,7 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
     temporary_workspace_result
         .map_err(|error| format!("文档已重置，但清理临时工作区失败；下次加载会重试：{error}"))?;
     image_attachment_result.map_err(|error| format!("文档已重置，但清理图片附件失败：{error}"))?;
+    file_attachment_result.map_err(|error| format!("文档已重置，但清理文件附件失败：{error}"))?;
     Ok(document)
 }
 
@@ -1619,9 +1199,6 @@ fn delete_hook(app: AppHandle, state: State<'_, AppState>, hook_id: String) -> R
 #[serde(rename_all = "camelCase")]
 struct McpProbeReport {
     ok: bool,
-    /// Whether the user cancelled this probe. A cancelled probe is not a failed
-    /// connection, so the catalog row must not present it as one.
-    cancelled: bool,
     /// Negotiated MCP protocol version; empty on probe failure.
     protocol_version: String,
     /// Remote `serverInfo.name` and `serverInfo.version`; empty on probe failure.
@@ -1682,16 +1259,12 @@ struct McpProbeResource {
 /// Probes a discovered MCP server for a single dial: the server is looked up
 /// in a fresh scan of `mcp.json` by id, so the renderer names a server and
 /// never describes one — executable configuration only ever comes off disk.
-///
-/// `probe_id` names this probe so `mcp_cancel_probe` can reach it. The renderer
-/// mints it; the host only requires that it not collide with a live probe.
 #[cfg(not(test))]
 #[tauri::command]
 async fn mcp_probe_server(
     app: AppHandle,
     state: State<'_, AppState>,
     server_id: String,
-    probe_id: String,
 ) -> Result<McpProbeReport, String> {
     let server = {
         let _guard = state
@@ -1705,13 +1278,11 @@ async fn mcp_probe_server(
     tauri::async_runtime::spawn_blocking(move || {
         let runtime = mcp::RuntimeMcpServer::from_config(&server);
         // Use production timeout and schema limits so probe results match runs.
-        let outcome = match mcp::probe_server_for_settings(&runtime, &probe_id) {
+        let outcome = match mcp::probe_server_for_settings(&runtime) {
             Ok(outcome) => outcome,
             Err((error, logs)) => {
                 return McpProbeReport {
                     ok: false,
-                    // A cancelled probe reached no verdict about the server.
-                    cancelled: error.kind == mcp::McpErrorKind::Cancelled,
                     protocol_version: String::new(),
                     server_name: String::new(),
                     server_version: String::new(),
@@ -1725,7 +1296,6 @@ async fn mcp_probe_server(
         };
         McpProbeReport {
             ok: true,
-            cancelled: false,
             protocol_version: outcome.protocol_version,
             server_name: outcome.server_name,
             server_version: outcome.server_version,
@@ -1776,18 +1346,6 @@ async fn mcp_probe_server(
     })
     .await
     .map_err(|error| format!("MCP 探测后台任务失败: {error}"))
-}
-
-/// Cancels the MCP probe named by `probe_id`.
-///
-/// Idempotent: cancelling an unknown probe succeeds, and a cancel that arrives
-/// before the probe registers is remembered so the probe starts already
-/// cancelled. Refusals (a malformed id) are returned so the renderer can show
-/// them instead of leaving a button that silently does nothing.
-#[cfg(not(test))]
-#[tauri::command]
-fn mcp_cancel_probe(probe_id: String) -> Result<(), String> {
-    mcp::cancel_probe(&probe_id).map_err(|error| error.to_string())
 }
 
 /// Deletes a discovered skill's folder — under `~/.mework/skills` or a
@@ -3547,6 +3105,7 @@ fn steer_model_run(
     message_id: String,
     content: String,
     images: Option<Vec<model::ImageAttachment>>,
+    files: Option<Vec<model::FileAttachment>>,
     created_at: String,
 ) -> Result<(), String> {
     state.steer_model_run(
@@ -3554,6 +3113,7 @@ fn steer_model_run(
         message_id,
         content,
         images.unwrap_or_default(),
+        files.unwrap_or_default(),
         created_at,
     )
 }
@@ -3857,6 +3417,7 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
         .parent()
         .ok_or_else(|| "数据文档没有应用数据父目录".to_owned())?;
     let image_store = image_attachments::ImageAttachmentStore::new(app_data);
+    let file_store = file_attachments::FileAttachmentStore::new(app_data);
     // Reconcile stale pending bodies before loading or starting any run; otherwise
     // newly created streaming rows could be misclassified as interrupted.
     match conversation_store::store_for(&path) {
@@ -3898,6 +3459,16 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
                         // Attachment cleanup is recoverable; startup continues and the
                         // reconciliation retries on the next launch.
                         eprintln!("启动时未能回收图片附件，将在下次启动重试：{error}");
+                    }
+                }
+            }
+            match conversations::template_file_ids(&path) {
+                Err(error) => {
+                    eprintln!("启动时无法读取模板文件附件引用，本次不回收文件附件：{error}");
+                }
+                Ok(pinned) => {
+                    if let Err(error) = file_store.reconcile_startup(document, &pinned) {
+                        eprintln!("启动时未能回收文件附件，将在下次启动重试：{error}");
                     }
                 }
             }
@@ -3950,6 +3521,104 @@ fn image_attachment_upload(
 #[tauri::command]
 fn image_attachment_data(app: AppHandle, image_id: String) -> Result<String, String> {
     image_attachment_store(&app)?.data_url_by_id(&image_id)
+}
+
+#[cfg(not(test))]
+fn file_attachment_store(app: &AppHandle) -> Result<file_attachments::FileAttachmentStore, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    Ok(file_attachments::FileAttachmentStore::new(&app_data))
+}
+
+/// Stores a non-image attachment. `format` is `text` or `pdf`; a PDF also
+/// carries the text the renderer extracted from it and its page count.
+///
+/// Decoding, hashing and writing up to 10 MiB runs on a blocking worker rather
+/// than on the thread the window's event loop lives on.
+#[cfg(not(test))]
+#[tauri::command]
+async fn file_attachment_upload(
+    app: AppHandle,
+    name: String,
+    data: String,
+    format: String,
+    text: Option<String>,
+    pages: Option<u32>,
+) -> Result<model::FileAttachment, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        import_file_attachment(&app, &name, &data, &format, text.as_deref(), pages)
+    })
+    .await
+    .map_err(|error| format!("附件上传任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+fn import_file_attachment(
+    app: &AppHandle,
+    name: &str,
+    data: &str,
+    format: &str,
+    text: Option<&str>,
+    pages: Option<u32>,
+) -> Result<model::FileAttachment, String> {
+    let format = match format {
+        "text" => model::FileAttachmentFormat::Text,
+        "pdf" => model::FileAttachmentFormat::Pdf,
+        other => return Err(format!("不支持的附件格式：{other}")),
+    };
+    // Bound the encoded form before decoding: the PDF limit is the larger of
+    // the two, and `import` applies the per-format one.
+    let max_encoded = file_attachments::MAX_FILE_ATTACHMENT_PDF_BYTES
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(4);
+    if data.len() > max_encoded {
+        return Err(format!(
+            "附件 base64 超过 {} MiB 原始字节限制",
+            file_attachments::MAX_FILE_ATTACHMENT_PDF_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|error| format!("附件 base64 无效: {error}"))?;
+    file_attachment_store(app)?.import(name, &bytes, format, text, pages)
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+async fn file_attachment_data(app: AppHandle, file_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_attachment_store(&app)?.data_url_by_id(&file_id)
+    })
+    .await
+    .map_err(|error| format!("附件读取任务失败: {error}"))?
+}
+
+/// Classifies paths of the drag currently over the main window. Only paths the
+/// window itself reported for that drag are answered.
+#[cfg(not(test))]
+#[tauri::command]
+fn dropped_paths_probe(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<dropped_files::DroppedPathProbe>, String> {
+    dropped_files::probe_paths(&state.drag_drop, &paths)
+}
+
+/// Reads one file of the last drop onto the main window, off the event loop's thread.
+#[cfg(not(test))]
+#[tauri::command]
+async fn dropped_file_read(
+    app: AppHandle,
+    path: String,
+) -> Result<dropped_files::DroppedFile, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        dropped_files::read_dropped(&app.state::<AppState>().drag_drop, &path)
+    })
+    .await
+    .map_err(|error| format!("拖放文件读取任务失败: {error}"))?
 }
 
 /// Site icon for one web-search source, as a `data:` URL.
@@ -4572,7 +4241,7 @@ fn trusted_git_workspace_operation(
     trusted_target_workspace_operation(app, state, target, request_label, access, None)
 }
 
-/// Entry point for Git/GitHub writes. In addition to
+/// Entry point for Git writes. In addition to
 /// `trusted_git_workspace_operation`, it rejects writes while a model run writes
 /// the same checkout.
 ///
@@ -4681,35 +4350,6 @@ fn remote_git_workspace(
         machine_key: run_environment::env_key(Some(machine)),
         root: root.clone(),
     }))
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_git_workspace_snapshot(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-) -> Result<Option<git::GitWorkspaceSnapshot>, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Some(remote) = remote_git_workspace(&app, &state, &target, "Git 状态请求")? {
-            return remote_git::workspace_snapshot(
-                &remote.runner,
-                &remote.machine_key,
-                &remote.root,
-            );
-        }
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 状态请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::workspace_snapshot(&operation.workspace_path)
-    })
-    .await
-    .map_err(|error| format!("读取 Git 状态的后台任务失败: {error}"))?
 }
 
 #[cfg(not(test))]
@@ -5202,40 +4842,6 @@ fn preview_server_logs(
     )
 }
 
-/// Records whether this project wants its previews verified automatically.
-///
-/// The only preview command that writes, so it takes the workspace exclusively.
-/// `false` for every reason the write did not happen — a project with no
-/// launch.json has nowhere to keep the preference, and a workspace on another
-/// machine is not written from here.
-#[cfg(not(test))]
-#[tauri::command]
-async fn preview_set_auto_verify(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: preview::PreviewTarget,
-    enabled: bool,
-) -> Result<bool, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        match preview_target_place(&app, &state, &target, "预览自动验证设置", false)? {
-            PreviewPlace::Local { root, .. } => {
-                let canonical = std::fs::canonicalize(&root).map_err(|error| {
-                    format!("预览自动验证设置的工作区路径不存在或无法访问（{}）: {error}", root.display())
-                })?;
-                let _lease = state.operation_gate().begin_workspace_mutation(
-                    WorkspaceKey::new(canonical),
-                    Some(target.conversation_id.clone()),
-                )?;
-                Ok(preview::set_auto_verify(&root, enabled))
-            }
-            PreviewPlace::Remote { .. } => Ok(false),
-        }
-    })
-    .await
-    .map_err(|error| format!("写入预览自动验证设置的后台任务失败: {error}"))?
-}
-
 #[cfg(not(test))]
 #[tauri::command]
 async fn get_git_branches(
@@ -5365,29 +4971,6 @@ async fn release_conversation_worktree(
 
 #[cfg(not(test))]
 #[tauri::command]
-async fn get_git_history(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    request: git::GitHistoryRequest,
-) -> Result<git::GitHistoryPage, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 历史请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::history(&operation.workspace_path, request)
-    })
-    .await
-    .map_err(|error| format!("读取 Git 历史的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
 async fn prepare_git_discard(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -5412,51 +4995,6 @@ async fn prepare_git_discard(
 
 #[cfg(not(test))]
 #[tauri::command]
-async fn prepare_git_stage_all(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-) -> Result<git::GitStageAllPreparation, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 全部暂存确认请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::prepare_stage_all(&operation.workspace_path)
-    })
-    .await
-    .map_err(|error| format!("准备 Git 全部暂存确认的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn prepare_git_commit(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    message: String,
-) -> Result<git::GitCommitPreparation, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 提交确认请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::prepare_commit(&operation.workspace_path, &message)
-    })
-    .await
-    .map_err(|error| format!("准备 Git 提交确认的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
 async fn execute_git_action(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -5470,194 +5008,10 @@ async fn execute_git_action(
         // atomically at the same coordinator rather than slipping through a
         // check/start gap.
         let operation = trusted_git_write_operation(&app, &state, &target, "Git 操作请求", "Git")?;
-        git::execute_action_with_policy(
-            &operation.workspace_path,
-            action,
-            operation.git_network_policy,
-        )
+        git::execute_action(&operation.workspace_path, action)
     })
     .await
     .map_err(|error| format!("执行 Git 操作的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_github_repository(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-) -> Result<Option<git::GithubRepository>, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "GitHub 仓库请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::github_repository(&operation.workspace_path)
-    })
-    .await
-    .map_err(|error| format!("读取 GitHub 仓库的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_github_pull_requests(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    page: u32,
-    page_size: u16,
-) -> Result<git::GithubPullRequestList, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "GitHub PR 列表请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::github_pull_requests(&operation.workspace_path, page, page_size)
-    })
-    .await
-    .map_err(|error| format!("读取 GitHub PR 列表的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_github_pull_request_detail(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    number: u64,
-) -> Result<git::GithubPullRequestDetail, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "GitHub PR 详情请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::github_pull_request_detail(&operation.workspace_path, number)
-    })
-    .await
-    .map_err(|error| format!("读取 GitHub PR 详情的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_github_pull_request_readiness(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    number: u64,
-) -> Result<git::GithubPullRequestReadiness, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "GitHub PR readiness 请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::github_pull_request_readiness(&operation.workspace_path, number)
-    })
-    .await
-    .map_err(|error| format!("读取 GitHub PR readiness 的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_github_pull_request_diff(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    number: u64,
-    path: Option<String>,
-) -> Result<git::GithubPullRequestDiff, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "GitHub PR 差异请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::github_pull_request_diff(&operation.workspace_path, number, path)
-    })
-    .await
-    .map_err(|error| format!("读取 GitHub PR 差异的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_github_pull_request_review_threads(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    request: git::GithubReviewThreadsRequest,
-) -> Result<git::GithubReviewThreadsResult, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "GitHub PR 审阅线程请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::github_pull_request_review_threads(&operation.workspace_path, request)
-    })
-    .await
-    .map_err(|error| format!("读取 GitHub PR 审阅线程的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_github_pull_request_review_thread_comments(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    request: git::GithubReviewThreadCommentsRequest,
-) -> Result<git::GithubReviewThreadCommentsResult, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "GitHub PR 审阅线程评论请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::github_pull_request_review_thread_comments(&operation.workspace_path, request)
-    })
-    .await
-    .map_err(|error| format!("读取 GitHub PR 审阅线程评论的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn execute_github_action(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    target: GitTarget,
-    action: git::GithubAction,
-) -> Result<git::GithubActionResult, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation =
-            trusted_git_write_operation(&app, &state, &target, "GitHub 操作请求", "GitHub")?;
-        git::execute_github_action(&operation.workspace_path, action)
-    })
-    .await
-    .map_err(|error| format!("执行 GitHub 操作的后台任务失败: {error}"))?
 }
 
 /// Opens (or reattaches to) an interactive terminal for a conversation.
@@ -6346,6 +5700,7 @@ fn push_ephemeral_user_context(
         id: id.clone(),
         content,
         images: Vec::new(),
+        files: Vec::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
     });
     Some(id)
@@ -6389,9 +5744,8 @@ fn tool_catalog_with_descriptions(
 #[cfg(test)]
 mod prompt_tests {
     use super::{assemble_system_prompt, tool_catalog_with_descriptions};
-    use crate::model::{ContextItem, ToolDescriptionEntry, ToolResult};
+    use crate::model::ToolDescriptionEntry;
     use crate::prompt_profile::PromptProfile;
-    use serde_json::{json, Map};
 
     fn profile_with(
         entries: Vec<ToolDescriptionEntry>,
@@ -6454,72 +5808,6 @@ mod prompt_tests {
             ),
             "应用数据目录：C:/app-data"
         );
-    }
-
-    fn state_tool(
-        id: &str,
-        tool_name: &str,
-        input: serde_json::Value,
-        success: bool,
-    ) -> ContextItem {
-        state_tool_with_output(id, tool_name, input, "ok".into(), success)
-    }
-
-    fn state_tool_with_output(
-        id: &str,
-        tool_name: &str,
-        input: serde_json::Value,
-        output: String,
-        success: bool,
-    ) -> ContextItem {
-        ContextItem::Tool {
-            id: id.into(),
-            tool_name: tool_name.into(),
-            round: Some(1),
-            model_turn_id: Some(format!("state-turn-{id}")),
-            provider_call_id: None,
-            requested_input: None,
-            input: input.as_object().cloned().unwrap_or_else(Map::new),
-            result: ToolResult {
-                success,
-                output,
-                images: Vec::new(),
-                diff: None,
-                executed_at: "2026-07-15T00:00:00Z".into(),
-                duration_ms: 1,
-            },
-            subagent: None,
-            attestation: String::new(),
-            created_at: "2026-07-15T00:00:00Z".into(),
-        }
-    }
-
-    fn task_create(id: &str, task_id: &str) -> ContextItem {
-        state_tool_with_output(
-            id,
-            "TaskCreate",
-            json!({"subject":format!("Task {task_id}"),"description":"details"}),
-            json!({"task":{"id":task_id,"subject":format!("Task {task_id}")}}).to_string(),
-            true,
-        )
-    }
-
-    fn task_update(id: &str, task_id: &str, status: Option<&str>) -> ContextItem {
-        state_tool_with_output(
-            id,
-            "TaskUpdate",
-            status.map_or_else(
-                || json!({"taskId":task_id,"subject":"Renamed task"}),
-                |status| json!({"taskId":task_id,"status":status}),
-            ),
-            json!({
-                "success":true,
-                "taskId":task_id,
-                "updatedFields":if status.is_some() { json!(["status"]) } else { json!(["subject"]) }
-            })
-            .to_string(),
-            true,
-        )
     }
 
     /// The model-visible description of `name` under `profile`: the root of the
@@ -6732,6 +6020,7 @@ mod authoritative_contexts_tests {
             id: id.into(),
             content: "hi".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-08-26T00:00:01.000Z".into(),
         }
     }
@@ -7208,7 +6497,6 @@ enum TrustedWorkspaceAccess {
 
 #[cfg(not(test))]
 struct TrustedWorkspaceOperation {
-    git_network_policy: git::GitNetworkPolicy,
     workspace_path: PathBuf,
     /// Held, never read: the operation owns the workspace for as long as it lives.
     _lease: Box<dyn Send>,
@@ -7232,56 +6520,6 @@ fn trusted_workspace_operation(
         access,
         None,
     )
-}
-
-fn git_network_policy_for_target(
-    target: &workspace_lookup::ResolvedGitTarget<'_>,
-) -> git::GitNetworkPolicy {
-    match target {
-        workspace_lookup::ResolvedGitTarget::Conversation { conversation, .. }
-            if conversation.settings.security_level == crate::model::SecurityLevel::FullAccess =>
-        {
-            git::GitNetworkPolicy::FullAccess
-        }
-        _ => git::GitNetworkPolicy::Restricted,
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn git_network_policy_uses_persisted_conversation_and_restricts_workspace_targets() {
-    let mut document = catalog::default_document();
-    let workspace = &mut document.workspaces[0];
-    workspace.conversations[0].settings.security_level = crate::model::SecurityLevel::FullAccess;
-    let conversation_target = workspace_lookup::ResolvedGitTarget::Conversation {
-        workspace,
-        conversation: &workspace.conversations[0],
-    };
-    assert_eq!(
-        git_network_policy_for_target(&conversation_target),
-        git::GitNetworkPolicy::FullAccess
-    );
-    assert_eq!(
-        git_network_policy_for_target(&workspace_lookup::ResolvedGitTarget::Workspace {
-            workspace,
-            member: None,
-        }),
-        git::GitNetworkPolicy::Restricted
-    );
-    for level in [
-        crate::model::SecurityLevel::Plan,
-        crate::model::SecurityLevel::RequestApproval,
-        crate::model::SecurityLevel::AllowEdits,
-    ] {
-        workspace.conversations[0].settings.security_level = level;
-        assert_eq!(
-            git_network_policy_for_target(&workspace_lookup::ResolvedGitTarget::Conversation {
-                workspace,
-                conversation: &workspace.conversations[0],
-            }),
-            git::GitNetworkPolicy::Restricted
-        );
-    }
 }
 
 #[cfg(not(test))]
@@ -7328,7 +6566,6 @@ fn trusted_target_workspace_operation(
             workspace_machine_label(&document.assets.execution_environments, machine)
         ));
     }
-    let git_network_policy = git_network_policy_for_target(&resolved_target);
     // Workspace-addressed writes have no conversation to inspect, so they collect the
     // conversations running against the same root checkout; isolated-worktree
     // conversations use another directory and are excluded. A project's further
@@ -7392,7 +6629,6 @@ fn trusted_target_workspace_operation(
         }
     };
     Ok(TrustedWorkspaceOperation {
-        git_network_policy,
         workspace_path,
         _lease: lease,
     })
@@ -7600,7 +6836,7 @@ fn conversation_workspace_set(
         &workspace.conversation_workspaces_after_primary(conversation),
         anchor,
     )?
-    .sandboxed(&document.assets.execution_environments.sandbox, &conversation.id))
+    .sandboxed(&conversation.settings.sandbox, &conversation.id))
 }
 
 /// [`conversation_workspace_set`] with the workspaces after workspace 1 given
@@ -8809,6 +8045,26 @@ pub fn run() {
         .expect("error while building Mework");
     app.run(move |app_handle, event| {
         match event {
+            // The main window's webview is its window content, so wry reports a
+            // native drag as a window event. Recording it here, rather than
+            // trusting paths the renderer passes back, is what scopes the drop
+            // commands to what the user actually dragged.
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::DragDrop(drag),
+                ..
+            } if label == BROWSER_RENDERER_MOUNT_MAIN_LABEL => {
+                let state = app_handle.state::<AppState>();
+                let mut session = state
+                    .drag_drop
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match drag {
+                    tauri::DragDropEvent::Enter { paths, .. } => session.enter(&paths),
+                    tauri::DragDropEvent::Drop { paths, .. } => session.drop_paths(&paths),
+                    _ => {}
+                }
+            }
             tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },

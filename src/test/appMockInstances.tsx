@@ -33,6 +33,8 @@ export const runtimeMocks = {
   loadDocument: vi.fn(),
   imageAttachmentData: vi.fn(),
   prepareImageAttachment: vi.fn(),
+  fileAttachmentData: vi.fn(),
+  prepareFileAttachment: vi.fn(),
   refreshCapabilities: vi.fn(),
   /* Capability writes are host commands with no browser fallback, so the real
      ones reject outside Tauri. Stub them so a test that exercises a delete or a

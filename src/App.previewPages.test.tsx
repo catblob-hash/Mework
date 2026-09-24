@@ -62,8 +62,7 @@ describe("preview pages across a conversation's workspaces", () => {
     vi.spyOn(previewApi, "listPreviewConfigurations").mockResolvedValue({
       launchJsonPath: "/srv/api/.mework/launch.json",
       servers: [],
-      malformed: [],
-      autoVerify: true
+      malformed: []
     });
     vi.spyOn(previewApi, "listPreviewServers").mockResolvedValue([]);
   });

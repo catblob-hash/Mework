@@ -6,6 +6,15 @@ import type { TaskContainerMessages } from "../lib/taskContainer";
 
 const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 
+/**
+ * The `ask_user` tool output the built-in English prompt profile persists while
+ * the answer is outstanding (`task.ask_user_pending`). Fixtures use it; the UI
+ * does not match it — a profile may word it differently, so a pending question
+ * is recognized structurally: a successful `ask_user` result with no real user
+ * reply after it.
+ */
+export const ASK_USER_PENDING_OUTPUT = "Asked the user; this turn is paused.";
+
 /** Rich data used by interaction tests; none of it is part of the product seed. */
 export function createTestDocument(): AppDocument {
   const document = createSeedDocument();

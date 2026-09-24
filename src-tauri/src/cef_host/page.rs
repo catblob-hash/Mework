@@ -107,11 +107,9 @@ pub(super) fn close_all_for_shutdown() {
 /// Stand-in for Tauri's `NewWindowFeatures`: `browser.rs` never reads the features.
 pub(crate) struct NewWindowFeatures;
 
-/// Stand-in for Tauri's `DownloadEvent`: every download is refused before it starts.
-pub(crate) struct DownloadEvent {
-    #[allow(dead_code)]
-    pub(crate) url: String,
-}
+/// Stand-in for Tauri's `DownloadEvent`: every download is refused before it starts, and
+/// `browser.rs` never reads the event.
+pub(crate) struct DownloadEvent;
 
 /// The payload of a main-frame load, with the accessors Tauri's `PageLoadPayload` has.
 pub(crate) struct PageLoadPayload {
@@ -329,11 +327,6 @@ pub(crate) struct CefWebview {
 }
 
 impl CefWebview {
-    #[allow(dead_code)]
-    pub(crate) fn label(&self) -> &str {
-        &self.shared.label
-    }
-
     pub(crate) fn window(&self) -> Window {
         self.shared.window.clone()
     }
@@ -1465,7 +1458,7 @@ wrap_download_handler! {
         fn can_download(
             &self,
             _browser: Option<&mut Browser>,
-            url: Option<&CefString>,
+            _url: Option<&CefString>,
             _request_method: Option<&CefString>,
         ) -> ::std::os::raw::c_int {
             let shared = &self.shared;
@@ -1474,12 +1467,7 @@ wrap_download_handler! {
                 .get()
                 .and_then(|callbacks| callbacks.download.as_ref())
                 .is_some_and(|handler| {
-                    handler(
-                        shared.handle(),
-                        DownloadEvent {
-                            url: url.map(ToString::to_string).unwrap_or_default(),
-                        },
-                    )
+                    handler(shared.handle(), DownloadEvent)
                 });
             allowed as ::std::os::raw::c_int
         }

@@ -343,6 +343,7 @@ pub fn perform_fork(
         id: format!("ctx_{}", uuid::Uuid::new_v4().simple()),
         content: card.prompt.clone(),
         images: Vec::new(),
+        files: Vec::new(),
         created_at: now.clone(),
     }];
 

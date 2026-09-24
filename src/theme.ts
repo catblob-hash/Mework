@@ -5,7 +5,6 @@ import {
   subscribeI18n
 } from "./i18n";
 import type {
-  AppLanguage,
   AppearancePreferences,
   GlobalSettings,
   ResolvedAppLanguage,
@@ -22,13 +21,10 @@ export type ApplicationAppearancePreferences = Pick<GlobalSettings, "appLanguage
   appearance?: AppearancePreferences;
 };
 
-export const defaultApplicationAppearance: ApplicationAppearancePreferences = {
+const defaultApplicationAppearance: ApplicationAppearancePreferences = {
   appLanguage: "auto",
   theme: "system"
 };
-
-/** Compatibility export for code that still needs the pre-settings bootstrap theme. */
-export const applicationTheme: ApplicationTheme = "day";
 
 /* Both are `--color-f7f7f5` from `src/palette.css`: the day value and its
    lightness-mirrored night counterpart. */
@@ -95,19 +91,6 @@ function renderApplicationAppearance(): void {
     preferences.theme,
     root
   );
-}
-
-/**
- * Applies the currently configured appearance once.
- *
- * Kept for compatibility with the previous bootstrap API; settings-aware code should call
- * `configureApplicationAppearance`.
- */
-export function applyApplicationTheme(root: HTMLElement = document.documentElement): void {
-  appearanceRoot = root;
-  configureI18n(preferences.appLanguage);
-  systemTheme = browserPrefersDark() ? "night" : "day";
-  renderApplicationAppearance();
 }
 
 async function syncNativeWindowPreference(preference: ThemePreference): Promise<void> {
@@ -194,17 +177,4 @@ export function stopApplicationAppearance(): void {
   stopLanguageListener = null;
   stopI18nSubscription = null;
   stopNativeThemeListener = null;
-}
-
-export function getApplicationAppearancePreferences(): {
-  appLanguage: AppLanguage;
-  theme: ThemePreference;
-  resolvedTheme: ApplicationTheme;
-  resolvedLanguage: ResolvedAppLanguage;
-} {
-  return {
-    ...preferences,
-    resolvedTheme: resolveApplicationTheme(preferences.theme, systemTheme === "night"),
-    resolvedLanguage: getI18nSnapshot().resolvedLanguage
-  };
 }

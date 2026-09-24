@@ -26,7 +26,6 @@ interface FetchProviderFieldProps {
   webSearchAssets: WebSearchAssets;
   /** Whether to offer the parent-selection option. Conversations have no parent. */
   inheritOption?: boolean;
-  inheritLabel?: string;
   hint?: string;
   /** Draws the selection as settled rather than removable. */
   disabled?: boolean;
@@ -51,7 +50,6 @@ export function FetchProviderField({
   onChange,
   webSearchAssets,
   inheritOption = false,
-  inheritLabel,
   hint,
   disabled = false,
   disabledHint,
@@ -71,7 +69,7 @@ export function FetchProviderField({
   const unavailable = value?.kind === "explicit"
     && !fetchProviders.some((provider) => provider.kind === value.providerKind);
   const triggerLabel = value === null
-    ? inheritLabel ?? t("跟随对话设置", "Follow the conversation")
+    ? t("跟随对话设置", "Follow the conversation")
     : value.kind === "native"
       ? nativeLabel
       : value.kind === "disabled"
@@ -108,7 +106,7 @@ export function FetchProviderField({
       ...(inheritOption
         ? [{
           id: INHERIT_VALUE,
-          label: inheritLabel ?? t("跟随对话设置", "Follow the conversation"),
+          label: t("跟随对话设置", "Follow the conversation"),
           checked: value === null,
           onSelect: () => onChange(null)
         }]

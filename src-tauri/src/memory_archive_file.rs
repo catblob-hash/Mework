@@ -84,17 +84,6 @@ pub fn write_all_nofollow_labeled(
     result
 }
 
-/// Removes a file through the same no-follow discipline as the writer: a
-/// symlink or reparse point at the target is refused rather than followed to
-/// whatever it points at.
-#[allow(dead_code)] // No-follow deletion primitive; kept beside the writer it mirrors.
-pub fn remove_file_nofollow(path: &Path, label: &str) -> Result<(), String> {
-    validate_parent_labeled(path, label)?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| format!("无法检查{label}文件"))?;
-    validate_regular_metadata(&metadata, label)?;
-    fs::remove_file(path).map_err(|_| format!("无法删除{label}文件"))
-}
-
 fn validate_parent_labeled(path: &Path, label: &str) -> Result<PathBuf, String> {
     let parent = path
         .parent()

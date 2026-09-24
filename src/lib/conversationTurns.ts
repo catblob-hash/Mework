@@ -320,7 +320,7 @@ export function repairTurnAnchor(turn: ConversationTurn, contexts: ContextItem[]
  * and a later run that carries no user message continues it rather than opening
  * a round of its own.
  */
-export function isUnfinishedTurn(turn: ConversationTurn): boolean {
+function isUnfinishedTurn(turn: ConversationTurn): boolean {
   return turn.status === "interrupted" || turn.status === "awaiting_user";
 }
 

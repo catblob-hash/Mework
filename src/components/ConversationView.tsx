@@ -43,7 +43,7 @@ export function ConversationView({
   const stableOnDeleteQuestion = useStableCallback(timelineProps.onDeleteQuestion);
   const stableOnCancelEdit = useStableCallback(timelineProps.onCancelEdit);
   const stableOnSaveText = useStableCallback(timelineProps.onSaveText);
-  const stableOnPasteImages = useStableResultCallback(timelineProps.onPasteImages);
+  const stableOnAddAttachments = useStableResultCallback(timelineProps.onAddAttachments);
   const stableOnSaveToolEdit = useStableResultCallback(timelineProps.onSaveToolEdit);
   const stableOnSaveTool = useStableResultCallback(timelineProps.onSaveTool);
   const stableOnSaveQuestion = useStableResultCallback(timelineProps.onSaveQuestion);
@@ -70,7 +70,7 @@ export function ConversationView({
         onDeleteQuestion={timelineProps.onDeleteQuestion ? stableOnDeleteQuestion : undefined}
         onCancelEdit={timelineProps.onCancelEdit ? stableOnCancelEdit : undefined}
         onSaveText={timelineProps.onSaveText ? stableOnSaveText : undefined}
-        onPasteImages={timelineProps.onPasteImages ? stableOnPasteImages : undefined}
+        onAddAttachments={timelineProps.onAddAttachments ? stableOnAddAttachments : undefined}
         onSaveTool={timelineProps.onSaveTool ? stableOnSaveTool : undefined}
         onSaveToolEdit={timelineProps.onSaveToolEdit ? stableOnSaveToolEdit : undefined}
         onSaveQuestion={timelineProps.onSaveQuestion ? stableOnSaveQuestion : undefined}

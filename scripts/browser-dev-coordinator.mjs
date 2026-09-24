@@ -115,7 +115,7 @@ const browserDevRustFingerprintEntries = [
   "src-tauri/windows-app-manifest.xml"
 ];
 
-export function browserDevCanShare(environment = process.env) {
+function browserDevCanShare(environment = process.env) {
   return !exclusiveEnvironmentNames.some((name) => {
     const value = environment[name];
     return typeof value === "string" && value.trim() !== "";

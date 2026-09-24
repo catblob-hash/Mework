@@ -336,6 +336,7 @@ mod tests {
                 id: "ctx_child_user".into(),
                 content: "hello".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-08-09T00:00:00Z".into(),
             }],
             updates: Vec::new(),
@@ -356,6 +357,7 @@ mod tests {
             id: "ctx_child_user".into(),
             content: "something else entirely".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-08-09T00:00:00Z".into(),
         }];
         assert!(!key.verify(&subject(&input, &result, Some(&nested_edited)), &token));

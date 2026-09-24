@@ -476,7 +476,7 @@ fn spawn_pipes(
     #[cfg(windows)]
     let tree = {
         use std::os::windows::io::AsRawHandle;
-        let tree = ProcessTree::adopt(pid, child.as_raw_handle() as _);
+        let tree = ProcessTree::adopt(child.as_raw_handle() as _);
         // Started suspended (see `prepare_child`); now that the job holds
         // it, nothing it starts can be outside the tree.
         if let Err(error) = platform::resume_suspended(pid) {
@@ -576,7 +576,7 @@ fn spawn_terminal(
     #[cfg(unix)]
     let tree = ProcessTree::adopt(pid);
     #[cfg(windows)]
-    let tree = ProcessTree::adopt(pid, child.as_raw_handle().unwrap_or(std::ptr::null_mut()) as _);
+    let tree = ProcessTree::adopt(child.as_raw_handle().unwrap_or(std::ptr::null_mut()) as _);
 
     let writer = pair
         .master

@@ -371,13 +371,6 @@ describe("sketch surface", () => {
     ref.current!.clear();
     expect(ref.current!.getStrokes()).toEqual([]);
   });
-
-  it("reports the CSS size, not the backing store size", () => {
-    const ref = createRef<SketchCanvasHandle>();
-    render(<SketchCanvas ref={ref} color={SKETCH_COLORS[0]!} strokeWidth={SKETCH_STROKE_WIDTH} />);
-
-    expect(ref.current!.getSize()).toEqual({ width: CANVAS_CSS_WIDTH, height: CANVAS_CSS_HEIGHT });
-  });
 });
 
 describe("SketchOverlay", () => {

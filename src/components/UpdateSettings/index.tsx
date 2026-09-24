@@ -24,7 +24,7 @@ import { MeworkIcon } from "../MeworkIcon";
 import { SettingsPageHeading } from "../SettingsPageHeading";
 import "./UpdateSettings.css";
 
-export function formatBytes(bytes: number): string {
+function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KiB", "MiB", "GiB"];
@@ -68,7 +68,7 @@ function VersionCard({
   return (
     <article className="update-settings__card update-settings__version">
       <div className="update-settings__mark" aria-hidden="true">
-        <MeworkIcon size={28} />
+        <MeworkIcon size={44} />
       </div>
       <div className="update-settings__version-copy">
         <div className="update-settings__version-line">

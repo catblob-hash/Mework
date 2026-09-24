@@ -6,17 +6,17 @@ import type {
   MachineShells,
   RunTarget,
   ShellBackend,
-  ShellPriority,
   SshMachineConfig
 } from "../types";
 import { runEnvKey } from "./workspaces";
 import type { TerminalShell } from "./workspaces";
 
 /**
- * Shell backends per operating system, in each OS's default priority order.
- * Mirrors `shell_backend::backends_for`: a combination is listed only when
- * Mework can run the shell tool *and* its own file-tool and language-server
- * scripts through it, so a shell absent here is never probed on that OS.
+ * Shell backends per operating system, most preferred first. Mirrors
+ * `shell_backend::backends_for`: a combination is listed only when Mework can
+ * run the shell tool *and* its own file-tool and language-server scripts
+ * through it, so a shell absent here is never probed on that OS. The order is
+ * Mework's own and the only one: nothing asks the user to rank shells.
  */
 export const SHELL_BACKENDS_BY_OS: Record<MachineOs, readonly ShellBackend[]> = {
   windows: ["powershell", "bash"],
@@ -24,8 +24,6 @@ export const SHELL_BACKENDS_BY_OS: Record<MachineOs, readonly ShellBackend[]> = 
   linux: ["bash", "zsh", "sh"],
   wsl: ["bash", "zsh", "sh"]
 };
-
-export const MACHINE_OSES: readonly MachineOs[] = ["windows", "macos", "linux", "wsl"];
 
 /** Every backend, in the order its tools are listed. Mirrors `ShellBackend::ALL`. */
 export const SHELL_BACKENDS: readonly ShellBackend[] = ["bash", "zsh", "sh", "powershell"];
@@ -52,11 +50,6 @@ export function machineOsLabel(os: MachineOs): string {
   }
 }
 
-/** The two tools a backend is exposed as: its command tool and its scoring tool. */
-export function shellToolNames(backend: ShellBackend): [string, string] {
-  return [backend, `${backend}_find_output`];
-}
-
 /** The backend a shell tool runs in, or `null` for any other tool. Mirrors `ShellBackend::of_tool`. */
 export function backendOfTool(toolName: string): ShellBackend | null {
   for (const backend of SHELL_BACKENDS) {
@@ -70,38 +63,19 @@ export function isRegistered(os: MachineOs, backend: ShellBackend): boolean {
 }
 
 /**
- * An OS's priority list with unregistered and repeated entries dropped and the
- * registered backends it left out appended in table order. Mirrors
- * `shell_backend::normalized_priority`.
+ * The first backend in `os`'s priority order that `available` has: the agent
+ * shell a newly probed machine starts with, and the shell tool a fresh
+ * install's presets turn on. Mirrors `shell_backend::preferred_backend`.
  */
-export function normalizedPriority(os: MachineOs, listed: readonly ShellBackend[] = []): ShellBackend[] {
-  const out: ShellBackend[] = [];
-  for (const backend of listed) {
-    if (isRegistered(os, backend) && !out.includes(backend)) out.push(backend);
-  }
-  for (const backend of SHELL_BACKENDS_BY_OS[os]) {
-    if (!out.includes(backend)) out.push(backend);
-  }
-  return out;
-}
-
-/**
- * The agent shell a newly added machine starts with: the first backend in its
- * OS's priority list that the probe found. This is the priority list's only use.
- */
-export function preferredBackend(
-  os: MachineOs,
-  priority: ShellPriority | undefined,
-  available: readonly ShellBackend[]
-): ShellBackend | null {
-  return normalizedPriority(os, priority?.[os]).find((backend) => available.includes(backend)) ?? null;
+export function preferredBackend(os: MachineOs, available: readonly ShellBackend[]): ShellBackend | null {
+  return SHELL_BACKENDS_BY_OS[os].find((backend) => available.includes(backend)) ?? null;
 }
 
 /**
  * The OS the renderer's own platform string names, or `null` when it names
  * none this table knows.
  */
-export function hostMachineOs(platform: string): MachineOs | null {
+function hostMachineOs(platform: string): MachineOs | null {
   const value = platform.trim();
   if (/^win/i.test(value)) return "windows";
   if (/^(mac|iphone|ipad)/i.test(value)) return "macos";
@@ -173,12 +147,11 @@ function terminalCanStart(machine: RunTarget | null, backend: ShellBackend): boo
 export function terminalShellsFor(
   machine: RunTarget | null | undefined,
   probes: Readonly<Record<string, MachineShells>>,
-  platform: string,
-  priority: ShellPriority | undefined
+  platform: string
 ): TerminalShell[] {
   const target = machine ?? null;
   const { os, backends } = knownShells(target, probes, platform);
-  const ranked = os ? normalizedPriority(os, priority?.[os]) : SHELL_BACKENDS;
+  const ranked = os ? SHELL_BACKENDS_BY_OS[os] : SHELL_BACKENDS;
   return ranked.filter((backend) => backends.includes(backend) && terminalCanStart(target, backend));
 }
 
@@ -196,7 +169,7 @@ export function toolsForShellBackends<T extends { name: string }>(
 /**
  * The agent shell a machine's scripts run in, as the host resolves it: the one
  * its settings chose when the machine still has it, else the first of its OS's
- * priority list the probe found. `null` for this machine, which has none.
+ * priority order the probe found. `null` for this machine, which has none.
  */
 export function effectiveAgentShell(
   machine: RunTarget | null,
@@ -209,11 +182,11 @@ export function effectiveAgentShell(
   if (!probed) return configured ?? "bash";
   const available = probed.shells.map((shell) => shell.backend);
   if (configured && available.includes(configured)) return configured;
-  return preferredBackend(probed.os, assets.shellPriority, available) ?? "bash";
+  return preferredBackend(probed.os, available) ?? "bash";
 }
 
 /** The agent shell recorded in a machine's settings, if any. */
-export function configuredAgentShell(
+function configuredAgentShell(
   machine: RunTarget,
   assets: ExecutionEnvironmentAssets
 ): ShellBackend | null {
@@ -247,8 +220,8 @@ export function withAgentShell(
 
 /**
  * Records a machine's agent shell the first time it is probed: the first
- * backend of its OS's priority list that it has. A machine that already has a
- * choice keeps it, whatever the priority list says now.
+ * backend of its OS's priority order that it has. A machine that already has a
+ * choice keeps it.
  */
 export function withDefaultAgentShell(
   assets: ExecutionEnvironmentAssets,
@@ -261,12 +234,12 @@ export function withDefaultAgentShell(
     return assets;
   }
   if (configuredAgentShell(machine, assets)) return assets;
-  const preferred = preferredBackend(shells.os, assets.shellPriority, shells.shells.map((shell) => shell.backend));
+  const preferred = preferredBackend(shells.os, shells.shells.map((shell) => shell.backend));
   return preferred ? withAgentShell(assets, machine, preferred) : assets;
 }
 
 /** The machine an environment key names, or `null` for this machine and anything unrecognized. */
-export function machineOfEnvKey(key: string): RunTarget | null {
+function machineOfEnvKey(key: string): RunTarget | null {
   if (key.startsWith("wsl:") && key.length > 4) return { kind: "wsl", distro: key.slice(4) };
   if (key.startsWith("ssh:") && key.length > 4) return { kind: "ssh", machineId: key.slice(4) };
   return null;

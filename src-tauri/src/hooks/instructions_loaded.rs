@@ -44,9 +44,7 @@ const DEFAULT_INSTRUCTIONS_LOADED_WORKERS: usize = 4;
 pub(crate) enum InstructionsLoadedPermissionMode {
     Default,
     Plan,
-    Auto,
     AcceptEdits,
-    DontAsk,
     BypassPermissions,
 }
 
@@ -214,10 +212,6 @@ impl InstructionsLoadedHostContext {
             turn_id,
         })
     }
-
-    pub(crate) fn owner_model_id(&self) -> &str {
-        &self.owner_model_id
-    }
 }
 
 /// JSON DTO written only to local hook stdin.
@@ -337,10 +331,7 @@ impl InstructionsLoadedInput {
         self.load_reason
     }
 
-    pub(crate) fn file_path(&self) -> &str {
-        &self.file_path
-    }
-
+    #[cfg(test)]
     pub(crate) fn to_local_hook_json(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }
@@ -401,6 +392,7 @@ pub(crate) enum InstructionsLoadedDispatchOutcome {
     QueueClosed,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InstructionsLoadedDispatchMetrics {
     pub enqueued: u64,
@@ -555,6 +547,7 @@ impl<H: Send + 'static> AsyncInstructionsLoadedDispatcher<H> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn metrics(&self) -> InstructionsLoadedDispatchMetrics {
         InstructionsLoadedDispatchMetrics {
             enqueued: self.metrics.enqueued.load(Ordering::Relaxed),

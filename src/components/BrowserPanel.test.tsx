@@ -123,15 +123,11 @@ function openStatus(url = "about:blank"): browserApi.BrowserStatus {
   };
 }
 
-function configuration(
-  servers: previewApi.PreviewConfiguredServer[],
-  autoVerify = true
-): previewApi.PreviewConfigurationList {
+function configuration(servers: previewApi.PreviewConfiguredServer[]): previewApi.PreviewConfigurationList {
   return {
     launchJsonPath: "C:\\work\\mework\\.mework\\launch.json",
     servers,
-    malformed: [],
-    autoVerify
+    malformed: []
   };
 }
 

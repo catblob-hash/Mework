@@ -1,12 +1,21 @@
+import type { Element as HastElement, ElementContent } from "hast";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ComponentProps } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
+import type { ComponentProps, ImgHTMLAttributes, MouseEvent } from "react";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import type { Components, ExtraProps } from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize from "rehype-sanitize";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { useAppearance } from "../lib/appearance";
+import { localLinkTarget, scrollToFragment } from "../lib/documentLinks";
+import { externalHttpUrl } from "../lib/externalLinks";
+import { fenceLanguage } from "../lib/fileViewers";
+import { MARKDOWN_HTML_SCHEMA, mayContainHtml } from "../lib/markdownHtml";
 import remarkPathLinks from "../lib/remarkPathLinks";
+import { MarkdownCodeBlock } from "./CodeBlock";
+import { MathFormula } from "./MathFormula";
 
 interface MarkdownContentProps {
   content: string;
@@ -33,6 +42,21 @@ interface MarkdownContentProps {
    * page's `img-src` is what decides whether it loads.
    */
   resolveImageSrc?: (src: string) => string | null;
+  /**
+   * Render the HTML the text carries, through GitHub's allow-list.
+   *
+   * Off by default for the same reason path linkification is: text a person
+   * typed renders exactly as typed. Model output and repository documents opt in.
+   */
+  renderHtml?: boolean;
+  /**
+   * Leave relative links for the caller's own click handler.
+   *
+   * A link in a repository document is written against the document, which only
+   * the file pane knows. Everywhere else a relative link is written against the
+   * conversation's working directory, and opens like any other detected path.
+   */
+  documentLinks?: boolean;
 }
 
 type VisibilityCallback = (visible: boolean) => void;
@@ -158,6 +182,89 @@ export function normalizeMathDelimiters(content: string) {
   return result;
 }
 
+function textOf(node: ElementContent | undefined): string {
+  if (!node) return "";
+  if (node.type === "text") return node.value;
+  if (node.type !== "element") return "";
+  return node.children.map(textOf).join("");
+}
+
+function classNames(node: HastElement | undefined): string[] {
+  const value: unknown = node?.properties?.className;
+  if (Array.isArray(value)) return value.map(String);
+  return typeof value === "string" ? value.split(/\s+/) : [];
+}
+
+/**
+ * A fenced block, or display math.
+ *
+ * Both reach here as `<pre><code class="language-…">`: remark-math writes `$$`
+ * blocks that way, and a fence that says ```math means the same thing. The block
+ * is drawn from the tree rather than from `children`, so the inline `code`
+ * override below never sees the code inside it.
+ */
+function MarkdownPre({ node, children, ...props }: ComponentProps<"pre"> & ExtraProps) {
+  const code = node?.children.find(
+    (child): child is HastElement => child.type === "element" && child.tagName === "code"
+  );
+  if (!code) return <pre {...props}>{children}</pre>;
+  const language = classNames(code).find((name) => name.startsWith("language-"))?.slice("language-".length) ?? null;
+  const source = textOf(code).replace(/\n$/, "");
+  if (language === "math") return <MathFormula source={source.trim()} display />;
+  return <MarkdownCodeBlock code={source} language={fenceLanguage(language)} label={language} />;
+}
+
+function MarkdownCode({ node, children, className, ...props }: ComponentProps<"code"> & ExtraProps) {
+  if (classNames(node).includes("language-math")) {
+    return <MathFormula source={textOf(node?.children[0]).trim()} display={false} />;
+  }
+  return <code className={className} {...props}>{children}</code>;
+}
+
+function MarkdownTable({ node: _node, ...props }: ComponentProps<"table"> & ExtraProps) {
+  return (
+    <div className="markdown-content__table-scroll">
+      <table {...props} />
+    </div>
+  );
+}
+
+/**
+ * An image that says what it was when it cannot be drawn.
+ *
+ * The page's `img-src` refuses remote addresses, so a reply that links a picture
+ * on the web would otherwise leave a broken-image glyph where its description
+ * belongs.
+ */
+function MarkdownImage({ src, alt, ...props }: ImgHTMLAttributes<HTMLImageElement>) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [src]);
+  if (failed || !src) return <span className="markdown-content__image-missing">{alt}</span>;
+  return <img {...props} src={src} alt={alt} loading="lazy" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
+}
+
+/**
+ * The URL filter every link and image passes through.
+ *
+ * react-markdown's default keeps the web and drops the rest. A few more schemes
+ * mean something here: `file:` names a file this app can open, a `data:` image
+ * is already a picture the page may draw, and `attachment:` is a picture stored
+ * in a notebook cell.
+ */
+function markdownUrlTransform(url: string, key: string): string {
+  if (key === "src" && /^data:image\//i.test(url.trim())) return url;
+  // A notebook cell's pasted picture, which the notebook viewer resolves itself.
+  if (key === "src" && /^attachment:/i.test(url.trim())) return url;
+  if (key === "href" && /^file:/i.test(url.trim())) return url;
+  return defaultUrlTransform(url);
+}
+
+const MATH_AND_CODE_COMPONENTS = {
+  pre: MarkdownPre,
+  code: MarkdownCode,
+  table: MarkdownTable
+} satisfies Components;
+
 /** Safe shared renderer for assistant replies and visible reasoning. */
 export const MarkdownContent = memo(function MarkdownContent({
   content,
@@ -166,7 +273,9 @@ export const MarkdownContent = memo(function MarkdownContent({
   streaming = false,
   linkifyPaths = false,
   pathBaseDir = null,
-  resolveImageSrc
+  resolveImageSrc,
+  renderHtml = false,
+  documentLinks = false
 }: MarkdownContentProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [nearViewport, setNearViewport] = useState(() => (
@@ -199,6 +308,69 @@ export const MarkdownContent = memo(function MarkdownContent({
     () => shouldRender ? normalizeMathDelimiters(content) : content,
     [content, shouldRender]
   );
+  // The raw-HTML pass costs a second parse of the whole tree, so it only joins
+  // the pipeline once the text has something that could be a tag.
+  const withHtml = renderHtml && shouldRender && mayContainHtml(content);
+  const rehypePlugins = useMemo<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>(
+    () => (withHtml ? [rehypeRaw, [rehypeSanitize, MARKDOWN_HTML_SCHEMA]] : []),
+    [withHtml]
+  );
+
+  // Links and images depend on how this surface resolves them; the rest of the
+  // overrides are fixed. Kept stable between renders, because a new component
+  // identity makes React remount every link, block and formula in the reply on
+  // each streamed token.
+  const components = useMemo<Components>(() => ({
+    ...MATH_AND_CODE_COMPONENTS,
+    a: ({ node: _node, href, children, ...props }) => {
+      const onFragmentClick = (event: MouseEvent<HTMLAnchorElement>, fragment: string) => {
+        event.preventDefault();
+        scrollToFragment(hostRef.current, fragment);
+      };
+      if (!href) return <a {...props}>{children}</a>;
+      if (href.startsWith("#")) {
+        return <a {...props} href={href} onClick={(event) => onFragmentClick(event, href.slice(1))}>{children}</a>;
+      }
+      if (externalHttpUrl(href) !== null || /^(?:mailto|xmpp|ircs?):/i.test(href)) {
+        return <a {...props} href={href} target="_blank" rel="noreferrer noopener">{children}</a>;
+      }
+      const local = localLinkTarget(href);
+      if (documentLinks || !local?.path) {
+        // The file pane resolves document links itself; anything else that names
+        // no file has nowhere to go, and must not navigate the app away.
+        return (
+          <a {...props} href={href} onClick={documentLinks ? undefined : (event) => event.preventDefault()}>
+            {children}
+          </a>
+        );
+      }
+      if (!linkifyPaths) return <a {...props} href={href} onClick={(event) => event.preventDefault()}>{children}</a>;
+      // A link to a file is a detected path with a label of its own: the
+      // document-level path interceptor opens it, and the default is suppressed
+      // for the click it declines.
+      return (
+        <a
+          {...props}
+          href={href}
+          data-mework-path={local.path}
+          data-mework-path-line={local.line ?? undefined}
+          title={local.line === null ? local.path : `${local.path}:${local.line}`}
+          onClick={(event) => event.preventDefault()}
+        >
+          {children}
+        </a>
+      );
+    },
+    img: ({ node: _node, ...props }) => {
+      if (!resolveImageSrc) return <MarkdownImage {...props} />;
+      const source = resolveImageSrc(props.src ?? "");
+      // A resolver that has nothing for this reference yet — or will never
+      // have anything — leaves the alternative text standing rather than a
+      // broken-image glyph.
+      if (source === null) return <span className="markdown-content__image-missing">{props.alt}</span>;
+      return <MarkdownImage {...props} src={source} />;
+    }
+  }), [documentLinks, linkifyPaths, resolveImageSrc]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -270,24 +442,9 @@ export const MarkdownContent = memo(function MarkdownContent({
       {shouldRender && (
         <ReactMarkdown
           remarkPlugins={remarkPlugins}
-          rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
-          components={{
-            a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener" />,
-            table: ({ node: _node, ...props }) => (
-              <div className="markdown-content__table-scroll">
-                <table {...props} />
-              </div>
-            ),
-            img: ({ node: _node, ...props }) => {
-              if (!resolveImageSrc) return <img {...props} loading="lazy" referrerPolicy="no-referrer" />;
-              const source = resolveImageSrc(props.src ?? "");
-              // A resolver that has nothing for this reference yet — or will
-              // never have anything — leaves the alternative text standing
-              // rather than a broken-image glyph.
-              if (source === null) return <span className="markdown-content__image-missing">{props.alt}</span>;
-              return <img {...props} src={source} loading="lazy" referrerPolicy="no-referrer" />;
-            }
-          }}
+          rehypePlugins={rehypePlugins}
+          urlTransform={markdownUrlTransform}
+          components={components}
         >
           {normalizedContent}
         </ReactMarkdown>

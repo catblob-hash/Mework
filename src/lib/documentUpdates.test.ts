@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createTestDocument } from "../test/fixtures";
-import {
-  applyGlobalSettingsChange,
-  applyQuarantinedContextReplacements,
-  conversationMatchesPersistenceGeneration,
-  replaceConversationFromAuthority
-} from "./documentUpdates";
+import { applyGlobalSettingsChange, applyQuarantinedContextReplacements } from "./documentUpdates";
 import type { AppDocument, ContextItem, ConversationPreset } from "../types";
 
 function presetFixture(id: string, name: string): ConversationPreset {
@@ -155,47 +150,6 @@ describe("applyQuarantinedContextReplacements", () => {
     expect(
       next.workspaces[0].conversations.find((conversation) => conversation.id === "conv_sibling")?.contexts
     ).toHaveLength(1);
-  });
-
-  it("matches only the rejected persistence generation", () => {
-    const document = documentWithContexts([toolContext("ctx_only")]);
-    const conversation = document.workspaces[0].conversations[0];
-
-    expect(conversationMatchesPersistenceGeneration(document, conversation.id, conversation.updatedAt)).toBe(
-      true
-    );
-    expect(
-      conversationMatchesPersistenceGeneration(document, conversation.id, "2026-08-24T23:59:59.999Z")
-    ).toBe(false);
-  });
-
-  it("restores the authoritative workspace membership and order", () => {
-    const authority = documentWithContexts([toolContext("ctx_only")]);
-    const current = structuredClone(authority);
-    const source = current.workspaces[0];
-    const sourceId = source.id;
-    current.workspaces.push({
-      ...source,
-      id: "ws_target",
-      name: "Target",
-      conversations: []
-    });
-    const target = current.workspaces.at(-1)!;
-    const moved = source.conversations.shift()!;
-    target.conversations.push(moved);
-
-    const next = replaceConversationFromAuthority(current, authority, moved.id);
-
-    expect(
-      next.workspaces
-        .find((workspace) => workspace.id === sourceId)
-        ?.conversations.some((conversation) => conversation.id === moved.id)
-    ).toBe(true);
-    expect(
-      next.workspaces
-        .find((workspace) => workspace.id === "ws_target")
-        ?.conversations.some((conversation) => conversation.id === moved.id)
-    ).toBe(false);
   });
 
   it("returns the same document when nothing matches, so no save is scheduled", () => {

@@ -16,6 +16,29 @@ export interface ImageAttachment {
   shortId?: number;
 }
 
+/** How the model reads an attached file: its own text, or the text layer of a PDF. */
+export type FileAttachmentFormat = "text" | "pdf";
+
+/**
+ * Lightweight reference to a non-image file attached to a user message.
+ *
+ * Mirrors Rust `model::FileAttachment`. The host keeps the bytes (and, for a
+ * PDF, the text read out of it) in its content-addressed attachment store; the
+ * model reads the text, inlined into the message when the request is built.
+ */
+export interface FileAttachment {
+  /** Full lowercase SHA-256 of the stored original bytes. */
+  id: string;
+  name: string;
+  format: FileAttachmentFormat;
+  /** Size of the stored original. */
+  bytes: number;
+  /** Estimated tokens of the text the model reads for this file. */
+  tokens: number;
+  /** Page count of a PDF. */
+  pages?: number;
+}
+
 interface TextContextBase {
   id: string;
   content: string;
@@ -35,6 +58,7 @@ export interface SystemContext extends TextContextBase {
 export interface UserContext extends TextContextBase {
   kind: "user";
   images?: ImageAttachment[];
+  files?: FileAttachment[];
 }
 
 /** One provider-cited web source on an assistant round (server-side search /
@@ -395,6 +419,21 @@ export interface ConversationSettings {
    * for the tools that are on. Absent means nothing is remembered.
    */
   rememberedDecisionForms?: RememberedDecisionForms;
+  /**
+   * The rows each tool family (`files`, `shell`, `preview`) had on when the
+   * family was switched off as a whole, keyed by family, so switching the
+   * family back on returns to them. A family with no entry has nothing to
+   * return to, and switching it on asks which of its tools to use. Renderer
+   * state like `rememberedDecisionForms`: the host keeps it but never reads
+   * it. Absent means nothing is remembered.
+   */
+  rememberedToolFamilies?: RememberedToolFamilies;
+  /**
+   * Whether this conversation's commands run in the operating system's
+   * sandbox, and what it lets through. Absent is off, with the default
+   * network allowlist waiting for when it is switched on.
+   */
+  sandbox?: SandboxSettings;
   /* The five file write guards used to be switches here. They are now
    * unconditional in the host — every conversation, and every child of one,
    * runs with read-before-write, the stale-write refusal, external-change
@@ -421,6 +460,9 @@ export interface RememberedDecisionForm {
 }
 
 export type RememberedDecisionForms = Partial<Record<string, RememberedDecisionForm>>;
+
+/** Each switched-off tool family's rows. See `ConversationSettings.rememberedToolFamilies`. */
+export type RememberedToolFamilies = Partial<Record<string, string[]>>;
 
 /**
  * The tool surface a conversation has already exposed. Each run merges its own
@@ -520,6 +562,8 @@ export interface ConversationPresetSettings {
   decisionParameterModes?: DecisionParameterModes;
   /** Miss-scoring template copied into conversations; absent means no entries. */
   decisionMissScoring?: string[];
+  /** Sandbox template copied into conversations; absent means off. */
+  sandbox?: SandboxSettings;
 }
 
 /**
@@ -666,6 +710,7 @@ export interface QueuedMessage {
   id: string;
   content: string;
   images?: ImageAttachment[];
+  files?: FileAttachment[];
   createdAt: string;
 }
 
@@ -1382,8 +1427,6 @@ export interface AppUpdateInstallOutcome {
 /** MCP connectivity-probe result. Mirrors Rust `lib.rs::McpProbeReport`. */
 export interface McpProbeReport {
   ok: boolean;
-  /** Whether the user cancelled this probe, which is not a connection failure. */
-  cancelled: boolean;
   /** Negotiated MCP protocol version; empty on probe failure. */
   protocolVersion: string;
   /** Remote `serverInfo.name`; empty on probe failure. */
@@ -1531,13 +1574,6 @@ export interface MachineShells {
 }
 
 /**
- * Each operating system's shell backends, most preferred first. Its only use is
- * choosing a newly added machine's agent shell. An absent or empty list is the
- * OS's default order.
- */
-export type ShellPriority = Partial<Record<MachineOs, ShellBackend[]>>;
-
-/**
  * Execution-environment assets. WSL distributions are machine state and are
  * enumerated live by `list_wsl_distros`. Environment variables are keyed by
  * `local`, `wsl:<distro>`, or `ssh:<machine id>`.
@@ -1547,21 +1583,19 @@ export interface ExecutionEnvironmentAssets {
   envVars: Record<string, Record<string, string>>;
   /** Each WSL distribution's agent shell, by distribution name. */
   wslAgentShells?: Record<string, ShellBackend>;
-  /** One shell priority list per operating system. */
-  shellPriority?: ShellPriority;
-  /** Whether conversations' commands run in the operating system's sandbox. Absent is off. */
-  sandbox?: SandboxSettings;
 }
 
 /** Which hosts a sandbox's processes may connect to. */
 export type SandboxNetworkMode = "off" | "allowlist" | "open";
 
 /**
- * The sandbox conversations' commands run in when it is on. Mirrors
+ * The sandbox a conversation's commands run in when it is on. Mirrors
  * `model::SandboxSettings`: one sandboxed agent process per conversation and
  * machine, which can write the conversation's workspaces (and nothing in them
  * that runs outside the sandbox later), cannot read credentials, and reaches
- * the network only through a proxy that applies `network`.
+ * the network only through a proxy that applies `network`. A setting of each
+ * conversation, and a component of a preset — the conversation is the
+ * smallest thing a sandbox is drawn around.
  */
 export interface SandboxSettings {
   enabled: boolean;
@@ -1872,7 +1906,7 @@ export type ModelStreamEvent =
   | { type: "reasoning_done"; round: number; item?: number; durationMs?: number }
   /** Provider-reported cumulative usage for this backend request round. */
   | { type: "usage_updated"; round: number; usage: ModelUsage }
-  | { type: "user_input_received"; round: number; id: string; content: string; images?: ImageAttachment[]; createdAt: string }
+  | { type: "user_input_received"; round: number; id: string; content: string; images?: ImageAttachment[]; files?: FileAttachment[]; createdAt: string }
   | {
       type: "tool_call_announced";
       round: number;
@@ -1941,8 +1975,6 @@ export type SettingsView =
   | "usage"
   | "execution_environments"
   | "dependencies"
-  | "shells"
-  | "sandbox"
   | "updates"
   | "web_search"
   | "memory"
@@ -1951,12 +1983,3 @@ export type SettingsView =
   | "advanced"
   | "conversation_presets"
   | "capability_catalog";
-
-/**
- * The `ask_user` tool output the built-in English prompt profile persists while
- * the answer is outstanding (`task.ask_user_pending`). Fixtures use it; the UI
- * does not match it — a profile may word it differently, so a pending question
- * is recognized structurally: a successful `ask_user` result with no real user
- * reply after it.
- */
-export const ASK_USER_PENDING_OUTPUT = "Asked the user; this turn is paused.";

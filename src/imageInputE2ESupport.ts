@@ -37,7 +37,7 @@ export function imageE2eModelId(protocol: ImageE2eFamily, runId: string): string
 }
 
 /** The provider name the menu shows as a row's secondary line. */
-export function imageE2eProviderName(protocol: ImageE2eFamily): string {
+function imageE2eProviderName(protocol: ImageE2eFamily): string {
   return `Image E2E · ${IMAGE_E2E_DISPLAY_NAMES[protocol]}`;
 }
 
@@ -101,11 +101,11 @@ export interface ModelMenuContext {
 }
 
 /** The composer's model picker root; `App` sets it through `rootClassName`. */
-export const MODEL_MENU_ROOT_SELECTOR = ".composer__model";
+const MODEL_MENU_ROOT_SELECTOR = ".composer__model";
 /** Locale-independent: the trigger is the only `aria-haspopup="menu"` button in that root. */
-export const MODEL_MENU_TRIGGER_SELECTOR = 'button[aria-haspopup="menu"]';
-export const POPOVER_PANEL_SELECTOR = '.popover-menu__panel[role="menu"]';
-export const MODEL_MENU_ITEM_SELECTOR = 'button[role="menuitemradio"]';
+const MODEL_MENU_TRIGGER_SELECTOR = 'button[aria-haspopup="menu"]';
+const POPOVER_PANEL_SELECTOR = '.popover-menu__panel[role="menu"]';
+const MODEL_MENU_ITEM_SELECTOR = 'button[role="menuitemradio"]';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_MS = 50;
@@ -136,7 +136,7 @@ export function modelMenuTrigger(context: ModelMenuContext = {}): HTMLButtonElem
 }
 
 /** Every popover panel currently mounted in the portal root. */
-export function openPopoverPanels(context: ModelMenuContext = {}): HTMLElement[] {
+function openPopoverPanels(context: ModelMenuContext = {}): HTMLElement[] {
   return Array.from(
     (context.portalRoot ?? document.body).querySelectorAll<HTMLElement>(POPOVER_PANEL_SELECTOR)
   );
@@ -188,7 +188,7 @@ export async function openModelMenu(context: ModelMenuContext = {}): Promise<HTM
   return panel;
 }
 
-export async function closeModelMenu(context: ModelMenuContext = {}): Promise<void> {
+async function closeModelMenu(context: ModelMenuContext = {}): Promise<void> {
   if (!modelMenuOpen(context)) return;
   modelMenuTrigger(context)?.click();
   await waitUntil(

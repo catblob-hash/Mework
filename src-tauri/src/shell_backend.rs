@@ -29,9 +29,10 @@
 //! shell: a distribution is a Linux machine the host reaches through
 //! `wsl.exe`, whichever of its shells runs the command.
 //!
-//! The table's order is also each OS's default priority: the global settings
-//! hold one priority list per OS, and a newly added machine's agent shell is
-//! the first backend in its OS's list that the probe found.
+//! The table's order is also each OS's priority, fixed rather than
+//! configurable: a newly added machine's agent shell is the first backend in
+//! its OS's order that the probe found, and so is the one shell tool a fresh
+//! install's presets turn on for this machine.
 
 use serde::{Deserialize, Serialize};
 
@@ -153,6 +154,7 @@ impl std::fmt::Display for ShellBackend {
 }
 
 impl MachineOs {
+    #[cfg(test)]
     pub const ALL: [MachineOs; 4] = [Self::Windows, Self::Macos, Self::Linux, Self::Wsl];
 
     pub fn display_name(self) -> &'static str {
@@ -204,9 +206,10 @@ impl std::fmt::Display for MachineOs {
     }
 }
 
-/// The registered backends of an OS, in its default priority order. This is
-/// the whole combination table: a backend absent here is never probed on that
-/// OS.
+/// The registered backends of an OS, most preferred first. This is the whole
+/// combination table — a backend absent here is never probed on that OS — and
+/// the one priority order: Mework ranks each OS's shells itself rather than
+/// asking the user to.
 pub fn backends_for(os: MachineOs) -> &'static [ShellBackend] {
     use ShellBackend::{Bash, PowerShell, Sh, Zsh};
     match os {
@@ -231,33 +234,12 @@ pub fn probe_names(os: MachineOs, backend: ShellBackend) -> &'static [&'static s
     }
 }
 
-/// An OS's priority list with anything unregistered or repeated dropped and
-/// every registered backend it left out appended in table order, so the list
-/// always ranks exactly the OS's registered backends.
-pub fn normalized_priority(os: MachineOs, listed: &[ShellBackend]) -> Vec<ShellBackend> {
-    let mut out: Vec<ShellBackend> = Vec::with_capacity(backends_for(os).len());
-    for backend in listed {
-        if is_registered(os, *backend) && !out.contains(backend) {
-            out.push(*backend);
-        }
-    }
-    for backend in backends_for(os) {
-        if !out.contains(backend) {
-            out.push(*backend);
-        }
-    }
-    out
-}
-
-/// The backend a new machine starts with: the first one in its OS's priority
-/// list that the machine has.
-pub fn preferred_backend(
-    os: MachineOs,
-    priority: &[ShellBackend],
-    available: &[ShellBackend],
-) -> Option<ShellBackend> {
-    normalized_priority(os, priority)
-        .into_iter()
+/// The backend a machine starts with: the first one in its OS's priority
+/// order that the machine has.
+pub fn preferred_backend(os: MachineOs, available: &[ShellBackend]) -> Option<ShellBackend> {
+    backends_for(os)
+        .iter()
+        .copied()
         .find(|backend| available.contains(backend))
 }
 
@@ -266,7 +248,7 @@ pub fn preferred_backend(
 ///
 /// The host has none — its file tools act on its own filesystem directly — so
 /// this belongs to a WSL distribution or an SSH machine, chosen per machine in
-/// its settings (the first backend of its OS's priority list when the machine
+/// its settings (the first backend of its OS's priority order when the machine
 /// was added).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentShell {
@@ -428,22 +410,15 @@ mod tests {
     }
 
     #[test]
-    fn priority_lists_rank_exactly_the_registered_backends() {
+    fn each_os_prefers_its_first_shell_the_machine_has() {
         use ShellBackend::{Bash, PowerShell, Sh, Zsh};
-        assert_eq!(
-            normalized_priority(MachineOs::Linux, &[Sh, PowerShell, Sh]),
-            vec![Sh, Bash, Zsh]
-        );
-        assert_eq!(normalized_priority(MachineOs::Windows, &[]), vec![PowerShell, Bash]);
-        assert_eq!(
-            preferred_backend(MachineOs::Macos, &[Bash, Zsh], &[Zsh, Sh]),
-            Some(Zsh)
-        );
-        assert_eq!(
-            preferred_backend(MachineOs::Windows, &[PowerShell], &[Bash]),
-            Some(Bash)
-        );
-        assert_eq!(preferred_backend(MachineOs::Linux, &[], &[]), None);
+        assert_eq!(backends_for(MachineOs::Windows), &[PowerShell, Bash]);
+        assert_eq!(backends_for(MachineOs::Linux), &[Bash, Zsh, Sh]);
+        assert_eq!(backends_for(MachineOs::Macos), &[Zsh, Bash, Sh]);
+        assert_eq!(preferred_backend(MachineOs::Macos, &[Sh, Bash]), Some(Bash));
+        assert_eq!(preferred_backend(MachineOs::Windows, &[Bash]), Some(Bash));
+        assert_eq!(preferred_backend(MachineOs::Linux, &[PowerShell]), None);
+        assert_eq!(preferred_backend(MachineOs::Linux, &[]), None);
     }
 
     #[test]

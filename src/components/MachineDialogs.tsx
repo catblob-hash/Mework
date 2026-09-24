@@ -143,12 +143,12 @@ function MachineShellsSection({ machine, shells, agentShell }: MachineShellsSect
 }
 
 /** Mirrors the host `validate_env_var_name` predicate for field-level validation. */
-export const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Mirrors host-reserved shell-startup and private child-environment names.
  * The host rejects an entire document containing these names, so reject them at
  * the field rather than on save. */
-export function reservedEnvVarName(name: string): boolean {
+function reservedEnvVarName(name: string): boolean {
   if ([
     "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "GIT_EXTERNAL_DIFF"
   ].includes(name)) return true;
@@ -158,20 +158,20 @@ export function reservedEnvVarName(name: string): boolean {
 }
 
 /** Mirrors limits enforced by host `validate_execution_environments`. */
-export const MAX_ENV_VARS_PER_TABLE = 128;
-export const MAX_ENV_VALUE_CHARS = 8192;
-export const MAX_SSH_MACHINES = 64;
-export const MAX_MACHINE_NAME_CHARS = 64;
-export const MAX_HOST_CHARS = 512;
-export const MAX_PATH_FIELD_CHARS = 4096;
+const MAX_ENV_VARS_PER_TABLE = 128;
+const MAX_ENV_VALUE_CHARS = 8192;
+const MAX_SSH_MACHINES = 64;
+const MAX_MACHINE_NAME_CHARS = 64;
+const MAX_HOST_CHARS = 512;
+const MAX_PATH_FIELD_CHARS = 4096;
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
-export function formatEnvText(vars: Record<string, string>): string {
+function formatEnvText(vars: Record<string, string>): string {
   return Object.entries(vars).map(([key, value]) => `${key}=${value}`).join("\n");
 }
 
-export interface ParsedEnvText {
+interface ParsedEnvText {
   vars: Record<string, string>;
   /** Lines with invalid variable-name syntax. */
   invalid: string[];
@@ -184,7 +184,7 @@ export interface ParsedEnvText {
 
 /** Parses `KEY=value` lines. Preserve everything after the first `=` verbatim;
  * only keys are trimmed. */
-export function parseEnvText(text: string): ParsedEnvText {
+function parseEnvText(text: string): ParsedEnvText {
   const vars: Record<string, string> = {};
   const invalid: string[] = [];
   const reserved: string[] = [];
@@ -222,7 +222,7 @@ export function parseEnvText(text: string): ParsedEnvText {
  * Field-level validation for the environment-variable editor. The host rejects
  * an entire document with invalid execution environments, so errors stay local.
  */
-export function envTextError(
+function envTextError(
   parsed: ParsedEnvText,
   t: (zh: string, en: string, params?: Record<string, string>) => string
 ): string | null {

@@ -15,3 +15,4 @@ Any successful read registers the file as read, which is what the writers' gate 
 - [edit](edit.html) and [write](write.html) — what the remembered read unlocks
 - [grep](grep.html) — find the line before you read around it
 - [Working with Mework](../working.html#images) — how images reach the model
+- [find_content](find_content.html) — locate the lines worth reading in a large file

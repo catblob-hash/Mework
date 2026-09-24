@@ -1849,7 +1849,6 @@ impl BrowserRuntime {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn is_attached(&self) -> bool {
         lock_unpoison(&self.state).app.is_some()
     }
@@ -2232,27 +2231,6 @@ impl BrowserRuntime {
             let result = session.navigate_history_with_resume(navigation);
             self.touch_session(&session_id);
             result
-        })
-    }
-
-    #[cfg(all(feature = "browser-dev", not(test)))]
-    pub(crate) async fn execute_tool(
-        &self,
-        session_id: String,
-        tool: PreviewTool,
-        input: Map<String, Value>,
-        grants: BrowserToolGrants,
-    ) -> Result<Value, String> {
-        let runtime = self.clone();
-        let output = tauri::async_runtime::spawn_blocking(move || {
-            runtime.execute_tool_blocking(&session_id, tool, &input, &grants)
-        })
-        .await
-        .map_err(|error| format!("browser tool background task failed: {error}"))??;
-        Ok(match output {
-            PreviewToolOutput::Text(text) => Value::String(text),
-            PreviewToolOutput::Image(capture) => serde_json::to_value(capture)
-                .map_err(|error| format!("browser tool image could not be encoded: {error}"))?,
         })
     }
 
@@ -3433,7 +3411,7 @@ impl BrowserRuntime {
             .collect()
     }
 
-    #[cfg(any(test, feature = "browser-dev"))]
+    #[cfg(test)]
     pub(crate) fn live_page_count(&self) -> usize {
         self.capacity_snapshots()
             .into_iter()
@@ -4327,11 +4305,6 @@ impl BrowserSession {
         }
         state.app = Some(app);
         Ok(())
-    }
-
-    #[allow(dead_code)] // Useful for embedding applications and setup diagnostics.
-    pub fn is_attached(&self) -> bool {
-        self.lock_state().app.is_some()
     }
 
     /// Opens (or focuses) the single native browser surface.

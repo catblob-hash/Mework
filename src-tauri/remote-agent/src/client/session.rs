@@ -205,7 +205,6 @@ pub struct RemoteProcess {
     pid: u32,
     stdout: Option<SessionReader>,
     stderr: Option<SessionReader>,
-    released: bool,
 }
 
 impl RemoteProcess {
@@ -224,12 +223,7 @@ impl RemoteProcess {
             pid,
             stdout: Some(stdout),
             stderr: Some(stderr),
-            released: false,
         }
-    }
-
-    pub fn sid(&self) -> &str {
-        &self.pipe.sid
     }
 
     /// The process id on the remote machine.
@@ -325,26 +319,14 @@ impl RemoteProcess {
     pub fn lost_bytes(&self) -> u64 {
         self.pipe.lost_bytes()
     }
-
-    /// Tells the agent the host is done with the session: its output is
-    /// discarded and, if it still runs, it is ended.
-    pub fn release(mut self) {
-        self.release_now();
-    }
-
-    fn release_now(&mut self) {
-        if !self.released {
-            self.released = true;
-            self.link.release(&self.pipe.sid);
-        }
-    }
 }
 
 impl Drop for RemoteProcess {
     /// Nobody can collect the output of a handle that is gone, so the agent
-    /// is told to stop keeping it.
+    /// is told to stop keeping it: its output is discarded and, if it still
+    /// runs, it is ended.
     fn drop(&mut self) {
-        self.release_now();
+        self.link.release(&self.pipe.sid);
     }
 }
 

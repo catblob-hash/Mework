@@ -523,6 +523,7 @@ pub fn reset_signal_dispositions() {
 
 /// Everything a session started, addressable as one.
 pub struct ProcessTree {
+    #[cfg(unix)]
     pid: u32,
     #[cfg(windows)]
     job: Option<windows_sys::Win32::Foundation::HANDLE>,
@@ -563,7 +564,7 @@ impl ProcessTree {
     /// the session — a dev server, a command that timed out — would stop
     /// Bash and leave the program running.
     #[cfg(windows)]
-    pub fn adopt(pid: u32, process: windows_sys::Win32::Foundation::HANDLE) -> Self {
+    pub fn adopt(process: windows_sys::Win32::Foundation::HANDLE) -> Self {
         use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS};
         use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -593,11 +594,7 @@ impl ProcessTree {
             }
             Some(job)
         });
-        Self { pid, job, process: own }
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.pid
+        Self { job, process: own }
     }
 
     /// Sends `signal` to the whole tree. Returns whether anything was
@@ -606,7 +603,6 @@ impl ProcessTree {
         #[cfg(unix)]
         {
             let number = match signal {
-                SignalKind::Interrupt => libc::SIGINT,
                 SignalKind::Terminate => libc::SIGTERM,
                 SignalKind::Hangup => libc::SIGHUP,
                 SignalKind::Kill => libc::SIGKILL,

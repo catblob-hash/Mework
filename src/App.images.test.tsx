@@ -223,9 +223,9 @@ describe("App model run flow — images", () => {
     const user = userEvent.setup();
     const { container } = render(<App />);
     const composer = await screen.findByLabelText("向 Agent 发送消息");
-    // The add button opens a menu; image availability belongs to its menu item.
+    // The add button opens a menu; pictures are uploaded like any other file.
     await user.click(screen.getByRole("button", { name: "添加内容" }));
-    expect(screen.getByRole("menuitem", { name: /添加图片/ })).toBeEnabled();
+    expect(screen.getByRole("menuitem", { name: /上传文件/ })).toBeEnabled();
     await user.keyboard("{Escape}");
     const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')!;
     const selected = new File([new Uint8Array([1, 2, 3, 4])], "selected.png", { type: "image/png" });
@@ -347,15 +347,16 @@ describe("App model run flow — images", () => {
     })).toBe(true));
   });
 
-  it("gates every composer image entry when the selected model has no vision capability", async () => {
+  it("turns composer images away with a reason when the selected model has no vision capability", async () => {
     runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
     const user = userEvent.setup();
     render(<App />);
     const composer = await screen.findByLabelText("向 Agent 发送消息");
     await user.click(screen.getByRole("button", { name: "添加内容" }));
-    const addImages = screen.getByRole("menuitem", { name: /添加图片/ });
-    expect(addImages).toBeDisabled();
-    expect(addImages).toHaveAttribute("title", "当前模型不支持图片输入");
+    // Files still go to a text-only model; only pictures cannot.
+    const upload = screen.getByRole("menuitem", { name: /上传文件/ });
+    expect(upload).toBeEnabled();
+    expect(upload).toHaveAttribute("title", "PDF 或文本文件（当前模型不支持图片）；也可粘贴或拖入");
     await user.keyboard("{Escape}");
 
     const file = new File([new Uint8Array([1])], "blocked.png", { type: "image/png" });
@@ -365,16 +366,12 @@ describe("App model run flow — images", () => {
         getData: () => ""
       }
     });
-    // Rejection is silent. Allow event-loop turns before verifying no upload began.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
+    // The composer says what it left out and why, rather than doing nothing.
+    const notice = await screen.findByText("1 项没有添加");
+    expect(notice.closest(".attachment-notice")).toHaveTextContent("blocked.png");
+    expect(notice.closest(".attachment-notice")).toHaveTextContent("当前模型不支持图片输入");
     expect(runtimeMocks.prepareImageAttachment).not.toHaveBeenCalled();
     expect(screen.queryByRole("img", { name: "blocked.png" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "添加内容" }));
-    expect(screen.getByRole("menuitem", { name: /添加图片/ }))
-      .toHaveAttribute("title", "当前模型不支持图片输入");
   });
 
   /// Images outlive the model that accepted them: attach under a vision model,

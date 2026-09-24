@@ -1,15 +1,14 @@
 //! Engine-independent workflow decision boundary.
 //!
 //! This crate contains workflow decisions for cache-key chains ([`chain`]),
-//! boundary cloning ([`boundary`]), run budgets ([`budget`]), progress merging
-//! ([`progress`]), and structured output ([`schema`]). Script engines and host
-//! runtimes supply values through [`StepSource`].
+//! boundary cloning ([`boundary`]), progress merging ([`progress`]), and
+//! structured output ([`schema`]). Script engines and host runtimes supply
+//! values through [`StepSource`].
 //!
 //! Dependencies are intentionally limited to serde, serde_json, and sha2. Adding
 //! an engine dependency here would couple decision logic back to that engine.
 
 pub mod boundary;
-pub mod budget;
 pub mod chain;
 pub mod progress;
 pub mod schema;
@@ -34,11 +33,6 @@ pub const MAX_LIFETIME_STEPS: usize = 1_000;
 /// Exceeding it is an explicit error, never silent truncation.
 pub const MAX_BOUNDARY_ITEMS: usize = 4_096;
 
-/// Number of retries allowed after structured-output validation fails.
-///
-/// Validation plus this retry/prompt loop is the only structured-output enforcement.
-pub const MAX_STRUCTURED_OUTPUT_RETRIES: usize = 5;
-
 /// Maximum progress-ledger rows before trimming.
 pub const MAX_PROGRESS_ROWS: usize = 1_000;
 
@@ -56,14 +50,6 @@ pub const MAX_LOG_MESSAGES: usize = 1_000;
 /// The `mw1` prefix identifies this project's own key construction and prevents
 /// cross-project replay of logs with incompatible key shapes.
 pub const CACHE_KEY_PREFIX: &str = "mw1";
-
-/// Milliseconds of inactivity before one step is stalled.
-pub const WORKFLOW_STEP_STALL_MS: u64 = 180_000;
-
-/// Retry count allowed after a step stalls.
-///
-/// This excludes the initial attempt, so five retries produce six total attempts.
-pub const WORKFLOW_MAX_STALL_RETRIES: u32 = 5;
 
 /// Request for one subagent step, produced by [`StepSource`] and run by the driver.
 ///
@@ -95,8 +81,6 @@ pub struct WorkflowStepRequest {
     /// journal keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stall_ms: Option<u64>,
 }
 
 impl WorkflowStepRequest {
@@ -112,7 +96,6 @@ impl WorkflowStepRequest {
             effort: None,
             agent_type: None,
             isolation: None,
-            stall_ms: None,
         }
     }
 }
@@ -131,11 +114,6 @@ pub struct StepRolePolicy {
 }
 
 impl StepRolePolicy {
-    /// Permissive default for fallback mode and non-host callers.
-    pub fn permissive() -> Self {
-        Self::default()
-    }
-
     /// Tests whether a role name is available for this run. An unknown set permits
     /// all names and leaves final resolution to `resolve_agent_definition`.
     pub fn accepts(&self, name: &str) -> bool {
@@ -185,12 +163,8 @@ pub enum StepProgress {
 pub enum WorkflowError {
     /// Rejected before startup because validation or shape checks failed.
     Invalid(String),
-    /// Exceeded a named runtime limit.
-    CapExceeded(String),
     /// The source produced no steps or completion while the driver has no in-flight work.
     Deadlock(String),
-    /// The run budget is exhausted.
-    BudgetExhausted(String),
     /// A runtime script failure, such as an uncaught exception, boundary-cloning
     /// error, or synchronous time-slice overrun. Unlike [`WorkflowError::Invalid`],
     /// the script has already started and may be eligible for recovery guidance.
@@ -203,13 +177,7 @@ impl std::fmt::Display for WorkflowError {
             WorkflowError::Invalid(message) => {
                 write!(formatter, "Pre-start validation failed: {message}")
             }
-            WorkflowError::CapExceeded(message) => {
-                write!(formatter, "Runtime limit exceeded: {message}")
-            }
             WorkflowError::Deadlock(message) => write!(formatter, "Workflow deadlock: {message}"),
-            WorkflowError::BudgetExhausted(message) => {
-                write!(formatter, "Workflow budget exhausted: {message}")
-            }
             WorkflowError::Script(message) => {
                 write!(formatter, "Script execution failed: {message}")
             }
@@ -252,13 +220,10 @@ mod tests {
         assert_eq!(MAX_BOUNDARY_ITEMS, 4_096);
         assert_eq!(MAX_SCHEMA_NODES, 100_000);
         assert_eq!(MAX_SCHEMA_DEPTH, 10_000);
-        assert_eq!(MAX_STRUCTURED_OUTPUT_RETRIES, 5);
         assert_eq!(MAX_PROGRESS_ROWS, 1_000);
         assert_eq!(PROGRESS_TRIM_TARGET, 500);
         assert_eq!(MAX_PREVIEW_CHARS, 400);
         assert_eq!(MAX_LOG_MESSAGES, 1_000);
         assert_eq!(CACHE_KEY_PREFIX, "mw1");
-        assert_eq!(WORKFLOW_STEP_STALL_MS, 180_000);
-        assert_eq!(WORKFLOW_MAX_STALL_RETRIES, 5);
     }
 }

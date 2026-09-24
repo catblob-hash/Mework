@@ -15,10 +15,7 @@
 //! resolves on `PATH`, and any `lsp.json` entry claiming the same name or the
 //! same file extension wins over it.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 use serde_json::Value;
 
@@ -88,18 +85,17 @@ fn id_prefix(source: ResourceSource) -> &'static str {
     }
 }
 
+/// Whether `config` comes from the workspace's own `lsp.json` — a command the
+/// project names, which only an approved `lsp` call may start.
+pub fn is_project_config(config: &LspServerConfig) -> bool {
+    config
+        .id
+        .starts_with(&format!("{}_", id_prefix(ResourceSource::Workspace)))
+}
+
 /// The address of one entry: the file, then the JSON pointer of the key.
 pub fn location_for(path: &Path, name: &str) -> String {
     format!("{}#/lspServers/{name}", path.to_string_lossy())
-}
-
-/// Reads an entry's `location` back into the file and key it was built from.
-pub fn parse_location(location: &str) -> Option<(PathBuf, String)> {
-    let (path, name) = location.rsplit_once("#/lspServers/")?;
-    if path.is_empty() || name.is_empty() {
-        return None;
-    }
-    Some((PathBuf::from(path), name.to_owned()))
 }
 
 /// Server names Claude Code accepts, so a file round-trips between the two
@@ -710,28 +706,6 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     }
 }
 
-/// Drops one server from its `lsp.json`, leaving every other entry and every
-/// other top-level key exactly as the user wrote them. A project may have this
-/// file in version control, so deleting one server must not reflow the rest
-/// into a whole-file diff.
-pub fn remove_server_from_file(path: &Path, name: &str) -> Result<(), String> {
-    let display = path.display();
-    let text =
-        std::fs::read_to_string(path).map_err(|error| format!("无法读取 {display}：{error}"))?;
-    let document: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("{display} 不是合法的 JSON：{error}"))?;
-    if !document
-        .get("lspServers")
-        .and_then(Value::as_object)
-        .is_some_and(|servers| servers.contains_key(name))
-    {
-        return Err(format!("{display} 里已经没有这台服务器了"));
-    }
-    let edited = crate::json_edit::remove_object_member(&text, &["lspServers"], name)
-        .map_err(|error| format!("无法从 {display} 里删除这台服务器：{error}"))?;
-    crate::capabilities::write_config_file(path, &edited)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,14 +891,5 @@ mod tests {
         assert!(!gopls.descriptor.available);
         assert!(gopls.config.is_none());
         assert!(gopls.descriptor.description.contains("PATH"), "{}", gopls.descriptor.description);
-    }
-
-    #[test]
-    fn a_location_round_trips_through_its_parser() {
-        let path = Path::new("/home/me/.mework/lsp.json");
-        let location = location_for(path, "rust-analyzer");
-        let (parsed_path, name) = parse_location(&location).expect("location parses");
-        assert_eq!(parsed_path, path);
-        assert_eq!(name, "rust-analyzer");
     }
 }

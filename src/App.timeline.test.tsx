@@ -8,7 +8,7 @@ import type {
   ModelRunRequest,
   ToolContext
 } from "./types";
-import { resetAppMocks, answeredQuestionPair, documentWithModel, openTasksPane, model, runtimeMocks, settledStateTool, taskCreateContext, taskGetContext, taskListContext, taskUpdateContext } from "./test/appMocks";
+import { resetAppMocks, answeredQuestionPair, documentWithModel, openTasksPane, model, runtimeMocks, taskCreateContext, taskGetContext, taskListContext, taskUpdateContext } from "./test/appMocks";
 
 vi.mock("./lib/runtime", async (importOriginal) => {
   const { runtimeMocks } = await import("./test/appMockInstances");

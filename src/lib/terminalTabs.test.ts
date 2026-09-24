@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  activeTerminalTab,
   initialTerminalTabsState,
   terminalShellKey,
   terminalTabId,
@@ -44,7 +43,6 @@ describe("terminal tabs", () => {
     expect(Object.isFrozen(first.nextNumbers)).toBe(true);
     // No conversation has a terminal until one is asked for.
     expect(ids(initialTerminalTabsState)).toEqual([]);
-    expect(activeTerminalTab(first)).toBeNull();
   });
 
   it("does not resolve prototype properties as layouts", () => {
@@ -92,7 +90,6 @@ describe("terminal tabs", () => {
       const empty = close(add(initialTerminalTabsState), terminalTabId(1));
       expect(ids(empty)).toEqual([]);
       expect(layout(empty).activeId).toBeNull();
-      expect(activeTerminalTab(layout(empty))).toBeNull();
     });
 
     it("ignores a tab that is not there", () => {

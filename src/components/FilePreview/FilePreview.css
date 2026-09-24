@@ -1,0 +1,280 @@
+/* The file pane's previewers. Each fills the viewer below its breadcrumb row and scrolls inside
+   itself; the ones with controls float them in a pill at the bottom, over the content, so the
+   content keeps the whole height. */
+
+.file-preview {
+  position: relative; flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* ---- floating toolbar ---- */
+
+.file-preview__toolbar {
+  position: absolute; left: 50%; bottom: 10px; z-index: 2; transform: translateX(-50%);
+  max-width: calc(100% - 20px);
+  display: flex; align-items: center; gap: 2px; padding: 3px 6px 3px 3px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); color: var(--muted);
+  box-shadow: 0 2px 8px var(--color-000000-ap10);
+  white-space: nowrap;
+}
+.file-preview__toolbar .file-preview__tool {
+  width: 24px; height: 24px; flex: 0 0 24px; border-radius: 5px;
+}
+.file-preview__toolbar .file-preview__tool[aria-pressed="true"] { background: var(--active); color: var(--text); }
+.file-preview__zoom-label {
+  min-width: 44px; height: 24px; padding: 0 4px; border: 0; border-radius: 5px;
+  background: none; color: var(--text); font: 11px/24px var(--mono); cursor: pointer;
+}
+.file-preview__zoom-label:hover { background: var(--hover); }
+.file-preview__meta {
+  min-width: 0; padding-left: 6px; overflow: hidden; text-overflow: ellipsis;
+  color: var(--faint); font-size: 10.5px;
+}
+
+.file-preview__banner {
+  flex: 0 0 auto; margin: 0; padding: 5px 10px;
+  display: flex; align-items: center; gap: 6px;
+  border-bottom: 1px solid var(--border); background: var(--subtle); color: var(--muted); font-size: 11px;
+}
+
+.file-preview__unsupported {
+  flex: 1; min-height: 0; padding: 24px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  color: var(--muted); font-size: 11.5px; text-align: center;
+}
+.file-preview__unsupported p { max-width: 280px; margin: 0; line-height: 1.5; }
+.file-preview__reveal {
+  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
+  color: var(--text); font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.file-preview__reveal:hover { background: var(--hover); }
+
+/* ---- picture ---- */
+
+.file-preview__stage {
+  flex: 1; min-width: 0; min-height: 0; overflow: auto;
+  display: grid; padding: 16px 16px 52px;
+}
+/* The picture sits in the middle while it is smaller than the pane, and scrolls from its corner
+   once it is larger: `safe` keeps an oversized picture's left edge reachable. */
+.file-preview__stage > .file-preview__checker { place-self: safe center; }
+.file-preview__stage--fit { overflow: hidden; }
+/* A checkerboard behind the picture, so transparency shows as transparency rather than as the
+   pane's own colour. */
+.file-preview__checker {
+  display: grid; line-height: 0;
+  background-color: var(--color-f7f7f4);
+  background-image:
+    linear-gradient(45deg, var(--color-e5e5e0) 25%, transparent 25%, transparent 75%, var(--color-e5e5e0) 75%),
+    linear-gradient(45deg, var(--color-e5e5e0) 25%, transparent 25%, transparent 75%, var(--color-e5e5e0) 75%);
+  background-position: 0 0, 8px 8px;
+  background-size: 16px 16px;
+  box-shadow: 0 0 0 1px var(--border);
+}
+.file-preview__stage--fit .file-preview__checker { max-width: 100%; max-height: 100%; min-height: 0; }
+.file-preview__checker img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; image-rendering: auto; }
+.file-preview__stage--fit .file-preview__checker img { max-height: calc(100vh - 200px); }
+
+/* ---- HTML ---- */
+
+/* The page's shadow host: a fixed box the page scrolls inside, containing its own paint so a
+   `position: fixed` element in the page pins to the preview rather than to the app window. */
+.file-preview__html-host { flex: 1; min-width: 0; min-height: 0; contain: strict; overflow: auto; }
+.file-preview__html-inline { min-width: 0; }
+.file-preview__html-host--inline { contain: layout paint; overflow-x: auto; overflow-y: visible; max-width: 100%; }
+
+/* ---- PDF ---- */
+
+.file-preview__pdf-scroll {
+  flex: 1; min-width: 0; min-height: 0; overflow: auto;
+  background: var(--color-e4e4df);
+}
+.file-preview__pdf-pages {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  width: max-content; min-width: 100%; box-sizing: border-box; padding: 16px 16px 60px;
+}
+.file-preview__pdf-page {
+  position: relative; flex: 0 0 auto;
+  background: var(--color-ffffff); box-shadow: 0 1px 3px var(--color-000000-ap16);
+}
+.file-preview__pdf-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+/* pdf.js's text layer: the page's words, transparent and positioned over the drawing so they can
+   be selected. Taken from pdf.js's own viewer stylesheet, flattened. */
+.file-preview__pdf-page .textLayer {
+  color-scheme: only light;
+  position: absolute; inset: 0; overflow: clip; z-index: 0;
+  text-align: initial; opacity: 1; line-height: 1; letter-spacing: normal; word-spacing: normal;
+  -webkit-text-size-adjust: none; text-size-adjust: none; forced-color-adjust: none;
+  transform-origin: 0 0; caret-color: CanvasText;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+.file-preview__pdf-page .textLayer :is(span, br) {
+  color: transparent; position: absolute; white-space: pre; cursor: text;
+  transform-origin: 0% 0%; -webkit-user-select: text; user-select: text;
+}
+.file-preview__pdf-page .textLayer > :not(.markedContent),
+.file-preview__pdf-page .textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.file-preview__pdf-page .textLayer .markedContent { display: contents; }
+.file-preview__pdf-page .textLayer span[role="img"] { -webkit-user-select: none; user-select: none; cursor: default; }
+.file-preview__pdf-page .textLayer ::selection { background: var(--color-315eae-ap35); color: transparent; }
+.file-preview__pdf-page .textLayer br::selection { background: transparent; }
+.file-preview__pdf-page .textLayer .endOfContent {
+  display: block; position: absolute; inset: 100% 0 0; z-index: 0; cursor: default;
+  -webkit-user-select: none; user-select: none;
+}
+
+/* ---- audio ---- */
+
+.file-preview--audio { align-items: center; justify-content: center; padding: 20px; }
+.file-preview__audio-card {
+  width: min(560px, 100%); box-sizing: border-box; padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+}
+.file-preview__audio-title {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text); font-size: 12.5px; font-weight: 500;
+}
+.file-preview__waveform {
+  --audio-played: var(--text);
+  --audio-rest: var(--border-strong);
+  width: 100%; height: 72px; display: block; cursor: pointer; border-radius: 4px;
+  touch-action: none;
+}
+.file-preview__waveform:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+/* In a narrow pane the volume slider drops to its own line rather than squeezing the time. */
+.file-preview__audio-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; color: var(--muted); }
+.file-preview__audio-controls .file-preview__tool { width: 26px; height: 26px; flex: 0 0 26px; border-radius: 6px; }
+.file-preview__audio-controls .file-preview__play { background: var(--active); color: var(--text); }
+.file-preview__time { flex: 1 0 auto; padding: 0 6px; white-space: nowrap; color: var(--text); font: 11px var(--mono); }
+.file-preview__volume-group { display: flex; flex: 0 1 auto; align-items: center; gap: 4px; margin-left: auto; }
+.file-preview__volume { width: 90px; min-width: 60px; accent-color: var(--accent); }
+.file-preview__audio-meta { padding-left: 0; }
+
+/* ---- font ---- */
+
+.file-preview--font { overflow: auto; padding: 14px 16px 24px; gap: 16px; }
+.file-preview__font-header { display: flex; flex-direction: column; gap: 6px; }
+.file-preview__font-name { color: var(--text); font-size: 26px; line-height: 1.25; overflow-wrap: anywhere; }
+.file-preview__font-header .file-preview__meta { padding-left: 0; }
+.file-preview__font-sample-input {
+  height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); font: inherit; font-size: 12px;
+}
+.file-preview__font-sample-input:focus { outline: 2px solid var(--focus); outline-offset: -1px; }
+.file-preview__font-sizes { display: flex; flex-direction: column; gap: 8px; }
+.file-preview__font-row { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.file-preview__font-size { flex: 0 0 22px; color: var(--faint); font: 10px var(--mono); text-align: right; }
+.file-preview__font-sample {
+  min-width: 0; color: var(--text); line-height: 1.2;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.file-preview__font-glyphs {
+  padding-top: 12px; border-top: 1px solid var(--border);
+  color: var(--text); font-size: 22px; line-height: 1.5; overflow-wrap: anywhere;
+}
+.file-preview__font-glyphs p { margin: 0; }
+
+/* ---- delimited text ---- */
+
+.file-preview__csv-bar {
+  flex: 0 0 auto; min-height: 28px; padding: 0 10px;
+  display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid var(--border); color: var(--muted); font-size: 11px;
+}
+.file-preview__csv-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+.file-preview__csv-toggle input { margin: 0; accent-color: var(--accent); }
+.file-preview__csv-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; }
+.file-preview__csv { border-collapse: separate; border-spacing: 0; font-size: 11.5px; user-select: text; }
+.file-preview__csv th, .file-preview__csv td {
+  max-width: 320px; padding: 3px 8px;
+  border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; vertical-align: top;
+}
+.file-preview__csv thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--subtle); color: var(--text); font-weight: 600;
+}
+.file-preview__csv .file-preview__csv-index {
+  position: sticky; left: 0; z-index: 1; min-width: 28px;
+  background: var(--subtle); color: var(--faint); font: 10.5px var(--mono); font-weight: 400; text-align: right;
+}
+.file-preview__csv thead .file-preview__csv-index { top: 0; z-index: 2; }
+.file-preview__csv .file-preview__csv-number { text-align: right; font-variant-numeric: tabular-nums; }
+.file-preview__csv tbody tr:hover td { background: var(--hover); }
+
+/* ---- notebook ---- */
+
+.file-preview--notebook { overflow: auto; padding: 8px 12px 28px 4px; gap: 10px; font-size: 12.5px; line-height: 1.6; user-select: text; }
+.notebook__cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.notebook__row { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.notebook__prompt {
+  flex: 0 0 64px; padding-top: 6px;
+  color: var(--faint); font: 10.5px/1.6 var(--mono); text-align: right; white-space: nowrap;
+}
+.notebook__prompt--in { color: var(--color-3769bb); }
+.notebook__prompt--out { color: var(--color-a56312); }
+.notebook__body { flex: 1; min-width: 0; }
+.notebook__code {
+  margin: 0; padding: 6px 10px; overflow-x: auto;
+  border: 1px solid var(--color-e0e0db); border-radius: 6px; background: var(--color-f1f1ee);
+  font: 11.5px/1.55 var(--mono); white-space: pre;
+}
+.notebook__text {
+  margin: 0; padding: 4px 2px; overflow-x: auto;
+  font: 11.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.notebook__text--stderr { background: var(--color-fff5f5); }
+.notebook__text--error { background: var(--color-fff0f0); border-radius: 4px; padding: 6px 8px; }
+.notebook__image { display: block; max-width: 100%; height: auto; background: var(--color-ffffff); }
+.notebook__output > .markdown-content { padding-top: 4px; }
+
+/* ---- terminal colours in captured output ---- */
+
+.ansi-bold { font-weight: 700; }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-fg-0 { color: var(--color-1b1b1a); }
+.ansi-fg-1 { color: var(--color-a23737); }
+.ansi-fg-2 { color: var(--color-287a38); }
+.ansi-fg-3 { color: var(--color-92600d); }
+.ansi-fg-4 { color: var(--color-3769bb); }
+.ansi-fg-5 { color: var(--color-aa4f6a); }
+.ansi-fg-6 { color: var(--color-267f99); }
+.ansi-fg-7 { color: var(--color-777771); }
+.ansi-fg-8 { color: var(--color-888881); }
+.ansi-fg-9 { color: var(--color-c43d3d); }
+.ansi-fg-10 { color: var(--color-218a62); }
+.ansi-fg-11 { color: var(--color-a56312); }
+.ansi-fg-12 { color: var(--color-315eae); }
+.ansi-fg-13 { color: var(--color-7c5cd6); }
+.ansi-fg-14 { color: var(--color-279070); }
+.ansi-fg-15 { color: var(--color-94948d); }
+.ansi-bg-0 { background: var(--color-1b1b1a); }
+.ansi-bg-1 { background: var(--color-f6dedb); }
+.ansi-bg-2 { background: var(--color-eaf7f0); }
+.ansi-bg-3 { background: var(--color-fff5e5); }
+.ansi-bg-4 { background: var(--color-dce3f3); }
+.ansi-bg-5 { background: var(--color-efd0cd); }
+.ansi-bg-6 { background: var(--color-edf7f0); }
+.ansi-bg-7 { background: var(--color-e4e4df); }
+.ansi-bg-8 { background: var(--color-989892); }
+.ansi-bg-9 { background: var(--color-edc7c7); }
+.ansi-bg-10 { background: var(--color-a9c5b5); }
+.ansi-bg-11 { background: var(--color-fbf6eb); }
+.ansi-bg-12 { background: var(--color-cfdcff); }
+.ansi-bg-13 { background: var(--color-efcfcb); }
+.ansi-bg-14 { background: var(--color-eaf7f1); }
+.ansi-bg-15 { background: var(--color-f7f7f4); }

@@ -166,7 +166,7 @@ function fillMissingChoices(frame: Record<string, unknown>): boolean {
 /**
  * Create a line rewriter for one response stream; index state is stream-local.
  */
-export function makeChatLineRewriter(): (line: string) => string {
+function makeChatLineRewriter(): (line: string) => string {
   const indexes: ToolCallIndexState = { byId: new Map(), byIndex: new Map(), next: 0, last: null };
   return (line: string): string => {
     if (!line.startsWith("data:")) return line;
@@ -197,18 +197,13 @@ export function makeChatLineRewriter(): (line: string) => string {
   };
 }
 
-/** Stateless test entry point for normalizing one SSE line. */
-export function normalizeChatSseLine(line: string): string {
-  return makeChatLineRewriter()(line);
-}
-
 /**
  * Add missing `reasoning_content` sentinels to compatible request bodies.
  *
  * A request is adapted only when another message already supplies the field,
  * preserving byte-for-byte behavior for other endpoint dialects.
  */
-export function backfillReasoningContentFromBody(text: string): string {
+function backfillReasoningContentFromBody(text: string): string {
   if (!text.includes('"reasoning_content"') || !text.includes(TOOL_CALLS_MARKER)) return text;
   let body: unknown;
   try {

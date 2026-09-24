@@ -14,3 +14,4 @@ Patterns use Rust `regex` syntax — character classes, alternation, anchors and
 - [read](read.html) — open a file at the line a match reported
 - [lsp](lsp.html) — definitions and references instead of text matches
 - [bash](bash.html) — `rg` when you need flags this tool does not expose
+- [find_content](find_content.html) — describe what you are after when no pattern spells it

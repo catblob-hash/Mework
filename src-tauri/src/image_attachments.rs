@@ -6,18 +6,17 @@
 
 use std::{
     collections::HashSet,
-    fs,
-    io::{Cursor, Read, Write},
+    io::{Cursor, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{Duration, SystemTime},
 };
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
+pub use crate::content_store::ReconcileReport;
+use crate::content_store::{hex_digest, read_regular_file, ContentDirectory, Label};
 use crate::model::{AppDocument, ContextItem, ImageAttachment};
 
 pub const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
@@ -30,17 +29,11 @@ pub const MAX_REQUEST_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_DECODED_IMAGE_BYTES: usize = (MAX_IMAGE_ATTACHMENT_PIXELS as usize) * 4;
 const MAX_DECODER_WORKING_BYTES: usize = MAX_DECODED_IMAGE_BYTES + 32 * 1024 * 1024;
 const PLACEHOLDER_KEY: &str = "$meworkImageAttachment";
-const QUARANTINE_DIRECTORY: &str = ".orphaned";
-const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
-const QUARANTINE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const LABEL: Label = Label {
+    noun: "image attachment",
+    title: "Image attachment",
+};
 static IMAGE_ATTACHMENT_FS_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReconcileReport {
-    pub restored: usize,
-    pub quarantined: usize,
-    pub deleted: usize,
-}
 
 /// Encoding stored in an image placeholder.
 ///
@@ -62,13 +55,18 @@ impl WireEncoding {
 
 #[derive(Clone, Debug)]
 pub struct ImageAttachmentStore {
-    root: PathBuf,
+    directory: ContentDirectory,
 }
 
 impl ImageAttachmentStore {
     pub fn new(app_data: &Path) -> Self {
         Self {
-            root: app_data.join("image-attachments"),
+            directory: ContentDirectory::new(
+                app_data.join("image-attachments"),
+                LABEL,
+                &IMAGE_ATTACHMENT_FS_LOCK,
+                &[],
+            ),
         }
     }
 
@@ -86,18 +84,11 @@ impl ImageAttachmentStore {
         }
         let canonical = canonicalize_image(bytes)?;
         let id = hex_digest(&canonical.bytes);
-        let _guard = image_attachment_fs_lock();
-        ensure_directory_within(
-            &self.root,
-            self.root.parent().ok_or_else(|| {
-                "Image attachment root directory has no parent directory".to_owned()
-            })?,
-            true,
-            "image attachment directory",
-        )?;
-        self.restore_quarantined_locked(&id)?;
+        let _guard = self.directory.lock();
+        self.directory.ensure_root(true)?;
+        self.directory.restore_quarantined_locked(&id)?;
         let target = self.path_for_id(&id)?;
-        match read_regular_file(&target) {
+        match read_image_file(&target) {
             Ok(existing) => {
                 if existing != canonical.bytes {
                     return Err(format!(
@@ -127,9 +118,9 @@ impl ImageAttachmentStore {
 
     pub fn read_bytes(&self, image: &ImageAttachment) -> Result<Vec<u8>, String> {
         validate_metadata(image)?;
-        let _guard = image_attachment_fs_lock();
-        self.restore_quarantined_locked(&image.id)?;
-        let bytes = read_regular_file(&self.path_for_id(&image.id)?)
+        let _guard = self.directory.lock();
+        self.directory.restore_quarantined_locked(&image.id)?;
+        let bytes = read_image_file(&self.path_for_id(&image.id)?)
             .map_err(|error| format!("Could not read image attachment {}: {error}", image.id))?;
         if bytes.len() as u64 != image.bytes {
             return Err(format!(
@@ -175,9 +166,9 @@ impl ImageAttachmentStore {
 
     pub fn data_url_by_id(&self, id: &str) -> Result<String, String> {
         validate_id(id)?;
-        let _guard = image_attachment_fs_lock();
-        self.restore_quarantined_locked(id)?;
-        let bytes = read_regular_file(&self.path_for_id(id)?)
+        let _guard = self.directory.lock();
+        self.directory.restore_quarantined_locked(id)?;
+        let bytes = read_image_file(&self.path_for_id(id)?)
             .map_err(|error| format!("Could not read image attachment {id}: {error}"))?;
         if bytes.is_empty() || bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES || hex_digest(&bytes) != id
         {
@@ -217,27 +208,8 @@ impl ImageAttachmentStore {
         let previous_ids = referenced_image_ids(previous);
         let mut next_ids = referenced_image_ids(next);
         next_ids.extend(pinned.iter().cloned());
-        let quarantine_ids = previous_ids
-            .difference(&next_ids)
-            .cloned()
-            .collect::<HashSet<_>>();
-        let now = SystemTime::now();
-        let _guard = image_attachment_fs_lock();
-        let mut report = ReconcileReport::default();
-
-        for id in &next_ids {
-            report.restored += usize::from(self.restore_quarantined_locked(id)?);
-        }
-        // A transition observes only two committed snapshots. A hash dropped
-        // here may simultaneously belong to a composer draft or request
-        // snapshot outside both documents, so every transition candidate
-        // remains recoverable. Startup reconciliation owns physical deletion
-        // after its complete persisted-document scan.
-        for id in &quarantine_ids {
-            report.quarantined += usize::from(self.quarantine_locked(id, now)?);
-        }
-        report.quarantined += self.quarantine_old_unreferenced_locked(&next_ids, now)?;
-        Ok(report)
+        self.directory
+            .reconcile_transition(&previous_ids, &next_ids)
     }
 
     /// Startup-only reconciliation. Call this before model/tool operations can
@@ -256,403 +228,27 @@ impl ImageAttachmentStore {
     ) -> Result<ReconcileReport, String> {
         let mut referenced = referenced_image_ids(document);
         referenced.extend(pinned.iter().cloned());
-        let now = SystemTime::now();
-        let _guard = image_attachment_fs_lock();
-        let mut report = ReconcileReport::default();
-
-        for id in &referenced {
-            report.restored += usize::from(self.restore_quarantined_locked(id)?);
-        }
-        report.deleted += self.delete_expired_quarantine_locked(&referenced, now)?;
-        report.quarantined += self.quarantine_old_unreferenced_locked(&referenced, now)?;
-        Ok(report)
+        self.directory.reconcile_startup(&referenced)
     }
 
     /// Used only by the explicit full-document reset after its durability
     /// barrier and dependency fence have succeeded.
     pub fn purge_all(&self) -> Result<(), String> {
-        let _guard = image_attachment_fs_lock();
-        let metadata = match fs::symlink_metadata(&self.root) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(format!(
-                    "Could not read image attachment directory: {error}"
-                ))
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err("Image attachment root path is not a regular directory; recursive cleanup is denied".into());
-        }
-        ensure_directory_within(
-            &self.root,
-            self.root.parent().ok_or_else(|| {
-                "Image attachment root directory has no parent directory".to_owned()
-            })?,
-            false,
-            "image attachment directory",
-        )?;
-        fs::remove_dir_all(&self.root)
-            .map_err(|error| format!("Could not remove image attachment directory: {error}"))
+        self.directory.purge_all()
     }
 
     fn path_for_id(&self, id: &str) -> Result<PathBuf, String> {
-        validate_id(id)?;
-        Ok(self.root.join(id))
+        self.directory.path_for_id(id)
     }
 
+    #[cfg(test)]
     fn quarantine_path_for_id(&self, id: &str) -> Result<PathBuf, String> {
-        validate_id(id)?;
-        Ok(self.root.join(QUARANTINE_DIRECTORY).join(id))
-    }
-
-    fn restore_quarantined_locked(&self, id: &str) -> Result<bool, String> {
-        let Some(()) = ensure_directory_within(
-            &self.root,
-            self.root.parent().ok_or_else(|| {
-                "Image attachment root directory has no parent directory".to_owned()
-            })?,
-            false,
-            "image attachment directory",
-        )?
-        else {
-            return Ok(false);
-        };
-        let active = self.path_for_id(id)?;
-        match fs::symlink_metadata(&active) {
-            Ok(metadata) => {
-                ensure_regular_metadata(&metadata, &active)?;
-                return Ok(false);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "Could not inspect image attachment path {}: {error}",
-                    active.display()
-                ))
-            }
-        }
-
-        let quarantine = self.root.join(QUARANTINE_DIRECTORY);
-        let Some(()) = ensure_directory_within(
-            &quarantine,
-            &self.root,
-            false,
-            "image attachment quarantine directory",
-        )?
-        else {
-            return Ok(false);
-        };
-        let quarantined = self.quarantine_path_for_id(id)?;
-        let metadata = match fs::symlink_metadata(&quarantined) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(format!(
-                    "Could not read quarantined image attachment {}: {error}",
-                    quarantined.display()
-                ))
-            }
-        };
-        ensure_regular_metadata(&metadata, &quarantined)?;
-        fs::rename(&quarantined, &active)
-            .map_err(|error| format!("Could not restore image attachment {id}: {error}"))?;
-        Ok(true)
-    }
-
-    fn quarantine_locked(&self, id: &str, now: SystemTime) -> Result<bool, String> {
-        let Some(()) = ensure_directory_within(
-            &self.root,
-            self.root.parent().ok_or_else(|| {
-                "Image attachment root directory has no parent directory".to_owned()
-            })?,
-            false,
-            "image attachment directory",
-        )?
-        else {
-            return Ok(false);
-        };
-        let active = self.path_for_id(id)?;
-        let metadata = match fs::symlink_metadata(&active) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(format!(
-                    "Could not inspect image attachment path {}: {error}",
-                    active.display()
-                ))
-            }
-        };
-        ensure_regular_metadata(&metadata, &active)?;
-
-        let quarantine = self.root.join(QUARANTINE_DIRECTORY);
-        ensure_directory_within(
-            &quarantine,
-            &self.root,
-            true,
-            "image attachment quarantine directory",
-        )?;
-        let target = self.quarantine_path_for_id(id)?;
-        match fs::symlink_metadata(&target) {
-            Ok(existing) => {
-                ensure_regular_metadata(&existing, &target)?;
-                fs::remove_file(&target).map_err(|error| {
-                    format!("Could not replace quarantined image attachment {id}: {error}")
-                })?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "Could not read quarantined image attachment {id}: {error}"
-                ))
-            }
-        }
-        fs::rename(&active, &target)
-            .map_err(|error| format!("Could not quarantine image attachment {id}: {error}"))?;
-        let touch_result = fs::OpenOptions::new()
-            .write(true)
-            .open(&target)
-            .and_then(|file| file.set_modified(now));
-        if let Err(error) = touch_result {
-            let _ = fs::rename(&target, &active);
-            return Err(format!(
-                "Could not record quarantine time for image attachment {id}: {error}"
-            ));
-        }
-        Ok(true)
-    }
-
-    fn quarantine_old_unreferenced_locked(
-        &self,
-        referenced: &HashSet<String>,
-        now: SystemTime,
-    ) -> Result<usize, String> {
-        let Some(()) = ensure_directory_within(
-            &self.root,
-            self.root.parent().ok_or_else(|| {
-                "Image attachment root directory has no parent directory".to_owned()
-            })?,
-            false,
-            "image attachment directory",
-        )?
-        else {
-            return Ok(0);
-        };
-        let entries = match fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(format!(
-                    "Could not read image attachment directory: {error}"
-                ))
-            }
-        };
-        let mut candidates = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!("Could not read image attachment directory entry: {error}")
-            })?;
-            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if validate_id(&id).is_err() || referenced.contains(&id) {
-                continue;
-            }
-            let metadata = entry.metadata().map_err(|error| {
-                format!("Could not read metadata for image attachment {id}: {error}")
-            })?;
-            if !entry
-                .file_type()
-                .map_err(|error| {
-                    format!("Could not read file type for image attachment {id}: {error}")
-                })?
-                .is_file()
-                || !is_old_enough(&metadata, now, ORPHAN_GRACE_PERIOD)
-            {
-                continue;
-            }
-            candidates.push(id);
-        }
-        let mut quarantined = 0;
-        for id in candidates {
-            quarantined += usize::from(self.quarantine_locked(&id, now)?);
-        }
-        Ok(quarantined)
-    }
-
-    fn delete_expired_quarantine_locked(
-        &self,
-        referenced: &HashSet<String>,
-        now: SystemTime,
-    ) -> Result<usize, String> {
-        let quarantine = self.root.join(QUARANTINE_DIRECTORY);
-        let Some(()) = ensure_directory_within(
-            &quarantine,
-            &self.root,
-            false,
-            "image attachment quarantine directory",
-        )?
-        else {
-            return Ok(0);
-        };
-        let entries = match fs::read_dir(&quarantine) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(format!(
-                    "Could not read image attachment quarantine directory: {error}"
-                ))
-            }
-        };
-        let mut deleted = 0;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!("Could not read quarantined image attachment directory entry: {error}")
-            })?;
-            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if validate_id(&id).is_err() || referenced.contains(&id) {
-                continue;
-            }
-            let file_type = entry.file_type().map_err(|error| {
-                format!("Could not read file type for quarantined image attachment {id}: {error}")
-            })?;
-            if !file_type.is_file() {
-                continue;
-            }
-            let metadata = entry.metadata().map_err(|error| {
-                format!("Could not read metadata for quarantined image attachment {id}: {error}")
-            })?;
-            if !is_old_enough(&metadata, now, QUARANTINE_RETENTION) {
-                continue;
-            }
-            fs::remove_file(entry.path()).map_err(|error| {
-                format!("Could not delete expired quarantined image attachment {id}: {error}")
-            })?;
-            deleted += 1;
-        }
-        Ok(deleted)
+        self.directory.quarantine_path_for_id(id)
     }
 }
 
-fn image_attachment_fs_lock() -> std::sync::MutexGuard<'static, ()> {
-    IMAGE_ATTACHMENT_FS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn ensure_directory_within(
-    path: &Path,
-    parent: &Path,
-    create: bool,
-    label: &str,
-) -> Result<Option<()>, String> {
-    if create {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(format!(
-                    "{label} is not a regular directory; access is denied"
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(path)
-                    .map_err(|error| format!("Could not create {label}: {error}"))?;
-            }
-            Err(error) => return Err(format!("Could not inspect {label}: {error}")),
-        }
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
-        Err(error) => return Err(format!("Could not inspect {label}: {error}")),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!(
-            "{label} is not a regular directory; access is denied"
-        ));
-    }
-    let canonical_parent = fs::canonicalize(parent)
-        .map_err(|error| format!("Could not canonicalize parent directory of {label}: {error}"))?;
-    let canonical_path = fs::canonicalize(path)
-        .map_err(|error| format!("Could not canonicalize {label}: {error}"))?;
-    if canonical_path.parent() != Some(canonical_parent.as_path()) {
-        return Err(format!(
-            "{label} escapes the fixed application-data path; access is denied"
-        ));
-    }
-    Ok(Some(()))
-}
-
-fn ensure_regular_metadata(metadata: &fs::Metadata, path: &Path) -> Result<(), String> {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "Image attachment path {} is not a regular file; access is denied",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(std::io::Error::other(
-            "Image attachment path is not a regular file",
-        ));
-    }
-    if metadata.len() > MAX_IMAGE_ATTACHMENT_BYTES as u64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Image attachment exceeds the {} MiB read limit",
-                MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
-            ),
-        ));
-    }
-
-    let file = fs::File::open(path)?;
-    let opened_metadata = file.metadata()?;
-    if !opened_metadata.is_file() {
-        return Err(std::io::Error::other(
-            "Image attachment path is not a regular file",
-        ));
-    }
-    if opened_metadata.len() > MAX_IMAGE_ATTACHMENT_BYTES as u64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Image attachment exceeds the {} MiB read limit",
-                MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
-            ),
-        ));
-    }
-
-    // The file may grow or be replaced after either metadata check. Reading at
-    // most limit + 1 keeps that race bounded; the extra byte distinguishes an
-    // exact-limit image from an oversized one without allocating the whole file.
-    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
-    file.take((MAX_IMAGE_ATTACHMENT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Image attachment exceeds the {} MiB read limit",
-                MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
-            ),
-        ));
-    }
-    Ok(bytes)
-}
-
-fn is_old_enough(metadata: &fs::Metadata, now: SystemTime, minimum: Duration) -> bool {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| now.duration_since(modified).ok())
-        .is_some_and(|age| age >= minimum)
+fn read_image_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_regular_file(path, MAX_IMAGE_ATTACHMENT_BYTES, LABEL.title)
 }
 
 pub fn referenced_image_ids(document: &AppDocument) -> HashSet<String> {
@@ -947,13 +543,6 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
@@ -1690,7 +1279,12 @@ fn validate_canonical_webp_container(bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_store::{ORPHAN_GRACE_PERIOD, QUARANTINE_RETENTION};
     use serde_json::json;
+    use std::{
+        fs,
+        time::{Duration, SystemTime},
+    };
 
     // Small valid 1x1 RGBA PNG.
     const PNG: &[u8] = &[
@@ -1717,24 +1311,6 @@ mod tests {
         output
     }
 
-    fn test_solid_png(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
-        let pixels = pixel
-            .into_iter()
-            .cycle()
-            .take((u64::from(width) * u64::from(height) * 4) as usize)
-            .collect::<Vec<_>>();
-        let mut output = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut output, width, height);
-            encoder.set_depth(png::BitDepth::Eight);
-            encoder.set_color(png::ColorType::Rgba);
-            let mut writer = encoder.write_header().unwrap();
-            writer.write_image_data(&pixels).unwrap();
-            writer.finish().unwrap();
-        }
-        output
-    }
-
     fn test_jpeg_2x1() -> Vec<u8> {
         let mut jpeg = base64::engine::general_purpose::STANDARD
             .decode("/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAABAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD4H8Q/8h/Uv+vmX/0M0UUV/ptkP/Ipwn/XuH/pKPAzr/kZ4r/r5P8A9KZ//9k=")
@@ -1748,19 +1324,6 @@ mod tests {
         let mut output = Vec::new();
         image_webp::WebPEncoder::new(&mut output)
             .encode(&pixel, 1, 1, image_webp::ColorType::Rgba8)
-            .unwrap();
-        output
-    }
-
-    fn test_solid_webp(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
-        let pixels = pixel
-            .into_iter()
-            .cycle()
-            .take((u64::from(width) * u64::from(height) * 4) as usize)
-            .collect::<Vec<_>>();
-        let mut output = Vec::new();
-        image_webp::WebPEncoder::new(&mut output)
-            .encode(&pixels, width, height, image_webp::ColorType::Rgba8)
             .unwrap();
         output
     }
@@ -2268,6 +1831,7 @@ mod tests {
                 id: "queue-image".into(),
                 content: String::new(),
                 images: vec![image.clone()],
+                files: Vec::new(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             });
         conversation.contexts = vec![
@@ -2509,7 +2073,7 @@ mod tests {
         fs::write(&unrelated, b"keep").unwrap();
 
         store.purge_all().unwrap();
-        assert!(!store.root.exists());
+        assert!(!store.directory.root().exists());
         assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
     }
 

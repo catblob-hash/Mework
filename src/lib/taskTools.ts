@@ -7,9 +7,9 @@ import { MEMORY_TOOL_NAME_SET } from "./memoryTools";
  * Keep descriptors for timeline rendering, but exclude them from selection and
  * persisted enabled lists. Mirrors Rust `agents::TASK_RUNTIME_TOOL_NAMES`.
  */
-export const TASK_RUNTIME_TOOL_NAMES = ["task_wait", "task_list", "box"] as const;
+const TASK_RUNTIME_TOOL_NAMES = ["task_wait", "task_list", "box"] as const;
 
-export const TASK_RUNTIME_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_RUNTIME_TOOL_NAMES);
+const TASK_RUNTIME_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_RUNTIME_TOOL_NAMES);
 
 /**
  * The preview tools that bring the conversation's page into existence.
@@ -20,11 +20,11 @@ export const TASK_RUNTIME_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_RUNT
  * produce a page and are deliberately absent.
  *
  * This is a page roster, not a task roster: a page is a view of the dev server
- * and has no task address of its own. Only `preview_start` appears in
- * {@link TASK_PRODUCING_TOOL_NAMES}, because only it starts the process a
+ * and has no task address of its own. Only `preview_start` appears in Rust
+ * `agents::TASK_PRODUCING_TOOL_NAMES`, because only it starts the process a
  * `preview:<serverId>` row stands for.
  */
-export const PREVIEW_PAGE_TOOL_NAMES = [
+const PREVIEW_PAGE_TOOL_NAMES = [
   "preview_start",
   "preview_console_logs",
   "preview_screenshot",
@@ -40,7 +40,7 @@ export const PREVIEW_PAGE_TOOL_NAMES = [
   "preview_find_logs"
 ] as const;
 
-export const PREVIEW_PAGE_TOOL_NAME_SET: ReadonlySet<string> = new Set(PREVIEW_PAGE_TOOL_NAMES);
+const PREVIEW_PAGE_TOOL_NAME_SET: ReadonlySet<string> = new Set(PREVIEW_PAGE_TOOL_NAMES);
 
 export function isPreviewPageToolName(name: string): boolean {
   return PREVIEW_PAGE_TOOL_NAME_SET.has(name);
@@ -67,7 +67,7 @@ export function isPreviewToolName(name: string): boolean {
  * else: the preview settings offer it under `preview_logs`, and the timeline
  * does not offer to re-place a call against a page that is gone.
  */
-export const DECISION_TOOL_NAMES = [
+const DECISION_TOOL_NAMES = [
   "find_content",
   "find_files",
   "find_output",
@@ -78,7 +78,7 @@ export const DECISION_TOOL_NAMES = [
   "preview_find_logs"
 ] as const;
 
-export const DECISION_TOOL_NAME_SET: ReadonlySet<string> = new Set(DECISION_TOOL_NAMES);
+const DECISION_TOOL_NAME_SET: ReadonlySet<string> = new Set(DECISION_TOOL_NAMES);
 
 export function isDecisionToolName(name: string): boolean {
   return DECISION_TOOL_NAME_SET.has(name);
@@ -124,7 +124,7 @@ export const DECISION_PARAMETER_TOOL_NAMES = [
   "preview_fill"
 ] as const;
 
-export const DECISION_PARAMETER_TOOL_NAME_SET: ReadonlySet<string> = new Set(DECISION_PARAMETER_TOOL_NAMES);
+const DECISION_PARAMETER_TOOL_NAME_SET: ReadonlySet<string> = new Set(DECISION_PARAMETER_TOOL_NAMES);
 
 export function takesDecisionParameters(name: string): boolean {
   return DECISION_PARAMETER_TOOL_NAME_SET.has(name);
@@ -149,45 +149,17 @@ export function scoresMisses(name: string): boolean {
 }
 
 /**
- * Enabling any producer can create a task-list row, making the runtime tools reachable.
- *
- * Mirrors Rust `agents::TASK_PRODUCING_TOOL_NAMES`, which maps onto
- * `orchestration::TaskRef`: agents and workflows use the agent pool,
- * `preview_start` starts the dev-server process behind a `preview:<serverId>`
- * row, and shells register shell tasks. The fourth `TaskRef` address,
- * `Terminal`, is deliberately absent: terminals are opened manually, never
- * produced by a tool. The preview page tools are absent for the opposite
- * reason — a page is a view of the server, not a task — and `web_search` /
- * `web_fetch` are ordinary asynchronous tools whose results stay on their calls.
- */
-export const TASK_PRODUCING_TOOL_NAMES = [
-  "agent_spawn",
-  "workflow",
-  "bash",
-  "zsh",
-  "sh",
-  "powershell",
-  "bash_find_output",
-  "zsh_find_output",
-  "sh_find_output",
-  "powershell_find_output",
-  "preview_start"
-] as const;
-
-export const TASK_PRODUCING_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_PRODUCING_TOOL_NAMES);
-
-/**
  * Catalog name for the on-demand skill tool. It is host-derived from
  * `skillToolEnabled` and the number of resolved skills.
  */
-export const SKILL_TOOL_NAME = "skill";
+const SKILL_TOOL_NAME = "skill";
 
 /**
  * Catalog name for on-demand MCP tool loading. Host-derived from
  * `mcpToolDiscoveryEnabled` and the number of tools a run actually withheld.
  * Mirrors Rust `capabilities::TOOL_SEARCH_TOOL`.
  */
-export const TOOL_SEARCH_TOOL_NAME = "tool_search";
+const TOOL_SEARCH_TOOL_NAME = "tool_search";
 
 /**
  * Catalog names for the plan-mode tools. The host derives them from the
@@ -196,9 +168,9 @@ export const TOOL_SEARCH_TOOL_NAME = "tool_search";
  * plan mode is the user's own choice in the composer, never a tool call.
  * Mirrors the Rust plan tool names.
  */
-export const PLAN_TOOL_NAMES = ["plan", "exit_plan_mode"] as const;
+const PLAN_TOOL_NAMES = ["plan", "exit_plan_mode"] as const;
 
-export const PLAN_TOOL_NAME_SET: ReadonlySet<string> = new Set(PLAN_TOOL_NAMES);
+const PLAN_TOOL_NAME_SET: ReadonlySet<string> = new Set(PLAN_TOOL_NAMES);
 
 /**
  * Catalog names for the two web tools. They follow the conversation's single
@@ -209,16 +181,12 @@ export const PLAN_TOOL_NAME_SET: ReadonlySet<string> = new Set(PLAN_TOOL_NAMES);
  * the picker offering them individually would promise a shape the upstream may
  * not have. Mirrors Rust `web_search::WEB_TOOL_NAMES`.
  */
-export const WEB_TOOL_NAMES = ["web_search", "web_fetch"] as const;
+const WEB_TOOL_NAMES = ["web_search", "web_fetch"] as const;
 
-export const WEB_TOOL_NAME_SET: ReadonlySet<string> = new Set(WEB_TOOL_NAMES);
+const WEB_TOOL_NAME_SET: ReadonlySet<string> = new Set(WEB_TOOL_NAMES);
 
 export function isWebToolName(name: string): boolean {
   return WEB_TOOL_NAME_SET.has(name);
-}
-
-export function isTaskRuntimeToolName(name: string): boolean {
-  return TASK_RUNTIME_TOOL_NAME_SET.has(name);
 }
 
 /**

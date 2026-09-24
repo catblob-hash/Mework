@@ -45,17 +45,6 @@ export interface TaskMetrics {
   elapsedMs: number | null;
 }
 
-/** Every task kind the sidebar can show. */
-export type TaskItemKind =
-  | "subagent"
-  | "workflow"
-  | "terminal"
-  | "shell"
-  | "preview"
-  | "browser"
-  | "plan"
-  | "fork";
-
 interface TaskItemBase {
   /** Source identity captured when the row is derived, never the active selection. */
   conversationId?: string;
@@ -397,7 +386,7 @@ const stoppingAutomationTool = "browser";
  * committed URL's origin stands in for it, which is also how the preview pane
  * decides which row is open.
  */
-export function pageIsServedBy(
+function pageIsServedBy(
   page: BrowserStatus,
   servers: PreviewServerSnapshot[]
 ): boolean {
@@ -582,7 +571,7 @@ function shellItem(
   };
 }
 
-export function taskItemSourceIdentity(item: TaskItem, modelRequestId: string | null = null): string {
+function taskItemSourceIdentity(item: TaskItem, modelRequestId: string | null = null): string {
   if (item.kind === "aborted") return item.sourceIdentity;
   if (item.kind === "subagent" || item.kind === "workflow") {
     return `agent:${item.agent.callIds.at(-1) ?? item.agent.id}:${item.agent.createdAt}`;
@@ -604,35 +593,6 @@ export function taskItemSourceIdentity(item: TaskItem, modelRequestId: string | 
   // the card, so it identifies the decision without the child having to exist.
   if (item.kind === "fork") return `fork:${item.decision.forkId}`;
   throw new Error("Unknown task item kind");
-}
-
-export function userAbortedTaskRecord(
-  item: TaskItem,
-  modelRequestId: string | null,
-  id: string,
-  endedAt: string
-): UserAbortedTaskRecord {
-  // The plan row carries no stop control, so it never reaches this.
-  if (item.kind === "plan") throw new Error("A plan row cannot be aborted");
-  // Neither does a fork decision: it is settled the moment it exists.
-  if (item.kind === "fork") throw new Error("A fork decision row cannot be aborted");
-  // A dev server is a state, not a task with a history — the same argument the
-  // preview page's records were dropped under. Stopping it kills the process,
-  // drops its log ring and retires its id; what a record would describe is a
-  // thing that no longer exists in any sense, and the row simply goes.
-  if (item.kind === "preview") throw new Error("A dev server row cannot be aborted");
-  const sourceKind = item.kind === "aborted" ? item.sourceKind : item.kind;
-  return {
-    id,
-    sourceKind,
-    sourceIdentity: taskItemSourceIdentity(item, modelRequestId),
-    label: item.label,
-    detail: item.detail,
-    metrics: { ...item.metrics },
-    startedAt: item.startedAt,
-    endedAt,
-    reason: "userAborted"
-  };
 }
 
 function abortedTaskItem(record: UserAbortedTaskRecord, messages: TaskContainerMessages): TaskItem {
@@ -935,17 +895,6 @@ export function finishedTaskItems(items: TaskItem[]): TaskItem[] {
 
 export function runningTaskItems(items: TaskItem[]): TaskItem[] {
   return items.filter((item) => item.state === "running" || item.kind === "plan");
-}
-
-/**
- * The agent a task row opens in the main area; other kinds have none.
- *
- * A workflow run is one of the other kinds. It is a script, not an agent, and
- * the transcript behind its view is the driver's own synthetic step list —
- * handing it back here is how it used to end up in the read-only panel.
- */
-export function taskItemAgent(item: TaskItem): SubagentView | null {
-  return item.kind === "subagent" ? item.agent : null;
 }
 
 /** Every row of the tree, parents before their own children. */

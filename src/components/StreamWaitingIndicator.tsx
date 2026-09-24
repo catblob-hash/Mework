@@ -5,60 +5,51 @@ import { useI18n } from "../i18n";
 import { formatCompactTokenCount } from "../lib/contextTokens";
 import type { LiveReasoningView } from "../lib/runContexts";
 import { RollingNumber } from "./RollingNumber";
-import { STREAM_CAT_FIGURE, STREAM_CAT_LAPTOP, STREAM_CAT_VIEWBOX } from "./streamCatRig";
-import type { StreamCatPart } from "./streamCatRig";
+import {
+  CAT_BODY_WITHOUT_PAWS,
+  CAT_EYE_WHITES,
+  CAT_FAR_PAW,
+  CAT_LAPTOP,
+  CAT_LEDGE_Y,
+  CAT_LIDS,
+  CAT_MUZZLE,
+  CAT_NEAR_PAW,
+  CAT_ON_LEDGE,
+  CAT_PUPILS,
+  CAT_SCENE_VIEWBOX,
+  CAT_TAIL,
+  CAT_WHISKERS
+} from "./catArt";
 import { getToolPresentation, isHoistedToolCall } from "./ToolRenderers";
 
 type Translate = ReturnType<typeof useI18n>["t"];
 
-export const CAT_MOODS = ["walk", "groom", "idle", "laptop"] as const;
+export const CAT_MOODS = ["work", "slack"] as const;
 export type CatMood = (typeof CAT_MOODS)[number];
 
 /**
- * Loop period of each mood: the shortest interval after which every part of that
- * mood is back on its 0% keyframe, which for all of them is that mood's resting
- * pose. Every `animation` duration under `.stream-waiting__cat--<mood>` in
- * conversation.css divides the entry here, and at least one of them equals it
- * — that one is the clock the dwell below is aligned against.
+ * Loop period of each mood: the shortest interval after which every loop of that
+ * mood is back on its 0% keyframe, which for all of them is the resting pose.
+ * Every `animation` duration under `.stream-waiting__cat--<mood>` in
+ * conversation.css divides the entry here, and at least one of them equals it —
+ * that one is the clock a mood change is aligned against.
  */
 export const CAT_MOOD_CYCLE_MS: Record<CatMood, number> = {
-  walk: 2_200,
-  groom: 3_400,
-  idle: 3_400,
-  laptop: 3_400
+  work: 4_800,
+  slack: 4_800
 };
 
-/** One transition beat. Mirrors the `.72s` the beat rules declare. */
-export const CAT_TRANSITION_MS = 720;
-
 /**
- * The one mood the cat does not stand up in.
- *
- * Every other mood rests on the same neutral standing pose, which is what lets a
- * beat be named after where it is going and ignore where it came from. This one
- * rests sitting, with a laptop it has just shut under one paw, so leaving it has
- * to be animated separately from arriving anywhere — see the `from-laptop` rules
- * in conversation.css.
+ * How long each mood lasts, as a window. The cat is mostly at its laptop, since
+ * that is what the round beside it is doing, and slacks off between spells of
+ * it. These are only the bounds: the dwell actually used is quantised up to whole
+ * loop cycles, so the real choices are 9.6s or 14.4s at work and 4.8s or 9.6s
+ * slacking.
  */
-const CAT_SEATED_MOOD: CatMood = "laptop";
-
-
-/**
- * A beat that never ends would strand the cat between moods, so the machine
- * gives up well after the beat should have finished — and gives up by putting
- * the cat back down on the mood it already had, never by committing a swap that
- * was not animated.
- */
-const CAT_TRANSITION_WATCHDOG_MS = CAT_TRANSITION_MS * 2 + 250;
-
-/**
- * Dwell window. Short enough that the cat visibly changes its mind several times
- * during an ordinary round, long enough that it is not competing with the text
- * streaming beside it. These are only the bounds: the dwell actually used is
- * quantised up to whole loop cycles, so the real range is 3.4s-6.8s.
- */
-const CAT_DWELL_MIN_MS = 3_200;
-const CAT_DWELL_MAX_MS = 7_200;
+const CAT_DWELL_WINDOW_MS: Record<CatMood, readonly [min: number, max: number]> = {
+  work: [9_000, 15_000],
+  slack: [4_000, 10_000]
+};
 
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
@@ -67,38 +58,39 @@ const CAT_ALIGNMENT_TOLERANCE_MS = 16;
 
 /**
  * The dwells available to one mood: every whole number of loop cycles that lands
- * inside the window. A mood whose single cycle already overruns the window gets
- * one cycle rather than a truncated one — cutting a loop short is the jump cut
- * this whole mechanism exists to remove.
+ * inside its window. A mood whose single cycle already overruns the window gets
+ * one cycle rather than a truncated one — a change mid-loop is exactly the jump
+ * cut the alignment below exists to avoid.
  */
 export function catDwellChoicesMs(mood: CatMood): number[] {
   const period = CAT_MOOD_CYCLE_MS[mood];
-  const first = Math.max(1, Math.ceil(CAT_DWELL_MIN_MS / period));
-  const last = Math.max(first, Math.floor(CAT_DWELL_MAX_MS / period));
+  const [min, max] = CAT_DWELL_WINDOW_MS[mood];
+  const first = Math.max(1, Math.ceil(min / period));
+  const last = Math.max(first, Math.floor(max / period));
   const choices: number[] = [];
   for (let count = first; count <= last; count += 1) choices.push(count * period);
   return choices;
 }
 
 /**
- * How much longer the mood has to run before it is back on the neutral pose.
+ * How much longer the mood has to run before every loop is on its resting pose.
  *
  * A dwell that is a whole number of periods is only a whole number of periods on
  * the JavaScript clock. The animation's clock starts at a style resolution this
  * code never sees, timers fire late, and a `display: none` spell restarts the
- * loop at a moment nothing here was told about — so the two drift. Asking the
+ * loops at a moment nothing here was told about — so the two drift. Asking the
  * animation itself where it is turns the dwell from an assumption into a
  * measurement.
  *
  * Zero when the answer cannot be measured (no Web Animations API, no animation
  * running, or already on the boundary), which degrades to trusting the clock.
  */
-function msUntilNeutral(group: SVGGElement | null, mood: CatMood): number {
-  if (!group || typeof group.getAnimations !== "function") return 0;
+function msUntilRest(root: SVGGElement | null, mood: CatMood): number {
+  if (!root || typeof root.getAnimations !== "function") return 0;
   const period = CAT_MOOD_CYCLE_MS[mood];
-  // The mood declares one animation whose duration is the whole period; every
-  // other part divides it, so that one alone says where the pose is.
-  const master = group.getAnimations({ subtree: true }).find((animation) => {
+  // The mood declares at least one loop whose duration is the whole period;
+  // every other one divides it, so that one alone says where the pose is.
+  const master = root.getAnimations({ subtree: true }).find((animation) => {
     const duration = animation.effect?.getTiming().duration;
     return typeof duration === "number" && Math.round(duration) === period;
   });
@@ -108,38 +100,35 @@ function msUntilNeutral(group: SVGGElement | null, mood: CatMood): number {
 }
 
 /**
- * Whether a transition beat would actually be painted right now.
+ * Whether a mood change would actually be seen easing from one pose to the other.
  *
  * Three things stop it. A hidden document suspends animation and throttles
- * timers, so a swap made there is one the user never sees happen. Under
- * `prefers-reduced-motion` the global kill switch in feedback.css forces every
- * animation to .01ms with a single iteration — the beat still fires its events,
- * almost immediately, but no intermediate frame of it ever reaches the screen,
- * which would put the mood change back to being the jump cut it used to be. And
- * the conversation pane is `display: none` behind any open task, subagent or
- * preview page, where a subtree runs no animations at all: the beat would never
- * start, so it could never end.
+ * timers, so a change made there is one the user never sees happen. Under
+ * `prefers-reduced-motion` the global kill switch in feedback.css cuts every
+ * transition to .01ms, which would turn the change into a jump cut. And the
+ * conversation pane is `display: none` behind any open task, subagent or preview
+ * page, where nothing transitions at all.
  *
  * A missing `matchMedia` — jsdom has none at all — reports nothing, which is not
  * the same as reporting a reduction, so it does not block. `checkVisibility` is
  * treated the same way.
  */
-function beatCanPlay(group: SVGGElement | null): boolean {
+function changeCanPlay(root: SVGGElement | null): boolean {
   if (typeof document !== "undefined" && document.visibilityState !== "visible") return false;
-  if (group && typeof group.checkVisibility === "function" && !group.checkVisibility()) return false;
+  if (root && typeof root.checkVisibility === "function" && !root.checkVisibility()) return false;
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") return true;
   return !window.matchMedia(REDUCED_MOTION_QUERY).matches;
 }
 
-/** The document-wide half of {@link beatCanPlay}, which is the part that has events. */
+/** The document-wide half of {@link changeCanPlay}, which is the part that has events. */
 function documentAllowsMotion(): boolean {
-  return beatCanPlay(null);
+  return changeCanPlay(null);
 }
 
-function useTransitionPlayable(): boolean {
-  const [playable, setPlayable] = useState(documentAllowsMotion);
+function useMotionAllowed(): boolean {
+  const [allowed, setAllowed] = useState(documentAllowsMotion);
   useEffect(() => {
-    const sync = () => setPlayable(documentAllowsMotion());
+    const sync = () => setAllowed(documentAllowsMotion());
     sync();
     const media = typeof window.matchMedia === "function" ? window.matchMedia(REDUCED_MOTION_QUERY) : null;
     media?.addEventListener("change", sync);
@@ -149,178 +138,109 @@ function useTransitionPlayable(): boolean {
       document.removeEventListener("visibilitychange", sync);
     };
   }, []);
-  return playable;
-}
-
-interface CatMoodState {
-  /** The mood the cat is in. A running beat has not changed it yet. */
-  mood: CatMood;
-  /** Where the beat now running is heading, or null while the cat is just holding a mood. */
-  next: CatMood | null;
+  return allowed;
 }
 
 /**
- * Random mood walk, punctuated by a transition beat.
+ * Work, slack, work: the cat alternates between its two moods.
  *
- * The mood is committed by the beat's own `animationend` and by nothing else: a
- * dwell expiring only proposes a target. That is the strictest reading of "only
- * change while the change can be animated", and it is why the watchdog aborts
- * rather than commits — a timer firing is evidence that time passed, not that
- * anything was drawn.
+ * Only the change is timed here. How it looks is the stylesheet's: the two moods
+ * are two poses (where the pupils sit, how far the lids hang) that the change
+ * eases between, each with its own loops running on top. Those loops are torn
+ * down and restarted by the change, which is why it waits for them all to come
+ * round to rest first — the pose then moves smoothly and nothing else jumps.
  *
- * Both random draws happen in the effect, never in render or inside a state
- * updater: the app mounts under StrictMode, which replays both, and a replayed
- * draw would commit a choice the timer never made.
+ * The dwell is drawn in the effect, never in render: the app mounts under
+ * StrictMode, which replays render, and a replayed draw would be a choice the
+ * timer never made.
  */
-function useCatMood(): CatMoodState & { rootGroup: RefObject<SVGGElement | null> } {
-  const playable = useTransitionPlayable();
-  const [state, setState] = useState<CatMoodState>({ mood: CAT_MOODS[0], next: null });
-  const rootGroup = useRef<SVGGElement | null>(null);
+function useCatMood(): { mood: CatMood; root: RefObject<SVGGElement | null> } {
+  const motionAllowed = useMotionAllowed();
+  const [mood, setMood] = useState<CatMood>(CAT_MOODS[0]);
+  const root = useRef<SVGGElement | null>(null);
 
   useEffect(() => {
-    if (state.next !== null) {
-      // Losing playability mid-beat means the rest of it will not be drawn, so
-      // put the cat back down on the mood it still has. Re-arming from there is
-      // what keeps the next dwell aligned to the loop that just restarted.
-      if (!playable) {
-        setState({ mood: state.mood, next: null });
-        return undefined;
-      }
-      const watchdog = window.setTimeout(() => setState({ mood: state.mood, next: null }), CAT_TRANSITION_WATCHDOG_MS);
-      return () => window.clearTimeout(watchdog);
-    }
-    if (!playable) return undefined;
-
+    if (!motionAllowed) return undefined;
     let timer = 0;
     const drawDwell = () => {
-      const choices = catDwellChoicesMs(state.mood);
+      const choices = catDwellChoicesMs(mood);
       return choices[Math.floor(Math.random() * choices.length)]!;
     };
     const schedule = (delay: number) => {
       timer = window.setTimeout(() => {
-        // Whether the beat can play has to be re-read here, not trusted from the
-        // last render. The document and the preference both announce themselves
-        // and would have re-rendered eventually, but a pane going `display: none`
-        // announces nothing at all — looking again on each dwell is the only way
-        // back from it.
-        if (!beatCanPlay(rootGroup.current)) {
+        // Whether the change can be seen has to be re-read here, not trusted
+        // from the last render. The document and the preference both announce
+        // themselves, but a pane going `display: none` announces nothing at all
+        // — looking again on each dwell is the only way back from it.
+        if (!changeCanPlay(root.current)) {
           schedule(drawDwell());
           return;
         }
         // Land on the loop boundary rather than near it: the dwell counted whole
         // periods on the JavaScript clock, and the animation's clock has its own
         // idea of where it is.
-        const wait = msUntilNeutral(rootGroup.current, state.mood);
+        const wait = msUntilRest(root.current, mood);
         if (wait > 0) {
           schedule(wait);
           return;
         }
-        // A non-zero step around the ring never lands on the mood already showing;
-        // repeating one would read as the animation having stalled.
-        const step = 1 + Math.floor(Math.random() * (CAT_MOODS.length - 1));
-        setState({ mood: state.mood, next: CAT_MOODS[(CAT_MOODS.indexOf(state.mood) + step) % CAT_MOODS.length]! });
+        setMood(mood === "work" ? "slack" : "work");
       }, Math.max(0, delay));
     };
     schedule(drawDwell());
     return () => window.clearTimeout(timer);
-  }, [playable, state]);
+  }, [motionAllowed, mood]);
 
-  useEffect(() => {
-    const group = rootGroup.current;
-    if (!group) return undefined;
-    // Deliberately a native listener rather than `onAnimationEnd`. react-dom
-    // decides once, at import, which animation event name to listen for, and
-    // because jsdom exposes no `AnimationEvent` constructor it settles on
-    // `webkitAnimationEnd` there — so a React handler is dead in tests while
-    // being live in the app. Listening directly makes both the same.
-    const onAnimationEnd = (event: AnimationEvent) => {
-      // Only the beat on the root group settles the swap. Every other part of
-      // the cat is animated too and its events bubble through here, so both the
-      // element and the animation name have to match or a tail flick would
-      // commit the mood halfway through the beat.
-      if (event.target !== group) return;
-      if (!beatCanPlay(group)) return;
-      setState((current) => (
-        current.next !== null && event.animationName === `stream-cat-to-${current.next}`
-          ? { mood: current.next, next: null }
-          : current
-      ));
-    };
-    group.addEventListener("animationend", onAnimationEnd);
-    return () => group.removeEventListener("animationend", onAnimationEnd);
-  }, []);
-
-  return { ...state, rootGroup };
+  return { mood, root };
 }
 
 /**
- * One node of the rig, and every node under it.
+ * The composer's cat, at its laptop beside a streaming round: the same drawing
+ * in the same scene (`catArt.ts`), on a ledge of its own instead of the
+ * composer's border.
  *
- * The drawing lives in `streamCatRig.ts` as data so that the browser harness the
- * silhouette is verified in renders the same tree this does, rather than its own
- * restatement of it — a harness with its own copy passes while the cat is broken.
+ * It has two moods and nothing else. At work it types with its far paw, works
+ * the mouse with the near one, and keeps its eyes on the screen; slacking, it
+ * leaves both paws where they are, looks away from the screen, and gets drowsy.
+ * The laptop stays open either way.
+ *
+ * Draw order is load-bearing: the paws, pupils and lids are drawn after the face
+ * because they are the head's own colour laid over it, visible only where they
+ * cross a hole — `catArt.ts` explains why each is freed that way. The laptop and
+ * the ledge sit outside the breathing group, so they stay still while the cat
+ * breathes against them.
  */
-function StreamCatPartNode({ part }: { part: StreamCatPart }) {
-  const shared = {
-    ...(part.className ? { className: part.className } : {}),
-    ...(part.transform ? { transform: part.transform } : {}),
-    ...(part.opacity !== undefined ? { opacity: part.opacity } : {})
-  };
-  if (part.d !== undefined) {
-    return <path {...shared} d={part.d} {...(part.fillRule ? { fillRule: part.fillRule } : {})} />;
-  }
-  return (
-    <g {...shared}>
-      {(part.children ?? []).map((child) => (
-        <StreamCatPartNode part={child} key={child.className ?? child.d} />
-      ))}
-    </g>
-  );
-}
-
-/**
- * Cat silhouette that stands in for the old pulsing square. Every mood keyframe
- * starts and ends on that mood's resting pose so mood changes — and the global
- * reduced-motion kill switch — land on a cat that is standing, or sitting, but
- * never halfway through a step.
- *
- * The head is the brand cat's own face, lifted out of the drawing the application
- * icon is cut from, on the flat-jawed skull `catArt.ts` cuts for surfaces that
- * hold their head up. Everything below the neck is drawn in `streamCatRig.ts`,
- * because the artwork has no standing cat to borrow it from.
- *
- * Three things about the markup are load-bearing, and all three are pinned by
- * `StreamWaitingIndicator.test.tsx`:
- *
- * - The tree is the rig's, node for node. Nothing may be drawn here that the
- *   harness cannot see.
- * - The laptop is a sibling of the figure, drawn before it, and is mounted for
- *   as long as the cat is either going to the seated mood or still in it — which
- *   is what gives the beat out of that mood something to put away.
- * - While a transition beat runs the mood class is off: the beat and the mood
- *   loop both drive `transform` on the same elements, and only one of them may
- *   own it. `data-cat-mood` keeps naming the mood the cat still has, so the beat
- *   reads as the cat leaving that mood rather than as having already left it —
- *   and so the stylesheet can tell a cat that has to stand up first.
- */
-export function StreamWaitingCat() {
-  const { mood, next, rootGroup } = useCatMood();
-  const phase = next ? `stream-waiting__cat--to-${next}` : `stream-waiting__cat--${mood}`;
-  const laptop = mood === CAT_SEATED_MOOD || next === CAT_SEATED_MOOD;
+function StreamWaitingCat() {
+  const { mood, root } = useCatMood();
   return (
     <svg
-      className={`stream-waiting__cat ${phase}`}
-      viewBox={STREAM_CAT_VIEWBOX}
+      className={`stream-waiting__cat stream-waiting__cat--${mood}`}
+      viewBox={CAT_SCENE_VIEWBOX}
       aria-hidden="true"
       data-cat-mood={mood}
-      data-cat-phase={next ? "transition" : "hold"}
-      {...(next ? { "data-cat-next-mood": next } : {})}
     >
-      {laptop && <StreamCatPartNode part={STREAM_CAT_LAPTOP} />}
-      <g className="stream-cat" ref={rootGroup}>
-        {STREAM_CAT_FIGURE.map((part) => (
-          <StreamCatPartNode part={part} key={part.className ?? part.d} />
-        ))}
+      <g className="stream-cat" ref={root}>
+        {/* One pixel thick at the size the stylesheet draws the cat, like the composer border it stands in for. */}
+        <rect className="stream-cat-ledge" x={300} y={CAT_LEDGE_Y} width={690} height={13.5} rx={6.75} />
+        <path className="stream-cat-tail" d={CAT_TAIL} />
+        <path className="stream-cat-laptop" transform={CAT_ON_LEDGE} d={CAT_LAPTOP} />
+        <g className="stream-cat-figure">
+          <g transform={CAT_ON_LEDGE}>
+            <path
+              className="stream-cat-body"
+              fillRule="evenodd"
+              d={`${CAT_BODY_WITHOUT_PAWS}${CAT_EYE_WHITES}${CAT_WHISKERS}${CAT_MUZZLE}`}
+            />
+            <path className="stream-cat-paw stream-cat-paw--far" d={CAT_FAR_PAW} />
+            <path className="stream-cat-paw stream-cat-paw--near" d={CAT_NEAR_PAW} />
+            <g className="stream-cat-gaze">
+              <path className="stream-cat-pupils" d={CAT_PUPILS} />
+            </g>
+            <g className="stream-cat-lids">
+              <path className="stream-cat-blink" d={CAT_LIDS} />
+            </g>
+          </g>
+        </g>
       </g>
     </svg>
   );

@@ -34,10 +34,6 @@ impl Ring {
         self.start
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
     /// Appends `data`, dropping the oldest bytes past capacity.
     pub fn push(&mut self, data: &[u8]) {
         if data.len() >= self.capacity {

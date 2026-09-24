@@ -32,7 +32,6 @@ interface SearchProviderFieldProps {
   webSearchAssets: WebSearchAssets;
   /** Whether to offer the parent-selection option. Conversations have no parent, so this defaults to false. */
   inheritOption?: boolean;
-  inheritLabel?: string;
   hint?: string;
   /** Draws the selection as settled rather than removable. */
   disabled?: boolean;
@@ -61,7 +60,6 @@ export function SearchProviderField({
   onChange,
   webSearchAssets,
   inheritOption = false,
-  inheritLabel,
   hint,
   disabled = false,
   disabledHint,
@@ -84,7 +82,7 @@ export function SearchProviderField({
   const triggerLabel = unavailable
     ? t("请修复搜索提供商", "Repair search provider")
     : value === null
-      ? inheritLabel ?? t("跟随对话设置", "Follow the conversation")
+      ? t("跟随对话设置", "Follow the conversation")
       : isNative
         ? nativeLabel
         : value?.kind === "disabled" ? offLabel : providerLabel ?? "";
@@ -119,7 +117,7 @@ export function SearchProviderField({
       ...(inheritOption
         ? [{
           id: INHERIT_VALUE,
-          label: inheritLabel ?? t("跟随对话设置", "Follow the conversation"),
+          label: t("跟随对话设置", "Follow the conversation"),
           checked: value === null,
           onSelect: () => onChange(null)
         }]

@@ -12,7 +12,7 @@ The call needs somewhere to look: a dev server running for this workspace, or a 
 
 ## Decision-model parameters
 
-Turn on its decision-model option in the conversation's preview tool window and it takes `query` and `threshold` as well: `level` filters as usual, and the entries left — the most recent `lines` of them, or all of them when `lines` is omitted — are cut into chunks the TypeSafe Jev decision model scores, so only the pieces scoring at or above `threshold` come back, with their line ranges. **Add decision-model parameters** keeps the plain listing beside it; **Decision model only** requires the pair on every call. The entries are sent to TypeSafe's API, which needs its key under Global settings → Decision model providers.
+Turn on its decision-model option in the conversation's preview tool window and it takes `query` and `threshold` as well: `level` filters as usual, and the entries left — the most recent `lines` of them, or all of them when `lines` is omitted — are each scored on their own by the TypeSafe Jev decision model, several to a request — an entry is never split, however many lines it spans — and every entry at or above `threshold` comes back whole, numbered by its place in that list. **Add decision-model parameters** keeps the plain listing beside it; **Decision model only** requires the pair on every call. The entries are sent to TypeSafe's API, which needs its key under Global settings → Decision model providers.
 
 ## Related
 
@@ -20,3 +20,4 @@ Turn on its decision-model option in the conversation's preview tool window and 
 - [preview_network](preview_network.html)
 - [preview_eval](preview_eval.html)
 - [Working with Mework](../working.html#the-built-in-browser)
+- [preview_find_logs](preview_find_logs.html) — score this console and the server output together

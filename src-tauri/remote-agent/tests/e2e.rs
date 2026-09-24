@@ -465,7 +465,7 @@ fn releasing_a_session_ends_its_whole_process_tree() {
     stdout.read_line(&mut line).unwrap();
     let grandchild: u32 = line.trim().parse().unwrap();
     assert!(process_alive(grandchild));
-    process.release();
+    drop(process);
     assert!(wait_until(Duration::from_secs(3), || !process_alive(grandchild)));
     link.close(true);
 }
@@ -925,7 +925,7 @@ mod windows {
         stdout.read_line(&mut line).unwrap();
         let grandchild: u32 = line.trim().parse().unwrap_or_else(|_| panic!("{line:?}"));
         assert!(process_alive(grandchild));
-        process.release();
+        drop(process);
         assert!(wait_until(Duration::from_secs(5), || !process_alive(grandchild)));
         assert!(wait_until(Duration::from_secs(5), || !process_alive(root_pid)));
         link.close(true);
@@ -966,7 +966,7 @@ mod windows {
         stdout.read_line(&mut line).unwrap();
         let program: u32 = line.trim().parse().unwrap_or_else(|_| panic!("{line:?}"));
         assert!(process_alive(program));
-        process.release();
+        drop(process);
         assert!(
             wait_until(Duration::from_secs(5), || !process_alive(program)),
             "the program Git Bash started broke away from the session's job"

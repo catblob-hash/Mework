@@ -27,7 +27,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::capabilities::{stable_id, CapabilityKind, ConfigLevel};
+use crate::capabilities::{stable_id, CapabilityKind};
 
 /// Bumped when the shipped set changes, which re-runs seeding once for every
 /// installation whose marker predates the bump. Re-runs only ever add: an entry
@@ -202,7 +202,7 @@ struct SeedMarker {
 /// is reported to stderr and the selection comes back with whatever did land.
 #[cfg(not(test))]
 pub fn seed_builtin_capabilities(app_data: &Path) -> BuiltinCapabilitySelection {
-    let Some(level) = ConfigLevel::user() else {
+    let Some(level) = crate::capabilities::ConfigLevel::user() else {
         eprintln!("内置技能与 MCP 未播种：当前平台没有主目录");
         return BuiltinCapabilitySelection::default();
     };

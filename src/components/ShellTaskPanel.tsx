@@ -11,7 +11,7 @@ import { IconButton } from "./Common";
 import { isCopyChord, terminalUiColors } from "./TerminalPanel";
 import "./ShellTaskPanel.css";
 
-export function shellTaskPanelId(shellTaskId: string): string {
+function shellTaskPanelId(shellTaskId: string): string {
   return `shell-task-output-${shellTaskId}`;
 }
 

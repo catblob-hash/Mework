@@ -1,6 +1,5 @@
 "use strict";
 
-import fs from "node:fs";
 import readline from "node:readline";
 
 const input = readline.createInterface({
@@ -12,12 +11,6 @@ let callCount = 0;
 let listCount = 0;
 let pingAcknowledged = process.env.MCP_MOCK_IDLE_PING !== "1";
 const idlePingId = "mework-idle-ping";
-// A request for this method is never answered, so the caller can observe what
-// happens while a request is in flight. Writing the marker file first turns the
-// wait into a barrier instead of a guess about timing.
-const hangMethod = process.env.MCP_MOCK_HANG_METHOD || "";
-const hangMarkerPath = process.env.MCP_MOCK_MARKER || "";
-const declarePrompts = process.env.MCP_MOCK_DECLARE_PROMPTS === "1";
 
 function send(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -36,21 +29,13 @@ input.on("line", (line) => {
     pingAcknowledged = true;
     return;
   }
-  if (hangMethod && message.method === hangMethod) {
-    if (hangMarkerPath) {
-      fs.writeFileSync(hangMarkerPath, "1");
-    }
-    return;
-  }
   if (message.method === "initialize") {
     send({
       jsonrpc: "2.0",
       id: message.id,
       result: {
         protocolVersion: "2025-11-25",
-        capabilities: declarePrompts
-          ? { tools: { listChanged: false }, prompts: { listChanged: false } }
-          : { tools: { listChanged: false } },
+        capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "mework-mock", version: "1.0.0" },
       },
     });

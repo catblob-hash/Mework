@@ -1,6 +1,5 @@
 #![deny(unsafe_code)]
 // `deny` permits the narrowly scoped read-only JSValue tag access in engine.rs.
-#![allow(clippy::module_name_repetitions)]
 
 //! workflow-script: the rquickjs implementation of the workflow-core
 //! [`StepSource`] boundary.
@@ -91,10 +90,6 @@ impl ScriptSpec {
             role_policy,
         };
         Ok((meta, spec))
-    }
-
-    pub fn meta(&self) -> &ScriptMeta {
-        &self.meta
     }
 
     /// Create the engine on the current driver worker thread.
@@ -441,7 +436,7 @@ return 42
     #[test]
     fn a_minimal_script_parses_and_blanks_the_meta_statement_in_place() {
         let (meta, spec) =
-            ScriptSpec::parse(MINIMAL, None, None, StepRolePolicy::permissive()).unwrap();
+            ScriptSpec::parse(MINIMAL, None, None, StepRolePolicy::default()).unwrap();
         assert_eq!(meta.name, "n");
         assert_eq!(meta.description, "d");
         assert!(meta.phases.is_empty());
@@ -455,7 +450,7 @@ return 42
     fn meta_extraction_survives_strings_templates_and_comments_inside_the_literal() {
         let source = "export const meta = { name: \"a}b\", description: 'c{', phases: [{ title: `t${\"x\"}y` /* } */ }] };\nlog(\"after\")\n";
         let (meta, spec) =
-            ScriptSpec::parse(source, None, None, StepRolePolicy::permissive()).unwrap();
+            ScriptSpec::parse(source, None, None, StepRolePolicy::default()).unwrap();
         assert_eq!(meta.name, "a}b");
         assert_eq!(meta.description, "c{");
         assert_eq!(meta.phases.len(), 1);
@@ -471,7 +466,7 @@ return 42
             "export let meta = { name: \"n\", description: \"d\" }",
         ] {
             let error =
-                ScriptSpec::parse(source, None, None, StepRolePolicy::permissive()).unwrap_err();
+                ScriptSpec::parse(source, None, None, StepRolePolicy::default()).unwrap_err();
             assert!(
                 error.to_string().contains("export const meta"),
                 "{source} → {error}"
@@ -483,7 +478,7 @@ return 42
     fn leading_comments_and_whitespace_before_meta_are_tolerated() {
         let source = "// header\n/* block */\n  export const meta = { name: \"n\", description: \"d\" };\nreturn 1\n";
         let (meta, _) =
-            ScriptSpec::parse(source, None, None, StepRolePolicy::permissive()).unwrap();
+            ScriptSpec::parse(source, None, None, StepRolePolicy::default()).unwrap();
         assert_eq!(meta.name, "n");
     }
 
@@ -498,7 +493,7 @@ return 42
             ),
         ] {
             let error =
-                ScriptSpec::parse(source, None, None, StepRolePolicy::permissive()).unwrap_err();
+                ScriptSpec::parse(source, None, None, StepRolePolicy::default()).unwrap_err();
             assert!(error.to_string().contains(needle), "{source} → {error}");
         }
     }
@@ -507,7 +502,7 @@ return 42
     fn a_computed_meta_is_rejected_because_the_bare_context_has_no_bindings() {
         let source = "export const meta = { name: someVariable, description: \"d\" }\nreturn 1\n";
         let error =
-            ScriptSpec::parse(source, None, None, StepRolePolicy::permissive()).unwrap_err();
+            ScriptSpec::parse(source, None, None, StepRolePolicy::default()).unwrap_err();
         assert!(error.to_string().contains("pure literal"), "{error}");
     }
 
@@ -517,7 +512,7 @@ return 42
             "export const meta = { name: \"n\"",
             None,
             None,
-            StepRolePolicy::permissive(),
+            StepRolePolicy::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("not closed"), "{error}");
@@ -527,7 +522,7 @@ return 42
     fn a_body_syntax_error_is_rejected_before_any_execution() {
         let source = "export const meta = { name: \"n\", description: \"d\" }\nconst x = ;\n";
         let error =
-            ScriptSpec::parse(source, None, None, StepRolePolicy::permissive()).unwrap_err();
+            ScriptSpec::parse(source, None, None, StepRolePolicy::default()).unwrap_err();
         assert!(error.to_string().contains("syntax error"), "{error}");
     }
 
@@ -536,7 +531,7 @@ return 42
         let mut source = String::from("export const meta = { name: \"n\", description: \"d\" }\n");
         source.push_str(&"// pad\n".repeat(MAX_SCRIPT_BYTES / 7 + 1));
         let error =
-            ScriptSpec::parse(&source, None, None, StepRolePolicy::permissive()).unwrap_err();
+            ScriptSpec::parse(&source, None, None, StepRolePolicy::default()).unwrap_err();
         assert!(error.to_string().contains("exceeding the limit"), "{error}");
     }
 
@@ -544,7 +539,7 @@ return 42
     fn oversized_args_are_rejected_at_parse_time() {
         let args = Value::Array(vec![Value::Null; workflow_core::MAX_BOUNDARY_ITEMS + 1]);
         let error =
-            ScriptSpec::parse(MINIMAL, Some(args), None, StepRolePolicy::permissive()).unwrap_err();
+            ScriptSpec::parse(MINIMAL, Some(args), None, StepRolePolicy::default()).unwrap_err();
         assert!(error.to_string().contains("args"), "{error}");
     }
 
@@ -567,7 +562,7 @@ return 42
     fn meta_phases_titles_are_validated_and_kept_in_declaration_order() {
         let source = "export const meta = { name: \"n\", description: \"d\", phases: [{ title: \"Scan\", detail: \"x\" }, { title: \"Fix\" }] }\nreturn 1\n";
         let (meta, _) =
-            ScriptSpec::parse(source, None, None, StepRolePolicy::permissive()).unwrap();
+            ScriptSpec::parse(source, None, None, StepRolePolicy::default()).unwrap();
         assert_eq!(
             meta.phases
                 .iter()
@@ -578,7 +573,7 @@ return 42
         assert_eq!(meta.phases[0].detail.as_deref(), Some("x"));
 
         let bad = "export const meta = { name: \"n\", description: \"d\", phases: [{ detail: \"x\" }] }\n";
-        let error = ScriptSpec::parse(bad, None, None, StepRolePolicy::permissive()).unwrap_err();
+        let error = ScriptSpec::parse(bad, None, None, StepRolePolicy::default()).unwrap_err();
         assert!(error.to_string().contains("phases[0].title"), "{error}");
     }
 }

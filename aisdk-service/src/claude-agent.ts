@@ -65,7 +65,7 @@ import {
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 
-import { redactError, redactSecrets, secretsOf } from "./error-redaction.js";
+import { redactError, secretsOf } from "./error-redaction.js";
 import { dropForeignSignedReasoning, stripReplayTags } from "./anthropic-dialect.js";
 import {
   MAX_STREAM_TEXT,
@@ -83,7 +83,7 @@ import {
 // ---------------------------------------------------------------- host-facing surface
 
 /** Frame writers and request bookkeeping supplied by `main.ts`. */
-export interface AgentIo {
+interface AgentIo {
   emit(id: string, event: StepEvent): void;
   done(id: string, result: StepResult): void;
   fail(id: string, error: StepError): void;
@@ -92,7 +92,7 @@ export interface AgentIo {
   end(id: string): void;
 }
 
-export interface ClaudeAgentRuntime {
+interface ClaudeAgentRuntime {
   step(id: string, request: StepRequest): Promise<void>;
   release(session: string): void;
   shutdown(): Promise<void>;
@@ -194,7 +194,7 @@ interface McpTransport {
 /** MCP `CallToolResult` content items this sidecar produces. */
 type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
-export interface McpToolResult {
+interface McpToolResult {
   content: McpContent[];
   isError?: boolean;
 }
@@ -828,7 +828,6 @@ function reasoningOptions(level: StepRequest["reasoning"]): Pick<Options, "think
   switch (level) {
     case "none":
       return { thinking: { type: "disabled" } };
-    case "minimal":
     case "low":
       return { effort: "low" };
     case "medium":
@@ -1287,7 +1286,7 @@ class StepTranslator {
     if (this.calls.some((call) => call.callId === block.id)) return;
     this.calls.push({ callId: block.id, toolName: block.name, input: block.input });
     this.parts.push({ type: "tool-call", toolCallId: block.id, toolName: block.name, input: block.input });
-    this.io.emit(this.id, { k: "tool-call", callId: block.id, toolName: block.name, input: block.input });
+    this.io.emit(this.id, { k: "tool-call", callId: block.id, input: block.input });
   }
 
   /**
@@ -1364,7 +1363,6 @@ function usageOf(usage: JsonObject): Usage {
     totalTokens: inputTotal === undefined && output === undefined ? undefined : (inputTotal ?? 0) + (output ?? 0),
     reasoningTokens: reasoning,
     cacheReadTokens: cacheRead,
-    cacheWriteTokens: cacheWrite,
   };
 }
 
@@ -1383,7 +1381,7 @@ function mergeUsage(base: Usage, update: Usage): Usage {
 /** Sums two usage records; a step spanning several API messages reports the total. */
 function addUsage(base: Usage, next: Usage): Usage {
   const sum: Usage = {};
-  for (const key of ["inputTokens", "outputTokens", "totalTokens", "reasoningTokens", "cacheReadTokens", "cacheWriteTokens"] as const) {
+  for (const key of ["inputTokens", "outputTokens", "totalTokens", "reasoningTokens", "cacheReadTokens"] as const) {
     const left = base[key];
     const right = next[key];
     if (left === undefined && right === undefined) continue;

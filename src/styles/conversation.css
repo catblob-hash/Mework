@@ -8,8 +8,6 @@
 .topbar__empty { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
 .topbar__empty-title { font-size: 15px; margin: 0; }
 .topbar__empty-tagline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--faint); }
-.topbar-button { height: 32px; padding: 0 9px; display: inline-flex; align-items: center; gap: 6px; border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; }
-.topbar-button:hover, .topbar-button--active { background: var(--hover); color: var(--text); }
 .save-status { height: 26px; display: inline-flex; align-items: center; gap: 4px; padding: 0 5px; color: var(--faint); font-size: 10px; }
 .save-status--error { color: var(--danger); }
 /* Truncate the host rejection reason in the top bar; the title retains the full text. */
@@ -165,11 +163,36 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 /* An image whose bytes the surface has not produced stands as its own alternative
    text: a broken-image glyph says the document is wrong when only the read is late. */
 .markdown-content__image-missing { color: var(--faint); font-style: italic; }
-.markdown-content .katex { font-size: 1.02em; }
-.markdown-content .katex-display { max-width: 100%; margin: .72em 0; padding: .15em 0; overflow-x: auto; overflow-y: hidden; text-align: left; }
-.markdown-content .katex-display > .katex { text-align: left; }
+/* Formulas are MathJax SVG drawings measured in `ex`, so they scale with the text around them and
+   take its colour through `currentColor`. A display formula scrolls sideways rather than breaking,
+   since the drawing is made without knowing the column it lands in. */
+.math-formula { position: relative; }
+.math-formula svg { overflow: visible; }
+.math-formula--display {
+  display: block; max-width: 100%; margin: .72em 0; padding: .15em 0;
+  overflow-x: auto; overflow-y: hidden; text-align: left;
+}
+/* The source rides along out of sight, so a selection across a formula copies its TeX. */
+.math-formula__source {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+/* Until MathJax answers, and for a formula it cannot read, the source stands in: quiet while it
+   waits, underlined with the reason on hover when it failed. */
+.math-formula--source > code { padding: 0; background: none; color: var(--muted); font-size: .92em; }
+.math-formula[data-math-state="error"] > code {
+  color: var(--color-a23737); text-decoration: underline dotted; text-underline-offset: 3px; cursor: help;
+}
+/* Model-written HTML: key caps look like keys, and a disclosure says it can be opened. */
+.markdown-content kbd {
+  padding: .05em .4em; border: 1px solid var(--border-strong); border-bottom-width: 2px; border-radius: 4px;
+  background: var(--panel); font: .86em var(--mono);
+}
+.markdown-content details { margin: .5em 0; }
+.markdown-content summary { cursor: pointer; }
+.markdown-content mark { padding: 0 .15em; border-radius: 3px; background: var(--color-fff5e5); color: inherit; }
+.markdown-content sup, .markdown-content sub { line-height: 0; }
 .stream-waiting { min-height: 30px; margin-top: 12px; padding: 2px 3px; display: flex; align-items: center; gap: 9px; color: var(--color-65655f); --pulse-color: var(--color-343431); }
-.stream-waiting__square { width: 11px; height: 11px; flex: 0 0 11px; border-radius: 3px; background: var(--color-343431); transform-origin: center; animation: stream-waiting-pulse 1.25s cubic-bezier(.45, 0, .55, 1) infinite; }
 /* One line per call in flight. Usually there is exactly one; async tools are
    what make it a column rather than a single row. */
 .stream-waiting__activities { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
@@ -184,460 +207,104 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .stream-waiting--retry { color: var(--color-92600d); --pulse-color: var(--color-92600d); }
 .stream-waiting--retry .stream-waiting__cat { color: var(--color-c98a1b); }
 .stream-waiting__retry-message { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ab7d3c); font-size: 10px; }
-@keyframes stream-waiting-pulse { 50% { transform: scale(.56); opacity: .58; } }
 @keyframes stream-waiting-activity-in { from { opacity: 0; transform: translateX(-4px); } }
 @keyframes stream-waiting-dot { 0%, 60%, 100% { opacity: .28; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
 
 /*
- * Streaming mascot.
+ * Streaming mascot: the composer's cat, at its laptop.
  *
- * The cat is one flat colour, so overlapping parts fuse and draw order decides
- * nothing except what shows through the eyes, which are holes punched in an
- * even-odd path. `transform-box: view-box` lets every origin below be a raw
- * viewBox coordinate, and every one of them is a joint out of `streamCatRig.ts`
- * — the two are compared by test, because a pivot that drifts away from its
- * joint does not fail loudly: the limb just starts turning about the wrong spot.
+ * The same drawing in the same scene as `.composer-cat`, and at the same size,
+ * lying on a ledge of its own. `transform-box: view-box` makes every origin below
+ * a raw scene coordinate: the figure and the tail turn about points on the ledge
+ * (y=730.9), and the far paw about the wrist it was cut round, which sits inside
+ * the group that lowers the cat onto the ledge and so is written in the
+ * drawing's own coordinates — `CAT_WRIST` in catArt.ts, compared by test.
+ *
+ * Each mood is a pose plus loops. The pose is where the pupils sit and how far
+ * the lids hang, and it eases across a mood change on `transition`. The loops
+ * run on the elements inside the posed ones, all on one period per mood, and
+ * every one of them starts and ends at rest: the change waits for that moment,
+ * so tearing them down never jumps.
  */
-.stream-waiting__cat { width: 40px; height: 28px; flex: 0 0 40px; color: var(--color-343431); fill: currentColor; }
-.stream-cat, .stream-cat-tail, .stream-cat-tail-mid, .stream-cat-tail-tip,
-.stream-cat-leg, .stream-cat-shin, .stream-cat-head, .stream-cat-ear,
-.stream-cat-laptop, .stream-cat-laptop-lid { transform-box: view-box; }
-/* One of the two bodies is always hidden; the seated one only comes up at the
-   moment the cat drops onto it. */
-.stream-cat-seat { opacity: 0; }
-.stream-cat { transform-origin: 38px 42px; }
-/* The tail's joints are also the nodes its width is stated at, so each one is a
-   disc shared by the segment above and the segment below — and a disc centred on
-   a pivot is the one shape turning cannot move. The tail thins from root to tip
-   through them without a step, and flicks without a seam. */
-.stream-cat-tail { transform-origin: 13.4px 26.6px; }
-.stream-cat-tail-mid { transform-origin: 9.6px 21.4px; }
-.stream-cat-tail-tip { transform-origin: 8.6px 14.6px; }
-/* Near and far legs pivot on the same numbers: the far pair is the near pair
-   inside one static offset, so near coordinates are its local coordinates too. */
-.stream-cat-leg--fore { transform-origin: 42.6px 28.4px; }
-.stream-cat-leg--hind { transform-origin: 21.6px 29.2px; }
-.stream-cat-shin--fore { transform-origin: 42.9px 35.8px; }
-.stream-cat-shin--hind { transform-origin: 18px 35.6px; }
-.stream-cat-head { transform-origin: 47.5px 25px; }
-/* Each ear turns on the midpoint of its own buried base, which is the point that
-   keeps both of its corners inside the skull through the whole swing. */
-.stream-cat-ear--far { transform-origin: 47.8px 16.3px; }
-.stream-cat-ear--near { transform-origin: 57px 16.3px; }
-.stream-cat-laptop-lid { transform-origin: 62.2px 39.1px; }
+.stream-waiting__cat { width: 53.41px; height: 45px; flex: 0 0 53.41px; color: var(--color-343431); fill: currentColor; }
+.stream-cat-ledge { fill: var(--border-strong); }
+.stream-cat-figure, .stream-cat-tail, .stream-cat-paw, .stream-cat-gaze, .stream-cat-pupils,
+.stream-cat-lids, .stream-cat-blink { transform-box: view-box; }
+.stream-cat-figure { transform-origin: 653.7px 730.9px; }
+.stream-cat-tail { transform-origin: 431.6px 730.9px; }
+.stream-cat-paw--far { transform-origin: 688px 624px; }
+.stream-cat-gaze, .stream-cat-lids { transition: transform .8s cubic-bezier(.45, 0, .25, 1); }
 
-/* Walking: a deliberate plod, not a trot. Each leg takes 1.1s to come forward
-   and go back, with a held moment at both ends of the stride, and the body dips
-   twice in that time. The tail is what makes it read as a walk rather than four
-   legs waving: its three joints run the same sway a beat apart, so the tip is
-   still travelling out while the base has already turned back. */
-.stream-waiting__cat--walk .stream-cat { animation: stream-cat-plod 550ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-leg { animation: stream-cat-step-a 1100ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-leg--fore-far,
-.stream-waiting__cat--walk .stream-cat-leg--hind-near { animation-name: stream-cat-step-b; }
-.stream-waiting__cat--walk .stream-cat-shin { animation: stream-cat-step-shin-a 1100ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-shin--fore-far,
-.stream-waiting__cat--walk .stream-cat-shin--hind-near { animation-name: stream-cat-step-shin-b; }
-.stream-waiting__cat--walk .stream-cat-head { animation: stream-cat-plod-head 1100ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-tail { animation: stream-cat-plod-tail 2200ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-tail-mid { animation: stream-cat-plod-tail-mid 2200ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-tail-tip { animation: stream-cat-plod-tail-tip 2200ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-ear--near { animation: stream-cat-plod-ear 2200ms ease-in-out infinite; }
-.stream-waiting__cat--walk .stream-cat-ear--far { animation: stream-cat-plod-ear-far 2200ms ease-in-out infinite; }
+/* Working. Eyes on the screen. A burst of typing with the far paw, then the
+   near paw takes the mouse, nudges it one way and the other and clicks, while
+   the pupils follow the pointer; the tail wags a little the whole time and a
+   blink comes every other round. */
+.stream-waiting__cat--work .stream-cat-gaze { transform: translateX(13px); }
+.stream-waiting__cat--work .stream-cat-figure { animation: stream-cat-breathe 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-tail { animation: stream-cat-wag 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-paw--far { animation: stream-cat-type 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-paw--near { animation: stream-cat-mouse 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-pupils { animation: stream-cat-follow 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-blink { animation: stream-cat-blink 4800ms linear infinite; }
 
-/* Grooming: the near foreleg folds up to the muzzle and stays there while the
-   head licks it. Head and paw move in counterphase — the lick is the two of them
-   closing on each other — and the paw parks in the clear ground in front of the
-   chest, which is the only place on the drawing a raised paw is visible at all. */
-.stream-waiting__cat--groom .stream-cat-head { animation: stream-cat-groom-head 3400ms ease-in-out infinite; }
-.stream-waiting__cat--groom .stream-cat-leg--fore-near { animation: stream-cat-groom-paw 3400ms ease-in-out infinite; }
-.stream-waiting__cat--groom .stream-cat-shin--fore-near { animation: stream-cat-groom-paw-shin 3400ms ease-in-out infinite; }
-.stream-waiting__cat--groom .stream-cat-ear--near { animation: stream-cat-groom-ear 1700ms ease-in-out infinite; }
-.stream-waiting__cat--groom .stream-cat-ear--far { animation: stream-cat-groom-ear-far 1700ms ease-in-out infinite; }
-.stream-waiting__cat--groom .stream-cat-tail { animation: stream-cat-groom-tail 1700ms ease-in-out infinite; }
-.stream-waiting__cat--groom .stream-cat-tail-mid { animation: stream-cat-groom-tail-mid 1700ms ease-in-out infinite; }
-.stream-waiting__cat--groom .stream-cat-tail-tip { animation: stream-cat-groom-tail-tip 1700ms ease-in-out infinite; }
+/* Slacking. The laptop stays open and both paws stay put. The eyes drift off
+   the screen and half close, glance back once as if something might have
+   happened, and give a long slow blink; the breath deepens and the tail swings
+   wider and slower. */
+.stream-waiting__cat--slack .stream-cat-gaze { transform: translateX(-16px); }
+.stream-waiting__cat--slack .stream-cat-lids { transform: translateY(24px); }
+.stream-waiting__cat--slack .stream-cat-figure { animation: stream-cat-breathe-deep 4800ms ease-in-out infinite; }
+.stream-waiting__cat--slack .stream-cat-tail { animation: stream-cat-swish 4800ms ease-in-out infinite; }
+.stream-waiting__cat--slack .stream-cat-pupils { animation: stream-cat-glance-back 4800ms ease-in-out infinite; }
+.stream-waiting__cat--slack .stream-cat-blink { animation: stream-cat-doze 4800ms ease-in-out infinite; }
 
-/* Standing about: a slow breath, a tail that wags from the base outward, one ear
-   turning to something behind, a glance away and a paw shifted and put back. The
-   two thoughts sit in disjoint windows of the cycle so they read as separate. */
-.stream-waiting__cat--idle .stream-cat { animation: stream-cat-breathe 3400ms ease-in-out infinite; }
-.stream-waiting__cat--idle .stream-cat-tail { animation: stream-cat-wag 1700ms ease-in-out infinite; }
-.stream-waiting__cat--idle .stream-cat-tail-mid { animation: stream-cat-wag-mid 1700ms ease-in-out infinite; }
-.stream-waiting__cat--idle .stream-cat-tail-tip { animation: stream-cat-wag-tip 1700ms ease-in-out infinite; }
-.stream-waiting__cat--idle .stream-cat-head { animation: stream-cat-gaze 3400ms ease-in-out infinite; }
-.stream-waiting__cat--idle .stream-cat-ear--near { animation: stream-cat-listen 3400ms ease-in-out infinite; }
-.stream-waiting__cat--idle .stream-cat-ear--far { animation: stream-cat-listen-far 3400ms ease-in-out infinite; }
-.stream-waiting__cat--idle .stream-cat-leg--fore-near { animation: stream-cat-paw-shift 3400ms ease-in-out infinite; }
-
-/*
- * The seated pose.
- *
- * Every other mood rests standing, which is what lets a transition beat be named
- * after where it is going and know nothing about where it came from. This one
- * rests sitting, with one paw still up on the laptop it has just shut.
- *
- * A cat sitting down is not a cat rotated. Its spine shortens as it comes up, so
- * the body is squashed along its own length as it swings about the shoulder —
- * that one non-rotation is what puts the back end on the floor without dragging
- * the head off the top of the box — and the rest of the cat is posed part by
- * part: the hind legs fold up under the new hip, the tail drops and sweeps out
- * behind, and the forelegs are left exactly where they were, because a cat's
- * shoulder is the one thing that does not move between standing and sitting.
- *
- * The pose is declared here rather than inside the loop's keyframes so that it
- * survives the parts the loop does not animate, and so that the global
- * reduced-motion switch, which cuts every animation to nothing, leaves a cat
- * sitting rather than a cat standing on a closed laptop. It is keyed on
- * `data-cat-mood`, not on the mood class: the attribute keeps naming this mood
- * for as long as the beat out of it is running, which is exactly how long the cat
- * still needs to be sitting.
- */
-.stream-waiting__cat[data-cat-mood="laptop"] .stream-cat-body { opacity: 0; }
-.stream-waiting__cat[data-cat-mood="laptop"] .stream-cat-seat { opacity: 1; }
-.stream-waiting__cat[data-cat-mood="laptop"] .stream-cat-leg--hind { transform: translate(11px, 4px) rotate(74deg); }
-.stream-waiting__cat[data-cat-mood="laptop"] .stream-cat-shin--hind { transform: rotate(-60deg); }
-.stream-waiting__cat[data-cat-mood="laptop"] .stream-cat-tail { transform: translate(15.6px, 10.4px) rotate(-64deg); }
-.stream-waiting__cat[data-cat-mood="laptop"] .stream-cat-tail-mid { transform: rotate(-10deg); }
-.stream-waiting__cat[data-cat-mood="laptop"] .stream-cat-tail-tip { transform: rotate(30deg); }
-
-/* Sitting with the laptop: the paw comes off the lid, up to the mouth, and the
-   head comes down to meet it. Every keyframe here starts and ends on the seated
-   pose above rather than on the standing one, because that is the pose this mood
-   hands back to its own next cycle. */
-.stream-waiting__cat--laptop .stream-cat-leg--fore-near { animation: stream-cat-lick-paw 3400ms ease-in-out infinite; }
-.stream-waiting__cat--laptop .stream-cat-shin--fore-near { animation: stream-cat-lick-shin 3400ms ease-in-out infinite; }
-.stream-waiting__cat--laptop .stream-cat-head { animation: stream-cat-lick-head 3400ms ease-in-out infinite; }
-.stream-waiting__cat--laptop .stream-cat-ear--near { animation: stream-cat-lick-ear 1700ms ease-in-out infinite; }
-.stream-waiting__cat--laptop .stream-cat-ear--far { animation: stream-cat-lick-ear-far 1700ms ease-in-out infinite; }
-.stream-waiting__cat--laptop .stream-cat-tail-tip { animation: stream-cat-lick-tail-tip 1700ms ease-in-out infinite; }
-
-/*
- * Mood transitions.
- *
- * A mood used to swap as a jump cut: the outgoing loop was torn off wherever it
- * happened to be — mid-stride, or with the grooming paw still folded up at the
- * muzzle — and the incoming one started from the neutral pose. Two things
- * remove that discontinuity, and they only work together.
- *
- * First, every duration inside one mood divides that mood's loop period (walk
- * 2.2s, everything else 3.4s) and one of them equals it, and the component only
- * ever dwells for a whole number of those periods — measured against the
- * equal-length animation's own clock, not the timer's. Parts of a mood therefore
- * reach their shared 0% keyframe — that mood's resting pose — at the same instant
- * the dwell expires. `keeps every part of a mood on one shared loop period` pins
- * the divisibility; break it and the beat starts from a pose the cat was never in.
- *
- * Second, the beat below also starts and ends on a resting pose, so the incoming
- * loop picks up exactly where the beat puts the cat down.
- *
- * The beat is keyed on the DESTINATION only. Every mood but one rests on the same
- * neutral standing pose, so the source contributes nothing a beat could react to
- * — which is what turns twelve ordered pairs into four animations. The one
- * exception is the seated mood, which needs the cat to stand up again before any
- * of these can run; that is the `from-laptop` block further down, and it is
- * keyed on the source instead. The duration is mirrored by CAT_TRANSITION_MS on
- * the component side, which owns the watchdog that has to outlast it.
- *
- * Nothing here is `infinite`: the beat is a one-shot, and its end on the root
- * group is the event the component commits the new mood on.
- */
-.stream-waiting__cat--to-walk .stream-cat { animation: stream-cat-to-walk 720ms ease-in-out; }
-.stream-waiting__cat--to-walk .stream-cat-leg { animation: stream-cat-to-walk-step-a 720ms ease-in-out; }
-.stream-waiting__cat--to-walk .stream-cat-leg--fore-far,
-.stream-waiting__cat--to-walk .stream-cat-leg--hind-near { animation-name: stream-cat-to-walk-step-b; }
-.stream-waiting__cat--to-walk .stream-cat-tail { animation: stream-cat-to-walk-tail 720ms ease-in-out; }
-.stream-waiting__cat--to-walk .stream-cat-tail-tip { animation: stream-cat-to-walk-tail-tip 720ms ease-in-out; }
-
-.stream-waiting__cat--to-groom .stream-cat { animation: stream-cat-to-groom 720ms ease-in-out; }
-.stream-waiting__cat--to-groom .stream-cat-tail { animation: stream-cat-to-groom-tail 720ms ease-in-out; }
-.stream-waiting__cat--to-groom .stream-cat-tail-tip { animation: stream-cat-to-groom-tail-tip 720ms ease-in-out; }
-.stream-waiting__cat--to-groom .stream-cat-leg--fore-near { animation: stream-cat-to-groom-paw 720ms ease-in-out; }
-
-.stream-waiting__cat--to-idle .stream-cat { animation: stream-cat-to-idle 720ms ease-in-out; }
-.stream-waiting__cat--to-idle .stream-cat-tail { animation: stream-cat-to-idle-tail 720ms ease-in-out; }
-.stream-waiting__cat--to-idle .stream-cat-tail-tip { animation: stream-cat-to-idle-tail-tip 720ms ease-in-out; }
-.stream-waiting__cat--to-idle .stream-cat-head { animation: stream-cat-to-idle-head 720ms ease-in-out; }
-.stream-waiting__cat--to-idle .stream-cat-ear--near { animation: stream-cat-to-idle-ear 720ms ease-in-out; }
-
-/*
- * Arriving at the laptop, which is the one beat that is a joke rather than a
- * change of weight: the laptop slides in open, the cat reaches out and brings a
- * paw down on the lid, the lid slams, and the cat drops onto its haunches with
- * the paw still on it. Everything that is different about the seated pose is
- * animated here — anything left out would snap into place when the beat ends.
- *
- * The paw and the lid are choreographed to touch rather than to overlap: two
- * shapes in one flat colour that cross each other read as one blob, so the strike
- * lands on the lid's top edge and rides it down.
- */
-.stream-waiting__cat--to-laptop .stream-cat { animation: stream-cat-to-laptop 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-body { animation: stream-cat-stand-out 720ms linear; }
-.stream-waiting__cat--to-laptop .stream-cat-seat { animation: stream-cat-seat-in 720ms linear; }
-.stream-waiting__cat--to-laptop .stream-cat-leg--hind { animation: stream-cat-sit-hind 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-shin--hind { animation: stream-cat-sit-hind-shin 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-tail { animation: stream-cat-sit-tail 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-tail-mid { animation: stream-cat-sit-tail-mid 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-tail-tip { animation: stream-cat-sit-tail-tip 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-leg--fore-near { animation: stream-cat-slap 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-shin--fore-near { animation: stream-cat-slap-shin 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-head { animation: stream-cat-to-laptop-head 720ms ease-in-out; }
-.stream-waiting__cat--to-laptop .stream-cat-laptop { animation: stream-cat-laptop-in 720ms cubic-bezier(.2, .8, .3, 1); }
-.stream-waiting__cat--to-laptop .stream-cat-laptop-lid { animation: stream-cat-laptop-shut 720ms ease-in; }
-
-/*
- * Leaving the laptop.
- *
- * This is the only beat that has to know where the cat is coming from, because
- * it is the only pose that is not the standing one: the cat gets up, and the
- * laptop goes back where it came from. It is the same set of poses as the beat
- * in, played backwards — `reverse` rather than a second set of keyframes, so the
- * two can never drift apart — except for the lid, which stays shut, and the paw,
- * which only has to come off the lid and not re-enact the slap.
- *
- * Every selector here carries two attributes and so outranks the destination
- * beat's rules, which are running on the same limbs at the same time. That is
- * deliberate: standing up IS this cat's anticipation of whatever comes next.
- */
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-body { animation: stream-cat-stand-out 720ms linear reverse; }
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-seat { animation: stream-cat-seat-in 720ms linear reverse; }
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-leg--hind { animation: stream-cat-sit-hind 720ms ease-in-out reverse; }
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-shin--hind { animation: stream-cat-sit-hind-shin 720ms ease-in-out reverse; }
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-tail { animation: stream-cat-sit-tail 720ms ease-in-out reverse; }
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-tail-mid { animation: stream-cat-sit-tail-mid 720ms ease-in-out reverse; }
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-tail-tip { animation: stream-cat-sit-tail-tip 720ms ease-in-out reverse; }
-.stream-waiting__cat[data-cat-mood="laptop"][data-cat-phase="transition"] .stream-cat-laptop { animation: stream-cat-laptop-in 720ms cubic-bezier(.4, 0, .8, .4) reverse; }
-
-@keyframes stream-cat-plod { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-0.55px); } }
-@keyframes stream-cat-step-a { 0%, 100% { transform: rotate(0deg); } 20%, 30% { transform: rotate(19deg); } 70%, 80% { transform: rotate(-19deg); } }
-@keyframes stream-cat-step-b { 0%, 100% { transform: rotate(0deg); } 20%, 30% { transform: rotate(-19deg); } 70%, 80% { transform: rotate(19deg); } }
-/* The second joint is most of what separates a walk from four rotating sticks:
-   the foot swings through before the leg has finished coming forward, and
-   flattens out under the cat as the leg goes back. */
-@keyframes stream-cat-step-shin-a { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(-14deg); } 75% { transform: rotate(9deg); } }
-@keyframes stream-cat-step-shin-b { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(9deg); } 75% { transform: rotate(-14deg); } }
-@keyframes stream-cat-plod-head { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(-1.8deg); } }
-@keyframes stream-cat-plod-tail { 0%, 100% { transform: rotate(0deg) scaleY(1); } 30% { transform: rotate(-7deg) scaleY(1.04); } 70% { transform: rotate(6deg) scaleY(1.03); } }
-@keyframes stream-cat-plod-tail-mid { 0%, 100% { transform: rotate(0deg) scaleY(1); } 36% { transform: rotate(-9deg) scaleY(1.05); } 76% { transform: rotate(8deg) scaleY(1.04); } }
-@keyframes stream-cat-plod-tail-tip { 0%, 100% { transform: rotate(0deg) scaleY(1); } 42% { transform: rotate(-13deg) scaleY(1.06); } 82% { transform: rotate(12deg) scaleY(1.05); } }
-/*
- * Ear flicks are short and land off the beat of everything else, which is what
- * stops a walking cat looking like a wind-up toy.
- *
- * An ear that only turned would have to turn far to be seen at all at 40px, and
- * a rigid shape turning that far on a pivot near the skull's edge drags its own
- * base out from under the crown and opens a gash. So the flick is mostly a
- * squash: the ear narrows and draws up as it swivels, then rebounds wide and
- * short. That is what an ear does when it turns — it foreshortens — and it is
- * the part of the motion the base is not asked to pay for, because scaling about
- * the base's own midpoint moves the base corners along the base, never out of
- * it. Between the two, ten degrees reads as far as fifteen used to.
- */
-@keyframes stream-cat-plod-ear {
-  0%, 54%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  62% { transform: rotate(-8deg) scaleX(.89) scaleY(1.12); }
-  70% { transform: rotate(3deg) scaleX(1.06) scaleY(.94); }
-  78% { transform: rotate(0deg) scaleX(1) scaleY(1); }
+@keyframes stream-cat-breathe { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.015); } }
+@keyframes stream-cat-breathe-deep { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.035); } }
+@keyframes stream-cat-wag { 0%, 100% { transform: rotate(0deg); } 30% { transform: rotate(5deg); } 70% { transform: rotate(-3deg); } }
+@keyframes stream-cat-swish { 0%, 100% { transform: rotate(0deg); } 35% { transform: rotate(8deg); } 75% { transform: rotate(-6deg); } }
+/* Five keystrokes in two bursts, each a quick lift of the paw off the keys
+   about the wrist, then the paw rests while the other one works the mouse. */
+@keyframes stream-cat-type {
+  0%, 38%, 100% { transform: rotate(0deg); }
+  3% { transform: rotate(-11deg); }
+  6% { transform: rotate(0deg); }
+  9% { transform: rotate(-8deg); }
+  12% { transform: rotate(0deg); }
+  15% { transform: rotate(-12deg); }
+  18%, 26% { transform: rotate(0deg); }
+  29% { transform: rotate(-10deg); }
+  32% { transform: rotate(0deg); }
+  35% { transform: rotate(-12deg); }
 }
-@keyframes stream-cat-plod-ear-far {
-  0%, 22%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  30% { transform: rotate(7deg) scaleX(.91) scaleY(1.1); }
-  38% { transform: rotate(-2deg) scaleX(1.05) scaleY(.95); }
-  46% { transform: rotate(0deg) scaleX(1) scaleY(1); }
+/* The near paw slides along the desk and back — the far end of its reach is
+   what `CAT_NEAR_PAW_OVERLAP` in catArt.ts has to cover — and presses down
+   once at the end for the click. */
+@keyframes stream-cat-mouse {
+  0%, 40%, 100% { transform: translate(0, 0); }
+  50%, 57% { transform: translate(-9px, 0); }
+  68%, 75% { transform: translate(7px, 0); }
+  78% { transform: translate(7px, 3px); }
+  81% { transform: translate(7px, 0); }
+  93% { transform: translate(0, 0); }
+}
+/* Reading along the line being typed, then following the pointer. */
+@keyframes stream-cat-follow {
+  0%, 100% { transform: translateX(0); }
+  36%, 42% { transform: translateX(7px); }
+  50%, 57% { transform: translateX(-5px); }
+  68%, 82% { transform: translateX(6px); }
+  93% { transform: translateX(0); }
+}
+/* A lid is parked 54 units above its eye (`CAT_LID_LIFT`); lowering it 62
+   closes the eye with 8 to spare, which is what keeps a closed eye from leaving
+   a ghost of its outline. Slacking lids already hang 24, so they need 38. */
+@keyframes stream-cat-blink { 0%, 18%, 100% { transform: translateY(0); } 21% { transform: translateY(62px); } 24% { transform: translateY(0); } }
+@keyframes stream-cat-doze { 0%, 74%, 100% { transform: translateY(0); } 82%, 87% { transform: translateY(38px); } 95% { transform: translateY(0); } }
+@keyframes stream-cat-glance-back {
+  0%, 30%, 72%, 100% { transform: translateX(0); }
+  40%, 58% { transform: translateX(22px); }
 }
 
-@keyframes stream-cat-groom-paw { 0%, 7% { transform: rotate(0deg); } 18%, 82% { transform: rotate(-22deg); } 93%, 100% { transform: rotate(0deg); } }
-@keyframes stream-cat-groom-paw-shin {
-  0%, 7% { transform: rotate(0deg); }
-  18% { transform: rotate(-130deg); }
-  30% { transform: rotate(-120deg); }
-  42% { transform: rotate(-132deg); }
-  54% { transform: rotate(-120deg); }
-  66% { transform: rotate(-132deg); }
-  82% { transform: rotate(-124deg); }
-  93%, 100% { transform: rotate(0deg); }
-}
-@keyframes stream-cat-groom-head {
-  0%, 9% { transform: rotate(0deg); }
-  20% { transform: rotate(7deg); }
-  32% { transform: rotate(3.5deg); }
-  44% { transform: rotate(8deg); }
-  56% { transform: rotate(3.5deg); }
-  68% { transform: rotate(7.5deg); }
-  80% { transform: rotate(3deg); }
-  92%, 100% { transform: rotate(0deg); }
-}
-@keyframes stream-cat-groom-ear {
-  0%, 44%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  54% { transform: rotate(-7deg) scaleX(.9) scaleY(1.11); }
-  64% { transform: rotate(2deg) scaleX(1.05) scaleY(.95); }
-  74% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-}
-@keyframes stream-cat-groom-ear-far {
-  0%, 12%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  22% { transform: rotate(6deg) scaleX(.92) scaleY(1.09); }
-  32% { transform: rotate(-1.5deg) scaleX(1.04) scaleY(.96); }
-  42% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-}
-@keyframes stream-cat-groom-tail { 0%, 100% { transform: rotate(0deg) scaleY(1); } 50% { transform: rotate(6deg) scaleY(1.04); } }
-@keyframes stream-cat-groom-tail-mid { 0%, 100% { transform: rotate(0deg) scaleY(1); } 58% { transform: rotate(8deg) scaleY(1.05); } }
-@keyframes stream-cat-groom-tail-tip { 0%, 100% { transform: rotate(0deg) scaleY(1); } 66% { transform: rotate(11deg) scaleY(1.06); } }
-
-@keyframes stream-cat-breathe { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.028); } }
-@keyframes stream-cat-wag { 0%, 100% { transform: rotate(0deg) scaleY(1); } 25% { transform: rotate(-11deg) scaleY(1.04); } 75% { transform: rotate(13deg) scaleY(1.05); } }
-@keyframes stream-cat-wag-mid { 0%, 100% { transform: rotate(0deg) scaleY(1); } 31% { transform: rotate(-13deg) scaleY(1.05); } 81% { transform: rotate(15deg) scaleY(1.06); } }
-@keyframes stream-cat-wag-tip { 0%, 100% { transform: rotate(0deg) scaleY(1); } 37% { transform: rotate(-17deg) scaleY(1.06); } 87% { transform: rotate(19deg) scaleY(1.07); } }
-/* Glance, ear turn and paw shift sit in disjoint windows of the shared cycle, so
-   no two fire together and the idle loop reads as separate thoughts rather than
-   one twitch. The ear turn is the widest the cat has, and so the one that leans
-   hardest on the squash: it is an ear swivelling to face behind, which is a
-   shape that narrows, not one that swings. */
-@keyframes stream-cat-gaze { 0%, 44%, 100% { transform: rotate(0deg); } 58%, 76% { transform: rotate(-5deg); } }
-@keyframes stream-cat-listen {
-  0%, 20%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  28% { transform: rotate(-10deg) scaleX(.85) scaleY(1.14); }
-  36% { transform: rotate(3deg) scaleX(1.07) scaleY(.93); }
-  44% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-}
-@keyframes stream-cat-listen-far {
-  0%, 24%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  32% { transform: rotate(8deg) scaleX(.89) scaleY(1.12); }
-  40% { transform: rotate(-2deg) scaleX(1.05) scaleY(.95); }
-  48% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-}
-@keyframes stream-cat-paw-shift { 0%, 8%, 30%, 100% { transform: rotate(0deg); } 14%, 24% { transform: rotate(-10deg); } }
-
-/* Seated, the chest is where the standing cat had clear air, so this paw folds
-   further forward than the standing one or it washes its face inside itself. */
-@keyframes stream-cat-lick-paw { 0%, 10% { transform: rotate(0deg); } 22%, 80% { transform: rotate(-34deg); } 92%, 100% { transform: rotate(0deg); } }
-@keyframes stream-cat-lick-shin {
-  0%, 10% { transform: rotate(0deg); }
-  22% { transform: rotate(-105deg); }
-  34% { transform: rotate(-95deg); }
-  46% { transform: rotate(-107deg); }
-  58% { transform: rotate(-95deg); }
-  70% { transform: rotate(-107deg); }
-  80% { transform: rotate(-99deg); }
-  92%, 100% { transform: rotate(0deg); }
-}
-@keyframes stream-cat-lick-head {
-  0%, 14% { transform: rotate(0deg); }
-  26% { transform: rotate(8deg); }
-  38% { transform: rotate(3deg); }
-  50% { transform: rotate(9deg); }
-  62% { transform: rotate(3deg); }
-  74% { transform: rotate(8deg); }
-  88%, 100% { transform: rotate(0deg); }
-}
-@keyframes stream-cat-lick-ear {
-  0%, 60%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  70% { transform: rotate(-8deg) scaleX(.9) scaleY(1.11); }
-  80% { transform: rotate(2deg) scaleX(1.05) scaleY(.95); }
-  90% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-}
-@keyframes stream-cat-lick-ear-far {
-  0%, 28%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  38% { transform: rotate(7deg) scaleX(.91) scaleY(1.1); }
-  48% { transform: rotate(-1.5deg) scaleX(1.04) scaleY(.96); }
-  58% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-}
-@keyframes stream-cat-lick-tail-tip { 0%, 40%, 100% { transform: rotate(30deg); } 60% { transform: rotate(48deg); } 80% { transform: rotate(22deg); } }
-
-/*
- * The transition beats.
- *
- * Each one is a wind-down the cat shares with every mood, folded into the first
- * third, followed by an anticipation of the mood it is about to start.
- *
- * The numbers are bounded by what the drawing can afford rather than by taste.
- * The neutral silhouette paints [2.9, 63.5] x [7.1, 42.3] inside a 70x49 viewBox,
- * so the top and the left are the scarce margins — the ears own one and the tail
- * owns the other — and everything else leans on the roomy bottom and right.
- */
-@keyframes stream-cat-to-walk {
-  /* Weight rocks onto the hind legs, then the front lifts into the first stride. */
-  0%, 100% { transform: rotate(0deg) translateY(0); }
-  30% { transform: rotate(2.4deg) translateY(.8px); }
-  64% { transform: rotate(-1.6deg) translateY(-.9px); }
-}
-/* Ends travelling in the same direction the walk loop opens with, so the handover reads as one stride. */
-@keyframes stream-cat-to-walk-step-a { 0%, 100% { transform: rotate(0deg); } 32% { transform: rotate(8deg); } 72% { transform: rotate(-15deg); } }
-@keyframes stream-cat-to-walk-step-b { 0%, 100% { transform: rotate(0deg); } 32% { transform: rotate(-8deg); } 72% { transform: rotate(15deg); } }
-@keyframes stream-cat-to-walk-tail { 0%, 100% { transform: rotate(0deg) scaleY(1); } 44% { transform: rotate(13deg) scaleY(1.05); } }
-@keyframes stream-cat-to-walk-tail-tip { 0%, 100% { transform: rotate(0deg) scaleY(1); } 56% { transform: rotate(18deg) scaleY(1.07); } }
-@keyframes stream-cat-to-groom {
-  /* Settles back onto the haunches: the rear sinks and the shoulders come up. */
-  0%, 100% { transform: rotate(0deg) translateY(0); }
-  38% { transform: rotate(-1.6deg) translateY(.9px); }
-  74% { transform: rotate(.5deg) translateY(-.2px); }
-}
-@keyframes stream-cat-to-groom-tail { 0%, 100% { transform: rotate(0deg) scaleY(1); } 46% { transform: rotate(-11deg) scaleY(1.05); } 78% { transform: rotate(4deg) scaleY(.98); } }
-@keyframes stream-cat-to-groom-tail-tip { 0%, 100% { transform: rotate(0deg) scaleY(1); } 58% { transform: rotate(-15deg) scaleY(1.07); } 86% { transform: rotate(5deg) scaleY(.98); } }
-/* The lift lands late, so it reads as the paw already reaching for the muzzle
-   the moment the grooming loop takes over. */
-@keyframes stream-cat-to-groom-paw { 0%, 46%, 100% { transform: rotate(0deg); } 66% { transform: rotate(-15deg); } 84% { transform: rotate(-6deg); } }
-@keyframes stream-cat-to-idle {
-  /* Drops its weight, then breathes back up into the idle loop's own breath. */
-  0%, 100% { transform: translateY(0) scaleY(1); }
-  28% { transform: translateY(1.4px) scaleY(.96); }
-  62% { transform: translateY(-.3px) scaleY(1.01); }
-}
-@keyframes stream-cat-to-idle-tail { 0%, 100% { transform: rotate(0deg) scaleY(1); } 24% { transform: rotate(16deg) scaleY(1.06); } 58% { transform: rotate(-11deg) scaleY(1.04); } 84% { transform: rotate(5deg) scaleY(.99); } }
-@keyframes stream-cat-to-idle-tail-tip { 0%, 100% { transform: rotate(0deg) scaleY(1); } 36% { transform: rotate(20deg) scaleY(1.08); } 70% { transform: rotate(-13deg) scaleY(1.05); } }
-@keyframes stream-cat-to-idle-head { 0%, 100% { transform: rotate(0deg); } 30% { transform: rotate(5deg); } 70% { transform: rotate(-3deg); } }
-@keyframes stream-cat-to-idle-ear {
-  0%, 100% { transform: rotate(0deg) scaleX(1) scaleY(1); }
-  40% { transform: rotate(-6deg) scaleX(.92) scaleY(1.09); }
-  74% { transform: rotate(2deg) scaleX(1.03) scaleY(.97); }
-}
-
-/*
- * Sitting down, and standing back up.
- *
- * One set of keyframes, run forwards on the way in and `reverse` on the way out:
- * the seated pose is stated once, in the 100% frame, and the pose rules further
- * up repeat it. A test compares the two, because a beat that lands on a pose the
- * mood does not hold shows up as the cat twitching at the moment it arrives.
- */
-/* The two bodies trade places on one frame, at the impact. Nothing tweens across
-   the cut: every part posed differently sitting down jumps on this same pair of
-   stops, so the cat is never halfway between the two poses. */
-@keyframes stream-cat-stand-out { 0% { opacity: 1; animation-timing-function: step-end; } 62%, 100% { opacity: 0; } }
-@keyframes stream-cat-seat-in { 0% { opacity: 0; animation-timing-function: step-end; } 62%, 100% { opacity: 1; } }
-@keyframes stream-cat-sit-hind { 0%, 62% { transform: translate(0px, 0px) rotate(0deg); } 64%, 100% { transform: translate(11px, 4px) rotate(74deg); } }
-@keyframes stream-cat-sit-hind-shin { 0%, 62% { transform: rotate(0deg); } 64%, 100% { transform: rotate(-60deg); } }
-@keyframes stream-cat-sit-tail { 0%, 62% { transform: translate(0px, 0px) rotate(0deg); } 64%, 100% { transform: translate(15.6px, 10.4px) rotate(-64deg); } }
-@keyframes stream-cat-sit-tail-mid { 0%, 62% { transform: rotate(0deg); } 64%, 100% { transform: rotate(-10deg); } }
-@keyframes stream-cat-sit-tail-tip { 0%, 62% { transform: rotate(0deg); } 64%, 100% { transform: rotate(30deg); } }
-
-/* The slap. The paw goes up past the open lid, comes down on its top edge at
-   52%, and rides it to the floor; the lid is shut by 68% and bounces once. Both
-   end on the seated pose, which is where the licking loop starts. */
-@keyframes stream-cat-slap {
-  0%, 14% { transform: rotate(0deg); }
-  38% { transform: rotate(-100deg); }
-  52% { transform: rotate(-88deg); }
-  72% { transform: rotate(-24deg); }
-  86% { transform: rotate(6deg); }
-  100% { transform: rotate(0deg); }
-}
-@keyframes stream-cat-slap-shin {
-  0%, 14% { transform: rotate(0deg); }
-  38% { transform: rotate(40deg); }
-  52% { transform: rotate(30deg); }
-  72% { transform: rotate(-14deg); }
-  100% { transform: rotate(0deg); }
-}
-/* The head follows its own paw down and comes back level. */
-@keyframes stream-cat-to-laptop-head { 0%, 100% { transform: rotate(0deg); } 34% { transform: rotate(-5deg); } 66% { transform: rotate(8deg); } }
-@keyframes stream-cat-laptop-in { 0% { transform: translateX(19px); } 44%, 100% { transform: translateX(0); } }
-@keyframes stream-cat-laptop-shut { 0%, 52% { transform: rotate(48deg); } 68% { transform: rotate(0deg); } 78% { transform: rotate(7deg); } 88%, 100% { transform: rotate(0deg); } }
-@keyframes stream-cat-to-laptop {
-  /* Braces, reaches, and takes the recoil of its own paw landing. */
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  36% { transform: translateY(-.5px) rotate(1.6deg); }
-  70% { transform: translateY(.6px) rotate(-.8deg); }
-}
 /*
  * Work blocks.
  *
@@ -760,7 +427,10 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 
 /* In-place editors. A card gives up its body rather than opening a dialog. */
 .context-card--editing { box-shadow: 0 0 0 1px var(--focus); }
-.inline-text-editor { display: flex; flex-direction: column; gap: 6px; }
+.inline-text-editor { position: relative; display: flex; flex-direction: column; gap: 6px; border-radius: 12px; }
+/* The attach control keeps to the left of the footer, the way it sits in the composer. */
+.inline-text-editor__attach { margin-right: auto; display: inline-flex; }
+.inline-text-editor .attachment-notice { margin: 0; }
 /* Buttons sit on the outer edge of whichever side the card already occupies. */
 .inline-text-editor__footer { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
 .inline-text-editor--assistant .inline-text-editor__footer,
@@ -825,10 +495,6 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
    left edge instead of inside a column reserved for a longer file. */
 .diff-output__line { min-width: max-content; min-height: 20px; display: grid; grid-template-columns: calc(var(--diff-gutter) + 10px) minmax(220px, 1fr); font: 10px/20px var(--mono); color: var(--color-50504c); }
 .diff-output__line-number { padding: 0 6px 0 4px; border-right: 1px solid var(--color-000000-ap5); color: var(--color-a0a099); text-align: right; user-select: none; }
-.diff-output__line-select { min-width: 0; min-height: 20px; border-width: 0 1px 0 0; border-style: solid; border-color: var(--color-000000-ap5); border-radius: 0; background: transparent; font: inherit; line-height: inherit; cursor: pointer; }
-.diff-output__line-select:hover { color: var(--text); background: var(--hover); }
-.diff-output__line-select:focus-visible { position: relative; z-index: 1; outline: 1px solid var(--accent); outline-offset: -2px; }
-.diff-output__line-select[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); font-weight: 700; }
 .diff-output__content { min-height: 20px; padding: 0 9px 0 3px; white-space: pre; }
 .diff-output__line--addition { color: var(--color-246b4e); background: var(--color-eaf7f0); }
 .diff-output__line--deletion { color: var(--color-994040); background: var(--color-fff0f0); }

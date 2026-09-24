@@ -91,10 +91,6 @@ impl Paths {
     pub fn log_file(&self) -> PathBuf {
         self.root.join("agent.log")
     }
-
-    pub fn bin_root(&self) -> PathBuf {
-        self.root.join("bin")
-    }
 }
 
 pub fn home_dir() -> Option<PathBuf> {

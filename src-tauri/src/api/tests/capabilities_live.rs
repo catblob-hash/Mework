@@ -47,6 +47,7 @@ fn capability_request(
         id: "live-user-1".into(),
         content: user_message.to_owned(),
         images: Vec::new(),
+        files: Vec::new(),
         created_at: "2026-09-02T00:00:00Z".into(),
     }];
     request

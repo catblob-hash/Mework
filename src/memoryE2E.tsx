@@ -13,7 +13,6 @@ import {
   saveDocument
 } from "./lib/runtime";
 import { startApplicationAppearance } from "./theme";
-import "katex/dist/katex.min.css";
 import "./styles.css";
 
 const summary = document.querySelector<HTMLOutputElement>("#memory-e2e-summary")!;

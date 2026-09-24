@@ -1,9 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { translate } from "../i18n";
-import type { SecurityLevel } from "../types";
 import {
   SECURITY_LEVEL_OPTIONS,
-  securityLevelDescription,
   securityLevelLabel
 } from "./securityLevels";
 
@@ -29,22 +27,11 @@ describe("securityLevels", () => {
       .toEqual(["Manual", "Accept edits", "Plan mode", "Full access"]);
   });
 
-  it("gives every level a distinct label and description", () => {
+  it("gives every level a distinct label", () => {
     const labels = SECURITY_LEVEL_OPTIONS.map((level) => securityLevelLabel(level, zh));
-    const descriptions = SECURITY_LEVEL_OPTIONS.map(
-      (level) => securityLevelDescription(level, zh)
-    );
 
     // The old catch-all ternary labelled the most restrictive level "完全访问";
     // an exhaustive switch is what keeps a fourth level from doing that again.
     expect(new Set(labels).size).toBe(SECURITY_LEVEL_OPTIONS.length);
-    expect(new Set(descriptions).size).toBe(SECURITY_LEVEL_OPTIONS.length);
-    expect(descriptions.every((text) => text.length > 0)).toBe(true);
-  });
-
-  it("says plan mode changes nothing until the plan is approved", () => {
-    const level: SecurityLevel = "plan";
-    expect(securityLevelDescription(level, zh)).toContain("批准");
-    expect(securityLevelDescription(level, en)).toContain("approve");
   });
 });

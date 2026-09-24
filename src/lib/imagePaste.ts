@@ -5,6 +5,7 @@ import {
   MAX_IMAGE_ATTACHMENT_BYTES,
   MAX_IMAGE_ATTACHMENT_PIXELS
 } from "./imageBudget";
+import { intakeAttachments, type AddMessageAttachments } from "./fileAttachments";
 import { nextImageShortId } from "./imageShortIds";
 import { prepareImageAttachment } from "./runtime";
 import type { ImageAttachment } from "../types";
@@ -75,4 +76,20 @@ export async function acceptPastedImages(
     accepted.push({ ...image, shortId });
   }
   return accepted;
+}
+
+/**
+ * The attach handler for a user message edited in place: images numbered
+ * against `taken()` through {@link acceptPastedImages}, files through the
+ * shared intake. `imageInput` false turns images away with a reason rather
+ * than letting them land where the model could never read them.
+ */
+export function messageAttachmentAdder(imageInput: boolean, taken: () => Set<number>): AddMessageAttachments {
+  return (files, existing, preRejected) => intakeAttachments(files, {
+    addImages: imageInput
+      ? (images) => acceptPastedImages(images, existing.images, taken())
+      : undefined,
+    existingFiles: () => existing.files,
+    preRejected
+  });
 }

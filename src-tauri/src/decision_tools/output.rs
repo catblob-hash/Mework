@@ -10,11 +10,17 @@
 //! Both keep the status out of the scoring. How the command ended is the one thing the model
 //! must always see, so it is printed verbatim above the report rather than left to clear a
 //! threshold.
+//!
+//! The output is cut into log records ([`Blocks::log_records`]) rather than bare lines: a
+//! command's output keeps no trace of how it was written — the registry holds one byte stream,
+//! and a C program writing into a pipe flushes in 4 KiB blocks anyway — so the records are read
+//! off the text itself, and an indented stack trace stays with the line it belongs to. Every
+//! record at or above the threshold comes back whole, its lines numbered.
 
 use std::sync::Arc;
 
 use crate::cancel::CancelSignal;
-use crate::decision_model::chunk::chunk_lines;
+use crate::decision_model::chunk::Blocks;
 use crate::decision_model::jev::RELEVANCE_RUBRIC;
 use crate::decision_model::search::{render_report, search, Scorer};
 use crate::decision_model::{parse_query, parse_threshold};
@@ -23,8 +29,7 @@ use crate::shell_tasks::{ShellTaskOutcome, ShellTaskSnapshot};
 use crate::state::AppState;
 use crate::tool_executor::required_string;
 
-use super::files::{chunk_candidates, refine_line_chunk};
-use super::{failure, jev_scorer};
+use super::{failure, jev_scorer, line_blocks, numbered};
 
 /// Longest task address accepted, matching the schema's `maxLength`.
 const MAX_TASK_ADDRESS_CHARS: usize = 64;
@@ -62,8 +67,8 @@ pub(crate) fn find_output(
              retained; only the last part of it was scored."
         ));
     }
-    let plan = chunk_lines(&text);
-    if plan.chunks.is_empty() {
+    let records = Blocks::log_records(&text);
+    if records.spans().is_empty() {
         lines.push(format!("shell:{id} has produced no output to score."));
         return Ok(lines.join("\n"));
     }
@@ -71,19 +76,12 @@ pub(crate) fn find_output(
     lines.push(score_chunks(
         scorer,
         &source,
-        &plan,
+        records,
         &query,
         threshold,
-        &format!("chunks of shell:{id} output"),
+        &format!("records of shell:{id} output"),
         cancel,
     )?);
-    if plan.covered_lines < plan.total_lines {
-        lines.push(format!(
-            "Only lines 1-{} of the {} retained lines were scored; this command's output is \
-             longer than one call can score.",
-            plan.covered_lines, plan.total_lines
-        ));
-    }
     Ok(lines.join("\n"))
 }
 
@@ -100,8 +98,8 @@ pub(crate) fn score_command_output(
     let (status, body) = split_status_line(output, success);
     let mut lines = Vec::new();
     lines.extend(status.map(str::to_owned));
-    let plan = chunk_lines(body);
-    if plan.chunks.is_empty() {
+    let records = Blocks::log_records(body);
+    if records.spans().is_empty() {
         lines.push(NO_OUTPUT.to_owned());
         return Ok(lines.join("\n"));
     }
@@ -109,44 +107,31 @@ pub(crate) fn score_command_output(
     lines.push(score_chunks(
         scorer,
         "output",
-        &plan,
+        records,
         &query,
         threshold,
-        "chunks of the command output",
+        "records of the command output",
         cancel,
     )?);
-    if plan.covered_lines < plan.total_lines {
-        lines.push(format!(
-            "Only lines 1-{} of the command's {} lines of output were scored; the rest was too \
-             long for one call.",
-            plan.covered_lines, plan.total_lines
-        ));
-    }
     Ok(lines.join("\n"))
 }
 
-/// The scoring pass both entry points share: coarse line chunks, winners refined into their
-/// pieces, rendered with the source and the line numbers of the output itself.
+/// The scoring pass both entry points share: every record scored, and every one at or above the
+/// threshold rendered whole, with the source and the line numbers of the output itself.
 fn score_chunks(
     scorer: Arc<dyn Scorer>,
     source: &str,
-    plan: &crate::decision_model::chunk::ChunkPlan,
+    records: Blocks,
     query: &str,
     threshold: f64,
     subject: &str,
     cancel: &CancelSignal,
 ) -> Result<String, String> {
-    let (coarse, by_label) = chunk_candidates(source, &plan.chunks);
-    let report = search(
-        scorer,
-        query,
-        threshold,
-        coarse,
-        |candidate| refine_line_chunk(source, &by_label, candidate),
-        cancel,
-    )
-    .map_err(failure)?;
-    Ok(render_report(&report, query, threshold, subject, true))
+    let blocks = line_blocks(&records, source, 1);
+    let report = search(scorer, query, threshold, &blocks, cancel).map_err(failure)?;
+    Ok(render_report(&report, query, threshold, subject, |hit| {
+        Some(numbered(&records, records.spans()[hit.block], 1))
+    }))
 }
 
 /// A failed command's result opens with its status — `Exit code 2`, the abort notice, or the

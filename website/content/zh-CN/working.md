@@ -39,9 +39,9 @@
 
 {{TOOL_COUNT}} 个内置工具，按组划分——每个工具在[内置工具](tools.html)下都有自己的页面：
 
-- **文件系统** — `ls`、`grep`、`read`、`write`、`edit`、`find`、`lsp`。受限于工作区和受信任根目录；符号链接、联接和 `..` 无法逃逸；写入是原子的，并返回差异。五道写入保护对每个对话、每个子代理恒常开启：对既有文件的 `edit`/`write` 要求先读取过；按文件修改时间已过期的写入会被拒绝，除非它是一次 `edit` 且其搜索文本在文件中仍恰好只匹配一处；你读过的文件的外部改动会在下一轮得到通报；钩子（格式化器）改写后会重新同步宿主对文件的记录；改动过你读过的文件的 Shell 格式化命令会被标记。`lsp` 由语言服务器作答（参见[代码语义导航](lsp.html)）；工作区自己的 `.mework/lsp.json` 点名的服务器会像一条命令那样请求批准，来自 `~/.mework/lsp.json` 或内置预设的则不会。
-- **Shell** — `bash`、`zsh`、`sh`、`powershell`：每个 shell 后端一个工具，对话中有机器装有该 shell 时才会列出。可在前台或后台（`run_in_background`）运行；批准卡显示的就是命令本身，折叠为一行。
-- **网络** — `web_search`、`web_fetch`，以及 15 个 `preview_*` 工具：把项目自己的开发服务器跑起来，并操作它渲染出的页面。
+- **文件系统** — `ls`、`grep`、`read`、`write`、`edit`、`find`（选择器里的 [`files`](tools.html#files) 一行）、`lsp`，以及凭描述经[决策模型](tools.html#decision-model)查找文件或段落的 `find_files` 与 `find_content`。受限于工作区和受信任根目录；符号链接、联接和 `..` 无法逃逸；写入是原子的，并返回差异。五道写入保护对每个对话、每个子代理恒常开启：对既有文件的 `edit`/`write` 要求先读取过；按文件修改时间已过期的写入会被拒绝，除非它是一次 `edit` 且其搜索文本在文件中仍恰好只匹配一处；你读过的文件的外部改动会在下一轮得到通报；钩子（格式化器）改写后会重新同步宿主对文件的记录；改动过你读过的文件的 Shell 格式化命令会被标记。`lsp` 由语言服务器作答（参见[代码语义导航](lsp.html)）；工作区自己的 `.mework/lsp.json` 点名的服务器会像一条命令那样请求批准，来自 `~/.mework/lsp.json` 或内置预设的则不会。
+- **Shell** — `bash`、`zsh`、`sh`、`powershell`（选择器里的 [`shell`](tools.html#shell) 一行）：每个 shell 后端一个工具，对话中有机器装有该 shell 时才会列出。可在前台或后台（`run_in_background`）运行；批准卡显示的就是命令本身，折叠为一行。每个 shell 还有一个筛选输出形式，即 `bash_find_output` 及其同类，只返回输出里和描述相符的部分；`find_output` 按 `shell:<id>` 地址对本对话运行过的任何 shell 命令做同样的事。
+- **网络** — `web_search`、`web_fetch`，以及 16 个 `preview_*` 工具（选择器里的 [`preview`](tools.html#preview) 一行）：把项目自己的开发服务器跑起来，并操作它渲染出的页面。
 - **编排** — `agent_spawn`、`send_message`、`followup_task`、`task_wait`、`task_list`、`box`、`workflow`、`fork`、`skill`、`tool_search`、`todo`、`ask_user`、`plan`、`exit_plan_mode`。
 - **记忆** — `read/create/edit_global_memory`、`read/create/edit_project_memory`。
 
@@ -68,7 +68,7 @@
 
 ## 运行环境
 
-每个工作区都在一台机器上——本机、某个 WSL 发行版，或你登记的 SSH 机器——而 shell 是这台机器下的执行后端。Mework 会探测每台机器上它能用的 shell（本机在启动时，SSH 机器在每次启动后首次连接时，WSL 发行版在首次使用时，任何机器也可以在其设置里点**重新探测 shell**），并且只探测它支持的组合：Windows 上的 PowerShell 与 Git Bash，macOS、Linux 和 WSL 上的 zsh、Bash 与 sh。对话列出的 shell 工具是它所有机器的 shell 的并集，每个工具只能指定机器上有该 shell 的工作区。WSL 发行版和 SSH 机器还有一个**代理 shell**，就在该按钮右侧选择：远程文件工具、语言服务器和 Git 状态读取都经它运行脚本。新机器的代理 shell 取**设置 → Shell 优先级**里它所在系统的列表中、它装有的第一个 shell。环境变量属于各个工作区，点工作区旁的齿轮编辑。批准会连同环境生成指纹，因此更改环境会使待处理的批准失效。
+每个工作区都在一台机器上——本机、某个 WSL 发行版，或你登记的 SSH 机器——而 shell 是这台机器下的执行后端。Mework 会探测每台机器上它能用的 shell（本机在启动时，SSH 机器在每次启动后首次连接时，WSL 发行版在首次使用时，任何机器也可以在其设置里点**重新探测 shell**），并且只探测它支持的组合：Windows 上的 PowerShell 与 Git Bash，macOS、Linux 和 WSL 上的 zsh、Bash 与 sh。对话列出的 shell 工具是它所有机器的 shell 的并集，每个工具只能指定机器上有该 shell 的工作区。WSL 发行版和 SSH 机器还有一个**代理 shell**，就在该按钮右侧选择：远程文件工具、语言服务器和 Git 状态读取都经它运行脚本。新机器的代理 shell 按 Mework 为各系统固定的顺序，取它装有的第一个：Windows 上 PowerShell 先于 Bash；Linux 与 WSL 上依次是 Bash、zsh、sh；macOS 上依次是 zsh、Bash、sh。环境变量属于各个工作区，点工作区旁的齿轮编辑。批准会连同环境生成指纹，因此更改环境会使待处理的批准失效。
 
 ### 额外工作目录
 
@@ -110,7 +110,7 @@
 
 另外 11 个工具作用在页面上：`preview_snapshot`（无障碍树）、`preview_inspect`（单个选择器的计算样式）、`preview_screenshot`、`preview_console_logs`、`preview_network`、`preview_click`、`preview_fill`、`preview_eval`、`preview_resize`、`preview_dialog` 与 `preview_upload_image`。这里刻意没有导航工具，也没有标签页管理：一个对话只有一个页面，且它来自模型自己启动的那个服务器（`preview_eval` 仍可用 `window.location` 把它挪走）。输入经可信 CDP 送达，并以可见的指针浮层提示；页面里不注入任何东西，远程内容也永远触不到应用的 IPC 表面。
 
-15 个中有 5 个只读宿主自己的状态，从不弹出批准卡：`preview_list`、`preview_logs`、`preview_snapshot`、`preview_inspect` 和 `preview_resize`。其余 10 个在完全访问以下都要询问。
+16 个中有 5 个只读宿主自己的状态，从不弹出批准卡：`preview_list`、`preview_logs`、`preview_snapshot`、`preview_inspect` 和 `preview_resize`。其余 11 个在完全访问以下都要询问。
 
 只要 `.mework/launch.json` 可用且没有写成 `autoVerify: false`（默认就是开的，面板上的开关写的就是这个字段），系统提示词就会多出一段 `<preview_tools>`，讲的是「改完代码怎么验收」：先起服务器、必要时刷新，再读控制台 / 服务器 / 网络日志、取快照、查样式、试交互，最后用截图向你出示结果，而不是让你自己去看。关掉开关会从**下一步**起不再收到这段，而不是等到下一回合；没启用 `preview_start` 的对话同样收不到。
 
@@ -135,9 +135,11 @@ SSH 机器上的工作区，开发服务器由那台机器上的 Mework 代理�
 
 名为 `MEWORK.md` 的项目说明文件——在工作区里、在其 `.mework/` 里、沿上级目录直到项目边界、以及 `~/.mework/` 里——连同 `.mework/rules/*.md` 和一份由机器管理的策略文件，在启动时被发现，并作为不受信任的文件上下文块注入，独立于记忆开关。
 
-## 图像 {#images}
+## 图像与文件 {#images}
 
-将图像拖入或粘贴到输入框中；每张图像都会在你的消息中获得一个模型可引用的 `[Image #N]` 占位符。产生图像的工具结果（对图像文件执行 `read`、`preview_screenshot`）也会获得编号，`preview_upload_image` 可将其中一张送进页面上的 file 输入框。图像会以内容寻址方式存储在应用数据目录下。
+用 **+ → 上传文件**、粘贴，或把文件拖到输入框上，都能给消息添加附件；在时间线上编辑一条消息时，它也有自己的 **+**，同样可以粘贴和拖入。可以添加图像、PDF 和文本文件（源代码、Markdown、CSV、JSON、日志等）；拖动时，放置区域会说明将接收哪些内容，文件夹或不支持的格式在松手前就会显示为不可用。没有添加的项会连同原因一起列出。点击附件即可预览：PDF 按页排版，Markdown、HTML、CSV 和 notebook 会渲染出来，其他文本带行号显示。
+
+每张图像都会在你的消息中获得一个模型可引用的 `[Image #N]` 占位符（所选模型需要支持图像输入）。产生图像的工具结果（对图像文件执行 `read`、`preview_screenshot`）也会获得编号，`preview_upload_image` 可将其中一张送进页面上的 file 输入框。文件以文字的形式交给模型，在请求发出时放在你的消息之前——PDF 是其各页的文字，所以没有文字层的扫描件会被拒收。文本文件最大 512 KB，PDF 最大 10 MB；一条消息最多带 20 个文件，文字合计约 40 万 tokens。粘贴一大段文字（5000 个字符或 100 行以上）时，它会变成 `pasted-text.md` 附件，而不是填满输入框。附件会以内容寻址方式存储在应用数据目录下。
 
 ## Git 与终端
 

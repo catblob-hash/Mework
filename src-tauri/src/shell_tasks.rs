@@ -614,100 +614,6 @@ impl ShellTaskRegistry {
         true
     }
 
-    /// Copies every finished row of one conversation into another under fresh ids, output tail
-    /// included, and publishes `ShellTaskEnded` for each clone so the renderer paints the rows.
-    ///
-    /// A forked conversation inherits the parent's transcript, and a command the parent ran is part
-    /// of that story: the copied tool cards reference rows the child would otherwise not have.
-    ///
-    /// Running rows are not copied. A live command belongs to the source's tool call — one process,
-    /// one stop button — and a second row pointing at it would hand a stop to a conversation that
-    /// never started it. Clones are minted in ascending source order so the sidebar reads the same
-    /// way in both conversations, and each gets a fresh stop flag rather than sharing the source's.
-    /// Returns the clones that survived the target's retention bound.
-    #[cfg(test)]
-    pub fn clone_finished_rows(&self, source: &str, target: &str) -> Vec<ShellTaskSnapshot> {
-        self.try_clone_finished_rows(source, target).unwrap()
-    }
-
-    pub fn try_clone_finished_rows(
-        &self,
-        source_conversation_id: &str,
-        target_conversation_id: &str,
-    ) -> Result<Vec<ShellTaskSnapshot>, String> {
-        let (snapshots, evicted) = {
-            let mut registry = self.lock();
-            let mut sources = registry
-                .entries
-                .values()
-                .filter(|entry| entry.conversation_id == source_conversation_id && entry.finished())
-                .map(|entry| {
-                    (
-                        entry.sequence,
-                        ShellTaskEntry {
-                            conversation_id: target_conversation_id.to_owned(),
-                            tool_name: entry.tool_name.clone(),
-                            command: entry.command.clone(),
-                            started_at: entry.started_at.clone(),
-                            // Never the source's `Arc`: a finished row has nothing left to stop, and
-                            // sharing the flag would let one conversation raise another's.
-                            stop: Arc::new(AtomicBool::new(false)),
-                            ended_at: entry.ended_at.clone(),
-                            outcome: entry.outcome,
-                            exit_code: entry.exit_code,
-                            background: entry.background,
-                            // Replaced below by the clone's own minted number.
-                            sequence: entry.sequence,
-                            output: ShellTaskOutput {
-                                buffer: entry.output.buffer.clone(),
-                                dropped_head_bytes: entry.output.dropped_head_bytes,
-                                next_seq: entry.output.next_seq,
-                                // The sink and its subscription belong to whoever is watching the
-                                // source; a clone starts with no watcher and no writer.
-                                ..ShellTaskOutput::default()
-                            },
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
-            sources.sort_by_key(|(sequence, _)| *sequence);
-            let mut snapshots = Vec::with_capacity(sources.len());
-            for (_, mut entry) in sources {
-                let sequence = registry.mint_sequence();
-                let shell_task_id = sequence.to_string();
-                entry.sequence = sequence;
-                snapshots.push(entry.snapshot(&shell_task_id));
-                registry.entries.insert(shell_task_id, entry);
-            }
-            let evicted = registry.evict_finished(target_conversation_id);
-            if let Err(error) = registry.persist() {
-                for snapshot in &snapshots {
-                    registry.entries.remove(&snapshot.shell_task_id);
-                }
-                return Err(error);
-            }
-            (snapshots, evicted)
-        };
-        for evicted_id in &evicted {
-            self.publish(AppPushEvent::ShellTaskEvicted {
-                conversation_id: target_conversation_id.to_owned(),
-                shell_task_id: evicted_id.clone(),
-            });
-        }
-        // A clone the target's own retention bound just dropped is not a row anyone can open, so
-        // only the survivors are announced and returned.
-        let survivors = snapshots
-            .into_iter()
-            .filter(|snapshot| !evicted.contains(&snapshot.shell_task_id))
-            .collect::<Vec<_>>();
-        for snapshot in &survivors {
-            self.publish(AppPushEvent::ShellTaskEnded {
-                task: snapshot.clone(),
-            });
-        }
-        Ok(survivors)
-    }
-
     /// Asks the named command to stop. Returns false when the task is unknown, already finished, or
     /// belongs to another conversation. The caller must supply the owning conversation: a stop is a
     /// per-conversation action, and one conversation may never reach into another's processes.
@@ -724,9 +630,8 @@ impl ShellTaskRegistry {
     }
 
     /// Stops every running command owned by a conversation. Finished rows remain.
-    /// This bulk operation is reserved for tests and an explicit future stop-all
-    /// action; production cancellation follows the owning run/task signal.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only: production cancellation follows the owning run/task signal.
+    #[cfg(test)]
     pub fn stop_conversation(&self, conversation_id: &str) -> usize {
         let registry = self.lock();
         registry
@@ -1145,36 +1050,47 @@ mod tests {
     }
 
     #[test]
-    fn durable_shell_forks_and_deletions_do_not_resurrect_removed_rows() {
+    fn durable_shell_deletions_do_not_resurrect_removed_rows() {
         let directory = tempfile::tempdir().unwrap();
         let registry = ShellTaskRegistry::default();
         registry.install_store(directory.path()).unwrap();
-        let mut guard = registry.register("parent", "bash", "copy me", true);
-        registry.append_output(
-            guard.shell_task_id(),
-            ShellOutputStream::Stdout,
-            "copied output",
-        );
+        let mut guard = registry.register("parent", "bash", "forget me", true);
         guard.finish(ShellTaskOutcome::Succeeded, Some(0));
         drop(guard);
-        let mut running = registry.register("parent", "bash", "do not copy me", true);
-        let copies = registry.try_clone_finished_rows("parent", "child").unwrap();
-        assert_eq!(copies.len(), 1);
+        let mut kept = registry.register("child", "bash", "keep me", true);
+        registry.append_output(
+            kept.shell_task_id(),
+            ShellOutputStream::Stdout,
+            "kept output",
+        );
+        kept.finish(ShellTaskOutcome::Succeeded, Some(0));
+        drop(kept);
+        let mut running = registry.register("parent", "bash", "stop me", true);
         registry.try_forget_missing(["child"]).unwrap();
         assert!(running.stop_requested());
         running.registry = ShellTaskRegistry::default();
         drop(running);
+        let kept_rows = registry.task_snapshots("child");
+        assert_eq!(kept_rows.len(), 1);
         drop(registry);
         let restored = ShellTaskRegistry::default();
         restored.install_store(directory.path()).unwrap();
         assert!(restored.task_snapshots("parent").is_empty());
-        assert_eq!(restored.task_snapshots("child"), copies);
+        assert_eq!(restored.task_snapshots("child"), kept_rows);
         let output = restored
-            .subscribe_output("child", &copies[0].shell_task_id, Channel::new(|_| Ok(())))
+            .subscribe_output(
+                "child",
+                &kept_rows[0].shell_task_id,
+                Channel::new(|_| Ok(())),
+            )
             .unwrap();
-        assert_eq!(output.snapshot, "copied output");
+        assert_eq!(output.snapshot, "kept output");
         assert!(restored
-            .subscribe_output("parent", &copies[0].shell_task_id, Channel::new(|_| Ok(())))
+            .subscribe_output(
+                "parent",
+                &kept_rows[0].shell_task_id,
+                Channel::new(|_| Ok(()))
+            )
             .is_none());
     }
 
@@ -1956,113 +1872,5 @@ mod tests {
             .output_sink(ShellOutputStream::Stdout)
             .append(b"nobody");
         assert_eq!(second_received.lock().unwrap().len(), 1);
-    }
-
-    /// A forked conversation inherits the parent's finished rows: same command, same outcome, same
-    /// transcript, under its own ids. The parent's rows are the record of what really ran and must
-    /// come through the copy untouched.
-    #[test]
-    fn a_fork_inherits_finished_rows_under_fresh_ids_with_their_output() {
-        let registry = ShellTaskRegistry::default();
-        let first_id = {
-            let mut guard = registry.register("conversation-a", "bash", "npm test", false);
-            guard
-                .output_sink(ShellOutputStream::Stdout)
-                .append(b"3 passed\n");
-            guard.finish(ShellTaskOutcome::Failed, Some(1));
-            guard.shell_task_id().to_owned()
-        };
-        let second_id = {
-            let mut guard = registry.register("conversation-a", "powershell", "Get-Date", true);
-            guard.finish(ShellTaskOutcome::Succeeded, Some(0));
-            guard.shell_task_id().to_owned()
-        };
-        // Attached after the source rows ended, so only the clones' events are collected.
-        let hub = AppEventHub::default();
-        let (channel, received) = collecting_push_channel();
-        hub.subscribe(channel);
-        registry.attach_events(hub);
-
-        let clones = registry.clone_finished_rows("conversation-a", "conversation-child");
-
-        assert_eq!(clones.len(), 2);
-        // Ascending source order, so both sidebars read the same way.
-        assert_eq!(clones[0].command, "npm test");
-        assert_eq!(clones[1].command, "Get-Date");
-        assert_eq!(clones[0].tool_name, "bash");
-        assert_eq!(clones[0].conversation_id, "conversation-child");
-        assert_ne!(clones[0].shell_task_id, first_id);
-        assert_ne!(clones[1].shell_task_id, second_id);
-        assert_eq!(clones[0].outcome, Some(ShellTaskOutcome::Failed));
-        assert_eq!(clones[0].exit_code, Some(1));
-        assert!(clones[1].background);
-
-        let source = registry
-            .task_snapshot("conversation-a", &first_id)
-            .expect("the source row is retained");
-        assert_eq!(clones[0].started_at, source.started_at);
-        assert_eq!(clones[0].ended_at, source.ended_at);
-
-        let (channel, _received) = collecting_channel();
-        let handle = registry
-            .subscribe_output("conversation-child", &clones[0].shell_task_id, channel)
-            .expect("the clone is registered");
-        assert_eq!(handle.snapshot, "3 passed\n");
-        assert!(!handle.live);
-
-        // The source keeps exactly its own two rows, still owned by its own conversation.
-        let sources = registry.task_snapshots("conversation-a");
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources[0].shell_task_id, first_id);
-        assert_eq!(sources[0].conversation_id, "conversation-a");
-
-        // The renderer paints an inherited row from the terminal event, like any other finished one.
-        let events = received.lock().unwrap();
-        let ended = events
-            .iter()
-            .filter(|event| event["type"] == "shellTaskEnded")
-            .collect::<Vec<_>>();
-        assert_eq!(ended.len(), 2);
-        assert_eq!(ended[0]["task"]["conversationId"], "conversation-child");
-        assert_eq!(ended[0]["task"]["command"], "npm test");
-    }
-
-    /// A running command is one process with one stop button. Copying its row would give the child
-    /// a stop for something it never started, so only finished rows are inherited.
-    #[test]
-    fn a_fork_does_not_inherit_a_running_row() {
-        let registry = ShellTaskRegistry::default();
-        let running = registry.register("conversation-a", "bash", "sleep 100", true);
-        let mut finished = registry.register("conversation-a", "bash", "echo ok", false);
-        finished.finish(ShellTaskOutcome::Succeeded, Some(0));
-        drop(finished);
-
-        let clones = registry.clone_finished_rows("conversation-a", "conversation-child");
-
-        assert_eq!(clones.len(), 1);
-        assert_eq!(clones[0].command, "echo ok");
-        assert!(registry
-            .task_snapshots("conversation-child")
-            .iter()
-            .all(|snapshot| snapshot.command != "sleep 100"));
-        assert!(!running.stop_requested());
-    }
-
-    /// Cloning twice mints two rows rather than colliding on the ids of the first copy.
-    #[test]
-    fn cloning_into_one_conversation_twice_mints_distinct_ids() {
-        let registry = ShellTaskRegistry::default();
-        {
-            let mut guard = registry.register("conversation-a", "bash", "echo ok", false);
-            guard.finish(ShellTaskOutcome::Succeeded, Some(0));
-        }
-
-        let first = registry.clone_finished_rows("conversation-a", "conversation-child");
-        let second = registry.clone_finished_rows("conversation-a", "conversation-child");
-
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_ne!(first[0].shell_task_id, second[0].shell_task_id);
-        assert_eq!(registry.task_snapshots("conversation-child").len(), 2);
     }
 }

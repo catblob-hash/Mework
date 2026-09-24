@@ -4,7 +4,6 @@ import {
   finishedTaskItems,
   flattenTaskItems,
   runningTaskItems,
-  taskItemAgent,
   taskStateForStatus
 } from "./taskContainer";
 import type { TaskContainerMessages } from "./taskContainer";
@@ -207,7 +206,7 @@ describe("deriveTaskItems", () => {
     expect(items[0]!.kind).toBe("subagent");
     expect(items[0]!.id).toBe("parent");
     expect(items[0]!.state).toBe("running");
-    expect(taskItemAgent(items[0]!)?.id).toBe("parent");
+    expect(items[0]!.kind === "subagent" && items[0]!.agent.id).toBe("parent");
     expect(items[0]!.children).toEqual([]);
     expect(flattenTaskItems(items).map((item) => item.id)).toEqual(["parent"]);
   });
@@ -382,8 +381,6 @@ describe("deriveTaskItems", () => {
     expect(items).toHaveLength(1);
     expect(items[0]!.kind).toBe("workflow");
     expect(items[0]!.detail).toBe("0 个步骤");
-    // Nothing hands the run back as an agent, so nothing can open it.
-    expect(taskItemAgent(items[0]!)).toBeNull();
   });
 
   it("counts a live shell as running whether or not a command is in flight", () => {
@@ -402,7 +399,6 @@ describe("deriveTaskItems", () => {
       ["终端 2", "running", "正在执行命令"],
       ["终端 3", "finished", "空闲"]
     ]);
-    expect(taskItemAgent(items[0]!)).toBeNull();
     // A shell reports none of the four columns, which renders as "—" not "0".
     expect(items[0]!.metrics)
       .toEqual({ childCount: null, tokens: null, toolCount: null, elapsedMs: null });

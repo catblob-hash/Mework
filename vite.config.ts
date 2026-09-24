@@ -45,6 +45,9 @@ export default defineConfig({
     }
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
+  // pdf.js's CMaps and standard fonts, imported `?inline` by the PDF viewer so the
+  // renderer never has to fetch them (its CSP allows no fetches but the host's IPC).
+  assetsInclude: ["**/*.bcmap", "**/*.pfb"],
   build: {
     target: "es2021",
     sourcemap: true,

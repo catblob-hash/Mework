@@ -18,3 +18,4 @@ A conversation with no tasks at all gets one line saying so. The whole listing i
 - [agent_spawn](agent_spawn.html), [followup_task](followup_task.html)
 - [box](box.html) — uncollected results arrive on their own
 - [Working with Mework](../working.html#subagents-workflows-and-tasks)
+- [find_output](find_output.html) — search a `shell:<id>` row's output by description

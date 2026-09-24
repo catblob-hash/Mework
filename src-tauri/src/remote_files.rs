@@ -27,7 +27,7 @@
 //! the machine's identity in: one machine's `/srv/app` is not another's, and a
 //! `stat` on this host says nothing about either.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use globset::Glob;
@@ -1418,13 +1418,6 @@ fn edit_with(
     })
 }
 
-/// The registry key a remote record is filed under, for callers that need it
-/// without running anything.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn record_key(machine_key: &str, canonical_path: &str) -> PathBuf {
-    file_read_state::remote_key(machine_key, canonical_path)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1433,6 +1426,12 @@ pub(crate) mod tests {
     use serde_json::{json, Value};
     use std::io::Write as _;
     use std::process::{Command, Stdio};
+
+    /// The registry key a remote record is filed under, for tests that need it
+    /// without running anything.
+    fn record_key(machine_key: &str, canonical_path: &str) -> std::path::PathBuf {
+        file_read_state::remote_key(machine_key, canonical_path)
+    }
 
     // -- pure tests ---------------------------------------------------------
 

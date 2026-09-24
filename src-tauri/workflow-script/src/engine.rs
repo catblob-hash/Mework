@@ -195,17 +195,11 @@ impl<'js> SourceValue for QjsSource<'js> {
 /// Inbound direction: materialize a plain-data graph as script values.
 struct QjsSink<'js> {
     ctx: Ctx<'js>,
-    /// Reused freeze helper. Host error records use a null prototype and are frozen,
-    /// so they deliberately do not satisfy script-side `instanceof Error`.
-    freeze: Function<'js>,
 }
 
 impl<'js> QjsSink<'js> {
-    fn new(ctx: Ctx<'js>) -> Result<Self, String> {
-        let freeze: Function = ctx
-            .eval("(value => Object.freeze(value))")
-            .map_err(|error| caught_text(&ctx, error))?;
-        Ok(Self { ctx, freeze })
+    fn new(ctx: Ctx<'js>) -> Self {
+        Self { ctx }
     }
 
     fn convert(&self, error: rquickjs::Error) -> String {
@@ -272,30 +266,6 @@ impl<'js> SinkBuilder for QjsSink<'js> {
             .set(key, value.clone())
             .map_err(|error| self.convert(error))
     }
-
-    fn host_error(
-        &mut self,
-        name: &str,
-        message: &str,
-        stack: &str,
-    ) -> Result<Self::Value, String> {
-        let object = Object::new(self.ctx.clone()).map_err(|error| self.convert(error))?;
-        object
-            .set_prototype(None)
-            .map_err(|error| self.convert(error))?;
-        object
-            .set("name", name)
-            .map_err(|error| self.convert(error))?;
-        object
-            .set("message", message)
-            .map_err(|error| self.convert(error))?;
-        object
-            .set("stack", stack)
-            .map_err(|error| self.convert(error))?;
-        self.freeze
-            .call::<_, Value>((object,))
-            .map_err(|error| self.convert(error))
-    }
 }
 
 /// Clone outbound and serialize to JSON.
@@ -308,7 +278,7 @@ fn value_to_json<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<JsonValue, St
 /// Parse JSON into a graph and materialize it inbound.
 fn json_to_value<'js>(ctx: &Ctx<'js>, json: &JsonValue) -> Result<Value<'js>, String> {
     let graph = graph_from_json(json).map_err(|error| error.to_string())?;
-    let mut sink = QjsSink::new(ctx.clone())?;
+    let mut sink = QjsSink::new(ctx.clone());
     clone_in(&graph, &mut sink).map_err(|error| error.to_string())
 }
 
@@ -958,7 +928,7 @@ mod tests {
     /// Test scripts use the permissive role policy by default. Role-required behavior
     /// has dedicated tests.
     fn spec(script: &str) -> crate::ScriptSpec {
-        crate::ScriptSpec::parse(script, None, None, StepRolePolicy::permissive())
+        crate::ScriptSpec::parse(script, None, None, StepRolePolicy::default())
             .expect("test script parses")
             .1
     }
@@ -979,7 +949,7 @@ mod tests {
     }
 
     fn spec_with(script: &str, args: JsonValue) -> crate::ScriptSpec {
-        crate::ScriptSpec::parse(script, Some(args), None, StepRolePolicy::permissive())
+        crate::ScriptSpec::parse(script, Some(args), None, StepRolePolicy::default())
             .expect("test script parses")
             .1
     }
@@ -1327,7 +1297,7 @@ return { hits, fixed };"#,
     fn phase_and_labels_annotate_requests_and_meta_phases_pin_declaration_order() {
         let source_text = "export const meta = { name: \"t\", description: \"d\", phases: [{ title: \"Scan\" }, { title: \"Fix\" }] }\nphase(\"Fix\");\nconst a = agent(\"one\", { label: \"L\" });\nphase(\"Scan\");\nconst b = agent(\"two\");\nconst c = agent(\"three\", { phase: \"Extra\" });\nawait Promise.all([a, b, c]);\nreturn 1;";
         let (_, spec) =
-            crate::ScriptSpec::parse(source_text, None, None, StepRolePolicy::permissive())
+            crate::ScriptSpec::parse(source_text, None, None, StepRolePolicy::default())
                 .unwrap();
         let mut source = spec.start().unwrap();
         let StepProgress::Run(requests) = source.advance(&[]).unwrap() else {
@@ -1371,7 +1341,7 @@ return { before, after, starved };"#,
             ),
             None,
             Some(100),
-            StepRolePolicy::permissive(),
+            StepRolePolicy::default(),
         )
         .unwrap();
         let mut source = spec.start().unwrap();

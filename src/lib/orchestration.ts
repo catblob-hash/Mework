@@ -40,36 +40,6 @@ export interface AgentStatus {
   todo: TodoItemView[] | null;
 }
 
-const orchestrationToolNames = new Set([
-  "subagent",
-  "subagent_update",
-  "structured_output",
-  "subagent_activity",
-  "update",
-  "ask_user",
-  "todo",
-  "agent_spawn",
-  "agent_send",
-  "send_message",
-  "followup_task",
-  "task_wait",
-  "task_list",
-  "box",
-  "workflow",
-  "workflow_step",
-  "plan",
-  "exit_plan_mode"
-]);
-
-/**
- * Orchestration calls are host-owned protocol messages.  Recognise them by
- * their stable wire name as well as by catalog metadata so an upgraded or
- * temporarily stale renderer catalog cannot hide an actionable question.
- */
-export function isOrchestrationToolName(toolName: string): boolean {
-  return orchestrationToolNames.has(toolName);
-}
-
 type UnknownRecord = Record<string, unknown>;
 
 interface ParsedTaskCreate {
@@ -339,15 +309,6 @@ export function questionsFromInput(input: JsonObject): QuestionItemView[] {
     options: optionsFromValue(input.options),
     multiSelect: false
   }] : [];
-}
-
-export function questionFromInput(input: JsonObject): QuestionItemView {
-  return questionsFromInput(input)[0] ?? {
-    question: "",
-    header: "Question",
-    options: [],
-    multiSelect: false
-  };
 }
 
 export function isClaudeQuestionInput(input: JsonObject): boolean {

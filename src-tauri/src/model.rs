@@ -66,15 +66,6 @@ pub struct ExecutionEnvironmentAssets {
         deserialize_with = "crate::model::lenient_backend_map"
     )]
     pub wsl_agent_shells: BTreeMap<String, crate::shell_backend::ShellBackend>,
-    /// One shell priority list per operating system. Its only use is choosing a
-    /// newly added machine's agent shell: the first backend in the machine's OS
-    /// list that the machine has.
-    #[serde(default)]
-    pub shell_priority: ShellPriority,
-    /// Whether conversations' commands run in the operating system's sandbox,
-    /// and what it lets through.
-    #[serde(default)]
-    pub sandbox: SandboxSettings,
 }
 
 /// The sandbox a conversation's commands run in when it is on: one sandboxed
@@ -83,6 +74,10 @@ pub struct ExecutionEnvironmentAssets {
 /// workspaces and nothing that runs outside it later, cannot read the
 /// account's credentials, and reaches the network only through a proxy that
 /// applies [`SandboxNetworkSettings`].
+///
+/// A setting of each conversation rather than of the application: the
+/// conversation is the smallest thing a sandbox is ever drawn around, so it is
+/// where the answer lives, and a preset carries one to copy in.
 ///
 /// A machine that cannot sandbox — no bubblewrap, WSL 1, an SSH machine the
 /// agent does not serve — refuses the command rather than running it
@@ -186,6 +181,12 @@ fn default_sandbox_allowlist() -> Vec<String> {
 }
 
 impl SandboxSettings {
+    /// Whether this is what an unstated conversation gets, so storing it would
+    /// say nothing.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// The network policy the agent applies.
     pub fn network_policy(&self) -> remote_agent::protocol::NetworkPolicy {
         use remote_agent::protocol::{NetworkMode, NetworkPolicy};
@@ -201,35 +202,6 @@ impl SandboxSettings {
     }
 }
 
-/// Each operating system's shell backends, most preferred first. An empty list
-/// is the OS's default order ([`crate::shell_backend::backends_for`]); a list
-/// that leaves a registered backend out ranks it after the ones it names.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ShellPriority {
-    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
-    pub windows: Vec<crate::shell_backend::ShellBackend>,
-    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
-    pub macos: Vec<crate::shell_backend::ShellBackend>,
-    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
-    pub linux: Vec<crate::shell_backend::ShellBackend>,
-    #[serde(default, deserialize_with = "crate::model::lenient_backends")]
-    pub wsl: Vec<crate::shell_backend::ShellBackend>,
-}
-
-impl ShellPriority {
-    /// The list as recorded for `os`, before normalization.
-    pub fn listed(&self, os: crate::shell_backend::MachineOs) -> &[crate::shell_backend::ShellBackend] {
-        use crate::shell_backend::MachineOs;
-        match os {
-            MachineOs::Windows => &self.windows,
-            MachineOs::Macos => &self.macos,
-            MachineOs::Linux => &self.linux,
-            MachineOs::Wsl => &self.wsl,
-        }
-    }
-}
-
 /// A backend identifier this build does not know — one a newer Mework wrote —
 /// is dropped instead of failing the whole document: it names a shell this
 /// build could not run anyway.
@@ -239,17 +211,6 @@ where
 {
     let value = Option::<String>::deserialize(deserializer)?;
     Ok(value.as_deref().and_then(crate::shell_backend::ShellBackend::parse))
-}
-
-fn lenient_backends<'de, D>(deserializer: D) -> Result<Vec<crate::shell_backend::ShellBackend>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let values = Vec::<String>::deserialize(deserializer)?;
-    Ok(values
-        .iter()
-        .filter_map(|value| crate::shell_backend::ShellBackend::parse(value))
-        .collect())
 }
 
 fn lenient_backend_map<'de, D>(
@@ -2013,18 +1974,6 @@ impl EndpointType {
         Self::OpenaiAudioTranscription,
     ];
 
-    /// Endpoints that can carry a chat request. Vocabulary only; kept so the
-    /// catalog test can still prove it is a proper subset of `CATALOG`.
-    #[cfg(test)]
-    pub const CHAT: &'static [Self] = &[
-        Self::OpenaiChatCompletions,
-        Self::OpenaiResponses,
-        Self::AnthropicMessages,
-        Self::GoogleGenerative,
-        Self::AzureOpenai,
-        Self::BedrockConverse,
-    ];
-
     pub fn slug(self) -> &'static str {
         match self {
             Self::OpenaiChatCompletions => "openai_chat_completions",
@@ -2486,6 +2435,11 @@ pub struct ConversationPresetSettings {
         skip_serializing_if = "BTreeSet::is_empty"
     )]
     pub decision_miss_scoring: BTreeSet<String>,
+    /// Sandbox template copied into a new conversation. A missing key is the
+    /// default: off, with the default network allowlist ready for when it is
+    /// switched on.
+    #[serde(default, skip_serializing_if = "SandboxSettings::is_default")]
+    pub sandbox: SandboxSettings,
     // The five file write guards were preset templates here. They are
     // unconditional in the host now, so there is nothing left to copy into a
     // conversation. See [`FileGuard`].
@@ -2794,6 +2748,8 @@ pub struct QueuedMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileAttachment>,
     pub created_at: String,
 }
 
@@ -2944,6 +2900,28 @@ pub struct ConversationSettings {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub remembered_decision_forms: BTreeMap<String, RememberedDecisionForm>,
+    /// The rows each tool family (`files`, `shell`, `preview`) had on when the
+    /// family was switched off as a whole, keyed by family, so switching it
+    /// back on returns to them.
+    ///
+    /// Renderer state like [`Self::remembered_decision_forms`]: a family that
+    /// is off grants nothing, so the host never reads it, and the field exists
+    /// here so a settings round trip through the store does not drop it.
+    #[serde(
+        default,
+        deserialize_with = "lenient_remembered_tool_families",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub remembered_tool_families: BTreeMap<String, Vec<String>>,
+    /// Whether this conversation's commands run in the operating system's
+    /// sandbox, and what it lets through. One cell per conversation and machine
+    /// ([`crate::workspace_set::WorkspaceSet::sandboxed`]), so a conversation's
+    /// answer changes nothing for any other.
+    ///
+    /// A missing key means OFF, like every capability here that a conversation
+    /// is given deliberately; a preset is where "on" is decided.
+    #[serde(default, skip_serializing_if = "SandboxSettings::is_default")]
+    pub sandbox: SandboxSettings,
     /// What this conversation's runs have already put in front of the model.
     ///
     /// `None` until the first run. The host does not decide the contents — the
@@ -3116,6 +3094,29 @@ where
             serde_json::from_value::<RememberedDecisionForm>(value)
                 .ok()
                 .map(|remembered| (tool, remembered))
+        })
+        .collect())
+}
+
+/// Keeps each family's row names out of whatever a newer or damaged renderer
+/// wrote, instead of refusing the whole document over one malformed entry.
+fn lenient_remembered_tool_families<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Option::<BTreeMap<String, Value>>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .flatten()
+        .filter_map(|(family, rows)| {
+            let rows: Vec<String> = rows
+                .as_array()?
+                .iter()
+                .filter_map(|row| row.as_str().map(str::to_owned))
+                .collect();
+            (!rows.is_empty()).then_some((family, rows))
         })
         .collect())
 }
@@ -3300,6 +3301,10 @@ pub enum ContextItem {
         /// Raw bytes/base64 never enter the conversation document.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageAttachment>,
+        /// Non-image attachments, by reference into the file attachment store
+        /// on the same terms as `images`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileAttachment>,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -3880,6 +3885,39 @@ pub struct ImageAttachment {
     /// an instance keeps its number even after other images are removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub short_id: Option<u32>,
+}
+
+/// How the model reads a [`FileAttachment`]. Both end up as text in the user
+/// message; the format decides where that text comes from.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileAttachmentFormat {
+    /// A UTF-8 text file; the stored original is what the model reads.
+    Text,
+    /// A PDF; the model reads the text layer the renderer extracted at upload,
+    /// stored beside the original because the host has no PDF parser.
+    Pdf,
+}
+
+/// Reference to a non-image file attached to a user message.
+///
+/// Like [`ImageAttachment`], conversation JSON carries only this metadata; the
+/// bytes live in the content-addressed `file_attachments` store and are read
+/// back, verified, and inlined as text only when a model request is built.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileAttachment {
+    /// Full lowercase SHA-256 digest of the stored original bytes.
+    pub id: String,
+    pub name: String,
+    pub format: FileAttachmentFormat,
+    /// Byte size of the stored original.
+    pub bytes: u64,
+    /// Estimated tokens of the model-visible text.
+    pub tokens: u64,
+    /// PDF page count; `None` for text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -4523,6 +4561,8 @@ pub enum ModelStreamEvent {
         content: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageAttachment>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileAttachment>,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -4800,22 +4840,6 @@ mod tests {
         }
         // `auto` was retired in favour of an explicit value written at load time.
         assert_eq!(ReasoningContent::from_slug("auto"), None);
-
-        // Chat endpoints must be a proper subset to keep image and audio models
-        // out of the chat selector.
-        for chat in EndpointType::CHAT {
-            assert!(EndpointType::CATALOG.contains(chat));
-        }
-        assert!(EndpointType::CHAT.len() < EndpointType::CATALOG.len());
-
-        // Every chat protocol endpoint belongs to CHAT.
-        for format in [
-            ProviderFamily::OpenaiResponses,
-            ProviderFamily::OpenaiChat,
-            ProviderFamily::Anthropic,
-        ] {
-            assert!(EndpointType::CHAT.contains(&format.chat_endpoint()));
-        }
     }
 
     /// `supports_vision` projects the capability set rather than an independent
@@ -6262,5 +6286,36 @@ mod tests {
             .unwrap()
             .get("rememberedDecisionForms")
             .is_none());
+    }
+
+    #[test]
+    fn remembered_tool_families_round_trip_and_drop_unreadable_entries() {
+        let settings: ConversationSettings = serde_json::from_value(json!({
+            "enabledTools": [],
+            "rememberedToolFamilies": {
+                "preview": ["preview_start", 7, "preview_click"],
+                "shell": "bash",
+                "files": []
+            }
+        }))
+        .expect("settings with remembered families");
+        assert_eq!(
+            settings.remembered_tool_families,
+            BTreeMap::from([(
+                "preview".to_owned(),
+                vec!["preview_start".to_owned(), "preview_click".to_owned()]
+            )])
+        );
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["rememberedToolFamilies"],
+            json!({ "preview": ["preview_start", "preview_click"] })
+        );
+        let empty: ConversationSettings =
+            serde_json::from_value(json!({ "enabledTools": [] })).unwrap();
+        let serialized = serde_json::to_value(&empty).unwrap();
+        assert!(serialized.get("rememberedToolFamilies").is_none());
+        // An unstated sandbox is the default one, and is not written out.
+        assert!(serialized.get("sandbox").is_none());
+        assert_eq!(empty.sandbox, SandboxSettings::default());
     }
 }

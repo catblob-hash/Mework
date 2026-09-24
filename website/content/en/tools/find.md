@@ -14,3 +14,4 @@ Patterns use ordinary glob syntax — `?`, `*`, `**`, character classes and `{a,
 - [grep](grep.html) — match file contents instead of names
 - [read](read.html) — open what the search turned up
 - [Working with Mework](../working.html#tools-and-approvals) — the security-level matrix
+- [find_files](find_files.html) — when you know what a file does but not its name

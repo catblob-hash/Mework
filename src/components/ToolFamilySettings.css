@@ -117,3 +117,15 @@
   font-size: 9px;
   line-height: 1.5;
 }
+
+/* Above the rows while the family is off: what the switches below choose is
+   what switching the family on uses, not tools that are on now. */
+.tool-family-settings__notice {
+  margin: 0 0 10px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--hover);
+  font-size: 9.5px;
+  line-height: 1.5;
+}

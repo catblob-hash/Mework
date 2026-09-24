@@ -1,4 +1,4 @@
-import { CornerUpLeft, Images, RotateCcw, Trash2 } from "lucide-react";
+import { CornerUpLeft, Images, Paperclip, RotateCcw, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { QueuedMessage } from "../types";
 import "./QueuedMessageList.css";
@@ -44,21 +44,40 @@ export function QueuedMessageList({
                 { name: firstImageName, count: imageCount - 1 }
               )
             : firstImageName;
-          const visibleSummary = contentSummary || imageIdentity;
+          const fileCount = message.files?.length ?? 0;
+          const fileCountSummary = t("{count} 个文件", "{count} files", { count: fileCount });
+          const firstFileName = message.files?.[0]?.name ?? "";
+          const fileIdentity = fileCount > 1
+            ? t(
+                "{name} + 另外 {count} 个",
+                "{name} + {count} more",
+                { name: firstFileName, count: fileCount - 1 }
+              )
+            : firstFileName;
+          const visibleSummary = contentSummary || (imageCount ? imageIdentity : fileIdentity) || imageIdentity;
           const actionSummary = [
             contentSummary.slice(0, 40),
-            imageCount ? imageIdentity : ""
+            imageCount ? imageIdentity : "",
+            fileCount ? fileIdentity : ""
           ].filter(Boolean).join(" · ");
           return (
             <li key={message.id} data-promotion-failed={promotionFailed || undefined}>
               <span title={actionSummary}>
-                {imageCount ? <Images size={13} aria-hidden="true" /> : null}
+                {imageCount
+                  ? <Images size={13} aria-hidden="true" />
+                  : fileCount ? <Paperclip size={13} aria-hidden="true" /> : null}
                 <span>
                   <span>{visibleSummary}</span>
                   {imageCount ? (
                     <>
                       <span aria-hidden="true"> · </span>
                       <span>{imageCountSummary}</span>
+                    </>
+                  ) : null}
+                  {fileCount ? (
+                    <>
+                      <span aria-hidden="true"> · </span>
+                      <span>{fileCountSummary}</span>
                     </>
                   ) : null}
                 </span>

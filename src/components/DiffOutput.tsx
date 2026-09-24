@@ -2,23 +2,10 @@ import { type CSSProperties, useMemo } from "react";
 import { useI18n } from "../i18n";
 
 export type DiffLineKind = "file" | "hunk" | "context" | "addition" | "deletion" | "meta";
-export type DiffLineSide = "LEFT" | "RIGHT";
-export type SelectableDiffLineKind = Extract<DiffLineKind, "context" | "addition" | "deletion">;
-
-export interface DiffLineSelection {
-  path: string;
-  line: number;
-  side: DiffLineSide;
-  text: string;
-  kind: SelectableDiffLineKind;
-}
 
 export interface DiffOutputProps {
   value: string;
   path?: string;
-  /** Controlled selected line. Clicking only emits `onLineSelect`. */
-  selectedLine?: DiffLineSelection | null;
-  onLineSelect?: (selection: DiffLineSelection) => void;
 }
 
 export interface ParsedDiffLine {
@@ -130,10 +117,6 @@ function displayedLineNumber(line: ParsedDiffLine): number | null {
   return line.kind === "deletion" ? line.oldLineNumber : line.newLineNumber;
 }
 
-function displayedSide(line: ParsedDiffLine): DiffLineSide {
-  return line.kind === "deletion" ? "LEFT" : "RIGHT";
-}
-
 /**
  * Reads a replacement as "what was there, then what replaced it": each run of
  * changed lines is regrouped with its deletions first, whatever order the
@@ -175,57 +158,9 @@ function gutterCharacters(lines: ParsedDiffLine[]): number {
   return Math.max(2, String(widest).length);
 }
 
-function selectionForSide(
-  line: ParsedDiffLine,
-  side: DiffLineSide,
-  path: string
-): DiffLineSelection | null {
-  if (
-    side === "LEFT"
-    && (line.kind === "deletion" || line.kind === "context")
-    && line.oldLineNumber !== null
-  ) {
-    return {
-      path,
-      line: line.oldLineNumber,
-      side,
-      text: line.text,
-      kind: line.kind
-    };
-  }
-  if (
-    side === "RIGHT"
-    && (line.kind === "addition" || line.kind === "context")
-    && line.newLineNumber !== null
-  ) {
-    return {
-      path,
-      line: line.newLineNumber,
-      side,
-      text: line.text,
-      kind: line.kind
-    };
-  }
-  return null;
-}
-
-function isSelectedLine(
-  selectedLine: DiffLineSelection | null | undefined,
-  selection: DiffLineSelection
-): boolean {
-  return Boolean(
-    selectedLine
-    && selectedLine.path === selection.path
-    && selectedLine.line === selection.line
-    && selectedLine.side === selection.side
-  );
-}
-
 export function DiffOutput({
   value,
-  path,
-  selectedLine,
-  onLineSelect
+  path
 }: DiffOutputProps) {
   const { t } = useI18n();
   const parsed = useMemo(() => parseUnifiedDiff(value), [value]);
@@ -237,36 +172,10 @@ export function DiffOutput({
     [parsed.lines, t]
   );
   const gutter = useMemo(() => gutterCharacters(renderedLines), [renderedLines]);
-  const selectablePath = path || parsed.path;
-  const displayPath = selectablePath || t("文件", "File");
-  const renderLineNumber = (line: ParsedDiffLine) => {
-    const side = displayedSide(line);
-    const number = displayedLineNumber(line);
-    const selection = onLineSelect && selectablePath
-      ? selectionForSide(line, side, selectablePath)
-      : null;
-    if (!selection) {
-      return <span className="diff-output__line-number" aria-hidden="true">{number ?? ""}</span>;
-    }
-    const sideLabel = side === "LEFT" ? t("旧文件", "old side") : t("新文件", "new side");
-    const label = t(
-      "选择 {path} {side}第 {line} 行",
-      "Select {path} line {line} on the {side}",
-      { path: displayPath, side: sideLabel, line: selection.line }
-    );
-    return (
-      <button
-        type="button"
-        className="diff-output__line-number diff-output__line-select"
-        aria-label={label}
-        aria-pressed={isSelectedLine(selectedLine, selection)}
-        title={label}
-        onClick={() => onLineSelect?.(selection)}
-      >
-        {selection.line}
-      </button>
-    );
-  };
+  const displayPath = path || parsed.path || t("文件", "File");
+  const renderLineNumber = (line: ParsedDiffLine) => (
+    <span className="diff-output__line-number" aria-hidden="true">{displayedLineNumber(line) ?? ""}</span>
+  );
 
   return (
     <div

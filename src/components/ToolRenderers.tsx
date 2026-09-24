@@ -101,7 +101,7 @@ type Translate = ReturnType<typeof useI18n>["t"];
 type PresentationResolver = (item: ToolContext, t: Translate) => string | undefined;
 type TitleResolver = (t: Translate) => string;
 
-export interface ToolViewConfig {
+interface ToolViewConfig {
   surface: ToolSurface;
   family: ToolViewFamily;
   icon: LucideIcon;
@@ -443,43 +443,6 @@ function stateToolTitle(
   return view.doneTitle(t);
 }
 
-type MemoryOperation = "list" | "read" | "search" | "upsert" | "delete";
-
-interface MemoryMetadata {
-  operation: MemoryOperation;
-  modelId?: string;
-  scope?: string;
-  name?: string;
-  version?: number;
-  bytes?: number;
-  status?: string;
-  documentCount?: number;
-  matchCount?: number;
-  enabled?: boolean;
-  rewriteRequired?: boolean;
-  compactionRecommended?: boolean;
-  loadedLines?: number;
-  loadedBytes?: number;
-  limitLines?: number;
-  limitBytes?: number;
-}
-
-function resultString(record: Record<string, unknown> | null, ...names: string[]): string | undefined {
-  for (const name of names) {
-    const value = record?.[name];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return undefined;
-}
-
-function resultNumber(record: Record<string, unknown> | null, ...names: string[]): number | undefined {
-  for (const name of names) {
-    const value = numberValue(record?.[name]);
-    if (value !== undefined) return value;
-  }
-  return undefined;
-}
-
 /**
  * Memory tools take a plain document name and return plain Markdown, so the
  * card shows only that name. There is no owner, scope, version or byte count
@@ -512,7 +475,7 @@ function waitStat(item: ToolContext, t: Translate): string | undefined {
  * while a row of domains is scannable — and the domain is what tells a reader
  * whether the answer came from vendor documentation or a forum.
  */
-export interface WebSourceChip {
+interface WebSourceChip {
   host: string;
   url: string;
   title?: string;
@@ -528,7 +491,7 @@ export interface WebSourceChip {
  * `{results:[{title,url,content}]}` with real text. Reading both here is what
  * lets one card serve every backend.
  */
-export function webSourceChips(item: ToolContext): WebSourceChip[] {
+function webSourceChips(item: ToolContext): WebSourceChip[] {
   const parsed = parseJsonOutput(item);
   const record = object(parsed.value);
   const entries = [
@@ -854,7 +817,7 @@ function isLiveCall(item: ToolContext): boolean {
  * the ordinary group must agree, or the call is counted in the summary and then
  * never rendered (or the reverse).
  */
-export function isOrdinaryToolCall(item: ToolContext): boolean {
+function isOrdinaryToolCall(item: ToolContext): boolean {
   return toolSurfaceForName(item.toolName) === "group";
 }
 

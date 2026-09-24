@@ -4,13 +4,12 @@ import type {
   SearchProviderKind,
   WebSearchAssets
 } from "../types";
-import { familySelectsNativeToolType, grantsWebFetch, grantsWebSearch } from "./webSearch";
+import { familySelectsNativeToolType, grantsWebFetch } from "./webSearch";
 
 /**
- * `grantsWebFetch` / `grantsWebSearch` mirror the two halves of Rust
- * `WebSearchSettings::effective`. These cases are the same ones `model.rs`
- * asserts, so a one-sided change to either shows up as a disagreement rather
- * than as a quietly wrong tool lock.
+ * `grantsWebFetch` mirrors the fetch half of Rust `WebSearchSettings::effective`.
+ * These cases are the same ones `model.rs` asserts, so a one-sided change shows
+ * up as a disagreement rather than as a quietly wrong tool lock.
  */
 function assets(patch: Partial<WebSearchAssets> = {}): WebSearchAssets {
   const enabled: SearchProviderKind[] = ["tavily", "jina", "firecrawl", "exa"];
@@ -93,32 +92,6 @@ describe("grantsWebFetch", () => {
   it("grants nothing at all when the conversation switched fetching off", () => {
     const off = conversation({ fetchProvider: { kind: "disabled" } });
     expect(grantsWebFetch(true, off, assets(), "anthropic")).toBe(false);
-  });
-});
-
-describe("grantsWebSearch", () => {
-  it("withholds searching from a conversation with no web access at all", () => {
-    expect(grantsWebSearch(false, conversation(), assets())).toBe(false);
-  });
-
-  it("grants nothing when the conversation switched searching off or lost its backend", () => {
-    expect(grantsWebSearch(true, conversation({ provider: { kind: "disabled" } }), assets()))
-      .toBe(false);
-    expect(grantsWebSearch(true, conversation({ provider: { kind: "unavailable" } }), assets()))
-      .toBe(false);
-  });
-
-  it("grants the native leg without consulting the provider catalog", () => {
-    expect(grantsWebSearch(true, conversation(), assets())).toBe(true);
-  });
-
-  it("refuses an explicit provider that cannot search or is switched off", () => {
-    const jina = conversation({ provider: { kind: "explicit", providerKind: "jina" } });
-    expect(grantsWebSearch(true, jina, assets())).toBe(true);
-    // The `fetch` provider has no search capability at all.
-    const fetchOnly = conversation({ provider: { kind: "explicit", providerKind: "fetch" } });
-    expect(grantsWebSearch(true, fetchOnly, assets())).toBe(false);
-    expect(grantsWebSearch(true, jina, withProvider("jina", false))).toBe(false);
   });
 });
 

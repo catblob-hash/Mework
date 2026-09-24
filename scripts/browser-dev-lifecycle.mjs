@@ -36,7 +36,7 @@ export function isControlledBackendFinalShutdown({
     && imageInputE2EEnabled === true;
 }
 
-export function waitForBrowserDevChildClose(child, timeoutMs) {
+function waitForBrowserDevChildClose(child, timeoutMs) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve();
   }

@@ -121,7 +121,6 @@ export function CapabilitySelectionPage({
   searchLabel,
   emptyTitle,
   emptyDescription,
-  header = null,
   footer = null,
   workspaceId,
   onRescan,
@@ -147,8 +146,6 @@ export function CapabilitySelectionPage({
   searchLabel: string;
   emptyTitle: string;
   emptyDescription: string;
-  /** Page-specific controls above the list, such as a delivery-mode switch. */
-  header?: ReactNode;
   /**
    * Page-specific controls below the list, for a policy that governs the whole
    * catalog rather than one entry. Drawn whether or not the catalog has
@@ -264,7 +261,6 @@ export function CapabilitySelectionPage({
 
   return (
     <>
-      {header}
       {error && <p className="field__hint field__hint--error">{error}</p>}
 
       <div className="capability-page__toolbar">

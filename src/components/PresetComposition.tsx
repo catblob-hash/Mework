@@ -2,12 +2,12 @@ import { type TranslationFunction, useI18n } from "../i18n";
 import type { ResourceDescriptor } from "../types";
 
 /** Id of the built-in English profile; selecting nothing means selecting it. */
-export const BUILTIN_EN_US_TOOL_DESCRIPTION_ID = "tooldesc_builtin_en_us";
-export const BUILTIN_ZH_CN_TOOL_DESCRIPTION_ID = "tooldesc_builtin_zh_cn";
+const BUILTIN_EN_US_TOOL_DESCRIPTION_ID = "tooldesc_builtin_en_us";
+const BUILTIN_ZH_CN_TOOL_DESCRIPTION_ID = "tooldesc_builtin_zh_cn";
 
 /** Display title of a prompt profile: the two built-ins are localized here
  * because the host names them in one language; files keep their own name. */
-export function toolDescriptionProfileTitle(
+function toolDescriptionProfileTitle(
   resource: ResourceDescriptor | undefined,
   t: TranslationFunction
 ): string | undefined {

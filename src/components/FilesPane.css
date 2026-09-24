@@ -13,18 +13,18 @@
   flex: 1; min-width: 0;
   display: flex; align-items: center; gap: 4px;
 }
+/* The title keeps its own width and the drawer handle sits right against it, so the handle is in
+   the same place whether or not a strip of tabs follows. */
 .files-pane__pane-title {
-  flex: 1; min-width: 0; padding-left: 4px;
+  flex: 0 0 auto; min-width: 0; padding-left: 4px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: none;
   color: var(--muted); font-size: 12.5px; font-weight: 500;
 }
 /* Two classes so the compact control outranks `.icon-button` in the barrel, which loads last. */
 .files-pane__header .files-pane__tree-toggle {
-  width: 24px; height: 24px; flex: 0 0 24px; border-radius: 5px; color: var(--muted);
+  width: 24px; height: 24px; flex: 0 0 24px; margin-left: -2px; border-radius: 5px; color: var(--muted);
 }
-.files-pane__header .files-pane__tree-toggle[aria-pressed="true"] {
-  background: var(--active); color: var(--text);
-}
+.files-pane__header .files-pane__tree-toggle:hover:not(:disabled) { color: var(--text); }
 
 /* The strip never scrolls: tabs share the bar and the rest move into the overflow menu. */
 .files-pane__tabs {
@@ -176,34 +176,9 @@
   flex: 0 0 auto; margin: 0; padding: 6px 10px;
   color: var(--danger); font-size: 11px;
 }
-.files-pane__code {
-  flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 4px 0;
-  display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden;
-  font: 11.5px/18px var(--mono); tab-size: 2; user-select: text;
-}
-.files-pane__line { display: flex; align-items: flex-start; min-height: 18px; }
-/* A line jumped to is lit long enough to be found, then released — the same
-   gesture the tree makes when it reveals a row. */
-.files-pane__line { transition: background-color .3s; }
-.files-pane__line--lit { background: var(--accent-soft); }
-/* The gutter is pinned so it survives the horizontal scroll a long line forces. */
-.files-pane__line-number {
-  position: sticky; left: 0; z-index: 1;
-  min-width: 40px; padding: 0 8px 0 6px; flex: 0 0 auto;
-  background: var(--panel); color: var(--faint); text-align: right;
-  user-select: none;
-}
-/* Wrapping is not a setting here, so the line box always owns its own height. */
-.files-pane__line-text {
-  flex: 1 1 auto; min-width: 0; padding-right: 10px;
-  white-space: pre-wrap; overflow-wrap: anywhere;
-}
-/* Four token kinds, because a colourer that only marks lexical shapes is the
-   only kind that is never subtly wrong about what it is looking at. */
-.files-pane__token--comment { color: var(--color-777771); font-style: italic; }
-.files-pane__token--string { color: var(--color-246b4e); }
-.files-pane__token--keyword { color: var(--color-6254aa); }
-.files-pane__token--number { color: var(--color-8b611d); }
+/* The numbered view's own look lives with it in `CodeBlock.css`; in the pane it only has to fill
+   the viewer. */
+.files-pane__code { flex: 1; }
 
 /* ---- rendered document ---- */
 
@@ -213,16 +188,13 @@
   font-size: 12.5px; line-height: 1.6; user-select: text;
 }
 .files-pane__document img { max-width: 100%; height: auto; border-radius: 6px; }
-
-/* ---- picture ---- */
-
-.files-pane__image {
-  flex: 1; min-width: 0; min-height: 0; padding: 12px;
-  display: grid; place-items: center; overflow: auto;
-}
-/* A picture is shown whole rather than filled to the pane: the file pane is a
-   reader, and a cropped screenshot answers a question nobody asked. */
-.files-pane__image img { max-width: 100%; max-height: 100%; object-fit: contain; }
+/* A README's badges and inline pictures sit in their line, the way the forge shows them; the
+   transcript's block-level images are for pictures a reply puts on their own. */
+.files-pane__document .markdown-content img { display: inline-block; margin: 0; vertical-align: middle; }
+.files-pane__document .markdown-content p > img:only-child { display: block; margin: .7em 0; }
+.files-pane__document .markdown-content [align="center"] img:only-child { display: inline-block; }
+/* A document's metadata block, above the document, set apart as data. */
+.files-pane__front-matter > .markdown-code > pre { margin-top: 0; font-size: 11.5px; }
 
 /* ---- empty state ---- */
 

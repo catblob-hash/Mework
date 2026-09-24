@@ -1,5 +1,6 @@
 import { BookOpen, ExternalLink } from "lucide-react";
 import { useI18n } from "../i18n";
+import type { ToolFamilyId } from "./ToolFamilySettings";
 
 /**
  * A one-line link to the published configuration documentation.
@@ -43,23 +44,20 @@ export function DocsLink({ page }: { page: keyof typeof DOCUMENTATION_PAGES }) {
 }
 
 /**
- * The way in to one tool's own page, in the slot a group heading puts its icon.
- *
- * The site publishes one page per catalog tool at `<locale>/tools/<name>.html`
- * (built by scripts/build-site.mjs from the catalog, so every tool name in the
- * picker has a page).
+ * The way in to one tool's documentation, in the slot a group heading puts its
+ * icon.
  *
  * It is an anchor and not a button because it leaves the application, and it is
  * a SIBLING of the tool's own toggle rather than a child of it: the row is
  * itself a button, and a link inside a button is neither valid nor operable.
  */
-export function ToolDocsLink({ name, label }: { name: string; label: string }) {
+function ToolDocsAnchor({ path, label }: { path: string; label: string }) {
   const { t, resolvedLanguage } = useI18n();
   const locale = documentationLocale(resolvedLanguage);
   return (
     <a
       className="tool-docs-link"
-      href={`${DOCUMENTATION_ORIGIN}/${locale}/tools/${encodeURIComponent(name)}.html`}
+      href={`${DOCUMENTATION_ORIGIN}/${locale}/${path}`}
       target="_blank"
       rel="noreferrer noopener"
       aria-label={t("{label}的说明文档", "Documentation for {label}", { label })}
@@ -68,4 +66,23 @@ export function ToolDocsLink({ name, label }: { name: string; label: string }) {
       <BookOpen size={14} aria-hidden="true" />
     </a>
   );
+}
+
+/**
+ * One tool's own page. The site publishes one per catalog tool at
+ * `<locale>/tools/<name>.html` (built by scripts/build-site.mjs from the
+ * catalog, so every tool name in the picker has a page).
+ */
+export function ToolDocsLink({ name, label }: { name: string; label: string }) {
+  return <ToolDocsAnchor path={`tools/${encodeURIComponent(name)}.html`} label={label} />;
+}
+
+/**
+ * The head of a tool family's section on the tools page, for the one picker row
+ * that stands for the whole family. scripts/build-site.mjs keeps a heading with
+ * the family's id there and refuses to build a page that lists the family's
+ * tools anywhere else.
+ */
+export function ToolFamilyDocsLink({ family, label }: { family: ToolFamilyId; label: string }) {
+  return <ToolDocsAnchor path={`tools.html#${encodeURIComponent(family)}`} label={label} />;
 }

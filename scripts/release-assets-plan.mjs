@@ -36,16 +36,3 @@ export function formatSha256Sums(entries) {
     .map(({ name, sha256 }) => `${sha256}  ${name}`)
     .join("\n") + (entries.length > 0 ? "\n" : "");
 }
-
-export function parseSha256Sums(text) {
-  if (typeof text !== "string") throw new TypeError("SHA256SUMS text must be a string");
-
-  const entries = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (/^\s*(?:#.*)?$/.test(line)) continue;
-    const match = /^([0-9a-fA-F]{64}) (?: |\*)(\S+)$/.exec(line);
-    if (!match) throw new TypeError(`Malformed SHA256SUMS line: ${line}`);
-    entries.push(normalizeEntry({ sha256: match[1], name: match[2] }));
-  }
-  return entries;
-}

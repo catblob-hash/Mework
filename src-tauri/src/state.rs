@@ -18,8 +18,12 @@ use crate::{
     browser::BrowserRuntime,
     browser_renderer_mount::BrowserRendererMountRegistry,
     document_store::DocumentStore,
+    file_attachments::validate_file_list,
     image_attachments::validate_image_list,
-    model::{ImageAttachment, JsonObject, SubagentRunRecord, ToolExecutionRequest, ToolResult},
+    model::{
+        FileAttachment, ImageAttachment, JsonObject, SubagentRunRecord, ToolExecutionRequest,
+        ToolResult,
+    },
     operation_coordinator::{OperationCoordinator, OperationLease, WorkspaceKey},
     push_events::AppEventHub,
     terminal::TerminalManager,
@@ -165,6 +169,10 @@ pub struct AppState {
     /// which is the only file `install_app_update` will launch. Process-local by design — a
     /// restart is the moment an update has either applied or been abandoned.
     pub app_update: Arc<crate::app_update::UpdateSession>,
+    /// Paths of the current native drag onto the main window, recorded from the
+    /// window's own events. The drop commands answer only for these, so reading
+    /// a dropped file never becomes reading any file the renderer names.
+    pub drag_drop: Arc<Mutex<crate::dropped_files::DragDropSession>>,
 }
 
 /// What one conversation's shell calls carry forward. See [`AppState::shell_sessions`].
@@ -361,6 +369,7 @@ impl AppState {
             shell_sessions: Arc::default(),
             file_read_state: Arc::default(),
             app_update: Arc::default(),
+            drag_drop: Arc::default(),
         }
     }
 
@@ -917,14 +926,15 @@ impl AppState {
         message_id: String,
         content: String,
         images: Vec<ImageAttachment>,
+        files: Vec<FileAttachment>,
         created_at: String,
     ) -> Result<(), String> {
         let content = content.trim();
         if message_id.trim().is_empty() || message_id.len() > 128 {
             return Err("排队消息 ID 无效".into());
         }
-        if content.is_empty() && images.is_empty() {
-            return Err("引导消息的文字与图片不能同时为空".into());
+        if content.is_empty() && images.is_empty() && files.is_empty() {
+            return Err("引导消息的文字、图片与文件不能同时为空".into());
         }
         if content.chars().count() > 100_000 {
             return Err("引导消息不能超过 100000 个字符".into());
@@ -932,6 +942,7 @@ impl AppState {
         chrono::DateTime::parse_from_rfc3339(&created_at)
             .map_err(|_| "排队消息时间无效".to_owned())?;
         validate_image_list(&images, "引导消息")?;
+        validate_file_list(&files, "引导消息")?;
         let inbox = self
             .model_runs
             .lock()
@@ -943,6 +954,7 @@ impl AppState {
             id: Some(message_id),
             content: content.to_owned(),
             images,
+            files,
             created_at: Some(created_at),
         });
         Ok(())
@@ -2190,6 +2202,7 @@ mod tests {
                 "queued-1".into(),
                 "  补充要求  ".into(),
                 Vec::new(),
+                Vec::new(),
                 "2026-07-24T00:00:00Z".into(),
             )
             .unwrap();
@@ -2199,6 +2212,7 @@ mod tests {
                 id: Some("queued-1".into()),
                 content: "补充要求".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: Some("2026-07-24T00:00:00Z".into()),
             }]
         );
@@ -2245,6 +2259,7 @@ mod tests {
                 "queued-image-bytes".into(),
                 String::new(),
                 oversized_bytes,
+                Vec::new(),
                 "2026-07-24T00:00:00Z".into(),
             )
             .unwrap_err();
@@ -2259,11 +2274,77 @@ mod tests {
                 "queued-image-pixels".into(),
                 String::new(),
                 oversized_pixels,
+                Vec::new(),
                 "2026-07-24T00:00:00Z".into(),
             )
             .unwrap_err();
         assert!(error.contains("引导消息"));
         assert!(error.contains("64 MP"));
+        assert!(inbox.drain().is_empty());
+    }
+
+    #[test]
+    fn steer_model_run_delivers_files_and_validates_them_before_delivery() {
+        fn file(index: usize) -> FileAttachment {
+            FileAttachment {
+                id: format!("{:064x}", index + 1),
+                name: format!("steer-{index}.md"),
+                format: crate::model::FileAttachmentFormat::Text,
+                bytes: 10,
+                tokens: 3,
+                pages: None,
+            }
+        }
+
+        let state = AppState::default();
+        let (_, inbox) = state
+            .begin_model_run("run-files", "conversation-files")
+            .unwrap();
+        // Files alone are a message.
+        state
+            .steer_model_run(
+                "run-files",
+                "queued-files".into(),
+                "   ".into(),
+                Vec::new(),
+                vec![file(0), file(1)],
+                "2026-07-24T00:00:00Z".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            inbox.drain(),
+            [MailboxMessage {
+                id: Some("queued-files".into()),
+                content: String::new(),
+                images: Vec::new(),
+                files: vec![file(0), file(1)],
+                created_at: Some("2026-07-24T00:00:00Z".into()),
+            }]
+        );
+
+        let steer = |id: &str, files: Vec<FileAttachment>| {
+            state.steer_model_run(
+                "run-files",
+                id.into(),
+                String::new(),
+                Vec::new(),
+                files,
+                "2026-07-24T00:00:00Z".into(),
+            )
+        };
+        assert!(steer("queued-empty", Vec::new())
+            .unwrap_err()
+            .contains("不能同时为空"));
+        let too_many = (0..=crate::file_attachments::MAX_MESSAGE_FILES)
+            .map(file)
+            .collect();
+        assert!(steer("queued-too-many", too_many)
+            .unwrap_err()
+            .contains("引导消息"));
+        assert!(steer("queued-duplicate", vec![file(0), file(0)]).is_err());
+        let mut forged = file(0);
+        forged.pages = Some(1);
+        assert!(steer("queued-forged", vec![forged]).is_err());
         assert!(inbox.drain().is_empty());
     }
 

@@ -9,16 +9,15 @@ include!("app_commands.rs");
 const APP_ICON_SVG: &[u8] = include_bytes!("../src/mework-icon.svg");
 const APP_ICON_SMALL_SVG: &[u8] = include_bytes!("../src/mework-icon-small.svg");
 const APP_ICON_SIZES: [u32; 6] = [16, 24, 32, 48, 128, 256];
-/// The smallest frame the full desk scene is still drawn at.
+/// The smallest frame the full icon — prompt chevron and mark — is drawn at.
 ///
-/// `mework-icon.svg` is a scene — cat, desk, laptop, tail — and below roughly a
-/// 64px frame its parts stop resolving into anything: the face collapses, the
-/// laptop merges with the desk, and the result is a smudge with ears. The
-/// Explorer/taskbar sizes therefore come from `mework-icon-small.svg`, which is
-/// the same creature's head alone on the same plate. Both are inputs to this
-/// build script, so both have to be registered in
-/// `browserDevRustFingerprintEntries` and in the Pages workflow's path filter.
-const APP_ICON_SCENE_MIN_SIZE: u32 = 64;
+/// `mework-icon.svg` puts a `›` prompt before the mark, and below a 32px frame
+/// the chevron's stroke is thinner than a pixel and blurs into the plate. The
+/// 16 and 24 frames therefore come from `mework-icon-small.svg`, which is the
+/// mark alone on the same plate, drawn larger. Both are inputs to this build
+/// script, so both have to be registered in `browserDevRustFingerprintEntries`
+/// and in the Pages workflow's path filter.
+const APP_ICON_FULL_MIN_SIZE: u32 = 32;
 
 macro_rules! app_command_names {
     ($($command:ident),* $(,)?) => {
@@ -437,11 +436,11 @@ fn prefer_mingw_toolchain() {
     }
 }
 
-/// Renders the icon as a PNG `size` pixels square, from the scene or, below
-/// [`APP_ICON_SCENE_MIN_SIZE`], from the head alone.
+/// Renders the icon as a PNG `size` pixels square, from the full icon or, below
+/// [`APP_ICON_FULL_MIN_SIZE`], from the mark alone.
 fn render_icon_png(size: u32) -> Vec<u8> {
     let options = resvg::usvg::Options::default();
-    let (svg, what) = if size >= APP_ICON_SCENE_MIN_SIZE {
+    let (svg, what) = if size >= APP_ICON_FULL_MIN_SIZE {
         (APP_ICON_SVG, "the canonical Mework SVG icon")
     } else {
         (APP_ICON_SMALL_SVG, "the small-frame Mework SVG icon")

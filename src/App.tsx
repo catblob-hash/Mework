@@ -28,8 +28,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import { createPortal } from "react-dom";
 import type { CSSProperties, ReactNode } from "react";
 import { CommonErrorBoundary } from "./components/ErrorBoundary";
-import { MeworkIcon } from "./components/MeworkIcon";
-import { ComposerAddImages } from "./components/ComposerAddMenu";
+import { MeworkMark } from "./components/MeworkIcon";
+import { ComposerAddFiles } from "./components/ComposerAddMenu";
+import { AttachmentDropOverlay, AttachmentNotice } from "./components/AttachmentFeedback";
 import { ComposerCat } from "./components/ComposerCat";
 import { PopoverMenu, type PopoverMenuSection } from "./components/PopoverMenu";
 import { ContextUsageMeter } from "./components/ContextUsageMeter";
@@ -37,8 +38,6 @@ import { ImageStrip } from "./components/ImageStrip";
 import { SelectedElementChips } from "./components/SelectedElementChips";
 import { imagesWithoutElementCrops, selectedElementImageFile } from "./lib/selectedElement";
 import { ConversationSettings } from "./components/ConversationSettings";
-import { ConversationTemplateEditor } from "./components/ConversationTemplateEditor";
-import { ConversationView } from "./components/ConversationView";
 import {
   StreamedConversationView,
   StreamedSubagentPanel,
@@ -47,7 +46,7 @@ import {
 import { QuestionDock } from "./components/QuestionDock";
 import { ToolApprovalDock } from "./components/ToolApprovalDock";
 import { QueuedMessageList } from "./components/QueuedMessageList";
-import { Dialog, EmptyState, IconButton } from "./components/Common";
+import { Dialog, IconButton } from "./components/Common";
 import { GlobalSettings } from "./components/GlobalSettings";
 import {
   clampSidebarWidth,
@@ -87,17 +86,16 @@ import { estimateContextsTokens, liveContextTokens } from "./lib/contextTokens";
 import { hasUsableBaseUrl, isEncryptedReasoning, supportsVision } from "./lib/modelCapabilities";
 import {
   imageShortIdsInUse,
-  nextImageShortId,
   reserveQueuedMessageIds
 } from "./lib/imageShortIds";
-import { acceptPastedImages } from "./lib/imagePaste";
+import { messageAttachmentAdder } from "./lib/imagePaste";
+import { useAttachmentDropZone } from "./lib/attachmentDrop";
+import { isLongPaste, pastedTextFile } from "./lib/fileAttachments";
 import {
   contextsContainProjectedImages,
   MAX_COMPOSER_IMAGE_BYTES,
   MAX_COMPOSER_IMAGE_PIXELS,
   MAX_COMPOSER_IMAGES,
-  MAX_IMAGE_ATTACHMENT_BYTES,
-  MAX_IMAGE_ATTACHMENT_PIXELS,
   projectedImageBudget
 } from "./lib/imageBudget";
 import {
@@ -144,7 +142,6 @@ import {
 } from "./lib/workspaces";
 import {
   settingsAtToolLockFloor,
-  toolLockOf,
   withRunToolLock
 } from "./lib/toolLock";
 import { grantsWebFetch } from "./lib/webSearch";
@@ -157,7 +154,7 @@ import {
 } from "./lib/draftConversation";
 import type { DraftConversationState } from "./lib/draftConversation";
 import { listWslDistros } from "./lib/runtime";
-import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, prepareImageAttachment, previewConversationTemplate, probeMcpServer, refreshCapabilities, revealCapabilityLocation, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, runModel, skipWorkflowStep, steerModelRun, workflowStepRecord } from "./lib/runtime";
+import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, previewConversationTemplate, probeMcpServer, refreshCapabilities, revealCapabilityLocation, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, skipWorkflowStep, workflowStepRecord } from "./lib/runtime";
 import { SECURITY_LEVEL_OPTIONS, securityLevelLabel } from "./lib/securityLevels";
 import {
   answersFromFormattedContent,
@@ -176,9 +173,7 @@ import {
   deriveSubagentViews,
   findExternalStepBodyRef,
   findOpenableSubagentView,
-  graftExternalStepBodies,
-  isAddressableAgentRunTool,
-  isAgentRunTool
+  graftExternalStepBodies
 } from "./lib/subagents";
 import type { SubagentView } from "./lib/subagents";
 import { BrowserPanel, splitBrowserAddress } from "./components/BrowserPanel";
@@ -288,7 +283,7 @@ import {
   type SidePaneId,
   type SidePanesAction
 } from "./lib/sidePanes";
-import { getI18nSnapshot, resolveApplicationLanguage, translate, useI18n } from "./i18n";
+import { resolveApplicationLanguage, translate, useI18n } from "./i18n";
 import { configureApplicationAppearance } from "./theme";
 import { ZOOM_STEP, clampZoom, defaultAppearancePreferences } from "./lib/appearance";
 import {
@@ -302,9 +297,7 @@ import { localizeToolDescriptor } from "./lib/toolDefaults";
 import {
   applyGlobalSettingsChange,
   applyQuarantinedContextReplacements,
-  conversationMatchesPersistenceGeneration,
   findConversation,
-  replaceConversationFromAuthority,
   type GlobalSettingsChange
 } from "./lib/documentUpdates";
 import { createDocumentStore } from "./lib/documentStore";
@@ -313,15 +306,9 @@ import { createConversationSync } from "./lib/conversationSync";
 import { createComposerController } from "./lib/composerController";
 import { createBrowserController } from "./lib/browserController";
 import {
-  createModelStreamCoalescer,
   cumulativeModelRunUsage,
-  reduceModelStreamEvent,
   type ModelRuns,
-  type ModelRunState,
-  type ModelStreamEffect,
-  type StreamingHookState,
-  type StreamingToolPhase,
-  type StreamingToolState
+  type ModelRunState
 } from "./lib/modelStream";
 import {
   applyConversationPresetSettings,
@@ -350,13 +337,10 @@ import {
   resumeConversationTurn,
   saveConversationTurns,
   subtractModelUsage,
-  sumModelUsage,
-  sumUsageByRound
+  sumModelUsage
 } from "./lib/conversationTurns";
 import type { ConversationTurn, ConversationTurnError, ConversationTurns } from "./lib/conversationTurns";
-import { editableUserAgentDefinition } from "./lib/agentDefinitions";
 import type {
-  ProviderFamily,
   ApiProvider,
   AppDocument,
   AttachedWorkspace,
@@ -368,18 +352,15 @@ import type {
   ConversationPresetSettings,
   ConversationSettings as ConversationSettingsType,
   ConversationToolLock,
-  GlobalSettings as GlobalSettingsType,
+  FileAttachment,
   ImageAttachment,
   InsertableContextKind,
   JsonObject,
   ModelProfile,
-  ModelRunRequest,
-  ModelStreamEvent,
   ModelUsage,
   PendingForkRequest,
   ForkDecisionRecord,
   PendingToolPrompt,
-  QueuedMessage,
   ReasoningEffort,
   ResourceDescriptor,
   RunTarget as RunTargetType,
@@ -389,7 +370,6 @@ import type {
   ShellBackend,
   SettingsView,
   ShortcutCommandId,
-  SubagentLiveState,
   SubagentRunRecord,
   ToolApprovalGrant,
   ToolResult,
@@ -523,52 +503,10 @@ type PendingUndoState = {
 
 export {
   gitReviewSnapshotCacheKey,
-  gitSnapshotBroadcastIds,
   gitSnapshotForWorkspace,
-  gitSnapshotRefreshResultFromSummary,
-  gitSnapshotsAfterDraftRedemption,
   gitSnapshotsAfterRefresh,
   gitSnapshotsAfterWorkspaceMutation
 } from "./lib/gitController";
-export type {
-  GitSnapshotEntry,
-  GitSnapshotRefreshResult,
-  GitSnapshots
-} from "./lib/gitController";
-
-type ResourceKind = "hooks" | "skills" | "mcp";
-
-export function mergeResourceOrder(previous: ResourceDescriptor[], discovered: ResourceDescriptor[]): ResourceDescriptor[] {
-  const discoveredById = new Map(discovered.map((resource) => [resource.id, resource]));
-  const previousIds = new Set(previous.map((resource) => resource.id));
-  return [
-    ...previous.flatMap((resource) => {
-      const next = discoveredById.get(resource.id);
-      return next ? [next] : [];
-    }),
-    ...discovered.filter((resource) => !previousIds.has(resource.id))
-  ];
-}
-
-export function reorderDocumentResources(
-  current: AppDocument,
-  kind: ResourceKind,
-  sourceId: string,
-  targetId: string,
-  position: "before" | "after"
-): AppDocument {
-  const currentResources = kind === "hooks"
-    ? current.capabilities.hooks
-    : kind === "skills" ? current.capabilities.skills : current.capabilities.mcps;
-  const resources = reorderItems(currentResources, sourceId, targetId, position, (resource) => resource.id);
-  if (resources === currentResources) return current;
-  const capabilities = kind === "hooks"
-    ? { ...current.capabilities, hooks: resources }
-    : kind === "skills"
-      ? { ...current.capabilities, skills: resources }
-      : { ...current.capabilities, mcps: resources };
-  return { ...current, capabilities };
-}
 
 const reasoningEffortOptions: ReasoningEffort[] = ["disabled", "low", "medium", "high", "xhigh"];
 
@@ -802,6 +740,8 @@ function App() {
   const composerState = useSyncExternalStore(composerController.subscribe, composerController.current);
   const composerDrafts = composerState.drafts;
   const composerImageDrafts = composerState.imageDrafts;
+  const composerFileDrafts = composerState.fileDrafts;
+  const composerAttachmentNotices = composerState.attachmentNotices;
   const composerElementPicks = composerState.elementPicks;
   const composerImageLoadingIds = composerState.imageLoadingIds;
   const steeringMessageIds = composerState.steeringMessageIds;
@@ -837,7 +777,6 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [paneResizing, setPaneResizing] = useState(false);
-  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [saveAsPresetDialog, setSaveAsPresetDialog] = useState<{ name: string; description: string } | null>(null);
   /**
    * Which side panes are open beside the conversation, per conversation, plus the live preview
@@ -889,7 +828,6 @@ function App() {
       workspace.id === projectEditor && workspace.kind === "directory"
     )) ?? null
     : null;
-  const [startingTerminals, setStartingTerminals] = useState<Set<string>>(() => new Set());
   /** Reload branch lists whenever their conversation is revisited because repository state is live. */
   const [branchPicker, setBranchPicker] = useState<{
     conversationId: string;
@@ -1192,12 +1130,6 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const updateViewportWidth = () => setViewportWidth(window.innerWidth);
-    window.addEventListener("resize", updateViewportWidth);
-    return () => window.removeEventListener("resize", updateViewportWidth);
-  }, []);
-
-  useEffect(() => {
     if (!isTauriRuntime()) return;
     let cancelled = false;
     let retryTimer: number | null = null;
@@ -1227,8 +1159,6 @@ function App() {
     ));
   }, [activeConversationId]);
 
-  const updateModelRuns = modelRunController.update;
-
   const updateConversationTurns = useCallback((updater: (current: ConversationTurns) => ConversationTurns) => {
     // Every writer funnels through here, so this is where a round that produced
     // nothing stops being a record. Sweeping it centrally is what keeps the next
@@ -1239,8 +1169,6 @@ function App() {
     setConversationTurns(next);
   }, []);
 
-  const updateSteeringMessageIds = composerController.updateSteeringMessageIds;
-  const updateFailedQueuedPromotionIds = composerController.updateFailedQueuedPromotionIds;
   const invalidateComposerImages = composerController.invalidateImages;
 
   useEffect(() => {
@@ -2367,45 +2295,6 @@ function App() {
       );
       return;
     }
-    if (event.type === "conversationSaveRejected") {
-      // Revert only the rejected conversation from host authority. Do not overwrite newer local edits when generations differ.
-      const language = getI18nSnapshot().resolvedLanguage;
-      console.error(
-        translate(
-          language,
-          `对话 ${event.conversationId} 的保存被宿主拒绝并回退到上一份快照：${event.error}`,
-          `The host rejected this save of conversation ${event.conversationId} and reverted it to the last committed snapshot: ${event.error}`
-        )
-      );
-      // Do not let a stale rejected generation overwrite newer local content.
-      if (!conversationMatchesPersistenceGeneration(
-        documentStore.current(),
-        event.conversationId,
-        event.rejectedUpdatedAt
-      )) return;
-      void loadDocument()
-        .then((authority) => {
-          documentStore.update((current) => {
-            if (!conversationMatchesPersistenceGeneration(
-              current,
-              event.conversationId,
-              event.rejectedUpdatedAt
-            )) return current;
-            return replaceConversationFromAuthority(current!, authority, event.conversationId);
-          });
-        })
-        .catch((error) => {
-          console.error(
-            translate(
-              language,
-              "拉取宿主权威快照失败，被拒对话仍留在本地内存中",
-              "Failed to fetch the host's authoritative snapshot; the rejected conversation is still in local memory"
-            ),
-            error
-          );
-        });
-      return;
-    }
     if (event.type === "documentWriteRecovered") {
       documentStore.reportBackendSaveResult("success");
     }
@@ -2537,11 +2426,10 @@ function App() {
    * start after it.
    */
   const activeProjectWorkspaceCount = Math.max(1, activeProjectWorkspaces.length);
-  const shellPriority = document?.globalSettings.executionEnvironments.shellPriority;
   /** The shells a terminal on `machine` can start, as its probe found them, most preferred first. */
   const terminalShellsOn = useCallback(
-    (machine: RunTargetType | null | undefined) => terminalShellsFor(machine, machineShells, platform, shellPriority),
-    [machineShells, platform, shellPriority]
+    (machine: RunTargetType | null | undefined) => terminalShellsFor(machine, machineShells, platform),
+    [machineShells, platform]
   );
   /** The shells a terminal in the selected workspace can start, which follow its machine. */
   const activeTerminalShells = useMemo(
@@ -2631,6 +2519,10 @@ function App() {
   }, [activeConversation, activeGitSnapshot, activeGitTarget, openPane]);
   const activeComposerDraft = activeConversation ? composerDrafts[activeConversation.id] ?? "" : "";
   const activeComposerImages = activeConversation ? composerImageDrafts[activeConversation.id] ?? [] : [];
+  const activeComposerFiles = activeConversation ? composerFileDrafts[activeConversation.id] ?? [] : [];
+  const activeComposerAttachmentNotice = activeConversation
+    ? composerAttachmentNotices[activeConversation.id] ?? []
+    : [];
   const activeElementPicks = activeConversation ? composerElementPicks[activeConversation.id] ?? [] : [];
   /* Every draft image except the element crops, which a chip already stands for.
      The gates above still count them: they are attachments on this message like
@@ -2641,7 +2533,9 @@ function App() {
   );
   const activeModelRunning = Boolean(activeConversation && modelRunSummaries[activeConversation.id]);
   const activeComposerHasText = Boolean(activeComposerDraft.trim());
-  const activeComposerHasPayload = activeComposerHasText || activeComposerImages.length > 0;
+  const activeComposerHasPayload = activeComposerHasText
+    || activeComposerImages.length > 0
+    || activeComposerFiles.length > 0;
   const activeComposerQueuesMessage = Boolean(
     activeComposerHasPayload
     && (activeModelRunning || activeConversation?.queuedMessages.length)
@@ -2775,16 +2669,16 @@ function App() {
     }
     return sections;
   }, [activeModelChoice, documentStore, enabledModelChoices]);
-  const activeComposerImageUnavailableReason = activeComposerImageLoading
-    ? t("正在处理图片…", "Preparing images…")
-    : !activeModelChoice
-      ? t("请先选择一个已启用的模型", "Select an enabled model first")
-      : !supportsVision(activeModelChoice.model)
-        ? t(
-          "当前模型不支持图片输入",
-          "The current model does not support image input"
-        )
-        : undefined;
+  /** Whether the composer's model can see images, which decides how pictures in a paste or drop are taken. */
+  const activeComposerImageInput = Boolean(activeModelChoice && supportsVision(activeModelChoice.model));
+  const composerDrop = useAttachmentDropZone({
+    imageInput: activeComposerImageInput,
+    disabled: !activeConversation || activeWorkspaceLifecycleOperationRunning,
+    onDrop: (files, preRejected) => {
+      if (!activeConversation) return;
+      void addComposerAttachments(activeConversation.id, files, preRejected);
+    }
+  });
   // Images can outlive the model that accepted them: attach under a vision model,
   // switch to a text-only one, and the request still carries them. Sending then
   // refuses deep in the pipeline, which used to happen with no visible reason at
@@ -2911,16 +2805,27 @@ function App() {
       const relative = workspaceRelativePath(path, baseDir ?? timelinePathBaseDir, filesPaneRoot);
       if (relative === null) return false;
       filesPaneRequestNonce.current += 1;
+      // A pane opened only to show this file opens on the file, tree folded; one
+      // already open keeps its tree the way the reader left it.
+      const paneWasOpen = paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, conversationId), "files");
       setFilesPaneRequest({
         conversationId,
         path: relative,
         line,
-        nonce: filesPaneRequestNonce.current
+        nonce: filesPaneRequestNonce.current,
+        collapseTree: !paneWasOpen
       });
       openPane("files");
       return true;
     });
   }, [activeConversation?.id, filesPaneAvailable, filesPaneRoot, openPane, timelinePathBaseDir]);
+  /**
+   * A request is acted on once: without this, closing the pane and opening it
+   * again from the toolbar would replay the last file the timeline asked for.
+   */
+  const onFilesPaneRequestHandled = useCallback((nonce: number) => {
+    setFilesPaneRequest((current) => (current?.nonce === nonce ? null : current));
+  }, []);
   const branchChipDisabled = Boolean(
     !activeGitSnapshot
     || !activeGitTarget
@@ -3406,7 +3311,6 @@ function App() {
       if (event.type !== "previewServersChanged") return;
       void refreshPreviewServers(conversationId, ownerId, target, event.stopped);
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     activeConversation?.id,
     activeHostConversationId,
@@ -5097,6 +5001,20 @@ function App() {
       delete next[DRAFT_CONVERSATION_ID];
       return next;
     });
+    composerController.updateFileDrafts((current) => {
+      const pending = current[DRAFT_CONVERSATION_ID];
+      if (!pending?.length) return current;
+      const next = { ...current, [conversationId]: pending };
+      delete next[DRAFT_CONVERSATION_ID];
+      return next;
+    });
+    composerController.updateAttachmentNotices((current) => {
+      const pending = current[DRAFT_CONVERSATION_ID];
+      if (!pending?.length) return current;
+      const next = { ...current, [conversationId]: pending };
+      delete next[DRAFT_CONVERSATION_ID];
+      return next;
+    });
     composerController.updateElementPicks((current) => {
       const pending = current[DRAFT_CONVERSATION_ID];
       if (!pending?.length) return current;
@@ -5413,7 +5331,7 @@ function App() {
    * unique among live probes.
    */
   const probeCapabilityMcpServer = useCallback(
-    (resource: ResourceDescriptor) => probeMcpServer(resource.id, createId("mcp-probe")),
+    (resource: ResourceDescriptor) => probeMcpServer(resource.id),
     []
   );
 
@@ -5901,9 +5819,6 @@ function App() {
       const removedConversationIds = new Set(
         removedWorkspace.conversations.map((conversation) => conversation.id)
       );
-      setStartingTerminals((current) => new Set(
-        [...current].filter((conversationId) => !removedConversationIds.has(conversationId))
-      ));
       const next = {
         ...latest,
         workspaces: latest.workspaces.filter((item) => item.id !== workspace.id)
@@ -6128,34 +6043,26 @@ function App() {
   };
 
   /**
-   * Images pasted into a user message on the timeline — one being edited, or
-   * one being written from the context menu.
+   * Files picked, pasted or dropped into a user message on the timeline — one
+   * being edited, or one being written from the context menu.
    *
    * The same gates the composer applies, because this is the same kind of
    * message arriving through a different box: vision, per-image size and
-   * pixels, and how many one message may carry. Numbering happens here, against
-   * the live transcript, so a pasted image is citable as `[Image #N]` the
-   * moment the card is saved. Undefined when the conversation's model has no
-   * image input, which is what withholds the paste instead of letting bytes
-   * land where the model could never read them.
+   * pixels, file formats and sizes, and how many one message may carry.
+   * Numbering happens here, against the live transcript, so an attached image
+   * is citable as `[Image #N]` the moment the card is saved. A model without
+   * image input turns pictures away with a reason instead of letting bytes
+   * land where it could never read them.
    */
-  const pasteImagesIntoTimelineMessage = activeConversation
-    && activeModelChoice
-    && supportsVision(activeModelChoice.model)
-    ? async (
-      files: File[],
-      existing: readonly ImageAttachment[]
-    ): Promise<ImageAttachment[]> => acceptPastedImages(
-      files,
-      existing,
-      reserveQueuedMessageIds(
-        imageShortIdsInUse(activeConversation.contexts),
-        activeConversation.queuedMessages
-      )
-    )
+  const timelineImageInput = Boolean(activeModelChoice && supportsVision(activeModelChoice.model));
+  const addAttachmentsToTimelineMessage = activeConversation
+    ? messageAttachmentAdder(timelineImageInput, () => reserveQueuedMessageIds(
+      imageShortIdsInUse(activeConversation.contexts),
+      activeConversation.queuedMessages
+    ))
     : undefined;
 
-  const saveTextContext = (content: string, images?: ImageAttachment[]) => {
+  const saveTextContext = (content: string, images?: ImageAttachment[], files?: FileAttachment[]) => {
     if (!editor || !activeConversation || contextMutationIsBlocked(activeConversation.id)) return;
     const conversationId = activeConversation?.id;
     if (editor.mode === "edit") {
@@ -6167,7 +6074,7 @@ function App() {
             return { ...item, content, interrupted: false };
           }
           if (item.kind === "user" && images) {
-            return { ...item, content, images };
+            return { ...item, content, images, files: files?.length ? files : undefined };
           }
           return { ...item, content };
         });
@@ -6181,7 +6088,7 @@ function App() {
         : editor.kind === "user"
           // A placed message carries what was pasted into it; every other kind
           // has nowhere to put an image and is never handed one.
-          ? { ...base, kind: "user", ...(images?.length ? { images } : {}) }
+          ? { ...base, kind: "user", ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) }
           : { ...base, kind: editor.kind as "system" | "assistant" };
       updateActiveConversation((conversation) => {
         const contexts = [...conversation.contexts];
@@ -6636,7 +6543,9 @@ function App() {
     deleteQueuedMessage,
     steerQueuedMessage,
     addComposerImages,
+    addComposerAttachments,
     removeComposerImage,
+    removeComposerFile,
     dispatchNextQueuedMessage,
     retryFailedQueuedPromotion
   } = sendPipeline;
@@ -7177,7 +7086,7 @@ function App() {
   if (!document) {
     return (
       <div className="app-loading">
-        <MeworkIcon size={38} /><p>{t("正在打开 Mework…", "Opening Mework…")}</p>
+        <MeworkMark className="app-loading__mark" /><p>{t("正在打开 Mework…", "Opening Mework…")}</p>
       </div>
     );
   }
@@ -7489,6 +7398,7 @@ function App() {
           workspacePath={filesPaneRoot}
           active
           openRequest={filesPaneRequest?.conversationId === conversationId ? filesPaneRequest : null}
+          onOpenRequestHandled={onFilesPaneRequestHandled}
           expanded={expanded}
           onToggleExpand={onToggleExpand}
           onPaneFocus={onFocus}
@@ -8000,7 +7910,8 @@ function App() {
                 }
                 onCancelEdit={closeTimelineEditors}
                 onSaveText={saveTextContext}
-                onPasteImages={pasteImagesIntoTimelineMessage}
+                onAddAttachments={addAttachmentsToTimelineMessage}
+                attachmentImageInput={timelineImageInput}
                 onSaveTool={saveToolContext}
                 onSaveToolEdit={saveToolContextEdit}
                 onSaveQuestion={saveQuestionContext}
@@ -8336,18 +8247,12 @@ function App() {
                   </p>
                 )}
                 <div
+                  ref={composerDrop.ref}
                   className="composer"
-                  onDragOver={(event) => {
-                    if (event.dataTransfer.types.includes("Files")) event.preventDefault();
-                  }}
-                  onDrop={(event) => {
-                    const files = Array.from(event.dataTransfer.files);
-                    if (!files.length) return;
-                    event.preventDefault();
-                    void addComposerImages(activeConversation.id, files);
-                  }}
+                  data-attachment-drop-ready={composerDrop.dragging && !composerDrop.over ? "true" : undefined}
                 >
                   {composerIsUnsentTask && <ComposerCat />}
+                  <AttachmentDropOverlay state={composerDrop} imageInput={activeComposerImageInput} />
                   {/* A failure that reached a turn is read in the timeline, where it
                       happened. Only failures with no turn to land on — a send refused
                       before the run started — still need the composer to carry them. */}
@@ -8399,11 +8304,22 @@ function App() {
                       }
                     }}
                   />
+                  <AttachmentNotice
+                    rejected={activeComposerAttachmentNotice}
+                    onDismiss={() => composerController.updateAttachmentNotices((current) => {
+                      const next = { ...current };
+                      delete next[activeConversation.id];
+                      return next;
+                    })}
+                  />
                   <ImageStrip
                     images={activeComposerVisibleImages}
+                    files={activeComposerFiles}
                     compact
+                    busy={activeComposerImageLoading}
                     className="composer__images"
                     onRemove={(imageId) => removeComposerImage(activeConversation.id, imageId)}
+                    onRemoveFile={(fileId) => removeComposerFile(activeConversation.id, fileId)}
                   />
                   <div className="composer__input">
                     <textarea
@@ -8420,9 +8336,22 @@ function App() {
                       spellCheck={appearance.spellCheck}
                       onPaste={(event) => {
                         const files = Array.from(event.clipboardData.files);
-                        if (!files.length) return;
-                        if (!event.clipboardData.getData("text/plain")) event.preventDefault();
-                        void addComposerImages(activeConversation.id, files);
+                        const text = event.clipboardData.getData("text/plain");
+                        if (files.length) {
+                          // A clipboard carrying both keeps its text; the files ride along.
+                          if (!text) event.preventDefault();
+                          void addComposerAttachments(activeConversation.id, files);
+                          return;
+                        }
+                        // A long paste travels as a Markdown file: the box stays
+                        // readable, and the model still reads every word of it.
+                        if (text && isLongPaste(text)) {
+                          event.preventDefault();
+                          void addComposerAttachments(
+                            activeConversation.id,
+                            [pastedTextFile(text, activeComposerFiles)]
+                          );
+                        }
                       }}
                       onChange={(event) => {
                         const draft = event.target.value;
@@ -8512,11 +8441,11 @@ function App() {
                         }))
                       }]}
                     />
-                    <ComposerAddImages
+                    <ComposerAddFiles
                       key={activeConversation.id}
                       disabled={activeWorkspaceLifecycleOperationRunning}
-                      imageUnavailableReason={activeComposerImageUnavailableReason}
-                      onChooseImages={(files) => void addComposerImages(activeConversation.id, files)}
+                      imageInput={activeComposerImageInput}
+                      onChooseFiles={(files) => void addComposerAttachments(activeConversation.id, files)}
                     />
                   </div>
                   <div className="composer__options">

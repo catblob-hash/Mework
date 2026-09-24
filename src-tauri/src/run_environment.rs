@@ -182,11 +182,7 @@ pub fn resolve_shell_runner(
             Ok(ShellRunner::Wsl {
                 distro: distro.clone(),
                 env,
-                agent_shell: resolve_agent_shell(
-                    assets,
-                    target,
-                    assets.wsl_agent_shells.get(distro).copied(),
-                ),
+                agent_shell: resolve_agent_shell(target, assets.wsl_agent_shells.get(distro).copied()),
             })
         }
         Some(RunTarget::Ssh { machine_id }) => {
@@ -210,7 +206,7 @@ pub fn resolve_shell_runner(
                 port: machine.port,
                 identity_file: machine.identity_file.clone(),
                 env,
-                agent_shell: resolve_agent_shell(assets, target, machine.agent_shell),
+                agent_shell: resolve_agent_shell(target, machine.agent_shell),
             })
         }
     }
@@ -218,10 +214,9 @@ pub fn resolve_shell_runner(
 
 /// The agent shell a machine's scripts run in: the one its settings chose when
 /// the machine still has it, otherwise the first backend in the OS's priority
-/// list that the last probe found. A machine never probed keeps its choice by
+/// order that the last probe found. A machine never probed keeps its choice by
 /// name, or bash — what every remote script ran in before there was a choice.
 fn resolve_agent_shell(
-    assets: &ExecutionEnvironmentAssets,
     target: Option<&RunTarget>,
     configured: Option<crate::shell_backend::ShellBackend>,
 ) -> AgentShell {
@@ -234,11 +229,7 @@ fn resolve_agent_shell(
     configured
         .filter(|backend| available.contains(backend))
         .or_else(|| {
-            crate::shell_backend::preferred_backend(
-                probed.os,
-                assets.shell_priority.listed(probed.os),
-                &available,
-            )
+            crate::shell_backend::preferred_backend(probed.os, &available)
         })
         .and_then(|backend| {
             probed

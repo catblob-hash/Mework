@@ -508,7 +508,6 @@ struct RegistryModel {
 
 #[derive(Deserialize)]
 struct ModelListFile {
-    version: String,
     models: Vec<RegistryModel>,
 }
 
@@ -518,10 +517,6 @@ struct ModelListFile {
 /// avoids reparsing it on subsequent lookups.
 struct Registry {
     models: Vec<RegistryModel>,
-    /// Catalog content hash used by the catalog invariant test to ensure the vendored
-    /// snapshot matches `resources/model-registry/README.md`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    models_version: String,
 
     model_by_id: HashMap<String, usize>,
     model_by_norm_id: HashMap<String, usize>,
@@ -540,7 +535,6 @@ impl Registry {
 
         let mut registry = Self {
             models: model_file.models,
-            models_version: model_file.version,
             model_by_id: HashMap::new(),
             model_by_norm_id: HashMap::new(),
             model_by_sized_norm: HashMap::new(),
@@ -840,7 +834,8 @@ mod tests {
         let registry = registry();
         // The README records the expected row count and content hash.
         assert_eq!(registry.models.len(), 911);
-        assert_eq!(registry.models_version, "90f2173cfa6525a2");
+        let catalog: serde_json::Value = serde_json::from_str(MODELS_JSON).unwrap();
+        assert_eq!(catalog["version"], "90f2173cfa6525a2");
     }
 
     #[test]

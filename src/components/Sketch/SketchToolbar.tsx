@@ -18,7 +18,7 @@ const TOOL_ICON_PATHS: Record<Exclude<SketchToolName, "pen">, string> = {
   text: "M3.5 3.5H12.5M8 3.5V12.5"
 };
 
-export function SketchToolIcon({ tool }: { tool: SketchToolName }) {
+function SketchToolIcon({ tool }: { tool: SketchToolName }) {
   if (tool === "pen") return <Pencil size={16} aria-hidden="true" />;
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -43,7 +43,7 @@ function SketchSwatch({ color, active = false }: { color: string; active?: boole
   );
 }
 
-export function sketchToolLabel(tool: SketchToolName, t: TranslationFunction): string {
+function sketchToolLabel(tool: SketchToolName, t: TranslationFunction): string {
   switch (tool) {
     case "pen": return t("画笔", "Pen");
     case "line": return t("直线", "Line");
@@ -54,7 +54,7 @@ export function sketchToolLabel(tool: SketchToolName, t: TranslationFunction): s
   }
 }
 
-export function sketchColorLabel(color: string, t: TranslationFunction): string {
+function sketchColorLabel(color: string, t: TranslationFunction): string {
   switch (color.toUpperCase()) {
     case "#E03131": return t("红色", "Red");
     case "#1971C2": return t("蓝色", "Blue");

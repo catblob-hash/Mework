@@ -6,7 +6,7 @@ import { paneKind, sidePaneDomId } from "../lib/sidePanes";
 import type { SidePaneId } from "../lib/sidePanes";
 import { IconButton } from "./Common";
 import { PopoverMenu } from "./PopoverMenu";
-import type { PopoverMenuSection, PopoverPanelRect } from "./PopoverMenu";
+import type { PopoverMenuSection } from "./PopoverMenu";
 import "./SidePane.css";
 
 export interface SidePaneBounds {
@@ -39,14 +39,6 @@ export interface SidePaneProps {
   expanded?: boolean;
   /** Present only for panes that can be shown alone over the workspace. */
   onToggleExpand?: () => void;
-  /**
-   * Reports the settings menu's viewport rectangle while it is open, and null once it closes.
-   * A pane whose body is a native page stacked beneath the renderer needs this to tell when the
-   * menu covers the page; every other pane can ignore it.
-   */
-  onMenuRectChange?: (rect: PopoverPanelRect | null) => void;
-  hideClose?: boolean;
-  closeLabel?: string;
   onClose: () => void;
   /** Any pointer or keyboard entry into the pane; the parent marks it focused. */
   onFocus?: () => void;
@@ -72,9 +64,6 @@ export function SidePane({
   menuSections,
   expanded = false,
   onToggleExpand,
-  onMenuRectChange,
-  hideClose = false,
-  closeLabel,
   onClose,
   onFocus,
   onContentBoundsChange,
@@ -143,7 +132,6 @@ export function SidePane({
               sections={menuSections}
               align="end"
               dense
-              onPanelRectChange={onMenuRectChange}
             />
           )}
           {onToggleExpand && (
@@ -159,18 +147,16 @@ export function SidePane({
                 : <Maximize2 size={13} aria-hidden="true" />}
             </IconButton>
           )}
-          {!hideClose && (
-            <IconButton
-              className="side-pane__close"
-              label={closeLabel ?? t("关闭面板", "Close pane")}
-              // Keeps the press from pulling focus out of whatever the pane holds before the click
-              // lands, so a page or terminal that is about to be closed never flashes a focus change.
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={onClose}
-            >
-              <X size={14} aria-hidden="true" />
-            </IconButton>
-          )}
+          <IconButton
+            className="side-pane__close"
+            label={t("关闭面板", "Close pane")}
+            // Keeps the press from pulling focus out of whatever the pane holds before the click
+            // lands, so a page or terminal that is about to be closed never flashes a focus change.
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={onClose}
+          >
+            <X size={14} aria-hidden="true" />
+          </IconButton>
         </div>
       </header>
       {subheader !== undefined && <div className="side-pane__subheader">{subheader}</div>}

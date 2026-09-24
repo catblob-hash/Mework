@@ -8,7 +8,8 @@
 //! with a probability-weighted position on the scale) and `choice` (a fixed option set,
 //! answered with the top option and the full distribution).
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -27,6 +28,22 @@ pub const JEV_MODEL: &str = "jev-latest";
 
 /// A `choice` question accepts at most this many options.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
+/// Jev's context budget for the `state` plus the longest question of a request.
+pub const STATE_TOKEN_LIMIT: usize = 32_000;
+
+/// A rough token count, for budgeting a request against [`STATE_TOKEN_LIMIT`]: three ASCII
+/// characters to a token, and one token for every other character — CJK text tokenizes close to
+/// that. Rough on purpose, and on the high side.
+pub fn estimate_tokens(text: &str) -> usize {
+    let (ascii, other) = text.chars().fold((0_usize, 0_usize), |(ascii, other), character| {
+        if character.is_ascii() {
+            (ascii + 1, other)
+        } else {
+            (ascii, other + 1)
+        }
+    });
+    ascii.div_ceil(3) + other
+}
 
 const MAX_RESPONSE_BODY: usize = 1024 * 1024;
 /// Jev answers in well under a second; anything slower than this is the network, not the model.
@@ -35,10 +52,25 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// documents as retryable. A `retry-after` header, when present, overrides the delay.
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
+/// Sustained request rate, shared by every tool call in the process. TypeSafe publishes
+/// 1,200 requests a minute per account — twenty a second — and returns `429` past it; a
+/// little under that leaves room for the retries themselves. Tool calls cut their material
+/// into as many requests as it takes, so a large file would otherwise run straight into the
+/// limit and come back with half its chunks unscored.
+const REQUESTS_PER_SECOND: f64 = 18.0;
+/// Requests that may start at once after a quiet spell, so an ordinary call of a few dozen
+/// chunks is not slowed down at all.
+const REQUEST_BURST: f64 = 32.0;
+
+static PACER: Mutex<Pacer> = Mutex::new(Pacer::new());
 
 /// One `score` question: the rating instructions and the ordered levels, low to high. Jev
 /// judges each level independently against the state and never sees level numbers, so a
 /// level must describe itself without referring to its neighbours.
+///
+/// The instructions point at one candidate of the state by `{c}` — `candidates[3]` — because a
+/// request carries several candidates, each with a question of its own; TypeSafe's own examples
+/// point a question at one item of the state the same way.
 #[derive(Clone, Copy, Debug)]
 pub struct ScoreRubric {
     pub instructions: &'static str,
@@ -47,22 +79,23 @@ pub struct ScoreRubric {
 }
 
 impl ScoreRubric {
-    fn question(&self) -> Value {
+    fn question_about(&self, candidate: &str) -> Value {
         json!({
             "type": "score",
-            "instructions": self.instructions,
+            "instructions": self.instructions.replace("{c}", candidate),
             "criteria": self.levels,
         })
     }
 }
 
-/// How well a chunk of text contains what a query asks for. The levels are about *containing*
-/// rather than *being about*, because a chunk is a slice of something larger and usually
-/// carries unrelated material around the part that matters.
+/// How well a block of text contains what a query asks for. The levels are about *containing*
+/// rather than *being about*, because a block is usually a slice of something larger — and, cut
+/// into parts, a slice of a block — and carries unrelated material around the part that matters.
 pub const RELEVANCE_RUBRIC: ScoreRubric = ScoreRubric {
-    instructions: "Rate how well `candidate.text` contains what `query` asks for. Judge only \
-                   the candidate's content; it may contain unrelated material as well, which \
-                   does not count against it. `candidate.source` says where the text came from.",
+    instructions: "Rate how well `{c}.text` contains what `query` asks for. Judge only that one \
+                   candidate's content — the other candidates in the state are separate material; \
+                   it may contain unrelated material as well, which does not count against it. \
+                   `{c}.source` says where the text came from.",
     levels: &[
         "Unrelated: nothing in the candidate has to do with what the query asks for.",
         "Loosely related: the candidate shares a topic or a keyword with the query but does \
@@ -76,10 +109,11 @@ pub const RELEVANCE_RUBRIC: ScoreRubric = ScoreRubric {
 /// How well one page element — a line of an accessibility snapshot — matches a description of
 /// the element to act on.
 pub const ELEMENT_RUBRIC: ScoreRubric = ScoreRubric {
-    instructions: "Rate how well the page element `candidate.text` is the element that `query` \
+    instructions: "Rate how well the page element `{c}.text` is the element that `query` \
                    describes. Elements are lines of an accessibility snapshot, formatted as \
-                   `[uid] role: \"name\" (value: \"...\")`, indented by depth; `candidate.context` \
-                   holds the neighbouring lines. Judge by role, name, value and position.",
+                   `[uid] role: \"name\" (value: \"...\")`, indented by depth; `{c}.context` \
+                   holds the neighbouring lines. Judge that one element by role, name, value and \
+                   position; the other candidates in the state are other elements.",
     levels: &[
         "Not the element: role, name and context do not match the description.",
         "Similar: the same role or a related name, but probably not the described element.",
@@ -113,17 +147,8 @@ pub struct ChoiceAnswer {
     pub probabilities: Vec<(String, f64)>,
 }
 
-/// Token usage and the versioned model that answered, for the tool's footer.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Usage {
-    pub model: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-}
-
 pub struct SystemOneResponse {
     pub answers: Map<String, Value>,
-    pub usage: Usage,
 }
 
 /// A client bound to one key. Cloning is cheap: the reqwest client is a handle to a shared pool.
@@ -169,14 +194,32 @@ impl Jev {
         })
     }
 
-    /// Asks one `score` question about `state`.
-    pub fn score(&self, state: Value, rubric: &ScoreRubric) -> Result<ScoreAnswer, DecisionError> {
-        let response = self.system_one(state, json!({ "answer": rubric.question() }))?;
-        let answer = response
-            .answers
-            .get("answer")
-            .ok_or_else(|| DecisionError::Transient("Jev returned no answer".to_owned()))?;
-        parse_score_answer(answer)
+    /// Asks one `score` question about each of the `count` candidates in `state`'s `candidates`
+    /// array, all in one request. An answer that is missing or malformed is `None`; the others
+    /// stand.
+    pub fn score_each(
+        &self,
+        state: Value,
+        rubric: &ScoreRubric,
+        count: usize,
+    ) -> Result<Vec<Option<ScoreAnswer>>, DecisionError> {
+        let questions = (0..count)
+            .map(|index| {
+                (
+                    format!("c{index}"),
+                    rubric.question_about(&format!("candidates[{index}]")),
+                )
+            })
+            .collect::<Map<_, _>>();
+        let response = self.system_one(state, Value::Object(questions))?;
+        Ok((0..count)
+            .map(|index| {
+                response
+                    .answers
+                    .get(&format!("c{index}"))
+                    .and_then(|answer| parse_score_answer(answer).ok())
+            })
+            .collect())
     }
 
     /// Asks one `choice` question about `state`. `options` are `(name, description)` pairs;
@@ -216,6 +259,7 @@ impl Jev {
     }
 
     /// One raw request. Retries the two documented retryable statuses with a short back-off.
+    /// Every attempt, retries included, first waits for a slot under the process-wide rate.
     pub fn system_one(
         &self,
         state: Value,
@@ -228,6 +272,7 @@ impl Jev {
         });
         let mut attempt = 0;
         loop {
+            pace();
             match self.send_once(&body) {
                 Ok(response) => return Ok(response),
                 Err(Attempt::Retry { after, error }) => {
@@ -310,24 +355,58 @@ impl Jev {
                     "TypeSafe response carries no answers".to_owned(),
                 ))
             })?;
-        Ok(SystemOneResponse {
-            answers,
-            usage: Usage {
-                model: payload
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                input_tokens: payload
-                    .pointer("/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                output_tokens: payload
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            },
-        })
+        Ok(SystemOneResponse { answers })
+    }
+}
+
+/// A token bucket over request starts: [`REQUEST_BURST`] slots, refilled at
+/// [`REQUESTS_PER_SECOND`].
+struct Pacer {
+    slots: f64,
+    updated: Option<Instant>,
+}
+
+impl Pacer {
+    const fn new() -> Self {
+        Self {
+            slots: REQUEST_BURST,
+            updated: None,
+        }
+    }
+
+    /// Takes one slot at `now`, or says how long until one is free.
+    ///
+    /// A slot counts as free a hair before the refill reaches exactly one: waiting the quoted
+    /// time lands a rounding error short of it, and the quote for that remainder would round to
+    /// zero nanoseconds — a wait that never ends on a clock that does not move by itself.
+    fn take(&mut self, now: Instant) -> Result<(), Duration> {
+        if let Some(updated) = self.updated {
+            let refill = now.saturating_duration_since(updated).as_secs_f64() * REQUESTS_PER_SECOND;
+            self.slots = (self.slots + refill).min(REQUEST_BURST);
+        }
+        self.updated = Some(now);
+        if self.slots >= 1.0 - 1e-6 {
+            self.slots = (self.slots - 1.0).max(0.0);
+            return Ok(());
+        }
+        Err(Duration::from_secs_f64(
+            (1.0 - self.slots) / REQUESTS_PER_SECOND,
+        ))
+    }
+}
+
+/// Blocks until the process-wide pacer gives this request a slot. The lock is held only to
+/// take or price a slot, never across the sleep.
+fn pace() {
+    loop {
+        let taken = PACER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take(Instant::now());
+        match taken {
+            Ok(()) => return,
+            Err(wait) => std::thread::sleep(wait),
+        }
     }
 }
 
@@ -476,9 +555,9 @@ pub(crate) mod fixture {
         .expect("client")
     }
 
-    /// A concurrent fixture that plays Jev: every connection is answered on its own thread
-    /// with a `score` answer computed by `level_of` from the request's `state`, on the
-    /// four-level rubrics. It serves until dropped; `requests()` returns what it saw so far.
+    /// A concurrent fixture that plays Jev: every connection is answered on its own thread, every
+    /// question `c{i}` of it with a `score` answer computed by `level_of` from the candidate it
+    /// is about, `state.candidates[i]`, on the four-level rubrics. It serves until dropped; `requests()` returns what it saw so far.
     pub struct ScoringServer {
         pub address: SocketAddr,
         seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -510,10 +589,32 @@ pub(crate) mod fixture {
                                 let (_head, body) = read_request(&mut stream);
                                 let request: serde_json::Value =
                                     serde_json::from_str(&body).expect("json request");
-                                let level = level_of(&request["state"]).clamp(0.0, 3.0);
+                                // Every question `c{i}` is about `candidates[i]`.
+                                let answers = request["questions"]
+                                    .as_object()
+                                    .map(|questions| {
+                                        questions
+                                            .keys()
+                                            .map(|key| {
+                                                let index = key
+                                                    .trim_start_matches('c')
+                                                    .parse::<usize>()
+                                                    .unwrap_or(usize::MAX);
+                                                let level = level_of(
+                                                    &request["state"]["candidates"][index],
+                                                )
+                                                .clamp(0.0, 3.0);
+                                                format!(
+                                                    r#""{key}":{{"type":"score","score":{level},"legend":{{"0":"a","1":"b","2":"c","3":"d"}},"probabilities":{{"0":0,"1":0,"2":0,"3":1}},"confidence":1}}"#
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    })
+                                    .unwrap_or_default();
                                 seen.lock().unwrap().push(request);
                                 let payload = format!(
-                                    r#"{{"model":"jev-1.13.0","answers":{{"answer":{{"type":"score","score":{level},"legend":{{"0":"a","1":"b","2":"c","3":"d"}},"probabilities":{{"0":0,"1":0,"2":0,"3":1}},"confidence":1}}}},"usage":{{"input_tokens":10,"output_tokens":1}}}}"#
+                                    r#"{{"model":"jev-1.13.0","answers":{{{answers}}},"usage":{{"input_tokens":10,"output_tokens":1}}}}"#
                                 );
                                 let response = format!(
                                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -590,19 +691,25 @@ mod tests {
     use super::fixture::{client_against, serve};
     use super::*;
 
-    const SCORE_BODY: &str = r#"{"model":"jev-1.13.0","answers":{"answer":{"type":"score","score":2.4,"legend":{"0":"a","1":"b","2":"c","3":"d"},"probabilities":{"0":0,"1":0.1,"2":0.4,"3":0.5},"confidence":0.62}},"usage":{"input_tokens":120,"output_tokens":7}}"#;
+    const SCORE_BODY: &str = r#"{"model":"jev-1.13.0","answers":{"c0":{"type":"score","score":2.4,"legend":{"0":"a","1":"b","2":"c","3":"d"},"probabilities":{"0":0,"1":0.1,"2":0.4,"3":0.5},"confidence":0.62},"c1":{"type":"choice","choice":"x"}},"usage":{"input_tokens":120,"output_tokens":7}}"#;
 
-    /// The request is the documented shape: bearer key, `model`, `state`, one `score` question
-    /// with ordered `criteria`. The answer's weighted level is normalised onto the threshold
-    /// scale.
+    /// The request is the documented shape: bearer key, `model`, `state`, and one `score`
+    /// question per candidate with ordered `criteria`, each pointed at its own candidate. The
+    /// answers' weighted levels are normalised onto the threshold scale; a malformed or missing
+    /// answer is that candidate's alone.
     #[test]
-    fn a_score_request_carries_the_rubric_and_normalises_the_answer() {
+    fn a_score_request_asks_about_every_candidate_and_normalises_the_answers() {
         let (address, server) = serve(vec![(200, "", SCORE_BODY)]);
         let jev = client_against(address);
-        let answer = jev
-            .score(
-                json!({"query": "q", "candidate": {"source": "x", "text": "t"}}),
+        let answers = jev
+            .score_each(
+                json!({"query": "q", "candidates": [
+                    {"source": "x", "text": "t"},
+                    {"source": "y", "text": "u"},
+                    {"source": "z", "text": "v"}
+                ]}),
                 &RELEVANCE_RUBRIC,
+                3,
             )
             .expect("score");
         let received = server.join().expect("fixture thread").remove(0);
@@ -619,18 +726,23 @@ mod tests {
         let body: Value = serde_json::from_str(&received.body).unwrap();
         assert_eq!(body["model"], JEV_MODEL);
         assert_eq!(body["state"]["query"], "q");
-        assert_eq!(body["questions"]["answer"]["type"], "score");
+        let questions = body["questions"].as_object().unwrap();
+        assert_eq!(questions.len(), 3);
+        assert_eq!(questions["c2"]["type"], "score");
+        let instructions = questions["c2"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("`candidates[2].text`"), "{instructions}");
+        assert!(!instructions.contains("{c}"), "{instructions}");
         assert_eq!(
-            body["questions"]["answer"]["criteria"]
-                .as_array()
-                .unwrap()
-                .len(),
+            questions["c0"]["criteria"].as_array().unwrap().len(),
             RELEVANCE_RUBRIC.levels.len()
         );
-        assert_eq!(answer.levels, 4);
-        assert_eq!(answer.score, 2.4);
-        assert_eq!(answer.normalized(), 0.8);
-        assert_eq!(answer.confidence, 0.62);
+        let first = answers[0].as_ref().expect("the first answer");
+        assert_eq!(first.levels, 4);
+        assert_eq!(first.score, 2.4);
+        assert_eq!(first.normalized(), 0.8);
+        assert_eq!(first.confidence, 0.62);
+        assert_eq!(answers[1], None, "an answer of the wrong type");
+        assert_eq!(answers[2], None, "no answer at all");
     }
 
     #[test]
@@ -685,7 +797,7 @@ mod tests {
         let (address, server) = serve(vec![(401, "", r#"{"error":"bad key sk-typesafe-test"}"#)]);
         let jev = client_against(address);
         let error = jev
-            .score(json!({}), &RELEVANCE_RUBRIC)
+            .score_each(json!({}), &RELEVANCE_RUBRIC, 1)
             .expect_err("401 must fail");
         server.join().unwrap();
         match error {
@@ -706,7 +818,7 @@ mod tests {
         )]);
         let jev = client_against(address);
         let error = jev
-            .score(json!({}), &RELEVANCE_RUBRIC)
+            .score_each(json!({}), &RELEVANCE_RUBRIC, 1)
             .expect_err("422 must fail");
         server.join().unwrap();
         match error {
@@ -725,10 +837,57 @@ mod tests {
             (200, "", SCORE_BODY),
         ]);
         let jev = client_against(address);
-        let answer = jev.score(json!({}), &RELEVANCE_RUBRIC).expect("retried");
+        let answer = jev
+            .score_each(json!({}), &RELEVANCE_RUBRIC, 1)
+            .expect("retried")
+            .remove(0)
+            .expect("an answer");
         let received = server.join().unwrap();
         assert_eq!(received.len(), 2);
         assert_eq!(answer.normalized(), 0.8);
+    }
+
+    /// A burst goes out at once; past it, requests start at the sustained rate, and a quiet
+    /// spell refills the bucket but never beyond the burst.
+    #[test]
+    fn the_pacer_allows_a_burst_then_holds_the_sustained_rate() {
+        let start = Instant::now();
+        let mut pacer = Pacer::new();
+        for _ in 0..REQUEST_BURST as usize {
+            assert_eq!(pacer.take(start), Ok(()));
+        }
+        let wait = pacer.take(start).expect_err("the burst is spent");
+        let interval = 1.0 / REQUESTS_PER_SECOND;
+        assert!((wait.as_secs_f64() - interval).abs() < 1e-6, "{wait:?}");
+        assert_eq!(pacer.take(start + wait), Ok(()));
+        // A minute of silence refills the bucket to the burst, not to a minute's worth.
+        let later = start + Duration::from_secs(60);
+        for _ in 0..REQUEST_BURST as usize {
+            assert_eq!(pacer.take(later), Ok(()));
+        }
+        assert!(pacer.take(later).is_err());
+        // Twenty seconds of back-to-back requests start no faster than the sustained rate — and
+        // every quoted wait moves the clock, so the loop ends (bounded, in case one does not).
+        let mut now = later;
+        let mut started = 0;
+        let end = later + Duration::from_secs(20);
+        for _ in 0..10_000 {
+            if now >= end {
+                break;
+            }
+            match pacer.take(now) {
+                Ok(()) => started += 1,
+                Err(wait) => {
+                    assert!(!wait.is_zero(), "a zero wait would spin");
+                    now += wait;
+                }
+            }
+        }
+        assert!(now >= end, "the pacer stopped advancing the clock");
+        assert!(
+            (started as f64 - 20.0 * REQUESTS_PER_SECOND).abs() <= 1.0,
+            "{started} requests in 20 s"
+        );
     }
 
     #[test]

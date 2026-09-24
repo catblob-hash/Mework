@@ -16,7 +16,7 @@ export const MEMORY_E2E_WORKSPACE_ENV = "MEWORK_MEMORY_E2E_WORKSPACE";
 export const MEMORY_E2E_WORKSPACE_MARKER_ENV =
   "MEWORK_MEMORY_E2E_WORKSPACE_MARKER";
 export const MEMORY_E2E_MARKER_FILE = ".mework-memory-e2e-workspace";
-export const MEMORY_E2E_DATA_IDENTIFIER_PREFIX =
+const MEMORY_E2E_DATA_IDENTIFIER_PREFIX =
   "com.mework.app.e2e.memory-";
 
 export const MEMORY_E2E_HOST_ENVIRONMENT_NAMES = Object.freeze([
@@ -44,7 +44,7 @@ function expectedDataIdentifier(runId) {
   return `${MEMORY_E2E_DATA_IDENTIFIER_PREFIX}${runId}`;
 }
 
-export function memoryE2eWorkspaceMarkerBody(runId, marker) {
+function memoryE2eWorkspaceMarkerBody(runId, marker) {
   return [
     "MEWORK_MEMORY_E2E_WORKSPACE_V1",
     `run=${runId}`,

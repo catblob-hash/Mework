@@ -147,7 +147,7 @@ function publishAppearance(next: AppearancePreferences): void {
   for (const listener of appearanceListeners) listener();
 }
 
-export function subscribeAppearance(listener: () => void): () => void {
+function subscribeAppearance(listener: () => void): () => void {
   appearanceListeners.add(listener);
   return () => {
     appearanceListeners.delete(listener);

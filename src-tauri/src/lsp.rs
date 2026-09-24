@@ -932,12 +932,6 @@ fn format_calls(value: &Value, root: &Path, incoming: bool) -> String {
     lines.join("\n")
 }
 
-/// The extension the tool would route on, for callers that only need to know
-/// whether a path is claimed at all.
-pub fn claims_path(configs: &[LspServerConfig], path: &Path) -> bool {
-    LspRegistry::config_for_path(configs, path).is_some()
-}
-
 /// Resolves a file path the way the tool does, for the edit hook.
 ///
 /// "The way the tool does" includes canonicalizing, because the navigation leg

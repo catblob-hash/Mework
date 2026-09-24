@@ -13,7 +13,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::{env, io::Write as _, net::SocketAddr, sync::mpsc as sync_mpsc, thread, time::Duration};
 use tauri::{
     ipc::{Channel, InvokeResponseBody},
@@ -66,14 +66,6 @@ const IMAGE_INPUT_BROWSER_E2E_CSP: &str = concat!(
     "media-src 'none'; manifest-src 'none'; base-uri 'none'; ",
     "form-action 'none'; frame-ancestors 'none'",
 );
-
-/// A minimal valid 1x1 PNG. The browser-upload bridge has no transcript to pull
-/// a real attachment from, so it materializes this fixture instead.
-const BROWSER_E2E_UPLOAD_FIXTURE_PNG: &[u8] = &[
-    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0,
-    0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 218, 99, 249, 207, 192, 0, 0, 3, 17,
-    1, 4, 251, 51, 50, 105, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-];
 
 #[derive(Clone)]
 struct BridgeState {
@@ -646,17 +638,6 @@ async fn dispatch(
             app.state::<AppState>(),
             arg(args, "conversationId")?,
         )),
-        "list_timeline_events" => result_value(super::list_timeline_events(
-            app.clone(),
-            app.state::<AppState>(),
-            arg(args, "conversationId")?,
-        )),
-        "load_timeline_snapshot" => result_value(super::load_timeline_snapshot(
-            app.clone(),
-            app.state::<AppState>(),
-            arg(args, "conversationId")?,
-            arg(args, "seq")?,
-        )),
         "list_wire_requests" => result_value(super::list_wire_requests(
             app.clone(),
             app.state::<AppState>(),
@@ -738,15 +719,9 @@ async fn dispatch(
             .await,
         ),
         "mcp_probe_server" => result_value(
-            super::mcp_probe_server(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "serverId")?,
-                arg(args, "probeId")?,
-            )
-            .await,
+            super::mcp_probe_server(app.clone(), app.state::<AppState>(), arg(args, "serverId")?)
+                .await,
         ),
-        "mcp_cancel_probe" => result_value(super::mcp_cancel_probe(arg(args, "probeId")?)),
         "environment_tool_snapshots" => result_value(
             super::environment_tool_snapshots(app.clone(), app.state::<AppState>()).await,
         ),
@@ -789,48 +764,6 @@ async fn dispatch(
             super::install_app_update(app.clone(), app.state::<AppState>(), arg(args, "path")?)
                 .await,
         ),
-        "mework_memory_overview" => result_value(super::mework_memory_overview(
-            app.clone(),
-            app.state::<AppState>(),
-            optional_arg(args, "workspaceId")?,
-        )),
-        "mework_memory_read_file" => result_value(super::mework_memory_read_file(
-            app.clone(),
-            app.state::<AppState>(),
-            optional_arg(args, "workspaceId")?,
-            arg(args, "tier")?,
-            arg(args, "name")?,
-        )),
-        "mework_memory_write_file" => result_value(super::mework_memory_write_file(
-            app.clone(),
-            app.state::<AppState>(),
-            optional_arg(args, "workspaceId")?,
-            arg(args, "tier")?,
-            arg(args, "name")?,
-            arg(args, "content")?,
-        )),
-        "mework_memory_delete_document" => result_value(super::mework_memory_delete_document(
-            app.clone(),
-            app.state::<AppState>(),
-            optional_arg(args, "workspaceId")?,
-            arg(args, "tier")?,
-            arg(args, "name")?,
-        )),
-        "project_memory_list_import_trust" => {
-            result_value(super::project_memory_list_import_trust(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "workspaceId")?,
-            ))
-        }
-        "project_memory_revoke_import_trust" => {
-            result_value(super::project_memory_revoke_import_trust(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "workspaceId")?,
-                arg(args, "recordId")?,
-            ))
-        }
         "execute_tool" => result_value(
             super::execute_tool(
                 app.clone(),
@@ -1054,6 +987,7 @@ async fn dispatch(
             arg(args, "messageId")?,
             arg(args, "content")?,
             optional_arg(args, "images")?,
+            optional_arg(args, "files")?,
             arg(args, "createdAt")?,
         )),
         "workflow_step_control" => result_value(super::workflow_step_control(
@@ -1078,6 +1012,30 @@ async fn dispatch(
             app.clone(),
             arg(args, "imageId")?,
         )),
+        "file_attachment_upload" => result_value(
+            super::file_attachment_upload(
+                app.clone(),
+                arg(args, "name")?,
+                arg(args, "data")?,
+                arg(args, "format")?,
+                optional_arg(args, "text")?,
+                optional_arg(args, "pages")?,
+            )
+            .await,
+        ),
+        "file_attachment_data" => {
+            result_value(super::file_attachment_data(app.clone(), arg(args, "fileId")?).await)
+        }
+        // No native window receives drops here, so the session stays empty and
+        // both commands refuse every path, as the desktop app would for a path
+        // that was never dragged.
+        "dropped_paths_probe" => result_value(super::dropped_paths_probe(
+            app.state::<AppState>(),
+            arg(args, "paths")?,
+        )),
+        "dropped_file_read" => {
+            result_value(super::dropped_file_read(app.clone(), arg(args, "path")?).await)
+        }
         "web_source_icon" => {
             result_value(super::web_source_icon(app.clone(), arg(args, "url")?).await)
         }
@@ -1200,14 +1158,6 @@ async fn dispatch(
             )
             .await,
         ),
-        "get_git_workspace_snapshot" => result_value(
-            super::get_git_workspace_snapshot(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-            )
-            .await,
-        ),
         "get_git_workspace_summary" => result_value(
             super::get_git_workspace_summary(
                 app.clone(),
@@ -1316,15 +1266,6 @@ async fn dispatch(
             optional_arg(args, "search")?,
             optional_arg(args, "lines")?,
         )),
-        "preview_set_auto_verify" => result_value(
-            super::preview_set_auto_verify(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "enabled")?,
-            )
-            .await,
-        ),
         "create_conversation_worktree" => result_value(
             super::create_conversation_worktree(
                 app.clone(),
@@ -1342,15 +1283,6 @@ async fn dispatch(
             )
             .await,
         ),
-        "get_git_history" => result_value(
-            super::get_git_history(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "request")?,
-            )
-            .await,
-        ),
         "prepare_git_discard" => result_value(
             super::prepare_git_discard(
                 app.clone(),
@@ -1358,23 +1290,6 @@ async fn dispatch(
                 arg(args, "target")?,
                 arg(args, "paths")?,
                 arg(args, "includeUntracked")?,
-            )
-            .await,
-        ),
-        "prepare_git_stage_all" => result_value(
-            super::prepare_git_stage_all(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-            )
-            .await,
-        ),
-        "prepare_git_commit" => result_value(
-            super::prepare_git_commit(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "message")?,
             )
             .await,
         ),
@@ -1387,99 +1302,6 @@ async fn dispatch(
             )
             .await,
         ),
-        "get_github_repository" => result_value(
-            super::get_github_repository(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-            )
-            .await,
-        ),
-        "get_github_pull_requests" => result_value(
-            super::get_github_pull_requests(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "page")?,
-                arg(args, "pageSize")?,
-            )
-            .await,
-        ),
-        "get_github_pull_request_detail" => result_value(
-            super::get_github_pull_request_detail(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "number")?,
-            )
-            .await,
-        ),
-        "get_github_pull_request_readiness" => result_value(
-            super::get_github_pull_request_readiness(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "number")?,
-            )
-            .await,
-        ),
-        "get_github_pull_request_diff" => result_value(
-            super::get_github_pull_request_diff(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "number")?,
-                optional_arg(args, "path")?,
-            )
-            .await,
-        ),
-        "get_github_pull_request_review_threads" => result_value(
-            super::get_github_pull_request_review_threads(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "request")?,
-            )
-            .await,
-        ),
-        "get_github_pull_request_review_thread_comments" => result_value(
-            super::get_github_pull_request_review_thread_comments(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "request")?,
-            )
-            .await,
-        ),
-        "execute_github_action" => result_value(
-            super::execute_github_action(
-                app.clone(),
-                app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "action")?,
-            )
-            .await,
-        ),
-        // Development-only authenticated bridge used by the real-WebView browser tool suite.
-        // Production model calls still go through execute_tool and its security classifier.
-        "browser_execute_agent_tool" => {
-            let tool_name: String = arg(args, "toolName")?;
-            let tool =
-                crate::browser::PreviewTool::from_tool_name(&tool_name).ok_or_else(|| {
-                    "browser_execute_agent_tool only permits the preview page tools".to_owned()
-                })?;
-            let session_id =
-                optional_arg(args, "sessionId")?.unwrap_or_else(|| "browser-dev".to_owned());
-            let input: Map<String, Value> = arg(args, "input")?;
-            let grants = browser_e2e_grants(&app, tool)?;
-            result_value(
-                app.state::<AppState>()
-                    .browser
-                    .execute_tool(session_id, tool, input, grants)
-                    .await,
-            )
-        }
-        "browser_e2e_live_page_count" => value(app.state::<AppState>().browser.live_page_count()),
         "browser_e2e_instance_id" => value(active_browser_e2e_instance_id()?),
         "browser_e2e_cleanup_web_search_keys" => {
             result_value(browser_e2e_cleanup_web_search_keys(&app).await)
@@ -1876,34 +1698,6 @@ async fn browser_e2e_cleanup_image_input_keys(app: &AppHandle) -> Result<Value, 
     })
     .await
     .map_err(|error| format!("图片输入 E2E Key 清理后台任务失败: {error}"))?
-}
-
-/// The one preview tool with a host-side grant. Production materializes the transcript attachment
-/// inside the run loop; the E2E bridge has no transcript, so it stands in a fixed 1x1 PNG fixture.
-fn browser_e2e_grants(
-    app: &AppHandle,
-    tool: crate::browser::PreviewTool,
-) -> Result<crate::browser::BrowserToolGrants, String> {
-    if tool != crate::browser::PreviewTool::UploadImage {
-        return Ok(crate::browser::BrowserToolGrants::default());
-    }
-    let fixture = browser_e2e_directory(app)?.join("upload-image-fixture.png");
-    std::fs::write(&fixture, BROWSER_E2E_UPLOAD_FIXTURE_PNG)
-        .map_err(|error| format!("Could not create image-upload fixture file: {error}"))?;
-    Ok(crate::browser::BrowserToolGrants {
-        upload_paths: Some(vec![fixture]),
-    })
-}
-
-fn browser_e2e_directory(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    let directory = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Could not resolve application data directory: {error}"))?
-        .join("image-input-browser-e2e");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("Could not create browser E2E directory: {error}"))?;
-    Ok(directory)
 }
 
 fn arg<T: DeserializeOwned>(args: &Value, key: &str) -> Result<T, String> {

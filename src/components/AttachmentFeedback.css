@@ -1,0 +1,113 @@
+/* ---- drop overlay ---- */
+
+/* A zone a file drag could land in says so while the drag is anywhere over the window, so the
+   reader can see where to aim; the one under the pointer then says what the drop would do. */
+[data-attachment-drop-ready="true"] {
+  outline: 1.5px dashed var(--border-strong);
+  outline-offset: 3px;
+}
+
+.attachment-drop {
+  position: absolute;
+  z-index: 5;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 10px 16px;
+  border: 1.5px dashed var(--accent);
+  border-radius: inherit;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  text-align: center;
+  pointer-events: none;
+}
+
+.attachment-drop strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.attachment-drop span {
+  max-width: 100%;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.attachment-drop--unavailable {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger-soft) 94%, transparent);
+  cursor: not-allowed;
+}
+
+.attachment-drop--unavailable strong {
+  color: var(--danger);
+}
+
+/* ---- rejection notice ---- */
+
+.attachment-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0 0 8px;
+  padding: 7px 6px 7px 9px;
+  border: 1px solid var(--color-efd0cd);
+  border-radius: 8px;
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.attachment-notice > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.attachment-notice__body {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.attachment-notice__body strong {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.attachment-notice__body ul {
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.attachment-notice__body li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  color: var(--muted);
+}
+
+.attachment-notice__names {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-notice__names::after {
+  content: ":";
+}
+
+.attachment-notice .attachment-notice__dismiss {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  border-radius: 5px;
+}

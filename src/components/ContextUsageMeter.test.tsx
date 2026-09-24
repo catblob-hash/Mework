@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { configureI18n } from "../i18n";
 import type { ContextItem } from "../types";
 import { ContextUsageMeter, type ContextUsageMeterProps } from "./ContextUsageMeter";

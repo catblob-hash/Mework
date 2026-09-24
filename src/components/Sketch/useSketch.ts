@@ -16,7 +16,7 @@ interface SketchKeyEvent {
   metaKey: boolean;
 }
 
-export function isApplePlatform(platform: string = typeof navigator === "undefined" ? "" : navigator.platform): boolean {
+function isApplePlatform(platform: string = typeof navigator === "undefined" ? "" : navigator.platform): boolean {
   return /mac|iphone|ipad|ipod/i.test(platform);
 }
 
@@ -32,7 +32,7 @@ export function sketchCommandForEvent(event: SketchKeyEvent, apple: boolean): Sk
   return null;
 }
 
-export function sketchShortcutLabel(command: SketchCommand, apple: boolean): string {
+function sketchShortcutLabel(command: SketchCommand, apple: boolean): string {
   if (apple) return command === "undo" ? "⌘Z" : "⇧⌘Z";
   return command === "undo" ? "Ctrl+Z" : "Ctrl+Shift+Z";
 }

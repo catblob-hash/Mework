@@ -163,80 +163,38 @@ export function SettingsRailDelete({
   );
 }
 
-/**
- * A rail row.
- *
- * Deletable rows use a `role="button"` div because a button cannot contain the inline
- * delete button.
- */
+/** A rail row. */
 export function SettingsRailRow({
   label,
   selected,
   active = false,
-  onSelect,
-  title,
-  onDelete
+  onSelect
 }: {
   label: string;
   selected: boolean;
   /** Green-dot condition: enabled provider or default new-conversation preset. */
   active?: boolean;
   onSelect: () => void;
-  title?: string;
-  /** Omit for rows that cannot be deleted. */
-  onDelete?: () => void;
 }) {
   const trailing = (
     <span className="provider-rail__trailing">
       {active && <span className="provider-rail__dot" aria-hidden="true" />}
-      {onDelete && <SettingsRailDelete name={label} onDelete={onDelete} />}
     </span>
   );
 
-  if (!onDelete) {
-    return (
-      <div className="provider-rail__slot">
-        <button
-          type="button"
-          className="provider-rail__row"
-          data-selected={selected ? "true" : "false"}
-          aria-current={selected || undefined}
-          title={title}
-          onClick={onSelect}
-        >
-          <ProviderAvatar name={label} />
-          <span className="provider-rail__name">{label}</span>
-          {trailing}
-        </button>
-      </div>
-    );
-  }
-
   return (
     <div className="provider-rail__slot">
-      {/* biome-ignore lint/a11y/useSemanticElements: the inline delete button prevents a button wrapper. */}
-      <div
-        role="button"
-        tabIndex={0}
+      <button
+        type="button"
+        className="provider-rail__row"
         data-selected={selected ? "true" : "false"}
         aria-current={selected || undefined}
-        // The nested delete button would otherwise be included in the computed accessible name.
-        aria-label={label}
-        title={title}
-        className="provider-rail__row"
         onClick={onSelect}
-        onKeyDown={(event) => {
-          if (event.currentTarget !== event.target) return;
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            onSelect();
-          }
-        }}
       >
         <ProviderAvatar name={label} />
         <span className="provider-rail__name">{label}</span>
         {trailing}
-      </div>
+      </button>
     </div>
   );
 }

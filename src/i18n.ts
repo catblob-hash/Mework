@@ -80,7 +80,7 @@ export function configureI18n(
   return resolvedLanguage;
 }
 
-export function refreshAutomaticLanguage(systemLocale: string = browserLanguage()): void {
+function refreshAutomaticLanguage(systemLocale: string = browserLanguage()): void {
   if (snapshot.preference !== "auto") return;
   configureI18n("auto", systemLocale);
 }

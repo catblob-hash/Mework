@@ -23,7 +23,6 @@ use crate::{
     model::{HookDefinition, HookEvent, ToolResult},
 };
 
-#[allow(dead_code)]
 pub(crate) mod instructions_loaded;
 
 const MAX_HOOK_TIMEOUT: Duration = Duration::from_secs(10 * 60);

@@ -18,12 +18,11 @@
 //! path belongs to a different product that may be installed alongside this one,
 //! so sharing it would have the two fight over one file.
 
-use std::{io::Read, path::Path};
+use std::path::Path;
 
 use serde::Serialize;
 
 use crate::{
-    path_guard,
     preview_launch_config::{self, LaunchConfigDiscovery, ServerConfig},
     preview_servers::{
         self, PreviewLogQuery, PreviewServerConfig, PreviewServerRegistry, PreviewServerSnapshot,
@@ -85,9 +84,6 @@ pub struct PreviewConfigurationList {
     pub launch_json_path: String,
     pub servers: Vec<PreviewConfiguredServer>,
     pub malformed: Vec<PreviewMalformedEntry>,
-    /// `false` whenever the file cannot be used at all, matching the source's own
-    /// `config ? config.autoVerify !== false : false`.
-    pub auto_verify: bool,
     /// The full explanation of an unusable file. `None` when it is usable.
     pub problem: Option<String>,
     /// The wire reason behind `problem`.
@@ -275,7 +271,6 @@ fn configuration_list(
                 reason: entry.reason.clone(),
             })
             .collect(),
-        auto_verify: config.is_some_and(|config| config.auto_verify),
         problem: preview_launch_config::discovery_model_message(found, workspace),
         problem_reason: preview_launch_config::discovery_deny_reason(found)
             .map(|reason| reason.as_str().to_owned()),
@@ -505,62 +500,6 @@ pub fn logs(registry: &PreviewServerRegistry, server_id: &str, query: &PreviewLo
     preview_servers::render_preview_logs(&registry.logs(server_id), query)
 }
 
-/// Writes `autoVerify` back into `.mework/launch.json`.
-///
-/// `false` for every reason a write can fail, which is the source's own contract:
-/// the toggle is a preference, and a project without a launch.json has nothing to
-/// remember it in. The path is resolved under the workspace scope because this is
-/// the one preview operation that writes, so a `.mework` junction pointing out of
-/// the project must fail closed rather than be followed.
-pub fn set_auto_verify(workspace: &Path, enabled: bool) -> bool {
-    let request = match launch_json_request(workspace) {
-        Some(request) => request,
-        None => return false,
-    };
-    let scope = path_guard::ExecutionScope::workspace_only(workspace);
-    let source = match read_scoped(workspace, &request, &scope) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("预览 autoVerify 无法读取 launch.json：{error}");
-            return false;
-        }
-    };
-    let Some(updated) = preview_launch_config::set_auto_verify_source(&source, enabled) else {
-        eprintln!("预览 autoVerify 无法改写 launch.json：文件不是 JSON 对象");
-        return false;
-    };
-    match path_guard::prepare_secure_write_with_scope(workspace, &request, &scope)
-        .and_then(|authority| authority.install(updated.as_bytes()))
-    {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!("预览 autoVerify 无法写入 launch.json：{error}");
-            false
-        }
-    }
-}
-
-fn read_scoped(
-    workspace: &Path,
-    request: &str,
-    scope: &path_guard::ExecutionScope,
-) -> Result<String, String> {
-    let (mut file, _) =
-        path_guard::secure_open_existing_file_with_scope(workspace, request, scope)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// The path guard takes a string, and a workspace path that cannot be spelled as
-/// one cannot be guarded either.
-fn launch_json_request(workspace: &Path) -> Option<String> {
-    preview_launch_config::launch_json_path(workspace)
-        .to_str()
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
@@ -610,7 +549,6 @@ mod tests {
 
         assert!(listed.servers.is_empty());
         assert!(listed.malformed.is_empty());
-        assert!(!listed.auto_verify);
         assert_eq!(
             listed.problem_reason.as_deref(),
             Some("launch_config_missing")
@@ -623,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn a_usable_file_lists_its_servers_and_defaults_auto_verify_on() {
+    fn a_usable_file_lists_its_servers() {
         let workspace = tempfile::tempdir().unwrap();
         write_launch_json(
             workspace.path(),
@@ -641,35 +579,8 @@ mod tests {
         assert_eq!(listed.servers[0].name, "web");
         assert_eq!(listed.servers[0].port, 5173);
         assert_eq!(listed.servers[0].command.as_deref(), Some("npm"));
-        assert!(listed.auto_verify);
         assert_eq!(listed.problem, None);
         assert_eq!(listed.problem_reason, None);
-    }
-
-    #[test]
-    fn auto_verify_is_written_back_and_read_back() {
-        let workspace = tempfile::tempdir().unwrap();
-        write_launch_json(
-            workspace.path(),
-            "{\n  // the dev server\n  \"configurations\": [\n    { \"name\": \"web\", \"runtimeExecutable\": \"npm\", \"port\": 5173 }\n  ]\n}\n",
-        );
-
-        assert!(set_auto_verify(workspace.path(), false));
-        assert!(!configurations(workspace.path()).auto_verify);
-        let written =
-            std::fs::read_to_string(workspace.path().join(".mework").join("launch.json")).unwrap();
-        assert!(written.contains("// the dev server"), "{written}");
-
-        assert!(set_auto_verify(workspace.path(), true));
-        assert!(configurations(workspace.path()).auto_verify);
-    }
-
-    #[test]
-    fn auto_verify_on_a_project_without_a_launch_json_is_refused() {
-        let workspace = tempfile::tempdir().unwrap();
-
-        assert!(!set_auto_verify(workspace.path(), true));
-        assert!(!workspace.path().join(".mework").exists());
     }
 
     #[test]

@@ -83,10 +83,6 @@ impl Schema {
         &self.root
     }
 
-    pub fn into_value(self) -> Value {
-        self.root
-    }
-
     /// Validate an instance and return all errors with instance paths rather
     /// than only the first error.
     pub fn validate(&self, instance: &Value) -> Result<(), Vec<String>> {
@@ -1082,6 +1078,5 @@ mod tests {
         });
         let schema = compile(&document).expect("compiles");
         assert_eq!(schema.as_value(), &document);
-        assert_eq!(schema.clone().into_value(), document);
     }
 }

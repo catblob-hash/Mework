@@ -13,7 +13,8 @@ import {
   FolderTree,
   LoaderCircle,
   MoreVertical,
-  PanelLeft,
+  PanelLeftClose,
+  PanelLeftOpen,
   Presentation,
   RotateCw,
   Scroll,
@@ -31,13 +32,24 @@ import {
 } from "react";
 import type { KeyboardEvent, MouseEvent, ReactNode } from "react";
 import { useI18n } from "../i18n";
-import { highlightCodeLines } from "../lib/codeHighlight";
-import type { CodeToken } from "../lib/codeHighlight";
+import { hasBackendRuntime } from "../lib/backend";
+import { localLinkTarget, scrollIntoContainer, scrollToFragment } from "../lib/documentLinks";
 import { externalHttpUrl } from "../lib/externalLinks";
 import { fileIconKind } from "../lib/fileIcons";
-import { codeLanguage, fileViewerKind, imageMediaType, resolveDocumentReference } from "../lib/fileViewers";
+import {
+  binaryMediaType,
+  codeLanguage,
+  fileViewerKind,
+  hasSourceForm,
+  imageMediaType,
+  readsBytes,
+  resolveDocumentReference
+} from "../lib/fileViewers";
 import type { FileViewerKind } from "../lib/fileViewers";
+import { splitFrontMatter } from "../lib/frontMatter";
 import { gitTargetKey } from "../lib/git";
+import { parseNotebook } from "../lib/notebook";
+import { revealPath } from "../lib/pathLinks";
 import type { GitTarget } from "../lib/git";
 import { readStoredFlag, writeStoredFlag } from "../lib/paneSettings";
 import type { SidePaneId } from "../lib/sidePanes";
@@ -56,11 +68,23 @@ import type {
   WorkspaceEntryKind,
   WorkspaceSearchMatch
 } from "../lib/workspaceFiles";
+import { MarkdownCodeBlock, NumberedCode } from "./CodeBlock";
 import { IconButton } from "./Common";
+import { AudioPlayer } from "./FilePreview/AudioPlayer";
+import { CsvTable } from "./FilePreview/CsvTable";
+import { FontPreview } from "./FilePreview/FontPreview";
+import { HtmlPreview } from "./FilePreview/HtmlPreview";
+import type { HtmlPreviewResources } from "./FilePreview/HtmlPreview";
+import { ImageViewer } from "./FilePreview/ImageViewer";
+import { NotebookView } from "./FilePreview/NotebookView";
+import { PdfViewer } from "./FilePreview/PdfViewer";
+import { UnsupportedNotice } from "./FilePreview/UnsupportedNotice";
+import { dataUrlByteLength } from "./FilePreview/format";
 import { MarkdownContent } from "./MarkdownContent";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuSection } from "./PopoverMenu";
 import { SidePane } from "./SidePane";
+import "./FilePreview/FilePreview.css";
 import "./FilesPane.css";
 
 /** A file the pane has been asked to show from somewhere outside it. */
@@ -71,6 +95,12 @@ export interface FilesPaneOpenRequest {
   line: number | null;
   /** Bumped per request, so asking twice for the same file asks twice. */
   nonce: number;
+  /**
+   * The pane was not open when the file was asked for: it opens on the file
+   * alone, with the tree folded away. A pane that was already open keeps the tree
+   * the way the reader left it.
+   */
+  collapseTree?: boolean;
 }
 
 export interface FilesPaneProps {
@@ -84,6 +114,8 @@ export interface FilesPaneProps {
   active: boolean;
   /** A file the timeline asked for, or null while nothing has been clicked. */
   openRequest?: FilesPaneOpenRequest | null;
+  /** Told once `openRequest` has been acted on, so a later mount does not act on it again. */
+  onOpenRequestHandled?: (nonce: number) => void;
   expanded: boolean;
   onToggleExpand: () => void;
   onPaneFocus: () => void;
@@ -100,8 +132,12 @@ type ViewerState =
   | { status: "ready"; content: string; binary: boolean; truncated: boolean }
   | { status: "error"; message: string };
 
-/** One picture, read as bytes rather than as text so it can be shown. */
-type ImageState =
+/**
+ * One file read as bytes rather than as text: a picture, a PDF, a recording, a
+ * font. Held as a `data:` URL, which is what the pictures need anyway and what
+ * the other viewers decode from.
+ */
+type MediaState =
   | { status: "loading" }
   | { status: "ready"; source: string }
   | { status: "tooLarge" }
@@ -254,12 +290,14 @@ function buildRows(
   return rows;
 }
 
-function splitLines(content: string): string[] {
-  const lines = content.split("\n");
-  // A file ending in a newline has no extra last line; numbering one would claim
-  // a line the file does not have.
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines.map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
+/**
+ * Whether a file's text has to be read to show it: everything but the files the
+ * pane reads as bytes, and a video, which it cannot show at all. An SVG is both —
+ * a picture, and markup its source toggle shows.
+ */
+function needsText(path: string): boolean {
+  if (readsBytes(path)) return hasSourceForm(path);
+  return fileViewerKind(path) !== "video";
 }
 
 /**
@@ -272,16 +310,18 @@ function splitLines(content: string): string[] {
  */
 const MARKDOWN_IMAGE = /!\[[^\]]*\]\(\s*<?([^)\s>]+)>?[^)]*\)/g;
 const MARKDOWN_IMAGE_DEFINITION = /^ {0,3}\[[^\]]+\]:\s*<?([^\s>]+)>?/gm;
+/** `<img src="…">`, which READMEs use for anything that needs a width or a centre. */
+const HTML_IMAGE = /<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
 
 /** Every reference in `source` that names something in the workspace rather than the web. */
 function documentImageReferences(source: string): string[] {
   const references = new Set<string>();
-  for (const pattern of [MARKDOWN_IMAGE, MARKDOWN_IMAGE_DEFINITION]) {
+  for (const pattern of [MARKDOWN_IMAGE, MARKDOWN_IMAGE_DEFINITION, HTML_IMAGE]) {
     pattern.lastIndex = 0;
     for (;;) {
       const match = pattern.exec(source);
       if (!match) break;
-      const reference = match[1];
+      const reference = match[1] ?? match[2] ?? match[3] ?? "";
       // An address with a scheme, a protocol-relative one, and a bare fragment
       // are all somebody else's to resolve.
       if (/^[a-z][a-z0-9+.-]*:/i.test(reference)) continue;
@@ -292,40 +332,17 @@ function documentImageReferences(source: string): string[] {
   return [...references];
 }
 
-/**
- * The anchor a heading answers to, in the form the ecosystem settled on:
- * lowercased, punctuation dropped, spaces hyphenated.
- *
- * Computed from the headings on screen at click time rather than written into
- * them at render time, so a document's own table of contents works without the
- * renderer having to mint ids for every heading it draws.
- */
-function headingSlug(text: string): string {
-  return text.trim().toLowerCase()
-    .replace(/[^\p{L}\p{N}\s_-]/gu, "")
-    .replace(/\s+/g, "-");
-}
-
-function scrollToHeading(container: HTMLElement | null, fragment: string): void {
-  if (!container) return;
-  let wanted: string;
+/** The Markdown a notebook's text cells hold, for the pictures they reference. */
+function notebookMarkdown(content: string): string {
   try {
-    wanted = headingSlug(decodeURIComponent(fragment));
+    return parseNotebook(content).cells
+      .filter((cell) => cell.kind === "markdown")
+      .map((cell) => cell.source)
+      .join("\n\n");
   } catch {
-    // A fragment that is not valid percent-encoding is still a fragment.
-    wanted = headingSlug(fragment);
-  }
-  if (!wanted) return;
-  const headings = container.querySelectorAll("h1, h2, h3, h4, h5, h6");
-  for (const heading of headings) {
-    if (headingSlug(heading.textContent ?? "") !== wanted) continue;
-    heading.scrollIntoView({ block: "start" });
-    return;
+    return "";
   }
 }
-
-/** Past this many lines the file is shown uncoloured: the spans cost more than the colour is worth. */
-const MAX_HIGHLIGHTED_LINES = 4000;
 
 /** Every directory on the way to `path`, so revealing a file can open all of them. */
 function ancestorsOf(path: string): string[] {
@@ -358,6 +375,7 @@ export function FilesPane({
   workspacePath,
   active,
   openRequest = null,
+  onOpenRequestHandled,
   expanded: paneExpanded,
   onToggleExpand,
   onPaneFocus,
@@ -371,8 +389,8 @@ export function FilesPane({
   const [viewers, setViewers] = useState<ReadonlyMap<string, ViewerState>>(
     () => new Map<string, ViewerState>()
   );
-  const [images, setImages] = useState<ReadonlyMap<string, ImageState>>(
-    () => new Map<string, ImageState>()
+  const [media, setMedia] = useState<ReadonlyMap<string, MediaState>>(
+    () => new Map<string, MediaState>()
   );
   const [tabs, setTabs] = useState<readonly FileTab[]>([]);
   const [activePath, setActivePath] = useState<string | null>(null);
@@ -392,18 +410,30 @@ export function FilesPane({
    * document's Markdown source says nothing about the next one.
    */
   const [sourcePaths, setSourcePaths] = useState<ReadonlySet<string>>(() => new Set<string>());
-  /** The line a request asked to land on, and the bump that makes a repeat ask again. */
-  const [pendingLine, setPendingLine] = useState<{ path: string; line: number; nonce: number } | null>(null);
+  /**
+   * Where a request asked to land once its file is on screen — a line, or a
+   * heading in a document — and the bump that makes a repeat ask again.
+   */
+  const [pendingJump, setPendingJump] = useState<
+    { path: string; line: number | null; fragment: string | null; nonce: number } | null
+  >(null);
+  const jumpNonceRef = useRef(0);
   const [litLine, setLitLine] = useState<{ path: string; line: number } | null>(null);
 
   const targetRef = useRef(target);
   const listingsRef = useRef(listings);
   const expandedRef = useRef(expanded);
   const tabsRef = useRef(tabs);
-  const activePathRef = useRef(activePath);
+  /**
+   * Files opened since the tabs last rendered. A reload in the same tick — the
+   * mount's own, which React runs twice under StrictMode — would otherwise read
+   * the tabs from before the open, fence off the read the open started, and
+   * leave the file waiting on an answer it has already thrown away.
+   */
+  const openedSinceRenderRef = useRef(new Set<string>());
   const generationRef = useRef(0);
   const fileRequestRef = useRef(new Map<string, number>());
-  const imageRequestRef = useRef(new Map<string, number>());
+  const mediaRequestRef = useRef(new Map<string, number>());
   const searchRequestRef = useRef(0);
   const loadedTargetRef = useRef<string | null>(null);
   const openRequestRef = useRef<number | null>(null);
@@ -417,7 +447,9 @@ export function FilesPane({
     listingsRef.current = listings;
     expandedRef.current = expanded;
     tabsRef.current = tabs;
-    activePathRef.current = activePath;
+    // Cleared by what the tabs now hold rather than wholesale: StrictMode replays
+    // this effect before the reload it is there for.
+    for (const tab of tabs) openedSinceRenderRef.current.delete(tab.path);
   });
 
   const loadDirectory = useCallback((relativePath: string, generation: number) => {
@@ -469,26 +501,26 @@ export function FilesPane({
   }, []);
 
   /**
-   * Reads a file as bytes so it can be shown as a picture.
+   * Reads a file as bytes: a picture, a PDF, a recording, a font.
    *
    * Fenced the same way as `loadFile`, and for the same reason: a document's
    * images are requested as the document is parsed, so several reads of the same
    * path can be outstanding while the reader clicks through a directory.
    */
-  const loadImage = useCallback((relativePath: string, generation: number) => {
-    const request = (imageRequestRef.current.get(relativePath) ?? 0) + 1;
-    imageRequestRef.current.set(relativePath, request);
-    setImages((current) => (
+  const loadMedia = useCallback((relativePath: string, generation: number) => {
+    const request = (mediaRequestRef.current.get(relativePath) ?? 0) + 1;
+    mediaRequestRef.current.set(relativePath, request);
+    setMedia((current) => (
       current.has(relativePath) ? current : new Map(current).set(relativePath, { status: "loading" })
     ));
-    const settled = (next: ImageState) => {
+    const settled = (next: MediaState) => {
       if (generation !== generationRef.current) return;
-      if (imageRequestRef.current.get(relativePath) !== request) return;
-      setImages((current) => new Map(current).set(relativePath, next));
+      if (mediaRequestRef.current.get(relativePath) !== request) return;
+      setMedia((current) => new Map(current).set(relativePath, next));
     };
-    const mediaType = imageMediaType(relativePath);
+    const mediaType = binaryMediaType(relativePath);
     if (mediaType === null) {
-      settled({ status: "error", message: t("这不是可显示的图片格式", "This is not a displayable image") });
+      settled({ status: "error", message: t("这不是可显示的文件格式", "This is not a displayable file format") });
       return;
     }
     readWorkspaceFileBytes(targetRef.current, relativePath).then((file) => {
@@ -512,7 +544,7 @@ export function FilesPane({
   const reload = useCallback((discardCache: boolean) => {
     const generation = ++generationRef.current;
     const expandedPaths = [...expandedRef.current];
-    const openPaths = tabsRef.current.map((tab) => tab.path);
+    const openPaths = [...new Set([...tabsRef.current.map((tab) => tab.path), ...openedSinceRenderRef.current])];
     setListings((current) => {
       if (discardCache) return new Map<string, DirectoryState>();
       const next = new Map(current);
@@ -522,14 +554,14 @@ export function FilesPane({
       return next;
     });
     if (discardCache) {
-      setViewers(new Map(openPaths.map((path) => [path, { status: "loading" } as ViewerState])));
+      setViewers(new Map(openPaths.filter(needsText).map((path) => [path, { status: "loading" } as ViewerState])));
     }
     // Pictures are re-read from whatever the open files turn out to reference,
     // so the cache is emptied rather than refilled here.
-    setImages(new Map<string, ImageState>());
+    setMedia(new Map<string, MediaState>());
     loadDirectory("", generation);
     for (const path of expandedPaths) loadDirectory(path, generation);
-    for (const path of openPaths) loadFile(path, generation);
+    for (const path of openPaths) if (needsText(path)) loadFile(path, generation);
   }, [loadDirectory, loadFile]);
 
   const refresh = useCallback(() => reload(false), [reload]);
@@ -654,7 +686,8 @@ export function FilesPane({
       return [...current, opened];
     });
     setActivePath(path);
-    if (viewers.get(path)?.status !== "ready") loadFile(path, generationRef.current);
+    openedSinceRenderRef.current.add(path);
+    if (needsText(path) && viewers.get(path)?.status !== "ready") loadFile(path, generationRef.current);
   }, [loadFile, viewers]);
 
   const keepTab = useCallback((path: string) => {
@@ -669,6 +702,7 @@ export function FilesPane({
 
   const closeTabs = useCallback((doomed: (tab: FileTab) => boolean) => {
     setTabs((current) => {
+      for (const tab of current) if (doomed(tab)) openedSinceRenderRef.current.delete(tab.path);
       const next = current.filter((tab) => !doomed(tab));
       if (next.length === current.length) return current;
       setActivePath((currentActive) => {
@@ -791,32 +825,35 @@ export function FilesPane({
   const activeSource = activePath !== null && sourcePaths.has(activePath);
   // Only a file with two readings offers the switch, and only once it is known
   // to have a text form — a PNG's "source" is the binary notice.
-  const canReadSource = (activeKind === "markdown" || activeKind === "image")
+  const canReadSource = activePath !== null
+    && hasSourceForm(activePath)
     && activeViewer?.status === "ready"
     && !activeViewer.binary;
 
   /**
-   * The pictures the open files need: an image tab needs its own bytes, and a
-   * rendered Markdown document needs everything it points at.
+   * The bytes the open files need: a picture, PDF, recording or font tab needs its
+   * own, and a rendered document — Markdown, or a notebook's text cells — needs
+   * every picture it points at.
    *
    * Derived rather than accumulated so the set shrinks when a tab closes; the
    * bytes are held as `data:` URLs, and the host will hand over eight megabytes
    * of one before it refuses.
    */
-  const neededImages = useMemo(() => {
+  const neededMedia = useMemo(() => {
     const needed = new Set<string>();
     for (const tab of tabs) {
       if (sourcePaths.has(tab.path)) continue;
-      const kind = fileViewerKind(tab.path);
-      if (kind === "image") {
+      if (readsBytes(tab.path)) {
         needed.add(tab.path);
         continue;
       }
-      if (kind !== "markdown") continue;
+      const kind = fileViewerKind(tab.path);
+      if (kind !== "markdown" && kind !== "notebook") continue;
       const viewer = viewers.get(tab.path);
       if (viewer?.status !== "ready" || viewer.binary) continue;
-      for (const reference of documentImageReferences(viewer.content)) {
-        const resolved = resolveDocumentReference(tab.path, reference);
+      const markdown = kind === "notebook" ? notebookMarkdown(viewer.content) : viewer.content;
+      for (const reference of documentImageReferences(markdown)) {
+        const resolved = resolveDocumentReference(tab.path, reference.split("#")[0]);
         if (resolved !== null && imageMediaType(resolved) !== null) needed.add(resolved);
       }
     }
@@ -825,46 +862,65 @@ export function FilesPane({
 
   useEffect(() => {
     if (!active) return;
-    for (const path of neededImages) {
-      if (!images.has(path)) loadImage(path, generationRef.current);
+    for (const path of neededMedia) {
+      if (!media.has(path)) loadMedia(path, generationRef.current);
     }
-    if (![...images.keys()].some((path) => !neededImages.has(path))) return;
-    setImages((current) => {
-      const next = new Map([...current].filter(([path]) => neededImages.has(path)));
+    if (![...media.keys()].some((path) => !neededMedia.has(path))) return;
+    setMedia((current) => {
+      const next = new Map([...current].filter(([path]) => neededMedia.has(path)));
       return next.size === current.size ? current : next;
     });
-  }, [active, images, loadImage, neededImages]);
+  }, [active, media, loadMedia, neededMedia]);
+
+  /**
+   * Opens `path` and lands on a place in it once it is on screen.
+   *
+   * A line names a place in the source, so a file that has a rendered form shows
+   * its source for it; a heading names a place in the rendered form, so it stays.
+   */
+  const openAt = useCallback((path: string, line: number | null, fragment: string | null, keep: boolean) => {
+    openFile(path, keep);
+    if (line !== null && hasSourceForm(path) && !readsBytes(path)) {
+      setSourcePaths((current) => (current.has(path) ? current : new Set(current).add(path)));
+    }
+    if (line === null && fragment === null) return;
+    jumpNonceRef.current += 1;
+    setPendingJump({ path, line, fragment, nonce: jumpNonceRef.current });
+  }, [openFile]);
 
   /**
    * Opens what the timeline asked for.
    *
    * The nonce is what makes a second click on the same path ask again, and it is
    * kept in a ref so a request that arrived while the pane was closed is still
-   * honoured on the mount that follows. Opening as a preview tab matches a single
+   * honoured on the mount that follows; the owner is told once it has been, so a
+   * later mount does not replay it. Opening as a preview tab matches a single
    * click in the tree: following a reference is a glance, not a decision.
    */
   useEffect(() => {
     if (!openRequest || openRequestRef.current === openRequest.nonce) return;
     openRequestRef.current = openRequest.nonce;
-    openFile(openRequest.path, false);
-    if (openRequest.line === null) return;
-    // A line number names a place in the source, so the rendered form steps aside.
-    if (fileViewerKind(openRequest.path) === "markdown") {
-      setSourcePaths((current) => new Set(current).add(openRequest.path));
-    }
-    setPendingLine({ path: openRequest.path, line: openRequest.line, nonce: openRequest.nonce });
-  }, [openFile, openRequest]);
+    // A pane opened just to show this file shows the file: the tree folds away
+    // for this visit without changing what the reader chose for the pane itself.
+    if (openRequest.collapseTree) setShowTree(false);
+    openAt(openRequest.path, openRequest.line, null, false);
+    onOpenRequestHandled?.(openRequest.nonce);
+  }, [onOpenRequestHandled, openAt, openRequest]);
 
   // The jump waits for the file it is a place in: the rows do not exist until the
   // read lands, and scrolling before then would settle on the wrong offset.
   useEffect(() => {
-    if (pendingLine === null || activePath !== pendingLine.path) return;
-    if (viewers.get(pendingLine.path)?.status !== "ready") return;
-    const row = viewerRef.current?.querySelector(`[data-line="${pendingLine.line}"]`);
-    row?.scrollIntoView({ block: "center" });
-    setLitLine(row ? { path: pendingLine.path, line: pendingLine.line } : null);
-    setPendingLine(null);
-  }, [activePath, pendingLine, viewers]);
+    if (pendingJump === null || activePath !== pendingJump.path) return;
+    if (needsText(pendingJump.path) && viewers.get(pendingJump.path)?.status !== "ready") return;
+    if (pendingJump.line !== null) {
+      const row = viewerRef.current?.querySelector(`[data-line="${pendingJump.line}"]`);
+      if (row) scrollIntoContainer(row, "center");
+      setLitLine(row ? { path: pendingJump.path, line: pendingJump.line } : null);
+    } else if (pendingJump.fragment !== null) {
+      scrollToFragment(viewerRef.current, pendingJump.fragment);
+    }
+    setPendingJump(null);
+  }, [activePath, pendingJump, viewers]);
 
   useEffect(() => {
     if (litLine === null) return;
@@ -877,16 +933,28 @@ export function FilesPane({
    *
    * Synchronous because it runs while the Markdown renders; anything not read
    * yet answers null and is drawn as its alternative text until the read that
-   * `neededImages` started lands and the document renders again.
+   * `neededMedia` started lands and the document renders again.
    */
   const resolveImageSrc = useCallback((source: string) => {
     if (activePath === null) return source;
     if (/^[a-z][a-z0-9+.-]*:/i.test(source) || source.startsWith("//")) return source;
     const resolved = resolveDocumentReference(activePath, source.split("#")[0]);
     if (resolved === null) return null;
-    const picture = images.get(resolved);
+    const picture = media.get(resolved);
     return picture?.status === "ready" ? picture.source : null;
-  }, [activePath, images]);
+  }, [activePath, media]);
+
+  /**
+   * Whether `path` is a directory as far as the listings already read can tell.
+   * A link written with a trailing slash says so itself.
+   */
+  const isKnownDirectory = useCallback((path: string): boolean => {
+    const parent = parentRelativePath(path) ?? "";
+    const listing = listingsRef.current.get(parent);
+    if (listing?.status !== "ready") return false;
+    const name = basename(path);
+    return listing.entries.some((entry) => entry.name === name && entry.kind === "directory");
+  }, []);
 
   /**
    * Follows a link inside a rendered document.
@@ -895,7 +963,8 @@ export function FilesPane({
    * alternative is the default one: a relative `href` resolves against the app's
    * own origin, and letting it through navigates the whole window away from the
    * app. External addresses are left to the document-level interceptor, which
-   * hands them to the system browser.
+   * hands them to the system browser. A link to a file opens it, at the line or
+   * heading it names; a link to a directory shows it in the tree.
    */
   const onDocumentClick = useCallback((event: MouseEvent<HTMLDivElement>) => {
     if (event.defaultPrevented || event.button !== 0) return;
@@ -905,27 +974,68 @@ export function FilesPane({
     const href = node.getAttribute("href") ?? "";
     if (externalHttpUrl(href) !== null) return;
     event.preventDefault();
-    if (href.startsWith("#")) {
-      scrollToHeading(viewerRef.current, href.slice(1));
+    const target = localLinkTarget(href);
+    if (!target) return;
+    if (!target.path) {
+      if (target.fragment) scrollToFragment(viewerRef.current, target.fragment);
       return;
     }
     if (activePath === null) return;
-    const resolved = resolveDocumentReference(activePath, href.split("#")[0]);
-    if (resolved !== null) openFile(resolved, false);
-  }, [activePath, openFile]);
+    const resolved = resolveDocumentReference(activePath, target.path);
+    if (resolved === null) return;
+    if (target.path.endsWith("/") || isKnownDirectory(resolved)) {
+      revealInTree(resolved);
+      if (!expandedRef.current.has(resolved)) toggleDirectory(resolved);
+      return;
+    }
+    openAt(resolved, target.line, target.fragment, false);
+  }, [activePath, isKnownDirectory, openAt, revealInTree, toggleDirectory]);
+
+  /** What a page in an HTML preview reads from the workspace: its stylesheets and its pictures. */
+  const htmlResources = useMemo<HtmlPreviewResources>(() => ({
+    readText: async (path) => {
+      try {
+        const file = await readWorkspaceFile(targetRef.current, path);
+        return file.binary ? null : file.content;
+      } catch {
+        return null;
+      }
+    },
+    readImage: async (path) => {
+      const mediaType = imageMediaType(path);
+      if (mediaType === null) return null;
+      try {
+        const file = await readWorkspaceFileBytes(targetRef.current, path);
+        return file.tooLarge ? null : `data:${mediaType};base64,${file.data}`;
+      } catch {
+        return null;
+      }
+    }
+  }), []);
+
+  const onOpenFileFromPage = useCallback((path: string, line: number | null) => {
+    openAt(path, line, null, false);
+  }, [openAt]);
+
+  const revealActiveFile = useMemo(() => {
+    if (activePath === null || !workspacePath || !hasBackendRuntime()) return undefined;
+    return () => {
+      void revealPath(activePath, workspacePath).catch(() => undefined);
+    };
+  }, [activePath, workspacePath]);
 
   const setShowTreePreference = useCallback((next: boolean) => {
     setShowTree(next);
     writeStoredFlag(SHOW_TREE_STORAGE_KEY, next);
   }, []);
 
-
-  // With nothing open the tree is the pane; with a file open it keeps its column
-  // only while the two fit side by side.
-  const treeVisible = activePath === null ? true : canFitTree && showTree;
+  // The tree folds away on request; with a file open it also steps aside when
+  // the pane is too narrow for the two to share it.
+  const treeVisible = activePath === null ? showTree : canFitTree && showTree;
   const treeIsColumn = treeVisible && canFitTree && activePath !== null;
   const viewerVisible = activePath !== null;
   const emptyStateVisible = !viewerVisible && (!treeVisible || canFitTree);
+  const treeToggleDisabled = activePath !== null && !canFitTree;
 
   const fileMenuSections = useCallback((path: string, inTab: boolean): PopoverMenuSection[] => {
     const absolute = workspacePath ? `${workspacePath}/${path}` : path;
@@ -1000,64 +1110,63 @@ export function FilesPane({
 
   const paneMenuSections = useMemo<PopoverMenuSection[]>(() => {
     const sections: PopoverMenuSection[] = [];
-    if (activePath !== null) {
-      sections.push({
-        id: "files-tree",
-        items: [
-          {
-            id: "show-tree",
-            label: t("显示文件树", "Show file tree"),
-            checked: treeVisible,
-            checkedRole: "checkbox",
-            disabled: !canFitTree,
-            description: canFitTree ? undefined : t("面板太窄，放不下文件树", "The pane is too narrow for the tree"),
-            onSelect: () => setShowTreePreference(!showTree)
-          }
-        ]
-      });
-    }
+    sections.push({
+      id: "files-tree",
+      items: [
+        {
+          id: "show-tree",
+          label: t("显示文件树", "Show file tree"),
+          checked: treeVisible,
+          checkedRole: "checkbox",
+          disabled: treeToggleDisabled,
+          description: treeToggleDisabled ? t("面板太窄，放不下文件树", "The pane is too narrow for the tree") : undefined,
+          onSelect: () => setShowTreePreference(!showTree)
+        }
+      ]
+    });
     sections.push({
       id: "files-refresh",
       items: [{ id: "refresh", label: t("刷新", "Refresh"), onSelect: refresh }]
     });
     return sections;
   }, [
-    activePath,
-    canFitTree,
     refresh,
     setShowTreePreference,
     showTree,
     t,
+    treeToggleDisabled,
     treeVisible
   ]);
 
   const treeToggleLabel = treeVisible
-    ? t("隐藏文件树", "Hide file tree")
-    : t("显示文件树", "Show file tree");
+    ? t("收起文件目录", "Collapse file tree")
+    : t("展开文件目录", "Expand file tree");
 
+  // The title stays put with the drawer handle right after it, whatever the tab
+  // strip beside them is doing, so folding the tree away is always one reach.
   const header = (
     <div className="files-pane__header">
-      {activePath !== null && (
-        <IconButton
-          className="files-pane__tree-toggle"
-          label={treeToggleLabel}
-          aria-pressed={treeVisible}
-          disabled={!canFitTree}
-          onClick={() => setShowTreePreference(!showTree)}
-        >
-          <PanelLeft size={14} aria-hidden="true" />
-        </IconButton>
-      )}
-      {tabs.length === 0
-        ? <span className="files-pane__pane-title" title={workspacePath ?? rootLabel}>{t("文件", "Files")}</span>
-        : (
+      <span className="files-pane__pane-title" title={workspacePath ?? rootLabel}>{t("文件", "Files")}</span>
+      <IconButton
+        className="files-pane__tree-toggle"
+        label={treeToggleLabel}
+        aria-expanded={treeVisible}
+        disabled={treeToggleDisabled}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => setShowTreePreference(!showTree)}
+      >
+        {treeVisible
+          ? <PanelLeftClose size={14} aria-hidden="true" />
+          : <PanelLeftOpen size={14} aria-hidden="true" />}
+      </IconButton>
+      {tabs.length > 0 && (
           <FileTabStrip
             tabs={tabs}
             activePath={activePath}
             workspacePath={workspacePath}
             onActivate={(path) => {
               setActivePath(path);
-              if (viewers.get(path)?.status !== "ready") loadFile(path, generationRef.current);
+              if (needsText(path) && viewers.get(path)?.status !== "ready") loadFile(path, generationRef.current);
             }}
             onKeep={keepTab}
             onClose={closeTab}
@@ -1266,14 +1375,14 @@ export function FilesPane({
                 className="files-pane__viewer-button"
                 label={t("重新读取文件", "Reload file")}
                 onClick={() => {
-                  loadFile(activePath, generationRef.current);
+                  if (needsText(activePath)) loadFile(activePath, generationRef.current);
                   // The bytes behind a picture are cached separately, and a
                   // reload that left them alone would keep showing the old one.
-                  setImages((current) => {
+                  setMedia((current) => {
                     if (!current.size) return current;
                     const next = new Map(current);
                     next.delete(activePath);
-                    for (const path of neededImages) next.delete(path);
+                    for (const path of neededMedia) next.delete(path);
                     return next;
                   });
                 }}
@@ -1299,7 +1408,7 @@ export function FilesPane({
                 <Copy size={13} aria-hidden="true" />
               </IconButton>
             </div>
-            {activeViewer?.status === "ready" && activeViewer.truncated && (
+            {activeViewer?.status === "ready" && activeViewer.truncated && needsText(activePath) && (
               <p className="files-pane__notice">
                 {t("文件过大，只显示了开头部分", "This file is too large; only its beginning is shown")}
               </p>
@@ -1309,11 +1418,14 @@ export function FilesPane({
               kind={activeKind ?? "text"}
               source={activeSource}
               viewer={activeViewer}
-              picture={images.get(activePath) ?? null}
+              picture={media.get(activePath) ?? null}
               litLine={litLine !== null && litLine.path === activePath ? litLine.line : null}
               pathBaseDir={workspacePath}
               onDocumentClick={onDocumentClick}
               resolveImageSrc={resolveImageSrc}
+              htmlResources={htmlResources}
+              onOpenFile={onOpenFileFromPage}
+              onReveal={revealActiveFile}
             />
           </div>
         )}
@@ -1364,22 +1476,28 @@ interface FileViewerBodyProps {
   /** True while the reader has asked for the source of a file that has another form. */
   source: boolean;
   viewer: ViewerState | null;
-  picture: ImageState | null;
+  /** The file's bytes, for the kinds read that way. */
+  picture: MediaState | null;
   /** The line to light, already narrowed to this file. */
   litLine: number | null;
   /** Workspace root, so a path written inside a document resolves the way it was meant. */
   pathBaseDir: string | null;
   onDocumentClick: (event: MouseEvent<HTMLDivElement>) => void;
   resolveImageSrc: (src: string) => string | null;
+  htmlResources: HtmlPreviewResources;
+  onOpenFile: (path: string, line: number | null) => void;
+  /** Shows the file in the system file manager; absent where there is none to reach. */
+  onReveal?: () => void;
 }
 
 /**
  * What an open file looks like.
  *
- * One file, one reading: a document is rendered, a picture is drawn, and
- * everything else is its own text. The file is read once either way — the text
- * read is what says whether there is anything to show at all — and the kind only
- * decides what is made of it.
+ * One file, one reading: a document is rendered, a picture drawn, a PDF laid out,
+ * a recording played, a font set, a table tabulated — and everything else is its
+ * own text, numbered and coloured. Kinds that are pictures of bytes are read as
+ * bytes; the rest are read as text, which is also what says whether there is
+ * anything to show at all.
  */
 function FileViewerBody({
   path,
@@ -1390,116 +1508,120 @@ function FileViewerBody({
   litLine,
   pathBaseDir,
   onDocumentClick,
-  resolveImageSrc
+  resolveImageSrc,
+  htmlResources,
+  onOpenFile,
+  onReveal
 }: FileViewerBodyProps) {
   const { t } = useI18n();
+  const name = basename(path);
+
+  if (kind === "video") {
+    return (
+      <UnsupportedNotice
+        message={t(
+          "视频无法在应用内播放：界面的安全策略不允许加载媒体。",
+          "Video cannot be played inside the app: the window's security policy allows no media."
+        )}
+        onReveal={onReveal}
+      />
+    );
+  }
+
+  if (readsBytes(path) && !source) {
+    if (picture === null || picture.status === "loading") {
+      return <p className="files-pane__notice">{t("正在读取…", "Loading…")}</p>;
+    }
+    if (picture.status === "tooLarge") {
+      return (
+        <UnsupportedNotice
+          message={t("文件过大（超过 8 MB），无法在面板中预览。", "This file is larger than 8 MB and cannot be previewed in the pane.")}
+          onReveal={onReveal}
+        />
+      );
+    }
+    if (picture.status === "error") {
+      return <p className="files-pane__error" role="alert">{picture.message}</p>;
+    }
+    const bytes = dataUrlByteLength(picture.source);
+    switch (kind) {
+      case "image":
+        return <ImageViewer key={path} source={picture.source} name={name} bytes={bytes} onReveal={onReveal} />;
+      case "pdf":
+        return <PdfViewer key={path} source={picture.source} bytes={bytes} />;
+      case "audio":
+        return <AudioPlayer key={path} source={picture.source} name={name} bytes={bytes} />;
+      case "font":
+        return <FontPreview key={path} source={picture.source} name={name} bytes={bytes} />;
+      default:
+        break;
+    }
+  }
+
   if (viewer === null || viewer.status === "loading") {
     return <p className="files-pane__notice">{t("正在读取…", "Loading…")}</p>;
   }
   if (viewer.status === "error") {
     return <p className="files-pane__error" role="alert">{viewer.message}</p>;
   }
-
-  if (kind === "image" && !source) {
-    if (picture === null || picture.status === "loading") {
-      return <p className="files-pane__notice">{t("正在读取…", "Loading…")}</p>;
-    }
-    if (picture.status === "tooLarge") {
-      return <p className="files-pane__notice">{t("图片过大，无法预览", "This image is too large to preview")}</p>;
-    }
-    if (picture.status === "error") {
-      return <p className="files-pane__error" role="alert">{picture.message}</p>;
-    }
-    return (
-      <div className="files-pane__image">
-        {/* Shown through `<img>` rather than inline, so an SVG from the
-            workspace cannot run scripts or reach anything of its own. */}
-        <img src={picture.source} alt={basename(path)} />
-      </div>
-    );
-  }
-
   if (viewer.binary) {
-    return <p className="files-pane__notice">{t("二进制文件，无法显示", "Binary file cannot be shown")}</p>;
+    return <UnsupportedNotice message={t("二进制文件，无法显示", "Binary file cannot be shown")} onReveal={onReveal} />;
   }
   if (viewer.content === "") {
     return <p className="files-pane__notice">{t("这个文件是空的。", "This file is empty.")}</p>;
   }
 
-  if (kind === "markdown" && !source) {
-    return (
-      <div className="files-pane__document" onClickCapture={onDocumentClick}>
-        <MarkdownContent
-          content={viewer.content}
-          // A path written in a document is written against the checkout, the
-          // way a repository's own prose writes one; a link is written against
-          // the document, and is resolved by the click handler instead.
-          linkifyPaths
-          pathBaseDir={pathBaseDir}
-          resolveImageSrc={resolveImageSrc}
-        />
-      </div>
-    );
+  if (!source) {
+    switch (kind) {
+      case "markdown": {
+        const frontMatter = splitFrontMatter(viewer.content);
+        return (
+          <div className="files-pane__document" onClickCapture={onDocumentClick}>
+            {frontMatter && (
+              <div className="files-pane__front-matter markdown-content">
+                <MarkdownCodeBlock code={frontMatter.source} language={frontMatter.language} label={frontMatter.language} />
+              </div>
+            )}
+            <MarkdownContent
+              content={frontMatter ? frontMatter.body : viewer.content}
+              // A path written in a document is written against the checkout, the
+              // way a repository's own prose writes one; a link is written against
+              // the document, and is resolved by the click handler instead.
+              linkifyPaths
+              documentLinks
+              renderHtml
+              pathBaseDir={pathBaseDir}
+              resolveImageSrc={resolveImageSrc}
+            />
+          </div>
+        );
+      }
+      case "html":
+        return <HtmlPreview key={path} path={path} content={viewer.content} resources={htmlResources} onOpenFile={onOpenFile} />;
+      case "csv":
+        return <CsvTable key={path} path={path} content={viewer.content} />;
+      case "notebook":
+        return (
+          <NotebookView
+            content={viewer.content}
+            pathBaseDir={pathBaseDir}
+            resolveImageSrc={resolveImageSrc}
+            onDocumentClick={onDocumentClick}
+          />
+        );
+      default:
+        break;
+    }
   }
 
-  return <CodeView path={path} content={viewer.content} litLine={litLine} />;
-}
-
-/**
- * A file as its own text, numbered and coloured.
- *
- * Wrapping is not a setting: the reference shell's viewer wraps, full stop, and
- * a pane this narrow has nowhere to put a horizontal scrollbar.
- */
-function CodeView({
-  path,
-  content,
-  litLine
-}: {
-  path: string;
-  content: string;
-  litLine: number | null;
-}) {
-  const lines = useMemo(() => splitLines(content), [content]);
-  const tokens = useMemo(
-    () => (lines.length > MAX_HIGHLIGHTED_LINES
-      ? null
-      : highlightCodeLines(codeLanguage(path), lines)),
-    [lines, path]
-  );
   return (
-    <pre className="files-pane__code" tabIndex={0} aria-label={path}>
-      {lines.map((line, index) => (
-        <span
-          className={`files-pane__line${litLine === index + 1 ? " files-pane__line--lit" : ""}`}
-          key={index}
-          data-line={index + 1}
-        >
-          <span className="files-pane__line-number" aria-hidden="true">{index + 1}</span>
-          <span className="files-pane__line-text">
-            {tokens === null ? line : <CodeLine tokens={tokens[index]} fallback={line} />}
-          </span>
-        </span>
-      ))}
-    </pre>
-  );
-}
-
-/** One line's tokens; plain runs stay text nodes so a line of prose is one node. */
-function CodeLine({ tokens, fallback }: { tokens: readonly CodeToken[]; fallback: string }) {
-  if (!tokens.length) return <>{fallback}</>;
-  return (
-    <>
-      {tokens.map((token, index) => (
-        token.kind === "plain"
-          ? token.value
-          : (
-            <span className={`files-pane__token files-pane__token--${token.kind}`} key={index}>
-              {token.value}
-            </span>
-          )
-      ))}
-    </>
+    <NumberedCode
+      className="files-pane__code"
+      content={viewer.content}
+      language={codeLanguage(path)}
+      label={path}
+      litLine={litLine}
+    />
   );
 }
 

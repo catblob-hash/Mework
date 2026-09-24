@@ -103,7 +103,7 @@ interface PendingDiscard {
  * The review panel lists tracked changes only.
  *
  * `git status` enumerates untracked files and the workspace snapshot carries
- * them for the `git_status` tool, discard and stash; the host filters them out
+ * them for the `git_status` tool and discard; the host filters them out
  * of `get_git_change_page`, and this is the same rule for the inline path that
  * reads `snapshot.files` without asking the host for a page.
  */
@@ -1292,7 +1292,6 @@ export function GitReviewPanel({
     return sections;
     // `setShowDiffFilesPreference` and `refreshSnapshot` are stable enough for this
     // menu; it is rebuilt whenever anything it displays changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     diffCanFitFiles,
     diffCanFitSplit,

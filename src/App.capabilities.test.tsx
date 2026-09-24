@@ -1,10 +1,7 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App, {
-  mergeResourceOrder,
-  reorderDocumentResources
-} from "./App";
+import App from "./App";
 import { createTestDocument as createSeedDocument } from "./test/fixtures";
 import { configureI18n } from "./i18n";
 import type {
@@ -49,46 +46,6 @@ describe("App model run flow — capabilities", () => {
     view.unmount();
 
     expect(browserRendererMountMocks.stopHeartbeat).toHaveBeenCalledTimes(1);
-  });
-
-  it("reorders the capability catalog without touching direct resource references", () => {
-    const document = createSeedDocument();
-    const template = document.capabilities.skills[0];
-    document.capabilities.hooks = ["hook-a", "hook-b", "hook-c"].map((id) => ({
-      ...template,
-      id,
-      name: id
-    }));
-    const conversation = document.workspaces[0].conversations[0];
-    conversation.settings.hookIds = ["hook-a", "hook-c"];
-    document.globalSettings.conversationPresets[0].settings.hookIds = ["hook-b", "hook-a"];
-
-    const reordered = reorderDocumentResources(document, "hooks", "hook-c", "hook-a", "before");
-
-    expect(reordered.capabilities.hooks.map((resource) => resource.id)).toEqual(["hook-c", "hook-a", "hook-b"]);
-    // Catalog order is display-only: conversations and presets retain direct resource IDs.
-    expect(reordered.workspaces[0].conversations[0].settings.hookIds).toEqual(["hook-a", "hook-c"]);
-    expect(reordered.globalSettings.conversationPresets[0].settings.hookIds).toEqual(["hook-b", "hook-a"]);
-  });
-
-  it("keeps a custom resource order when a scan updates entries and adds new ones", () => {
-    const descriptor = (id: string, name: string): ResourceDescriptor => ({
-      id,
-      name,
-      description: "",
-      location: `test://skills/${id}/SKILL.md`,
-      source: "user",
-      available: true
-    });
-    const first = descriptor("skill-a", "技能 A");
-    const second = descriptor("skill-b", "技能 B");
-    const merged = mergeResourceOrder(
-      [second, first],
-      [{ ...first, description: "已更新" }, { ...second, description: "也已更新" }, descriptor("skill-new", "新技能")]
-    );
-
-    expect(merged.map((resource) => resource.id)).toEqual([second.id, first.id, "skill-new"]);
-    expect(merged[1].description).toBe("已更新");
   });
 
   /**
@@ -139,7 +96,6 @@ describe("App model run flow — capabilities", () => {
     runtimeMocks.refreshCapabilities.mockResolvedValue(document.capabilities);
     runtimeMocks.probeMcpServer.mockResolvedValue({
       ok: true,
-      cancelled: false,
       protocolVersion: "2025-06-18",
       serverName: "Workspace Files",
       serverVersion: "1.0.0",
@@ -166,10 +122,7 @@ describe("App model run flow — capabilities", () => {
     const row = within(settings).getByText("Workspace Files").closest(".catalog-row") as HTMLElement;
     await user.click(within(row).getByRole("button", { name: "测试连接 Workspace Files" }));
     // The renderer names a server; the host re-reads its configuration from disk.
-    await waitFor(() => expect(runtimeMocks.probeMcpServer).toHaveBeenCalledWith(
-      "mcp_workspace",
-      expect.stringMatching(/^mcp-probe_/u)
-    ));
+    await waitFor(() => expect(runtimeMocks.probeMcpServer).toHaveBeenCalledWith("mcp_workspace"));
   });
 });
 

@@ -748,6 +748,7 @@ function ReasoningRow({
                 deferOffscreen={callbacks.deferOffscreen}
                 streaming={streaming}
                 linkifyPaths
+                renderHtml
                 pathBaseDir={callbacks.pathBaseDir}
               />
             </div>

@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{
     ContextItem, Conversation, ConversationBranch, ConversationSettings, ConversationWorktree,
-    ImageAttachment, QueuedMessage, RunTarget, UserAbortedTaskRecord,
+    FileAttachment, ImageAttachment, QueuedMessage, RunTarget, UserAbortedTaskRecord,
 };
 use crate::model::AttachedWorkspace;
 
@@ -38,7 +38,7 @@ pub const DATABASE_FILE_NAME: &str = "conversations.v1.sqlite3";
 /// more than the schema delivers. Trusting it is what let a `wire_request` without
 /// `owner` sit behind a current stamp and fail every ledger read and write for the
 /// remaining life of the store.
-pub const STORE_VERSION: i32 = 14;
+pub const STORE_VERSION: i32 = 15;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -396,9 +396,9 @@ impl ContextStatus {
 /// Default gap between ordering keys. Insertions use the midpoint; exhausted precision reindexes the segment.
 const ORDER_STEP: f64 = 1.0;
 
-/// One recorded moment in a conversation's trunk history.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+/// One recorded moment in a conversation's trunk history, as the tests read it back.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimelineEvent {
     pub seq: i64,
     /// `baseline` for the entry a conversation's history starts from, `run` for a
@@ -547,6 +547,9 @@ CREATE TABLE IF NOT EXISTS queued_message (
     order_key       REAL NOT NULL,
     content         TEXT NOT NULL,
     images          TEXT NOT NULL,
+    -- JSON array of FileAttachment, like images. Added in v15; the default is
+    -- what a row written before then, or by an older build, reads as.
+    files           TEXT NOT NULL DEFAULT '[]',
     created_at      TEXT NOT NULL,
     PRIMARY KEY (conversation_id, id)
 ) STRICT;
@@ -599,6 +602,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("wire_request", "messages_removed", "INTEGER"),
     ("wire_request", "owner", "TEXT"),
     ("wire_request_part", "role", "TEXT"),
+    ("queued_message", "files", "TEXT NOT NULL DEFAULT '[]'"),
 ];
 
 /// Process-local connections cached by database path. Storage operations receive only the anchor path,
@@ -1015,7 +1019,7 @@ impl ConversationStore {
         {
             let mut statement = conn
                 .prepare(
-                    "SELECT id, content, images, created_at FROM queued_message
+                    "SELECT id, content, images, files, created_at FROM queued_message
                      WHERE conversation_id = ?1 ORDER BY order_key, id",
                 )
                 .map_err(|error| format!("无法查询排队消息：{error}"))?;
@@ -1026,18 +1030,22 @@ impl ConversationStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(|error| format!("无法查询排队消息：{error}"))?;
             for row in rows {
-                let (id, content, images_json, created_at) =
+                let (id, content, images_json, files_json, created_at) =
                     row.map_err(|error| format!("无法读取排队消息：{error}"))?;
                 let images: Vec<ImageAttachment> = serde_json::from_str(&images_json)
                     .map_err(|error| format!("排队消息附图无法解析：{error}"))?;
+                let files: Vec<FileAttachment> = serde_json::from_str(&files_json)
+                    .map_err(|error| format!("排队消息附件无法解析：{error}"))?;
                 queued_messages.push(QueuedMessage {
                     id,
                     content,
                     images,
+                    files,
                     created_at,
                 });
             }
@@ -1079,25 +1087,6 @@ impl ConversationStore {
             attached_workspaces,
             additional_directories,
         }))
-    }
-
-    /// Returns the last finalized trunk context available as a fork boundary.
-    pub fn last_settled_context_id(&self, conversation_id: &str) -> Result<Option<String>, String> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT id FROM context WHERE conversation_id = ?1 AND branch_id IS NULL
-             AND status = 'settled' ORDER BY order_key DESC, rowid DESC LIMIT 1",
-            [conversation_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| format!("无法读取已定稿上下文边界：{error}"))
-    }
-
-    /// Returns finalized trunk contexts in timeline order, excluding live output.
-    pub fn settled_contexts(&self, conversation_id: &str) -> Result<Vec<ContextItem>, String> {
-        let conn = self.lock()?;
-        read_contexts_with_status(&conn, conversation_id, None, Some(ContextStatus::Settled))
     }
 
     /// Every saved template, newest first, without bodies. The picker only needs
@@ -1177,6 +1166,30 @@ impl ConversationStore {
             // pins nothing; the shape check on write is what keeps that rare.
             if let Ok(context) = serde_json::from_str::<ContextItem>(&data) {
                 crate::image_attachments::collect_context_image_ids(
+                    std::slice::from_ref(&context),
+                    &mut ids,
+                );
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Every file attachment id any stored template body holds, for the same
+    /// reason as [`Self::template_image_ids`]: a template's attachments are
+    /// referenced by nothing in the document.
+    pub fn template_file_ids(&self) -> Result<HashSet<String>, String> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare("SELECT data FROM template_context")
+            .map_err(|error| format!("无法查询模板附件引用：{error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法查询模板附件引用：{error}"))?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            let data = row.map_err(|error| format!("无法读取模板正文：{error}"))?;
+            if let Ok(context) = serde_json::from_str::<ContextItem>(&data) {
+                crate::file_attachments::collect_context_file_ids(
                     std::slice::from_ref(&context),
                     &mut ids,
                 );
@@ -1295,7 +1308,9 @@ impl ConversationStore {
             .map_err(|error| format!("无法提交模板删除事务：{error}"))
     }
 
-    /// Every recorded change to the trunk timeline, oldest first.
+    /// Every recorded change to the trunk timeline, oldest first. Test-only: it
+    /// reads back what the recorder wrote.
+    #[cfg(test)]
     pub fn timeline_events(&self, conversation_id: &str) -> Result<Vec<TimelineEvent>, String> {
         let conn = self.lock()?;
         let mut statement = conn
@@ -1328,7 +1343,8 @@ impl ConversationStore {
     /// The trunk as it stood once `seq` applied, rebuilt by folding the chain from
     /// its baseline. A row whose body no longer parses is dropped rather than
     /// failing the whole snapshot: one unreadable card must not hide the history
-    /// around it.
+    /// around it. Test-only: it reads back what the recorder wrote.
+    #[cfg(test)]
     pub fn timeline_snapshot(
         &self,
         conversation_id: &str,
@@ -1461,9 +1477,8 @@ impl ConversationStore {
     }
 
     /// One recorded request with its envelope and ordered parts. An envelope that
-    /// no longer parses reads as `null` instead of failing the whole request, for
-    /// the same reason [`Self::timeline_snapshot`] drops unreadable rows: the parts
-    /// beside it are still evidence, and one corrupt row must not hide them.
+    /// no longer parses reads as `null` instead of failing the whole request: the
+    /// parts beside it are still evidence, and one corrupt row must not hide them.
     pub fn wire_request(
         &self,
         conversation_id: &str,
@@ -3236,15 +3251,18 @@ fn replace_queued_messages_tx(
     for (index, message) in conversation.queued_messages.iter().enumerate() {
         let images = serde_json::to_string(&message.images)
             .map_err(|error| format!("排队消息附图无法序列化：{error}"))?;
+        let files = serde_json::to_string(&message.files)
+            .map_err(|error| format!("排队消息附件无法序列化：{error}"))?;
         tx.execute(
-            "INSERT INTO queued_message (conversation_id, id, order_key, content, images, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO queued_message (conversation_id, id, order_key, content, images, files, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 conversation.id,
                 message.id,
                 index as f64 * ORDER_STEP,
                 message.content,
                 images,
+                files,
                 message.created_at,
             ],
         )
@@ -3280,30 +3298,16 @@ fn read_contexts(
     conversation_id: &str,
     branch_id: Option<&str>,
 ) -> Result<Vec<ContextItem>, String> {
-    read_contexts_with_status(conn, conversation_id, branch_id, None)
-}
-
-fn read_contexts_with_status(
-    conn: &Connection,
-    conversation_id: &str,
-    branch_id: Option<&str>,
-    status: Option<ContextStatus>,
-) -> Result<Vec<ContextItem>, String> {
     let mut statement = conn
         .prepare(
             "SELECT data FROM context WHERE conversation_id = ?1 AND branch_id IS ?2
-             AND (?3 IS NULL OR status = ?3) ORDER BY order_key, rowid",
+             ORDER BY order_key, rowid",
         )
         .map_err(|error| format!("无法查询上下文：{error}"))?;
     let rows = statement
-        .query_map(
-            rusqlite::params![
-                conversation_id,
-                branch_id,
-                status.map(ContextStatus::as_str)
-            ],
-            |row| row.get::<_, String>(0),
-        )
+        .query_map(rusqlite::params![conversation_id, branch_id], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|error| format!("无法查询上下文：{error}"))?;
     let mut items = Vec::new();
     for row in rows {
@@ -3373,6 +3377,7 @@ mod tests {
             id: id.into(),
             content: content.into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-08-25T00:00:01.000Z".into(),
         }
     }
@@ -3382,6 +3387,7 @@ mod tests {
             id: id.into(),
             content: "hi".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: created_at.into(),
         }
     }
@@ -4616,6 +4622,103 @@ mod tests {
         );
     }
 
+    fn queued_with_files(id: &str) -> QueuedMessage {
+        QueuedMessage {
+            id: id.into(),
+            content: String::new(),
+            images: Vec::new(),
+            files: vec![FileAttachment {
+                id: "a".repeat(64),
+                name: "report.pdf".into(),
+                format: crate::model::FileAttachmentFormat::Pdf,
+                bytes: 2048,
+                tokens: 300,
+                pages: Some(4),
+            }],
+            created_at: "2026-08-25T00:00:04.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn queued_message_files_round_trip() {
+        let (_dir, store) = temp_store();
+        let mut source = conversation("queued_files");
+        source.queued_messages = vec![
+            queued_with_files("queued_1"),
+            QueuedMessage {
+                id: "queued_2".into(),
+                content: "text only".into(),
+                images: Vec::new(),
+                files: Vec::new(),
+                created_at: "2026-08-25T00:00:05.000Z".into(),
+            },
+        ];
+        store.put_conversation("ws", &source).expect("put");
+        let loaded = store
+            .conversation(&source.id)
+            .expect("read")
+            .expect("present");
+        assert_eq!(loaded.queued_messages, source.queued_messages);
+    }
+
+    /// v15 added `queued_message.files`. A v14 store keeps its queue, reads
+    /// each old row as carrying no files, and can store files afterwards.
+    #[test]
+    fn version_fourteen_upgrades_in_place_and_reads_old_queue_rows_without_files() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("released_v14");
+        source.contexts.push(user("history", "保留的历史"));
+        source.queued_messages = vec![QueuedMessage {
+            id: "queued_old".into(),
+            content: "排队中".into(),
+            images: Vec::new(),
+            files: Vec::new(),
+            created_at: "2026-08-25T00:00:04.000Z".into(),
+        }];
+        store.put_conversation("ws", &source).expect("seed");
+        store
+            .lock()
+            .expect("lock")
+            .execute_batch(
+                "ALTER TABLE queued_message DROP COLUMN files; PRAGMA user_version = 14;",
+            )
+            .expect("downgrade to v14");
+        drop(store);
+
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("upgrade");
+        let version: i32 = store
+            .lock()
+            .expect("lock")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, STORE_VERSION, "升级必须写入当前版本号");
+        let loaded = store
+            .conversation(&source.id)
+            .expect("read")
+            .expect("preserved row");
+        assert_eq!(
+            loaded.contexts, source.contexts,
+            "v14 升级必须保留既有对话历史"
+        );
+        assert_eq!(
+            loaded.queued_messages, source.queued_messages,
+            "旧行按无附件读出"
+        );
+
+        source.queued_messages.push(queued_with_files("queued_new"));
+        store
+            .put_conversation("ws", &source)
+            .expect("write files after upgrade");
+        assert_eq!(
+            store
+                .conversation(&source.id)
+                .expect("read")
+                .expect("present")
+                .queued_messages,
+            source.queued_messages
+        );
+    }
+
     /// A store can carry a current stamp and still be missing a column: a build
     /// whose upgrade steps differed, an upgrade that died between two `ALTER`s, a
     /// database edited by hand. The stamp is not evidence of shape, so the open
@@ -5630,59 +5733,6 @@ mod tests {
     }
 
     #[test]
-    fn settled_context_helpers_skip_streaming_and_branch_rows() {
-        let (_dir, store) = temp_store();
-        let mut source = conversation("conv_a");
-        source.branches.push(ConversationBranch {
-            id: "branch".into(),
-            fork_context_id: "ctx_u".into(),
-            active: false,
-            contexts: vec![assistant("branch_a", "branch output", 1)],
-            created_at: source.created_at.clone(),
-            updated_at: source.updated_at.clone(),
-        });
-        store.put_conversation("ws", &source).expect("put");
-        assert_eq!(
-            store
-                .last_settled_context_id("conv_a")
-                .expect("empty trunk"),
-            None
-        );
-        assert!(store
-            .settled_contexts("conv_a")
-            .expect("empty trunk")
-            .is_empty());
-        let settled = vec![user("ctx_u", "hi"), assistant("ctx_a", "done", 1)];
-        store
-            .upsert_contexts("conv_a", &settled, ContextStatus::Settled)
-            .expect("settled");
-        store
-            .upsert_contexts(
-                "conv_a",
-                &[assistant("ctx_live", "partial", 2)],
-                ContextStatus::Streaming,
-            )
-            .expect("streaming");
-        assert_eq!(
-            store.last_settled_context_id("conv_a").expect("boundary"),
-            Some("ctx_a".into())
-        );
-        assert_eq!(
-            store.settled_contexts("conv_a").expect("settled contexts"),
-            settled
-        );
-        assert_eq!(
-            store
-                .conversation("conv_a")
-                .expect("read")
-                .expect("present")
-                .contexts
-                .len(),
-            3
-        );
-    }
-
-    #[test]
     fn activity_buckets_collapse_messages_to_the_utc_hour() {
         let (_dir, store) = temp_store();
         let mut first = conversation("c1");
@@ -5815,6 +5865,7 @@ mod tests {
             id: "queued_1".into(),
             content: "later".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-08-25T00:00:04.000Z".into(),
         }];
         source.user_aborted_tasks = vec![UserAbortedTaskRecord {
@@ -6428,6 +6479,7 @@ mod tests {
             id: "queued_1".into(),
             content: "later".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-08-25T00:00:04.000Z".into(),
         }];
         // The edit also proposes a different timeline; that part must not land.
@@ -6504,6 +6556,7 @@ mod tests {
             id: "queued_1".into(),
             content: "later".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-08-25T00:00:04.000Z".into(),
         }];
         store.put_conversation("ws", &source).expect("put");

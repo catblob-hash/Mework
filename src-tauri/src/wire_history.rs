@@ -31,7 +31,9 @@ use std::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::model::{AppDocument, ContextItem, ImageAttachment, JsonObject, ToolResult};
+use crate::model::{
+    AppDocument, ContextItem, FileAttachment, ImageAttachment, JsonObject, ToolResult,
+};
 
 fn is_memory_tool_name(name: &str) -> bool {
     matches!(
@@ -152,6 +154,7 @@ pub(crate) enum CanonicalHistoryBlock {
     User {
         content: String,
         images: Vec<ImageAttachment>,
+        files: Vec<FileAttachment>,
     },
     Assistant(CanonicalAssistantTurn),
     /// A background task's terminal result the host delivered on the model's
@@ -486,12 +489,16 @@ impl CanonicalFold {
     fn push(&mut self, context: &ContextItem, blocks: &mut Vec<CanonicalHistoryBlock>) {
         match context {
             ContextItem::User {
-                content, images, ..
+                content,
+                images,
+                files,
+                ..
             } => {
                 self.flush(blocks);
                 blocks.push(CanonicalHistoryBlock::User {
                     content: content.clone(),
                     images: images.clone(),
+                    files: files.clone(),
                 });
             }
             ContextItem::Assistant {
@@ -1133,6 +1140,7 @@ mod tests {
             id: id.into(),
             content: content.into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: Utc::now().to_rfc3339(),
         }
     }
@@ -2141,8 +2149,8 @@ mod tests {
         assert_eq!(blocks.len(), 3);
         assert!(matches!(
             &blocks[0],
-            CanonicalHistoryBlock::User { content, images }
-                if content == "Question" && images.is_empty()
+            CanonicalHistoryBlock::User { content, images, files }
+                if content == "Question" && images.is_empty() && files.is_empty()
         ));
         assert!(
             matches!(&blocks[1], CanonicalHistoryBlock::Assistant(turn) if turn.content == "Answer")

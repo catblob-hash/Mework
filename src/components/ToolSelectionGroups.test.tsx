@@ -2,7 +2,12 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import type { DecisionParameterModes, RememberedDecisionForms, ToolDescriptor } from "../types";
+import type {
+  DecisionParameterModes,
+  RememberedDecisionForms,
+  RememberedToolFamilies,
+  ToolDescriptor
+} from "../types";
 import { ToolSelectionGroups } from "./ToolSelectionGroups";
 
 const tools: ToolDescriptor[] = [
@@ -333,28 +338,104 @@ describe("ToolSelectionGroups", () => {
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
   });
 
-  it("gathers the preview tools behind one row that opens their own settings window", async () => {
+  it("gathers the preview tools behind one row whose gear opens their own settings window", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
-    render(<ControlledGroups initialEnabledTools={["read"]} expansionKey="preset-one" onChange={onChange} />);
+    render(<ControlledGroups initialEnabledTools={["read", "preview_click"]} expansionKey="preset-one" onChange={onChange} />);
 
     const web = groupRegion(groupDisclosure("操控"));
     expect(within(web).queryByText("页面快照")).not.toBeInTheDocument();
     expect(within(web).queryByText("点击元素")).not.toBeInTheDocument();
 
-    await user.click(within(web).getByRole("button", { name: "预览工具设置，已启用 0 / 2" }));
+    await user.click(within(web).getByRole("button", { name: "预览工具设置" }));
     const dialog = screen.getByRole("dialog", { name: "预览工具" });
     const categories = within(dialog).getByRole("navigation", { name: "预览工具分类" });
     expect(within(categories).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "开发服务器管理", "查看页面", "操作页面"
     ]);
+    // The family is on, so the window edits live tools and says nothing about parking.
+    expect(within(dialog).queryByRole("note")).not.toBeInTheDocument();
 
-    await user.click(within(categories).getByRole("button", { name: "操作页面" }));
-    await user.click(within(dialog).getByRole("switch", { name: "点击元素已关闭" }));
-    expect(onChange).toHaveBeenLastCalledWith(["read", "preview_click"]);
-    expect(within(dialog).getByRole("switch", { name: "点击元素已启用" })).toBeInTheDocument();
-    expect(within(web).getByRole("button", { name: "预览工具设置，已启用 1 / 2" }))
+    await user.click(within(categories).getByRole("button", { name: "查看页面" }));
+    await user.click(within(dialog).getByRole("switch", { name: "页面快照已关闭" }));
+    expect(onChange).toHaveBeenLastCalledWith(["read", "preview_click", "preview_snapshot"]);
+    expect(within(web).getByRole("button", { name: "预览工具已启用，2 / 2" }).closest(".tool-family-row"))
       .toHaveClass("tool-toggle-row--on");
+  });
+
+  it("switches a family off and back on from its row, keeping the tools it had", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<ControlledGroups initialEnabledTools={["read", "preview_click"]} expansionKey="preset-one" onChange={onChange} />);
+    const web = groupRegion(groupDisclosure("操控"));
+
+    await user.click(within(web).getByRole("button", { name: "预览工具已启用，1 / 2" }));
+    expect(onChange).toHaveBeenLastCalledWith(["read"]);
+    // Off, the row counts what switching it on would bring back.
+    const off = within(web).getByRole("button", { name: "预览工具已关闭，已选 1 / 2" });
+    expect(off).toHaveAttribute("aria-pressed", "false");
+    expect(off.closest(".tool-family-row")).not.toHaveClass("tool-toggle-row--on");
+
+    await user.click(off);
+    expect(onChange).toHaveBeenLastCalledWith(["read", "preview_click"]);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(within(web).getByRole("button", { name: "预览工具已启用，1 / 2" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("asks which tools to use when a family with nothing kept is switched on", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<ControlledGroups initialEnabledTools={["read"]} expansionKey="preset-one" onChange={onChange} />);
+    const web = groupRegion(groupDisclosure("操控"));
+
+    await user.click(within(web).getByRole("button", { name: "预览工具已关闭，已选 0 / 2" }));
+    const dialog = screen.getByRole("dialog", { name: "预览工具" });
+    expect(within(dialog).getByRole("note")).toHaveTextContent("关闭窗口时，这里选中的工具随即启用");
+    await user.click(within(dialog).getByRole("button", { name: "操作页面" }));
+    await user.click(within(dialog).getByRole("switch", { name: "点击元素已关闭" }));
+    // Chosen, not yet switched on: that happens when the window closes.
+    expect(onChange).not.toHaveBeenCalledWith(expect.arrayContaining(["preview_click"]));
+    expect(within(dialog).getByRole("switch", { name: "点击元素已启用" })).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "关闭" }));
+    expect(onChange).toHaveBeenLastCalledWith(["read", "preview_click"]);
+    expect(within(web).getByRole("button", { name: "预览工具已启用，1 / 2" })).toBeInTheDocument();
+  });
+
+  it("leaves a family off when the window its row opened closes with nothing chosen", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<ControlledGroups initialEnabledTools={["read"]} expansionKey="preset-one" onChange={onChange} />);
+    const web = groupRegion(groupDisclosure("操控"));
+
+    await user.click(within(web).getByRole("button", { name: "预览工具已关闭，已选 0 / 2" }));
+    const dialog = screen.getByRole("dialog", { name: "预览工具" });
+    await user.click(within(dialog).getByRole("button", { name: "操作页面" }));
+    await user.click(within(dialog).getByRole("switch", { name: "点击元素已关闭" }));
+    await user.click(within(dialog).getByRole("switch", { name: "点击元素已启用" }));
+    await user.click(within(dialog).getByRole("button", { name: "关闭" }));
+
+    expect(onChange).not.toHaveBeenCalledWith(expect.arrayContaining(["preview_click"]));
+    expect(within(web).getByRole("button", { name: "预览工具已关闭，已选 0 / 2" })).toBeInTheDocument();
+  });
+
+  it("parks what the gear chooses while the family is off, for its row to switch on", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<ControlledGroups initialEnabledTools={["read"]} expansionKey="preset-one" onChange={onChange} />);
+    const web = groupRegion(groupDisclosure("操控"));
+
+    await user.click(within(web).getByRole("button", { name: "预览工具设置" }));
+    const dialog = screen.getByRole("dialog", { name: "预览工具" });
+    expect(within(dialog).getByRole("note")).toHaveTextContent("这里选中的工具会在打开这组工具时启用");
+    await user.click(within(dialog).getByRole("button", { name: "查看页面" }));
+    await user.click(within(dialog).getByRole("switch", { name: "页面快照已关闭" }));
+    await user.click(within(dialog).getByRole("button", { name: "关闭" }));
+
+    // The gear only configures: nothing is on, but the row now has something to bring back.
+    expect(onChange).not.toHaveBeenCalledWith(expect.arrayContaining(["preview_snapshot"]));
+    await user.click(within(web).getByRole("button", { name: "预览工具已关闭，已选 1 / 2" }));
+    expect(onChange).toHaveBeenLastCalledWith(["read", "preview_snapshot"]);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("keeps the preview row in place when some of its tools are spent", () => {
@@ -367,7 +448,7 @@ describe("ToolSelectionGroups", () => {
     );
 
     const web = groupRegion(groupDisclosure("操控"));
-    expect(within(web).getByRole("button", { name: "预览工具设置，已启用 1 / 2" })).toBeInTheDocument();
+    expect(within(web).getByRole("button", { name: "预览工具已启用，1 / 2" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /已生效的工具/ })).not.toBeInTheDocument();
   });
 
@@ -594,7 +675,8 @@ function ModedGroups({
   lockedModes,
   onWrite,
   onScoring,
-  onRemember
+  onRemember,
+  onFamilies
 }: {
   catalog?: ToolDescriptor[];
   initialEnabledTools: string[];
@@ -606,11 +688,13 @@ function ModedGroups({
   onWrite?: (enabledTools: string[], modes?: DecisionParameterModes) => void;
   onScoring?: (scoring: string[]) => void;
   onRemember?: (remembered: RememberedDecisionForms) => void;
+  onFamilies?: (families: RememberedToolFamilies | undefined) => void;
 }) {
   const [enabledTools, setEnabledTools] = useState(initialEnabledTools);
   const [modes, setModes] = useState(initialModes);
   const [scoring, setScoring] = useState(initialScoring);
   const [remembered, setRemembered] = useState(initialRemembered);
+  const [families, setFamilies] = useState<RememberedToolFamilies>({});
   return (
     <ToolSelectionGroups
       tools={catalog}
@@ -621,6 +705,7 @@ function ModedGroups({
       lockedDecisionParameterModes={lockedModes}
       decisionMissScoring={scoring}
       rememberedDecisionForms={remembered}
+      rememberedToolFamilies={families}
       onChange={(next) => {
         onWrite?.(next);
         setEnabledTools(next);
@@ -629,17 +714,19 @@ function ModedGroups({
         onWrite?.(next.enabledTools, next.decisionParameterModes);
         onScoring?.(next.decisionMissScoring);
         onRemember?.(next.rememberedDecisionForms);
+        onFamilies?.(next.rememberedToolFamilies);
         setEnabledTools(next.enabledTools);
         setModes(next.decisionParameterModes);
         setScoring(next.decisionMissScoring);
         setRemembered(next.rememberedDecisionForms);
+        if (next.rememberedToolFamilies) setFamilies(next.rememberedToolFamilies);
       }}
     />
   );
 }
 
 async function openPreviewPage(user: ReturnType<typeof userEvent.setup>, page: string): Promise<HTMLElement> {
-  await user.click(screen.getByRole("button", { name: /^预览工具设置/ }));
+  await user.click(screen.getByRole("button", { name: "预览工具设置" }));
   const dialog = screen.getByRole("dialog", { name: "预览工具" });
   await user.click(within(dialog).getByRole("button", { name: page }));
   return dialog;
@@ -655,7 +742,8 @@ describe("the preview tool settings window", () => {
   it("slides a tool's two decision forms out only while the tool is on, and keeps them exclusive", async () => {
     const user = userEvent.setup();
     const onWrite = vi.fn();
-    render(<ModedGroups initialEnabledTools={[]} onWrite={onWrite} />);
+    // Another preview tool is on, so the family is on and the window edits live tools.
+    render(<ModedGroups initialEnabledTools={["preview_snapshot"]} onWrite={onWrite} />);
     const dialog = await openPreviewPage(user, "操作页面");
 
     expect(formsRegion(dialog, "preview_click")).toHaveClass("collapse-region--closed");
@@ -663,21 +751,21 @@ describe("the preview tool settings window", () => {
     expect(formsRegion(dialog, "preview_click")).not.toHaveClass("collapse-region--closed");
 
     await user.click(within(dialog).getByRole("switch", { name: "点击元素：加上决策模型参数" }));
-    expect(onWrite).toHaveBeenLastCalledWith(["preview_click"], { preview_click: "augment" });
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_click"], { preview_click: "augment" });
 
     // The second form replaces the first rather than joining it.
     await user.click(within(dialog).getByRole("switch", { name: "点击元素：只用决策模型" }));
-    expect(onWrite).toHaveBeenLastCalledWith(["preview_click"], { preview_click: "replace" });
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_click"], { preview_click: "replace" });
     expect(within(dialog).getByRole("switch", { name: "点击元素：加上决策模型参数" }))
       .toHaveAttribute("aria-checked", "false");
 
     // Off takes the live form away and keeps it for the next time the tool comes on.
     await user.click(within(dialog).getByRole("switch", { name: "点击元素已启用" }));
-    expect(onWrite).toHaveBeenLastCalledWith([], {});
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot"], {});
     expect(formsRegion(dialog, "preview_click")).toHaveClass("collapse-region--closed");
 
     await user.click(within(dialog).getByRole("switch", { name: "点击元素已关闭" }));
-    expect(onWrite).toHaveBeenLastCalledWith(["preview_click"], { preview_click: "replace" });
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_click"], { preview_click: "replace" });
     expect(within(dialog).getByRole("switch", { name: "点击元素：只用决策模型" }))
       .toHaveAttribute("aria-checked", "true");
   });
@@ -685,29 +773,29 @@ describe("the preview tool settings window", () => {
   it("reads preview_logs' forms off which of the two log tools are on", async () => {
     const user = userEvent.setup();
     const onWrite = vi.fn();
-    render(<ModedGroups initialEnabledTools={[]} onWrite={onWrite} />);
+    render(<ModedGroups initialEnabledTools={["preview_snapshot"]} onWrite={onWrite} />);
     const dialog = await openPreviewPage(user, "开发服务器管理");
 
     // The variant is a choice under its row, never a row of its own.
     expect(within(dialog).queryByRole("switch", { name: "按描述查找日志已关闭" })).not.toBeInTheDocument();
     await user.click(within(dialog).getByRole("switch", { name: "服务器日志已关闭" }));
-    expect(onWrite).toHaveBeenLastCalledWith(["preview_logs"], {});
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_logs"], {});
 
     await user.click(within(dialog).getByRole("switch", { name: "服务器日志：加上决策模型参数" }));
-    expect(onWrite).toHaveBeenLastCalledWith(["preview_logs", "preview_find_logs"], {});
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_logs", "preview_find_logs"], {});
 
     await user.click(within(dialog).getByRole("switch", { name: "服务器日志：只用决策模型" }));
-    expect(onWrite).toHaveBeenLastCalledWith(["preview_find_logs"], {});
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_find_logs"], {});
     // The row stays on while its variant is.
     expect(within(dialog).getByRole("switch", { name: "服务器日志已启用" })).toBeInTheDocument();
 
     await user.click(within(dialog).getByRole("switch", { name: "服务器日志已启用" }));
-    expect(onWrite).toHaveBeenLastCalledWith([], {});
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot"], {});
 
     // Both log tools are off, so the choice lives in the remembered forms, and
     // switching the row back on reads it from there.
     await user.click(within(dialog).getByRole("switch", { name: "服务器日志已关闭" }));
-    expect(onWrite).toHaveBeenLastCalledWith(["preview_find_logs"], {});
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_find_logs"], {});
     expect(within(dialog).getByRole("switch", { name: "服务器日志：只用决策模型" }))
       .toHaveAttribute("aria-checked", "true");
   });
@@ -744,6 +832,52 @@ describe("the preview tool settings window", () => {
 
     await user.click(within(dialog).getByRole("button", { name: "开发服务器管理" }));
     expect(within(dialog).getByRole("switch", { name: "服务器日志：加上决策模型参数" })).toBeInTheDocument();
+  });
+
+  it("keeps a switched-off family's rows, and their forms, with the owner", async () => {
+    const user = userEvent.setup();
+    const onWrite = vi.fn();
+    const onFamilies = vi.fn();
+    render(
+      <ModedGroups
+        initialEnabledTools={["preview_click", "preview_find_logs"]}
+        initialModes={{ preview_click: "replace" }}
+        onWrite={onWrite}
+        onFamilies={onFamilies}
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "预览工具已启用，2 / 4" }));
+    expect(onWrite).toHaveBeenLastCalledWith([], {});
+    expect(onFamilies).toHaveBeenLastCalledWith({ preview: ["preview_logs", "preview_click"] });
+
+    // The gear on the family while it is off shows the rows it keeps, in their forms.
+    const dialog = await openPreviewPage(user, "操作页面");
+    expect(within(dialog).getByRole("switch", { name: "点击元素：只用决策模型" }))
+      .toHaveAttribute("aria-checked", "true");
+    await user.click(within(dialog).getByRole("button", { name: "关闭" }));
+
+    await user.click(screen.getByRole("button", { name: "预览工具已关闭，已选 2 / 4" }));
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_find_logs", "preview_click"], { preview_click: "replace" });
+    expect(onFamilies).toHaveBeenLastCalledWith({});
+  });
+
+  it("switches off only a family's free tools when some are spent, and brings them back", async () => {
+    const user = userEvent.setup();
+    const onWrite = vi.fn();
+    render(
+      <ModedGroups
+        initialEnabledTools={["preview_snapshot", "preview_click"]}
+        lockedTools={["preview_snapshot"]}
+        onWrite={onWrite}
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "预览工具已启用，2 / 4" }));
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot"], {});
+    // A spent tool keeps the family on; the row's click now brings the rest back.
+    await user.click(screen.getByRole("button", { name: "预览工具已启用，1 / 4" }));
+    expect(onWrite).toHaveBeenLastCalledWith(["preview_snapshot", "preview_click"], {});
   });
 
   it("switches the base tools on in bulk and leaves the variants to the window", async () => {
@@ -939,7 +1073,8 @@ describe("the file and shell tool families", () => {
     // The decision-model tool keeps its own row beside the family's.
     expect(pickRows(files)).toEqual(["files", "find_content"]);
 
-    await user.click(within(files).getByRole("button", { name: "文件工具设置，已启用 0 / 6" }));
+    // Nothing on and nothing kept: the row asks which tools to use.
+    await user.click(within(files).getByRole("button", { name: "文件工具已关闭，已选 0 / 6" }));
     const dialog = screen.getByRole("dialog", { name: "文件工具" });
     const categories = within(dialog).getByRole("navigation", { name: "文件工具分类" });
     expect(within(categories).getAllByRole("button").map((button) => button.textContent))
@@ -948,20 +1083,22 @@ describe("the file and shell tool families", () => {
       .toEqual(["列出文件已关闭", "查找文件已关闭", "搜索内容已关闭", "读取文件已关闭", "写入文件已关闭", "编辑文件已关闭"]);
 
     await user.click(within(dialog).getByRole("switch", { name: "读取文件已关闭" }));
+    expect(onChange).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "关闭" }));
     expect(onChange).toHaveBeenLastCalledWith(["read"]);
-    expect(within(files).getByRole("button", { name: "文件工具设置，已启用 1 / 6" }))
+    expect(within(files).getByRole("button", { name: "文件工具已启用，1 / 6" }).closest(".tool-family-row"))
       .toHaveClass("tool-toggle-row--on");
   });
 
   it("gathers the shells behind one row and slides each one's scored form out under it", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
-    render(<FamilyGroups initialEnabledTools={[]} onChange={onChange} />);
+    render(<FamilyGroups initialEnabledTools={["zsh"]} onChange={onChange} />);
 
     const shells = groupRegion(groupDisclosure("Shell"));
     expect(pickRows(shells)).toEqual(["shell", "find_output"]);
 
-    await user.click(within(shells).getByRole("button", { name: "Shell 工具设置，已启用 0 / 2" }));
+    await user.click(within(shells).getByRole("button", { name: "Shell 工具设置" }));
     const dialog = screen.getByRole("dialog", { name: "Shell 工具" });
     const categories = within(dialog).getByRole("navigation", { name: "Shell 工具分类" });
     expect(within(categories).getAllByRole("button").map((button) => button.textContent))
@@ -971,20 +1108,20 @@ describe("the file and shell tool families", () => {
 
     expect(formsRegion(dialog, "bash")).toHaveClass("collapse-region--closed");
     await user.click(within(dialog).getByRole("switch", { name: "Bash已关闭" }));
-    expect(onChange).toHaveBeenLastCalledWith(["bash"]);
+    expect(onChange).toHaveBeenLastCalledWith(["zsh", "bash"]);
     expect(formsRegion(dialog, "bash")).not.toHaveClass("collapse-region--closed");
 
     await user.click(within(dialog).getByRole("switch", { name: "Bash：加上决策模型参数" }));
-    expect(onChange).toHaveBeenLastCalledWith(["bash", "bash_find_output"]);
+    expect(onChange).toHaveBeenLastCalledWith(["zsh", "bash", "bash_find_output"]);
 
     await user.click(within(dialog).getByRole("switch", { name: "Bash：只用决策模型" }));
-    expect(onChange).toHaveBeenLastCalledWith(["bash_find_output"]);
+    expect(onChange).toHaveBeenLastCalledWith(["zsh", "bash_find_output"]);
     // The row stays on while its scored form is, and counts once.
     expect(within(dialog).getByRole("switch", { name: "Bash已启用" })).toBeInTheDocument();
-    expect(within(shells).getByRole("button", { name: "Shell 工具设置，已启用 1 / 2" })).toBeInTheDocument();
+    expect(within(shells).getByRole("button", { name: "Shell 工具已启用，2 / 2" })).toBeInTheDocument();
 
     await user.click(within(dialog).getByRole("switch", { name: "Bash已启用" }));
-    expect(onChange).toHaveBeenLastCalledWith([]);
+    expect(onChange).toHaveBeenLastCalledWith(["zsh"]);
   });
 
   it("switches the shells on in bulk and leaves their scored forms to the window", async () => {
@@ -1011,7 +1148,7 @@ describe("the file and shell tool families", () => {
         onRemember={onRemember}
       />
     );
-    await user.click(screen.getByRole("button", { name: "Shell 工具设置，已启用 1 / 2" }));
+    await user.click(screen.getByRole("button", { name: "Shell 工具设置" }));
     const dialog = screen.getByRole("dialog", { name: "Shell 工具" });
 
     await user.click(within(dialog).getByRole("switch", { name: "Bash已启用" }));
@@ -1023,12 +1160,32 @@ describe("the file and shell tool families", () => {
     expect(onRemember).toHaveBeenLastCalledWith({});
   });
 
+  it("leads a family's row to the head of its section and each scored form to its own page", async () => {
+    const user = userEvent.setup();
+    render(<FamilyGroups initialEnabledTools={["bash"]} />);
+
+    for (const [family, name] of [["files", "文件工具"], ["shell", "Shell 工具"]] as const) {
+      const link = screen.getByRole("link", { name: `${name}的说明文档` });
+      // A sibling of the row's button, pointing at the family's section rather than a tool page.
+      expect(link.getAttribute("href")).toMatch(new RegExp(`/tools\\.html#${family}$`));
+      expect(link).toHaveAttribute("target", "_blank");
+    }
+
+    await user.click(screen.getByRole("button", { name: "Shell 工具设置" }));
+    const dialog = screen.getByRole("dialog", { name: "Shell 工具" });
+    const forms = formsRegion(dialog, "bash");
+    // Both forms switch the scored tool on, so both lead to its page.
+    const links = within(forms).getAllByRole("link", { name: "Bash（筛选输出）的说明文档" });
+    expect(links).toHaveLength(2);
+    for (const link of links) expect(link.getAttribute("href")).toMatch(/\/tools\/bash_find_output\.html$/);
+  });
+
   it("keeps a spent shell switched on in the window", async () => {
     const user = userEvent.setup();
     render(<FamilyGroups initialEnabledTools={["zsh", "zsh_find_output"]} lockedTools={["zsh"]} />);
 
     expect(screen.queryByRole("button", { name: /已生效的工具/ })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Shell 工具设置，已启用 1 / 2" }));
+    await user.click(screen.getByRole("button", { name: "Shell 工具设置" }));
     const dialog = screen.getByRole("dialog", { name: "Shell 工具" });
     expect(within(dialog).getByRole("switch", { name: "zsh已启用" })).toBeDisabled();
     // Plain zsh calls went out, so dropping plain zsh is refused; keeping both is not.

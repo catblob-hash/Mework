@@ -276,7 +276,7 @@ pub struct SpawnSpec {
     /// Overrides the client's [`Policy::orphan_ttl_secs`] for this session.
     #[serde(default)]
     pub orphan_ttl_secs: Option<u64>,
-    /// Shown by `mework-remote status` on the machine.
+    /// Reported back in [`SessionInfo::label`].
     #[serde(default)]
     pub label: Option<String>,
     /// Runs the process in a sandbox rather than as the account itself.
@@ -392,7 +392,6 @@ pub struct TerminalSize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalKind {
-    Interrupt,
     Terminate,
     Hangup,
     Kill,
@@ -503,12 +502,6 @@ pub struct ExitInfo {
     pub ends: StreamEnds,
 }
 
-impl ExitInfo {
-    pub fn success(&self) -> bool {
-        self.code == Some(0)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitReason {
@@ -530,7 +523,6 @@ pub struct LocalHello {
     /// The secret the daemon wrote to its private state file; proves the
     /// proxy runs as the account that owns the daemon.
     pub token: String,
-    pub proxy_pid: u32,
     /// The environment the proxy's SSH login produced. Processes the daemon
     /// starts for this connection inherit it, so they see what a fresh SSH
     /// command would see now rather than what the daemon saw when it started.

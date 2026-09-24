@@ -17,10 +17,9 @@ import { useI18n } from "../i18n";
 import {
   deriveTaskItems,
   finishedTaskItems,
-  flattenTaskItems,
   runningTaskItems
 } from "../lib/taskContainer";
-import type { TaskContainerMessages, TaskItem, TaskItemState } from "../lib/taskContainer";
+import type { TaskContainerMessages, TaskItem } from "../lib/taskContainer";
 import type { AgentStatus, TodoItemView } from "../lib/orchestration";
 import type { ConversationPlan, ForkDecisionRecord, UserAbortedTaskRecord } from "../types";
 import type { SubagentView } from "../lib/subagents";
@@ -627,5 +626,4 @@ export function TasksPane({
   );
 }
 
-export { flattenTaskItems };
-export type { TaskItem, TaskItemState };
+export type { TaskItem };

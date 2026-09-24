@@ -6,6 +6,7 @@ import type {
   ConversationWebSearchSettings,
   GlobalSettings,
   ResolvedAppLanguage,
+  SandboxSettings,
   ToolDescriptor
 } from "../types";
 import {
@@ -17,7 +18,7 @@ import {
   sameDecisionMissScoring,
   sameDecisionParameterModes
 } from "./decisionParameters";
-import { defaultConversationWebSearchSettings } from "./runtime";
+import { defaultConversationWebSearchSettings, defaultSandboxSettings } from "./runtime";
 import { isHostDerivedToolName } from "./taskTools";
 import { toolLockOf } from "./toolLock";
 
@@ -119,6 +120,25 @@ function copyWebSearchSettings(
   };
 }
 
+/** Deep-copies a sandbox so presets and conversations do not share its lists. */
+function copySandboxSettings(settings: SandboxSettings): SandboxSettings {
+  return {
+    ...settings,
+    network: {
+      ...settings.network,
+      allow: [...settings.network.allow],
+      deny: [...settings.network.deny]
+    },
+    writable: [...settings.writable],
+    denyRead: [...settings.denyRead]
+  };
+}
+
+/** A body's sandbox as a field, left out when the body states none — which reads as off. */
+function sandboxField(settings: SandboxSettings | undefined): { sandbox?: SandboxSettings } {
+  return settings ? { sandbox: copySandboxSettings(settings) } : {};
+}
+
 /** Captures the reusable preset subset of current conversation settings. Resource
  * IDs are copied directly and may be dangling. */
 export function captureConversationPresetSettings(
@@ -150,7 +170,8 @@ export function captureConversationPresetSettings(
       normalizeDecisionMissScoring(settings.decisionMissScoring),
       decisionParameterModes,
       settings.enabledTools
-    )
+    ),
+    ...sandboxField(settings.sandbox)
   };
 }
 
@@ -206,7 +227,10 @@ export function sameConversationPresetSettings(
     && sameDecisionMissScoring(
       decisionMissScoringFor(a.decisionMissScoring, a.decisionParameterModes, a.enabledTools),
       decisionMissScoringFor(b.decisionMissScoring, b.decisionParameterModes, b.enabledTools)
-    );
+    )
+    /* An unstated sandbox is the default one, so leaving it out and writing it
+       out in full say the same thing. */
+    && equalValues(a.sandbox ?? defaultSandboxSettings(), b.sandbox ?? defaultSandboxSettings());
 }
 
 export function defaultConversationPreset(
@@ -266,11 +290,13 @@ export function cloneConversationSettings(
     skillToolEnabled: snapshot.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true,
     decisionParameterModes: normalizeDecisionParameterModes(snapshot.decisionParameterModes),
-    decisionMissScoring: normalizeDecisionMissScoring(snapshot.decisionMissScoring)
+    decisionMissScoring: normalizeDecisionMissScoring(snapshot.decisionMissScoring),
+    ...sandboxField(snapshot.sandbox)
     // `toolLock` is deliberately absent: the new conversation has run nothing
     // yet, so it has exposed nothing and every setting is still free to move.
-    // `rememberedDecisionForms` is absent too: the choices a conversation kept
-    // for the tools it switched off belong to that conversation.
+    // `rememberedDecisionForms` and `rememberedToolFamilies` are absent too:
+    // the choices a conversation kept for the tools it switched off belong to
+    // that conversation.
   };
 }
 
@@ -336,6 +362,10 @@ export function applyConversationPresetSettings(
        transcript, not a preference a preset may restate. */
     mcpToolDiscoveryEnabled: lock.mcpIds.length
       ? lock.mcpToolDiscovery
-      : preset.mcpToolDiscoveryEnabled === true || lock.mcpToolDiscovery
+      : preset.mcpToolDiscoveryEnabled === true || lock.mcpToolDiscovery,
+    /* No lock reaches the sandbox: it confines what later commands can do and
+       puts nothing in front of the model, so the preset's answer applies as it
+       is — including none, which is off. */
+    sandbox: preset.sandbox ? copySandboxSettings(preset.sandbox) : undefined
   };
 }

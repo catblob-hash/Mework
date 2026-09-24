@@ -1,4 +1,4 @@
-import { ChevronRight, Trash2, X } from "lucide-react";
+import { Trash2, X } from "lucide-react";
 import type { PropsWithChildren, ReactNode } from "react";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -152,7 +152,8 @@ export function Dialog({
   onClose,
   width = "560px",
   dismissible = true,
-  bodyClassName
+  bodyClassName,
+  className
 }: PropsWithChildren<{
   title: string;
   /**
@@ -171,6 +172,8 @@ export function Dialog({
   dismissible?: boolean;
   /** Added to the scrolling body, for content that brings its own padding and dividers. */
   bodyClassName?: string;
+  /** Added to the panel, for a window that needs a size of its own rather than its content's. */
+  className?: string;
 }>) {
   const { t } = useI18n();
   const titleId = useId();
@@ -242,7 +245,7 @@ export function Dialog({
     >
       <div
         ref={panelRef}
-        className="dialog"
+        className={`dialog${className ? ` ${className}` : ""}`}
         style={{ maxWidth: width }}
         role="dialog"
         aria-modal="true"
@@ -271,13 +274,12 @@ export function Dialog({
   );
 }
 
-export function EmptyState({ icon, title, description, action }: { icon: ReactNode; title: string; description: string; action?: ReactNode }) {
+export function EmptyState({ icon, title, description }: { icon: ReactNode; title: string; description: string }) {
   return (
     <div className="empty-state">
       <div className="empty-state__icon">{icon}</div>
       <h3>{title}</h3>
       <p>{description}</p>
-      {action}
     </div>
   );
 }
@@ -297,93 +299,5 @@ export function Field({ label, hint, hintIsError = false, children }: PropsWithC
         <span className={hintIsError ? "field__hint field__hint--error" : "field__hint"}>{hint}</span>
       )}
     </label>
-  );
-}
-
-export function CheckRow({
-  checked,
-  onChange,
-  title,
-  description,
-  badge,
-  inputAriaLabel,
-  disabled = false
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  title: string;
-  description?: string;
-  badge?: string;
-  inputAriaLabel?: string;
-  disabled?: boolean;
-}) {
-  return (
-    <label className={`check-row${disabled ? " check-row--disabled" : ""}`}>
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled}
-        aria-label={inputAriaLabel}
-        onChange={(event) => onChange(event.target.checked)}
-      />
-      <span className="check-row__box" aria-hidden="true" />
-      <span className="check-row__copy">
-        <span>
-          {title}
-          {badge && <em>{badge}</em>}
-        </span>
-        {description && <small>{description}</small>}
-      </span>
-    </label>
-  );
-}
-
-/** A collapsible section whose title row is its only heading. It starts closed
- * to keep a new conversation sidebar compact. */
-export function CollapsibleSection({
-  title,
-  summary,
-  icon,
-  actions,
-  defaultOpen = false,
-  children
-}: PropsWithChildren<{
-  title: string;
-  summary?: ReactNode;
-  icon?: ReactNode;
-  /** Persistent controls such as bulk actions. Rendered only while expanded. */
-  actions?: ReactNode;
-  defaultOpen?: boolean;
-}>) {
-  const [open, setOpen] = useState(defaultOpen);
-  const regionId = useId();
-  return (
-    <section className={`collapsible-section${open ? " collapsible-section--open" : ""}`}>
-      <div className="collapsible-section__heading">
-        <button
-          type="button"
-          className="collapsible-section__toggle"
-          aria-expanded={open}
-          aria-controls={regionId}
-          onClick={() => setOpen((current) => !current)}
-        >
-          <ChevronRight className={`disclosure-chevron${open ? " disclosure-chevron--open" : ""}`} size={14} />
-          {icon}
-          <strong>{title}</strong>
-          {summary !== undefined && <small>{summary}</small>}
-        </button>
-        {open && actions}
-      </div>
-      <div
-        id={regionId}
-        className={`collapse-region ${open ? "" : "collapse-region--closed"}`}
-        aria-hidden={!open || undefined}
-        inert={!open || undefined}
-      >
-        <div className="collapse-region__inner">
-          <div className="collapsible-section__body">{children}</div>
-        </div>
-      </div>
-    </section>
   );
 }

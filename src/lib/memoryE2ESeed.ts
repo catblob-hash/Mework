@@ -55,7 +55,7 @@ export function validateMemoryE2ESeedConfig(
   return { runId: config.runId, protocolBaseUrl: canonical };
 }
 
-export function memoryE2EProviderId(protocol: ProviderFamily, runId: string): string {
+function memoryE2EProviderId(protocol: ProviderFamily, runId: string): string {
   return `memory-e2e-${protocol}-${runId}`;
 }
 

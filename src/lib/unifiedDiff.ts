@@ -451,14 +451,3 @@ export function parseUnifiedDiff(patch: string, options?: ParseUnifiedDiffOption
   }
   return files;
 }
-
-/** Total added and removed lines across every file. */
-export function diffTotals(files: readonly DiffFile[]): { additions: number; deletions: number } {
-  return files.reduce(
-    (sum, file) => ({
-      additions: sum.additions + file.additions,
-      deletions: sum.deletions + file.deletions
-    }),
-    { additions: 0, deletions: 0 }
-  );
-}

@@ -43,8 +43,6 @@ export interface PaneToolbarMenuItem {
 export interface PaneToolbarProps {
   buttons: PaneToolbarButton[];
   menuItems: PaneToolbarMenuItem[];
-  /** Accessible name of the overflow menu itself. Defaults to "视图 / Views". */
-  menuLabel?: string;
 }
 
 /**
@@ -54,7 +52,7 @@ export interface PaneToolbarProps {
  * spelled out — an open pane is already visible on screen, a command still running behind a
  * closed one is not.
  */
-export function PaneToolbar({ buttons, menuItems, menuLabel }: PaneToolbarProps) {
+export function PaneToolbar({ buttons, menuItems }: PaneToolbarProps) {
   const { t } = useI18n();
   // A trigger that can only ever open a menu of dead rows is itself dead.
   const menuUnavailable = menuItems.every((item) => item.disabled === true);
@@ -107,7 +105,7 @@ export function PaneToolbar({ buttons, menuItems, menuLabel }: PaneToolbarProps)
         triggerClassName="icon-button pane-toolbar__button"
         trigger={<EllipsisVertical size={18} aria-hidden="true" />}
         triggerLabel={t("更多选项", "More options")}
-        menuLabel={menuLabel ?? t("视图", "Views")}
+        menuLabel={t("视图", "Views")}
         align="end"
         dense
         disabled={menuUnavailable}

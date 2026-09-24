@@ -24,7 +24,6 @@ struct AppExitCoordinatorInner {
 }
 
 impl AppExitCoordinator {
-    #[cfg_attr(not(feature = "browser-dev"), allow(dead_code))]
     pub fn try_begin_draining(&self) -> bool {
         self.inner
             .phase
@@ -37,7 +36,6 @@ impl AppExitCoordinator {
             .is_ok()
     }
 
-    #[cfg_attr(not(feature = "browser-dev"), allow(dead_code))]
     pub fn abort_draining(&self) -> bool {
         self.inner
             .phase
@@ -50,12 +48,10 @@ impl AppExitCoordinator {
             .is_ok()
     }
 
-    #[cfg_attr(not(feature = "browser-dev"), allow(dead_code))]
     pub fn mark_ready(&self) {
         self.inner.phase.store(EXIT_READY, Ordering::Release);
     }
 
-    #[cfg_attr(not(feature = "browser-dev"), allow(dead_code))]
     pub fn is_ready(&self) -> bool {
         self.inner.phase.load(Ordering::Acquire) == EXIT_READY
     }

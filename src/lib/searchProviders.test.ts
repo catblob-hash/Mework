@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import providerSource from "../../src-tauri/src/model.rs?raw";
 import {
-  capabilityNeedsApiHost,
   isKnownSearchProvider,
   SEARCH_PROVIDERS,
   searchProviderCapability,
@@ -48,7 +47,7 @@ describe("search provider catalog", () => {
       expect(provider.search ?? provider.fetch).not.toBeNull();
     }
     const hostless = SEARCH_PROVIDERS.filter((provider) =>
-      [provider.search, provider.fetch].some((spec) => spec && !capabilityNeedsApiHost(spec))
+      [provider.search, provider.fetch].some((spec) => spec && spec.defaultApiHost.length === 0)
     ).map((provider) => provider.kind);
     // Only fetch runs locally and has no third-party endpoint.
     expect(hostless).toEqual(["fetch"]);

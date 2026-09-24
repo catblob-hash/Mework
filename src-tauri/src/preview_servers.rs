@@ -1322,7 +1322,9 @@ fn run_system_tool(name: &str, args: &[&str], timeout: Duration) -> Option<Strin
 // Readiness
 // ---------------------------------------------------------------------------
 
-/// Waits for the server to answer, up to `timeout`.
+/// Waits for the server to answer, up to `timeout`, abandoned early when `keep_going`
+/// says the server it was started for no longer exists. Without it a stopped server
+/// leaves a thread probing a dead port for the rest of the minute.
 ///
 /// Two stages, because they fail differently: a refused TCP connection means the
 /// process has not bound yet, while a bound-but-silent port means the framework is
@@ -1330,13 +1332,6 @@ fn run_system_tool(name: &str, args: &[&str], timeout: Duration) -> Option<Strin
 ///
 /// Builds its own blocking HTTP client and must therefore run on a plain thread, not
 /// inside the async runtime.
-pub fn wait_until_ready(port: u16, timeout: Duration, https: bool) -> bool {
-    wait_until_ready_while(port, timeout, https, &|| true)
-}
-
-/// The readiness poll, abandoned early when `keep_going` says the server it was
-/// started for no longer exists. Without it a stopped server leaves a thread probing
-/// a dead port for the rest of the minute.
 fn wait_until_ready_while(
     port: u16,
     timeout: Duration,
@@ -1644,8 +1639,8 @@ impl PreviewServerRegistry {
         }
     }
 
-    /// Every server, across worktrees. Ports are machine-global, so the port-conflict
-    /// check has to see all of them.
+    /// Every server, across worktrees, for tests.
+    #[cfg(test)]
     pub fn servers(&self) -> Vec<PreviewServerSnapshot> {
         let registry = self.lock();
         let mut servers = Vec::new();
@@ -2377,16 +2372,6 @@ impl PreviewServerRegistry {
         kill_server_process(&process);
         self.emit_stopped(&[server_id.to_owned()]);
         true
-    }
-
-    /// Stops everything registered under one worktree. Returns how many were stopped.
-    pub fn stop_for_worktree(&self, worktree: &Path) -> usize {
-        let ids: Vec<String> = self
-            .servers_for_worktree(worktree)
-            .into_iter()
-            .map(|server| server.server_id)
-            .collect();
-        ids.iter().filter(|id| self.stop(id)).count()
     }
 
     /// Kills every server. Safe to call from the app-exit hook: synchronous, and the

@@ -140,7 +140,7 @@ describe("seed document", () => {
   });
 
   it("ships the two shipped presets and no other user-managed preset domain", () => {
-    const document = createSeedDocument();
+    const document = createSeedDocument("MacIntel");
     const settings = document.globalSettings;
     const [codex, claudeCode] = settings.conversationPresets;
     expect([codex.name, claudeCode.name]).toEqual(["Codex", "Claude Code"]);
@@ -157,20 +157,22 @@ describe("seed document", () => {
       expect(preset.settings.allowRolelessSubagents).toBe(false);
       // Everything on except the names the host derives for itself. The two web
       // tools among them: they follow `webSearchEnabled`, and the plan tools
-      // follow the security level, not a tool toggle. The preview tools and
-      // `workflow` are withheld separately — nothing re-derives those, so the
-      // seed is the only place that choice lives. The decision-model tools are
-      // withheld too: none works until the TypeSafe key is configured.
+      // follow the security level, not a tool toggle. The decision-model tools
+      // are withheld: none works until the TypeSafe key is configured. Of the
+      // shells, only this machine's most preferred one.
       expect(preset.settings.enabledTools).toEqual(
         document.tools.map((tool) => tool.name).filter((name) => !(
           document.tools.find((tool) => tool.name === name)!.category === "memory"
           || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
           || ["plan", "exit_plan_mode"].includes(name)
-          || name.startsWith("preview_")
           || isDecisionToolName(name)
-          || name === "workflow"
+          || ["bash", "sh", "powershell"].includes(name)
         ))
       );
+      expect(preset.settings.enabledTools).toEqual(expect.arrayContaining(["zsh", "preview_start", "workflow"]));
+      // The memory tools are switched rather than listed, and both switches are on.
+      expect(preset.settings.globalMemoryEnabled).toBe(true);
+      expect(preset.settings.projectMemoryEnabled).toBe(true);
       // These presets mirror CLIs that search the web, so web access is on even
       // though the two web tool names are host-derived from this switch.
       expect(preset.settings.webSearchEnabled).toBe(true);
@@ -314,6 +316,16 @@ describe("seed document", () => {
     expect(implicit.globalMemoryEnabled).toBe(false);
     expect(implicit.projectMemoryEnabled).toBe(false);
     expect(implicit.enabledTools.some((name) => memoryToolNames.has(name))).toBe(false);
+  });
+
+  it("turns on the platform's most preferred shell in the shipped presets", () => {
+    const shellsOn = (platform: string) => createSeedDocument(platform).globalSettings.conversationPresets
+      .map((preset) => preset.settings.enabledTools.filter((name) => ["bash", "zsh", "sh", "powershell"].includes(name)));
+    expect(shellsOn("Win32")).toEqual([["powershell"], ["powershell"]]);
+    expect(shellsOn("MacIntel")).toEqual([["zsh"], ["zsh"]]);
+    expect(shellsOn("Linux x86_64")).toEqual([["bash"], ["bash"]]);
+    // A platform the table does not know gets the first shell in tool order.
+    expect(shellsOn("")).toEqual([["bash"], ["bash"]]);
   });
 
   it("gives a fresh conversation every backend's shell tool, and no scoring variant", () => {

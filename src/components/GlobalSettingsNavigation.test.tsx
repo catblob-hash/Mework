@@ -20,8 +20,6 @@ describe("GlobalSettingsNavigation", () => {
       "Appearance",
       "Keyboard shortcuts",
       "Usage statistics",
-      "Shell priority",
-      "Sandbox",
       "Dependencies",
       "Updates"
     ]);
@@ -62,8 +60,6 @@ describe("GlobalSettingsNavigation", () => {
       "外观",
       "快捷键",
       "用量统计",
-      "Shell 优先级",
-      "沙箱",
       "环境依赖",
       "版本更新"
     ]);

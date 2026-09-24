@@ -13,3 +13,4 @@ The conversation's first call runs your rc file into a snapshot every later shel
 - [powershell](powershell.html), [task_wait](task_wait.html), [task_list](task_list.html)
 - [Working with Mework](../working.html#tools-and-approvals)
 - [Hooks](../hooks.html)
+- [bash_find_output](bash_find_output.html), [find_output](find_output.html) — only the parts of a command's output that match a description

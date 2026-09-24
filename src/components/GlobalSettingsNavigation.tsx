@@ -6,8 +6,6 @@ import {
   Palette,
   Scale,
   Search,
-  ShieldCheck,
-  SquareTerminal,
   Terminal
 } from "lucide-react";
 import { Fragment } from "react";
@@ -24,7 +22,7 @@ import type { SettingsView } from "../types";
  */
 type NavigationGroupId = "providers" | "preferences" | "efficiency" | "system";
 
-export const globalSettingsNavigationGroups: Array<{
+const globalSettingsNavigationGroups: Array<{
   id: NavigationGroupId;
   items: Array<{ id: SettingsView; icon: typeof Palette }>;
 }> = [
@@ -52,27 +50,18 @@ export const globalSettingsNavigationGroups: Array<{
   {
     id: "system",
     items: [
-      { id: "shells", icon: SquareTerminal },
-      { id: "sandbox", icon: ShieldCheck },
       { id: "dependencies", icon: Terminal },
       { id: "updates", icon: Download }
     ]
   }
 ];
 
-/** Flat order for callers that enumerate items or navigate to the next or previous item. */
-export const globalSettingsNavigationItems = globalSettingsNavigationGroups.flatMap(
-  (group) => group.items
-);
-
 export function GlobalSettingsNavigation({
   view,
-  onSelect,
-  className = "settings-nav"
+  onSelect
 }: {
   view: SettingsView;
   onSelect: (view: SettingsView) => void;
-  className?: string;
 }) {
   const { t } = useI18n();
   const labels: Partial<Record<SettingsView, string>> = {
@@ -82,8 +71,6 @@ export function GlobalSettingsNavigation({
     decision_providers: t("决策模型提供商", "Decision model providers"),
     shortcuts: t("快捷键", "Keyboard shortcuts"),
     usage: t("用量统计", "Usage statistics"),
-    shells: t("Shell 优先级", "Shell priority"),
-    sandbox: t("沙箱", "Sandbox"),
     dependencies: t("环境依赖", "Dependencies"),
     updates: t("版本更新", "Updates")
   };
@@ -94,7 +81,7 @@ export function GlobalSettingsNavigation({
     system: t("系统", "System")
   };
   return (
-    <nav className={className} aria-label={t("全局设置分类", "Global settings categories")}>
+    <nav className="settings-nav" aria-label={t("全局设置分类", "Global settings categories")}>
       {globalSettingsNavigationGroups.map((group) => (
         <Fragment key={group.id}>
           {groupTitles[group.id] && (

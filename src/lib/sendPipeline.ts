@@ -56,6 +56,11 @@ import {
   type ModelRunState,
   type ModelStreamEffect
 } from "./modelStream";
+import {
+  intakeAttachments,
+  mergeFileAttachments,
+  type AttachmentRejection
+} from "./fileAttachments";
 import type { ComposerController } from "./composerController";
 import type { DocumentStore } from "./documentStore";
 import type { ModelRunController } from "./modelRunController";
@@ -66,6 +71,7 @@ import type {
   Conversation,
   ConversationSettings,
   ConversationToolLock,
+  FileAttachment,
   ImageAttachment,
   ModelRunRequest,
   ModelStreamEvent,
@@ -266,18 +272,23 @@ export interface SendPipeline {
    * persisted contexts anchored at that message. `false` means configuration or an
    * existing run blocked it; the child then simply waits for the user. */
   startForkedConversationRun(workspaceId: string, conversationId: string): Promise<boolean>;
-  queueComposerMessage(
-    workspaceId: string,
-    conversationId: string,
-    content: string,
-    images: ImageAttachment[],
-    clearComposer?: boolean
-  ): void;
   deleteQueuedMessage(workspaceId: string, conversationId: string, messageId: string): void;
   steerQueuedMessage(conversationId: string, message: QueuedMessage): Promise<void>;
   addComposerImages(conversationId: string, files: File[]): Promise<ImageAttachment[]>;
+  /**
+   * Attaches whatever the user picked, pasted or dropped: images join the image
+   * drafts, PDFs and text files the file drafts, and anything left out is
+   * reported on the composer. `preRejected` carries what a drop turned away
+   * before reading (a folder).
+   */
+  addComposerAttachments(
+    conversationId: string,
+    files: File[],
+    preRejected?: readonly AttachmentRejection[]
+  ): Promise<void>;
   /** Drops a draft image, and any `[Image #N]` the user typed for it, together. */
   removeComposerImage(conversationId: string, imageId: string): void;
+  removeComposerFile(conversationId: string, fileId: string): void;
   dispatchNextQueuedMessage(workspaceId: string, conversationId: string): Promise<void>;
   retryFailedQueuedPromotion(workspaceId: string, conversationId: string, messageId: string): void;
 }
@@ -806,11 +817,12 @@ export function createSendPipeline(
     conversationId: string,
     content: string,
     images: ImageAttachment[],
+    files: FileAttachment[],
     clearComposer = true
   ) => {
     const latest = documentStore.current();
     const located = findConversation(latest, workspaceId, conversationId);
-    if (!latest || !located.conversation || (!content.trim() && !images.length)) return;
+    if (!latest || !located.conversation || (!content.trim() && !images.length && !files.length)) return;
     if (Array.from(content.trim()).length > 100_000) return;
     if (located.conversation.queuedMessages.length >= 100) return;
     // Queued numbers must be unique against the transcript *and* the queue
@@ -828,6 +840,7 @@ export function createSendPipeline(
       id: createId("queued"),
       content: queueReady.content,
       images: queueReady.images.length ? queueReady.images : undefined,
+      files: files.length ? files : undefined,
       createdAt: new Date().toISOString()
     };
     const next: AppDocument = {
@@ -854,6 +867,7 @@ export function createSendPipeline(
       composerController.updateDrafts((current) => ({ ...current, [conversationId]: "" }));
       composerController.updateImageDrafts((current) => ({ ...current, [conversationId]: [] }));
       composerController.updateElementPicks((current) => ({ ...current, [conversationId]: [] }));
+      clearComposerFiles(conversationId);
     }
   };
 
@@ -933,6 +947,7 @@ export function createSendPipeline(
               kind: "user" as const,
               content: queued.content,
               images: queued.images,
+              files: queued.files,
               createdAt: queued.createdAt
             }]
           : []
@@ -942,6 +957,7 @@ export function createSendPipeline(
         kind: "user",
         content: currentMessage.content,
         images: currentMessage.images,
+        files: currentMessage.files,
         createdAt: currentMessage.createdAt
       };
       const requestContexts = mergeUniqueContexts(
@@ -966,102 +982,174 @@ export function createSendPipeline(
     }
   };
 
+  /**
+   * Whether uploads queued for a conversation's composer may still land. A draft
+   * that materialized mid-upload has handed its attachments on already, so an
+   * upload still addressed to it is as stale as one for a deleted conversation.
+   */
+  const uploadTargetCheck = (conversationId: string, uploadStillCurrent: () => boolean) => () => (
+    uploadStillCurrent()
+    && (isDraftConversationId(conversationId)
+      ? host().draftIsOpen()
+      : Boolean(documentStore.current()?.workspaces.some((workspace) => (
+        workspace.conversations.some((conversation) => conversation.id === conversationId)
+      ))))
+  );
+
   const addComposerImages = (conversationId: string, files: File[]): Promise<ImageAttachment[]> => {
     if (!files.length) return Promise.resolve([]);
+    return composerController.enqueueImageUpload(conversationId, (uploadStillCurrent) => (
+      addComposerImagesNow(conversationId, files, uploadTargetCheck(conversationId, uploadStillCurrent))
+    ));
+  };
+
+  /** The image half of an upload batch, run inside the conversation's upload queue. */
+  const addComposerImagesNow = async (
+    conversationId: string,
+    files: File[],
+    uploadTargetIsCurrent: () => boolean
+  ): Promise<ImageAttachment[]> => {
+    if (!uploadTargetIsCurrent()) return [];
+    const latest = documentStore.current();
+    const choice = latest ? modelChoiceForConversation(latest) : undefined;
+    const provider = choice?.provider;
+    const model = choice?.model;
+    if (!provider?.enabled || !model || !model.id.trim()) return [];
+    if (!supportsVision(model)) return [];
+    const existingImages = composerController.current().imageDrafts[conversationId] ?? [];
+    let selectedBytes = existingImages.reduce((total, image) => total + image.bytes, 0);
+    const acceptedFiles: File[] = [];
+    for (const file of files) {
+      if (
+        file.size <= 0
+        || file.size > MAX_IMAGE_ATTACHMENT_BYTES
+        || existingImages.length + acceptedFiles.length >= MAX_COMPOSER_IMAGES
+        || selectedBytes + file.size > MAX_COMPOSER_IMAGE_BYTES
+      ) {
+        continue;
+      }
+      acceptedFiles.push(file);
+      selectedBytes += file.size;
+    }
+    if (!acceptedFiles.length) return [];
+    const results = await Promise.allSettled(acceptedFiles.map(async (file) => (
+      prepareImageAttachment(file.name, new Uint8Array(await file.arrayBuffer()))
+    )));
+    if (!uploadTargetIsCurrent()) return [];
+    const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    const accepted: ImageAttachment[] = [];
+    if (uploaded.length) {
+      composerController.updateImageDrafts((current) => {
+        const existing = current[conversationId] ?? [];
+        const known = new Set(existing.map((image) => image.id));
+        let selectedPixels = existing.reduce(
+          (total, image) => total + image.width * image.height,
+          0
+        );
+        const unique = uploaded.filter((image) => {
+          if (known.has(image.id)) return false;
+          const pixels = image.width * image.height;
+          if (
+            !Number.isSafeInteger(pixels)
+            || pixels <= 0
+            || pixels > MAX_IMAGE_ATTACHMENT_PIXELS
+            || selectedPixels + pixels > MAX_COMPOSER_IMAGE_PIXELS
+          ) {
+            return false;
+          }
+          known.add(image.id);
+          selectedPixels += pixels;
+          return true;
+        });
+        if (!unique.length) return current;
+        // Number the accepted images the way Claude Code does, but keep the
+        // number off the draft: the composer shows a thumbnail, and the
+        // `[Image #N]` the model reads is written at the send boundary.
+        // Numbers already taken anywhere visible — transcript, queued
+        // messages, this draft's images and any placeholder the user typed
+        // themselves — are never reissued.
+        const uploadDocument = documentStore.current();
+        const conversation = uploadDocument?.workspaces
+          .flatMap((workspace) => workspace.conversations)
+          .find((candidate) => candidate.id === conversationId);
+        const taken = reserveQueuedMessageIds(
+          imageShortIdsInUse(conversation?.contexts ?? []),
+          conversation?.queuedMessages ?? []
+        );
+        for (const image of existing) {
+          if (image.shortId !== undefined) taken.add(image.shortId);
+        }
+        for (const id of imagePlaceholderIds(composerController.current().drafts[conversationId] ?? "")) {
+          taken.add(id);
+        }
+        const numbered = unique.map((image) => {
+          const shortId = nextImageShortId(taken);
+          taken.add(shortId);
+          accepted.push({ ...image, shortId });
+          return { ...image, shortId };
+        });
+        return { ...current, [conversationId]: [...existing, ...numbered] };
+      });
+    }
+    return accepted;
+  };
+
+  const addComposerAttachments = (
+    conversationId: string,
+    files: File[],
+    preRejected: readonly AttachmentRejection[] = []
+  ): Promise<void> => {
+    if (!files.length && !preRejected.length) return Promise.resolve();
     return composerController.enqueueImageUpload(conversationId, async (uploadStillCurrent) => {
-      // A draft that materialized mid-upload has handed its images on already, so an upload still
-      // addressed to it is as stale as one for a deleted conversation.
-      const uploadTargetIsCurrent = () => (
-        uploadStillCurrent()
-        && (isDraftConversationId(conversationId)
-          ? host().draftIsOpen()
-          : Boolean(documentStore.current()?.workspaces.some((workspace) => (
-            workspace.conversations.some((conversation) => conversation.id === conversationId)
-          ))))
-      );
-      if (!uploadTargetIsCurrent()) return [];
+      const uploadTargetIsCurrent = uploadTargetCheck(conversationId, uploadStillCurrent);
+      if (!uploadTargetIsCurrent()) return;
       const latest = documentStore.current();
       const choice = latest ? modelChoiceForConversation(latest) : undefined;
-      const provider = choice?.provider;
-      const model = choice?.model;
-      if (!provider?.enabled || !model || !model.id.trim()) return [];
-      if (!supportsVision(model)) return [];
-      const existingImages = composerController.current().imageDrafts[conversationId] ?? [];
-      let selectedBytes = existingImages.reduce((total, image) => total + image.bytes, 0);
-      const acceptedFiles: File[] = [];
-      for (const file of files) {
-        if (
-          file.size <= 0
-          || file.size > MAX_IMAGE_ATTACHMENT_BYTES
-          || existingImages.length + acceptedFiles.length >= MAX_COMPOSER_IMAGES
-          || selectedBytes + file.size > MAX_COMPOSER_IMAGE_BYTES
-        ) {
-          continue;
-        }
-        acceptedFiles.push(file);
-        selectedBytes += file.size;
+      const model = choice?.provider?.enabled ? choice.model : undefined;
+      const imageInput = Boolean(model && model.id.trim() && supportsVision(model));
+      const result = await intakeAttachments(files, {
+        addImages: imageInput
+          ? (images) => addComposerImagesNow(conversationId, images, uploadTargetIsCurrent)
+          : undefined,
+        existingFiles: () => composerController.current().fileDrafts[conversationId] ?? [],
+        preRejected
+      });
+      if (!uploadTargetIsCurrent()) return;
+      if (result.files.length) {
+        composerController.updateFileDrafts((current) => ({
+          ...current,
+          [conversationId]: mergeFileAttachments(current[conversationId] ?? [], result.files)
+        }));
       }
-      if (!acceptedFiles.length) return [];
-      const results = await Promise.allSettled(acceptedFiles.map(async (file) => (
-        prepareImageAttachment(file.name, new Uint8Array(await file.arrayBuffer()))
-      )));
-      if (!uploadTargetIsCurrent()) return [];
-      const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
-      const accepted: ImageAttachment[] = [];
-      if (uploaded.length) {
-        composerController.updateImageDrafts((current) => {
-          const existing = current[conversationId] ?? [];
-          const known = new Set(existing.map((image) => image.id));
-          let selectedPixels = existing.reduce(
-            (total, image) => total + image.width * image.height,
-            0
-          );
-          const unique = uploaded.filter((image) => {
-            if (known.has(image.id)) return false;
-            const pixels = image.width * image.height;
-            if (
-              !Number.isSafeInteger(pixels)
-              || pixels <= 0
-              || pixels > MAX_IMAGE_ATTACHMENT_PIXELS
-              || selectedPixels + pixels > MAX_COMPOSER_IMAGE_PIXELS
-            ) {
-              return false;
-            }
-            known.add(image.id);
-            selectedPixels += pixels;
-            return true;
-          });
-          if (!unique.length) return current;
-          // Number the accepted images the way Claude Code does, but keep the
-          // number off the draft: the composer shows a thumbnail, and the
-          // `[Image #N]` the model reads is written at the send boundary.
-          // Numbers already taken anywhere visible — transcript, queued
-          // messages, this draft's images and any placeholder the user typed
-          // themselves — are never reissued.
-          const uploadDocument = documentStore.current();
-          const conversation = uploadDocument?.workspaces
-            .flatMap((workspace) => workspace.conversations)
-            .find((candidate) => candidate.id === conversationId);
-          const taken = reserveQueuedMessageIds(
-            imageShortIdsInUse(conversation?.contexts ?? []),
-            conversation?.queuedMessages ?? []
-          );
-          for (const image of existing) {
-            if (image.shortId !== undefined) taken.add(image.shortId);
-          }
-          for (const id of imagePlaceholderIds(composerController.current().drafts[conversationId] ?? "")) {
-            taken.add(id);
-          }
-          const numbered = unique.map((image) => {
-            const shortId = nextImageShortId(taken);
-            taken.add(shortId);
-            accepted.push({ ...image, shortId });
-            return { ...image, shortId };
-          });
-          return { ...current, [conversationId]: [...existing, ...numbered] };
-        });
-      }
-      return accepted;
+      // Each attempt reports for itself: a later one that took everything clears
+      // what an earlier one left out.
+      composerController.updateAttachmentNotices((current) => {
+        if (!result.rejected.length && !current[conversationId]) return current;
+        const next = { ...current };
+        if (result.rejected.length) next[conversationId] = result.rejected;
+        else delete next[conversationId];
+        return next;
+      });
+    });
+  };
+
+  const removeComposerFile = (conversationId: string, fileId: string) => {
+    composerController.updateFileDrafts((current) => {
+      const existing = current[conversationId] ?? [];
+      if (!existing.some((file) => file.id === fileId)) return current;
+      return { ...current, [conversationId]: existing.filter((file) => file.id !== fileId) };
+    });
+  };
+
+  const clearComposerFiles = (conversationId: string) => {
+    composerController.updateFileDrafts((current) => (
+      current[conversationId]?.length ? { ...current, [conversationId]: [] } : current
+    ));
+    composerController.updateAttachmentNotices((current) => {
+      if (!current[conversationId]) return current;
+      const next = { ...current };
+      delete next[conversationId];
+      return next;
     });
   };
 
@@ -1166,6 +1254,9 @@ export function createSendPipeline(
     const images = overrideText === undefined
       ? composerController.current().imageDrafts[conversationId] ?? []
       : [];
+    const files = overrideText === undefined
+      ? composerController.current().fileDrafts[conversationId] ?? []
+      : [];
     // The send boundary is where a draft stops being something the user is
     // still arranging: the picked elements expand into the prompt text they
     // stand for, and every attached image gets the `[Image #N]` the model
@@ -1218,12 +1309,13 @@ export function createSendPipeline(
     const answeringPendingQuestion = overrideText !== undefined;
     const queueIsBlocking = Boolean(modelRunController.current()[conversationId])
       || (!answeringPendingQuestion && activeConversation.queuedMessages.length > 0);
-    if ((draft || images.length) && queueIsBlocking) {
+    if ((draft || images.length || files.length) && queueIsBlocking) {
       queueComposerMessage(
         workspaceId,
         conversationId,
         draft,
         images,
+        files,
         overrideText === undefined
       );
       return;
@@ -1239,11 +1331,12 @@ export function createSendPipeline(
       draft,
       images
     );
-    const pendingUserContext: UserContext | undefined = draft || images.length ? {
+    const pendingUserContext: UserContext | undefined = draft || images.length || files.length ? {
       id: createId("ctx"),
       kind: "user",
       content: sendReady.content,
       images: sendReady.images.length ? sendReady.images : undefined,
+      files: files.length ? files : undefined,
       createdAt: new Date().toISOString()
     } : undefined;
     let requestContexts = pendingUserContext
@@ -1264,7 +1357,7 @@ export function createSendPipeline(
           if (!host().requestFitsImageBudget(requestContexts)) return;
           const titleFor = (conversation: Conversation) => (
             conversation.title === "新任务" || conversation.title === "New task" // i18n-audit-ignore: recognizes both localized default-title markers
-              ? (textWithoutImagePlaceholders(sendReady.content).slice(0, 32) || sendReady.images[0]?.name || t("图片", "Image"))
+              ? (textWithoutImagePlaceholders(sendReady.content).slice(0, 32) || files[0]?.name || sendReady.images[0]?.name || t("图片", "Image"))
               : conversation.title
           );
           const nextTitle = titleFor(located.conversation);
@@ -1400,6 +1493,7 @@ export function createSendPipeline(
         composerController.updateDrafts((current) => ({ ...current, [conversationId]: "" }));
         composerController.updateImageDrafts((current) => ({ ...current, [conversationId]: [] }));
         composerController.updateElementPicks((current) => ({ ...current, [conversationId]: [] }));
+        clearComposerFiles(conversationId);
       }
       host().scrollTimelineToBottom();
       await performModelRun(workspaceId, conversationId, {
@@ -1582,6 +1676,7 @@ export function createSendPipeline(
           kind: "user",
           content: promoted.content,
           images: promoted.images.length ? promoted.images : undefined,
+          files: currentMessage.files?.length ? currentMessage.files : undefined,
           createdAt: currentMessage.createdAt
         };
         requestContexts = [...currentLocated.conversation.contexts, userContext];
@@ -1589,7 +1684,7 @@ export function createSendPipeline(
         queuedConversation = {
           ...currentLocated.conversation,
           title: currentLocated.conversation.title === "新任务" || currentLocated.conversation.title === "New task" // i18n-audit-ignore: recognizes both localized default-title markers
-            ? (textWithoutImagePlaceholders(currentMessage.content).slice(0, 32) || currentMessage.images?.[0]?.name || t("图片", "Image"))
+            ? (textWithoutImagePlaceholders(currentMessage.content).slice(0, 32) || currentMessage.files?.[0]?.name || currentMessage.images?.[0]?.name || t("图片", "Image"))
             : currentLocated.conversation.title,
           contexts: requestContexts,
           queuedMessages: currentLocated.conversation.queuedMessages.filter(
@@ -1721,11 +1816,12 @@ export function createSendPipeline(
     sendComposer,
     wakeConversation,
     startForkedConversationRun,
-    queueComposerMessage,
     deleteQueuedMessage,
     steerQueuedMessage,
     addComposerImages,
+    addComposerAttachments,
     removeComposerImage,
+    removeComposerFile,
     dispatchNextQueuedMessage,
     retryFailedQueuedPromotion
   };

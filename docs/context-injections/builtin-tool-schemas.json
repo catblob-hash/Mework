@@ -146,7 +146,7 @@
       "name": "bash_find_output",
       "schema": {
         "additionalProperties": false,
-        "description": "Run a Bash command exactly as the bash tool does, but instead of the whole output you get only the parts that match your query: the output is cut into chunks the TypeSafe Jev decision model scores against the query, and only pieces at or above your threshold come back, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The chunks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Run a Bash command exactly as the bash tool does, but instead of the whole output you get only the parts that match your query: the output is cut into log records (a line with its indented continuation, such as a stack trace), the TypeSafe Jev decision model scores each record against the query, and every record at or above your threshold comes back whole, its lines numbered, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The records are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "command": {
             "description": "The Bash command line.",
@@ -187,7 +187,7 @@
       "name": "powershell_find_output",
       "schema": {
         "additionalProperties": false,
-        "description": "Run a PowerShell command exactly as the powershell tool does, but instead of the whole output you get only the parts that match your query: the output is cut into chunks the TypeSafe Jev decision model scores against the query, and only pieces at or above your threshold come back, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The chunks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Run a PowerShell command exactly as the powershell tool does, but instead of the whole output you get only the parts that match your query: the output is cut into log records (a line with its indented continuation, such as a stack trace), the TypeSafe Jev decision model scores each record against the query, and every record at or above your threshold comes back whole, its lines numbered, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The records are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "command": {
             "description": "The PowerShell command line.",
@@ -290,7 +290,7 @@
       "name": "zsh_find_output",
       "schema": {
         "additionalProperties": false,
-        "description": "Run a zsh command exactly as the zsh tool does, but instead of the whole output you get only the parts that match your query: the output is cut into chunks the TypeSafe Jev decision model scores against the query, and only pieces at or above your threshold come back, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The chunks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Run a zsh command exactly as the zsh tool does, but instead of the whole output you get only the parts that match your query: the output is cut into log records (a line with its indented continuation, such as a stack trace), the TypeSafe Jev decision model scores each record against the query, and every record at or above your threshold comes back whole, its lines numbered, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The records are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "command": {
             "description": "The zsh command line.",
@@ -331,7 +331,7 @@
       "name": "sh_find_output",
       "schema": {
         "additionalProperties": false,
-        "description": "Run a POSIX sh command exactly as the sh tool does, but instead of the whole output you get only the parts that match your query: the output is cut into chunks the TypeSafe Jev decision model scores against the query, and only pieces at or above your threshold come back, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The chunks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Run a POSIX sh command exactly as the sh tool does, but instead of the whole output you get only the parts that match your query: the output is cut into log records (a line with its indented continuation, such as a stack trace), the TypeSafe Jev decision model scores each record against the query, and every record at or above your threshold comes back whole, its lines numbered, with the exit status. Use it for commands whose output is long (test runs, builds, logs) when you only care about one thing in it. Cannot run in the background. The records are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "command": {
             "description": "The POSIX sh command line.",
@@ -482,7 +482,7 @@
       "name": "find_content",
       "schema": {
         "additionalProperties": false,
-        "description": "Find where a text file contains what you describe, without reading the file. The file is cut into chunks; each chunk is scored 0 to 1 by the TypeSafe Jev decision model against your query, winners are refined into smaller pieces, and only pieces scoring at or above your threshold come back with their line ranges. Use it before `read` on large files, and feed a hit's line range into `read` or a narrower `find_content` to zoom in. The chunks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Find where a text file contains what you describe, without reading the file. The file is cut into its own blocks — each function or other innermost symbol when a language server answers, each Markdown section, otherwise each indented block or paragraph; each block is scored 0 to 1 by the TypeSafe Jev decision model against your query, and every block at or above your threshold comes back whole, each line with its line number. Use it before `read` on large files. The blocks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "end_line": {
             "description": "Last line to consider, inclusive; defaults to the end of the file.",
@@ -526,7 +526,7 @@
       "name": "find_files",
       "schema": {
         "additionalProperties": false,
-        "description": "Find which files under a directory a description points at, without listing the directory yourself. The listing (files and folders, to the given depth) is cut into groups the TypeSafe Jev decision model scores against your query; groups that clear your threshold are re-scored entry by entry, and only entries at or above the threshold come back with their scores. Use it when you know what a file is for but not what it is called. The paths are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Find which files under a directory a description points at, without listing the directory yourself. The listing (files and folders, to the given depth) is scored entry by entry by the TypeSafe Jev decision model against your query, and only entries at or above your threshold come back, with their scores. Use it when you know what a file is for but not what it is called. The paths are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "depth": {
             "default": 6,
@@ -566,7 +566,7 @@
       "name": "find_output",
       "schema": {
         "additionalProperties": false,
-        "description": "Find which parts of a shell command's output contain what you ask, without reading the whole transcript. Name the command by its task address from task_list (e.g. shell:3); its retained output (the last 256 KiB) is cut into chunks the TypeSafe Jev decision model scores against your query, and only pieces at or above your threshold come back with their line ranges. Works for running and finished commands. The chunks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Find which parts of a shell command's output contain what you ask, without reading the whole transcript. Name the command by its task address from task_list (e.g. shell:3); its retained output (the last 256 KiB) is cut into log records (a line with its indented continuation, such as a stack trace), the TypeSafe Jev decision model scores each record against your query, and every record at or above your threshold comes back whole, its lines numbered. Works for running and finished commands. The records are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "query": {
             "description": "What to look for in the command output, in plain language.",
@@ -1110,7 +1110,7 @@
       "name": "preview_find_logs",
       "schema": {
         "additionalProperties": false,
-        "description": "Find which log lines say what you ask, across the preview page's console and the dev server's output, without reading them. Both logs are cut into chunks the TypeSafe Jev decision model scores against your query; winners are re-scored in smaller pieces, and only pieces at or above your threshold come back, each labelled console or server with its line range. Use it instead of paging through preview_console_logs / preview_logs when you are looking for one thing. The chunks are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
+        "description": "Find which log lines say what you ask, across the preview page's console and the dev server's output, without reading them. Both logs are cut into their output rounds — each console entry (an error with its stack is one entry), each read of the server's output — the TypeSafe Jev decision model scores each against your query, and every one at or above your threshold comes back whole, labelled console with its entry number or server with its numbered lines. Use it instead of paging through preview_console_logs / preview_logs when you are looking for one thing. The entries and lines are sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.",
         "properties": {
           "query": {
             "description": "What to look for in the console and server logs, in plain language.",

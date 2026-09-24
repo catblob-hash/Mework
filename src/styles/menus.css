@@ -4,7 +4,6 @@
 .context-menu > button, .context-menu__branch > button, .context-menu__submenu > button { width: 100%; min-height: 24px; display: flex; align-items: center; padding: 2px 7px; background: transparent; border-radius: 5px; color: var(--text); text-align: left; font-size: 12px; white-space: nowrap; }
 .context-menu > button:hover:not(:disabled), .context-menu > button:focus-visible, .context-menu__branch > button:hover:not(:disabled), .context-menu__branch > button:focus-visible, .context-menu__submenu > button:hover:not(:disabled), .context-menu__submenu > button:focus-visible { background: var(--hover); outline: 0; }
 .context-menu > button:disabled, .context-menu__branch > button:disabled { color: var(--faint); cursor: not-allowed; }
-.context-menu__divider { height: 1px; margin: 3px 2px; background: var(--border); }
 /* Choosing a tool is two choices deep, so each step opens beside the one it came
    from rather than replacing it. Only the last step scrolls: a group's tool list
    can outrun the viewport, while a panel that holds another panel must not clip
@@ -16,12 +15,6 @@
 .context-menu__submenu--flipped { left: auto; right: 100%; margin: 0 2px 0 0; }
 .context-menu > button > svg, .context-menu__branch > button > svg, .context-menu__submenu > button > svg { flex: 0 0 auto; color: var(--faint); }
 .context-menu__more { margin-left: auto; padding-left: 10px; box-sizing: content-box; }
-/* Naming a conversation template happens in the menu, not a dialog, so this
-   panel widens the same shell rather than replacing it. */
-.context-menu__name { min-width: 216px; padding: 4px; display: flex; flex-direction: column; gap: 7px; }
-.context-menu__name label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 10.5px; font-weight: 650; }
-.context-menu__name .input { min-height: 30px; font-size: 12px; }
-.context-menu__name-actions { display: flex; justify-content: flex-end; gap: 4px; }
 
 /* Shared popover menu (PopoverMenu.tsx).
    The panel is attached directly to document.body, so these rules must not
@@ -151,9 +144,6 @@
 .field__label { font-size: 11.5px; font-weight: 600; }
 .field__hint { margin-top: -2px; color: var(--faint); font-size: 9.5px; line-height: 1.4; }
 .field__hint--error { color: var(--danger); }
-.workspace-path-picker { display: flex; gap: 8px; }
-.workspace-path-picker .input { flex: 1; min-width: 0; }
-.workspace-path-picker .button { flex: 0 0 auto; }
 .input { width: 100%; min-height: 36px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 7px; outline: 0; background: var(--color-ffffff); font-size: 12px; line-height: 1.5; transition: border .12s, box-shadow .12s; }
 .input:hover { border-color: var(--color-c0c0ba); }
 .input:focus { border-color: var(--focus); box-shadow: 0 0 0 2px var(--color-5f5f5a-ap12); }
@@ -169,33 +159,11 @@
 .popover-select__value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .popover-select__note { flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: 10.5px; }
 .popover-select__chevron { flex: 0 0 auto; color: var(--faint); }
-.snippet-dialog__note { margin: -4px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.55; }
-.snippet-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
-.snippet-list__row { display: flex; align-items: center; gap: 6px; }
-.snippet-list__name { flex: 1; min-width: 0; min-height: 31px; padding: 5px 8px; font-size: 11.5px; }
-.snippet-list__count { flex: 0 0 auto; color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }
 .switch { width: 31px; height: 18px; flex: 0 0 31px; padding: 2px; border-radius: 999px; background: var(--color-c8c8c2); position: relative; transition: background .15s; }
 .switch span { display: block; width: 14px; height: 14px; border-radius: 50%; background: var(--color-ffffff); box-shadow: 0 1px 2px var(--color-000000-ap20); transition: transform .15s; }
 .switch--on { background: var(--color-2d2d2b); }
 .switch--on span { transform: translateX(13px); }
 .switch:disabled { cursor: not-allowed; opacity: .45; }
-.check-row { min-height: 46px; display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 7px; position: relative; cursor: pointer; }
-.check-row:hover { background: var(--subtle); }
-.check-row > input { position: absolute; opacity: 0; pointer-events: none; }
-.check-row__box { width: 16px; height: 16px; flex: 0 0 16px; border: 1px solid var(--color-bdbdb6); border-radius: 4px; background: var(--color-ffffff); position: relative; }
-.check-row > input:checked + .check-row__box { background: var(--color-282827); border-color: var(--color-282827); }
-.check-row > input:checked + .check-row__box::after { content: ""; position: absolute; left: 4px; top: 1px; width: 5px; height: 8px; border: solid var(--color-ffffff); border-width: 0 2px 2px 0; transform: rotate(45deg); }
-.check-row > input:focus-visible + .check-row__box { outline: 2px solid var(--focus); outline-offset: 2px; }
-.check-row__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.check-row__copy > span { font-size: 11.5px; font-weight: 600; }
-.check-row__copy small { margin-top: 1px; color: var(--muted); font-size: 9.5px; line-height: 1.35; }
-.check-row__copy em { margin-left: 6px; padding: 1px 5px; border-radius: 99px; background: var(--subtle); color: var(--muted); font-size: 8px; font-style: normal; font-weight: 650; }
-/* A spent selection: still readable, no longer movable. */
-.check-row--disabled { cursor: default; }
-.check-row--disabled:hover { background: transparent; }
-.check-row--disabled .check-row__box { opacity: .55; }
-.check-row--disabled .check-row__copy > span { color: var(--faint); }
-.check-row--disabled .check-row__copy small { color: var(--faint); }
 
 .editor-kind { width: fit-content; height: 29px; margin-bottom: 9px; padding: 0 8px; display: inline-flex; align-items: center; gap: 6px; border-radius: 7px; background: var(--subtle); color: var(--muted); font-size: 10.5px; font-weight: 650; }
 .context-text-editor { font-size: 13px; line-height: 1.6; }

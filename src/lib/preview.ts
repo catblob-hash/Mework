@@ -48,7 +48,6 @@ export interface PreviewConfigurationList {
   launchJsonPath: string;
   servers: PreviewConfiguredServer[];
   malformed: PreviewMalformedEntry[];
-  autoVerify: boolean;
   /** The full explanation of an unusable file, absent when the file is usable. */
   problem?: string | null;
   problemReason?: string | null;
@@ -198,20 +197,6 @@ export async function readPreviewServerLogs(
   });
 }
 
-/**
- * Records whether this project wants its previews verified automatically.
- *
- * False for every reason the write did not happen — a project without a launch.json has nowhere
- * to keep the preference — so callers re-read the configuration rather than trusting the request.
- */
-export async function setPreviewAutoVerify(
-  target: PreviewTarget,
-  enabled: boolean
-): Promise<boolean> {
-  requireDesktopRuntime();
-  return invoke<boolean>("preview_set_auto_verify", { target, enabled });
-}
-
 /** Where a configured or running server answers. */
 export function previewServerAddress(server: {
   port: number;
@@ -260,7 +245,7 @@ export const PREVIEW_EMPTY_LOG_REPLIES = [
  * Nothing reaches the drawer with it today — the drawer has no search box — and the host answers
  * with it the moment one exists.
  */
-export const PREVIEW_EMPTY_LOG_SEARCH_REPLY = /^No logs matching "[\s\S]*"\.$/u;
+const PREVIEW_EMPTY_LOG_SEARCH_REPLY = /^No logs matching "[\s\S]*"\.$/u;
 
 /** Splits one `preview_server_logs` reply into drawer lines. Empty for every "nothing yet" reply. */
 export function previewLogLines(rendered: string): string[] {

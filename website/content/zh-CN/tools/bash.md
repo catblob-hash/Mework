@@ -13,3 +13,4 @@
 - [powershell](powershell.html)、[task_wait](task_wait.html)、[task_list](task_list.html)
 - [使用 Mework](../working.html#tools-and-approvals)
 - [钩子](../hooks.html)
+- [bash_find_output](bash_find_output.html)、[find_output](find_output.html) — 只取回命令输出里和描述相符的部分

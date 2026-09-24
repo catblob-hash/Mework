@@ -47,15 +47,13 @@ const STORE_ID_BYTES: usize = 16;
 const NONCE_BYTES: usize = 12;
 const KEYRING_SERVICE: &str = "com.mework.app.project-import-trust.v1";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectImportDecision {
     Allowed,
     Denied,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectImportTargetKind {
     File,
     Directory,
@@ -105,22 +103,6 @@ pub struct ProjectImportCandidate {
     pub target_kind: ProjectImportTargetKind,
 }
 
-/// Renderer-facing record. Canonical paths are intentionally absent.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectImportTrustSummary {
-    pub id: String,
-    pub workspace_id: String,
-    pub label: String,
-    pub target_kind: ProjectImportTargetKind,
-    pub decision: ProjectImportDecision,
-    /// False for a decision bound to an older/moved workspace root or a target
-    /// that is no longer present with the approved canonical identity.
-    pub active_for_current_workspace: bool,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 /// Backend-only persisted authorization record.
 ///
 /// Do not implement `Serialize` or `Debug`: both canonical paths are private
@@ -138,21 +120,6 @@ pub(crate) struct StoredProjectImportTrust {
     pub updated_at: String,
 }
 
-impl StoredProjectImportTrust {
-    pub(crate) fn summary(&self, active_for_current_workspace: bool) -> ProjectImportTrustSummary {
-        ProjectImportTrustSummary {
-            id: self.id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            label: self.label.clone(),
-            target_kind: self.target_kind,
-            decision: self.decision,
-            active_for_current_workspace,
-            created_at: self.created_at.clone(),
-            updated_at: self.updated_at.clone(),
-        }
-    }
-}
-
 /// Storage boundary implemented by the encrypted application-data store.
 pub(crate) trait ProjectImportTrustRepository {
     fn list_records(&self) -> Result<Vec<StoredProjectImportTrust>, String>;
@@ -163,9 +130,6 @@ pub(crate) trait ProjectImportTrustRepository {
     /// canonical targets. The caller then reloads and honors that persisted
     /// decision instead of using its stale dialog result.
     fn insert_records(&self, records: &[StoredProjectImportTrust]) -> Result<bool, String>;
-
-    /// Removes exactly one record after verifying its workspace owner.
-    fn revoke_record(&self, workspace_id: &str, record_id: &str) -> Result<bool, String>;
 
     /// Acquires the current ledger generation and workspace identity in one
     /// repository snapshot. Implementations must not assemble this lease from
@@ -549,22 +513,6 @@ impl ProjectImportTrustRepository for EncryptedProjectImportTrustStore {
             }
             ledger.generation = next_generation(ledger.generation)?;
             ledger.records.extend_from_slice(records);
-            self.write_ledger_locked(&ledger)?;
-            Ok(true)
-        })
-    }
-
-    fn revoke_record(&self, workspace_id: &str, record_id: &str) -> Result<bool, String> {
-        self.with_lock(true, || {
-            let mut ledger = self.read_ledger_locked()?;
-            let before = ledger.records.len();
-            ledger
-                .records
-                .retain(|record| !(record.workspace_id == workspace_id && record.id == record_id));
-            if ledger.records.len() == before {
-                return Ok(false);
-            }
-            ledger.generation = next_generation(ledger.generation)?;
             self.write_ledger_locked(&ledger)?;
             Ok(true)
         })
@@ -1033,51 +981,6 @@ where
     Err("外部项目记忆导入链在单轮中产生了过多新的信任边界；本轮已停止加载".into())
 }
 
-pub(crate) fn list_project_import_trust<R: ProjectImportTrustRepository>(
-    repository: &R,
-    workspace_id: &str,
-    workspace_root: Option<&Path>,
-) -> Result<Vec<ProjectImportTrustSummary>, String> {
-    validate_workspace_id(workspace_id)?;
-    let canonical_workspace = workspace_root
-        .map(canonical_existing_directory)
-        .transpose()?;
-    let mut records = repository
-        .list_records()?
-        .into_iter()
-        .filter(|record| record.workspace_id == workspace_id)
-        .map(|record| {
-            let active = canonical_workspace.as_ref().is_some_and(|workspace| {
-                paths_equal(workspace, &record.canonical_workspace)
-                    && valid_record_identity(&record)
-            });
-            record.summary(active)
-        })
-        .collect::<Vec<_>>();
-    records.sort_by(|left, right| {
-        left.label
-            .cmp(&right.label)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(records)
-}
-
-pub(crate) fn revoke_project_import_trust<R: ProjectImportTrustRepository>(
-    repository: &R,
-    workspace_id: &str,
-    record_id: &str,
-) -> Result<(), String> {
-    validate_workspace_id(workspace_id)?;
-    if Uuid::parse_str(record_id).is_err() {
-        return Err("项目记忆导入信任记录 ID 无效".into());
-    }
-    if repository.revoke_record(workspace_id, record_id)? {
-        Ok(())
-    } else {
-        Err("找不到指定的项目记忆导入信任记录".into())
-    }
-}
-
 /// Captures the authenticated trust-ledger revision for the current workspace.
 /// The opaque result is backend-only and contains no model-provided identity.
 pub(crate) fn acquire_project_import_trust_lease<R: ProjectImportTrustRepository>(
@@ -1464,19 +1367,6 @@ mod tests {
             Ok(true)
         }
 
-        fn revoke_record(&self, workspace_id: &str, record_id: &str) -> Result<bool, String> {
-            let mut state = self.state.lock().unwrap();
-            let before = state.records.len();
-            state
-                .records
-                .retain(|record| !(record.workspace_id == workspace_id && record.id == record_id));
-            if state.records.len() == before {
-                return Ok(false);
-            }
-            state.generation = next_generation(state.generation)?;
-            Ok(true)
-        }
-
         fn acquire_lease(
             &self,
             workspace_id: &str,
@@ -1644,35 +1534,9 @@ mod tests {
             .report
             .included_sources()
             .all(|source| source.content.as_deref() != Some("must never load")));
-        let summaries =
-            list_project_import_trust(&repository, "workspace-1", Some(&workspace)).unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].decision, ProjectImportDecision::Denied);
-    }
-
-    #[test]
-    fn revocation_removes_exact_record_and_causes_a_new_prompt() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        write(&workspace.join("MEWORK.md"), "@../shared.md\n");
-        write(&root.path().join("shared.md"), "shared");
-        let repository = MemoryRepository::default();
-        resolve_project_memory_imports(&repository, "workspace-1", &options(&workspace), |_| {
-            Ok(true)
-        })
-        .unwrap();
-        let record = list_project_import_trust(&repository, "workspace-1", Some(&workspace))
-            .unwrap()[0]
-            .clone();
-        revoke_project_import_trust(&repository, "workspace-1", &record.id).unwrap();
-
-        let mut prompted = false;
-        resolve_project_memory_imports(&repository, "workspace-1", &options(&workspace), |_| {
-            prompted = true;
-            Ok(false)
-        })
-        .unwrap();
-        assert!(prompted);
+        let records = repository.list_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, ProjectImportDecision::Denied);
     }
 
     #[test]
@@ -1769,27 +1633,6 @@ mod tests {
     }
 
     #[test]
-    fn renderer_summaries_contain_no_canonical_paths_or_content() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let external = root.path().join("private-name.md");
-        write(&workspace.join("MEWORK.md"), "@../private-name.md\n");
-        write(&external, "TOP_SECRET_CONTENT");
-        let repository = MemoryRepository::default();
-        resolve_project_memory_imports(&repository, "workspace-1", &options(&workspace), |_| {
-            Ok(true)
-        })
-        .unwrap();
-
-        let summaries =
-            list_project_import_trust(&repository, "workspace-1", Some(&workspace)).unwrap();
-        let serialized = serde_json::to_string(&summaries).unwrap();
-        assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
-        assert!(!serialized.contains("TOP_SECRET_CONTENT"));
-        assert!(serialized.contains("external:private-name.md"));
-    }
-
-    #[test]
     fn approval_display_distinguishes_same_named_targets_without_an_absolute_user_path() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
@@ -1846,19 +1689,14 @@ mod tests {
             acquire_project_import_trust_lease(&store, "workspace-1", &workspace).unwrap();
         assert_eq!(after_deny.generation, INITIAL_GENERATION + 2);
 
-        assert!(store.revoke_record("workspace-1", &allowed.id).unwrap());
-        let after_revoke =
-            acquire_project_import_trust_lease(&store, "workspace-1", &workspace).unwrap();
-        assert_eq!(after_revoke.generation, INITIAL_GENERATION + 3);
-
         let reopened =
             EncryptedProjectImportTrustStore::open_with_test_key(app_data.path(), [0x31; 32]);
         let reopened_lease =
             acquire_project_import_trust_lease(&reopened, "workspace-1", &workspace).unwrap();
-        assert_eq!(reopened_lease.generation, after_revoke.generation);
+        assert_eq!(reopened_lease.generation, after_deny.generation);
         assert!(project_import_trust_lease_is_current(
             &reopened,
-            &after_revoke,
+            &after_deny,
             "workspace-1",
             &workspace
         )
@@ -1890,9 +1728,6 @@ mod tests {
             ..record
         };
         assert!(!store.insert_records(&[conflicting]).unwrap());
-        assert!(!store
-            .revoke_record("workspace-1", &Uuid::new_v4().to_string())
-            .unwrap());
 
         let after = acquire_project_import_trust_lease(&store, "workspace-1", &workspace).unwrap();
         assert_eq!(after.generation, stable.generation);
@@ -2104,7 +1939,13 @@ mod tests {
             EncryptedProjectImportTrustStore::open_with_test_key(app_data.path(), [0x41; 32]);
         let loaded = reopened.list_records().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].summary(true), record.summary(true));
+        assert_eq!(loaded[0].id, record.id);
+        assert_eq!(loaded[0].workspace_id, record.workspace_id);
+        assert_eq!(loaded[0].label, record.label);
+        assert_eq!(loaded[0].target_kind, record.target_kind);
+        assert_eq!(loaded[0].decision, record.decision);
+        assert_eq!(loaded[0].created_at, record.created_at);
+        assert_eq!(loaded[0].updated_at, record.updated_at);
         assert!(paths_equal(
             &loaded[0].canonical_target,
             &record.canonical_target

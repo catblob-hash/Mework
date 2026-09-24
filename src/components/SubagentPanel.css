@@ -3,8 +3,6 @@
   container-type: inline-size;
 }
 
-.subagent-avatar-stack { display: flex; padding-left: 4px; }
-.subagent-avatar-stack .subagent-avatar + .subagent-avatar { margin-left: -5px; }
 .subagent-avatar {
   width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center;
   border: 0; border-radius: 50%; color: var(--muted, var(--color-6b6b67)); background: transparent; box-shadow: none;

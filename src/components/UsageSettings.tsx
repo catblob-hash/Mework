@@ -40,7 +40,6 @@ export function UsageSettings({ document }: { document: AppDocument | null }) {
     return () => { cancelled = true; };
     // The document is only read to backfill turns recorded before the ledger existed, so a
     // later edit to it must not refetch.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return <UsageStatsCard statistics={statistics} loading={loading} />;

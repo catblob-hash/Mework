@@ -1,18 +1,23 @@
 import type { SelectedElement } from "./browser";
-import type { ImageAttachment } from "../types";
+import type { AttachmentRejection } from "./fileAttachments";
+import type { FileAttachment, ImageAttachment } from "../types";
 
 export interface ComposerControllerState {
   /** Composer text drafts per conversation. */
   drafts: Record<string, string>;
   /** Prepared image attachments per conversation. */
   imageDrafts: Record<string, ImageAttachment[]>;
+  /** Prepared non-image file attachments per conversation. */
+  fileDrafts: Record<string, FileAttachment[]>;
+  /** What the last attempt to attach to a conversation's composer left out, until dismissed. */
+  attachmentNotices: Record<string, AttachmentRejection[]>;
   /**
    * Elements the user picked out of a page, per conversation. Kept beside the image drafts
    * rather than inside them: the crop travels as an ordinary attachment, but the description
    * is prompt text, and `ImageAttachment` is persisted.
    */
   elementPicks: Record<string, SelectedElement[]>;
-  /** Conversations with an image upload batch still in flight. */
+  /** Conversations with an attachment upload batch (images or files) still in flight. */
   imageLoadingIds: Set<string>;
   /** Queued messages currently being steered into the running turn. */
   steeringMessageIds: Set<string>;
@@ -29,6 +34,12 @@ export interface ComposerController {
   updateImageDrafts(
     updater: (current: Record<string, ImageAttachment[]>) => Record<string, ImageAttachment[]>
   ): void;
+  updateFileDrafts(
+    updater: (current: Record<string, FileAttachment[]>) => Record<string, FileAttachment[]>
+  ): void;
+  updateAttachmentNotices(
+    updater: (current: Record<string, AttachmentRejection[]>) => Record<string, AttachmentRejection[]>
+  ): void;
   updateElementPicks(
     updater: (current: Record<string, SelectedElement[]>) => Record<string, SelectedElement[]>
   ): void;
@@ -43,7 +54,7 @@ export interface ComposerController {
     conversationId: string,
     run: (uploadStillCurrent: () => boolean) => Promise<Result>
   ): Promise<Result>;
-  /** Invalidates in-flight uploads and drops image drafts and element picks for the conversations. */
+  /** Invalidates in-flight uploads and drops attachment drafts and element picks for the conversations. */
   invalidateImages(conversationIds: Iterable<string>): void;
   /**
    * Queued-message save barrier: a live steer can make a queued message part
@@ -64,6 +75,8 @@ export function createComposerController(): ComposerController {
   let state: ComposerControllerState = {
     drafts: {},
     imageDrafts: {},
+    fileDrafts: {},
+    attachmentNotices: {},
     elementPicks: {},
     imageLoadingIds: new Set(),
     steeringMessageIds: new Set(),
@@ -97,6 +110,12 @@ export function createComposerController(): ComposerController {
     },
     updateImageDrafts(updater) {
       commit({ imageDrafts: updater(state.imageDrafts) });
+    },
+    updateFileDrafts(updater) {
+      commit({ fileDrafts: updater(state.fileDrafts) });
+    },
+    updateAttachmentNotices(updater) {
+      commit({ attachmentNotices: updater(state.attachmentNotices) });
     },
     updateElementPicks(updater) {
       commit({ elementPicks: updater(state.elementPicks) });
@@ -141,6 +160,12 @@ export function createComposerController(): ComposerController {
       commit({
         imageDrafts: Object.fromEntries(
           Object.entries(state.imageDrafts).filter(([conversationId]) => !removed.has(conversationId))
+        ),
+        fileDrafts: Object.fromEntries(
+          Object.entries(state.fileDrafts).filter(([conversationId]) => !removed.has(conversationId))
+        ),
+        attachmentNotices: Object.fromEntries(
+          Object.entries(state.attachmentNotices).filter(([conversationId]) => !removed.has(conversationId))
         ),
         elementPicks: Object.fromEntries(
           Object.entries(state.elementPicks).filter(([conversationId]) => !removed.has(conversationId))

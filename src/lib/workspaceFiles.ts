@@ -54,7 +54,7 @@ export interface WorkspaceSearchResults {
 }
 
 /** Host-side cap; asking for more is clamped there, so the UI asks for exactly this. */
-export const WORKSPACE_SEARCH_LIMIT = 200;
+const WORKSPACE_SEARCH_LIMIT = 200;
 
 function requireWorkspaceRuntime(): void {
   if (!hasBackendRuntime()) throw new Error("文件浏览仅可在连接 Rust 后端时使用");

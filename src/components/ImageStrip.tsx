@@ -1,10 +1,22 @@
-import { LoaderCircle, RefreshCw, X } from "lucide-react";
+import {
+  Database,
+  File as FileGlyph,
+  FileCode2,
+  FileText,
+  LoaderCircle,
+  RefreshCw,
+  Sheet,
+  X
+} from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
+import { fileExtension, fileIconKind } from "../lib/fileIcons";
 import { useFloatingSurface } from "../lib/floatingSurfaces";
 import { imageAttachmentData } from "../lib/runtime";
-import type { ImageAttachment } from "../types";
+import type { FileAttachment, ImageAttachment } from "../types";
+import { FileAttachmentPreview } from "./FileAttachmentPreview";
+import { formatBytes } from "./FilePreview/format";
 import "./ImageStrip.css";
 
 const imageDataCache = new Map<string, Promise<string>>();
@@ -279,28 +291,127 @@ function ImageThumbnail({
   );
 }
 
+function FileKindGlyph({ file }: { file: FileAttachment }) {
+  if (file.format === "pdf") return <FileText aria-hidden="true" />;
+  switch (fileIconKind(file.name)) {
+    case "code":
+      return <FileCode2 aria-hidden="true" />;
+    case "data":
+      return <Database aria-hidden="true" />;
+    case "sheet":
+      return <Sheet aria-hidden="true" />;
+    case "doc":
+    case "skill":
+      return <FileText aria-hidden="true" />;
+    default:
+      return <FileGlyph aria-hidden="true" />;
+  }
+}
+
+/** The short type label a file tile carries, the way an image carries its number. */
+function fileTypeLabel(file: FileAttachment): string {
+  if (file.format === "pdf") return "PDF";
+  const extension = fileExtension(file.name);
+  return extension ? extension.slice(0, 6).toUpperCase() : "TXT";
+}
+
+/**
+ * A file on a message, in the same strip as its pictures: a tile rather than a
+ * thumbnail, since a file's first look is its name and type, not its pixels.
+ */
+function FileTile({
+  file,
+  compact,
+  onRemove,
+  onOpen
+}: {
+  file: FileAttachment;
+  compact: boolean;
+  onRemove?: () => void;
+  onOpen: (file: FileAttachment) => void;
+}) {
+  const { t } = useI18n();
+  const size = file.format === "pdf" && file.pages
+    ? t("{pages} 页 · {size}", "{pages} pages · {size}", { pages: file.pages, size: formatBytes(file.bytes) })
+    : formatBytes(file.bytes);
+  return (
+    <li
+      className={`image-strip__item image-strip__item--file${compact ? " image-strip__item--compact" : ""}`}
+      title={`${file.name} · ${size}`}
+    >
+      <button
+        type="button"
+        className="image-strip__open image-strip__file"
+        aria-label={t("预览文件 {name}", "Preview file {name}", { name: file.name })}
+        onClick={() => onOpen(file)}
+      >
+        <span className="image-strip__file-icon">
+          <FileKindGlyph file={file} />
+        </span>
+        <span className="image-strip__file-text">
+          <span className="image-strip__file-name">{file.name}</span>
+          <span className="image-strip__file-meta">
+            <span className="image-strip__file-type">{fileTypeLabel(file)}</span>
+            <span>{size}</span>
+          </span>
+        </span>
+      </button>
+      {onRemove ? (
+        <button
+          type="button"
+          className="image-strip__remove"
+          aria-label={t("移除文件 {name}", "Remove file {name}", { name: file.name })}
+          onClick={onRemove}
+        >
+          <X aria-hidden="true" />
+        </button>
+      ) : null}
+    </li>
+  );
+}
+
+/**
+ * Everything attached to a message: its images, then its files.
+ *
+ * `busy` adds a placeholder for attachments still being prepared — a PDF being
+ * read, an upload in flight — so the strip shows work in progress where the
+ * result will land.
+ */
 export function ImageStrip({
   images,
+  files,
   compact = false,
+  busy = false,
   onRemove,
+  onRemoveFile,
   className = ""
 }: {
   images?: readonly ImageAttachment[];
+  files?: readonly FileAttachment[];
   compact?: boolean;
+  busy?: boolean;
   onRemove?: (imageId: string) => void;
+  onRemoveFile?: (fileId: string) => void;
   className?: string;
 }) {
   const { t } = useI18n();
   const [viewer, setViewer] = useState<ImageViewerState | null>(null);
+  const [openFile, setOpenFile] = useState<FileAttachment | null>(null);
   const closeViewer = useCallback(() => setViewer(null), []);
-  if (!images?.length) return null;
+  const closeFile = useCallback(() => setOpenFile(null), []);
+  const imageCount = images?.length ?? 0;
+  const fileCount = files?.length ?? 0;
+  if (!imageCount && !fileCount && !busy) return null;
   return (
     <>
       <ul
         className={`image-strip${compact ? " image-strip--compact" : ""}${className ? ` ${className}` : ""}`}
-        aria-label={t("{count} 张图片", "{count} images", { count: images.length })}
+        aria-label={fileCount
+          ? t("{count} 个附件", "{count} attachments", { count: imageCount + fileCount })
+          : t("{count} 张图片", "{count} images", { count: imageCount })}
+        aria-busy={busy || undefined}
       >
-        {images.map((image, index) => (
+        {images?.map((image, index) => (
           <ImageThumbnail
             key={`${image.id}:${index}`}
             image={image}
@@ -309,6 +420,23 @@ export function ImageStrip({
             onOpen={(selected, source, trigger) => setViewer({ image: selected, source, trigger })}
           />
         ))}
+        {files?.map((file) => (
+          <FileTile
+            key={file.id}
+            file={file}
+            compact={compact}
+            onRemove={onRemoveFile ? () => onRemoveFile(file.id) : undefined}
+            onOpen={setOpenFile}
+          />
+        ))}
+        {busy ? (
+          <li className={`image-strip__item image-strip__item--pending${compact ? " image-strip__item--compact" : ""}`}>
+            <span className="image-strip__placeholder">
+              <LoaderCircle className="spin" aria-hidden="true" />
+            </span>
+            <span className="sr-only" role="status">{t("正在添加附件…", "Adding attachments…")}</span>
+          </li>
+        ) : null}
       </ul>
       {viewer ? (
         <ImageViewer
@@ -318,6 +446,7 @@ export function ImageStrip({
           onClose={closeViewer}
         />
       ) : null}
+      {openFile ? <FileAttachmentPreview file={openFile} onClose={closeFile} /> : null}
     </>
   );
 }

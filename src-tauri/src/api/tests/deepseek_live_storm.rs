@@ -365,6 +365,7 @@ fn deepseek_live_storm_keeps_every_subagent_message() {
         id: "storm-user-1".into(),
         content: storm_script(8, 3),
         images: Vec::new(),
+        files: Vec::new(),
         created_at: "2026-08-27T00:00:00Z".into(),
     }];
     save_api_key(&request.provider.id, &live_api_key()).expect("stash key in test keyring");
@@ -520,6 +521,7 @@ fn deepseek_live_storm_subagents_survive_a_simulated_restart() {
         id: "storm-restart-user-1".into(),
         content: storm_script(3, 1),
         images: Vec::new(),
+        files: Vec::new(),
         created_at: "2026-08-27T00:00:00Z".into(),
     }];
     save_api_key(&request.provider.id, &live_api_key()).expect("stash key in test keyring");

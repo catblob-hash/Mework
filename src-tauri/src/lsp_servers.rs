@@ -54,8 +54,6 @@ pub enum ServerHost {
         /// `run_environment::env_key` of the machine — its identity everywhere
         /// else in the host, and the first component of every key here.
         machine_key: String,
-        /// Human-readable machine name for the settings row and error text.
-        machine_label: String,
     },
 }
 
@@ -71,13 +69,6 @@ impl ServerHost {
 
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local)
-    }
-
-    fn machine_label(&self) -> &str {
-        match self {
-            Self::Local => "",
-            Self::Remote { machine_label, .. } => machine_label,
-        }
     }
 }
 
@@ -476,8 +467,6 @@ pub struct Connection {
     /// Why the reader stopped, when it stopped for a reason worth reporting.
     failure: Arc<Mutex<Option<String>>>,
     shutdown_timeout: Duration,
-    /// The machine the server runs on, for the settings row. Empty here.
-    machine_label: String,
     /// Fires once the stderr drain reaches end of file, so a failure report
     /// can wait for the server's last words rather than race the drain.
     stderr_done: Mutex<Option<mpsc::Receiver<()>>>,
@@ -685,16 +674,6 @@ pub struct LspRegistry {
     inner: Arc<Mutex<Registry>>,
 }
 
-/// What one server looks like from the outside, for the settings row.
-#[derive(Clone, Debug)]
-pub struct LspServerSnapshot {
-    pub name: String,
-    /// The root it indexes, qualified by the machine when that is not this one.
-    pub root: String,
-    pub running: bool,
-    pub detail: String,
-}
-
 impl LspRegistry {
     fn lock(&self) -> MutexGuard<'_, Registry> {
         self.inner
@@ -728,35 +707,6 @@ impl LspRegistry {
         })
     }
 
-    /// Every server this registry currently holds, for the read-only list the
-    /// settings page draws.
-    pub fn snapshot(&self) -> Vec<LspServerSnapshot> {
-        let registry = self.lock();
-        registry
-            .servers
-            .iter()
-            .map(|(key, entry)| LspServerSnapshot {
-                name: key.name.clone(),
-                root: if key.root.machine == crate::run_environment::env_key(None) {
-                    key.root.path.to_string_lossy().into_owned()
-                } else {
-                    let label = entry
-                        .connection
-                        .as_ref()
-                        .map(|connection| connection.machine_label.clone())
-                        .filter(|label| !label.is_empty())
-                        .unwrap_or_else(|| key.root.machine.clone());
-                    format!("{} ({label})", key.root.path.to_string_lossy())
-                },
-                running: entry
-                    .connection
-                    .as_ref()
-                    .is_some_and(|connection| connection.is_alive()),
-                detail: entry.fatal.clone().unwrap_or_default(),
-            })
-            .collect()
-    }
-
     /// Picks the server that claims `path`, out of the ones configured for this
     /// run. The first configuration claiming an extension wins, as in the
     /// source; `configs` therefore arrives in precedence order.
@@ -773,6 +723,21 @@ impl LspRegistry {
                 .get(&extension)
                 .map(|language| (config, language.clone()))
         })
+    }
+
+    /// Whether the server `config` names is already up for `workspace` on
+    /// `host`, without starting it. For a caller that may use a server someone
+    /// else was allowed to start, but may not start it itself.
+    pub fn is_running(&self, host: &ServerHost, config: &LspServerConfig, workspace: &Path) -> bool {
+        let key = ServerKey {
+            root: ServerRoot::new(host, server_root(config, workspace)),
+            name: config.name.clone(),
+        };
+        self.lock()
+            .servers
+            .get(&key)
+            .and_then(|entry| entry.connection.as_ref())
+            .is_some_and(|connection| connection.is_alive())
     }
 
     /// Returns a live server for `path`, starting it if this is the first call
@@ -1228,7 +1193,6 @@ fn attach_server(
         stderr: Arc::new(Mutex::new(String::new())),
         failure: Arc::new(Mutex::new(None)),
         shutdown_timeout: Duration::from_millis(config.shutdown_timeout_millis),
-        machine_label: host.machine_label().to_owned(),
         stderr_done: Mutex::new(None),
     });
 
@@ -2473,7 +2437,6 @@ process.stderr.write("fake server up\n");
                 env: BTreeMap::new(),
             },
             machine_key: "ssh:fake".into(),
-            machine_label: "SSH: fake".into(),
         }
     }
 

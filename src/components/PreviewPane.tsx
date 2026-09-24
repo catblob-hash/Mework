@@ -19,7 +19,6 @@ import {
   previewServerAddress,
   previewUrlIsServedAt,
   readPreviewServerLogs,
-  setPreviewAutoVerify,
   startPreviewServer,
   stopPreviewServer,
   PREVIEW_LOG_POLL_INTERVAL_MS,
@@ -34,30 +33,10 @@ import {
 import { IconButton } from "./Common";
 
 /** `Cf` — the start page lists this many servers before "See all". */
-export const PREVIEW_START_PAGE_LIMIT = 5;
+const PREVIEW_START_PAGE_LIMIT = 5;
 
 /** `zd` — how long the copy confirmation replaces the copy affordance. */
-export const PREVIEW_COPY_FLASH_MS = 1500;
-
-export type PreviewViewportPreset = "responsive" | "mobile" | "tablet";
-
-export interface PreviewViewportSize {
-  width: number;
-  height: number;
-}
-
-/**
- * The sizes `preview_resize` emulates. There is deliberately no desktop preset: "Responsive" is
- * the reset, and its size is the pane itself.
- */
-export const PREVIEW_VIEWPORT_PRESETS: {
-  preset: PreviewViewportPreset;
-  size: PreviewViewportSize | null;
-}[] = [
-  { preset: "responsive", size: null },
-  { preset: "mobile", size: { width: 375, height: 812 } },
-  { preset: "tablet", size: { width: 768, height: 1024 } }
-];
+const PREVIEW_COPY_FLASH_MS = 1500;
 
 /** One row of the server picker: a configuration, joined to the process answering it if any. */
 export interface PreviewServerRow {
@@ -141,7 +120,7 @@ export function previewRowDetail(row: PreviewServerRow): string {
  * Whether the page on screen came from this row's server. The reference marks the bound server
  * with a radio check; Mework has no binding to read, so the committed origin stands in for it.
  */
-export function previewRowIsOpen(row: PreviewServerRow, url: string | null): boolean {
+function previewRowIsOpen(row: PreviewServerRow, url: string | null): boolean {
   return previewUrlIsServedAt(url, previewServerAddress({ port: row.port, url: row.url }));
 }
 
@@ -616,16 +595,14 @@ export function PreviewFileMenuItems({ onOpenFile }: { onOpenFile: () => void })
 /** The logs toggle that sits under the server section. */
 export function PreviewLogsMenuItem({
   expanded,
-  disabled = false,
   onToggle
 }: {
   expanded: boolean;
-  disabled?: boolean;
   onToggle: () => void;
 }) {
   const { t } = useI18n();
   return (
-    <button type="button" role="menuitem" disabled={disabled} onClick={onToggle}>
+    <button type="button" role="menuitem" onClick={onToggle}>
       <span>
         {expanded
           ? t("隐藏开发服务器日志", "Hide dev server logs")
@@ -653,8 +630,6 @@ export interface PreviewServersController {
   stop: (row: PreviewServerRow) => Promise<void>;
   stopAll: () => Promise<void>;
   dismissStopped: () => void;
-  setAutoVerify: (enabled: boolean) => Promise<void>;
-  refresh: () => void;
 }
 
 /**
@@ -694,7 +669,6 @@ export function usePreviewServers(
     setStopped(null);
     activeServer.current = null;
     pendingOpen.current = null;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetKey]);
 
   useEffect(() => {
@@ -742,7 +716,6 @@ export function usePreviewServers(
       cancelled = true;
       window.clearTimeout(timer);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetKey, refreshKey]);
 
   const rows = useMemo(
@@ -841,15 +814,6 @@ export function usePreviewServers(
     setStopped(null);
   }, []);
 
-  const setAutoVerify = useCallback(async (enabled: boolean) => {
-    if (!target) return;
-    try {
-      await setPreviewAutoVerify(target, enabled);
-    } finally {
-      refresh();
-    }
-  }, [target, refresh]);
-
   return {
     configurations,
     rows,
@@ -861,9 +825,7 @@ export function usePreviewServers(
     adopt,
     stop,
     stopAll,
-    dismissStopped: useCallback(() => setStopped(null), []),
-    setAutoVerify,
-    refresh
+    dismissStopped: useCallback(() => setStopped(null), [])
   };
 }
 
@@ -895,5 +857,3 @@ export function usePreviewServerLogs(serverId: string | null, enabled: boolean):
   }, [serverId, enabled]);
   return lines;
 }
-
-export { previewServerAddress };

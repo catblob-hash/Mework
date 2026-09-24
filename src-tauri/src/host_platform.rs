@@ -146,6 +146,8 @@ impl HostPlatform {
     /// The command that hands a path or URL to whatever the desktop opens it
     /// with, or `None` on Windows, which goes through `ShellExecute` instead of
     /// a child process.
+    // Only the non-Windows builds of its callers ask, so a Windows build never does.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn desktop_opener(self) -> Option<&'static str> {
         match self {
             Self::Windows => None,

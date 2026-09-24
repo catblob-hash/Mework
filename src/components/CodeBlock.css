@@ -1,0 +1,74 @@
+/* Code wherever the app shows it: the file pane's numbered viewer and fenced blocks in rendered
+   Markdown share one set of token colours, so the same line reads the same in both. */
+
+/* Lexical shapes only — see `codeHighlight.ts` for why nothing here claims more. */
+.code-token--comment { color: var(--color-777771); font-style: italic; }
+.code-token--string { color: var(--color-246b4e); }
+.code-token--keyword { color: var(--color-6254aa); }
+.code-token--number { color: var(--color-8b611d); }
+.code-token--function { color: var(--color-795d2e); }
+.code-token--type { color: var(--color-267f99); }
+.code-token--meta { color: var(--color-aa4f6a); }
+.code-token--tag { color: var(--color-8e3630); }
+.code-token--attribute { color: var(--color-a56312); }
+.code-token--property { color: var(--color-315eae); }
+.code-token--variable { color: var(--color-315eae); }
+/* A diff's added and removed lines are bands, not just coloured text: the eye scans for the
+   change, and a background carries further than a hue. */
+.code-token--inserted { color: var(--color-287a38); background: var(--color-eaf7f0); }
+.code-token--deleted { color: var(--color-a23737); background: var(--color-fff0f0); }
+
+/* ---- fenced block in rendered Markdown ---- */
+
+.markdown-code { position: relative; }
+.markdown-code > pre { margin: .65em 0; }
+.markdown-code__line .code-token--inserted,
+.markdown-code__line .code-token--deleted { display: inline-block; min-width: 100%; }
+/* The language and the copy button sit over the block's corner and stay out of the way until the
+   block is pointed at: most code in a reply is read, not copied. */
+.markdown-code__bar {
+  position: absolute; top: 5px; right: 5px; z-index: 1;
+  display: flex; align-items: center; gap: 4px;
+  opacity: 0; transition: opacity .12s;
+  pointer-events: none;
+}
+.markdown-code:hover .markdown-code__bar,
+.markdown-code:focus-within .markdown-code__bar { opacity: 1; pointer-events: auto; }
+.markdown-code__language {
+  padding: 0 4px; color: var(--faint); font: 10.5px/20px var(--mono); user-select: none;
+}
+.markdown-code__bar .markdown-code__copy {
+  width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px;
+  background: var(--color-f1f1ee); color: var(--muted);
+}
+.markdown-code__bar .markdown-code__copy:hover { background: var(--hover); color: var(--text); }
+
+/* ---- numbered file view ---- */
+
+.numbered-code {
+  --numbered-code-digits: 3;
+  flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 4px 0;
+  display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden;
+  font: 11.5px/18px var(--mono); tab-size: 2; user-select: text;
+}
+/* Rows keep their own height: as items of the scrolling column they would otherwise shrink to the
+   18px minimum and wrapped lines would draw over the ones below. */
+.numbered-code__line { flex: 0 0 auto; display: flex; align-items: flex-start; min-height: 18px; }
+/* A line jumped to is lit long enough to be found, then released — the same gesture the tree
+   makes when it reveals a row. The transition is on the release so the jump lands instantly. */
+.numbered-code__line { transition: background-color .3s; }
+.numbered-code__line--lit { background: var(--accent-soft); }
+/* The gutter has no background of its own: it is the same surface as the code, so a lit line is
+   one band across both and the column never shows a seam. */
+.numbered-code__number {
+  flex: 0 0 auto; box-sizing: content-box;
+  min-width: calc(var(--numbered-code-digits) * 1ch); padding: 0 10px 0 8px;
+  color: var(--faint); text-align: right; user-select: none;
+}
+/* Wrapping is not a setting here, so the line box always owns its own height. */
+.numbered-code__text {
+  flex: 1 1 auto; min-width: 0; padding-right: 10px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.numbered-code__text .code-token--inserted,
+.numbered-code__text .code-token--deleted { display: inline-block; min-width: 100%; }

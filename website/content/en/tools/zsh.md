@@ -12,3 +12,4 @@ On this machine zsh runs as a login shell (`zsh -l -c`), so `.zprofile` sets up 
 
 - [bash](bash.html), [sh](sh.html), [powershell](powershell.html)
 - [Working with Mework](../working.html#tools-and-approvals)
+- [zsh_find_output](zsh_find_output.html) — only the parts of the output that match a description

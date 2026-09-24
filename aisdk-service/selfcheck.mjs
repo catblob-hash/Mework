@@ -1146,11 +1146,6 @@ async function main() {
     sc.stderr.slice(0, 160),
   );
 
-  let rss = 0;
-  try {
-    rss = process.platform === "win32" ? 0 : 0;
-  } catch {}
-
   // Check 8: exhausting Anthropic native-search `max_uses` must not interrupt the turn.
   sc.send({
     v: V,
@@ -1386,10 +1381,8 @@ async function main() {
     } });
     const done = await sc.wait((f) => f.id === id && ["done", "error"].includes(f.type));
     const expected = ["missing", "unsafe"].includes(mode) ? 0 : mode === "bounded" ? 64 : mode === "search" ? 2 : 1;
-    const events = sc.frames.filter((f) => f.id === id && f.type === "event" && f.event.k === "source");
     check(`provider search sources ${mode}`, done.type === "done" && done.result.sources.length === expected
-      && done.result.calls.length === 0 && events.length === expected
-      && events.every((f, i) => f.event.url === done.result.sources[i].url)
+      && done.result.calls.length === 0
       && (expected === 0 || done.result.sources[0].url === "https://source.example/article"), JSON.stringify(done));
   }
 

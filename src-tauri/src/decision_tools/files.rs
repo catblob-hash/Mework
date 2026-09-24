@@ -1,20 +1,27 @@
 //! `find_content`: which parts of one file contain what a query asks for.
 //!
 //! The executor hands over the file's text (host or remote); this module cuts the requested
-//! line range into chunks, scores them, refines the winners, and renders the hits with the
-//! file's own line numbers so a hit can go straight into `read`.
+//! line range into the file's original blocks, scores every block, and renders every block at
+//! or above the threshold whole, each line with its number in the file, so a hit can go straight
+//! into `read` or `edit`.
+//!
+//! The blocks are the best the file offers: a language server's innermost document symbols when
+//! one answers ([`super::symbols`]), a Markdown file's sections, and otherwise its paragraphs of
+//! indented blocks.
 
-use std::collections::HashMap;
+use std::path::Path;
 
 use crate::cancel::CancelSignal;
-use crate::decision_model::chunk::{chunk_lines_from, refine_chunk, Chunk};
+use crate::decision_model::chunk::Blocks;
 use crate::decision_model::jev::RELEVANCE_RUBRIC;
-use crate::decision_model::search::{render_report, search, Candidate};
+use crate::decision_model::search::{render_report, search};
 use crate::decision_model::{parse_query, parse_threshold};
-use crate::model::JsonObject;
+use crate::model::{JsonObject, ResolvedLanguage};
+use crate::security::ExecutionScope;
+use crate::state::AppState;
 use crate::tool_executor::optional_u64_value;
 
-use super::{failure, jev_scorer};
+use super::{failure, jev_scorer, line_blocks, numbered};
 
 /// The line range a call asks for: `start_line` (1-based, default 1) to `end_line`
 /// (inclusive, default the end of the file). Unlike `read`, there is no line cap: scoring a
@@ -36,45 +43,42 @@ pub(crate) fn parse_line_range(input: &JsonObject) -> Result<(usize, Option<usiz
     ))
 }
 
-/// Builds the coarse candidates and the refinement map for a chunk plan. Labels carry the
-/// source and the line range, which is both how Jev sees `candidate.source` and how the hit
-/// is addressed in the output.
-pub(crate) fn chunk_candidates(
-    source: &str,
-    chunks: &[Chunk],
-) -> (Vec<Candidate>, HashMap<String, Chunk>) {
-    let mut by_label = HashMap::with_capacity(chunks.len());
-    let candidates = chunks
-        .iter()
-        .map(|chunk| {
-            let label = format!("{source} {}", chunk.label());
-            by_label.insert(label.clone(), chunk.clone());
-            Candidate::new(label, chunk.text.clone())
-        })
-        .collect();
-    (candidates, by_label)
+/// `find_content` on this machine: the file read under the usual scope rules, and cut along
+/// the symbols of the language server that claims it when one may be used.
+pub(crate) fn find_content_local(
+    workspace: &Path,
+    input: &JsonObject,
+    scope: &ExecutionScope,
+    state: &AppState,
+    language: ResolvedLanguage,
+    cancel: &CancelSignal,
+) -> Result<String, String> {
+    let (display, content, path) =
+        crate::tool_executor::read_text_for_scoring(workspace, input, scope)?;
+    find_content(
+        &display,
+        &content,
+        || {
+            super::symbols::document_symbols(
+                &state.lsp_servers,
+                workspace,
+                &path,
+                &content,
+                language,
+            )
+        },
+        input,
+        cancel,
+    )
 }
 
-/// The refinement step for line chunks: a winner is cut into its pieces, each labelled with
-/// its own line range.
-pub(crate) fn refine_line_chunk(
-    source: &str,
-    by_label: &HashMap<String, Chunk>,
-    candidate: &Candidate,
-) -> Vec<Candidate> {
-    let Some(chunk) = by_label.get(&candidate.label) else {
-        return Vec::new();
-    };
-    refine_chunk(chunk)
-        .into_iter()
-        .map(|piece| Candidate::new(format!("{source} {}", piece.label()), piece.text))
-        .collect()
-}
-
-/// Scores the requested range of `content`, which came from `display_path`.
+/// Scores the requested range of `content`, which came from `display_path` — every line of it,
+/// in as many requests as its chunks take. `symbols` is asked for the file's document symbols
+/// (1-based line spans) only once the call is known to score something.
 pub(crate) fn find_content(
     display_path: &str,
     content: &str,
+    symbols: impl FnOnce() -> Option<Vec<(usize, usize)>>,
     input: &JsonObject,
     cancel: &CancelSignal,
 ) -> Result<String, String> {
@@ -92,35 +96,60 @@ pub(crate) fn find_content(
         ));
     }
     let end_line = end_line.map_or(lines.len(), |line| line.min(lines.len()));
-    let region = lines[start_line - 1..end_line].join("\n");
-    let plan = chunk_lines_from(&region, start_line);
     let scorer = jev_scorer(RELEVANCE_RUBRIC)?;
-    let (coarse, by_label) = chunk_candidates(display_path, &plan.chunks);
-    let report = search(
-        scorer,
-        &query,
-        threshold,
-        coarse,
-        |candidate| refine_line_chunk(display_path, &by_label, candidate),
-        cancel,
-    )
-    .map_err(failure)?;
-    let mut text = render_report(
+    let region = lines[start_line - 1..end_line].join("\n");
+    let material = content_blocks(display_path, &region, start_line, symbols);
+    let blocks = line_blocks(&material, display_path, start_line);
+    let report = search(scorer, &query, threshold, &blocks, cancel).map_err(failure)?;
+    Ok(render_report(
         &report,
         &query,
         threshold,
-        &format!("chunks of {display_path}"),
-        true,
-    );
-    if plan.covered_lines < plan.total_lines {
-        text.push_str(&format!(
-            "\n\nOnly lines {start_line}-{} of the requested {start_line}-{end_line} were scored; \
-             call again with start_line {} to continue.",
-            start_line + plan.covered_lines - 1,
-            start_line + plan.covered_lines
-        ));
+        &format!("blocks of {display_path}"),
+        |hit| Some(numbered(&material, material.spans()[hit.block], start_line)),
+    ))
+}
+
+/// How a region of a file is cut. Markdown by its sections, which no language server is
+/// needed for; code by its symbols when a server reported them, their spans moved into the
+/// region's own numbering and clipped to it; anything else by paragraphs of indented blocks.
+fn content_blocks(
+    display_path: &str,
+    region: &str,
+    start_line: usize,
+    symbols: impl FnOnce() -> Option<Vec<(usize, usize)>>,
+) -> Blocks {
+    if is_markdown(display_path) {
+        return Blocks::markdown(region);
     }
-    Ok(text)
+    let Some(spans) = symbols() else {
+        return Blocks::text(region);
+    };
+    let count = region.lines().count();
+    let offset = start_line - 1;
+    let spans = spans
+        .into_iter()
+        .filter(|&(first, last)| last > offset && first <= offset + count && first <= last)
+        .map(|(first, last)| {
+            (
+                first.saturating_sub(offset).max(1),
+                (last - offset).min(count),
+            )
+        })
+        .collect::<Vec<_>>();
+    Blocks::symbols(region, &spans)
+}
+
+fn is_markdown(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdx"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -148,37 +177,59 @@ mod tests {
             .is_err());
     }
 
+    /// The blocks follow the file: Markdown by section whatever a server says, code by the
+    /// symbols it was given — moved into the region's numbering — and indentation otherwise;
+    /// labels and line numbers are the file's own.
     #[test]
-    fn chunk_candidates_are_labelled_with_source_and_range_and_refine_by_label() {
-        let content = (1..=40)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let plan = chunk_lines_from(&content, 1);
-        let (coarse, by_label) = chunk_candidates("src/a.ts", &plan.chunks);
-        assert_eq!(coarse[0].label, "src/a.ts lines 1-16");
-        assert_eq!(coarse[0].text.lines().count(), 16);
-        let pieces = refine_line_chunk("src/a.ts", &by_label, &coarse[0]);
-        assert_eq!(pieces.len(), 6);
-        assert_eq!(pieces[0].label, "src/a.ts lines 1-3");
-        assert_eq!(pieces[5].label, "src/a.ts line 16");
-        // An unknown label — not one this plan produced — refines to nothing.
-        assert!(refine_line_chunk("src/a.ts", &by_label, &Candidate::new("x", "y")).is_empty());
+    fn the_region_is_cut_into_the_best_blocks_the_file_offers() {
+        let code = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}";
+        let blocks = content_blocks("src/a.rs", code, 1, || None);
+        let labels = line_blocks(&blocks, "src/a.rs", 1)
+            .into_iter()
+            .map(|block| block.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["src/a.rs lines 1-3", "src/a.rs lines 5-7"]);
+
+        // A region starting at line 11: the server's spans are in file lines, and one of them
+        // began above the region.
+        let asked = std::cell::Cell::new(false);
+        let symbols = content_blocks("src/a.rs", code, 11, || {
+            asked.set(true);
+            Some(vec![(9, 13), (15, 17), (40, 50)])
+        });
+        assert!(asked.get());
+        let labels = line_blocks(&symbols, "src/a.rs", 11)
+            .into_iter()
+            .map(|block| block.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["src/a.rs lines 11-13", "src/a.rs lines 15-17"]);
+        // The model reads the lines back numbered as the file numbers them.
+        assert_eq!(
+            numbered(&symbols, symbols.spans()[1], 11),
+            "    15\tfn b() {\n    16\t    two();\n    17\t}"
+        );
+
+        // Markdown never asks a server.
+        let markdown = content_blocks("docs/guide.MD", "# A\ntext\n# B\nmore", 1, || {
+            panic!("a Markdown file needs no language server")
+        });
+        assert_eq!(markdown.spans(), &[(1, 2), (3, 4)]);
     }
 
     /// Argument errors surface before any credential is read or request made.
     #[test]
     fn missing_arguments_fail_before_the_decision_model_is_consulted() {
         let cancel = CancelSignal::default();
-        let error = find_content("a.txt", "x", &input(&[("threshold", json!(0.5))]), &cancel)
+        let error = find_content("a.txt", "x", || None, &input(&[("threshold", json!(0.5))]), &cancel)
             .unwrap_err();
         assert!(error.contains("query"), "{error}");
-        let error = find_content("a.txt", "x", &input(&[("query", json!("q"))]), &cancel)
+        let error = find_content("a.txt", "x", || None, &input(&[("query", json!("q"))]), &cancel)
             .unwrap_err();
         assert!(error.contains("threshold"), "{error}");
         let error = find_content(
             "a.txt",
             "x\ny",
+            || None,
             &input(&[
                 ("query", json!("q")),
                 ("threshold", json!(0.5)),
@@ -191,6 +242,7 @@ mod tests {
         let text = find_content(
             "a.txt",
             "",
+            || None,
             &input(&[("query", json!("q")), ("threshold", json!(0.5))]),
             &cancel,
         )

@@ -37,8 +37,8 @@ use serde_json::Value;
 
 use crate::{
     model::{
-        canonical_subagent_execution_mode_payload, ContextItem, ImageAttachment, ModelUsage,
-        QueuedSubagentMessage, RunModelRequest, SubagentRunKind, SubagentRunRecord,
+        canonical_subagent_execution_mode_payload, ContextItem, FileAttachment, ImageAttachment,
+        ModelUsage, QueuedSubagentMessage, RunModelRequest, SubagentRunKind, SubagentRunRecord,
         SubagentRunStatus, SubagentUpdate,
     },
     prompt_profile::PromptKey,
@@ -347,6 +347,7 @@ pub struct MailboxMessage {
     pub id: Option<String>,
     pub content: String,
     pub images: Vec<ImageAttachment>,
+    pub files: Vec<FileAttachment>,
     pub created_at: Option<String>,
 }
 
@@ -364,6 +365,7 @@ impl AgentMailbox {
             id: None,
             content: message,
             images: Vec::new(),
+            files: Vec::new(),
             created_at: None,
         });
     }

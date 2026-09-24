@@ -69,31 +69,6 @@ export function grantsWebFetch(
   }
 }
 
-/**
- * Whether these settings grant `web_search` at all.
- *
- * The search leg used to be implied by web access being on, and the host could
- * be trusted to have granted it. It cannot any more: a conversation may name no
- * search backend while still naming a fetch backend, which is a conversation
- * that retrieves pages it is given and never goes looking for one.
- */
-export function grantsWebSearch(
-  webSearchEnabled: boolean,
-  conversation: ConversationWebSearchSettings,
-  assets: WebSearchAssets
-): boolean {
-  if (!webSearchEnabled) return false;
-  switch (conversation.provider.kind) {
-    case "disabled":
-    case "unavailable":
-      return false;
-    case "native":
-      return true;
-    case "explicit":
-      return resolvesBackend(assets, conversation.provider.providerKind, "searchKeywords");
-  }
-}
-
 /** A catalog backend resolves when it has the capability and is switched on. */
 function resolvesBackend(
   assets: WebSearchAssets,

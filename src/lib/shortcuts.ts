@@ -24,7 +24,7 @@ export interface ShortcutCommand {
   editable: boolean;
 }
 
-export const SHORTCUT_MODIFIERS = ["Control", "Alt", "Shift", "Meta"] as const;
+const SHORTCUT_MODIFIERS = ["Control", "Alt", "Shift", "Meta"] as const;
 const MODIFIER_SET = new Set<string>(SHORTCUT_MODIFIERS);
 
 export const SHORTCUT_COMMANDS: readonly ShortcutCommand[] = [
@@ -47,15 +47,7 @@ export const SHORTCUT_COMMANDS: readonly ShortcutCommand[] = [
 
 export const SHORTCUT_GROUP_ORDER: readonly ShortcutGroup[] = ["general", "conversation", "message", "panel"];
 
-const COMMANDS_BY_ID = new Map<string, ShortcutCommand>(
-  SHORTCUT_COMMANDS.map((command) => [command.id, command])
-);
-
-export function shortcutCommand(id: string): ShortcutCommand | undefined {
-  return COMMANDS_BY_ID.get(id);
-}
-
-export function isModifierToken(token: KeyToken): boolean {
+function isModifierToken(token: KeyToken): boolean {
   return MODIFIER_SET.has(token);
 }
 

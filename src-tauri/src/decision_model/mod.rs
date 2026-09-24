@@ -42,12 +42,6 @@ impl DecisionProviderKind {
         }
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Typesafe => "TypeSafe",
-        }
-    }
-
     pub fn from_slug(slug: &str) -> Option<Self> {
         Self::CATALOG.iter().copied().find(|kind| kind.slug() == slug)
     }

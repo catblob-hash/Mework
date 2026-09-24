@@ -9,18 +9,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
 use wait_timeout::ChildExt;
-
-#[path = "managed_mcp_http.rs"]
-mod managed_mcp_http;
-use managed_mcp_http::{
-    acquire_managed_http_sidecar, validate_managed_http_launch, ManagedHttpLaunch,
-    ManagedHttpSidecar,
-};
 
 pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const COMPATIBLE_PROTOCOL_VERSIONS: &[&str] =
@@ -118,16 +111,6 @@ pub enum RuntimeMcpTransport {
         url: String,
         headers: BTreeMap<String, String>,
     },
-    #[allow(dead_code)]
-    ManagedHttp {
-        command: String,
-        args: Vec<String>,
-        env: BTreeMap<String, String>,
-        cwd: Option<String>,
-        env_passthrough: Vec<String>,
-        url: String,
-        headers: BTreeMap<String, String>,
-    },
 }
 
 impl fmt::Debug for RuntimeMcpTransport {
@@ -143,21 +126,6 @@ impl fmt::Debug for RuntimeMcpTransport {
             Self::Http { headers, .. } => formatter
                 .debug_struct("Http")
                 .field("url", &"<redacted>")
-                .field("header_count", &headers.len())
-                .finish(),
-            Self::ManagedHttp {
-                args,
-                env,
-                cwd,
-                headers,
-                ..
-            } => formatter
-                .debug_struct("ManagedHttp")
-                .field("command", &"<redacted>")
-                .field("argument_count", &args.len())
-                .field("environment_count", &env.len())
-                .field("has_working_directory", &cwd.is_some())
-                .field("url", &"<loopback>")
                 .field("header_count", &headers.len())
                 .finish(),
         }
@@ -418,7 +386,6 @@ impl fmt::Debug for McpToolBinding {
         let transport = match &self.server.transport {
             RuntimeMcpTransport::Stdio { .. } => "stdio",
             RuntimeMcpTransport::Http { .. } => "http",
-            RuntimeMcpTransport::ManagedHttp { .. } => "managed-http",
         };
         formatter
             .debug_struct("McpToolBinding")
@@ -598,83 +565,9 @@ impl McpClient {
         Ok(Self { options })
     }
 
-    #[allow(dead_code)]
-    pub fn discover_tools(
-        &self,
-        servers: &[RuntimeMcpServer],
-    ) -> Result<Vec<McpToolBinding>, McpError> {
-        let report = self.discover_tools_report(servers);
-        if let Some(failure) = report.failures.first() {
-            return Err(McpError {
-                kind: failure.kind,
-                server_id: Some(failure.server_id.clone()),
-                message: failure.message.clone(),
-            });
-        }
-        Ok(report.bindings)
-    }
-
-    /// Best-effort discovery used by model runs. Every server is an isolation
-    /// boundary: a broken or malicious server is reported and skipped without
-    /// removing tools successfully discovered from other servers.
-    pub fn discover_tools_report(&self, servers: &[RuntimeMcpServer]) -> McpDiscoveryReport {
-        let mut report = McpDiscoveryReport::default();
-        let mut exposed_names = HashSet::new();
-        let deadline = Instant::now()
-            .checked_add(self.options.discovery_timeout)
-            .unwrap_or_else(Instant::now);
-        for (index, server) in servers.iter().enumerate() {
-            if index >= MAX_SERVERS {
-                let error = McpError::new(
-                    McpErrorKind::Bounds,
-                    format!("At most {MAX_SERVERS} MCP servers can be connected per run"),
-                );
-                report
-                    .failures
-                    .push(McpDiscoveryFailure::from_error(server, &error));
-                break;
-            }
-            if Instant::now() >= deadline {
-                report.deadline_reached = true;
-                let error = McpError::new(
-                    McpErrorKind::Timeout,
-                    "MCP tool discovery exceeded the global time budget",
-                );
-                for pending in &servers[index..servers.len().min(MAX_SERVERS)] {
-                    report
-                        .failures
-                        .push(McpDiscoveryFailure::from_error(pending, &error));
-                }
-                break;
-            }
-            let server_bindings = match self.discover_server_tools_until(server, Some(deadline)) {
-                Ok(bindings) => bindings,
-                Err(error) => {
-                    if error.kind == McpErrorKind::Timeout && Instant::now() >= deadline {
-                        report.deadline_reached = true;
-                    }
-                    report
-                        .failures
-                        .push(McpDiscoveryFailure::from_error(server, &error));
-                    continue;
-                }
-            };
-            if let Err(error) = merge_discovered_bindings(
-                &mut report,
-                &mut exposed_names,
-                server_bindings,
-                self.options.max_total_schema_bytes,
-            ) {
-                report
-                    .failures
-                    .push(McpDiscoveryFailure::from_error(server, &error));
-            }
-        }
-        report
-    }
-
-    /// Single-server discovery. Conversations discover through [`Self::discover_tools`] over the
-    /// whole enabled set, so this narrower entry point covers the transport tests below.
+    /// Single-server discovery. Conversations discover through
+    /// [`McpSessionManager::discover_for_conversation`] over the whole enabled set, so this
+    /// narrower entry point covers the transport tests below.
     #[cfg(test)]
     pub fn discover_server_tools(
         &self,
@@ -691,6 +584,7 @@ impl McpClient {
         self.discover_server_tools_until(server, Some(deadline))
     }
 
+    #[cfg(test)]
     fn discover_server_tools_until(
         &self,
         server: &RuntimeMcpServer,
@@ -707,88 +601,33 @@ impl McpClient {
 
     /// Settings connectivity probe: connects, handshakes, lists tools/prompts/
     /// resources, then disconnects. Failure results retain stderr diagnostics.
-    ///
-    /// `abort` is the in-flight registration's token, when the probe is
-    /// cancellable. Abandoning it terminates a stdio child at once, and every
-    /// phase boundary re-reads it so no further request is issued. Cancelling
-    /// tears the connection down, so the transport reports a closed pipe or a
-    /// timeout; the probe reports [`McpErrorKind::Cancelled`] instead of that
-    /// symptom, and never absorbs a cancellation into an empty optional section
-    /// that would let the probe finish as a success.
     fn probe_server(
         &self,
         server: &RuntimeMcpServer,
-        abort: Option<&Arc<ManagedAbortToken>>,
     ) -> Result<McpProbeOutcome, (McpError, Vec<String>)> {
         let deadline = Instant::now().checked_add(self.options.discovery_timeout);
         validate_runtime_server(server).map_err(|error| (error.for_server(server), Vec::new()))?;
-        if probe_cancelled(abort) {
-            return Err((probe_cancelled_error().for_server(server), Vec::new()));
-        }
         let (mut connection, session_info) =
-            initialize_connection(server, self.options, deadline, None, abort.cloned()).map_err(
-                |error| {
-                    (
-                        probe_outcome_error(error, abort).for_server(server),
-                        Vec::new(),
-                    )
-                },
-            )?;
+            initialize_connection(server, self.options, deadline, None, None)
+                .map_err(|error| (error.for_server(server), Vec::new()))?;
 
         let request_timeout = self.options.request_timeout;
-        if probe_cancelled(abort) {
-            return Err((
-                probe_cancelled_error().for_server(server),
-                connection.diagnostics(),
-            ));
-        }
         let tools = match list_tools(&mut connection, request_timeout, deadline) {
             Ok(tools) => tools,
-            Err(error) => {
-                return Err((
-                    probe_outcome_error(error, abort).for_server(server),
-                    connection.diagnostics(),
-                ))
-            }
+            Err(error) => return Err((error.for_server(server), connection.diagnostics())),
         };
         // Prompts and resources are optional. Do not query undeclared support;
         // failures there leave only that section empty, while tools are required.
-        // A cancellation is not such a failure: swallowing it here would report a
-        // probe the user stopped as a successful connection.
-        let prompts = if session_info.supports_prompts && !probe_cancelled(abort) {
-            match list_prompts(&mut connection, request_timeout, deadline) {
-                Ok(prompts) => prompts,
-                Err(_) if probe_cancelled(abort) => {
-                    return Err((
-                        probe_cancelled_error().for_server(server),
-                        connection.diagnostics(),
-                    ))
-                }
-                Err(_) => Vec::new(),
-            }
+        let prompts = if session_info.supports_prompts {
+            list_prompts(&mut connection, request_timeout, deadline).unwrap_or_default()
         } else {
             Vec::new()
         };
-        let resources = if session_info.supports_resources && !probe_cancelled(abort) {
-            match list_resources(&mut connection, request_timeout, deadline) {
-                Ok(resources) => resources,
-                Err(_) if probe_cancelled(abort) => {
-                    return Err((
-                        probe_cancelled_error().for_server(server),
-                        connection.diagnostics(),
-                    ))
-                }
-                Err(_) => Vec::new(),
-            }
+        let resources = if session_info.supports_resources {
+            list_resources(&mut connection, request_timeout, deadline).unwrap_or_default()
         } else {
             Vec::new()
         };
-        if probe_cancelled(abort) {
-            return Err((
-                probe_cancelled_error().for_server(server),
-                connection.diagnostics(),
-            ));
-        }
 
         Ok(McpProbeOutcome {
             protocol_version: session_info.protocol_version.clone(),
@@ -839,160 +678,12 @@ impl McpClient {
     }
 }
 
-/// Maximum bytes in a renderer-minted probe id.
-const MAX_PROBE_ID_BYTES: usize = 128;
-/// Cancels that arrive before their probe registers are remembered so the probe
-/// never starts. Ids are minted per probe, so an entry no probe ever claims only
-/// ages out of this bounded queue.
-const MAX_PENDING_PROBE_CANCELS: usize = 64;
-
-/// Settings-page probes the user can cancel.
-///
-/// Registration is keyed by the renderer-minted probe id rather than by server id,
-/// so a cancel reaches exactly the dial the catalog row started: never a second
-/// probe of the same server, and never a conversation's pooled session.
-static PROBE_REGISTRY: OnceLock<Mutex<ProbeRegistry>> = OnceLock::new();
-
-#[derive(Default)]
-struct ProbeRegistry {
-    live: HashMap<String, Arc<ManagedAbortToken>>,
-    cancelled_before_start: VecDeque<String>,
-}
-
-fn probe_registry() -> &'static Mutex<ProbeRegistry> {
-    PROBE_REGISTRY.get_or_init(|| Mutex::new(ProbeRegistry::default()))
-}
-
-fn lock_probe_registry() -> std::sync::MutexGuard<'static, ProbeRegistry> {
-    probe_registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn validate_probe_id(probe_id: &str) -> Result<(), McpError> {
-    if probe_id.is_empty() || probe_id.len() > MAX_PROBE_ID_BYTES {
-        return Err(McpError::new(
-            McpErrorKind::InvalidConfiguration,
-            "MCP probe id must be between 1 and 128 bytes",
-        ));
-    }
-    if !probe_id
-        .chars()
-        .all(|value| value.is_ascii_alphanumeric() || value == '-' || value == '_')
-    {
-        return Err(McpError::new(
-            McpErrorKind::InvalidConfiguration,
-            "MCP probe id must use ASCII letters, digits, '-' or '_'",
-        ));
-    }
-    Ok(())
-}
-
-/// One registered probe. Dropping it releases the registration, so success,
-/// failure, cancellation and panic all reclaim the entry.
-pub struct McpProbeLease {
-    probe_id: String,
-    abort: Arc<ManagedAbortToken>,
-}
-
-impl McpProbeLease {
-    fn abort(&self) -> &Arc<ManagedAbortToken> {
-        &self.abort
-    }
-}
-
-impl fmt::Debug for McpProbeLease {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("McpProbeLease")
-            .field("probe_id", &self.probe_id)
-            .field("cancelled", &self.abort.is_abandoned())
-            .finish()
-    }
-}
-
-impl Drop for McpProbeLease {
-    fn drop(&mut self) {
-        let mut registry = lock_probe_registry();
-        // Remove only this lease's own registration: a later probe that reused the
-        // id owns its own entry.
-        if registry
-            .live
-            .get(&self.probe_id)
-            .is_some_and(|token| Arc::ptr_eq(token, &self.abort))
-        {
-            registry.live.remove(&self.probe_id);
-        }
-    }
-}
-
-/// Registers a probe. A cancel that arrived before the worker got here wins,
-/// because the user asked for it before any connection existed.
-pub fn begin_probe(probe_id: &str) -> Result<McpProbeLease, McpError> {
-    validate_probe_id(probe_id)?;
-    let mut registry = lock_probe_registry();
-    if let Some(index) = registry
-        .cancelled_before_start
-        .iter()
-        .position(|pending| pending == probe_id)
-    {
-        registry.cancelled_before_start.remove(index);
-        return Err(probe_cancelled_error());
-    }
-    if registry.live.contains_key(probe_id) {
-        return Err(McpError::new(
-            McpErrorKind::InvalidConfiguration,
-            "MCP probe id is already in flight",
-        ));
-    }
-    let abort = Arc::new(ManagedAbortToken::default());
-    registry.live.insert(probe_id.to_owned(), abort.clone());
-    Ok(McpProbeLease {
-        probe_id: probe_id.to_owned(),
-        abort,
-    })
-}
-
-/// Cancels one probe. Idempotent: cancelling an unknown, already finished or
-/// already cancelled probe succeeds without touching anything else.
-pub fn cancel_probe(probe_id: &str) -> Result<(), McpError> {
-    validate_probe_id(probe_id)?;
-    let token = {
-        let mut registry = lock_probe_registry();
-        match registry.live.get(probe_id) {
-            Some(token) => Some(token.clone()),
-            None => {
-                if !registry
-                    .cancelled_before_start
-                    .iter()
-                    .any(|pending| pending == probe_id)
-                {
-                    if registry.cancelled_before_start.len() >= MAX_PENDING_PROBE_CANCELS {
-                        registry.cancelled_before_start.pop_front();
-                    }
-                    registry
-                        .cancelled_before_start
-                        .push_back(probe_id.to_owned());
-                }
-                None
-            }
-        }
-    };
-    // Terminating a stdio child blocks, so it must not happen under the lock.
-    if let Some(token) = token {
-        token.abandon();
-    }
-    Ok(())
-}
-
-/// Runs one settings probe that `probe_id` can cancel. Production timeouts and
-/// schema limits keep probe results comparable with runs.
+/// Runs one settings probe. Production timeouts and schema limits keep probe
+/// results comparable with runs.
 pub fn probe_server_for_settings(
     server: &RuntimeMcpServer,
-    probe_id: &str,
 ) -> Result<McpProbeOutcome, (McpError, Vec<String>)> {
-    let lease = begin_probe(probe_id).map_err(|error| (error.for_server(server), Vec::new()))?;
-    McpClient::default().probe_server(server, Some(lease.abort()))
+    McpClient::default().probe_server(server)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1546,26 +1237,6 @@ impl McpSessionManager {
             .map_err(|error| error.for_server(&binding.server))
     }
 
-    #[allow(dead_code)]
-    pub fn evict_artifact(&self, artifact_id: &str) {
-        let removed = {
-            let mut entries = self
-                .inner
-                .entries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let keys = entries
-                .keys()
-                .filter(|key| key.artifact_id == artifact_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| entries.remove(&key))
-                .collect::<Vec<_>>()
-        };
-        drop(removed);
-    }
-
     pub fn evict_conversations<'a>(&self, conversation_ids: impl IntoIterator<Item = &'a str>) {
         let requested = conversation_ids
             .into_iter()
@@ -2014,26 +1685,6 @@ fn cancelled_error() -> McpError {
     McpError::new(McpErrorKind::Cancelled, "MCP operation was cancelled")
 }
 
-/// Whether the settings probe holding `abort` has been cancelled. A probe without
-/// a registration (discovery, tests) can never be cancelled this way.
-fn probe_cancelled(abort: Option<&Arc<ManagedAbortToken>>) -> bool {
-    abort.is_some_and(|token| token.is_abandoned())
-}
-
-fn probe_cancelled_error() -> McpError {
-    McpError::new(McpErrorKind::Cancelled, "MCP probe was cancelled")
-}
-
-/// Cancelling tears the connection down, so the transport reports a closed pipe or
-/// a timeout. Report the cause the user chose rather than the symptom it produced.
-fn probe_outcome_error(error: McpError, abort: Option<&Arc<ManagedAbortToken>>) -> McpError {
-    if probe_cancelled(abort) {
-        probe_cancelled_error()
-    } else {
-        error
-    }
-}
-
 fn validate_managed_conversation_id(conversation_id: &str) -> Result<(), McpError> {
     if conversation_id.trim().is_empty()
         || conversation_id.len() > 512
@@ -2089,38 +1740,6 @@ fn runtime_server_fingerprint(server: &RuntimeMcpServer) -> [u8; 32] {
         }
         RuntimeMcpTransport::Http { url, headers } => {
             fingerprint_field(&mut hasher, b"http");
-            fingerprint_field(&mut hasher, url.as_bytes());
-            for (name, value) in headers {
-                fingerprint_field(&mut hasher, name.as_bytes());
-                fingerprint_field(&mut hasher, value.as_bytes());
-            }
-        }
-        RuntimeMcpTransport::ManagedHttp {
-            command,
-            args,
-            env,
-            cwd,
-            env_passthrough,
-            url,
-            headers,
-        } => {
-            fingerprint_field(&mut hasher, b"managed-http");
-            fingerprint_field(&mut hasher, command.as_bytes());
-            for argument in args {
-                fingerprint_field(&mut hasher, argument.as_bytes());
-            }
-            for (name, value) in env {
-                fingerprint_field(&mut hasher, name.as_bytes());
-                fingerprint_field(&mut hasher, value.as_bytes());
-            }
-            fingerprint_field(&mut hasher, &(env_passthrough.len() as u64).to_be_bytes());
-            for name in env_passthrough {
-                fingerprint_field(&mut hasher, name.as_bytes());
-            }
-            match cwd {
-                Some(cwd) => fingerprint_field(&mut hasher, cwd.as_bytes()),
-                None => fingerprint_field(&mut hasher, b"<no-cwd>"),
-            }
             fingerprint_field(&mut hasher, url.as_bytes());
             for (name, value) in headers {
                 fingerprint_field(&mut hasher, name.as_bytes());
@@ -2248,13 +1867,6 @@ fn tool_requires_user_interaction(meta: Option<&Value>) -> bool {
     // value is treated as mandatory rather than allowing Full Access to erase
     // a safety signal from an untrusted server.
     value.as_bool().unwrap_or(true)
-}
-
-#[allow(dead_code)]
-pub fn discover_tools_strict(servers: &[RuntimeMcpServer]) -> Result<Vec<McpToolBinding>, String> {
-    McpClient::default()
-        .discover_tools(servers)
-        .map_err(|error| error.to_string())
 }
 
 pub fn is_compatible_protocol_version(version: &str) -> bool {
@@ -2418,25 +2030,6 @@ fn validate_runtime_server(server: &RuntimeMcpServer) -> Result<(), McpError> {
         }
         RuntimeMcpTransport::Http { url, headers } => {
             validate_http_endpoint(url)?;
-            build_header_map(headers)?;
-        }
-        RuntimeMcpTransport::ManagedHttp {
-            command,
-            args,
-            env,
-            cwd,
-            env_passthrough,
-            url,
-            headers,
-        } => {
-            validate_managed_http_launch(&ManagedHttpLaunch {
-                command: command.clone(),
-                args: args.clone(),
-                env: env.clone(),
-                cwd: cwd.clone(),
-                env_passthrough: env_passthrough.clone(),
-                url: url.clone(),
-            })?;
             build_header_map(headers)?;
         }
     }
@@ -2750,51 +2343,10 @@ fn initialize_connection(
             options.request_timeout,
             options.shutdown_timeout,
         )?),
-        RuntimeMcpTransport::ManagedHttp {
-            command,
-            args,
-            env,
-            cwd,
-            env_passthrough,
-            url,
-            headers,
-        } => {
-            let launch_timeout = operation_timeout(options.request_timeout, deadline)?;
-            let launch_deadline = Instant::now().checked_add(launch_timeout).ok_or_else(|| {
-                McpError::new(
-                    McpErrorKind::Bounds,
-                    "Managed MCP launch timeout is invalid",
-                )
-            })?;
-            let sidecar = acquire_managed_http_sidecar(
-                ManagedHttpLaunch {
-                    command: command.clone(),
-                    args: args.clone(),
-                    env: env.clone(),
-                    cwd: cwd.clone(),
-                    env_passthrough: env_passthrough.clone(),
-                    url: url.clone(),
-                },
-                launch_deadline,
-                operation_abort.as_deref().map(|abort| &abort.abandoned),
-                session_abort.as_deref().map(|abort| &abort.abandoned),
-            )?;
-            let http = HttpSession::new(
-                sidecar.url(),
-                headers,
-                options.request_timeout,
-                options.shutdown_timeout,
-            )?;
-            ConnectionTransport::ManagedHttp(ManagedHttpSession {
-                http,
-                _sidecar: sidecar,
-            })
-        }
     };
     let mut transport = transport;
     let http = match &mut transport {
         ConnectionTransport::Http(session) => Some(session),
-        ConnectionTransport::ManagedHttp(session) => Some(&mut session.http),
         ConnectionTransport::Stdio(_) => None,
     };
     if let Some(http) = http {
@@ -2844,10 +2396,8 @@ fn initialize_connection(
             ),
         ));
     }
-    if matches!(
-        &server.transport,
-        RuntimeMcpTransport::Http { .. } | RuntimeMcpTransport::ManagedHttp { .. }
-    ) && protocol_version == "2024-11-05"
+    if matches!(&server.transport, RuntimeMcpTransport::Http { .. })
+        && protocol_version == "2024-11-05"
     {
         return Err(McpError::new(
             McpErrorKind::Protocol,
@@ -3361,14 +2911,6 @@ impl McpConnection {
 enum ConnectionTransport {
     Stdio(StdioSession),
     Http(HttpSession),
-    ManagedHttp(ManagedHttpSession),
-}
-
-struct ManagedHttpSession {
-    // Declare HTTP first so its Drop sends the MCP session DELETE while the
-    // sidecar is still alive; the Arc then releases the pooled process.
-    http: HttpSession,
-    _sidecar: Arc<ManagedHttpSidecar>,
 }
 
 impl ConnectionTransport {
@@ -3381,14 +2923,12 @@ impl ConnectionTransport {
         match self {
             Self::Stdio(session) => session.exchange(payload, expected_id, timeout),
             Self::Http(session) => session.exchange(payload, expected_id, timeout),
-            Self::ManagedHttp(session) => session.http.exchange(payload, expected_id, timeout),
         }
     }
 
     fn set_protocol_version(&mut self, version: &str) -> Result<(), McpError> {
         match self {
             Self::Http(session) => session.set_protocol_version(version)?,
-            Self::ManagedHttp(session) => session.http.set_protocol_version(version)?,
             Self::Stdio(_) => {}
         }
         Ok(())
@@ -3398,7 +2938,7 @@ impl ConnectionTransport {
         match self {
             Self::Stdio(session) => session.pump_idle(frame_budget),
             // Streamable HTTP has no client-owned long-lived GET stream.
-            Self::Http(_) | Self::ManagedHttp(_) => Ok(()),
+            Self::Http(_) => Ok(()),
         }
     }
 
@@ -3406,7 +2946,6 @@ impl ConnectionTransport {
         match self {
             Self::Stdio(session) => abort.register_stdio(&session.process),
             Self::Http(session) => session.abort.operation = Some(abort.clone()),
-            Self::ManagedHttp(session) => session.http.abort.operation = Some(abort.clone()),
         }
     }
 
@@ -3414,14 +2953,13 @@ impl ConnectionTransport {
         match self {
             Self::Stdio(session) => abort.clear_stdio(&session.process),
             Self::Http(session) => session.abort.operation = None,
-            Self::ManagedHttp(session) => session.http.abort.operation = None,
         }
     }
 
     fn diagnostics(&self) -> Vec<String> {
         match self {
             Self::Stdio(session) => session.diagnostics.snapshot(),
-            Self::Http(_) | Self::ManagedHttp(_) => Vec::new(),
+            Self::Http(_) => Vec::new(),
         }
     }
 }
@@ -4815,7 +4353,7 @@ fn slug(value: &str, fallback: &str, maximum: usize) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn stdio_env(server: &RuntimeMcpServer) -> BTreeMap<String, String> {
         match &server.transport {
@@ -5453,7 +4991,7 @@ process.stdin.on("data", (chunk) => {
     }
 
     #[test]
-    fn resilient_discovery_isolates_a_bad_server_but_strict_probe_fails() {
+    fn resilient_discovery_isolates_a_bad_server() {
         if !node_available() {
             return;
         }
@@ -5470,14 +5008,17 @@ process.stdin.on("data", (chunk) => {
             cwd: None,
             env_passthrough: Vec::new(),
         };
-        let client = McpClient::new(test_options()).unwrap();
+        let manager = McpSessionManager::new(test_options(), 2, Duration::from_secs(30)).unwrap();
         let servers = vec![invalid, mock_server()];
-        let report = client.discover_tools_report(&servers);
+        let report = manager.discover_for_conversation(
+            "resilient-discovery",
+            &servers,
+            crate::cancel::CancelSignal::default(),
+        );
         assert_eq!(report.bindings.len(), 2);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].server_id, "invalid-server");
         assert!(!format!("{:?}", report.failures).contains("do-not-print"));
-        assert!(client.discover_tools(&servers).is_err());
     }
 
     #[test]
@@ -5485,14 +5026,22 @@ process.stdin.on("data", (chunk) => {
         if !node_available() {
             return;
         }
-        let client = McpClient::new(McpClientOptions {
-            request_timeout: Duration::from_secs(5),
-            shutdown_timeout: Duration::from_millis(250),
-            discovery_timeout: Duration::from_secs(10),
-            max_total_schema_bytes: 32,
-        })
+        let manager = McpSessionManager::new(
+            McpClientOptions {
+                request_timeout: Duration::from_secs(5),
+                shutdown_timeout: Duration::from_millis(250),
+                discovery_timeout: Duration::from_secs(10),
+                max_total_schema_bytes: 32,
+            },
+            2,
+            Duration::from_secs(30),
+        )
         .unwrap();
-        let report = client.discover_tools_report(&[mock_server()]);
+        let report = manager.discover_for_conversation(
+            "schema-budget",
+            &[mock_server()],
+            crate::cancel::CancelSignal::default(),
+        );
         assert!(report.bindings.is_empty());
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].kind, McpErrorKind::Bounds);
@@ -5997,8 +5546,6 @@ process.stdin.on("data", (chunk) => {
 
         manager.evict_conversations(["conversation-evict-a"]);
         assert_eq!(manager.session_count(), 1);
-        manager.evict_artifact(&server.artifact_id);
-        assert_eq!(manager.session_count(), 0);
 
         assert!(manager
             .discover_for_conversation(
@@ -6250,160 +5797,5 @@ process.stdin.on("data", (chunk) => {
             std::fs::canonicalize(actual).unwrap(),
             std::fs::canonicalize(temporary.path()).unwrap()
         );
-    }
-
-    /// Probe ids arrive from the renderer, so the host validates them before one
-    /// can name a registration.
-    #[test]
-    fn probe_ids_must_be_bounded_ascii_identifiers() {
-        assert_eq!(
-            validate_probe_id("").unwrap_err().kind,
-            McpErrorKind::InvalidConfiguration
-        );
-        assert_eq!(
-            validate_probe_id(&"a".repeat(MAX_PROBE_ID_BYTES + 1))
-                .unwrap_err()
-                .kind,
-            McpErrorKind::InvalidConfiguration
-        );
-        assert_eq!(
-            validate_probe_id("probe id").unwrap_err().kind,
-            McpErrorKind::InvalidConfiguration
-        );
-        // A refused cancel is reported rather than quietly succeeding, so the
-        // catalog row cannot show a stop button that does nothing.
-        assert_eq!(
-            cancel_probe("probe/../elsewhere").unwrap_err().kind,
-            McpErrorKind::InvalidConfiguration
-        );
-        validate_probe_id("probe-1_A").unwrap();
-    }
-
-    /// The renderer cancels by id, which may reach the host before the blocking
-    /// worker registers. The user asked for it first, so it wins.
-    #[test]
-    fn a_cancel_that_arrives_before_the_probe_starts_stops_it_from_starting() {
-        cancel_probe("probe-early-cancel").unwrap();
-        let error = begin_probe("probe-early-cancel").unwrap_err();
-        assert_eq!(error.kind, McpErrorKind::Cancelled);
-
-        // The record is consumed, so the next probe of that dial still runs.
-        let lease = begin_probe("probe-early-cancel").unwrap();
-        assert!(!lease.abort().is_abandoned());
-    }
-
-    #[test]
-    fn a_probe_id_is_reusable_only_after_its_probe_released_the_registration() {
-        let lease = begin_probe("probe-registration").unwrap();
-        assert_eq!(
-            begin_probe("probe-registration").unwrap_err().kind,
-            McpErrorKind::InvalidConfiguration
-        );
-
-        // Success, failure and panic all drop the lease, which reclaims the entry.
-        drop(lease);
-        let second = begin_probe("probe-registration").unwrap();
-        cancel_probe("probe-registration").unwrap();
-        assert!(second.abort().is_abandoned());
-        drop(second);
-        assert!(!lock_probe_registry()
-            .live
-            .contains_key("probe-registration"));
-    }
-
-    #[test]
-    fn cancelling_one_probe_is_idempotent_and_leaves_other_probes_running() {
-        let first = begin_probe("probe-scope-first").unwrap();
-        let second = begin_probe("probe-scope-second").unwrap();
-
-        cancel_probe("probe-scope-first").unwrap();
-        cancel_probe("probe-scope-first").unwrap();
-        assert!(first.abort().is_abandoned());
-        // A second dial of the same server is a different probe.
-        assert!(!second.abort().is_abandoned());
-
-        // Cancelling a probe that already finished is not an error either.
-        drop(first);
-        cancel_probe("probe-scope-first").unwrap();
-        drop(second);
-    }
-
-    /// Builds a probe server whose mock hangs on `method`, and the marker file the
-    /// mock writes once that request arrives.
-    fn hanging_probe_server(
-        temporary: &tempfile::TempDir,
-        method: &str,
-        declare_prompts: bool,
-    ) -> (RuntimeMcpServer, PathBuf) {
-        let marker = temporary.path().join("request-arrived");
-        let mut server = mock_server();
-        let RuntimeMcpTransport::Stdio { env, .. } = &mut server.transport else {
-            unreachable!();
-        };
-        env.insert("MCP_MOCK_HANG_METHOD".into(), method.into());
-        env.insert(
-            "MCP_MOCK_MARKER".into(),
-            marker.to_string_lossy().into_owned(),
-        );
-        if declare_prompts {
-            env.insert("MCP_MOCK_DECLARE_PROMPTS".into(), "1".into());
-        }
-        (server, marker)
-    }
-
-    /// Waits until the mock reports that the hanging request arrived, so the
-    /// cancel lands on a probe that is provably in flight.
-    fn await_probe_request(marker: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !marker.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "the probe never reached the mock server"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn cancelling_a_stdio_probe_reports_cancellation_without_waiting_out_the_request() {
-        if !node_available() {
-            return;
-        }
-        let temporary = tempfile::tempdir().unwrap();
-        let (server, marker) = hanging_probe_server(&temporary, "tools/list", false);
-        let probe = thread::spawn(move || probe_server_for_settings(&server, "probe-live-stdio"));
-        await_probe_request(&marker);
-
-        let cancelled_at = Instant::now();
-        cancel_probe("probe-live-stdio").unwrap();
-        let (error, _logs) = probe.join().unwrap().unwrap_err();
-
-        // The user stopped the probe: report that, not the closed pipe the
-        // cancellation itself caused, and do not wait out the request timeout.
-        assert_eq!(error.kind, McpErrorKind::Cancelled);
-        assert!(
-            cancelled_at.elapsed() < Duration::from_secs(5),
-            "cancelling took {:?}",
-            cancelled_at.elapsed()
-        );
-        // The registration is released, so the same dial can be probed again.
-        begin_probe("probe-live-stdio").unwrap();
-    }
-
-    /// Prompts and resources are optional sections whose failures leave only that
-    /// section empty. A cancellation must not disappear into that allowance.
-    #[test]
-    fn a_cancel_during_the_optional_prompts_phase_is_not_reported_as_success() {
-        if !node_available() {
-            return;
-        }
-        let temporary = tempfile::tempdir().unwrap();
-        let (server, marker) = hanging_probe_server(&temporary, "prompts/list", true);
-        let probe = thread::spawn(move || probe_server_for_settings(&server, "probe-live-prompts"));
-        await_probe_request(&marker);
-
-        cancel_probe("probe-live-prompts").unwrap();
-        let (error, _logs) = probe.join().unwrap().unwrap_err();
-        assert_eq!(error.kind, McpErrorKind::Cancelled);
     }
 }

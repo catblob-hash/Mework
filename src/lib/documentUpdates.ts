@@ -80,58 +80,6 @@ export function findConversation(
   return { workspace, conversation };
 }
 
-/**
- * Replace or remove a conversation with the host-authoritative snapshot after `conversationSaveRejected`. The renderer must discard a rejected state so debounced saves do not repeatedly resubmit it; remove the local conversation when no authoritative version exists.
- */
-export function conversationMatchesPersistenceGeneration(
-  document: AppDocument | null,
-  conversationId: string,
-  updatedAt: string
-): boolean {
-  return (
-    document?.workspaces
-      .flatMap((workspace) => workspace.conversations)
-      .some((conversation) => conversation.id === conversationId && conversation.updatedAt === updatedAt) ??
-    false
-  );
-}
-
-export function replaceConversationFromAuthority(
-  current: AppDocument,
-  authority: AppDocument,
-  conversationId: string
-): AppDocument {
-  const authorityLocation = authority.workspaces
-    .flatMap((workspace) =>
-      workspace.conversations.map((conversation, index) => ({
-        workspaceId: workspace.id,
-        conversation,
-        index
-      }))
-    )
-    .find((item) => item.conversation.id === conversationId);
-  const withoutRejected = current.workspaces.map((workspace) => ({
-    ...workspace,
-    conversations: workspace.conversations.filter((conversation) => conversation.id !== conversationId)
-  }));
-  if (!authorityLocation) {
-    return { ...current, workspaces: withoutRejected };
-  }
-  return {
-    ...current,
-    workspaces: withoutRejected.map((workspace) => {
-      if (workspace.id !== authorityLocation.workspaceId) return workspace;
-      const conversations = [...workspace.conversations];
-      conversations.splice(
-        Math.min(authorityLocation.index, conversations.length),
-        0,
-        authorityLocation.conversation
-      );
-      return { ...workspace, conversations };
-    })
-  };
-}
-
 /** The document-wide provider and model choice; conversations do not own model selections. */
 export function modelChoiceForConversation(latest: AppDocument): {
   provider: ApiProvider | undefined;

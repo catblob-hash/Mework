@@ -5,7 +5,6 @@ import {
   backendOfTool,
   effectiveAgentShell,
   knownShells,
-  normalizedPriority,
   preferredBackend,
   SHELL_BACKENDS_BY_OS,
   terminalShellsFor,
@@ -49,11 +48,14 @@ describe("the shell × OS table", () => {
     expect(backendOfTool("shell")).toBeNull();
   });
 
-  it("ranks exactly an OS's registered backends", () => {
-    expect(normalizedPriority("linux", ["sh", "powershell", "sh"])).toEqual(["sh", "bash", "zsh"]);
-    expect(preferredBackend("windows", { windows: ["bash"] }, ["powershell", "bash"])).toBe("bash");
-    expect(preferredBackend("windows", undefined, ["bash"])).toBe("bash");
-    expect(preferredBackend("macos", {}, [])).toBeNull();
+  it("ranks each OS's shells in Mework's own fixed order", () => {
+    expect(SHELL_BACKENDS_BY_OS.windows).toEqual(["powershell", "bash"]);
+    expect(SHELL_BACKENDS_BY_OS.linux).toEqual(["bash", "zsh", "sh"]);
+    expect(SHELL_BACKENDS_BY_OS.macos).toEqual(["zsh", "bash", "sh"]);
+    expect(preferredBackend("windows", ["bash", "powershell"])).toBe("powershell");
+    expect(preferredBackend("windows", ["bash"])).toBe("bash");
+    expect(preferredBackend("macos", ["sh", "bash"])).toBe("bash");
+    expect(preferredBackend("macos", [])).toBeNull();
   });
 });
 
@@ -88,10 +90,9 @@ describe("the shells a terminal offers", () => {
   it("lists the machine's probed shells in its OS's priority order", () => {
     const probes = { local: probe("macos", ["zsh", "bash", "sh"]), "wsl:Ubuntu": probe("wsl", ["bash", "sh"]) };
     // This machine's sh is left out: its line editor cannot hold a line for the Git mutex.
-    expect(terminalShellsFor(null, probes, "MacIntel", undefined)).toEqual(["zsh", "bash"]);
-    expect(terminalShellsFor(null, probes, "MacIntel", { macos: ["bash"] })).toEqual(["bash", "zsh"]);
+    expect(terminalShellsFor(null, probes, "MacIntel")).toEqual(["zsh", "bash"]);
     // A shell the probe did not find is not offered, however high it ranks.
-    expect(terminalShellsFor(wsl, probes, "Win32", { wsl: ["zsh", "sh"] })).toEqual(["sh", "bash"]);
+    expect(terminalShellsFor(wsl, probes, "Win32")).toEqual(["bash", "sh"]);
   });
 
   it("offers PowerShell on a Windows host and a Windows SSH machine, never in WSL", () => {
@@ -100,30 +101,26 @@ describe("the shells a terminal offers", () => {
       "ssh:m1": probe("windows", ["powershell", "bash"]),
       "wsl:Ubuntu": probe("wsl", ["bash"])
     };
-    expect(terminalShellsFor(null, probes, "Win32", undefined)).toEqual(["powershell", "bash"]);
-    expect(terminalShellsFor(ssh, probes, "Win32", { windows: ["bash"] })).toEqual(["bash", "powershell"]);
-    expect(terminalShellsFor(wsl, probes, "Win32", undefined)).toEqual(["bash"]);
+    expect(terminalShellsFor(null, probes, "Win32")).toEqual(["powershell", "bash"]);
+    expect(terminalShellsFor(ssh, probes, "Win32")).toEqual(["powershell", "bash"]);
+    expect(terminalShellsFor(wsl, probes, "Win32")).toEqual(["bash"]);
   });
 
   it("falls back to what is assumed of a machine nobody has probed", () => {
-    expect(terminalShellsFor(null, {}, "Win32", undefined)).toEqual(["powershell", "bash"]);
-    expect(terminalShellsFor(undefined, {}, "Linux x86_64", undefined)).toEqual(["bash", "zsh"]);
-    expect(terminalShellsFor(ssh, {}, "MacIntel", undefined)).toEqual(["bash"]);
+    expect(terminalShellsFor(null, {}, "Win32")).toEqual(["powershell", "bash"]);
+    expect(terminalShellsFor(undefined, {}, "Linux x86_64")).toEqual(["bash", "zsh"]);
+    expect(terminalShellsFor(ssh, {}, "MacIntel")).toEqual(["bash"]);
   });
 
   it("offers nothing when the probe found nothing a terminal can start", () => {
-    expect(terminalShellsFor(ssh, { "ssh:m1": probe("linux", []) }, "MacIntel", undefined)).toEqual([]);
+    expect(terminalShellsFor(ssh, { "ssh:m1": probe("linux", []) }, "MacIntel")).toEqual([]);
   });
 });
 
 describe("agent shells", () => {
   it("records a new machine's first probe as its OS's most preferred backend it has", () => {
-    const next = withDefaultAgentShell(
-      assets({ shellPriority: { linux: ["zsh", "bash"] } }),
-      "ssh:m1",
-      probe("linux", ["bash", "zsh", "sh"])
-    );
-    expect(next.sshMachines[0]!.agentShell).toBe("zsh");
+    const next = withDefaultAgentShell(assets(), "ssh:m1", probe("linux", ["sh", "zsh", "bash"]));
+    expect(next.sshMachines[0]!.agentShell).toBe("bash");
     // A machine that already has a choice keeps it.
     expect(withDefaultAgentShell(next, "ssh:m1", probe("linux", ["bash"]))).toBe(next);
     // This machine has no agent shell, and a deleted machine has nothing to record.

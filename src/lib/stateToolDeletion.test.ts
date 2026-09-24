@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ContextItem, Conversation, JsonObject, ToolContext } from "../types";
 import {
-  deleteStateToolContext,
-  restoreStateToolContexts
+  deleteStateToolContext
 } from "./stateToolDeletion";
 
 const NOW = "2026-07-24T12:00:00Z";

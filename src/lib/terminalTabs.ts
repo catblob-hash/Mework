@@ -94,10 +94,6 @@ export function terminalTabsFor(
     ? state.byConversation[conversationId] : EMPTY_LAYOUT;
 }
 
-export function activeTerminalTab(layout: TerminalTabsLayout): TerminalTab | null {
-  return layout.tabs.find((tab) => tab.id === layout.activeId) ?? null;
-}
-
 /**
  * Which count a tab's number is drawn from: its shell's, or — for a tab that left the shell to
  * the host — the count of those.

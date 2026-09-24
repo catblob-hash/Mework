@@ -5,7 +5,6 @@ import {
   FileArchive,
   FileCode2,
   FileImage,
-  FolderOpen,
   MoreVertical,
   Presentation,
   Scroll,
@@ -24,11 +23,11 @@ import type { PopoverMenuSection } from "./PopoverMenu";
 import "./DiffViewer.css";
 
 /** Fixed width of the file column while it sits beside the diff. */
-export const DIFF_TREE_WIDTH = 240;
+const DIFF_TREE_WIDTH = 240;
 /** Below this body width the file column and the diff cannot share the pane. */
-export const DIFF_TREE_MIN_WIDTH = 400;
+const DIFF_TREE_MIN_WIDTH = 400;
 /** Below this body width side-by-side is unreadable and the viewer falls back to unified. */
-export const DIFF_SPLIT_MIN_WIDTH = 560;
+const DIFF_SPLIT_MIN_WIDTH = 560;
 /** Changed lines past which every file starts collapsed. */
 export const DIFF_LARGE_LINE_COUNT = 5000;
 
@@ -888,6 +887,3 @@ function SplitHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: bool
     </>
   );
 }
-
-/** Re-exported so callers can build the same folder rows in their own empty states. */
-export { FolderOpen as DiffViewerFolderIcon };

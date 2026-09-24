@@ -66,6 +66,7 @@ impl CacheKeyChain {
         }
     }
 
+    #[cfg(test)]
     pub fn is_diverged(&self) -> bool {
         self.diverged
     }
@@ -258,7 +259,6 @@ mod tests {
         decorated.label = Some("标签".into());
         decorated.phase = Some("阶段".into());
         decorated.phase_index = Some(7);
-        decorated.stall_ms = Some(1);
         assert_eq!(CacheKeyChain::new().advance(&decorated), baseline);
     }
 

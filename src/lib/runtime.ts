@@ -1,4 +1,4 @@
-import { Channel, hasBackendRuntime, invoke, isBrowserDevRuntime } from "./backend";
+import { Channel, hasBackendRuntime, invoke } from "./backend";
 import { createId } from "./id";
 import {
   createTemporaryWorkspace,
@@ -7,7 +7,7 @@ import {
   workspaceEnvKey
 } from "./workspaces";
 import { createSeedDocument } from "../seed";
-import { isRegistered, isShellBackend, MACHINE_OSES } from "./machineShells";
+import { isRegistered, isShellBackend } from "./machineShells";
 import {
   emptyConversationPresetSettings
 } from "./conversationPresets";
@@ -16,7 +16,7 @@ import {
   isAgentToolNameList,
   validateAgentTypeName
 } from "./agentDefinitions";
-import type { SandboxSettings, SandboxSupport, ShellBackend, ShellPriority } from "../types";
+import type { SandboxSettings, SandboxSupport, ShellBackend } from "../types";
 import type {
   AgentDefinition,
   AppLanguage,
@@ -51,6 +51,8 @@ import type {
   ExecutionEnvironmentAssets,
   ForkDecisionRecord,
   GlobalSettings,
+  FileAttachment,
+  FileAttachmentFormat,
   ImageAttachment,
   KeyToken,
   McpProbeReport,
@@ -66,11 +68,9 @@ import type {
   ReasoningEffort,
   SecurityLevel,
   ShortcutCommandId,
-  ShortcutPreference,
   SubagentRunRecord,
   SshMachineConfig,
   ThemePreference,
-  ToolContext,
   ToolDescriptor,
   AttestEditedToolContextRequest,
   AttestInsertedToolContextRequest,
@@ -84,7 +84,6 @@ import type {
   WebSearchAssets,
   FamilySetting,
 } from "../types";
-import { estimateContextsTokens } from "./contextTokens";
 import {
   DEFAULT_SEARCH_COMPRESSION_CUTOFF,
   DEFAULT_SEARCH_MAX_RESULTS,
@@ -110,6 +109,14 @@ import { SHORTCUT_COMMANDS, isValidBinding, orderBinding } from "./shortcuts";
 import { NATIVE_FETCH_TOOLS, NATIVE_SEARCH_TOOLS } from "../types";
 import { CLAUDE_AGENT_REGISTRY, ensureClaudeAgentProvider } from "./claudeAgentProvider";
 import { ensureCodexProvider } from "./codexProvider";
+import { estimateTokens } from "./contextTokens";
+import {
+  MAX_FILE_ATTACHMENT_PDF_BYTES,
+  MAX_FILE_ATTACHMENT_TEXT_BYTES,
+  MAX_FILE_ATTACHMENT_TOKENS,
+  MAX_MESSAGE_FILES,
+  MAX_PDF_PAGES
+} from "./fileBudget";
 
 const STORAGE_KEY = "mework.document.v1";
 const API_KEY_LENGTH_PREFIX = "mework.api-key-length.v1.";
@@ -198,8 +205,15 @@ function normalizeConversationPresetSettings(
     globalMemoryEnabled: input.globalMemoryEnabled === true,
     projectMemoryEnabled: input.projectMemoryEnabled === true,
     skillToolEnabled: input.skillToolEnabled === true,
-    mcpToolDiscoveryEnabled: input.mcpToolDiscoveryEnabled === true
+    mcpToolDiscoveryEnabled: input.mcpToolDiscoveryEnabled === true,
+    ...sandboxField(input.sandbox)
   };
+}
+
+/** A settings body's sandbox, left out when unstated — which reads as off. */
+function sandboxField(value: unknown): { sandbox?: SandboxSettings } {
+  const sandbox = normalizeSandboxSettings(value);
+  return sandbox ? { sandbox } : {};
 }
 
 function normalizeConversationPreset(
@@ -284,6 +298,45 @@ function normalizeImageAttachments(value: unknown): ImageAttachment[] | undefine
     }];
   }).filter((image, index, all) => all.findIndex((candidate) => candidate.id === image.id) === index);
   return images.length ? images : undefined;
+}
+
+/**
+ * Mirrors Rust `file_attachments::validate_file_metadata`: a reference the
+ * host would refuse on save never reaches the renderer's document either.
+ */
+function normalizeFileAttachments(value: unknown): FileAttachment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const files = value.flatMap((entry) => {
+    const file = record(entry);
+    const bytes = optionalNonNegativeInteger(file?.bytes);
+    const tokens = optionalNonNegativeInteger(file?.tokens);
+    const pages = optionalNonNegativeInteger(file?.pages);
+    const name = typeof file?.name === "string" ? file.name.trim() : "";
+    const format = file?.format;
+    if (
+      !file
+      || typeof file.id !== "string"
+      || !/^[0-9a-f]{64}$/.test(file.id)
+      || !isValidImageAttachmentName(name)
+      || (format !== "text" && format !== "pdf")
+      || bytes === undefined
+      || bytes === 0
+      || bytes > (format === "pdf" ? MAX_FILE_ATTACHMENT_PDF_BYTES : MAX_FILE_ATTACHMENT_TEXT_BYTES)
+      || tokens === undefined
+      || tokens > MAX_FILE_ATTACHMENT_TOKENS
+      || (format === "pdf" ? pages === undefined || pages === 0 || pages > MAX_PDF_PAGES : file.pages !== undefined)
+    ) return [];
+    return [{
+      id: file.id,
+      name,
+      format,
+      bytes,
+      tokens,
+      ...(format === "pdf" ? { pages } : {})
+    } as FileAttachment];
+  }).filter((file, index, all) => all.findIndex((candidate) => candidate.id === file.id) === index)
+    .slice(0, MAX_MESSAGE_FILES);
+  return files.length ? files : undefined;
 }
 
 function normalizeReasoningEffort(value: unknown, fallback: ReasoningEffort = "disabled"): ReasoningEffort {
@@ -459,8 +512,7 @@ function normalizeExecutionEnvironments(
       envVars: Object.fromEntries(
         Object.entries(fallback.envVars).map(([key, table]) => [key, { ...table }])
       ),
-      ...(fallback.wslAgentShells ? { wslAgentShells: { ...fallback.wslAgentShells } } : {}),
-      ...(fallback.shellPriority ? { shellPriority: normalizeShellPriority(fallback.shellPriority) } : {})
+      ...(fallback.wslAgentShells ? { wslAgentShells: { ...fallback.wslAgentShells } } : {})
     };
   }
   const now = new Date().toISOString();
@@ -536,14 +588,10 @@ function normalizeExecutionEnvironments(
     if (!WSL_DISTRO_NAME.test(distro) || !isShellBackend(backend) || !isRegistered("wsl", backend)) continue;
     wslAgentShells[distro] = backend;
   }
-  const shellPriority = normalizeShellPriority(input.shellPriority);
-  const sandbox = normalizeSandboxSettings(input.sandbox);
   return {
     sshMachines,
     envVars,
-    ...(Object.keys(wslAgentShells).length ? { wslAgentShells } : {}),
-    ...(Object.keys(shellPriority).length ? { shellPriority } : {}),
-    ...(sandbox ? { sandbox } : {})
+    ...(Object.keys(wslAgentShells).length ? { wslAgentShells } : {})
   };
 }
 
@@ -596,7 +644,7 @@ export function defaultSandboxSettings(): SandboxSettings {
 }
 
 /** Mirrors host validation of the sandbox's lists: bounded, no blanks or control characters. */
-function normalizeSandboxSettings(value: unknown): SandboxSettings | null {
+export function normalizeSandboxSettings(value: unknown): SandboxSettings | null {
   const input = record(value);
   if (!input) return null;
   const controlChars = /[\u0000-\u001f\u007f]/;
@@ -627,22 +675,6 @@ function normalizeSandboxSettings(value: unknown): SandboxSettings | null {
 
 /** Mirrors the host's `validate_wsl_distro_name`. */
 const WSL_DISTRO_NAME = /^[\p{L}\p{N}](?:[\p{L}\p{N}._ -]{0,62}[\p{L}\p{N}._-])?$/u;
-
-/** Each OS's list with only that OS's registered backends, each once. Mirrors host validation. */
-function normalizeShellPriority(value: unknown): ShellPriority {
-  const input = record(value);
-  const out: ShellPriority = {};
-  if (!input) return out;
-  for (const os of MACHINE_OSES) {
-    const listed = Array.isArray(input[os]) ? input[os] as unknown[] : [];
-    const kept: ShellBackend[] = [];
-    for (const backend of listed) {
-      if (isShellBackend(backend) && isRegistered(os, backend) && !kept.includes(backend)) kept.push(backend);
-    }
-    if (kept.length) out[os] = kept;
-  }
-  return out;
-}
 
 function normalizeAppLanguage(value: unknown, fallback: AppLanguage): AppLanguage {
   return typeof value === "string" && APP_LANGUAGES.has(value as AppLanguage)
@@ -1355,7 +1387,8 @@ function normalizeContextItem(value: unknown): ContextItem | null {
     if (input.kind === "user") {
       return {
         ...(input as unknown as Extract<ContextItem, { kind: "user" }>),
-        images: normalizeImageAttachments(input.images)
+        images: normalizeImageAttachments(input.images),
+        files: normalizeFileAttachments(input.files)
       };
     }
     return input as unknown as ContextItem;
@@ -1498,6 +1531,7 @@ export function normalizeDocument(value: unknown): AppDocument {
       // Absence means false, preserving inline skill content for older conversations.
       skillToolEnabled: settingsInput.skillToolEnabled === true,
       mcpToolDiscoveryEnabled: settingsInput.mcpToolDiscoveryEnabled === true,
+      sandbox: normalizeSandboxSettings(settingsInput.sandbox) ?? undefined,
       // Absent until this conversation's first run has exposed something.
       toolLock: normalizeToolLockValue(settingsInput.toolLock)
     };
@@ -1515,13 +1549,14 @@ export function normalizeDocument(value: unknown): AppDocument {
             ? conversationInput.queuedMessages.flatMap((value) => {
                 const message = record(value);
                 const images = normalizeImageAttachments(message?.images);
+                const files = normalizeFileAttachments(message?.files);
                 if (
                   !message
                   || typeof message.id !== "string"
                   || !message.id.trim()
                   || message.id.length > 128
                   || typeof message.content !== "string"
-                  || (!message.content.trim() && !images?.length)
+                  || (!message.content.trim() && !images?.length && !files?.length)
                   || Array.from(message.content).length > 100_000
                   || typeof message.createdAt !== "string"
                   || !Number.isFinite(Date.parse(message.createdAt))
@@ -1530,6 +1565,7 @@ export function normalizeDocument(value: unknown): AppDocument {
                   id: message.id,
                   content: message.content,
                   images,
+                  files,
                   createdAt: message.createdAt
                 }];
               }).filter((message, index, messages) => messages.findIndex(
@@ -1967,37 +2003,6 @@ export async function loadConversationRemote(
   return invoke<Conversation | null>("load_conversation", { conversationId });
 }
 
-/** One recorded moment in a conversation's trunk history. */
-export interface TimelineEvent {
-  seq: number;
-  /** `baseline` starts the chain, `run` is a settled backend request, `edit` a renderer change. */
-  kind: "baseline" | "run" | "edit";
-  requestId: string | null;
-  inserted: number;
-  removed: number;
-  replaced: number;
-  /** Trunk length once this event applied. */
-  rowCount: number;
-  createdAt: string;
-}
-
-export async function listTimelineEvents(conversationId: string): Promise<TimelineEvent[]> {
-  if (!hasBackendRuntime()) return [];
-  return invoke<TimelineEvent[]>("list_timeline_events", { conversationId });
-}
-
-export async function loadTimelineSnapshot(
-  conversationId: string,
-  seq: number
-): Promise<ContextItem[]> {
-  if (!hasBackendRuntime()) return [];
-  // Through the same normalizer a loaded conversation goes through: a snapshot row
-  // is the very same stored body, so it has the same shape to repair.
-  return normalizeContextItems(
-    await invoke<unknown>("load_timeline_snapshot", { conversationId, seq })
-  );
-}
-
 /** What a recorded request was: a conversation round, or a host-minted one-shot. */
 export type WireRequestKind = "model" | "search" | "fetch";
 
@@ -2119,6 +2124,17 @@ function imageAttachmentForPersistence(image: ImageAttachment): ImageAttachment 
   };
 }
 
+function fileAttachmentForPersistence(file: FileAttachment): FileAttachment {
+  return {
+    id: file.id,
+    name: file.name,
+    format: file.format,
+    bytes: file.bytes,
+    tokens: file.tokens,
+    ...(file.pages !== undefined ? { pages: file.pages } : {})
+  };
+}
+
 /**
  * Projects a renderer context into the only shape allowed in local persistence.
  * Streaming state and provider protocol envelopes intentionally have no branch
@@ -2151,6 +2167,9 @@ function contextForPersistence(context: ContextItem): ContextItem {
         content: context.content,
         ...(context.images?.length
           ? { images: context.images.map(imageAttachmentForPersistence) }
+          : {}),
+        ...(context.files?.length
+          ? { files: context.files.map(fileAttachmentForPersistence) }
           : {}),
         createdAt: context.createdAt
       };
@@ -2354,6 +2373,9 @@ function documentForPersistence(document: AppDocument): PersistedAppDocument {
           content: message.content,
           ...(message.images?.length
             ? { images: message.images.map(imageAttachmentForPersistence) }
+            : {}),
+          ...(message.files?.length
+            ? { files: message.files.map(fileAttachmentForPersistence) }
             : {}),
           createdAt: message.createdAt
         })),
@@ -3000,6 +3022,117 @@ export async function imageAttachmentData(imageId: string): Promise<string> {
   }
 }
 
+/**
+ * Browser-preview stand-in for the host's file attachment store. The frontend
+ * alone has nowhere durable to keep a file, so it lives for the page's lifetime:
+ * enough to attach, preview and send while developing the UI, and a reload
+ * leaves the reference behind with nothing to open — which the preview says.
+ */
+const previewFileAttachments = new Map<string, { format: FileAttachmentFormat; bytes: Uint8Array; text: string }>();
+const PREVIEW_FILE_ATTACHMENT_LIMIT = 32;
+
+function previewFileText(bytes: Uint8Array): string {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("文本文件必须是 UTF-8 编码");
+  }
+  if (text.includes("\u0000")) throw new Error("文本文件不能包含空字符");
+  return text.startsWith("\uFEFF") ? text.slice(1) : text;
+}
+
+/**
+ * Stores a non-image file with the host and returns its reference.
+ *
+ * `extracted` is the text a PDF's pages carry, read out by the renderer (pdf.js
+ * lives here, not in the host); a text file is its own text and sends none.
+ */
+export async function prepareFileAttachment(
+  name: string,
+  bytes: Uint8Array,
+  format: FileAttachmentFormat,
+  extracted?: { text: string; pages: number }
+): Promise<FileAttachment> {
+  if (hasBackendRuntime()) {
+    return invoke<FileAttachment>("file_attachment_upload", {
+      name,
+      data: bytesToBase64(bytes),
+      format,
+      text: extracted?.text ?? null,
+      pages: extracted?.pages ?? null
+    });
+  }
+  const normalizedName = name.trim();
+  if (!isValidImageAttachmentName(normalizedName)) {
+    throw new Error(`文件名称不能为空、不能含控制字符且不能超过 ${IMAGE_ATTACHMENT_MAX_NAME_BYTES} 字节`);
+  }
+  if (!bytes.byteLength) throw new Error("文件是空的");
+  let text: string;
+  if (format === "text") {
+    if (bytes.byteLength > MAX_FILE_ATTACHMENT_TEXT_BYTES) throw new Error("文本文件过大");
+    text = previewFileText(bytes);
+  } else {
+    if (bytes.byteLength > MAX_FILE_ATTACHMENT_PDF_BYTES) throw new Error("PDF 过大");
+    if (!extracted?.text.trim() || extracted.pages < 1) throw new Error("PDF 没有可读取的文字");
+    text = extracted.text;
+  }
+  const id = await browserImageAttachmentId(bytes);
+  previewFileAttachments.delete(id);
+  previewFileAttachments.set(id, { format, bytes, text });
+  while (previewFileAttachments.size > PREVIEW_FILE_ATTACHMENT_LIMIT) {
+    const oldest = previewFileAttachments.keys().next().value as string | undefined;
+    if (!oldest) break;
+    previewFileAttachments.delete(oldest);
+  }
+  return {
+    id,
+    name: normalizedName,
+    format,
+    bytes: bytes.byteLength,
+    tokens: estimateTokens(text),
+    ...(format === "pdf" ? { pages: extracted?.pages ?? 1 } : {})
+  };
+}
+
+/** Resolves one file attachment to a `data:` URL of its original bytes. */
+export async function fileAttachmentData(fileId: string): Promise<string> {
+  if (hasBackendRuntime()) return invoke<string>("file_attachment_data", { fileId });
+  const stored = previewFileAttachments.get(fileId);
+  if (!stored) throw new Error(`文件 ${fileId} 不存在`);
+  const mime = stored.format === "pdf" ? "application/pdf" : "text/plain;charset=utf-8";
+  return `data:${mime};base64,${bytesToBase64(stored.bytes)}`;
+}
+
+/** What the host could tell about one path in a native drag, before anything is dropped. */
+export interface DroppedPathProbe {
+  path: string;
+  name: string;
+  kind: "file" | "directory" | "other" | "missing";
+  size: number;
+  /** Read from the file's first bytes; `none` for anything that is not a file. */
+  sniff: "image" | "pdf" | "text" | "binary" | "empty" | "unreadable" | "none";
+}
+
+/**
+ * Classifies the paths of the drag in progress.
+ *
+ * The host answers only for paths its own window saw enter or drop, so this is
+ * not a way to stat arbitrary files.
+ */
+export async function probeDroppedPaths(paths: string[]): Promise<DroppedPathProbe[]> {
+  if (!hasBackendRuntime()) return [];
+  return invoke<DroppedPathProbe[]>("dropped_paths_probe", { paths });
+}
+
+/** Reads one file of the last native drop, as a `File` the upload pipeline can take. */
+export async function readDroppedFile(path: string): Promise<File> {
+  const dropped = await invoke<{ name: string; data: string }>("dropped_file_read", { path });
+  const binary = window.atob(dropped.data);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new File([bytes], dropped.name);
+}
+
 export async function refreshCapabilities(): Promise<CapabilityCatalog> {
   if (hasBackendRuntime()) return invoke<CapabilityCatalog>("discover_capabilities");
   return (await browserLoad()).capabilities;
@@ -3016,21 +3149,11 @@ export async function refreshCapabilities(): Promise<CapabilityCatalog> {
  *
  * The renderer names a server; it never describes one. The host re-reads the
  * owning `mcp.json` and builds the connection from what is on disk, so nothing
- * executable crosses IPC. `probeId` is minted here so `cancelMcpProbe` can reach
- * this dial.
+ * executable crosses IPC.
  */
-export async function probeMcpServer(
-  serverId: string,
-  probeId: string
-): Promise<McpProbeReport> {
+export async function probeMcpServer(serverId: string): Promise<McpProbeReport> {
   if (!hasBackendRuntime()) throw new Error("浏览器预览无法探测 MCP 服务器");
-  return invoke<McpProbeReport>("mcp_probe_server", { serverId, probeId });
-}
-
-/** Cancels the probe `probeId` names. The host answers whether it accepted it. */
-export async function cancelMcpProbe(probeId: string): Promise<void> {
-  if (!hasBackendRuntime()) throw new Error("浏览器预览无法探测 MCP 服务器");
-  return invoke<void>("mcp_cancel_probe", { probeId });
+  return invoke<McpProbeReport>("mcp_probe_server", { serverId });
 }
 
 /**
@@ -3420,6 +3543,7 @@ export async function runModel(
           id: steer.id,
           content: steer.content,
           images: steer.images,
+          files: steer.files,
           createdAt: steer.createdAt
         });
         contexts.push({
@@ -3427,6 +3551,7 @@ export async function runModel(
           kind: "user",
           content: steer.content,
           images: steer.images,
+          files: steer.files,
           createdAt: steer.createdAt
         });
       }
@@ -3606,6 +3731,7 @@ export async function steerModelRun(
       messageId: message.id,
       content: message.content,
       images: message.images,
+      files: message.files,
       createdAt: message.createdAt
     });
     return;

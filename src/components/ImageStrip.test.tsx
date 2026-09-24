@@ -5,7 +5,8 @@ import { configureI18n } from "../i18n";
 import { ImageStrip } from "./ImageStrip";
 
 const runtimeMocks = vi.hoisted(() => ({
-  imageAttachmentData: vi.fn()
+  imageAttachmentData: vi.fn(),
+  fileAttachmentData: vi.fn()
 }));
 
 vi.mock("../lib/runtime", () => runtimeMocks);
@@ -23,6 +24,7 @@ describe("ImageStrip", () => {
   beforeEach(() => {
     configureI18n("zh-CN");
     runtimeMocks.imageAttachmentData.mockReset().mockResolvedValue("data:image/png;base64,AAAA");
+    runtimeMocks.fileAttachmentData.mockReset();
   });
 
   it("loads bytes on demand and exposes a removable thumbnail", async () => {
@@ -100,5 +102,39 @@ describe("ImageStrip", () => {
     expect(screen.queryByRole("img", { name: "screen.png" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试加载图片 screen.png" })).toBeInTheDocument();
     expect(screen.getByRole("list", { name: "1 张图片" })).toBeInTheDocument();
+  });
+
+  it("draws files beside the images, each removable and previewable", async () => {
+    const user = userEvent.setup();
+    const onRemoveFile = vi.fn();
+    // "a,b\n1,2"
+    runtimeMocks.fileAttachmentData.mockResolvedValue("data:text/plain;charset=utf-8;base64,YSxiCjEsMg==");
+    render(
+      <ImageStrip
+        images={[image]}
+        files={[
+          { id: "f".repeat(64), name: "table.csv", format: "text", bytes: 7, tokens: 3 },
+          { id: "p".repeat(64), name: "paper.pdf", format: "pdf", bytes: 2048, tokens: 900, pages: 12 }
+        ]}
+        onRemove={vi.fn()}
+        onRemoveFile={onRemoveFile}
+      />
+    );
+
+    expect(screen.getByRole("list", { name: "3 个附件" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "预览文件 paper.pdf" }).closest("li"))
+      .toHaveTextContent("12 页");
+    await user.click(screen.getByRole("button", { name: "移除文件 paper.pdf" }));
+    expect(onRemoveFile).toHaveBeenCalledWith("p".repeat(64));
+
+    await user.click(screen.getByRole("button", { name: "预览文件 table.csv" }));
+    const dialog = await screen.findByRole("dialog", { name: "table.csv" });
+    expect(await within(dialog).findByRole("table")).toHaveTextContent("1");
+    expect(runtimeMocks.fileAttachmentData).toHaveBeenCalledWith("f".repeat(64));
+  });
+
+  it("holds a place for attachments still being prepared", () => {
+    render(<ImageStrip compact busy />);
+    expect(screen.getByRole("status")).toHaveTextContent("正在添加附件…");
   });
 });

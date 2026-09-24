@@ -304,8 +304,7 @@ describe("the new task's host-backed panes", () => {
     vi.spyOn(previewApi, "listPreviewConfigurations").mockResolvedValue({
       launchJsonPath: "C:\\test\\Mework\\.mework\\launch.json",
       servers: [{ name: "web", command: "npm", args: ["run", "dev"], cwd: "C:\\test\\Mework", port: 5173 }],
-      malformed: [],
-      autoVerify: true
+      malformed: []
     });
     vi.spyOn(previewApi, "listPreviewServers").mockResolvedValue([]);
     const start = vi.spyOn(previewApi, "startPreviewServer")

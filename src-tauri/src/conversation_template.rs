@@ -259,6 +259,7 @@ pub fn seed_with_task(
         id: new_id("subagent-task"),
         content: task.to_owned(),
         images: Vec::new(),
+        files: Vec::new(),
         created_at,
     });
     contexts
@@ -340,6 +341,7 @@ mod tests {
             id: id.into(),
             content: content.into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
     }

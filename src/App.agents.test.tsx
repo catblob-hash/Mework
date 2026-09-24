@@ -6,7 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App, { subagentViewsEqualForChrome } from "./App";
 import { configureI18n } from "./i18n";
-import { ASK_USER_PENDING_OUTPUT } from "./types";
+import { ASK_USER_PENDING_OUTPUT } from "./test/fixtures";
 import { roundModelTurnId, roundProseContextId } from "./lib/runContexts";
 import { CONVERSATION_TURNS_STORAGE_KEY } from "./lib/conversationTurns";
 import type { SubagentView } from "./lib/subagents";

@@ -1,7 +1,6 @@
 import {
   Eye,
   FileCode2,
-  MonitorPlay,
   MousePointerClick,
   Server,
   SquareTerminal,
@@ -70,8 +69,6 @@ export interface ToolFamily {
   /** The picker row's name. */
   name: string;
   category: ToolDescriptor["category"];
-  /** The picker row's icon, in the slot a tool row puts its documentation link. */
-  icon: LucideIcon;
   /** Whether a catalog tool is gathered behind this family's row. */
   owns: (name: string) => boolean;
   title: (t: Translate) => string;
@@ -91,7 +88,6 @@ const FILES_FAMILY: ToolFamily = {
   id: "files",
   name: "files",
   category: "filesystem",
-  icon: FileCode2,
   owns: (name) => FILE_TOOL_NAME_SET.has(name),
   title: (t) => t("文件工具", "File tools"),
   settingsLabel: (t) => t("文件工具设置", "File tool settings"),
@@ -115,7 +111,6 @@ const SHELL_FAMILY: ToolFamily = {
   id: "shell",
   name: "shell",
   category: "shell",
-  icon: SquareTerminal,
   owns: (name) => backendOfTool(name) !== null,
   title: (t) => t("Shell 工具", "Shell tools"),
   settingsLabel: (t) => t("Shell 工具设置", "Shell tool settings"),
@@ -145,7 +140,6 @@ const PREVIEW_FAMILY: ToolFamily = {
   id: "preview",
   name: "preview",
   category: "web",
-  icon: MonitorPlay,
   // The prefix is the whole test, so a preview tool added to the catalog is
   // gathered behind the row the day it lands.
   owns: isPreviewToolName,
@@ -217,6 +211,38 @@ export function familyVariantNames(family: ToolFamily): ReadonlySet<string> {
     .flatMap((entry) => (entry.variant?.kind === "tool" ? [entry.variant.tool] : [])));
 }
 
+/** The rows `family`'s window would draw from `available`, page after page. */
+function familyEntries(family: ToolFamily, available: ReadonlySet<string>): ToolFamilyEntry[] {
+  return family.pages.flatMap((page) => page.tools).filter((entry) => available.has(entry.name));
+}
+
+/** The names a row stands for among `available`: its tool, and its variant tool when it has one. */
+export function familyRowNames(
+  family: ToolFamily,
+  row: string,
+  available: ReadonlySet<string>
+): string[] {
+  const entry = familyEntries(family, available).find((candidate) => candidate.name === row);
+  if (!entry) return [];
+  return entry.variant?.kind === "tool" && available.has(entry.variant.tool)
+    ? [entry.name, entry.variant.tool]
+    : [entry.name];
+}
+
+/**
+ * The rows of `family`'s window that are on, each by its row name: on when its
+ * tool, its variant or both are.
+ */
+export function familyRowsOn(
+  family: ToolFamily,
+  available: ReadonlySet<string>,
+  isOn: (name: string) => boolean
+): string[] {
+  return familyEntries(family, available)
+    .filter((entry) => familyRowNames(family, entry.name, available).some(isOn))
+    .map((entry) => entry.name);
+}
+
 /**
  * How many of the rows `family`'s window would draw are on, out of how many it
  * would draw. A row counts once whether its tool, its variant or both are on.
@@ -226,12 +252,10 @@ export function familyRowCounts(
   available: ReadonlySet<string>,
   isOn: (name: string) => boolean
 ): { enabled: number; total: number } {
-  const entries = family.pages.flatMap((page) => page.tools).filter((entry) => available.has(entry.name));
-  const enabled = entries.filter((entry) => {
-    if (isOn(entry.name)) return true;
-    return entry.variant?.kind === "tool" && available.has(entry.variant.tool) && isOn(entry.variant.tool);
-  }).length;
-  return { enabled, total: entries.length };
+  return {
+    enabled: familyRowsOn(family, available, isOn).length,
+    total: familyEntries(family, available).length
+  };
 }
 
 /** The backend a shell's command tool runs in; `null` for its scoring tool and every other tool. */
@@ -392,6 +416,11 @@ interface ToolFamilySettingsProps {
    */
   onChange: (next: DecisionToolSettings) => void;
   onClose: () => void;
+  /**
+   * Said above every page when the window is not editing live tools: the
+   * family is off, and what the window chooses is what switching it on uses.
+   */
+  notice?: string;
 }
 
 /**
@@ -450,7 +479,8 @@ function ToolFamilyPageView({
   lockedDecisionParameterModes,
   decisionMissScoring,
   rememberedDecisionForms,
-  onChange
+  onChange,
+  notice
 }: ToolFamilySettingsProps & { page: string }) {
   const { t } = useI18n();
   const page = family.pages.find((item) => item.id === pageId) ?? family.pages[0];
@@ -542,6 +572,7 @@ function ToolFamilyPageView({
   return (
     <div className="settings-page tool-family-settings__page">
       <SettingsPageHeading title={page.title(t)} description={page.description(t)} />
+      {notice && <p className="tool-family-settings__notice" role="note">{notice}</p>}
       <section className="settings-card tool-family-settings__card">
         {entries.map((entry) => {
           const descriptor = descriptors.get(entry.name)!;
@@ -566,6 +597,9 @@ function ToolFamilyPageView({
           const replace = formSwitch("replace");
           const formsLocked = shown && on && (augment.disabled || replace.disabled);
           const missScoring = entry.variant?.kind === "parameters" && scoresMisses(entry.name);
+          /* Both forms switch the variant tool on, so each is also the way in to its page. */
+          const variantTool = entry.variant?.kind === "tool" ? descriptors.get(entry.variant.tool) : undefined;
+          const variantDocs = variantTool && <ToolDocsLink name={variantTool.name} label={variantTool.label} />;
           return (
             <div className="tool-family-settings__entry" key={entry.name} data-tool-name={entry.name}>
               <div className="tool-family-settings__row">
@@ -602,6 +636,7 @@ function ToolFamilyPageView({
                       <div className="tool-family-settings__row tool-family-settings__row--form">
                         <div className="tool-family-settings__row-copy">
                           <span className="tool-family-settings__row-title">
+                            {variantDocs}
                             <strong>{t("加上决策模型参数", "Add decision-model parameters")}</strong>
                             <DecisionMark />
                           </span>
@@ -619,6 +654,7 @@ function ToolFamilyPageView({
                       <div className="tool-family-settings__row tool-family-settings__row--form">
                         <div className="tool-family-settings__row-copy">
                           <span className="tool-family-settings__row-title">
+                            {variantDocs}
                             <strong>{t("只用决策模型", "Decision model only")}</strong>
                             <DecisionMark />
                           </span>

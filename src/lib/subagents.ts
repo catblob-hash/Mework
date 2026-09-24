@@ -275,27 +275,10 @@ function agentModelId(
     ?? null;
 }
 const agentMessageToolNames = new Set(["agent_send", "send_message", "followup_task"]);
-// Workflow steps are intentionally excluded: synthetic workflow runs have no
-// durable public name and cannot be addressed by send_message/followup_task.
-const addressableAgentRunToolNames = new Set([
-  "agent_spawn",
-  "agent_send",
-  "send_message",
-  "followup_task"
-]);
 
 /** Tool calls that carry a child run (chips, live stream, persisted record). */
-export function isAgentRunTool(toolName: string): boolean {
+function isAgentRunTool(toolName: string): boolean {
   return agentRunToolNames.has(toolName);
-}
-
-/**
- * Agent calls whose public name is a durable host-issued identity.
- * Stream-only state must never synthesize a persisted record for these calls:
- * only the backend's signed final record may make them reloadable.
- */
-export function isAddressableAgentRunTool(toolName: string): boolean {
-  return addressableAgentRunToolNames.has(toolName);
 }
 
 /**
@@ -368,7 +351,7 @@ export function agentTimelineRunStatus(item: ToolContext): SubagentViewStatus {
   return item.result.success ? "completed" : "interrupted";
 }
 
-export const subagentAvatarTones = ["amber", "green", "mint", "blue", "violet", "rose"] as const;
+const subagentAvatarTones = ["amber", "green", "mint", "blue", "violet", "rose"] as const;
 export type SubagentAvatarTone = typeof subagentAvatarTones[number];
 
 export function hashSubagentId(value: string): number {
@@ -407,7 +390,7 @@ export interface ExternalStepBodyRef {
   stepIndex: number;
 }
 
-export function externalStepBodyRef(item: ToolContext): ExternalStepBodyRef | null {
+function externalStepBodyRef(item: ToolContext): ExternalStepBodyRef | null {
   if (item.toolName !== "workflow_step" || item.subagent) return null;
   const runId = stringInput(item, "runId");
   const stepIndex = numberInput(item, "stepIndex");
@@ -424,7 +407,7 @@ export function externalStepBodyRef(item: ToolContext): ExternalStepBodyRef | nu
  * status and the body fingerprint: without it the only way to learn a finished
  * step's cost was to open the step and let the drawer fetch its body.
  */
-export function externalStepUsage(item: ToolContext): ModelUsage | null {
+function externalStepUsage(item: ToolContext): ModelUsage | null {
   if (item.toolName !== "workflow_step" || item.subagent) return null;
   const usage = item.input.usage;
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
@@ -890,7 +873,7 @@ function liveUsage(items: ToolContext[]): ModelUsage {
  * `address` is an identity that is *not* addressable: a workflow step has one,
  * and nothing may be sent to it.
  */
-export function agentKeyForContext(
+function agentKeyForContext(
   item: ToolContext
 ): { key: string; name: string | null; address: string | null } {
   // A workflow step is identified by the run-scoped address the host publishes

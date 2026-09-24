@@ -1,60 +1,100 @@
-import { CAT_GLYPH, CAT_HEAD, catHeadTransform } from "./catArt";
+import {
+  BRAND_AMBER,
+  BRAND_PLATE,
+  BRAND_PROMPT,
+  ICON_MARK_TRANSFORM,
+  ICON_PROMPT_PATH,
+  LOCKUP_MARK_TRANSFORM,
+  LOCKUP_VIEWBOX,
+  MARK_PATH,
+  MARK_VIEWBOX,
+  WORDMARK_PATH
+} from "./brandMark";
 
 /**
- * The Mework brand glyph: the head of the cat the product is drawn with, as a solid
- * silhouette with its face punched out of it.
+ * The Mework brand in the app: the application icon, the bare mark, and the wordmark
+ * lockup. The geometry is `brandMark.ts`, which the shipped SVG assets are cut from too.
  *
- * The head rather than the whole drawing, because every slot that renders this is small — 25px
- * in the sidebar, 28px on the update card, 38px on the startup screen — and the desk, the
- * laptop and the tail stop resolving into anything well above that. The boxed application icon
- * keeps the whole scene for its large frames and falls back to this same head below 64px.
- *
- * Rendered inline rather than through `<img src=...>` because the mark is drawn in
- * `currentColor`: an external SVG loaded by `<img>` gets its own document and cannot see the
- * host page's color, so the glyph would have to hard-code a fill and stop tracking the
- * day/night palette. The geometry comes from `catArt.ts`, which is also what the standalone
- * assets are authored from; the companion test pins the two together so the shipped file and
- * the in-app copy cannot drift.
+ * Rendered inline rather than through `<img src=...>` so the mark and the wordmark can take
+ * their color from the page: an external SVG loaded by `<img>` gets its own document and
+ * cannot see the host's palette, so it could not follow day and night.
  */
 
-/** Fits the head into the 64-unit viewBox, with room for the shadow. */
-export const MEWORK_MARK_TRANSFORM = catHeadTransform(31.8, 32.2, 0.1351);
-
-/** Offset of the gold under-shadow, in drawing units (≈2.6 × 2.2 at 64). */
-export const MEWORK_MARK_SHADOW_OFFSET = "translate(19.25 16.28)";
-
-interface MeworkIconProps {
+interface BrandProps {
   className?: string;
-  label?: string;
-  size?: number;
 }
 
-export function MeworkIcon({
-  className,
-  label,
-  size = 24
-}: MeworkIconProps) {
+/**
+ * The application icon as the Dock and the taskbar show it: the prompt and the amber mark on
+ * the dark plate. Drawn edge to edge — the OS margins the shipped files carry are the OS's —
+ * and in fixed colors, because it is a picture of the app rather than a piece of the page.
+ */
+export function MeworkIcon({ className, size = 24 }: BrandProps & { size?: number }) {
   return (
     <svg
       className={className}
       width={size}
       height={size}
-      viewBox="0 0 64 64"
-      fill="currentColor"
-      role={label ? "img" : undefined}
-      aria-label={label}
-      aria-hidden={label ? undefined : true}
+      viewBox="0 0 100 100"
+      aria-hidden={true}
       focusable="false"
     >
-      <g transform={MEWORK_MARK_TRANSFORM}>
-        <path
-          fill="#b68235"
-          fillOpacity={0.34}
-          transform={MEWORK_MARK_SHADOW_OFFSET}
-          d={CAT_HEAD}
-        />
-        <path fill="currentColor" fillRule="evenodd" d={CAT_GLYPH} />
-      </g>
+      <rect width="100" height="100" rx="23" fill={BRAND_PLATE} />
+      <rect
+        x="0.5"
+        y="0.5"
+        width="99"
+        height="99"
+        rx="22.5"
+        fill="none"
+        stroke="#ffffff"
+        strokeOpacity={0.07}
+      />
+      <path
+        d={ICON_PROMPT_PATH}
+        fill="none"
+        stroke={BRAND_PROMPT}
+        strokeWidth={6}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d={MARK_PATH} transform={ICON_MARK_TRANSFORM} fill={BRAND_AMBER} />
+    </svg>
+  );
+}
+
+/** The mark alone, filled with `currentColor`; size it by height in CSS. */
+export function MeworkMark({ className }: BrandProps) {
+  return (
+    <svg
+      className={className}
+      viewBox={MARK_VIEWBOX}
+      fill="currentColor"
+      aria-hidden={true}
+      focusable="false"
+    >
+      <path d={MARK_PATH} />
+    </svg>
+  );
+}
+
+/**
+ * "Mework" with the mark after it. The wordmark takes `currentColor`; the mark carries the
+ * `mework-lockup__mark` class so the stylesheet can give it the amber token, which follows
+ * the night palette where an attribute color could not. Size it by height in CSS.
+ */
+export function MeworkLockup({ className }: BrandProps) {
+  return (
+    <svg
+      className={className}
+      viewBox={LOCKUP_VIEWBOX}
+      fill="currentColor"
+      role="img"
+      aria-label="Mework"
+      focusable="false"
+    >
+      <path d={WORDMARK_PATH} />
+      <path className="mework-lockup__mark" d={MARK_PATH} transform={LOCKUP_MARK_TRANSFORM} />
     </svg>
   );
 }

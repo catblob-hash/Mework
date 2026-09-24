@@ -21,14 +21,14 @@ export const API_FORMAT_OPTIONS: ReadonlyArray<{ value: ProviderFamily; label: s
 ];
 
 /** The built-in OAuth provider is fixed rather than selectable in the add dialog. */
-export const CODEX_FAMILY_OPTION = {
+const CODEX_FAMILY_OPTION = {
   value: "openai_codex" as const,
   label: "OpenAI Codex (ChatGPT)",
   defaultBaseUrl: CODEX_DEFAULT_BASE_URL,
 };
 
 /** The built-in local-CLI provider is fixed rather than selectable in the add dialog. */
-export const CLAUDE_AGENT_FAMILY_OPTION = {
+const CLAUDE_AGENT_FAMILY_OPTION = {
   value: "claude_agent" as const,
   label: "Claude Agent (Claude Code)",
   defaultBaseUrl: "",
@@ -74,7 +74,7 @@ export const NON_CHAT_ENDPOINTS: readonly EndpointType[] = [
 ];
 
 /** Path segment that the host POSTs for this protocol. */
-export function chatRequestPath(family: ProviderFamily): string {
+function chatRequestPath(family: ProviderFamily): string {
   switch (chatEndpointOf(family)) {
     case "openai_responses": return "/responses";
     case "openai_chat_completions": return "/chat/completions";

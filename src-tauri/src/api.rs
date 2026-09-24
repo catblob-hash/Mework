@@ -1463,6 +1463,7 @@ impl ProjectMemoryRunState {
                 id: context_id.clone(),
                 content: startup_prompt,
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: Utc::now().to_rfc3339(),
             });
             request.project_memory_context_id = Some(context_id);
@@ -1555,6 +1556,7 @@ impl ProjectMemoryRunState {
             id: new_context_id("project-memory"),
             content: prompt,
             images: Vec::new(),
+            files: Vec::new(),
             created_at: Utc::now().to_rfc3339(),
         });
         if let Some(instructions_loaded) = instructions_loaded {
@@ -2753,6 +2755,7 @@ fn run_model_inner(
                                 .unwrap_or_else(|| new_context_id("agent-message")),
                             content,
                             images,
+                            files: message.files,
                             created_at: message
                                 .created_at
                                 .unwrap_or_else(|| Utc::now().to_rfc3339()),
@@ -2773,6 +2776,7 @@ fn run_model_inner(
                     }
                     for message in steer_batch {
                         let mut images = message.images;
+                        let files = message.files;
                         let id = message
                             .id
                             .unwrap_or_else(|| new_context_id("steer-message"));
@@ -2795,12 +2799,14 @@ fn run_model_inner(
                             id: id.clone(),
                             content: content.clone(),
                             images: images.clone(),
+                            files: files.clone(),
                             created_at: created_at.clone(),
                         })?;
                         let context = ContextItem::User {
                             id,
                             content,
                             images,
+                            files,
                             created_at,
                         };
                         // Invalidate the durable queue copy once the model has
@@ -3341,6 +3347,7 @@ fn run_model_inner(
                             id: new_context_id("hook-continuation"),
                             content: reason,
                             images: Vec::new(),
+                            files: Vec::new(),
                             created_at: Utc::now().to_rfc3339(),
                         };
                         request.contexts.push(continuation.clone());
@@ -3383,6 +3390,7 @@ fn run_model_inner(
                                 .text(PromptKey::SubagentStructuredOutputNudge)
                                 .to_owned(),
                             images: Vec::new(),
+                            files: Vec::new(),
                             created_at: Utc::now().to_rfc3339(),
                         };
                         request.contexts.push(nudge.clone());
@@ -4548,6 +4556,7 @@ fn defer_mcp_tools(request: &mut RunModelRequest) {
         id: format!("ctx_ephemeral_deferred_tools_{}", Uuid::new_v4().simple()),
         content: announcement,
         images: Vec::new(),
+        files: Vec::new(),
         created_at: Utc::now().to_rfc3339(),
     });
 }
@@ -4852,8 +4861,8 @@ fn renumber_user_message_images(
 
 /// Cheap, deterministic fallback estimator shared with the frontend mirror
 /// (`src/lib/contextTokens.ts`); the unit test pins the exact vectors so the
-/// two implementations cannot drift apart silently.
-#[cfg(test)]
+/// two implementations cannot drift apart silently. File attachments record
+/// their size with it at upload, so the renderer can show it without the text.
 pub fn estimate_tokens(text: &str) -> u64 {
     let (ascii, non_ascii) = text.chars().fold((0_u64, 0_u64), |(ascii, non_ascii), ch| {
         if ch.is_ascii() {
@@ -6482,6 +6491,7 @@ fn web_search_task_context(task: String) -> ContextItem {
         id: new_context_id("web-search-task"),
         content: task,
         images: Vec::new(),
+        files: Vec::new(),
         created_at: Utc::now().to_rfc3339(),
     }
 }
@@ -9106,6 +9116,7 @@ fn refresh_named_agent_memory(
             id: context_id.clone(),
             content: prompt,
             images: Vec::new(),
+            files: Vec::new(),
             created_at: Utc::now().to_rfc3339(),
         });
     }
@@ -9548,6 +9559,7 @@ fn restore_conversation_fork_binding(
                 id: context_id.clone(),
                 content: prompt,
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: Utc::now().to_rfc3339(),
             });
         }
@@ -12521,6 +12533,7 @@ fn inject_lsp_diagnostics(request: &mut RunModelRequest, state: &AppState) {
         id: new_context_id(LSP_DIAGNOSTICS_CONTEXT_PREFIX),
         content: crate::lsp_servers::render_diagnostics(&files),
         images: Vec::new(),
+        files: Vec::new(),
         created_at: Utc::now().to_rfc3339(),
     });
     // Ephemeral contexts are re-sent in full on every round, so an unbounded
@@ -12589,6 +12602,7 @@ fn push_file_change_block(request: &mut RunModelRequest, content: String) {
         id: new_context_id(FILE_CHANGES_CONTEXT_PREFIX),
         content,
         images: Vec::new(),
+        files: Vec::new(),
         created_at: Utc::now().to_rfc3339(),
     });
     let mut blocks = request
@@ -14896,6 +14910,7 @@ mod tests {
                 id: "user-1".into(),
                 content: "Read the file.".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-01-01T00:00:00Z".into(),
             }],
             ephemeral_contexts: Vec::new(),
@@ -15149,11 +15164,12 @@ mod tests {
         std::fs::write(&launch_json, usable).unwrap();
         assert!(has_section(&request));
 
-        // The pane's toggle writes the file, and the very next step must go out
-        // without the section.
-        assert!(crate::preview::set_auto_verify(workspace.path(), false));
+        // `autoVerify: false` in the file takes the section out of the very next
+        // step, and dropping it again brings the section back.
+        let silenced = r#"{"autoVerify":false,"configurations":[{"name":"dev","runtimeExecutable":"npm","runtimeArgs":["run","dev"],"port":5173}]}"#;
+        std::fs::write(&launch_json, silenced).unwrap();
         assert!(!has_section(&request));
-        assert!(crate::preview::set_auto_verify(workspace.path(), true));
+        std::fs::write(&launch_json, usable).unwrap();
         assert!(has_section(&request));
 
         // A file that configures no usable server is the same as no file.
@@ -15636,6 +15652,7 @@ mod tests {
             id: "child-task".into(),
             content: "read checkpoint.txt".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-09-05T00:00:00Z".into(),
         }];
         let shared = pool
@@ -16333,6 +16350,7 @@ mod tests {
                 id: "historical-image".into(),
                 content: "看这张".into(),
                 images: vec![image.clone()],
+                files: Vec::new(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             }];
 
@@ -17029,6 +17047,7 @@ mod tests {
             id: "pure-image-user".into(),
             content: String::new(),
             images: vec![image.clone()],
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         }];
 
@@ -17060,6 +17079,7 @@ mod tests {
             id: "captioned-image-user".into(),
             content: "看这张".into(),
             images: vec![image],
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         }];
         let content = step_json(&request)["messages"][0]["content"]
@@ -17442,6 +17462,90 @@ mod tests {
         assert!(!within.contains("总像素超过"), "{within}");
     }
 
+    /// The ledger records what the timeline stores — the file's metadata — and
+    /// the provider receives the file's text, inlined before the question.
+    #[test]
+    fn attached_files_are_sent_as_text_while_the_ledger_keeps_the_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::file_attachments::FileAttachmentStore::new(temp.path());
+        let notes = store
+            .import(
+                "notes.md",
+                b"remember the milk\n",
+                crate::model::FileAttachmentFormat::Text,
+                None,
+                None,
+            )
+            .unwrap();
+        let pdf = store
+            .import(
+                "report.pdf",
+                b"%PDF-1.7\n%%EOF\n",
+                crate::model::FileAttachmentFormat::Pdf,
+                Some("page one"),
+                Some(1),
+            )
+            .unwrap();
+        let mut request = run_request(ProviderFamily::Anthropic);
+        request.app_data_path = temp.path().to_string_lossy().into_owned();
+        request.contexts = vec![ContextItem::User {
+            id: "user-files".into(),
+            content: "Summarize.".into(),
+            images: Vec::new(),
+            files: vec![notes.clone(), pdf.clone()],
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let family = crate::aisdk::protocol::Family::for_format(request.provider.family);
+        let (step, audit) = crate::aisdk::step::build_step_request_audited(
+            &request,
+            &[],
+            wire_history::project_full(family, &request.contexts),
+            "https://api.test.invalid/v1",
+            None,
+            1,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            step.messages,
+            vec![json!({
+                "role": "user",
+                "content": "<attached_file name=\"notes.md\">\nremember the milk\n</attached_file>\n\n\
+                    <attached_file name=\"report.pdf\" type=\"pdf\" pages=\"1\" content=\"text extracted from the PDF\">\npage one\n</attached_file>\n\n\
+                    Summarize.",
+            })]
+        );
+        let recorded = audit
+            .parts
+            .iter()
+            .find(|(kind, _)| *kind == crate::wire_ledger::PART_MESSAGE)
+            .map(|(_, message)| message.clone())
+            .unwrap();
+        assert_eq!(
+            recorded["content"][0],
+            json!({ "type": "mework-file", "file": notes })
+        );
+        assert_eq!(
+            recorded["content"][1],
+            json!({ "type": "mework-file", "file": pdf })
+        );
+        assert!(!recorded.to_string().contains("remember the milk"));
+
+        // The bytes gone, the request is refused rather than sent without them.
+        store.purge_all().unwrap();
+        let error = crate::aisdk::step::build_step_request(
+            &request,
+            &[],
+            wire_history::project_full(family, &request.contexts),
+            "https://api.test.invalid/v1",
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("notes.md"), "{error}");
+    }
+
     #[test]
     fn forged_anthropic_tool_input_does_not_trigger_vision_or_sidecar_hydration() {
         let temp = tempfile::tempdir().unwrap();
@@ -17645,6 +17749,7 @@ mod tests {
             id: "image-history".into(),
             content: String::new(),
             images: vec![attachment.clone(); MAX_REQUEST_IMAGES],
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         }];
         let mut execution = ToolExecution {
@@ -17727,6 +17832,7 @@ mod tests {
             id: "ephemeral-user".into(),
             content: String::new(),
             images: vec![attachment.clone()],
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         }];
         request.contexts = vec![
@@ -17775,6 +17881,7 @@ mod tests {
             id: "pixel-heavy-history".into(),
             content: String::new(),
             images: vec![attachment.clone(); 4],
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         }];
         let mut execution = ToolExecution {
@@ -18415,6 +18522,7 @@ mod tests {
                 id: "ctx_user".into(),
                 content: "读取 a.txt".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-07-21T00:00:00Z".into(),
             },
             ContextItem::Reasoning {
@@ -18462,6 +18570,7 @@ mod tests {
                 id: "ctx_followup".into(),
                 content: "继续".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-07-21T00:00:03Z".into(),
             },
         ];
@@ -18594,6 +18703,7 @@ mod tests {
                 id: "later_user".into(),
                 content: "new request".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-07-21T00:00:03Z".into(),
             },
         ];
@@ -18665,6 +18775,7 @@ mod tests {
                     id: "edited-user".into(),
                     content: "开始".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-07-22T00:00:00Z".into(),
                 },
                 ContextItem::Assistant {
@@ -18746,6 +18857,7 @@ mod tests {
                     id: "edited-followup".into(),
                     content: "继续".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-07-22T00:00:08Z".into(),
                 },
             ]
@@ -18822,6 +18934,7 @@ mod tests {
             id: "oversized-user".into(),
             content: "x".repeat(crate::aisdk::protocol::MAX_LINE_BYTES / 2 + 1),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }];
         let error = try_step_request_with(&request, &[], "https://api.test.invalid/v1")
@@ -19509,6 +19622,7 @@ mod tests {
             id: "user-1".into(),
             content: "Read the file.".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-09-05T00:00:00Z".into(),
         };
         store
@@ -19705,6 +19819,7 @@ mod tests {
                         id: "user-1".into(),
                         content: "Think, then answer.".into(),
                         images: Vec::new(),
+                        files: Vec::new(),
                         created_at: "2026-09-05T00:00:00Z".into(),
                     }],
                     queued_messages: Vec::new(),
@@ -20875,6 +20990,7 @@ mod tests {
                 id: "ephemeral-memory".into(),
                 content: SENTINEL.into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             });
 
@@ -22376,10 +22492,12 @@ mod tests {
                 id,
                 content,
                 images,
+                files,
                 created_at,
             }) if id.starts_with("ctx_subagent-task_")
                 && content == task
                 && images.is_empty()
+                && files.is_empty()
                 && !created_at.is_empty()
         ));
         assert!(record.contexts.iter().any(|context| matches!(
@@ -24163,6 +24281,7 @@ mod tests {
                     id: "subagent-task-1".into(),
                     content: "跑一条很长的命令".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                 }],
                 Vec::new(),
@@ -24360,6 +24479,7 @@ mod tests {
                     id: "subagent-task-1".into(),
                     content: "列个目录".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                 }],
                 Vec::new(),
@@ -24432,6 +24552,7 @@ mod tests {
                     id: "step-task-1".into(),
                     content: "跑一条很长的命令".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                 }],
                 Vec::new(),
@@ -27061,6 +27182,7 @@ mod tests {
                         id: "old-task".into(),
                         content: "历史任务".into(),
                         images: Vec::new(),
+                        files: Vec::new(),
                         created_at: "2026-07-13T00:00:00Z".into(),
                     },
                     ContextItem::Assistant {
@@ -28248,6 +28370,7 @@ mod tests {
                     id: "child-task".into(),
                     content: "历史任务".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-07-24T00:00:00Z".into(),
                 }],
                 Vec::new(),
@@ -28863,6 +28986,7 @@ mod tests {
                     id: "task".into(),
                     content: "任务".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-07-14T00:00:00Z".into(),
                 }],
                 Vec::new(),
@@ -28972,6 +29096,7 @@ mod tests {
                     id: "task".into(),
                     content: "任务".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-07-14T00:00:00Z".into(),
                 }],
                 Vec::new(),
@@ -29393,6 +29518,7 @@ mod tests {
             id: Some("queued-user-1".into()),
             content: "先检查失败日志".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: Some("2026-07-24T00:00:00Z".into()),
         });
         request.steer_mailbox = AgentMailboxHandle(Some(Arc::clone(&mailbox)));
@@ -29421,10 +29547,12 @@ mod tests {
                     id,
                     content,
                     images,
+                    files,
                     created_at,
                 } if id == "queued-user-1"
                     && content == "先检查失败日志"
                     && images.is_empty()
+                    && files.is_empty()
                     && created_at == "2026-07-24T00:00:00Z"
             )));
         assert!(response.contexts.iter().any(|context| matches!(
@@ -29437,6 +29565,64 @@ mod tests {
             } if id == "queued-user-1"
                 && content == "先检查失败日志"
                 && created_at == "2026-07-24T00:00:00Z"
+        )));
+    }
+
+    /// A steered message's files travel with it: into the acknowledgement the
+    /// renderer persists, into the timeline, and — as text — into the request.
+    #[test]
+    fn a_steered_message_carries_its_files_to_the_event_timeline_and_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_json_sequence(listener, vec![responses_text_output("看过了")]);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = loop_request_for(address, workspace.path());
+        let file = crate::file_attachments::FileAttachmentStore::new(workspace.path())
+            .import(
+                "trace.log",
+                b"panic at step 7\n",
+                crate::model::FileAttachmentFormat::Text,
+                None,
+                None,
+            )
+            .unwrap();
+        let mailbox = Arc::new(crate::agents::AgentMailbox::default());
+        mailbox.push_message(crate::agents::MailboxMessage {
+            id: Some("queued-file-1".into()),
+            content: "看这个日志".into(),
+            images: Vec::new(),
+            files: vec![file.clone()],
+            created_at: Some("2026-07-24T00:00:00Z".into()),
+        });
+        request.steer_mailbox = AgentMailboxHandle(Some(Arc::clone(&mailbox)));
+        let events = Mutex::new(Vec::<ModelStreamEvent>::new());
+        let sink = |event: ModelStreamEvent| {
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+            Ok(())
+        };
+
+        let response = run_model(request, &AppState::default(), &sink, &approve_tool).unwrap();
+        let captured = server.join().unwrap();
+
+        assert!(captured[0].contains("panic at step 7"), "{}", captured[0]);
+        assert!(captured[0].contains("trace.log"));
+        assert!(events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|event| matches!(
+                event,
+                ModelStreamEvent::UserInputReceived { id, files, .. }
+                    if id == "queued-file-1" && files == &vec![file.clone()]
+            )));
+        assert!(response.contexts.iter().any(|context| matches!(
+            context,
+            ContextItem::User { id, files, .. }
+                if id == "queued-file-1" && files == &vec![file.clone()]
         )));
     }
 
@@ -29501,6 +29687,7 @@ mod tests {
             id: "forkable-parent-memory".into(),
             content: prompt,
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-08-01T00:00:00Z".into(),
         });
         parent.memory_context_id = Some("forkable-parent-memory".into());
@@ -30176,6 +30363,7 @@ mod tests {
             id: "ctx_u".into(),
             content: "hi".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-09-16T00:00:00.000Z".into(),
         }];
         request.added_skills = vec![crate::model::AddedSkill {
@@ -31379,6 +31567,7 @@ mod tests {
                 project_memory::PROJECT_MEMORY_PROMPT_END
             ),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         });
 
@@ -31978,6 +32167,7 @@ mod tests {
                     id: "old-task".into(),
                     content: "历史任务".into(),
                     images: Vec::new(),
+                    files: Vec::new(),
                     created_at: "2026-07-13T00:00:00Z".into(),
                 }],
                 updates: Vec::new(),
@@ -32773,6 +32963,7 @@ mod tests {
                 id: "ctx_real_prompt".into(),
                 content: "真正的用户请求".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-07-29T00:00:00Z".into(),
             },
             ContextItem::User {
@@ -32781,6 +32972,7 @@ mod tests {
                 // their ID prefix.
                 content: "[a1 · 已完成]\n注入内容".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-07-29T00:00:01Z".into(),
             },
         ];
@@ -32833,6 +33025,7 @@ mod tests {
                 id: "ctx_real_prompt".into(),
                 content: "真正的用户请求".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: "2026-08-26T00:00:00Z".into(),
             },
             delivery("0af31cde9b", BOX_TOOL),
@@ -33028,6 +33221,7 @@ mod tests {
             id: "ctx_turn2_prompt".into(),
             content: "继续".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: Utc::now().to_rfc3339(),
         });
         let second_response = run_model(second, &state, &discard_event, &approve_tool).unwrap();
@@ -35680,6 +35874,7 @@ mod tests {
                 id: "live-user".into(),
                 content: "Run the requested smoke test now.".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: Utc::now().to_rfc3339(),
             }],
             ephemeral_contexts: Vec::new(),

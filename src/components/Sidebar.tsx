@@ -35,11 +35,11 @@ import { isImeKeyEvent } from "../lib/shortcuts";
 import { isBrowserDevRuntime } from "../lib/backend";
 import { usePointerDrag } from "./usePointerDrag";
 import type { DragPoint } from "./usePointerDrag";
-import { MeworkIcon } from "./MeworkIcon";
+import { MeworkLockup } from "./MeworkIcon";
 
 export const SIDEBAR_DEFAULT_WIDTH = 264;
-export const SIDEBAR_MIN_WIDTH = 220;
-export const SIDEBAR_MAX_WIDTH = 420;
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 420;
 
 export function clampSidebarWidth(width: number): number {
   return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(width)));
@@ -436,8 +436,7 @@ export function Sidebar({
       {...(!open ? { inert: true } : {})}
     >
       <div className="sidebar__brand">
-        <MeworkIcon className="brand-mark" size={25} />
-        <span>Mework</span>
+        <MeworkLockup className="brand-lockup" />
         <IconButton label={t("收起侧栏", "Collapse sidebar")} onClick={onClose}>
           <PanelLeftClose size={18} />
         </IconButton>

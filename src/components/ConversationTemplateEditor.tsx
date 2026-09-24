@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { createId } from "../lib/id";
-import { acceptPastedImages } from "../lib/imagePaste";
+import { messageAttachmentAdder } from "../lib/imagePaste";
 import { imageShortIdsInUse } from "../lib/imageShortIds";
 import { isEncryptedReasoning } from "../lib/modelCapabilities";
 import {
@@ -12,6 +12,7 @@ import {
 import { isHostDerivedToolName } from "../lib/taskTools";
 import type {
   ContextItem,
+  FileAttachment,
   ImageAttachment,
   InsertableContextKind,
   JsonObject,
@@ -172,7 +173,7 @@ export function ConversationTemplateEditor({
     setQuestionEditor(null);
   };
 
-  const saveText = (content: string, images?: ImageAttachment[]) => {
+  const saveText = (content: string, images?: ImageAttachment[], files?: FileAttachment[]) => {
     if (!editor) return;
     if (editor.mode === "edit") {
       const { id } = editor.item;
@@ -181,7 +182,7 @@ export function ConversationTemplateEditor({
         if (item.kind === "assistant" || item.kind === "reasoning") {
           return { ...item, content, interrupted: false };
         }
-        if (item.kind === "user" && images) return { ...item, content, images };
+        if (item.kind === "user" && images) return { ...item, content, images, files: files?.length ? files : undefined };
         return { ...item, content };
       }));
     } else {
@@ -197,7 +198,7 @@ export function ConversationTemplateEditor({
         : editor.kind === "user"
           // A placed message carries what was pasted into it; every other kind
           // has nowhere to put an image and is never handed one.
-          ? { ...base, kind: "user", ...(images?.length ? { images } : {}) }
+          ? { ...base, kind: "user", ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) }
           : { ...base, kind: editor.kind as "system" | "assistant" };
       const { index } = editor;
       amend((contexts) => {
@@ -419,15 +420,12 @@ export function ConversationTemplateEditor({
             : undefined}
           onCancelEdit={editable ? closeEditors : undefined}
           onSaveText={editable ? saveText : undefined}
-          onPasteImages={editable && imageInputSupported
-            ? (files, existing) => acceptPastedImages(
-              files,
-              existing,
-              // A template has no transcript behind it, so its own body is the
-              // whole of what a number can already be spoken for by.
-              imageShortIdsInUse(draft ?? [])
-            )
+          onAddAttachments={editable
+            // A template has no transcript behind it, so its own body is the
+            // whole of what a number can already be spoken for by.
+            ? messageAttachmentAdder(imageInputSupported, () => imageShortIdsInUse(draft ?? []))
             : undefined}
+          attachmentImageInput={imageInputSupported}
           /* No `onSaveTool`: that handler is the one that executes, and there is
              nothing here to execute against. Its absence is what keeps the run
              button off the card editor. */

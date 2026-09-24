@@ -796,7 +796,7 @@ fn forward(
                 context_id: String::new(),
             })
         }
-        StepEvent::ToolCall { call_id, input, .. } => {
+        StepEvent::ToolCall { call_id, input } => {
             let input = input.as_object().cloned().unwrap_or_default();
             event_sink(ModelStreamEvent::ToolCallArgumentsReady {
                 round,
@@ -811,9 +811,6 @@ fn forward(
             }
             event_sink(ModelStreamEvent::UsageUpdated { round, usage })
         }
-        // Sources are attached during settlement to the assistant card or search envelope, so a
-        // dropped live event cannot lose source facts.
-        StepEvent::Source(_) => Ok(()),
         StepEvent::Heartbeat => event_sink(ModelStreamEvent::Ping),
     }
 }

@@ -40,19 +40,6 @@ impl CancelSignal {
         Self { flags: vec![flag] }
     }
 
-    /// Adds a source. `None` means that source is absent, not cancelled, so it leaves
-    /// the signal unchanged.
-    ///
-    /// Production construction now supplies one owner-scoped source, but this method
-    /// preserves the container's union contract for future multi-source construction.
-    #[allow(dead_code)]
-    pub fn with(mut self, flag: Option<Arc<AtomicBool>>) -> Self {
-        if let Some(flag) = flag {
-            self.flags.push(flag);
-        }
-        self
-    }
-
     /// Returns cancelled when any source is set.
     pub fn cancelled(&self) -> bool {
         self.flags.iter().any(|flag| flag.load(Ordering::Acquire))
@@ -101,34 +88,17 @@ mod tests {
         assert!(!CancelSignal::default().cancelled());
     }
 
-    /// `None` means the source is absent, not cancelled.
+    /// Emptiness is about sources, not cancellation.
     #[test]
-    fn merging_an_absent_source_changes_nothing() {
-        let signal = CancelSignal::default().with(None);
-        assert!(!signal.cancelled());
-        assert_eq!(signal, CancelSignal::default());
-        assert!(signal.is_empty(), "空信号＝不属于任何任务、也没有运行");
+    fn an_unset_source_is_not_an_empty_signal() {
+        assert!(
+            CancelSignal::default().is_empty(),
+            "空信号＝不属于任何任务、也没有运行"
+        );
         assert!(
             !CancelSignal::from_flag(Arc::new(AtomicBool::new(false))).is_empty(),
             "有来源但未置位 ≠ 空：归属判据与取消状态是两个问题"
         );
-    }
-
-    /// With multiple sources, either set flag cancels. Production construction uses
-    /// one owner-scoped source, but this preserves the container's union semantics.
-    #[test]
-    fn either_source_cancels() {
-        let run = Arc::new(AtomicBool::new(false));
-        let task = Arc::new(AtomicBool::new(false));
-        let signal = CancelSignal::from_flag(Arc::clone(&run)).with(Some(Arc::clone(&task)));
-
-        assert!(!signal.cancelled());
-        task.store(true, Ordering::Release);
-        assert!(signal.cancelled());
-        task.store(false, Ordering::Release);
-        assert!(!signal.cancelled());
-        run.store(true, Ordering::Release);
-        assert!(signal.cancelled());
     }
 
     /// Signals share flags rather than snapshotting them, so a stop requested after

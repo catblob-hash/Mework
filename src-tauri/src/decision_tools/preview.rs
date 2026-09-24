@@ -12,7 +12,6 @@
 //! through the ordinary dispatcher, carrying the selector of the element the model chose.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -25,11 +24,15 @@ use crate::browser::{
     PREVIEW_ELEMENT_LINES_CAP,
 };
 use crate::cancel::CancelSignal;
-use crate::decision_model::chunk::{chunk_lines, group_entries};
+use crate::decision_model::chunk::Blocks;
 use crate::decision_model::jev::{
-    ChoiceAnswer, ELEMENT_RUBRIC, MAX_CHOICE_OPTIONS, RELEVANCE_RUBRIC,
+    estimate_tokens, ChoiceAnswer, ELEMENT_RUBRIC, MAX_CHOICE_OPTIONS, RELEVANCE_RUBRIC,
+    STATE_TOKEN_LIMIT,
 };
-use crate::decision_model::search::{render_report, search, Candidate, Scorer, SearchReport};
+use crate::decision_model::search::{
+    compare_scores, render_report, render_summary, report, score_blocks, search, Block, Scorer,
+    Scores, SearchReport,
+};
 use crate::decision_model::{parse_query, parse_threshold, DecisionError};
 use crate::model::{JsonObject, ToolExecutionRequest};
 use crate::state::AppState;
@@ -38,21 +41,25 @@ use crate::tool_executor::{
     resolve_preview_page_session, Outcome,
 };
 
-use super::files::{chunk_candidates, refine_line_chunk};
-use super::{failure, jev_client, jev_scorer};
+use super::{failure, jev_client, jev_scorer, line_blocks, numbered};
 
 /// Wall clock one page read gets. The same 30 s `dispatch_preview_page_tool` gives a page tool,
 /// kept here as its own constant because that one is private to the executor and because these
 /// reads are not dispatched through it.
 const PAGE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Coarse scoring unit for page elements: a run of consecutive snapshot lines, and the cap on
-/// how many runs one call scores. Both mirror the line chunker's shape for text.
-const ELEMENTS_PER_RUN: usize = 12;
-const MAX_ELEMENT_RUNS: usize = 48;
-
 /// Element lines one `choice` question may offer, with the last option reserved for `none`.
 const MAX_ELEMENT_CHOICES: usize = MAX_CHOICE_OPTIONS - 1;
+
+/// What the elements of one choice question may cost, in estimated tokens: Jev's limit for the
+/// state and the longest question, less room for the instructions and the description. Each
+/// element is counted twice — its line in the state, and again as its option.
+const CHOICE_TOKEN_BUDGET: usize = STATE_TOKEN_LIMIT - 4_000;
+
+/// When the elements cannot be offered in a choice at all, the scored ones at or above this come
+/// back instead, for the caller to pick from. The element rubric's "likely" level sits at 0.667,
+/// "similar" at 0.333.
+const FALLBACK_THRESHOLD: f64 = 0.5;
 
 const CHOICE_INSTRUCTIONS: &str = "Which element in `elements` is the one that `description` \
 refers to? Every element line starts with its uid in square brackets; answer with that uid. \
@@ -100,17 +107,8 @@ fn find_element(
     if lines.is_empty() {
         return Ok(Outcome::success(NO_ELEMENTS.to_owned()));
     }
-    let rendered = render_lines(&lines);
-    let (coarse, by_label) = element_runs(&lines, &rendered);
-    let report = search(
-        scorer,
-        &query,
-        threshold,
-        coarse,
-        |candidate| refine_element_run(&lines, &rendered, &by_label, candidate),
-        cancel,
-    )
-    .map_err(failure)?;
+    let report = search(scorer, &query, threshold, &element_blocks(&lines), cancel)
+        .map_err(failure)?;
     Ok(Outcome::success(render_element_report(
         &report,
         &query,
@@ -140,7 +138,7 @@ pub(crate) fn find_logs(
     let mut server = Vec::new();
     if source.reads_server() {
         match server_for_logs(request, state, workspace) {
-            Some(server_id) => server = server_log_lines(state, &server_id),
+            Some(server_id) => server = server_log_reads(state, &server_id),
             None if source == LogSource::Server => return Err(NO_SERVER_LOGS.to_owned()),
             None => notes.push(NO_RUNNING_SERVER.to_owned()),
         }
@@ -151,29 +149,28 @@ pub(crate) fn find_logs(
         Vec::new()
     };
 
-    let console_plan = chunk_lines(&console.join("\n"));
-    let server_plan = chunk_lines(&server.join("\n"));
-    let (mut coarse, mut by_label) = chunk_candidates("console", &console_plan.chunks);
-    let (server_coarse, server_by_label) = chunk_candidates("server", &server_plan.chunks);
-    coarse.extend(server_coarse);
-    by_label.extend(server_by_label);
+    // Each log is cut into its own original blocks: the console by entry, the server by read —
+    // one output round each. Every block of both is scored, and every one that clears comes back
+    // whole.
+    let console = Blocks::entries(console);
+    let server = Blocks::reads(&server);
+    let mut blocks = console_blocks(&console);
+    let console_blocks = blocks.len();
+    blocks.extend(line_blocks(&server, "server", 1));
 
     let mut text = vec![scored_lines_line(console.len(), server.len())];
     text.append(&mut notes);
-    if coarse.is_empty() {
+    if blocks.is_empty() {
         text.push(NO_LOG_LINES.to_owned());
         return Ok(Outcome::success(text.join("\n")));
     }
-    let report = search(
-        scorer,
-        &query,
-        threshold,
-        coarse,
-        |candidate| refine_line_chunk(label_source(&candidate.label), &by_label, candidate),
-        cancel,
-    )
-    .map_err(failure)?;
-    text.push(render_report(&report, &query, threshold, "chunks of logs", true));
+    let report = search(scorer, &query, threshold, &blocks, cancel).map_err(failure)?;
+    text.push(render_report(&report, &query, threshold, "blocks of logs", |hit| {
+        Some(match hit.block.checked_sub(console_blocks) {
+            None => console.text_of(hit.block + 1, hit.block + 1),
+            Some(read) => numbered(&server, server.spans()[read], 1),
+        })
+    }));
     Ok(Outcome::success(text.join("\n")))
 }
 
@@ -202,23 +199,17 @@ fn score_console_logs(
         let skip = console.len().saturating_sub(limit);
         console.drain(..skip);
     }
-    let plan = chunk_lines(&console.join("\n"));
-    let (coarse, by_label) = chunk_candidates("console", &plan.chunks);
     let mut text = vec![scored_console_line(console.len())];
-    if coarse.is_empty() {
+    let console = Blocks::entries(console);
+    let blocks = console_blocks(&console);
+    if blocks.is_empty() {
         text.push(NO_CONSOLE_LINES.to_owned());
         return Ok(Outcome::success(text.join("\n")));
     }
-    let report = search(
-        scorer,
-        &query,
-        threshold,
-        coarse,
-        |candidate| refine_line_chunk("console", &by_label, candidate),
-        cancel,
-    )
-    .map_err(failure)?;
-    text.push(render_report(&report, &query, threshold, "chunks of console logs", true));
+    let report = search(scorer, &query, threshold, &blocks, cancel).map_err(failure)?;
+    text.push(render_report(&report, &query, threshold, "entries of the console", |hit| {
+        Some(console.text_of(hit.block + 1, hit.block + 1))
+    }));
     Ok(Outcome::success(text.join("\n")))
 }
 
@@ -313,6 +304,10 @@ impl DescribedAction {
 /// reading the page again. With `score_misses` those lines are first scored against the
 /// description one by one and listed highest first — a second opinion on the same material, from
 /// a question that cannot decline.
+///
+/// A page whose elements do not all fit one question is scored first and the best of it offered
+/// ([`shortlist`]). Only an element line too long for any choice question stops the choice
+/// altogether ([`unchoosable`]).
 fn act_by_query(
     request: &ToolExecutionRequest,
     state: &AppState,
@@ -328,7 +323,32 @@ fn act_by_query(
     let session_id = resolve_preview_page_session(request, state, workspace)?;
     let jev = jev_client()?;
     let (lines, capped) = element_lines(state, &session_id, action.tool())?;
-    let candidates = narrow_candidates(&lines, &description, cancel)?;
+    let rendered = render_lines(&lines);
+    let too_long = too_long_to_offer(&rendered);
+    if !too_long.is_empty() {
+        let blocks = element_blocks(&lines);
+        let scores = jev_scorer(ELEMENT_RUBRIC)
+            .map_err(DecisionError::Config)
+            .and_then(|scorer| score_blocks(scorer, &description, &blocks, cancel));
+        if scores == Err(DecisionError::Cancelled) {
+            return Err(failure(DecisionError::Cancelled));
+        }
+        let text = unchoosable(
+            action,
+            &description,
+            &lines,
+            capped,
+            &too_long,
+            scores.map_err(failure),
+            |line| selector_for(state, &session_id, action.tool(), line),
+        );
+        return if action.misses_are_errors() {
+            Err(text)
+        } else {
+            Ok(Outcome::success(text))
+        };
+    }
+    let candidates = shortlist(&lines, &description, cancel)?;
     let shown = Shown::new(&candidates, lines.len(), capped);
     if candidates.is_empty() {
         return missed(action, &description, None, &shown, &MissListing::Plain)
@@ -441,8 +461,8 @@ impl<'a> Shown<'a> {
         let count = self.elements.len();
         if self.narrowed() {
             format!(
-                "The page has {} element lines; the decision model was shown the {count} in the \
-                 runs that scored best against the description",
+                "The page has {} element lines; the decision model was shown the {count} that \
+                 scored best against the description",
                 self.page_elements
             )
         } else if count == 1 {
@@ -477,13 +497,12 @@ impl<'a> Shown<'a> {
     /// The same lines after each was scored against the description on its own: highest first,
     /// each with its score, and any a failed request left unscored at the end in page order.
     fn render_scored(&self, report: &SearchReport) -> String {
-        let by_uid = uid_index(self.elements);
         let mut scored = HashSet::new();
         let mut lines = report
             .hits
             .iter()
             .filter_map(|hit| {
-                let line = by_uid.get(&uid_from_element_label(&hit.candidate.label)?)?;
+                let line = self.elements.get(hit.block)?;
                 scored.insert(line.uid);
                 Some(format!(
                     "{} (score {:.3})",
@@ -512,18 +531,6 @@ impl<'a> Shown<'a> {
         self.listing(header, lines)
     }
 
-    /// One scoring candidate per line, labelled by uid and carrying the two lines on either side,
-    /// the same shape `preview_snapshot`'s refinement scores.
-    fn candidates(&self) -> Vec<Candidate> {
-        self.elements
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                Candidate::new(element_label(line.uid), self.rendered[index].clone())
-                    .with_context(line_context(&self.rendered, index))
-            })
-            .collect()
-    }
 }
 
 fn counted_requests(count: usize) -> String {
@@ -543,11 +550,11 @@ enum MissListing {
     ScoringFailed(String),
 }
 
-/// Scores every line a choice question showed, one request per line, for a miss's listing.
+/// Scores every line a choice question showed, each on its own, for a miss's listing.
 ///
-/// Threshold zero and no refinement: every line is its own candidate and every score is wanted,
-/// so the listing can rank them all. Cancellation stops the call; any other failure is reported
-/// in the listing, because the miss itself is still worth answering.
+/// Threshold zero: every score is wanted, so the listing can rank them all. Cancellation stops the
+/// call; any other failure is reported in the listing, because the miss itself is still worth
+/// answering.
 fn score_shown(
     scorer: Result<Arc<dyn Scorer>, String>,
     shown: &Shown<'_>,
@@ -558,7 +565,8 @@ fn score_shown(
         Ok(scorer) => scorer,
         Err(error) => return Ok(MissListing::ScoringFailed(error)),
     };
-    match search(scorer, description, 0.0, shown.candidates(), |_| Vec::new(), cancel) {
+    let blocks = element_blocks(shown.elements);
+    match search(scorer, description, 0.0, &blocks, cancel) {
         Ok(report) => Ok(MissListing::Scored(report)),
         Err(DecisionError::Cancelled) => Err(failure(DecisionError::Cancelled)),
         Err(error) => Ok(MissListing::ScoringFailed(failure(error))),
@@ -673,69 +681,166 @@ fn choice_option_text(line: &AxLine) -> String {
         .map_or_else(|| line.role.clone(), |(_, rest)| rest.to_owned())
 }
 
-/// The element lines one choice question is asked about.
-///
-/// A page with more elements than the question holds is narrowed first: the runs are scored
-/// against the description and the best ones are kept, in page order, until the budget is full.
-fn narrow_candidates(
-    lines: &[AxLine],
-    description: &str,
-    cancel: &CancelSignal,
-) -> Result<Vec<AxLine>, String> {
-    if lines.len() <= MAX_ELEMENT_CHOICES {
-        return Ok(lines.to_vec());
-    }
-    narrow_with(jev_scorer(ELEMENT_RUBRIC)?, lines, description, cancel)
+/// What one element line costs a choice question, in estimated tokens: the line in the state, and
+/// nearly the same text again as its option.
+fn choice_cost(rendered: &str) -> usize {
+    2 * estimate_tokens(rendered) + 8
 }
 
-fn narrow_with(
-    scorer: Arc<dyn Scorer>,
+/// The element lines too long for any choice question: each alone costs more than a whole
+/// question may. None of today's element lines comes near — names and values are cut at 200
+/// characters — but the limit is Jev's, not the page's.
+fn too_long_to_offer(rendered: &[String]) -> Vec<usize> {
+    rendered
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| choice_cost(line) > CHOICE_TOKEN_BUDGET)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The element lines one choice question is asked about: every one when they all fit a question,
+/// and otherwise the ones that score best against the description. Every element of the page is
+/// scored, each on its own, and the highest are offered until the question is full — by option
+/// count and by size — in page order.
+fn shortlist(
     lines: &[AxLine],
     description: &str,
     cancel: &CancelSignal,
 ) -> Result<Vec<AxLine>, String> {
     let rendered = render_lines(lines);
-    let (coarse, by_label) = element_runs(lines, &rendered);
-    // One coarse pass and no refinement: this is a shortlist, not an answer. Threshold zero so
-    // every run is ranked; the budget below is what actually selects.
-    let report = search(scorer, description, 0.0, coarse, |_| Vec::new(), cancel).map_err(failure)?;
-    Ok(select_runs(lines, &report, &by_label))
+    let cost = rendered.iter().map(|line| choice_cost(line)).sum::<usize>();
+    if lines.len() <= MAX_ELEMENT_CHOICES && cost <= CHOICE_TOKEN_BUDGET {
+        return Ok(lines.to_vec());
+    }
+    let scores = score_blocks(
+        jev_scorer(ELEMENT_RUBRIC)?,
+        description,
+        &element_blocks(lines),
+        cancel,
+    )
+    .map_err(failure)?;
+    Ok(top_elements(lines, &rendered, &scores))
 }
 
-/// The best-scoring runs that fit the option budget, returned in page order. The best run is
-/// always kept, even if it alone would overflow the budget — a shortlist of nothing is useless.
-fn select_runs(
-    lines: &[AxLine],
-    report: &SearchReport,
-    by_label: &HashMap<String, Range<usize>>,
-) -> Vec<AxLine> {
-    let mut ranges: Vec<Range<usize>> = Vec::new();
-    let mut collected = 0;
-    for hit in &report.hits {
-        let Some(range) = by_label.get(&hit.candidate.label) else {
-            continue;
-        };
-        if collected + range.len() > MAX_ELEMENT_CHOICES {
+/// The highest-scoring elements, as many as one question holds, in page order. An element no
+/// request managed to score ranks below every scored one.
+fn top_elements(lines: &[AxLine], rendered: &[String], scores: &Scores) -> Vec<AxLine> {
+    let mut order = (0..lines.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        let score = |index: usize| scores.best.get(index).copied().flatten().map(|best| best.0);
+        match (score(left), score(right)) {
+            (Some(left_score), Some(right_score)) => compare_scores(right_score, left_score),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then(left.cmp(&right))
+    });
+    let mut chosen = Vec::new();
+    let mut cost = 0;
+    for index in order {
+        let next = choice_cost(&rendered[index]);
+        if chosen.len() == MAX_ELEMENT_CHOICES || cost + next > CHOICE_TOKEN_BUDGET {
             break;
         }
-        collected += range.len();
-        ranges.push(range.clone());
+        cost += next;
+        chosen.push(index);
     }
-    if ranges.is_empty() {
-        let best = report
-            .hits
-            .first()
-            .and_then(|hit| by_label.get(&hit.candidate.label));
-        let Some(best) = best else {
-            return Vec::new();
-        };
-        ranges.push(best.start..best.end.min(best.start + MAX_ELEMENT_CHOICES));
+    chosen.sort_unstable();
+    chosen.into_iter().map(|index| lines[index].clone()).collect()
+}
+
+/// The answer when the page's elements cannot be offered in a choice at all — some element line is
+/// longer than a whole choice question may be — so the decision model chose nothing and nothing
+/// was done. It says so first, in so many words; then every element scored at or above
+/// [`FALLBACK_THRESHOLD`], with its selector; then every line too long to offer, as it is, with its
+/// score and selector — for the caller to pick from.
+fn unchoosable(
+    action: DescribedAction,
+    description: &str,
+    lines: &[AxLine],
+    capped: bool,
+    too_long: &[usize],
+    scores: Result<Scores, String>,
+    selector_of: impl Fn(&AxLine) -> Option<String>,
+) -> String {
+    let undone = match action {
+        DescribedAction::Click => "nothing was clicked",
+        DescribedAction::Fill => "nothing was filled",
+        DescribedAction::Inspect => "nothing was inspected",
+    };
+    let count = if too_long.len() == 1 {
+        "1 element line of the page is".to_owned()
+    } else {
+        format!("{} element lines of the page are", too_long.len())
+    };
+    let mut text = vec![format!(
+        "The decision model was not asked to choose, so {undone}: {count} too long to offer in a \
+         choice question (more than Jev's {STATE_TOKEN_LIMIT}-token limit for one). Every \
+         element line was scored against the description {description:?} instead. Below are the \
+         elements scoring at or above {FALLBACK_THRESHOLD:.3}, each with its selector, and then \
+         every line too long to offer, as it is. Pick the element from these, or describe it \
+         differently."
+    )];
+    if capped {
+        text.push(format!(
+            "(Only the first {PREVIEW_ELEMENT_LINES_CAP} element lines of the page were read; the \
+             page has more.)"
+        ));
     }
-    ranges.sort_by_key(|range| range.start);
-    ranges
-        .into_iter()
-        .flat_map(|range| lines[range].to_vec())
-        .collect()
+    let blocks = element_blocks(lines);
+    let best = match &scores {
+        Ok(scores) => {
+            let report = report(&blocks, scores, FALLBACK_THRESHOLD);
+            text.push(render_summary(
+                &report,
+                description,
+                FALLBACK_THRESHOLD,
+                "elements of the page",
+            ));
+            text.extend(
+                report
+                    .hits
+                    .iter()
+                    .filter(|hit| !too_long.contains(&hit.block))
+                    .map(|hit| {
+                        element_hit_line(&lines[hit.block], Some(hit.score), &selector_of)
+                    }),
+            );
+            scores.best.clone()
+        }
+        Err(error) => {
+            text.push(format!(
+                "Scoring the elements failed, so none are ranked: {error}"
+            ));
+            vec![None; lines.len()]
+        }
+    };
+    text.push(format!("Too long to offer ({}):", too_long.len()));
+    text.extend(too_long.iter().map(|&index| {
+        element_hit_line(
+            &lines[index],
+            best.get(index).copied().flatten().map(|best| best.0),
+            &selector_of,
+        )
+    }));
+    text.join("\n")
+}
+
+/// One element as a hit: its snapshot line, its score when it has one, and the selector that
+/// addresses it.
+fn element_hit_line(
+    line: &AxLine,
+    score: Option<f64>,
+    selector_of: impl Fn(&AxLine) -> Option<String>,
+) -> String {
+    let selector = selector_of(line).unwrap_or_else(|| SELECTOR_UNAVAILABLE.to_owned());
+    let score = score.map_or_else(|| "unscored".to_owned(), |score| format!("score {score:.3}"));
+    format!(
+        "{} ({score}) \u{2014} selector: {selector}",
+        render_ax_line(line, false)
+    )
 }
 
 // ----------------------------------------------------------------- Element candidates
@@ -744,56 +849,36 @@ fn render_lines(lines: &[AxLine]) -> Vec<String> {
     lines.iter().map(|line| render_ax_line(line, true)).collect()
 }
 
-/// The coarse candidates for a page's elements: runs of consecutive lines, labelled by the uids
-/// at each end so a whole-run hit is still addressable.
-fn element_runs(
-    lines: &[AxLine],
-    rendered: &[String],
-) -> (Vec<Candidate>, HashMap<String, Range<usize>>) {
-    let runs = group_entries(lines.len(), MAX_ELEMENT_RUNS, ELEMENTS_PER_RUN);
-    let mut by_label = HashMap::with_capacity(runs.len());
-    let candidates = runs
-        .into_iter()
-        .map(|range| {
-            let label = run_label(&lines[range.clone()]);
-            by_label.insert(label.clone(), range.clone());
-            Candidate::new(label, rendered[range].join("\n"))
-        })
-        .collect();
-    (candidates, by_label)
-}
-
-/// A winning run refined into its individual elements, each carrying its neighbours as context.
-fn refine_element_run(
-    lines: &[AxLine],
-    rendered: &[String],
-    by_label: &HashMap<String, Range<usize>>,
-    candidate: &Candidate,
-) -> Vec<Candidate> {
-    let Some(range) = by_label.get(&candidate.label) else {
-        return Vec::new();
-    };
-    range
-        .clone()
-        .map(|index| {
-            Candidate::new(element_label(lines[index].uid), rendered[index].clone())
-                .with_context(line_context(rendered, index))
+/// A page's elements as blocks: every element on its own, labelled by its uid and carrying the
+/// two lines on either side as context — what the element rubric reads as `candidate.context`.
+fn element_blocks(lines: &[AxLine]) -> Vec<Block> {
+    let rendered = render_lines(lines);
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            Block::whole(element_label(line.uid), rendered[index].clone())
+                .with_context(line_context(&rendered, index))
         })
         .collect()
 }
 
-fn run_label(lines: &[AxLine]) -> String {
-    let first = lines.first().map_or(0, |line| line.uid);
-    let last = lines.last().map_or(0, |line| line.uid);
-    format!("elements {first}-{last}")
+/// Console entries as blocks, each addressed by its place in the list the call gathered.
+fn console_blocks(console: &Blocks) -> Vec<Block> {
+    console
+        .spans()
+        .iter()
+        .map(|&(position, _)| {
+            Block::in_parts(
+                format!("console entry {position}"),
+                console.parts(position, position),
+            )
+        })
+        .collect()
 }
 
 fn element_label(uid: u64) -> String {
     format!("element {uid}")
-}
-
-fn uid_from_element_label(label: &str) -> Option<u64> {
-    label.strip_prefix("element ")?.parse().ok()
 }
 
 /// The two lines on either side of one element, which is what the element rubric reads as
@@ -811,20 +896,8 @@ fn line_context(rendered: &[String], index: usize) -> String {
 
 // ----------------------------------------------------------------- Rendering
 
-/// The report's summary lines — everything `render_report` prints that is not a hit — so a tool
-/// that renders its own hits still says "no page elements scored…" in exactly the same words.
-fn report_summary(report: &SearchReport, query: &str, threshold: f64, subject: &str) -> String {
-    let rendered = render_report(report, query, threshold, subject, false);
-    let summary = rendered.lines().count().saturating_sub(report.hits.len());
-    rendered
-        .lines()
-        .take(summary)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// `preview_snapshot`'s answer to a `query`: the summary, then each hit as its own snapshot line with the
-/// selector that addresses it, or — for a run that never got refined — the run itself.
+/// `preview_snapshot`'s answer to a `query`: the summary, then each hit as its own snapshot line
+/// with the selector that addresses it.
 fn render_element_report(
     report: &SearchReport,
     query: &str,
@@ -833,54 +906,33 @@ fn render_element_report(
     capped: bool,
     selector_of: impl Fn(&AxLine) -> Option<String>,
 ) -> String {
-    let by_uid = lines
-        .iter()
-        .map(|line| (line.uid, line))
-        .collect::<HashMap<_, _>>();
-    let mut text = vec![report_summary(report, query, threshold, "runs of page elements")];
+    let mut text = vec![render_summary(report, query, threshold, "elements of the page")];
     if capped {
         text.push(format!(
             "Only the first {PREVIEW_ELEMENT_LINES_CAP} element lines of the page were scored; \
              the page has more."
         ));
     }
-    for hit in &report.hits {
-        let line = uid_from_element_label(&hit.candidate.label)
-            .and_then(|uid| by_uid.get(&uid).copied());
-        match line {
-            Some(line) => {
-                let selector =
-                    selector_of(line).unwrap_or_else(|| SELECTOR_UNAVAILABLE.to_owned());
-                text.push(format!(
-                    "{} (score {:.3}) \u{2014} selector: {selector}",
-                    render_ax_line(line, false),
-                    hit.score
-                ));
-            }
-            None => {
-                text.push(String::new());
-                text.push(format!(
-                    "--- {} (score {:.3}, whole run) ---",
-                    hit.candidate.label, hit.score
-                ));
-                text.push(hit.candidate.text.clone());
-            }
-        }
-    }
+    text.extend(
+        report
+            .hits
+            .iter()
+            .map(|hit| element_hit_line(&lines[hit.block], Some(hit.score), &selector_of)),
+    );
     text.join("\n")
 }
 
 fn scored_console_line(console: usize) -> String {
     format!(
-        "Scored {console} console line{}.",
-        if console == 1 { "" } else { "s" }
+        "Scored {console} console entr{}.",
+        if console == 1 { "y" } else { "ies" }
     )
 }
 
 fn scored_lines_line(console: usize, server: usize) -> String {
     format!(
-        "Scored {console} console line{} and {server} server line{}.",
-        if console == 1 { "" } else { "s" },
+        "Scored {console} console entr{} and {server} server line{}.",
+        if console == 1 { "y" } else { "ies" },
         if server == 1 { "" } else { "s" }
     )
 }
@@ -951,15 +1003,6 @@ fn parse_console_lines(input: &JsonObject) -> Result<Option<usize>, String> {
     }
 }
 
-/// Which source a merged chunk label came from, so the refinement keeps labelling it the same way.
-fn label_source(label: &str) -> &'static str {
-    if label.starts_with("console ") {
-        "console"
-    } else {
-        "server"
-    }
-}
-
 /// The dev server whose output this call scores: the one it named, else the first one running.
 ///
 /// A `serverId` that names nothing was already refused by `resolve_preview_page_session`, so the
@@ -982,19 +1025,14 @@ fn server_for_logs(
     }
 }
 
-/// A log entry is a whole read from the pipe rather than one line, so every entry is split.
-fn server_log_lines(state: &AppState, server_id: &str) -> Vec<String> {
+/// The server's buffer as its pipes delivered it: one string per read, both streams in arrival
+/// order, which [`Outline::reads`] turns into lines without losing where each read began.
+fn server_log_reads(state: &AppState, server_id: &str) -> Vec<String> {
     state
         .preview_servers
         .logs(server_id)
         .into_iter()
-        .flat_map(|entry| {
-            entry
-                .line
-                .split('\n')
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
+        .map(|entry| entry.line)
         .collect()
 }
 
@@ -1108,7 +1146,7 @@ fn console_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision_model::search::Hit;
+    use crate::decision_model::search::{Candidate, Hit};
     use crate::decision_model::DecisionError;
 
     fn line(uid: u64, role: &str, name: &str) -> AxLine {
@@ -1300,8 +1338,8 @@ mod tests {
             narrowed,
             format!(
                 "Element not found: x (confidence 0.60)\nThe page has 2400 element lines; the \
-                 decision model was shown the 1 in the runs that scored best against the \
-                 description, in page order:\n(Only the first {PREVIEW_ELEMENT_LINES_CAP} element \
+                 decision model was shown the 1 that scored best against the description, in page \
+                 order:\n(Only the first {PREVIEW_ELEMENT_LINES_CAP} element \
                  lines of the page were read; the page has more.)\n  [42] button: \"Save\""
             )
         );
@@ -1325,11 +1363,37 @@ mod tests {
         );
     }
 
-    fn scored(uid: u64, score: f64) -> Hit {
+    /// A hit on the `block`th element shown.
+    fn scored(block: usize, score: f64) -> Hit {
         Hit {
-            candidate: Candidate::new(element_label(uid), "x"),
+            block,
+            label: String::new(),
             score,
-            refined: false,
+            part: None,
+        }
+    }
+
+    fn uid_of(candidate: &Candidate) -> u64 {
+        candidate
+            .label
+            .strip_prefix("element ")
+            .and_then(|uid| uid.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Scores an element by how close its uid is to the one named in the query, fails the one the
+    /// query names after `!`, and records what it was asked.
+    struct NearestElement(std::sync::Mutex<Vec<Candidate>>);
+    impl Scorer for NearestElement {
+        fn score(&self, query: &str, candidate: &Candidate) -> Result<f64, DecisionError> {
+            self.0.lock().unwrap().push(candidate.clone());
+            let (wanted, failing) = query.split_once('!').unwrap_or((query, ""));
+            let uid = uid_of(candidate);
+            if failing.parse::<u64>().ok() == Some(uid) {
+                return Err(DecisionError::Transient("down".into()));
+            }
+            let wanted: f64 = wanted.parse().unwrap_or(0.0);
+            Ok(1.0 / (1.0 + (uid as f64 - wanted).abs()))
         }
     }
 
@@ -1348,8 +1412,8 @@ mod tests {
         let whole_page = shown(&elements, 3, false);
         let nothing = answer("none", 0.9, &[("none", 0.9)]);
         let report = SearchReport {
-            hits: vec![scored(7, 0.41), scored(9, 0.052)],
-            coarse_count: 3,
+            hits: vec![scored(1, 0.41), scored(2, 0.052)],
+            blocks: 3,
             requests: 3,
             failed_requests: 1,
             ..SearchReport::default()
@@ -1372,16 +1436,16 @@ mod tests {
 
         // A shortlist says so and keeps the note on a read that stopped short.
         let one = SearchReport {
-            hits: vec![scored(42, 1.0)],
+            hits: vec![scored(0, 1.0)],
             requests: 1,
             ..SearchReport::default()
         };
         assert_eq!(
             shown(&elements[..1], 900, true).render_scored(&one),
             format!(
-                "The page has 900 element lines; the decision model was shown the 1 in the runs \
-                 that scored best against the description. Each was then scored against the \
-                 description on its own (1 request), highest first:\n(Only the first \
+                "The page has 900 element lines; the decision model was shown the 1 that scored \
+                 best against the description. Each was then scored against the description on \
+                 its own (1 request), highest first:\n(Only the first \
                  {PREVIEW_ELEMENT_LINES_CAP} element lines of the page were read; the page has \
                  more.)\n[42] button: \"Save\" (score 1.000)"
             )
@@ -1406,22 +1470,10 @@ mod tests {
         assert!(failed.ends_with(&whole_page.text()), "{failed}");
     }
 
-    /// Every line is scored as its own candidate with its neighbours as context — nothing is cut,
-    /// nothing refined — and only cancellation turns a scoring failure into a failed call.
+    /// Every line is scored as its own block with its neighbours as context, many to a request,
+    /// and only cancellation turns a scoring failure into a failed call.
     #[test]
     fn a_miss_scores_each_shown_line_on_its_own() {
-        /// Scores by how close the candidate's uid is to the one named in the query, and records
-        /// what it was asked.
-        struct NearestElement(std::sync::Mutex<Vec<Candidate>>);
-        impl Scorer for NearestElement {
-            fn score(&self, query: &str, candidate: &Candidate) -> Result<f64, DecisionError> {
-                self.0.lock().unwrap().push(candidate.clone());
-                let wanted: f64 = query.parse().unwrap_or(0.0);
-                let uid = uid_from_element_label(&candidate.label).unwrap_or(0) as f64;
-                Ok(1.0 / (1.0 + (uid - wanted).abs()))
-            }
-        }
-
         let page = lines(5);
         let shown = shown(&page, 5, false);
         let scorer = Arc::new(NearestElement(Default::default()));
@@ -1435,16 +1487,16 @@ mod tests {
         let MissListing::Scored(report) = listing else {
             panic!("expected a scored listing");
         };
-        assert_eq!(report.requests, 5);
+        assert_eq!(report.requests, 1, "five short lines share a request");
         let order = report
             .hits
             .iter()
-            .map(|hit| uid_from_element_label(&hit.candidate.label).unwrap())
+            .map(|hit| page[hit.block].uid)
             .collect::<Vec<_>>();
         assert_eq!(order, vec![4, 3, 5, 2, 1], "every line, highest first");
         let mut asked = scorer.0.lock().unwrap().clone();
-        asked.sort_by_key(|candidate| uid_from_element_label(&candidate.label));
-        assert_eq!(asked.len(), 5, "one request per line, no refinement pass");
+        asked.sort_by_key(uid_of);
+        assert_eq!(asked.len(), 5, "one question per line");
         assert_eq!(asked[0].text, "  [1] button: \"Button 1\"");
         assert_eq!(
             asked[2].context.as_deref(),
@@ -1454,7 +1506,7 @@ mod tests {
             )
         );
 
-        // A scorer that cannot be built, or a pass that fails outright, is reported in the listing.
+        // A scorer that cannot be built, or a pass that scores nothing, is reported in the listing.
         assert!(matches!(
             score_shown(Err("no key".to_owned()), &shown, "4", &CancelSignal::default()),
             Ok(MissListing::ScoringFailed(error)) if error == "no key"
@@ -1485,113 +1537,155 @@ mod tests {
         .is_err());
     }
 
-    /// A page with more elements than one choice question holds is shortlisted by run score, and
-    /// the shortlist stays in page order so the model reads the page as it is laid out.
+    /// A page whose elements do not fit one choice is scored element by element, and the highest
+    /// N go into the choice — N as many as one question holds — in page order.
     #[test]
-    fn a_long_page_is_narrowed_to_the_best_runs_in_page_order() {
-        /// Scores a run by how close its first uid is to the one named in the query.
-        struct NearestRun;
-        impl Scorer for NearestRun {
-            fn score(&self, query: &str, candidate: &Candidate) -> Result<f64, DecisionError> {
-                let wanted: f64 = query.parse().unwrap_or(0.0);
-                let first: f64 = candidate
-                    .label
-                    .trim_start_matches("elements ")
-                    .split('-')
-                    .next()
-                    .and_then(|uid| uid.parse().ok())
-                    .unwrap_or(0.0);
-                Ok(1.0 / (1.0 + (first - wanted).abs()))
-            }
-        }
-
+    fn a_long_page_offers_its_best_scoring_elements_in_page_order() {
         let page = lines(600);
-        let narrowed = narrow_with(
-            Arc::new(NearestRun),
-            &page,
+        let scorer = Arc::new(NearestElement(Default::default()));
+        let scores = score_blocks(
+            scorer.clone(),
             "300",
+            &element_blocks(&page),
             &CancelSignal::default(),
         )
-        .expect("narrowed");
-        assert!(narrowed.len() <= MAX_ELEMENT_CHOICES, "{}", narrowed.len());
-        assert!(narrowed.len() > MAX_ELEMENT_CHOICES - 13, "{}", narrowed.len());
+        .unwrap();
+        assert_eq!(scorer.0.lock().unwrap().len(), 600, "every element is scored");
+        let offered = top_elements(&page, &render_lines(&page), &scores);
+        assert_eq!(offered.len(), MAX_ELEMENT_CHOICES);
         assert!(
-            narrowed.windows(2).all(|pair| pair[0].uid < pair[1].uid),
+            offered.windows(2).all(|pair| pair[0].uid < pair[1].uid),
             "the shortlist keeps page order"
         );
-        // The run around the query is in; the far ends of the page are not.
-        assert!(narrowed.iter().any(|element| element.uid == 300));
-        assert!(!narrowed.iter().any(|element| element.uid == 1));
-        assert!(!narrowed.iter().any(|element| element.uid == 600));
+        assert!(offered.iter().any(|element| element.uid == 300));
+        assert!(!offered.iter().any(|element| element.uid == 1));
+        assert!(!offered.iter().any(|element| element.uid == 600));
+
+        // An element no request scored ranks below every scored one.
+        let scores = score_blocks(
+            Arc::new(NearestElement(Default::default())),
+            "300!301",
+            &element_blocks(&page),
+            &CancelSignal::default(),
+        )
+        .unwrap();
+        let offered = top_elements(&page, &render_lines(&page), &scores);
+        assert_eq!(offered.len(), MAX_ELEMENT_CHOICES);
+        assert!(!offered.iter().any(|element| element.uid == 301));
+
+        // Size bounds the shortlist too: long lines fill a question with fewer of them.
+        let long = (1..=300)
+            .map(|uid| line(uid, "button", &"n".repeat(200)))
+            .collect::<Vec<_>>();
+        let rendered = render_lines(&long);
+        let scores = score_blocks(
+            Arc::new(NearestElement(Default::default())),
+            "150",
+            &element_blocks(&long),
+            &CancelSignal::default(),
+        )
+        .unwrap();
+        let offered = top_elements(&long, &rendered, &scores);
+        assert!(offered.len() < MAX_ELEMENT_CHOICES, "{}", offered.len());
+        assert!(
+            offered
+                .iter()
+                .map(|element| choice_cost(&render_ax_line(element, true)))
+                .sum::<usize>()
+                <= CHOICE_TOKEN_BUDGET
+        );
 
         // A page that fits needs no scoring at all.
         let short = lines(MAX_ELEMENT_CHOICES as u64);
         assert_eq!(
-            narrow_candidates(&short, "anything", &CancelSignal::default()).unwrap(),
+            shortlist(&short, "anything", &CancelSignal::default()).unwrap(),
             short
         );
     }
 
-    /// The best run is kept even when every run is wider than the option budget.
+    /// An element line too long for any choice question stops the choice, and the answer says
+    /// so in its first words — then the elements at or above the fallback threshold with their
+    /// selectors, then every line too long to offer, as it is.
     #[test]
-    fn the_best_run_survives_a_budget_no_run_fits() {
-        let page = lines(600);
-        let mut by_label = HashMap::new();
-        by_label.insert("elements 1-600".to_owned(), 0..600);
-        let report = SearchReport {
-            hits: vec![Hit {
-                candidate: Candidate::new("elements 1-600", "text"),
-                score: 1.0,
-                refined: false,
-            }],
-            ..SearchReport::default()
+    fn a_line_too_long_for_a_choice_stops_it_and_says_why() {
+        let rendered = vec!["  [1] button: \"Save\"".to_owned(), "x".repeat(200_000)];
+        assert_eq!(too_long_to_offer(&rendered), vec![1]);
+        assert!(too_long_to_offer(&render_lines(&lines(600))).is_empty());
+
+        let page = vec![
+            line(1, "button", "Save"),
+            line(2, "textbox", "Notes"),
+            line(3, "link", "Help"),
+        ];
+        let scores = Scores {
+            best: vec![Some((0.9, 0)), Some((0.2, 0)), Some((0.4, 0))],
+            requests: 1,
+            failed_requests: 0,
         };
-        let selected = select_runs(&page, &report, &by_label);
-        assert_eq!(selected.len(), MAX_ELEMENT_CHOICES);
-        assert_eq!(selected[0].uid, 1);
-        // Nothing to select from is empty rather than a panic.
-        assert!(select_runs(&page, &SearchReport::default(), &by_label).is_empty());
+        let text = unchoosable(
+            DescribedAction::Click,
+            "the save button",
+            &page,
+            false,
+            &[1],
+            Ok(scores),
+            |line| Some(format!("#e{}", line.uid)),
+        );
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].starts_with(
+                "The decision model was not asked to choose, so nothing was clicked: 1 element \
+                 line of the page is too long to offer in a choice question"
+            ),
+            "{text}"
+        );
+        assert!(lines[1].starts_with("1 hit at or above 0.500 for query \"the save button\""), "{text}");
+        assert_eq!(lines[2], "[1] button: \"Save\" (score 0.900) \u{2014} selector: #e1");
+        assert_eq!(lines[3], "Too long to offer (1):");
+        assert_eq!(lines[4], "[2] textbox: \"Notes\" (score 0.200) \u{2014} selector: #e2");
+        assert!(!text.contains("[3] link"), "below the threshold and not too long: {text}");
+
+        // Scoring that failed still says why nothing was chosen, and still lists the long lines.
+        let text = unchoosable(
+            DescribedAction::Inspect,
+            "x",
+            &page,
+            true,
+            &[1],
+            Err("TypeSafe is unreachable".to_owned()),
+            |_| None,
+        );
+        assert!(text.starts_with("The decision model was not asked to choose, so nothing was inspected"), "{text}");
+        assert!(text.contains("Scoring the elements failed, so none are ranked: TypeSafe is unreachable"), "{text}");
+        assert!(text.ends_with(&format!(
+            "Too long to offer (1):\n[2] textbox: \"Notes\" (unscored) \u{2014} selector: {SELECTOR_UNAVAILABLE}"
+        )), "{text}");
     }
 
-    /// Runs are labelled by the uids at their ends, refined one element at a time, and each
-    /// element carries the two lines on either side as context.
+    /// Every element is a block of its own, labelled by uid, carrying the two lines on either side
+    /// as context.
     #[test]
-    fn element_runs_are_labelled_by_uid_and_refine_to_single_elements() {
-        let page = lines(30);
-        let rendered = render_lines(&page);
-        let (coarse, by_label) = element_runs(&page, &rendered);
-        assert_eq!(coarse[0].label, "elements 1-12");
-        assert_eq!(coarse[0].text.lines().count(), 12);
-        assert_eq!(coarse[2].label, "elements 25-30");
-        assert_eq!(by_label["elements 13-24"], 12..24);
-
-        let pieces = refine_element_run(&page, &rendered, &by_label, &coarse[1]);
-        assert_eq!(pieces.len(), 12);
-        assert_eq!(pieces[0].label, "element 13");
-        assert_eq!(pieces[0].text, "  [13] button: \"Button 13\"");
+    fn every_element_is_a_block_with_its_neighbours_as_context() {
+        let page = lines(40);
+        let blocks = element_blocks(&page);
+        assert_eq!(blocks.len(), 40);
+        assert_eq!(blocks[39].label, "element 40");
+        assert_eq!(blocks[39].parts[0].text, "  [40] button: \"Button 40\"");
         assert_eq!(
-            pieces[0].context.as_deref(),
+            blocks[39].context.as_deref(),
+            Some("  [38] button: \"Button 38\"\n  [39] button: \"Button 39\"")
+        );
+        assert_eq!(
+            blocks[16].context.as_deref(),
             Some(
-                "  [11] button: \"Button 11\"\n  [12] button: \"Button 12\"\n  [14] button: \
-                 \"Button 14\"\n  [15] button: \"Button 15\""
+                "  [15] button: \"Button 15\"\n  [16] button: \"Button 16\"\n  [18] button: \
+                 \"Button 18\"\n  [19] button: \"Button 19\""
             )
         );
-        // The first element of the page has no lines before it.
-        let first = refine_element_run(&page, &rendered, &by_label, &coarse[0]);
-        assert_eq!(
-            first[0].context.as_deref(),
-            Some("  [2] button: \"Button 2\"\n  [3] button: \"Button 3\"")
-        );
-        // A label from another plan refines to nothing.
-        assert!(
-            refine_element_run(&page, &rendered, &by_label, &Candidate::new("x", "y")).is_empty()
-        );
-        assert_eq!(uid_from_element_label("element 13"), Some(13));
-        assert_eq!(uid_from_element_label("elements 1-12"), None);
     }
 
-    /// Hits come back as their own snapshot line plus a selector; a run that never refined comes
-    /// back whole; and the summary is `render_report`'s own wording.
+    /// Hits come back as their own snapshot line plus a selector, and the summary is the shared
+    /// wording.
     #[test]
     fn the_element_report_addresses_every_hit() {
         let page = vec![
@@ -1600,28 +1694,9 @@ mod tests {
             line(44, "button", "Cancel"),
         ];
         let report = SearchReport {
-            hits: vec![
-                Hit {
-                    candidate: Candidate::new("element 42", "  [42] button: \"Save\""),
-                    score: 0.933,
-                    refined: true,
-                },
-                Hit {
-                    candidate: Candidate::new("element 44", "  [44] button: \"Cancel\""),
-                    score: 0.8,
-                    refined: true,
-                },
-                Hit {
-                    candidate: Candidate::new(
-                        "elements 40-51",
-                        "  [40] listitem\n  [41] listitem",
-                    ),
-                    score: 0.7,
-                    refined: false,
-                },
-            ],
-            coarse_count: 4,
-            requests: 9,
+            hits: vec![scored(0, 0.933), scored(2, 0.8)],
+            blocks: 3,
+            requests: 1,
             ..SearchReport::default()
         };
         let text = render_element_report(&report, "the save button", 0.6, &page, true, |line| {
@@ -1629,8 +1704,8 @@ mod tests {
         });
         assert!(
             text.starts_with(
-                "3 hits at or above 0.600 for query \"the save button\" (4 runs of page elements scored, \
-                 9 requests)."
+                "2 hits at or above 0.600 for query \"the save button\" (3 elements of the page \
+                 scored, 1 request)."
             ),
             "{text}"
         );
@@ -1647,53 +1722,25 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(&format!(
+            text.ends_with(&format!(
                 "[44] button: \"Cancel\" (score 0.800) \u{2014} selector: {SELECTOR_UNAVAILABLE}"
             )),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "--- elements 40-51 (score 0.700, whole run) ---\n  [40] listitem\n  [41] listitem"
-            ),
             "{text}"
         );
 
         // Nothing passed: the summary is the only thing the model reads, near-misses included.
         let empty = SearchReport {
-            coarse_count: 3,
-            requests: 3,
-            near_misses: vec![("elements 1-12".into(), 0.333)],
+            blocks: 3,
+            requests: 1,
+            near_misses: vec![("element 43".into(), 0.333)],
             ..SearchReport::default()
         };
         let text = render_element_report(&empty, "x", 0.5, &page, false, |_| None);
         assert_eq!(
             text,
-            "No runs of page elements scored at or above 0.500 for query \"x\" (3 scored, 3 requests).\n\
-             Highest scores: elements 1-12 (0.333). Lower the threshold to see them."
+            "No elements of the page scored at or above 0.500 for query \"x\" (3 scored, 1 request).\n\
+             Highest scores: element 43 (0.333). Lower the threshold to see them."
         );
-    }
-
-    /// The summary keeps every note `render_report` prints and drops only the hit lines.
-    #[test]
-    fn the_summary_keeps_the_notes_and_drops_the_hits() {
-        let report = SearchReport {
-            hits: vec![Hit {
-                candidate: Candidate::new("element 1", "x"),
-                score: 1.0,
-                refined: true,
-            }],
-            coarse_count: 2,
-            requests: 3,
-            failed_requests: 1,
-            refine_budget_exhausted: true,
-            ..SearchReport::default()
-        };
-        let summary = report_summary(&report, "q", 0.5, "runs of page elements");
-        assert_eq!(summary.lines().count(), 3, "{summary}");
-        assert!(summary.contains("1 request failed"), "{summary}");
-        assert!(summary.contains("refinement budget ran out"), "{summary}");
-        assert!(!summary.contains("element 1"), "{summary}");
     }
 
     #[test]
@@ -1732,27 +1779,35 @@ mod tests {
         assert!(NO_SERVER_LOGS.contains("preview_start"), "{NO_SERVER_LOGS}");
         assert_eq!(
             scored_lines_line(1, 0),
-            "Scored 1 console line and 0 server lines."
+            "Scored 1 console entry and 0 server lines."
         );
         assert_eq!(
             scored_lines_line(40, 1),
-            "Scored 40 console lines and 1 server line."
+            "Scored 40 console entries and 1 server line."
         );
 
-        let console = (1..=20).map(|index| format!("[log] c{index}")).collect::<Vec<_>>();
-        let server = (1..=20).map(|index| format!("s{index}")).collect::<Vec<_>>();
-        let console_plan = chunk_lines(&console.join("\n"));
-        let server_plan = chunk_lines(&server.join("\n"));
-        let (mut coarse, mut by_label) = chunk_candidates("console", &console_plan.chunks);
-        let (server_coarse, server_by_label) = chunk_candidates("server", &server_plan.chunks);
-        coarse.extend(server_coarse);
-        by_label.extend(server_by_label);
-        assert_eq!(coarse[0].label, "console lines 1-16");
-        assert_eq!(coarse[2].label, "server lines 1-16");
-        assert_eq!(label_source(&coarse[0].label), "console");
-        assert_eq!(label_source(&coarse[2].label), "server");
-        let pieces = refine_line_chunk(label_source(&coarse[2].label), &by_label, &coarse[2]);
-        assert_eq!(pieces[0].label, "server lines 1-3");
+        // The console by entry, the server by read: every entry and every read is a block.
+        let console = Blocks::entries(
+            (1..=3).map(|index| format!("[error] c{index}\n    at frame")).collect(),
+        );
+        let reads = ["s1\n".to_owned(), "Error: s2\nFile: a.ts\n".to_owned()];
+        let server = Blocks::reads(&reads);
+        let labels = console_blocks(&console)
+            .into_iter()
+            .chain(line_blocks(&server, "server", 1))
+            .map(|block| block.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "console entry 1",
+                "console entry 2",
+                "console entry 3",
+                "server line 1",
+                "server lines 2-3"
+            ]
+        );
+        assert_eq!(numbered(&server, server.spans()[1], 1), "     2\tError: s2\n     3\tFile: a.ts");
     }
 
     /// Argument errors surface before any credential is read, page touched or request made.

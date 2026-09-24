@@ -31,7 +31,6 @@ pub fn run_proxy(nonce: &str, daemon_args: &[String]) -> Result<(), String> {
             &mut writer,
             &LocalHello {
                 token,
-                proxy_pid: std::process::id(),
                 env,
             },
             &[],

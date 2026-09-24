@@ -9,12 +9,12 @@
 import path from "node:path";
 
 /** Tauri `identifier` from src-tauri/tauri.conf.json — the production data directory name. */
-export const PRODUCTION_IDENTIFIER = "com.mework.app";
+const PRODUCTION_IDENTIFIER = "com.mework.app";
 /** Retired identifier from the CatIC/naiword era; only ever read by the legacy migration. */
-export const LEGACY_IDENTIFIER = "com.naiword.agentstudio";
+const LEGACY_IDENTIFIER = "com.naiword.agentstudio";
 /** Every browser-dev data identifier carries this prefix (src-tauri/src/browser_dev.rs). */
-export const DEV_IDENTIFIER_PREFIX = "com.mework.app.e2e.";
-export const LEGACY_DEV_IDENTIFIER_PREFIX = "com.naiword.agentstudio.e2e.";
+const DEV_IDENTIFIER_PREFIX = "com.mework.app.e2e.";
+const LEGACY_DEV_IDENTIFIER_PREFIX = "com.naiword.agentstudio.e2e.";
 /** The one dev identifier that is stable across restarts (scripts/browser-dev.mjs). */
 export const INTERACTIVE_DEV_IDENTIFIER = "com.mework.app.e2e.interactive-dev";
 
@@ -52,7 +52,7 @@ export const KEYRING_SERVICES = [
 export const MACOS_VAULT_KEY_SERVICE = "Mework Safe Storage";
 
 /** Scope selectors accepted on the command line. */
-export const SCOPES = ["prod", "dev", "all"];
+const SCOPES = ["prod", "dev", "all"];
 
 export function parseResetArguments(args) {
   const flags = new Set(["--dev", "--prod", "--all", "--keys", "--dry-run", "--yes"]);

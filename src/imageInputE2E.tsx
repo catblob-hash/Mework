@@ -32,7 +32,6 @@ import type {
   ToolContext,
   UserContext
 } from "./types";
-import "katex/dist/katex.min.css";
 import "./styles.css";
 
 type CheckState = "PASS" | "FAIL";
@@ -379,26 +378,34 @@ async function uploadComposerImage(
   );
   if (mode === "file") {
     const input = await waitFor(
-      "图片文件输入",
-      () => document.querySelector<HTMLInputElement>('input[type="file"][accept*="image"]')
-        ?? document.querySelector<HTMLInputElement>('input[type="file"]')
+      "附件文件输入",
+      () => document.querySelector<HTMLInputElement>(".composer .composer-add-menu__file-input")
+        ?? document.querySelector<HTMLInputElement>(".composer-add-menu__file-input")
     );
     const addButton = await waitFor(
-      "图片添加按钮",
+      "附件添加按钮",
       () => document.querySelector<HTMLButtonElement>(
-        '.composer-add-menu__trigger[aria-label="添加图片"]'
+        '.composer-add-menu__trigger[aria-label="添加内容"]'
       )
     );
-    assert(!addButton.disabled, "图片添加按钮不可用");
+    assert(!addButton.disabled, "附件添加按钮不可用");
+    addButton.click();
+    // Pictures are uploaded like any other file: through the menu's one upload entry.
+    const uploadItem = await waitFor(
+      "上传文件菜单项",
+      () => Array.from(document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+        .find((item) => item.textContent?.includes("上传文件")) ?? null
+    );
+    assert(!uploadItem.disabled, "上传文件菜单项不可用");
     let inputClickObserved = false;
     input.addEventListener("click", (event) => {
       inputClickObserved = true;
-      // Exercise the real button wiring without opening an OS picker that
+      // Exercise the real menu wiring without opening an OS picker that
       // the in-page runner cannot control.
       event.preventDefault();
     }, { once: true });
-    addButton.click();
-    assert(inputClickObserved, "图片添加按钮没有触发隐藏文件输入");
+    uploadItem.click();
+    assert(inputClickObserved, "上传文件菜单项没有触发隐藏文件输入");
     input.files = transfer.files;
     input.dispatchEvent(new Event("change", { bubbles: true }));
   } else if (mode === "paste") {

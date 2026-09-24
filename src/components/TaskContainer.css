@@ -4,8 +4,6 @@
 .tasks-pane { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 8px 16px; }
 .task-container__empty { margin: 24px 12px; font-size: 11.5px; color: var(--faint); text-align: center; }
 .task-container__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.task-container__group { margin-top: 10px; }
-.task-container__group-title { margin: 0 8px 5px; font-size: 11px; font-weight: 600; color: var(--faint); }
 
 .task-container__finished { margin-top: 10px; }
 .task-container__finished-toggle {

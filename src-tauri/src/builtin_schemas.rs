@@ -112,10 +112,10 @@ const NONE_OF_THE_ABOVE: &str = "The model may also answer none of the above, wh
 fn decision_parameter_text(tool: &str) -> DecisionParameterText {
     match tool {
         "preview_console_logs" => DecisionParameterText {
-            query: "What to look for in the console, in plain language. The entries that pass level (the most recent lines of them, or all of them when lines is omitted) are sent to the TypeSafe Jev decision model, and only the pieces scoring at or above threshold come back, each with its line range.",
+            query: "What to look for in the console, in plain language. The entries that pass level (the most recent lines of them, or all of them when lines is omitted) are sent to the TypeSafe Jev decision model, whole — an entry is never split — and only the entries scoring at or above threshold come back, numbered by their place among those entries.",
             threshold: Some(SCORE_THRESHOLD_DESCRIPTION),
             without: "Leave query and threshold out for the plain listing.",
-            does: "the TypeSafe Jev decision model scores the entries that pass level and only the pieces at or above threshold come back",
+            does: "the TypeSafe Jev decision model scores each entry that passes level and only the entries at or above threshold come back, whole",
         },
         "preview_snapshot" => DecisionParameterText {
             query: "The page element to look for, in plain language. Instead of the whole snapshot, its element lines are sent to the TypeSafe Jev decision model and only the elements scoring at or above threshold come back, each with its uid, its snapshot line and a CSS selector for preview_click, preview_fill or preview_inspect.",

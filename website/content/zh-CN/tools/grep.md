@@ -14,3 +14,4 @@
 - [read](read.html) — 在某次命中报告的那一行上打开文件
 - [lsp](lsp.html) — 定义与引用，而不是文本匹配
 - [bash](bash.html) — 需要这个工具没有提供的选项时用 `rg`
+- [find_content](find_content.html) — 写不出模式时，直接描述要找的东西

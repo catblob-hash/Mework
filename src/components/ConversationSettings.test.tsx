@@ -162,7 +162,7 @@ function template(
 describe("ConversationSettings", () => {
   afterEach(() => configureI18n("zh-CN"));
 
-  it("lists six pages and opens on the features page", () => {
+  it("lists seven pages and opens on the features page", () => {
     const seed = createSeedDocument();
     render(
       <SettingsHarness
@@ -179,7 +179,7 @@ describe("ConversationSettings", () => {
     // save-as-preset entry point closing the list.
     const pages = within(navigation()).getAllByRole("button")
       .map((button) => (button.textContent ?? "").replace(/\d+$/, ""));
-    expect(pages).toEqual(["功能", "技能", "MCP", "钩子", "代理角色", "对话预设", "另存为预设"]);
+    expect(pages).toEqual(["功能", "沙箱", "技能", "MCP", "钩子", "代理角色", "对话预设", "另存为预设"]);
     // A live conversation's own timeline IS its message queue, editable in
     // place, so the template page belongs to a preset and to a role's window.
     expect(within(navigation()).queryByRole("button", { name: /^对话模板/ })).toBeNull();
@@ -192,6 +192,30 @@ describe("ConversationSettings", () => {
     expect(active.querySelectorAll("svg")).toHaveLength(1);
     // Nothing is a disclosure any more, so the catalogs are not rendered until visited.
     expect(screen.queryByRole("switch", { name: /代码审查/ })).toBeNull();
+  });
+
+  it("keeps the sandbox with the conversation, as a page of its own", async () => {
+    const seed = createSeedDocument();
+    const onSettingsChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+
+    await user.click(within(navigation()).getByRole("button", { name: /^沙箱/ }));
+    const toggle = screen.getByRole("switch", { name: "在沙箱中运行命令" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    await user.click(toggle);
+    // A preset component, written with the rest of the conversation's body.
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      sandbox: expect.objectContaining({ enabled: true, network: expect.objectContaining({ mode: "allowlist" }) })
+    }));
   });
 
   it("keeps the save-as-preset entry point as the last thing in the nav", async () => {
@@ -1536,7 +1560,7 @@ describe("ConversationSettings", () => {
     // appears, and the footer saves in place rather than saving a copy.
     expect(within(nestedNav).getAllByRole("button")
       .map((button) => (button.textContent ?? "").replace(/\d+$/, "")))
-      .toEqual(["功能", "技能", "MCP", "钩子", "代理角色", "对话模板", "保存预设"]);
+      .toEqual(["功能", "沙箱", "技能", "MCP", "钩子", "代理角色", "对话模板", "保存预设"]);
     expect(within(nestedNav).queryByRole("button", { name: /对话预设/ })).toBeNull();
     // Conversation-only, so a preset has no room to carry it.
     expect(within(dialog).queryByRole("switch", { name: /拼接应用数据目录/ })).toBeNull();
@@ -1823,7 +1847,6 @@ describe("ConversationSettings", () => {
     });
     const passing: McpProbeReport = {
       ok: true,
-      cancelled: false,
       protocolVersion: "2025-06-18",
       serverName: "files",
       serverVersion: "1.2.3",
@@ -1877,7 +1900,6 @@ describe("ConversationSettings", () => {
 
     const failing = vi.fn(async (): Promise<McpProbeReport> => ({
       ok: false,
-      cancelled: false,
       protocolVersion: "",
       serverName: "",
       serverVersion: "",

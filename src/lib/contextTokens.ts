@@ -49,8 +49,19 @@ function estimateContextImageTokens(item: ContextItem): number {
   }, 0) ?? 0;
 }
 
+/**
+ * Attached files are read by the model as their text, inlined at request time;
+ * the host estimated that text's tokens when the file was stored.
+ */
+function estimateContextFileTokens(item: ContextItem): number {
+  if (item.kind !== "user") return 0;
+  return item.files?.reduce((total, file) => total + file.tokens, 0) ?? 0;
+}
+
 export function estimateContextTokens(item: ContextItem): number {
-  return estimateTokens(projectedContextText(item)) + estimateContextImageTokens(item);
+  return estimateTokens(projectedContextText(item))
+    + estimateContextImageTokens(item)
+    + estimateContextFileTokens(item);
 }
 
 export function estimateContextsTokens(contexts: ContextItem[]): number {

@@ -1,8 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createTestDocument as createSeedDocument } from "../test/fixtures";
-import { ASK_USER_PENDING_OUTPUT } from "../types";
+import { ASK_USER_PENDING_OUTPUT, createTestDocument as createSeedDocument } from "../test/fixtures";
 import type { ContextItem, ToolContext } from "../types";
 import type { ConversationTurn } from "../lib/conversationTurns";
 import { applyAppearance, defaultAppearancePreferences } from "../lib/appearance";
@@ -178,15 +177,15 @@ describe("ContextStream", () => {
     ).container;
 
     // System prompts and reasoning live inside rows; a reply or a message has no shell of its own.
-    const inserted = (root: HTMLElement, editorKind: string) => {
+    const inserted = (root: HTMLElement) => {
       const editor = root.querySelector(".inline-text-editor");
       return { editor: !!editor, shell: editor?.closest(".context-card")?.className ?? null };
     };
-    const system = inserted(render1("system"), "system");
+    const system = inserted(render1("system"));
     expect(system.editor).toBe(true);
     expect(system.shell).toBeNull();
     expect(render1("system").querySelector('.timeline-row[data-row-kind="system"] .inline-text-editor')).not.toBeNull();
-    const assistant = inserted(render1("assistant"), "assistant");
+    const assistant = inserted(render1("assistant"));
     expect(assistant.editor).toBe(true);
     expect(assistant.shell).toBeNull();
     // A user message shares the reply's shell-less editor, and is the one kind
@@ -1491,7 +1490,7 @@ describe("ContextStream", () => {
     });
   });
 
-  it("uses the shared Markdown and math renderer for replies and visible reasoning", () => {
+  it("uses the shared Markdown and math renderer for replies and visible reasoning", async () => {
     const contexts = [
       {
         id: "reasoning-markdown",
@@ -1518,10 +1517,14 @@ describe("ContextStream", () => {
     );
 
     expect(screen.getByRole("heading", { name: "结论" })).toBeInTheDocument();
-    expect(container.querySelector("[data-context-id='assistant-markdown'] .katex-display")).toBeInTheDocument();
+    await waitFor(() => expect(
+      container.querySelector("[data-context-id='assistant-markdown'] .math-formula--display[data-math-state='ready'] svg")
+    ).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "think · 思考过程" }));
     expect(container.querySelector("[data-context-id='reasoning-markdown'] strong")).toHaveTextContent("推导");
-    expect(container.querySelector("[data-context-id='reasoning-markdown'] .katex")).toBeInTheDocument();
+    await waitFor(() => expect(
+      container.querySelector("[data-context-id='reasoning-markdown'] .math-formula[data-math-state='ready'] svg")
+    ).toBeInTheDocument());
   });
 
   it("renders provider citations as a chip row under assistant prose", () => {
@@ -1565,7 +1568,7 @@ describe("ContextStream", () => {
     expect(container.querySelector('[data-context-id="assistant-no-citations"] .context-card__sources')).toBeNull();
   });
 
-  it("keeps Markdown and math rendered while replies and reasoning are streaming", () => {
+  it("keeps Markdown and math rendered while replies and reasoning are streaming", async () => {
     const contexts = [
       {
         id: "reasoning-markdown-stream",
@@ -1595,9 +1598,13 @@ describe("ContextStream", () => {
     );
 
     expect(screen.getByRole("heading", { name: "当前结论" })).toBeInTheDocument();
-    expect(container.querySelector("[data-context-id='assistant-markdown-stream'] .katex-display")).toBeInTheDocument();
+    await waitFor(() => expect(
+      container.querySelector("[data-context-id='assistant-markdown-stream'] .math-formula--display[data-math-state='ready']")
+    ).toBeInTheDocument());
     expect(container.querySelector("[data-context-id='reasoning-markdown-stream'] strong")).toHaveTextContent("推导中");
-    expect(container.querySelector("[data-context-id='reasoning-markdown-stream'] .katex")).toBeInTheDocument();
+    await waitFor(() => expect(
+      container.querySelector("[data-context-id='reasoning-markdown-stream'] .math-formula[data-math-state='ready']")
+    ).toBeInTheDocument());
   });
 
   it("opens streaming reasoning in place and leaves it open once it settles", async () => {

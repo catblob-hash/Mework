@@ -177,8 +177,8 @@ pub(crate) fn workspace_summary(
     }
 }
 
-/// [`crate::git::workspace_snapshot`] for a workspace on the machine `shell`
-/// reaches: `None` when the root is not a repository's root.
+/// The Git status snapshot of a workspace on the machine `shell` reaches:
+/// `None` when the root is not a repository's root.
 pub(crate) fn workspace_snapshot(
     shell: &dyn RemoteShell,
     machine_key: &str,

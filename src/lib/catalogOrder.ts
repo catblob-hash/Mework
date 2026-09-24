@@ -33,12 +33,12 @@ function readStored(): StoredOrders {
   }
 }
 
-export function readCatalogOrder(scope: CatalogOrderScope): string[] {
+function readCatalogOrder(scope: CatalogOrderScope): string[] {
   const stored = readStored()[scope];
   return Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : [];
 }
 
-export function writeCatalogOrder(scope: CatalogOrderScope, ids: string[]): void {
+function writeCatalogOrder(scope: CatalogOrderScope, ids: string[]): void {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...readStored(), [scope]: ids }));

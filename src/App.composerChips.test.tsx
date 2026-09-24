@@ -259,9 +259,8 @@ describe("composer context chips", () => {
   });
 
   it("opens a terminal in the selected workspace with a shell its machine was probed to have", async () => {
-    machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["bash", "zsh", "sh"]) };
+    machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["zsh", "sh", "bash"]) };
     const document = documentWithWslWorkspace();
-    document.globalSettings.executionEnvironments.shellPriority = { wsl: ["zsh"] };
     runtimeMocks.loadDocument.mockResolvedValue(document);
     const user = userEvent.setup();
     render(<App />);
@@ -279,7 +278,7 @@ describe("composer context chips", () => {
     // the menu opens a menu of its own.
     await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
     const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
-    await waitFor(() => expect(menuTexts(menu)).toEqual(["zsh", "bash", "sh", "打开终端面板"]));
+    await waitFor(() => expect(menuTexts(menu)).toEqual(["bash", "zsh", "sh", "打开终端面板"]));
     expect(within(menu).queryAllByRole("menuitem")
       .filter((item) => item.hasAttribute("aria-haspopup"))).toEqual([]);
     await user.click(within(menu).getByRole("menuitem", { name: "sh" }));
@@ -291,9 +290,8 @@ describe("composer context chips", () => {
   });
 
   it("opens the pane on the selected workspace's most preferred shell when it has no terminal", async () => {
-    machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["bash", "zsh"]) };
+    machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["zsh", "bash"]) };
     const document = documentWithWslWorkspace();
-    document.globalSettings.executionEnvironments.shellPriority = { wsl: ["zsh", "bash"] };
     runtimeMocks.loadDocument.mockResolvedValue(document);
     const user = userEvent.setup();
     render(<App />);
@@ -304,14 +302,14 @@ describe("composer context chips", () => {
       .getByRole("menuitemradio", { name: /^services/ }));
     await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
     const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
-    await waitFor(() => expect(menuTexts(menu)[0]).toBe("zsh"));
+    await waitFor(() => expect(menuTexts(menu)[0]).toBe("bash"));
     await user.click(within(menu).getByRole("menuitem", { name: "打开终端面板" }));
 
     // No default "Terminal" page: the pane opens on a real shell, in the workspace chosen.
     const conversationId = document.workspaces[0].conversations[0].id;
     expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
-      .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "zsh" }));
-    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["zsh 1"]);
+      .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "bash" }));
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["bash 1"]);
 
     // The same row now puts the pane away rather than adding a terminal.
     await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));

@@ -12,7 +12,6 @@ interface SearchDomainFilterRowProps {
   excludeDomains: readonly string[];
   /** Whether to offer the parent-selection option. Conversations have no parent. */
   inheritOption?: boolean;
-  inheritLabel?: string;
   hint: string;
   windowOpen: boolean;
   onOpenWindow: () => void;
@@ -43,7 +42,6 @@ export function SearchDomainFilterRow({
   includeDomains,
   excludeDomains,
   inheritOption = false,
-  inheritLabel,
   hint,
   windowOpen,
   onOpenWindow,
@@ -82,7 +80,7 @@ export function SearchDomainFilterRow({
         >
           {inheritOption && (
             <option value={INHERIT_VALUE}>
-              {inheritLabel ?? t("跟随对话设置", "Follow the conversation")}
+              {t("跟随对话设置", "Follow the conversation")}
             </option>
           )}
           <option value="exclude">{t("启用黑名单", "Use blocklist")}</option>

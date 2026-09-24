@@ -13,7 +13,7 @@ import type { ContextItem, ImageAttachment } from "../types";
 
 const PLACEHOLDER = /\[Image #([0-9]{1,9})\]/g;
 
-export function imagePlaceholder(shortId: number): string {
+function imagePlaceholder(shortId: number): string {
   return `[Image #${shortId}]`;
 }
 

@@ -4,7 +4,6 @@ import { useI18n } from "../../i18n";
 import {
   EMPTY_SKETCH_HISTORY,
   historyState,
-  mapHistory,
   pushHistory,
   redoHistory,
   undoHistory
@@ -14,16 +13,13 @@ import {
   SKETCH_FONT_STACK,
   SKETCH_TEXT_SIZE,
   constrainPoint,
-  drawStroke,
-  rescaleStroke
+  drawStroke
 } from "./strokes";
 import type { SketchPoint, SketchStroke, SketchToolName } from "./strokes";
 import "./Sketch.css";
 
 export interface SketchCanvasHandle {
   getStrokes: () => SketchStroke[];
-  /** The CSS size of the drawing surface, which is the coordinate space strokes are stored in. */
-  getSize: () => { width: number; height: number };
   undo: () => number;
   redo: () => number;
   clear: () => void;
@@ -33,15 +29,9 @@ export interface SketchCanvasHandle {
 
 export interface SketchCanvasProps {
   className?: string;
-  style?: CSSProperties;
   tool?: SketchToolName;
   color: string;
   strokeWidth: number;
-  textSize?: number;
-  readOnly?: boolean;
-  /** Keeps marks over the same part of the picture when the surface resizes. */
-  rescaleOnResize?: boolean;
-  onStrokeEnd?: (stroke: SketchStroke, previous: SketchStroke[]) => void;
   onHistoryChange?: (state: SketchHistoryState) => void;
 }
 
@@ -54,14 +44,9 @@ interface TextDraft {
 export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(function SketchCanvas(
   {
     className,
-    style,
     tool = "pen",
     color,
     strokeWidth,
-    textSize = SKETCH_TEXT_SIZE,
-    readOnly,
-    rescaleOnResize = false,
-    onStrokeEnd,
     onHistoryChange
   },
   ref
@@ -105,8 +90,8 @@ export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(fu
   }, [hasDraftText, notify]);
 
   const wrapperStyle = useMemo<CSSProperties>(
-    () => ({ position: "relative", touchAction: "none", outline: "none", ...style }),
-    [style]
+    () => ({ position: "relative", touchAction: "none", outline: "none" }),
+    []
   );
   const canvasStyle = useMemo<CSSProperties>(
     () => ({ cursor: tool === "text" ? "text" : "crosshair" }),
@@ -129,18 +114,6 @@ export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(fu
       const width = canvas.offsetWidth;
       const height = canvas.offsetHeight;
       if (width === 0 || height === 0) return;
-      const previous = sizeRef.current;
-      if (rescaleOnResize && previous.w > 0 && previous.h > 0) {
-        const scaleX = width / previous.w;
-        const scaleY = height / previous.h;
-        if (scaleX !== 1 || scaleY !== 1) {
-          historyRef.current = mapHistory(historyRef.current, (stroke) => rescaleStroke(stroke, scaleX, scaleY));
-          if (pendingRef.current) pendingRef.current = rescaleStroke(pendingRef.current, scaleX, scaleY);
-          setDraft((current) => (current && { ...current, x: current.x * scaleX, y: current.y * scaleY }));
-          const pendingDraft = draftRef.current;
-          if (pendingDraft) draftRef.current = { ...pendingDraft, x: pendingDraft.x * scaleX, y: pendingDraft.y * scaleY };
-        }
-      }
       // The backing store is device pixels; the transform keeps every stroke in CSS pixels.
       const dpr = window.devicePixelRatio || 1;
       canvas.width = Math.round(width * dpr);
@@ -157,13 +130,12 @@ export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(fu
     const observer = new ResizeObserver(measure);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [redraw, rescaleOnResize]);
+  }, [redraw]);
 
   const commitStroke = useCallback((stroke: SketchStroke) => {
     const previous = historyRef.current.present;
     setHistory(pushHistory(historyRef.current, [...previous, stroke]));
-    onStrokeEnd?.(stroke, historyRef.current.present);
-  }, [onStrokeEnd, setHistory]);
+  }, [setHistory]);
 
   const commitText = useCallback(() => {
     const pending = draftRef.current;
@@ -175,13 +147,13 @@ export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(fu
       x: pending.x,
       y: pending.y,
       text: pending.value,
-      size: textSize,
+      size: SKETCH_TEXT_SIZE,
       color
     };
     commitStroke(stroke);
     const context = contextRef.current;
     if (context) drawStroke(context, stroke);
-  }, [color, commitStroke, textSize]);
+  }, [color, commitStroke]);
 
   const commitTextRef = useRef(commitText);
   useEffect(() => {
@@ -198,7 +170,7 @@ export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(fu
   };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (readOnly || event.button !== 0) return;
+    if (event.button !== 0) return;
     const point = localPoint(event);
     if (tool === "text") {
       event.preventDefault();
@@ -275,7 +247,6 @@ export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(fu
 
   useImperativeHandle(ref, () => ({
     getStrokes: () => historyRef.current.present,
-    getSize: () => ({ width: Math.round(sizeRef.current.w), height: Math.round(sizeRef.current.h) }),
     undo: () => {
       if (!pendingRef.current) {
         setHistory(undoHistory(historyRef.current));
@@ -363,7 +334,7 @@ export const SketchCanvas = forwardRef<SketchCanvasHandle, SketchCanvasProps>(fu
             top: draft.y,
             width: `${Math.max(4, draft.value.length + 2)}ch`,
             color,
-            font: `${textSize}px/1.2 ${SKETCH_FONT_STACK}`
+            font: `${SKETCH_TEXT_SIZE}px/1.2 ${SKETCH_FONT_STACK}`
           }}
         />
       )}

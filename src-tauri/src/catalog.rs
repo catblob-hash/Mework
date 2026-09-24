@@ -2148,73 +2148,45 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "activeForm" => "Active form",
         "addBlockedBy" => "Add blockers",
         "addBlocks" => "Add blocked tasks",
-        "allowed_domains" => "Allowed domains",
         "agent_type" => "Named agent type",
         "args" => "Arguments",
-        "background" => "Background color",
-        "blocked_domains" => "Blocked domains",
-        "button" => "Mouse button",
         "case_sensitive" => "Case sensitive",
         "character" => "Character",
-        "clear" => "Clear",
         "colorScheme" => "Color scheme",
         "command" => "Command",
         "content" => "File content",
         "context" => "Initial context",
         "depth" => "Recursion depth",
         "description" => "Description",
-        "double" => "Double-click",
         "doubleClick" => "Double-click",
         "end_line" => "End line",
         "expression" => "Expression",
-        "fields" => "Form fields",
         "filename" => "File name",
         "filter" => "Filter",
         "filePath" => "File path",
         "find" => "Find text",
-        "format" => "Format",
-        "full_page" => "Full page",
         "height" => "Height",
         "image_id" => "Image number",
-        "input_image_path" => "Input image path",
-        "items" => "Task items",
-        "key" => "Key",
         "label" => "Display name",
-        "layer" => "Layer filter",
-        "layers" => "Initial layers",
         "level" => "Level",
-        "limit" => "Result limit",
         "line" => "Line",
         "lines" => "Line limit",
         "operation" => "Operation",
-        "load" => "Wait for load",
-        "max_chars" => "Maximum characters",
         "max_results" => "Maximum results",
         "message" => "Message",
         "metadata" => "Metadata",
-        "modifiers" => "Modifier keys",
         "name" => "Name",
         "new_text" => "New text",
-        "objective" => "Objective",
         "old_text" => "Original text",
         "owner" => "Owner",
-        "only_errors" => "Errors only",
-        "ops" => "Operations",
-        "options" => "Options",
         "path" => "Path",
-        "paths" => "File paths",
         "pattern" => "Search pattern",
         "preset" => "Device preset",
-        "profile" => "Model profile",
         "prompt" => "Prompt",
         "prompt_text" => "Prompt text",
         "query" => "Query",
-        "question" => "Question",
         "questions" => "Questions",
-        "ref" => "Element ref",
-        "repeat" => "Repeat count",
         "requestId" => "Request ID",
-        "require_screenshot" => "Require screenshot",
         "replace" => "Replacement",
         "resume_run_id" => "Resume run ID",
         "run_in_background" => "Run in background",
@@ -2223,35 +2195,22 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "search" => "Text filter",
         "selector" => "CSS selector",
         "serverId" => "Server ID",
-        "slowly" => "Type key by key",
         "start_line" => "Start line",
         "status" => "Status",
         "styles" => "CSS properties",
-        "submit" => "Submit after typing",
         "subject" => "Task subject",
-        "tab" => "Tab ID",
         "taskId" => "Task ID",
         "task" => "Task address",
         "tasks" => "Tasks",
         "source" => "Log source",
-        "text" => "Text",
-        "text_gone" => "Text to disappear",
         "threshold" => "Score threshold",
         "timeout" => "Timeout (ms)",
-        "timeout_ms" => "Timeout (ms)",
         "timeout_seconds" => "Timeout (seconds)",
-        "title" => "Title",
         "token_budget" => "Token budget",
         "target" => "Child agent",
-        "url" => "URL",
         "value" => "Value",
-        "values" => "Option values",
         "width" => "Width",
-        "x" => "Horizontal distance",
-        "y" => "Vertical distance",
-        "scope" => "Scope",
         "urls" => "URLs",
-        "expected_version" => "Expected version",
         "schema" => "Output schema",
         _ => return None,
     })
@@ -2515,7 +2474,6 @@ fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static
         ("zsh", "description") | ("sh", "description") => "List files in the current directory",
         ("find_content", "query") => "The code that handles a failed login",
         ("find_files", "query") => "The code that stores provider credentials",
-        ("find_output", "task") => "shell:3",
         ("find_output", "query") => "Are there compile errors",
         ("bash_find_output", "description") => "Show working tree status",
         ("powershell_find_output", "description") => "List files in the current directory",
@@ -2534,18 +2492,7 @@ fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static
             "The Save button in the dialog"
         }
         ("preview_fill", "query") => "The email field",
-        ("find_content", "threshold")
-        | ("find_files", "threshold")
-        | ("find_output", "threshold")
-        | ("bash_find_output", "threshold")
-        | ("powershell_find_output", "threshold")
-        | ("zsh_find_output", "threshold")
-        | ("sh_find_output", "threshold")
-        | ("preview_find_logs", "threshold")
-        | ("preview_console_logs", "threshold")
-        | ("preview_snapshot", "threshold") => "0.6",
         ("web_search", "query") => "Anthropic Claude 4.5 release date",
-        ("web_fetch", "urls") => "[\"https://example.com/docs/changelog\"]",
         ("agent_spawn", "prompt") => "Inspect routing under src/ and summarize the key files",
         ("agent_spawn", "label") => "Inspect routing",
         ("read_global_memory", "name")
@@ -2563,12 +2510,9 @@ fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static
         ("ask_user", "questions") => {
             r#"[{"question":"Which approach should I use?","header":"Approach","options":[{"label":"Approach A","description":"Keep the change small"},{"label":"Approach B","description":"Perform a full rewrite"}],"multiSelect":false}]"#
         }
-        ("todo", "action") => "create",
         ("todo", "subject") => "Implement user authentication",
         ("todo", "description") => "Add login and signup endpoints and cover them with tests.",
         ("todo", "activeForm") => "Implementing user authentication",
-        ("todo", "taskId") => "task-1",
-        ("todo", "status") => "in_progress",
         ("fork", "prompt") => "The task to complete in the forked conversation",
         _ => return None,
     })
@@ -2716,23 +2660,21 @@ fn seed_agent_definition(name: &str, provider_id: &str, model_id: &str) -> Agent
     }
 }
 
-/// Everything in the catalog except the names the host derives for itself, and
-/// except the two surfaces a shipped preset should not open with.
+/// Everything in the catalog except the names the host derives for itself and
+/// the decision-model tools.
 ///
 /// The memory tools follow the two memory switches, `skill` follows
 /// `skill_tool_enabled`, `tool_search` follows `mcp_tool_discovery_enabled`,
-/// the task-runtime tools appear only once something
-/// can produce a task, and the plan tools follow the security level. Listing
-/// any of them here would be inert at best: the renderer strips them again when
-/// the preset is applied. Mirrors the renderer's `isHostDerivedToolName`.
+/// the task-runtime tools appear only once something can produce a task, and
+/// the plan tools follow the security level. Listing any of them here would be
+/// inert at best: the renderer strips them again when the preset is applied.
+/// Mirrors the renderer's `isHostDerivedToolName`.
 ///
-/// `preview_*` and `workflow` are different: they are ordinary catalog tools
-/// that nothing strips or re-derives, so a name left here would really persist.
-/// They are withheld because each opens a surface a first conversation should
-/// not open by itself — the preview tools bring a dev server up, and `workflow`
-/// spawns an orchestration pool — and both are one toggle away in the picker.
-/// Because no predicate downstream repeats this choice, this list is the only
-/// place it lives; the renderer mirror is in `src/seed.ts::seedPreset`.
+/// The decision-model tools are withheld because none of them works until the
+/// TypeSafe key is configured. Every shell's command tool is listed here; the
+/// first launch narrows them to the one this machine prefers
+/// (`storage::seed_local_shell`), which only a probe of the machine can say.
+/// The renderer mirror is `src/seed.ts::seedPresetEnabledTools`.
 fn seed_preset_enabled_tools(tools: &[ToolDescriptor]) -> Vec<String> {
     tools
         .iter()
@@ -2742,9 +2684,7 @@ fn seed_preset_enabled_tools(tools: &[ToolDescriptor]) -> Vec<String> {
                 && !crate::plan_mode::is_plan_mode_tool_name(&tool.name)
                 && tool.name != crate::capabilities::SKILL_TOOL
                 && tool.name != crate::capabilities::TOOL_SEARCH_TOOL
-                && !tool.name.starts_with("preview_")
                 && !crate::decision_tools::is_decision_tool_name(&tool.name)
-                && tool.name != crate::workflow::WORKFLOW_TOOL
         })
         .map(|tool| tool.name.clone())
         .collect()
@@ -2785,14 +2725,17 @@ fn seed_preset(
             // is on; which of the two web tools that grants follows the backend.
             web_search_enabled: true,
             security_level: Default::default(),
-            global_memory_enabled: false,
-            project_memory_enabled: false,
+            // Every tool but the decision-model ones is on, and the memory
+            // tools are switched by these two rather than named in the list.
+            global_memory_enabled: true,
+            project_memory_enabled: true,
             // Both capability surfaces load on demand rather than inlining every
             // selected body and every MCP schema into the system prompt.
             skill_tool_enabled: true,
             mcp_tool_discovery_enabled: true,
             decision_parameter_modes: Default::default(),
             decision_miss_scoring: Default::default(),
+            sandbox: Default::default(),
         },
     }
 }
@@ -3005,6 +2948,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
             mcp_tool_discovery_enabled: false,
             decision_parameter_modes: Default::default(),
             decision_miss_scoring: Default::default(),
+            sandbox: Default::default(),
         },
     }];
     document.presets.default_conversation_preset_id = "conversation_default".into();
@@ -3050,6 +2994,8 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                     decision_parameter_modes: Default::default(),
                     decision_miss_scoring: Default::default(),
                     remembered_decision_forms: Default::default(),
+                    remembered_tool_families: Default::default(),
+                    sandbox: Default::default(),
                     tool_lock: None,
                 },
                 contexts: Vec::new(),
@@ -3086,6 +3032,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                 id: "ctx_welcome_user".into(),
                 content: "检查工作区，并协助我完成第一个任务。".into(),
                 images: Vec::new(),
+                files: Vec::new(),
                 created_at: timestamp(3),
             },
             ContextItem::Reasoning {

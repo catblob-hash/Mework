@@ -19,10 +19,17 @@ import {
   switchToolsOn
 } from "../lib/decisionParameters";
 import { isDecisionToolName, isHostDerivedToolName } from "../lib/taskTools";
-import type { DecisionParameterModes, RememberedDecisionForms, ToolDescriptor } from "../types";
-import { ToolDocsLink } from "./DocsLink";
+import type {
+  DecisionParameterModes,
+  RememberedDecisionForms,
+  RememberedToolFamilies,
+  ToolDescriptor
+} from "../types";
+import { ToolDocsLink, ToolFamilyDocsLink } from "./DocsLink";
 import {
   familyRowCounts,
+  familyRowNames,
+  familyRowsOn,
   familyVariantNames,
   TOOL_FAMILIES,
   ToolFamilySettingsDialog,
@@ -59,9 +66,10 @@ const NESTED_TOOL_NAMES: ReadonlySet<string> = new Set(Object.values(NESTED_TOOL
  *
  * The files, the shells and the preview are each a single capability split into
  * many calls for the model's benefit, not the reader's. So the picker shows one
- * row per family, and that row opens the family's own settings window. The
- * stored list keeps the real names: nothing downstream of this component has
- * ever heard of `files`, `shell` or `preview`.
+ * row per family: the row switches the family on and off, and the gear at its
+ * end opens the family's own settings window, where its tools are chosen one
+ * by one. The stored list keeps the real names: nothing downstream of this
+ * component has ever heard of `files`, `shell` or `preview`.
  */
 interface PresentFamily {
   family: ToolFamily;
@@ -85,6 +93,23 @@ function familyDescriptor({ family, members }: PresentFamily): ToolDescriptor {
 }
 
 type Translate = ReturnType<typeof useI18n>["t"];
+
+/** A family's window, and what it is editing. */
+interface OpenFamily {
+  id: ToolFamilyId;
+  /**
+   * The family was off when the window opened, so the window edits the rows
+   * switching the family on would use — its remembered ones — rather than live
+   * tools. Fixed for the window's life: turning every row off in a window that
+   * opened on live tools switches the family off, it does not start parking.
+   */
+  parked: boolean;
+  /**
+   * The window was opened by a click on the row of a family that was off with
+   * nothing remembered: closing it switches on whatever it chose.
+   */
+  enableOnClose: boolean;
+}
 
 /** The fallback is not type-protected. Adding a `ToolCategory` makes `groupMeta`
  * fail through `satisfies`, but this function must be updated explicitly too. */
@@ -116,6 +141,7 @@ export function ToolSelectionGroups({
   lockedDecisionParameterModes,
   decisionMissScoring,
   rememberedDecisionForms,
+  rememberedToolFamilies,
   onToolSettingsChange
 }: {
   tools: ToolDescriptor[];
@@ -142,6 +168,12 @@ export function ToolSelectionGroups({
   /** The sub-option choices the conversation keeps for its switched-off tools. */
   rememberedDecisionForms?: RememberedDecisionForms;
   /**
+   * The rows each switched-off family had on, which switching it back on
+   * returns to. Kept by an owner with `onToolSettingsChange`; any other owner's
+   * are held here for as long as the picker is on screen.
+   */
+  rememberedToolFamilies?: RememberedToolFamilies;
+  /**
    * A tool-list change with the modes, miss scoring and remembered choices
    * that go with it, written as one edit. Without it, only the list is written.
    */
@@ -149,7 +181,10 @@ export function ToolSelectionGroups({
 }) {
   const { t } = useI18n();
   const instanceId = useId().replace(/:/g, "");
-  const [openFamily, setOpenFamily] = useState<ToolFamilyId | null>(null);
+  const [openFamily, setOpenFamily] = useState<OpenFamily | null>(null);
+  /* A role's tool list has nowhere to keep a family's rows, so they live here. */
+  const [heldFamilies, setHeldFamilies] = useState<RememberedToolFamilies>({});
+  const rememberedFamilies = onToolSettingsChange ? rememberedToolFamilies ?? {} : heldFamilies;
   const families = useMemo((): PresentFamily[] => {
     const catalog = uniqueTools(tools);
     return TOOL_FAMILIES.flatMap((family) => {
@@ -202,20 +237,55 @@ export function ToolSelectionGroups({
     enabledTools,
     decisionParameterModes: decisionParameterModes ?? {},
     decisionMissScoring: [...(decisionMissScoring ?? [])],
-    rememberedDecisionForms: rememberedDecisionForms ?? {}
+    rememberedDecisionForms: rememberedDecisionForms ?? {},
+    rememberedToolFamilies: rememberedFamilies
   };
   const write = (next: DecisionToolSettings) => {
-    if (onToolSettingsChange) onToolSettingsChange(next);
-    else onChange(next.enabledTools);
+    if (onToolSettingsChange) {
+      onToolSettingsChange(next);
+      return;
+    }
+    // A parked window's edit moves no tool, and a list-only owner has nothing else to hear.
+    const moved = next.enabledTools.length !== enabledTools.length
+      || next.enabledTools.some((name, index) => name !== enabledTools[index]);
+    if (moved) onChange(next.enabledTools);
+    if (next.rememberedToolFamilies) setHeldFamilies(next.rememberedToolFamilies);
+  };
+  /** Whether a name is on in `names` and free to move: a locked one is neither on nor off by choice. */
+  const freelyOn = (names: readonly string[]) => (name: string) => names.includes(name) && !lockedRealNames.has(name);
+  /** Whether a name is on in `names`, a locked one included. */
+  const onIn = (names: readonly string[]) => (name: string) => names.includes(name) || lockedRealNames.has(name);
+  /** The rows of a family switching it on would bring back, as far as the catalog still has them. */
+  const rememberedRows = (present: PresentFamily): string[] => {
+    const rows = new Set(rememberedFamilies[present.family.id] ?? []);
+    return familyRowsOn(present.family, present.nameSet, (name) => rows.has(name));
+  };
+  /**
+   * `after` with each family's rows remembered as it goes off, and forgotten
+   * as it comes on. Only free rows count either way: a locked tool stays on
+   * whatever the row says, so it is neither what switching off put away nor
+   * what switching on brought back.
+   */
+  const withFamilyMemory = (before: DecisionToolSettings, after: DecisionToolSettings): DecisionToolSettings => {
+    const memory: RememberedToolFamilies = { ...(after.rememberedToolFamilies ?? {}) };
+    for (const present of families) {
+      const wasOn = familyRowsOn(present.family, present.nameSet, freelyOn(before.enabledTools));
+      const nowOn = familyRowsOn(present.family, present.nameSet, freelyOn(after.enabledTools));
+      if (nowOn.length) delete memory[present.family.id];
+      else if (wasOn.length) memory[present.family.id] = wasOn;
+    }
+    return { ...after, rememberedToolFamilies: memory };
   };
   /**
    * Writes a narrowed tool list. A decision tool that leaves keeps its form and
-   * miss scoring among the remembered choices, so switching it back on returns
-   * to them.
+   * miss scoring among the remembered choices, and a family that leaves keeps
+   * its rows, so switching either back on returns to them.
    */
-  const removeTools = (removed: ReadonlySet<string>) => write(switchToolsOff(settings, removed));
+  const removeTools = (removed: ReadonlySet<string>) =>
+    write(withFamilyMemory(settings, switchToolsOff(settings, removed)));
   /** Writes a widened tool list, each row coming back to the choices it was switched off with. */
-  const addTools = (rows: readonly string[]) => write(switchToolsOn(settings, rows, availableNames));
+  const addTools = (rows: readonly string[]) =>
+    write(withFamilyMemory(settings, switchToolsOn(settings, rows, availableNames)));
   const groupedTools = useMemo(() => {
     const deduplicated = uniqueTools(tools).filter(
       // Memory, task-runtime, and skill tools are host-derived and cannot be
@@ -259,6 +329,9 @@ export function ToolSelectionGroups({
     previousExpansionKey.current = expansionKey;
     setCollapsedGroups(new Set());
     setLockedExpanded(false);
+    // Another owner's list: what this one held for its families is not that one's.
+    setHeldFamilies({});
+    setOpenFamily(null);
   }, [expansionKey]);
 
   const toggleTool = (name: string, checked: boolean) => {
@@ -307,10 +380,64 @@ export function ToolSelectionGroups({
     removeTools(removed);
   };
 
+  /**
+   * A family row's click. A family with rows free to move switches off, keeping
+   * them; one that is off comes back on with what it kept. One with nothing
+   * kept has nothing to come back with, so the click opens its window instead,
+   * and whatever the window chooses is switched on when it closes.
+   */
+  const toggleFamily = (present: PresentFamily) => {
+    const freeRows = familyRowsOn(present.family, present.nameSet, freelyOn(enabledTools));
+    if (freeRows.length) {
+      const names = freeRows.flatMap((row) => familyRowNames(present.family, row, present.nameSet));
+      removeTools(new Set(names.filter((name) => !lockedRealNames.has(name))));
+      return;
+    }
+    const remembered = rememberedRows(present);
+    if (remembered.length) {
+      addTools(remembered);
+      return;
+    }
+    const anyOn = familyRowsOn(present.family, present.nameSet, onIn(enabledTools)).length > 0;
+    setOpenFamily({ id: present.family.id, parked: !anyOn, enableOnClose: !anyOn });
+  };
+
+  /** The gear: the family's window, on its live tools while it is on and on the rows it keeps while it is off. */
+  const configureFamily = (present: PresentFamily) => {
+    const anyOn = familyRowsOn(present.family, present.nameSet, onIn(enabledTools)).length > 0;
+    setOpenFamily({ id: present.family.id, parked: !anyOn, enableOnClose: false });
+  };
+
   const lockedRegionId = `tool-lock-${instanceId}`;
   /* A family can leave the catalog while its window is open — a workspace moves
      to a machine without that shell — and the window goes with it. */
-  const openPresent = families.find((present) => present.family.id === openFamily);
+  const openPresent = families.find((present) => present.family.id === openFamily?.id);
+  /* A parked window draws the family as switching it on would leave it, and
+     each edit is put away again as the family's kept rows, so nothing it does
+     reaches the live list. */
+  const parkedSettings = openPresent && openFamily?.parked
+    ? switchToolsOn(settings, rememberedRows(openPresent), availableNames)
+    : null;
+  const windowSettings = parkedSettings ?? settings;
+  const writeFromWindow = (next: DecisionToolSettings) => {
+    if (!openPresent || !parkedSettings) {
+      write(next);
+      return;
+    }
+    const rows = familyRowsOn(openPresent.family, openPresent.nameSet, (name) => next.enabledTools.includes(name));
+    const parked = switchToolsOff(next, openPresent.nameSet);
+    const memory: RememberedToolFamilies = { ...rememberedFamilies };
+    if (rows.length) memory[openPresent.family.id] = rows;
+    else delete memory[openPresent.family.id];
+    write({ ...parked, rememberedToolFamilies: memory });
+  };
+  const closeFamily = () => {
+    if (openPresent && openFamily?.enableOnClose) {
+      const remembered = rememberedRows(openPresent);
+      if (remembered.length) addTools(remembered);
+    }
+    setOpenFamily(null);
+  };
   return (
     <div className="tool-settings-groups">
       {lockedRows.length > 0 && (
@@ -451,19 +578,26 @@ export function ToolSelectionGroups({
                       />
                     );
                   }
+                  const on = familyRowsOn(present.family, present.nameSet, onIn(enabledTools)).length > 0;
+                  /* While the family is off, its count is the rows it keeps:
+                     what the row would switch on. */
+                  const kept = new Set(rememberedRows(present));
                   const counts = familyRowCounts(
                     present.family,
                     present.nameSet,
-                    (name) => enabledTools.includes(name) || lockedRealNames.has(name)
+                    on ? onIn(enabledTools) : (name) => kept.has(name)
                   );
                   return (
                     <ToolFamilyRow
                       key={tool.name}
                       family={present.family}
                       dangerous={tool.dangerous}
+                      on={on}
+                      switchesOff={familyRowsOn(present.family, present.nameSet, freelyOn(enabledTools)).length > 0}
                       enabledCount={counts.enabled}
                       total={counts.total}
-                      onOpen={() => setOpenFamily(present.family.id)}
+                      onToggle={() => toggleFamily(present)}
+                      onConfigure={() => configureFamily(present)}
                     />
                   );
                 })}
@@ -476,14 +610,25 @@ export function ToolSelectionGroups({
         <ToolFamilySettingsDialog
           family={openPresent.family}
           tools={openPresent.members}
-          enabledTools={enabledTools}
+          enabledTools={windowSettings.enabledTools}
           lockedTools={lockedTools}
-          decisionParameterModes={onToolSettingsChange ? decisionParameterModes ?? {} : undefined}
+          decisionParameterModes={onToolSettingsChange ? windowSettings.decisionParameterModes : undefined}
           lockedDecisionParameterModes={lockedDecisionParameterModes}
-          decisionMissScoring={decisionMissScoring ?? []}
-          rememberedDecisionForms={rememberedDecisionForms}
-          onChange={write}
-          onClose={() => setOpenFamily(null)}
+          decisionMissScoring={windowSettings.decisionMissScoring}
+          rememberedDecisionForms={windowSettings.rememberedDecisionForms}
+          onChange={writeFromWindow}
+          onClose={closeFamily}
+          notice={!openFamily?.parked
+            ? undefined
+            : openFamily.enableOnClose
+              ? t(
+                "这组工具目前关闭。关闭窗口时，这里选中的工具随即启用；一个都不选，这组工具保持关闭。",
+                "This group is off. When this window closes, the tools chosen here are switched on; with none chosen, the group stays off."
+              )
+              : t(
+                "这组工具目前关闭。这里选中的工具会在打开这组工具时启用。",
+                "This group is off. The tools chosen here are the ones switching it on will use."
+              )}
         />
       )}
     </div>
@@ -491,49 +636,74 @@ export function ToolSelectionGroups({
 }
 
 /**
- * A tool family's row. It holds no switch of its own: the tools behind it are
- * chosen one by one in the window its trailing settings button opens, so the
- * row reports how many of that window's rows are on and is otherwise the way in.
+ * A tool family's row. The row is the family's switch: it fills in while any
+ * of the family's tools is on, and its sign says which way a click moves it.
+ * The gear at its end is the way into the window where the tools behind it are
+ * chosen one by one. The count is the window's: how many of its rows are on —
+ * or, while the family is off, how many switching it on would bring back.
  */
 function ToolFamilyRow({
   family,
   dangerous,
+  on,
+  switchesOff,
   enabledCount,
   total,
-  onOpen
+  onToggle,
+  onConfigure
 }: {
   family: ToolFamily;
   dangerous: boolean;
+  /** Any of the family's tools is on, a locked one included. */
+  on: boolean;
+  /** A click would switch tools off: some that are on are free to move. */
+  switchesOff: boolean;
   enabledCount: number;
   total: number;
-  onOpen: () => void;
+  onToggle: () => void;
+  onConfigure: () => void;
 }) {
   const { t } = useI18n();
-  const on = enabledCount > 0;
-  const Icon = family.icon;
+  const Mark = switchesOff ? Minus : Plus;
+  const label = family.title(t);
   return (
     <div className="tool-pick-row">
-      {/* The documentation link's slot, kept so the label reads down the same
-          column as every other tool's; the family's tools link their own pages
-          from the window. */}
-      <span className="tool-docs-link" aria-hidden="true"><Icon size={14} /></span>
-      <button
-        type="button"
-        className={`tool-toggle-row tool-toggle-row--pick${on ? " tool-toggle-row--on" : ""}`}
+      {/* The row stands for the whole family, so its link goes to the head of
+          the family's section; each tool's own page is linked from the window. */}
+      <ToolFamilyDocsLink family={family.id} label={label} />
+      <div
+        className={`tool-toggle-row tool-toggle-row--pick tool-family-row${on ? " tool-toggle-row--on" : ""}`}
         data-tool-name={family.name}
-        aria-haspopup="dialog"
-        aria-label={t(
-          "{settings}，已启用 {enabled} / {total}",
-          "{settings}, {enabled} of {total} enabled",
-          { settings: family.settingsLabel(t), enabled: enabledCount, total }
-        )}
-        onClick={onOpen}
       >
-        <span><strong>{family.name}</strong></span>
-        <small className="tool-toggle-row__count">{enabledCount} / {total}</small>
-        {dangerous && <em>{t("需审查", "Reviewed")}</em>}
-        <Settings2 className="tool-toggle-row__mark" size={14} aria-hidden="true" />
-      </button>
+        <button
+          type="button"
+          className="tool-family-row__switch"
+          aria-pressed={on}
+          aria-label={on
+            ? t("{label}已启用，{enabled} / {total}", "{label} enabled, {enabled} of {total}", {
+              label, enabled: enabledCount, total
+            })
+            : t("{label}已关闭，已选 {enabled} / {total}", "{label} disabled, {enabled} of {total} chosen", {
+              label, enabled: enabledCount, total
+            })}
+          onClick={onToggle}
+        >
+          <span><strong>{family.name}</strong></span>
+          <small className="tool-toggle-row__count">{enabledCount} / {total}</small>
+          {dangerous && <em>{t("需审查", "Reviewed")}</em>}
+          <Mark className="tool-toggle-row__mark" size={14} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="tool-family-row__settings"
+          aria-haspopup="dialog"
+          aria-label={family.settingsLabel(t)}
+          title={family.settingsLabel(t)}
+          onClick={onConfigure}
+        >
+          <Settings2 className="tool-toggle-row__mark" size={14} aria-hidden="true" />
+        </button>
+      </div>
     </div>
   );
 }

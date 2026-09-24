@@ -1,18 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   executeGitAction,
-  executeGitHubAction,
   getGitBranches,
   getGitDiff,
-  getGitHistory,
   getGitChangePage,
-  getGitHubPullRequestDiff,
-  getGitHubPullRequestReadiness,
-  getGitHubPullRequestReviewThreadComments,
-  getGitHubPullRequestReviewThreads,
-  getGitHubPullRequests,
   getGitWorkspaceSummary,
-  getGitWorkspaceSnapshot,
   gitConversationTarget,
   gitCheckoutsAreDistinct,
   gitFileHasStagedChange,
@@ -21,11 +13,8 @@ import {
   gitTargetKey,
   gitWorkspaceTarget,
   prepareGitDiscard,
-  prepareGitStageAll,
   summaryToGitWorkspaceSnapshot,
-  type GitAction,
   type GitCheckoutRef,
-  type GitHubAction,
   type GitWorkspaceSnapshot
 } from "./git";
 
@@ -42,15 +31,6 @@ describe("Git backend client", () => {
   beforeEach(() => {
     backend.hasBackendRuntime.mockReturnValue(true);
     backend.invoke.mockReset();
-  });
-
-  it("resolves snapshots through the trusted conversation id", async () => {
-    backend.invoke.mockResolvedValueOnce(null);
-
-    await expect(getGitWorkspaceSnapshot(conversationTarget)).resolves.toBeNull();
-    expect(backend.invoke).toHaveBeenCalledWith("get_git_workspace_snapshot", {
-      target: conversationTarget
-    });
   });
 
   it("uses revision-bound bounded summary and change-page commands", async () => {
@@ -146,20 +126,6 @@ describe("Git backend client", () => {
     });
   });
 
-  it("prepares a repository-scoped stage-all proof before the mutation", async () => {
-    const preparation = {
-      snapshot: { branch: "main", contentRevision: "revision-1" },
-      targetRevision: "target-revision-1",
-      candidateTreeOid: "a".repeat(40)
-    };
-    backend.invoke.mockResolvedValueOnce(preparation);
-
-    await expect(prepareGitStageAll(conversationTarget)).resolves.toBe(preparation);
-    expect(backend.invoke).toHaveBeenCalledWith("prepare_git_stage_all", {
-      target: conversationTarget
-    });
-  });
-
   it("normalizes plain patch responses while preserving structured diffs", async () => {
     backend.invoke
       .mockResolvedValueOnce("--- a/a.ts\n+++ b/a.ts\n")
@@ -189,7 +155,7 @@ describe("Git backend client", () => {
     });
   });
 
-  it("normalizes collection-only branch, history, and pull request responses", async () => {
+  it("normalizes collection-only branch responses", async () => {
     backend.invoke
       .mockResolvedValueOnce([{
         name: "main",
@@ -199,49 +165,11 @@ describe("Git backend client", () => {
         upstream: "origin/main",
         ahead: 0,
         behind: 0
-      }])
-      .mockResolvedValueOnce([{
-        oid: "abcdef",
-        shortOid: "abcdef",
-        subject: "Initial",
-        authorName: "Cat",
-        authoredAt: "2026-07-24T00:00:00Z",
-        parents: []
-      }])
-      .mockResolvedValueOnce([{
-        number: 12,
-        title: "Review",
-        state: "open",
-        url: "https://github.com/example/repo/pull/12",
-        author: "cat",
-        headRefName: "feature",
-        baseRefName: "main",
-        draft: false,
-        updatedAt: "2026-07-24T00:00:00Z"
       }]);
 
     await expect(getGitBranches(conversationTarget)).resolves.toMatchObject({
       defaultBranch: null,
       branches: [{ name: "main" }]
-    });
-    await expect(getGitHistory(conversationTarget)).resolves.toMatchObject({
-      nextCursor: null,
-      commits: [{ subject: "Initial" }]
-    });
-    await expect(getGitHubPullRequests(conversationTarget, {
-      page: 3,
-      pageSize: 25
-    })).resolves.toMatchObject({
-      pullRequests: [{ number: 12 }],
-      page: 3,
-      pageSize: 25,
-      hasMore: false,
-      nextPage: null
-    });
-    expect(backend.invoke).toHaveBeenLastCalledWith("get_github_pull_requests", {
-      target: conversationTarget,
-      page: 3,
-      pageSize: 25
     });
   });
 
@@ -272,25 +200,6 @@ describe("Git backend client", () => {
     expect(gitTargetKey(gitConversationTarget("shared-id"))).toBe(gitTargetKey(conversation));
     expect(gitTargetKey(gitWorkspaceTarget("shared-id"))).toBe(gitTargetKey(workspace));
     expect(gitTargetKey(conversation)).not.toBe(gitTargetKey(workspace));
-  });
-
-  it("requests pull request readiness through the trusted conversation and number", async () => {
-    const readiness = {
-      identity: { number: 42 },
-      identityRevision: "identity-revision",
-      readinessRevision: "readiness-revision"
-    };
-    backend.invoke.mockResolvedValueOnce(readiness);
-
-    await expect(getGitHubPullRequestReadiness(conversationTarget, 42))
-      .resolves.toBe(readiness);
-    expect(backend.invoke).toHaveBeenCalledWith(
-      "get_github_pull_request_readiness",
-      {
-        target: conversationTarget,
-        number: 42
-      }
-    );
   });
 
   it("normalizes action snapshots and forwards tagged actions", async () => {
@@ -327,223 +236,15 @@ describe("Git backend client", () => {
     backend.invoke.mockResolvedValueOnce(snapshot);
 
     await expect(executeGitAction(conversationTarget, {
-      type: "push",
-      expectedRepositoryId: "repository-id-1",
-      expectedWorktreeId: "worktree-id-1",
-      remote: {
-        name: "origin",
-        fetchRevision: "origin-fetch-revision-1",
-        pushRevision: "origin-push-revision-1",
-        url: "https://github.com/example/repo.git"
-      },
-      expectedLocalBranch: "main",
-      remoteBranch: "main",
-      expectedHead: "0123456789abcdef0123456789abcdef01234567",
-      expectedUpstream: null,
-      setUpstream: true
+      type: "checkout",
+      branch: "main"
     })).resolves.toEqual({ snapshot });
     expect(backend.invoke).toHaveBeenCalledWith("execute_git_action", {
       target: conversationTarget,
       action: {
-        type: "push",
-        expectedRepositoryId: "repository-id-1",
-        expectedWorktreeId: "worktree-id-1",
-        remote: {
-          name: "origin",
-          fetchRevision: "origin-fetch-revision-1",
-          pushRevision: "origin-push-revision-1",
-          url: "https://github.com/example/repo.git"
-        },
-        expectedLocalBranch: "main",
-        remoteBranch: "main",
-        expectedHead: "0123456789abcdef0123456789abcdef01234567",
-        expectedUpstream: null,
-        setUpstream: true
+        type: "checkout",
+        branch: "main"
       }
-    });
-  });
-
-  it("does not accept legacy string-only remote or upstream action shapes", () => {
-    type FetchAction = Extract<GitAction, { type: "fetch" }>;
-    type PullAction = Extract<GitAction, { type: "pull" }>;
-    type PushAction = Extract<GitAction, { type: "push" }>;
-    type LegacyFetch = { type: "fetch"; remote: string };
-    type LegacyPull = { type: "pull"; remote: string; branch: string };
-    type LegacyPush = {
-      type: "push";
-      remote: string;
-      branch: string;
-      expectedHead: string;
-    };
-    const legacyFetchIsAssignable: LegacyFetch extends FetchAction ? true : false = false;
-    const legacyPullIsAssignable: LegacyPull extends PullAction ? true : false = false;
-    const legacyPushIsAssignable: LegacyPush extends PushAction ? true : false = false;
-
-    expect([
-      legacyFetchIsAssignable,
-      legacyPullIsAssignable,
-      legacyPushIsAssignable
-    ]).toEqual([false, false, false]);
-  });
-
-  it("passes an optional PR path to the GitHub diff command", async () => {
-    const diff = {
-      headRefOid: "0123456789abcdef0123456789abcdef01234567",
-      patch: "patch",
-      path: "src/App.tsx",
-      additions: 1,
-      deletions: 0,
-      binary: false,
-      truncated: false,
-      files: []
-    };
-    backend.invoke.mockResolvedValueOnce(diff);
-
-    await expect(
-      getGitHubPullRequestDiff(conversationTarget, 42, "src/App.tsx")
-    ).resolves.toEqual(diff);
-    expect(backend.invoke).toHaveBeenCalledWith("get_github_pull_request_diff", {
-      target: conversationTarget,
-      number: 42,
-      path: "src/App.tsx"
-    });
-  });
-
-  it("forwards the reviewed head and cursor for pull request review threads", async () => {
-    const result = {
-      number: 42,
-      headRefOid: "0123456789abcdef0123456789abcdef01234567",
-      threads: [],
-      totalCount: 0,
-      nextCursor: null
-    };
-    backend.invoke.mockResolvedValueOnce(result);
-    const request = {
-      number: 42,
-      expectedHeadOid: result.headRefOid,
-      cursor: "cursor-1",
-      pageSize: 30
-    };
-
-    await expect(
-      getGitHubPullRequestReviewThreads(conversationTarget, request)
-    ).resolves.toBe(result);
-    expect(backend.invoke).toHaveBeenCalledWith(
-      "get_github_pull_request_review_threads",
-      { target: conversationTarget, request }
-    );
-  });
-
-  it("forwards the exact identity, thread, head, state, and cursor for review replies", async () => {
-    const result = {
-      number: 42,
-      headRefOid: "0123456789abcdef0123456789abcdef01234567",
-      threadId: "PRRT_thread_1",
-      comments: [],
-      totalCount: 50,
-      nextCursor: null
-    };
-    backend.invoke.mockResolvedValueOnce(result);
-    const request = {
-      expectedRepository: {
-        host: "github.example",
-        owner: "example",
-        name: "repo"
-      },
-      expectedViewerLogin: "cat",
-      number: 42,
-      expectedState: "open" as const,
-      expectedHeadOid: result.headRefOid,
-      threadId: result.threadId,
-      cursor: "comment-cursor-50",
-      pageSize: 50
-    };
-
-    await expect(
-      getGitHubPullRequestReviewThreadComments(conversationTarget, request)
-    ).resolves.toBe(result);
-    expect(backend.invoke).toHaveBeenCalledWith(
-      "get_github_pull_request_review_thread_comments",
-      { target: conversationTarget, request }
-    );
-  });
-
-  it("forwards the exact proof-bound pull request merge contract", async () => {
-    backend.invoke.mockResolvedValueOnce({
-      repository: null,
-      pullRequest: null,
-      snapshot: null
-    });
-    const action = {
-      type: "merge_pull_request" as const,
-      number: 42,
-      expectedRepository: {
-        host: "github.com",
-        owner: "example",
-        name: "repo"
-      },
-      expectedViewerLogin: "cat",
-      expectedHeadOid: "0123456789abcdef0123456789abcdef01234567",
-      expectedBaseOid: "89abcdef0123456789abcdef0123456789abcdef",
-      expectedState: "open" as const,
-      expectedIdentityRevision: "identity-revision-42",
-      expectedReadinessRevision: "readiness-revision-42",
-      method: "squash" as const
-    };
-
-    await executeGitHubAction(conversationTarget, action);
-    expect(backend.invoke).toHaveBeenCalledWith("execute_github_action", {
-      target: conversationTarget,
-      action
-    });
-  });
-
-  it("does not accept the legacy merge shape without base and readiness proofs", () => {
-    type MergeAction = Extract<GitHubAction, { type: "merge_pull_request" }>;
-    type LegacyMergeAction = {
-      type: "merge_pull_request";
-      expectedRepository: { host: string; owner: string; name: string };
-      expectedViewerLogin: string;
-      number: number;
-      expectedHeadOid: string;
-      expectedState: "open";
-      method: "squash";
-    };
-    const legacyShapeIsAssignable: LegacyMergeAction extends MergeAction ? true : false = false;
-
-    expect(legacyShapeIsAssignable).toBe(false);
-  });
-
-  it("forwards exact identity, head, state, and line sides when submitting a review", async () => {
-    backend.invoke.mockResolvedValueOnce({
-      repository: null,
-      pullRequest: null
-    });
-    const action = {
-      type: "submit_pull_request_review" as const,
-      expectedRepository: {
-        host: "github.com",
-        owner: "example",
-        name: "repo"
-      },
-      expectedViewerLogin: "cat",
-      number: 42,
-      expectedHeadOid: "0123456789abcdef0123456789abcdef01234567",
-      expectedState: "open" as const,
-      event: "request_changes" as const,
-      body: "Please address the inline notes.",
-      comments: [{
-        path: "src/App.tsx",
-        line: 17,
-        side: "RIGHT" as const,
-        body: "Handle the empty state here."
-      }]
-    };
-
-    await executeGitHubAction(conversationTarget, action);
-    expect(backend.invoke).toHaveBeenCalledWith("execute_github_action", {
-      target: conversationTarget,
-      action
     });
   });
 
@@ -559,7 +260,7 @@ describe("Git backend client", () => {
   it("refuses to synthesize Git state without the Rust runtime", async () => {
     backend.hasBackendRuntime.mockReturnValue(false);
 
-    await expect(getGitWorkspaceSnapshot(conversationTarget)).rejects.toThrow(
+    await expect(getGitWorkspaceSummary(conversationTarget)).rejects.toThrow(
       "Git 功能仅可在连接 Rust 后端时使用"
     );
     expect(backend.invoke).not.toHaveBeenCalled();

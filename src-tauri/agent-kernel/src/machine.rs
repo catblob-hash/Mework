@@ -312,10 +312,6 @@ impl Kernel {
         &self.state
     }
 
-    pub fn config(&self) -> KernelConfig {
-        self.config
-    }
-
     fn call(&self, c: SlotId, event: &'static str) -> Result<&CallSlot, KernelRefusal> {
         self.state
             .calls

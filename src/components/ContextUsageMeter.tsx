@@ -47,7 +47,7 @@ export function ContextUsageMeter({
   counts
 }: ContextUsageMeterProps) {
   const { t } = useI18n();
-  const { open, position, triggerRef, panelRef, toggle, close } = usePopoverAnchor({
+  const { open, position, triggerRef, panelRef, toggle } = usePopoverAnchor({
     align: "end",
     width: PANEL_WIDTH
   });

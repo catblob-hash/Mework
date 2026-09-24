@@ -18,12 +18,11 @@ import {
   terminalMocks,
   workspacePickerMocks
 } from "./appMockInstances";
-import { createTestDocument as createSeedDocument } from "./fixtures";
+import { ASK_USER_PENDING_OUTPUT, createTestDocument as createSeedDocument } from "./fixtures";
 import { configureI18n } from "../i18n";
 import { CONVERSATION_TURNS_STORAGE_KEY } from "../lib/conversationTurns";
 import { SIDEBAR_COLLAPSED_PARENTS_STORAGE_KEY } from "../components/Sidebar";
 import { previewPaneId, sidePaneDomId } from "../lib/sidePanes";
-import { ASK_USER_PENDING_OUTPUT } from "../types";
 import type {
   AppDocument,
   ModelProfile,
@@ -206,9 +205,6 @@ export async function openTasksPane(user: ReturnType<typeof userEvent.setup>) {
   return await screen.findByRole("region", { name: "任务" });
 }
 
-/** Former name of `openTasksPane`, kept so existing suites keep reading. */
-export const openTaskContainer = openTasksPane;
-
 /**
  * What the conversation's page reports once `preview_start` has pointed it at the server it
  * started.
@@ -380,6 +376,21 @@ export function resetAppMocks() {
   runtimeMocks.loadDocument.mockReset();
   runtimeMocks.imageAttachmentData.mockReset().mockResolvedValue("data:image/png;base64,AAAA");
   runtimeMocks.prepareImageAttachment.mockReset();
+  runtimeMocks.fileAttachmentData.mockReset().mockResolvedValue("data:text/plain;charset=utf-8;base64,aGVsbG8=");
+  // Stands in for the host's store: an id per name, sized by the bytes it was handed.
+  runtimeMocks.prepareFileAttachment.mockReset().mockImplementation(async (
+    name: string,
+    bytes: Uint8Array,
+    format: "text" | "pdf",
+    extracted?: { text: string; pages: number }
+  ) => ({
+    id: `${name.replace(/[^a-z0-9]/gi, "").toLowerCase().padEnd(64, "0").slice(0, 64)}`,
+    name,
+    format,
+    bytes: bytes.byteLength,
+    tokens: Math.ceil((extracted?.text.length ?? bytes.byteLength) / 4),
+    ...(format === "pdf" ? { pages: extracted?.pages ?? 1 } : {})
+  }));
   runtimeMocks.refreshCapabilities.mockReset();
   runtimeMocks.deleteHook.mockReset().mockResolvedValue(undefined);
   runtimeMocks.deleteSkill.mockReset().mockResolvedValue(undefined);
@@ -483,9 +494,7 @@ export function resetAppMocks() {
   browserRendererMountMocks.stopHeartbeat.mockReset();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   window.localStorage.removeItem("mework.sidebar-width");
-  window.localStorage.removeItem("mework.right-sidebar-width");
   window.localStorage.removeItem("naiword.sidebar-width");
-  window.localStorage.removeItem("naiword.right-sidebar-width");
   window.localStorage.removeItem(CONVERSATION_TURNS_STORAGE_KEY);
   window.localStorage.removeItem(SIDEBAR_COLLAPSED_PARENTS_STORAGE_KEY);
   Object.defineProperty(window, "innerWidth", {

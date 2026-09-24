@@ -16,3 +16,4 @@ Each result comes back under a `[name · status]` header carrying the child's te
 - [task_list](task_list.html) — the addresses this tool accepts
 - [box](box.html) — how an uncollected result arrives instead
 - [Working with Mework](../working.html#subagents-workflows-and-tasks)
+- [find_output](find_output.html) — look into a command's output without waiting for it

@@ -23,7 +23,7 @@ function isObject(value: unknown): value is JsonObject {
  * ask to stream must be converted back from the mandatory upstream SSE transport
  * to an AI SDK JSON result.
  */
-export function coerceCodexRequestBody(text: string): { body: string; wasStreaming: boolean } {
+function coerceCodexRequestBody(text: string): { body: string; wasStreaming: boolean } {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -62,7 +62,7 @@ function errorResult(event: JsonObject): { status: number; body: string } {
  * Turn Codex's completed SSE transport response into the normal Responses JSON
  * response expected by a non-streaming AI SDK call.
  */
-export function responseFromCompletedSse(text: string): { status: number; body: string } {
+function responseFromCompletedSse(text: string): { status: number; body: string } {
   for (const line of text.split(/\r?\n/)) {
     if (!line.startsWith("data:")) continue;
     const payload = line.slice("data:".length).trim();

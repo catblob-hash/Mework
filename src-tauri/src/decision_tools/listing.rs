@@ -1,22 +1,19 @@
 //! `find_files`: which entries of a directory listing a query describes.
 //!
 //! The executor resolves the directory under the usual scope rules and walks it (here for a
-//! local workspace, through the remote `ls` machinery for another machine); this module cuts
-//! the listing into groups of consecutive paths, scores the groups, and re-scores the paths of
-//! every group that clears the threshold, so what comes back is a handful of paths with their
-//! scores rather than a directory the conversation model has to read.
+//! local workspace, through the remote `ls` machinery for another machine); this module scores
+//! every path of the listing on its own — many to a request — so what comes back is a handful of
+//! paths with their scores rather than a directory the conversation model has to read.
 
-use std::collections::HashMap;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 use walkdir::WalkDir;
 
 use crate::cancel::CancelSignal;
-use crate::decision_model::chunk::group_entries;
+use crate::decision_model::chunk::Blocks;
 use crate::decision_model::jev::RELEVANCE_RUBRIC;
-use crate::decision_model::search::{render_report, search, Candidate, Scorer, SearchReport};
+use crate::decision_model::search::{render_summary, search, Block, Scorer, SearchReport};
 use crate::decision_model::{parse_query, parse_threshold};
 use crate::model::JsonObject;
 use crate::path_guard::{canonical_workspace, existing_path_is_allowed, relative_display,
@@ -29,12 +26,6 @@ use super::{failure, jev_scorer};
 /// Entries one call lists before it stops walking. Ten times `ls`'s own cap: `ls` is a listing
 /// a person reads, while this one is only ever read by the scorer, which sees it in groups.
 pub(crate) const MAX_FIND_FILES_ENTRIES: usize = 20_000;
-
-/// The coarse cut of a listing: at most this many groups, of at least this many paths each.
-/// Same shape as the line chunker — the group count is what is bounded, so a large tree grows
-/// its groups instead of its request count.
-const MAX_ENTRY_GROUPS: usize = 48;
-const MIN_ENTRIES_PER_GROUP: usize = 8;
 
 /// `depth` counts the levels below the target, exactly as `ls` counts them. The default is
 /// deeper than `ls`'s because nobody reads this listing: a `find_files` that only saw the
@@ -131,69 +122,39 @@ fn find_files(
     find_files_with(scorer, root, entries, &query, threshold, cancel)
 }
 
-/// The scoring pass, with the scorer passed in so the grouping and the rendering can be tested
+/// The scoring pass, with the scorer passed in so the scoring and the rendering can be tested
 /// without a key or a network.
 fn find_files_with(
     scorer: Arc<dyn Scorer>,
     root: &str,
-    entries: Vec<String>,
+    mut entries: Vec<String>,
     query: &str,
     threshold: f64,
     cancel: &CancelSignal,
 ) -> Result<String, String> {
     let capped = entries.len() >= MAX_FIND_FILES_ENTRIES;
-    let (coarse, by_label) = entry_groups(root, &entries);
-    let report = search(
-        scorer,
-        query,
-        threshold,
-        coarse,
-        |candidate| refine_entry_group(&entries, &by_label, candidate),
-        cancel,
-    )
-    .map_err(failure)?;
+    entries.sort_unstable();
+    let blocks = entry_blocks(entries);
+    let report = search(scorer, query, threshold, &blocks, cancel).map_err(failure)?;
     Ok(render_entry_report(&report, query, threshold, root, capped))
 }
 
-/// The coarse candidates: runs of consecutive paths, labelled by their position in the listing
-/// so a group that is never refined is still addressable.
-fn entry_groups(root: &str, entries: &[String]) -> (Vec<Candidate>, HashMap<String, Range<usize>>) {
-    let groups = group_entries(entries.len(), MAX_ENTRY_GROUPS, MIN_ENTRIES_PER_GROUP);
-    let mut by_label = HashMap::with_capacity(groups.len());
-    let candidates = groups
-        .into_iter()
-        .map(|range| {
-            let label = group_label(root, &range);
-            by_label.insert(label.clone(), range.clone());
-            Candidate::new(label, entries[range].join("\n"))
-        })
-        .collect();
-    (candidates, by_label)
-}
-
-/// A winning group refined into one candidate per path. The path is both the label and the
-/// text: for a listing there is nothing else to judge, and the label *is* the answer.
-fn refine_entry_group(
-    entries: &[String],
-    by_label: &HashMap<String, Range<usize>>,
-    candidate: &Candidate,
-) -> Vec<Candidate> {
-    let Some(range) = by_label.get(&candidate.label) else {
-        return Vec::new();
-    };
-    entries[range.clone()]
+/// Every path a block of its own, labelled by itself: for a listing there is nothing else to
+/// judge, and the path *is* the answer.
+fn entry_blocks(entries: Vec<String>) -> Vec<Block> {
+    let listing = Blocks::entries(entries);
+    listing
+        .spans()
         .iter()
-        .map(|entry| Candidate::new(entry.clone(), entry.clone()))
+        .map(|&(position, _)| {
+            let path = listing.text_of(position, position);
+            Block::whole(path.clone(), path)
+        })
         .collect()
 }
 
-fn group_label(root: &str, range: &Range<usize>) -> String {
-    format!("entries {}-{} of {root}", range.start + 1, range.end)
-}
-
-/// `find_files`'s answer: `render_report`'s own summary, then one line per path that cleared
-/// the threshold, and — for a group the refinement pass never split — the group's paths under
-/// a header that says so.
+/// `find_files`'s answer: the summary, a note when the walk stopped short, and one line per
+/// path that cleared the threshold.
 fn render_entry_report(
     report: &SearchReport,
     query: &str,
@@ -201,46 +162,31 @@ fn render_entry_report(
     root: &str,
     capped: bool,
 ) -> String {
-    let subject = format!("groups of entries under {root}");
-    let mut text = vec![report_summary(report, query, threshold, &subject)];
+    let mut text = vec![render_summary(
+        report,
+        query,
+        threshold,
+        &format!("entries under {root}"),
+    )];
     if capped {
         text.push(format!(
             "Only the first {MAX_FIND_FILES_ENTRIES} entries under {root} were listed; there are \
              more. Narrow the search with path or depth."
         ));
     }
-    for hit in &report.hits {
-        if hit.refined {
-            text.push(format!("{} (score {:.3})", hit.candidate.label, hit.score));
-            continue;
-        }
-        text.push(String::new());
-        text.push(format!(
-            "--- {} (score {:.3}, whole group) ---",
-            hit.candidate.label, hit.score
-        ));
-        for line in hit.candidate.text.lines() {
-            text.push(format!("  {line}"));
-        }
-    }
+    text.extend(
+        report
+            .hits
+            .iter()
+            .map(|hit| format!("{} (score {:.3})", hit.label, hit.score)),
+    );
     text.join("\n")
-}
-
-/// The report's summary lines — everything `render_report` prints that is not a hit — so a tool
-/// that renders its own hits still says "no entry groups scored…" in exactly the same words.
-fn report_summary(report: &SearchReport, query: &str, threshold: f64, subject: &str) -> String {
-    let rendered = render_report(report, query, threshold, subject, false);
-    let summary = rendered.lines().count().saturating_sub(report.hits.len());
-    rendered
-        .lines()
-        .take(summary)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision_model::search::Candidate;
     use crate::decision_model::DecisionError;
     use serde_json::json;
     use std::sync::Mutex;
@@ -281,92 +227,70 @@ mod tests {
             .collect()
     }
 
+    /// A tree: `src/auth/` with two files, `src/util/` with `count` more.
     fn listing(count: usize) -> Vec<String> {
-        (0..count).map(|index| format!("src/f{index:02}.rs")).collect()
+        let mut entries = vec![
+            "src/".to_owned(),
+            "src/auth/".to_owned(),
+            "src/auth/login_handler.rs".to_owned(),
+            "src/auth/session.rs".to_owned(),
+            "src/util/".to_owned(),
+        ];
+        entries.extend((0..count).map(|index| format!("src/util/f{index:02}.rs")));
+        entries
     }
 
+    /// Every path is a block of its own, label and text alike.
     #[test]
-    fn a_listing_is_grouped_in_order_and_labelled_by_position() {
-        let entries = listing(20);
-        let (coarse, by_label) = entry_groups("src", &entries);
-        assert_eq!(coarse.len(), 3);
-        assert_eq!(coarse[0].label, "entries 1-8 of src");
-        assert_eq!(coarse[2].label, "entries 17-20 of src");
-        assert_eq!(coarse[0].text.lines().count(), 8);
-        assert_eq!(coarse[0].text.lines().next().unwrap(), "src/f00.rs");
-        // Refinement turns a group into one candidate per path, label and text alike.
-        let pieces = refine_entry_group(&entries, &by_label, &coarse[2]);
-        assert_eq!(pieces.len(), 4);
-        assert_eq!(pieces[0].label, "src/f16.rs");
-        assert_eq!(pieces[0].text, "src/f16.rs");
-        // A label this plan never produced refines to nothing.
-        assert!(refine_entry_group(&entries, &by_label, &Candidate::new("x", "y")).is_empty());
+    fn every_path_is_a_block_labelled_by_itself() {
+        let blocks = entry_blocks(listing(3));
+        assert_eq!(blocks.len(), 8);
+        assert_eq!(blocks[2].label, "src/auth/login_handler.rs");
+        assert_eq!(blocks[2].parts[0].text, "src/auth/login_handler.rs");
     }
 
-    /// The whole pass: only the group that mentions the query is refined, and only the paths
-    /// that clear the threshold come back — each as its own line, with its score.
+    /// The whole pass: every path is scored, many to a request, and only the ones that clear the
+    /// threshold come back — each as its own line, with its score.
     #[test]
-    fn only_the_paths_of_a_winning_group_are_scored_and_returned() {
+    fn only_the_paths_that_clear_the_threshold_are_returned() {
         let scorer = KeywordScorer::new();
-        let mut entries = listing(16);
-        entries[9] = "src/auth/login_handler.rs".into();
         let text = find_files_with(
             scorer.clone(),
             ".",
-            entries,
+            listing(30),
             "login",
             0.5,
             &CancelSignal::default(),
         )
         .unwrap();
         assert!(
-            text.starts_with("1 hit at or above 0.500 for query \"login\" (2 groups of entries under . scored, 10 requests)."),
+            text.starts_with("1 hit at or above 0.500 for query \"login\" (35 entries under . scored, 2 requests)."),
             "{text}"
         );
-        assert!(text.contains("src/auth/login_handler.rs (score 1.000)"), "{text}");
-        assert!(!text.contains("src/f00.rs"), "losers stay out: {text}");
-        // The first group never mentions the query, so its paths are never scored one by one.
-        assert!(
-            !scorer.calls().contains(&"src/f00.rs".to_owned()),
-            "{:?}",
-            scorer.calls()
-        );
+        assert!(text.ends_with("\nsrc/auth/login_handler.rs (score 1.000)"), "{text}");
+        assert!(!text.contains("src/util/f00.rs"), "losers stay out: {text}");
+        assert_eq!(scorer.calls().len(), 35, "every path is scored");
     }
 
-    /// A group that passes as a whole but whose paths individually do not is printed entire,
-    /// indented under a header that says the group was never split.
+    /// The note on a listing the walk cut short sits under the summary, above the paths.
     #[test]
-    fn an_unrefined_group_prints_its_paths_under_a_whole_group_header() {
+    fn a_capped_listing_says_so_above_the_hits() {
         let report = SearchReport {
             hits: vec![crate::decision_model::search::Hit {
-                candidate: Candidate::new("entries 1-3 of src", "src/a.rs\nsrc/b.rs\nsrc/c.rs"),
-                score: 0.75,
-                refined: false,
-            }],
-            coarse_count: 2,
-            requests: 5,
-            ..SearchReport::default()
-        };
-        let text = render_entry_report(&report, "parser", 0.6, "src", false);
-        assert!(
-            text.starts_with("1 hit at or above 0.600 for query \"parser\" (2 groups of entries under src scored, 5 requests)."),
-            "{text}"
-        );
-        assert!(text.contains("\n--- entries 1-3 of src (score 0.750, whole group) ---\n  src/a.rs\n  src/b.rs\n  src/c.rs"), "{text}");
-        // A refined hit is the path itself, with no indentation and no header.
-        let refined = SearchReport {
-            hits: vec![crate::decision_model::search::Hit {
-                candidate: Candidate::new("src/a.rs", "src/a.rs"),
+                block: 0,
+                label: "src/a.rs".into(),
                 score: 0.9,
-                refined: true,
+                part: None,
             }],
-            coarse_count: 1,
-            requests: 2,
+            blocks: 1,
+            requests: 1,
             ..SearchReport::default()
         };
-        let text = render_entry_report(&refined, "parser", 0.6, "src", true);
-        assert!(text.ends_with("src/a.rs (score 0.900)"), "{text}");
-        assert!(text.contains("Only the first 20000 entries under src were listed"), "{text}");
+        let text = render_entry_report(&report, "parser", 0.6, "src", true);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(lines[0].starts_with("1 hit at or above 0.600"), "{text}");
+        assert!(lines[1].starts_with("Only the first 20000 entries under src were listed"), "{text}");
+        assert_eq!(lines[2], "src/a.rs (score 0.900)");
     }
 
     /// An empty directory is an answer, not a failure — and it costs no request.

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use crate::tunnel::{relay, Outbound, Upstream};
+pub use crate::tunnel::{relay, Upstream};
 
 /// Longest request head a client may send before the proxy gives up on it.
 const MAX_HEAD: usize = 64 * 1024;

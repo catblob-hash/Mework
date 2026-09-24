@@ -12,7 +12,7 @@ The `uid` on each line comes from a counter that runs for the life of the page, 
 
 ## Decision-model parameters
 
-Turn on its decision-model option in the conversation's preview tool window and it takes `query` and `threshold` as well: the page's element lines are cut into runs the TypeSafe Jev decision model scores, and instead of the whole snapshot only the elements scoring at or above `threshold` come back, each with a CSS selector to hand straight to [preview_click](preview_click.html), [preview_fill](preview_fill.html) or [preview_inspect](preview_inspect.html). **Add decision-model parameters** keeps the whole snapshot beside it; **Decision model only** requires the pair on every call. The element lines are sent to TypeSafe's API, which needs its key under Global settings → Decision model providers.
+Turn on its decision-model option in the conversation's preview tool window and it takes `query` and `threshold` as well: every element line of the page is scored on its own by the TypeSafe Jev decision model, many to a request, and instead of the whole snapshot only the elements scoring at or above `threshold` come back, each with a CSS selector to hand straight to [preview_click](preview_click.html), [preview_fill](preview_fill.html) or [preview_inspect](preview_inspect.html). **Add decision-model parameters** keeps the whole snapshot beside it; **Decision model only** requires the pair on every call. The element lines are sent to TypeSafe's API, which needs its key under Global settings → Decision model providers.
 
 ## Related
 

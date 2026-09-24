@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { diffTotals, parseUnifiedDiff, unquoteGitPath } from "./unifiedDiff";
+import { parseUnifiedDiff, unquoteGitPath } from "./unifiedDiff";
 
 const MODIFIED_PATCH = `diff --git a/src/app.ts b/src/app.ts
 index 1111111..2222222 100644
@@ -370,26 +370,6 @@ index 3333333..4444444 100644
 
       expect(files.map((file) => file.path)).toEqual(["one.txt", "two.txt"]);
     });
-  });
-
-  it("totals additions and deletions across files", () => {
-    const files = parseUnifiedDiff(`diff --git a/one.txt b/one.txt
-index 1111111..2222222 100644
---- a/one.txt
-+++ b/one.txt
-@@ -1,2 +1,2 @@
--keep me
-+swap
-+in
-diff --git a/two.txt b/two.txt
-index 3333333..4444444 100644
---- a/two.txt
-+++ b/two.txt
-@@ -1 +0,0 @@
--gone
-`);
-
-    expect(diffTotals(files)).toEqual({ additions: 2, deletions: 2 });
   });
 
   describe("garbage input", () => {

@@ -189,7 +189,7 @@ export interface BrowserCloseDisposition {
 
 const PREVIEW_ERROR = "此操作仅可在 Mework 桌面应用的内置浏览器中使用";
 
-export function isDesktopBrowserRuntime(): boolean {
+function isDesktopBrowserRuntime(): boolean {
   return hasBackendRuntime();
 }
 

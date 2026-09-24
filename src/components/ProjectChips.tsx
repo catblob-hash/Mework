@@ -337,7 +337,6 @@ export function TerminalShellButton({
   shells,
   paneOpen,
   disabled = false,
-  disabledReason,
   onSelect,
   onTogglePane
 }: {
@@ -347,7 +346,6 @@ export function TerminalShellButton({
   /** Whether the terminal pane is on screen, which decides what its row says. */
   paneOpen: boolean;
   disabled?: boolean;
-  disabledReason?: string;
   onSelect: (shell: TerminalShell) => void;
   onTogglePane: () => void;
 }) {
@@ -359,7 +357,7 @@ export function TerminalShellButton({
       triggerClassName="composer-chip composer-chip--icon"
       trigger={<SquareTerminal size={13} />}
       triggerLabel={label}
-      triggerTitle={disabled && disabledReason ? disabledReason : label}
+      triggerTitle={label}
       disabled={disabled}
       menuLabel={t("用哪个 shell", "Which shell")}
       menuWidth={200}

@@ -33,25 +33,3 @@ export function securityLevelLabel(level: SecurityLevel, t: TranslationFunction)
       return t("完全访问", "Full access");
   }
 }
-
-export function securityLevelDescription(level: SecurityLevel, t: TranslationFunction): string {
-  switch (level) {
-    case "request_approval":
-      return t("写入与高风险操作先询问", "Writes and risky calls ask first");
-    case "allow_edits":
-      return t(
-        "可信目录内读写免提示",
-        "Reads and writes inside trusted directories run without prompts"
-      );
-    case "plan":
-      return t(
-        "只探索与撰写计划，批准前不改动任何文件",
-        "Explores and writes a plan only; nothing changes until you approve it"
-      );
-    case "full_access":
-      return t(
-        "大多数已验证调用免提示；强制确认仍保留",
-        "Most validated calls run without prompts; mandatory confirmations remain"
-      );
-  }
-}

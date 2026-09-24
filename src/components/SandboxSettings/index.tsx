@@ -5,7 +5,6 @@ import { useI18n } from "../../i18n";
 import { DEFAULT_SANDBOX_ALLOWLIST, defaultSandboxSettings, localSandboxSupport, setupLocalSandbox } from "../../lib/runtime";
 import type { SandboxNetworkMode, SandboxSettings as SandboxSettingsType, SandboxSupport } from "../../types";
 import { Switch } from "../Common";
-import { SettingsPageHeading } from "../SettingsPageHeading";
 import "./SandboxSettings.css";
 
 interface SandboxSettingsProps {
@@ -55,12 +54,16 @@ function ListField({
 }
 
 /**
- * The sandbox conversations' commands run in: one sandboxed agent process per
- * conversation and machine, enforced by the operating system (Seatbelt on
- * macOS, bubblewrap and seccomp on Linux and WSL 2, srt-win's restricted
- * account and firewall rules on Windows). Off unless switched on; a machine
- * that cannot sandbox refuses the command rather than running it unsandboxed.
- * Windows needs a one-time setup with administrator rights, started here.
+ * The sandbox one conversation's commands run in: one sandboxed agent process
+ * per machine the conversation uses, enforced by the operating system
+ * (Seatbelt on macOS, bubblewrap and seccomp on Linux and WSL 2, srt-win's
+ * restricted account and firewall rules on Windows). A page of the
+ * conversation-settings pane, so a preset opened in that pane carries one too:
+ * the conversation is the smallest thing a sandbox is ever drawn around. Off
+ * unless switched on; a machine that cannot sandbox refuses the command rather
+ * than running it unsandboxed. Windows needs a one-time setup with
+ * administrator rights, started here — that part belongs to the computer, not
+ * to the conversation.
  */
 export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): JSX.Element {
   const { t } = useI18n();
@@ -109,14 +112,7 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
   const needsSetup = unavailable && support.setup;
 
   return (
-    <section className="settings-page sandbox-settings-page">
-      <SettingsPageHeading
-        title={t("沙箱", "Sandbox")}
-        description={t(
-          "开启后，每个对话的命令都在操作系统的沙箱里运行：同一台机器上一个对话一个沙箱进程。按“命令里的代码可能是恶意的”来设防。",
-          "When on, each conversation's commands run in the operating system's sandbox — one sandboxed process per conversation and machine — on the assumption that the code they run may be hostile."
-        )}
-      />
+    <section className="sandbox-settings-page">
       <section className="settings-card">
         <div className="sandbox-settings-page__row">
           <div className="sandbox-settings-page__copy">
@@ -233,8 +229,8 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
         <ListField
           label={t("额外可写目录", "Further writable directories")}
           description={t(
-            "每个沙箱都可写，在哪台机器上存在就在哪台生效。绝对路径或以 ~ 开头。",
-            "Writable by every sandbox, on whichever machine has them. Absolute, or starting with ~."
+            "这个对话在各台机器上的沙箱都可写，在哪台机器上存在就在哪台生效。绝对路径或以 ~ 开头。",
+            "Writable by this conversation's sandbox on whichever machine has them. Absolute, or starting with ~."
           )}
           value={current.writable}
           placeholder={"~/shared-data"}
@@ -243,8 +239,8 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
         <ListField
           label={t("额外禁读路径", "Further unreadable paths")}
           description={t(
-            "内置的凭据位置之外，沙箱也读不到这些。",
-            "Besides the built-in credential locations, no sandbox can read these."
+            "内置的凭据位置之外，这个对话的沙箱也读不到这些。",
+            "Besides the built-in credential locations, this conversation's sandbox cannot read these."
           )}
           value={current.denyRead}
           placeholder={"~/secrets"}

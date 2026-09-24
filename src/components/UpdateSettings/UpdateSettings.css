@@ -23,11 +23,10 @@
 .update-settings__mark {
   width: 44px;
   height: 44px;
-  display: grid;
-  place-items: center;
-  border-radius: 12px;
-  background: var(--accent-soft);
-  color: var(--accent);
+}
+
+.update-settings__mark > svg {
+  display: block;
 }
 
 .update-settings__version-copy {

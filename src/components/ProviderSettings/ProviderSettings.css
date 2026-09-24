@@ -79,15 +79,6 @@
   overflow-y: auto;
 }
 .provider-rail__slot { position: relative; }
-.provider-rail__group { display: flex; flex-direction: column; gap: 3px; }
-.provider-rail__group-body {
-  margin-left: 11px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  border-left: 1px solid var(--border);
-  padding-left: 6px;
-}
 
 .provider-rail__row {
   position: relative;
@@ -166,28 +157,6 @@
      bundler emits first. */
   opacity: 1;
 }
-
-/* Group headers display both status and expansion state because they convey distinct
-   information. */
-.provider-rail__row--group .provider-rail__trailing { width: auto; gap: 5px; }
-.provider-rail__chevron { flex: 0 0 auto; color: var(--faint); transition: transform .15s; }
-.provider-rail__chevron--open { transform: rotate(90deg); }
-
-.provider-rail__group-add {
-  width: 100%;
-  min-height: 26px;
-  padding: 0 8px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px dashed var(--border-strong);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--faint);
-  font-size: 9.5px;
-  transition: color .14s, background .14s, border-color .14s;
-}
-.provider-rail__group-add:hover { color: var(--text); background: var(--hover); border-color: var(--muted); }
 
 .provider-rail__empty {
   padding: 24px 8px;
@@ -412,15 +381,6 @@
 }
 .provider-square-action.icon-button:hover:not(:disabled) { background: var(--hover); }
 
-/* Multiline inputs retain the `.provider-input-group` border but need variable height,
-   so replace single-line centering with all-around padding. */
-.provider-input-group--multiline {
-  min-height: 0;
-  padding: 8px 10px;
-  align-items: stretch;
-}
-.provider-textarea { min-height: 132px; resize: vertical; line-height: 1.5; }
-
 /* Embedded list components bring padding and negative margins designed for sidebars and
    tab pages. Reset those offsets here to align them with the field inputs. */
 .provider-field .tool-toggle-row { padding-left: 0; padding-right: 0; }
@@ -437,7 +397,6 @@
 .provider-models__title { min-width: 0; display: flex; align-items: center; gap: 3px; }
 .provider-models__title h2 { margin: 0 5px 0 0; font-size: 11.5px; font-weight: 650; }
 .provider-models__tool.icon-button { width: 24px; height: 24px; flex-basis: 24px; border-radius: 6px; }
-.provider-models__tool--active { color: var(--text); background: var(--active); }
 
 /* Fetching models and adding them manually are two paths to the same operation, so
    they form a joined button group. */
@@ -597,7 +556,6 @@
   border-top: 1px solid var(--border);
   background: var(--color-fafaf8);
 }
-.drawer__footer-meta { margin-right: auto; color: var(--faint); font-size: 9px; }
 .drawer-section { margin-top: 4px; }
 .drawer-section__title { margin-bottom: 9px; display: flex; flex-direction: column; }
 .drawer-section__title strong { font-size: 11px; }

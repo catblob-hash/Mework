@@ -161,16 +161,18 @@ pub(crate) struct VerifiedToolExecutionResponse {
     pub file_touch: Option<FileGuardTouch>,
 }
 
-#[allow(dead_code)] // Backward-compatible workspace-only execution entry point.
+/// Workspace-only execution, for tests.
+#[cfg(test)]
 pub fn execute(request: ToolExecutionRequest, state: &AppState) -> ToolExecutionResponse {
     let scope = ExecutionScope::workspace_only(Path::new(&request.workspace_path));
     execute_with_scope(request, state, scope)
 }
 
 /// Executes a request with the filesystem boundary selected by the trusted
-/// security classifier. Callers must still honor `requires_approval` before
-/// passing the corresponding scope here; this function enforces the boundary
-/// but does not display or verify approval UI itself.
+/// security classifier, for tests. Callers must still honor `requires_approval`
+/// before passing the corresponding scope here; this function enforces the
+/// boundary but does not display or verify approval UI itself.
+#[cfg(test)]
 pub fn execute_with_scope(
     request: ToolExecutionRequest,
     state: &AppState,
@@ -190,8 +192,8 @@ pub fn execute_with_scope(
 /// require this root to make their pixels available to later model rounds.
 ///
 /// `runner` is the trusted shell environment resolved by the host. Only `bash` and
-/// `powershell` use it. Tests and backward-compatible callers use the default
-/// local runner with no injected variables.
+/// `powershell` use it. Tests use the default local runner with no injected
+/// variables.
 ///
 /// `profile` is the conversation's prompt profile: it words the framing this
 /// executor puts around a command's output. A tool run outside a model turn is
@@ -469,9 +471,12 @@ fn run_tool(
             "find_content" => {
                 let path = required_string(&request.input, "path", MAX_PATH_CHARS, false)?;
                 let (display, content) = crate::remote_files::read_text(&remote, &path)?;
+                // No language server is consulted for a file on another machine; its text is cut
+                // by indentation and paragraphs.
                 return crate::decision_tools::files::find_content(
                     &display,
                     &content,
+                    || None,
                     &request.input,
                     cancel,
                 )
@@ -553,11 +558,15 @@ fn run_tool(
         "lsp" => run_lsp(workspace, request, scope, state, profile).map(Outcome::success),
         // Decision-model tools: the material is gathered here under the usual scope rules and
         // scored in `decision_tools`, so only the parts that clear the model's threshold return.
-        "find_content" => {
-            let (display, content) = read_text_for_scoring(workspace, &request.input, scope)?;
-            crate::decision_tools::files::find_content(&display, &content, &request.input, cancel)
-                .map(Outcome::success)
-        }
+        "find_content" => crate::decision_tools::files::find_content_local(
+            workspace,
+            &request.input,
+            scope,
+            state,
+            profile.language,
+            cancel,
+        )
+        .map(Outcome::success),
         "find_output" => {
             crate::decision_tools::output::find_output(request, state, cancel).map(Outcome::success)
         }
@@ -1661,14 +1670,15 @@ fn run_read(
 }
 
 /// The text of one workspace file for a tool that scores it rather than shows it: the
-/// display path and the content. Same scope rules and limits as `read`; images are refused
+/// display path, the content, and the resolved path a language server is asked about. Same
+/// scope rules and limits as `read`; images are refused
 /// because there is no text to score. No read record is taken, because nothing of the file
 /// is put in front of the model.
 pub(crate) fn read_text_for_scoring(
     workspace: &Path,
     input: &JsonObject,
     scope: &ExecutionScope,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, PathBuf), String> {
     let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
     let workspace = canonical_workspace(workspace)?;
     let (mut file, file_path) = secure_open_existing_file_with_scope(&workspace, &path, scope)?;
@@ -1681,7 +1691,7 @@ pub(crate) fn read_text_for_scoring(
         return Err(format!("{path} is an image; only text files can be scored"));
     }
     let content = read_text_file_handle(&mut file)?;
-    Ok((display_path(&workspace, &file_path), content))
+    Ok((display_path(&workspace, &file_path), content, file_path))
 }
 
 /// What a `read` hands back for the run loop to commit once the result is
@@ -5274,8 +5284,9 @@ mod tests {
         );
     }
 
-    /// `find_content` through the executor: the file's chunks go to the decision model, and
-    /// only the refined pieces that clear the threshold come back, addressed by line range.
+    /// `find_content` through the executor: the file's blocks go to the decision model, and every
+    /// block that clears the threshold comes back whole, its lines numbered as the file numbers
+    /// them.
     /// Without a key the call fails with the words that send the user to the settings page.
     #[test]
     fn find_content_returns_the_scored_pieces_by_line_range() {
@@ -5298,8 +5309,8 @@ mod tests {
         assert!(missing.output.contains("Decision model providers"), "{}", missing.output);
         drop(absent);
 
-        let server = crate::decision_model::jev::fixture::ScoringServer::start(|state| {
-            let text = state["candidate"]["text"].as_str().unwrap_or_default();
+        let server = crate::decision_model::jev::fixture::ScoringServer::start(|candidate| {
+            let text = candidate["text"].as_str().unwrap_or_default();
             if text.contains("LOGIN") || text.contains("login") {
                 3.0
             } else {
@@ -5309,19 +5320,23 @@ mod tests {
         let _override = crate::decision_model::test_overrides::install("sk-test", &server.endpoint());
         let result = execute(request(directory.path(), "find_content", input), &state);
         assert!(result.success, "{}", result.output);
-        // Lines 31 and 32 sit in the second 16-line chunk; its 3-line pieces put them in
-        // `lines 29-31` and `line 32`.
-        assert!(result.output.contains("--- auth.rs lines 29-31 (score 1.000) ---"), "{}", result.output);
-        assert!(result.output.contains("--- auth.rs line 32 (score 1.000) ---"), "{}", result.output);
-        assert!(result.output.contains("on_login_failed"), "{}", result.output);
+        // Line 32 is indented under line 31, so the two are one block — the one that comes back,
+        // whole and numbered. The one-liners around it are two paragraphs of their own.
+        assert!(
+            result.output.ends_with(
+                "--- auth.rs lines 31-32 (score 1.000) ---\n    31\tfn on_login_failed(reason: \
+                 &str) { record_failure(reason); }\n    32\t    // shows the LOGIN error banner"
+            ),
+            "{}",
+            result.output
+        );
         assert!(!result.output.contains("helper_10()"), "losers stay out: {}", result.output);
-        // 60 lines → 4 coarse chunks of 16, one winner refined into 6 pieces.
-        assert!(result.output.starts_with("2 hits at or above 0.600"), "{}", result.output);
-        assert!(result.output.contains("(4 chunks of auth.rs scored, 10 requests)"), "{}", result.output);
+        assert!(result.output.starts_with("1 hit at or above 0.600"), "{}", result.output);
+        assert!(result.output.contains("(3 blocks of auth.rs scored, 2 requests)"), "{}", result.output);
         let requests = server.requests();
-        assert_eq!(requests.len(), 10);
+        assert_eq!(requests.len(), 2);
         assert!(requests.iter().all(|request| request["state"]["query"] == "login failure handling"));
-        assert!(requests.iter().all(|request| request["questions"]["answer"]["type"] == "score"));
+        assert!(requests.iter().all(|request| request["questions"]["c0"]["type"] == "score"));
     }
 
     /// A shell command must be addressable while it runs, and must still be *there* once it does
@@ -7050,8 +7065,8 @@ mod tests {
             "threshold": 0.6,
         });
 
-        let server = crate::decision_model::jev::fixture::ScoringServer::start(|state| {
-            if state["candidate"]["text"]
+        let server = crate::decision_model::jev::fixture::ScoringServer::start(|candidate| {
+            if candidate["text"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("ERROR")
@@ -7064,16 +7079,16 @@ mod tests {
         let _override = crate::decision_model::test_overrides::install("sk-test", &server.endpoint());
         let result = execute(request(directory.path(), "bash_find_output", input), &state);
         assert!(result.success, "{}", result.output);
-        // 40 lines → 3 coarse chunks of 16/16/8; the ERROR is on line 31, in the second, whose
-        // 3-line pieces put it in `lines 29-31`.
+        // 40 one-line records, 32 questions to a request; the ERROR record comes back on its own,
+        // numbered as the output numbers it.
         assert!(result.output.starts_with("1 hit at or above 0.600"), "{}", result.output);
         assert!(
-            result.output.contains("(3 chunks of the command output scored, 9 requests)"),
+            result.output.contains("(40 records of the command output scored, 2 requests)"),
             "{}",
             result.output
         );
         assert!(
-            result.output.contains("--- output lines 29-31 (score 1.000) ---"),
+            result.output.contains("--- output line 31 (score 1.000) ---\n    31\tERROR_disk_full"),
             "{}",
             result.output
         );
@@ -7099,8 +7114,8 @@ mod tests {
         }
         let input = json!({"query": "the sign-in page", "threshold": 0.6});
 
-        let server = crate::decision_model::jev::fixture::ScoringServer::start(|state| {
-            if state["candidate"]["text"]
+        let server = crate::decision_model::jev::fixture::ScoringServer::start(|candidate| {
+            if candidate["text"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("login")
@@ -7113,10 +7128,10 @@ mod tests {
         let _override = crate::decision_model::test_overrides::install("sk-test", &server.endpoint());
         let result = execute(request(directory.path(), "find_files", input), &state);
         assert!(result.success, "{}", result.output);
-        // Eight entries — four files and their four directories — are one group, whose eight
-        // paths are then scored one by one.
+        // Eight entries — four files and their four directories — each scored on its own, all in
+        // one request.
         assert!(
-            result.output.starts_with("1 hit at or above 0.600 for query \"the sign-in page\" (1 group of entries under . scored, 9 requests)."),
+            result.output.starts_with("1 hit at or above 0.600 for query \"the sign-in page\" (8 entries under . scored, 1 request)."),
             "{}",
             result.output
         );

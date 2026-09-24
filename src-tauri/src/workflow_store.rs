@@ -628,64 +628,6 @@ pub fn remove_conversation_runs(
     }
 }
 
-/// Duplicates one conversation's run directories under another conversation.
-///
-/// A forked conversation inherits copies of the parent's timeline cards, and a workflow card reads
-/// its step bodies from `workflows/<conversationId>/<runId>/steps/`. Without this copy the child's
-/// cards would open onto nothing, because run artifacts are addressed by the conversation that owns
-/// them, not by the card. A source with no runs is a no-op, and nothing is ever removed: the source
-/// conversation keeps driving its own runs from the same files.
-pub fn copy_conversation_runs(
-    app_data_path: &Path,
-    source_conversation_id: &str,
-    target_conversation_id: &str,
-) -> Result<(), String> {
-    validate_path_component("会话 id", source_conversation_id)?;
-    validate_path_component("会话 id", target_conversation_id)?;
-    let source = app_data_path
-        .join(RUNS_DIRECTORY)
-        .join(source_conversation_id);
-    if !source.is_dir() {
-        return Ok(());
-    }
-    let target = app_data_path
-        .join(RUNS_DIRECTORY)
-        .join(target_conversation_id);
-    copy_directory(&source, &target)
-}
-
-/// Recursively copies run content, creating the destination as it goes.
-///
-/// Only regular files and directories are copied. A symbolic link is not run content, and following
-/// one would write outside the destination tree; the driver lock is process liveness rather than
-/// content, and on Windows it may be held exclusively by a live driver, which would fail the whole
-/// copy for a file the copy does not want.
-fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
-    fs::create_dir_all(target).map_err(|error| format!("无法创建工作流运行目录：{error}"))?;
-    restrict_directory(target);
-    let entries =
-        fs::read_dir(source).map_err(|error| format!("无法读取工作流运行目录：{error}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("无法读取工作流运行目录：{error}"))?;
-        let name = entry.file_name();
-        if name == DRIVER_LOCK_FILE {
-            continue;
-        }
-        let from = entry.path();
-        let to = target.join(&name);
-        let metadata = fs::symlink_metadata(&from)
-            .map_err(|error| format!("无法检查工作流运行文件：{error}"))?;
-        if metadata.is_dir() {
-            copy_directory(&from, &to)?;
-        } else if metadata.is_file() {
-            fs::copy(&from, &to)
-                .map(|_| ())
-                .map_err(|error| format!("无法复制工作流运行文件：{error}"))?;
-        }
-    }
-    Ok(())
-}
-
 /// Finishes a save transaction by deleting runs for conversations removed by that transaction.
 ///
 /// Failures are logged and deferred to [`reap_conversation_orphans`] so a save does not fail solely
@@ -926,8 +868,6 @@ pub fn manifest_steps(entries: impl IntoIterator<Item = (usize, Value)>) -> Valu
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use serde_json::json;
 
     use super::*;
@@ -1369,70 +1309,5 @@ mod tests {
         );
         assert!(read_step_record(directory.path(), "../escape", "run1", 0).is_err());
         assert!(read_step_record(directory.path(), "conv1", "..", 0).is_err());
-    }
-
-    /// A forked conversation must be able to open the step bodies its copied cards reference, so the
-    /// whole run tree — nested directories included — arrives byte for byte, and the source keeps
-    /// driving its own runs from files the copy never touched.
-    #[test]
-    fn copying_runs_duplicates_the_whole_tree_and_leaves_the_source_intact() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = RunStore::open(directory.path(), "convsrc", "run1", b"{\"a\":1}").unwrap();
-        assert!(source.write_step(0, &json!({"status": "completed"})));
-        source.append(&JournalLine::Result {
-            key: "k1".into(),
-            agent_id: "ws1".into(),
-            result: json!(1),
-        });
-
-        copy_conversation_runs(directory.path(), "convsrc", "convchild").unwrap();
-
-        let source_run = directory
-            .path()
-            .join(RUNS_DIRECTORY)
-            .join("convsrc")
-            .join("run1");
-        let target_run = directory
-            .path()
-            .join(RUNS_DIRECTORY)
-            .join("convchild")
-            .join("run1");
-        for relative in [
-            PathBuf::from(SOURCE_FILE),
-            PathBuf::from(JOURNAL_FILE),
-            Path::new(STEPS_DIRECTORY).join("0.json"),
-        ] {
-            let copied = target_run.join(&relative);
-            assert!(copied.is_file(), "{} 必须被复制", relative.display());
-            assert_eq!(
-                fs::read(&copied).unwrap(),
-                fs::read(source_run.join(&relative)).unwrap(),
-                "{} 的内容必须逐字节相同",
-                relative.display()
-            );
-        }
-        // The child reads its inherited step through the normal address, not a special case.
-        assert_eq!(
-            read_step_record(directory.path(), "convchild", "run1", 0).unwrap(),
-            Some(json!({"status": "completed"}))
-        );
-        assert!(source_run.join(SOURCE_FILE).is_file());
-        assert_eq!(source.load_journal().result_count(), 1);
-    }
-
-    /// Forking a conversation that never ran a workflow copies nothing rather than failing, and an
-    /// identifier is validated before any path is touched.
-    #[test]
-    fn copying_runs_from_a_conversation_without_any_is_a_no_op() {
-        let directory = tempfile::tempdir().unwrap();
-        copy_conversation_runs(directory.path(), "convempty", "convchild").unwrap();
-        assert!(!directory
-            .path()
-            .join(RUNS_DIRECTORY)
-            .join("convchild")
-            .exists());
-
-        assert!(copy_conversation_runs(directory.path(), "../escape", "convchild").is_err());
-        assert!(copy_conversation_runs(directory.path(), "convempty", "..").is_err());
     }
 }

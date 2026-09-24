@@ -1,5 +1,5 @@
 import { getI18nSnapshot, translate } from "../i18n";
-import type { ContextItem, Conversation, ToolContext } from "../types";
+import type { ContextItem, Conversation } from "../types";
 import { canonicalJson } from "./contextTokens";
 import { isEncryptedReasoning } from "./modelCapabilities";
 import type { ModelRunState, StreamingHookState, StreamingToolState } from "./modelStream";
@@ -37,7 +37,7 @@ export function reasoningSegmentContextId(
   return segment === 0 ? base : `${base}_${segment}`;
 }
 
-export function hookContextId(requestId: string, executionId: string, purpose: "display" | "injection", index = 0): string {
+function hookContextId(requestId: string, executionId: string, purpose: "display" | "injection", index = 0): string {
   return `ctx_hook_${requestId}_${executionId}_${purpose}_${index}`;
 }
 

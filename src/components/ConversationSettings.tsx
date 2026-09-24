@@ -4,6 +4,7 @@ import {
   Box,
   FileText,
   FolderCog,
+  ShieldCheck,
   SlidersHorizontal
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -12,7 +13,7 @@ import {
   captureConversationPresetSettings,
   implicitConversationPreset
 } from "../lib/conversationPresets";
-import { normalizeRememberedDecisionForms } from "../lib/decisionParameters";
+import { normalizeRememberedDecisionForms, normalizeRememberedToolFamilies } from "../lib/decisionParameters";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
 import type {
@@ -36,6 +37,7 @@ import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/w
 import { toolLockOf } from "../lib/toolLock";
 import { ConversationTemplateEditor } from "./ConversationTemplateEditor";
 import { FeaturesPage } from "./FeaturesPage";
+import { SandboxSettings } from "./SandboxSettings";
 import {
   AgentRolesPage,
   CapabilitySelectionPage,
@@ -52,8 +54,9 @@ import "./ConversationSettings.css";
  * picker and the switches derived from it. The others each own one kind of thing
  * the conversation composes with, so a page is never a mixed bag.
  */
-export type ConversationSettingsView =
+type ConversationSettingsView =
   | "features"
+  | "sandbox"
   | "skills"
   | "mcp"
   | "hooks"
@@ -74,6 +77,7 @@ export type ConversationSettingsMode = "conversation" | "preset";
 
 const NAVIGATION: Array<{ id: ConversationSettingsView; icon: typeof SlidersHorizontal }> = [
   { id: "features", icon: SlidersHorizontal },
+  { id: "sandbox", icon: ShieldCheck },
   { id: "skills", icon: Box },
   { id: "mcp", icon: Blocks },
   { id: "hooks", icon: FolderCog },
@@ -357,6 +361,7 @@ export function ConversationSettings({
 
   const pageTitles: Record<ConversationSettingsView, string> = {
     features: t("功能", "Features"),
+    sandbox: t("沙箱", "Sandbox"),
     skills: t("技能", "Skills"),
     mcp: "MCP",
     hooks: t("钩子", "Hooks"),
@@ -367,6 +372,7 @@ export function ConversationSettings({
   /** The count each row trails, so the nav says what the conversation carries. */
   const pageCounts: Record<ConversationSettingsView, number | null> = {
     features: null,
+    sandbox: null,
     skills: settings.skillIds.length,
     mcp: settings.mcpIds.length,
     hooks: settings.hookIds.length,
@@ -379,6 +385,15 @@ export function ConversationSettings({
       "本对话给模型的工具面，以及由开关派生的那几件事。",
       "The tool surface this conversation hands the model, and the things derived from switches."
     ),
+    sandbox: editingPreset
+      ? t(
+        "套用这份预设的对话，命令是否在操作系统的沙箱里运行。沙箱以对话为单位：每个对话在它用到的每台机器上各有一个沙箱进程，按“命令里的代码可能是恶意的”来设防。",
+        "Whether the commands of a conversation this preset is applied to run in the operating system's sandbox. A sandbox is drawn around one conversation: each has one sandboxed process on every machine it uses, set up on the assumption that the code its commands run may be hostile."
+      )
+      : t(
+        "本对话的命令是否在操作系统的沙箱里运行。沙箱以对话为单位：本对话在它用到的每台机器上各有一个沙箱进程，与其他对话互不影响，按“命令里的代码可能是恶意的”来设防。",
+        "Whether this conversation's commands run in the operating system's sandbox. A sandbox is drawn around one conversation: this one has one sandboxed process on every machine it uses, apart from every other conversation's, set up on the assumption that the code its commands run may be hostile."
+      ),
     skills: t(
       "技能从 ~/.mework/skills/ 与工作区的 .mework/skills/ 扫描而来；这里挑给本对话用的，并决定正文怎么送到模型面前。",
       "Skills are scanned from ~/.mework/skills/ and the workspace's .mework/skills/. Pick which ones this conversation uses, and how their bodies reach the model."
@@ -477,6 +492,7 @@ export function ConversationSettings({
                   lockedDecisionParameterModes: lock.decisionParameterModes,
                   decisionMissScoring: settings.decisionMissScoring ?? [],
                   rememberedDecisionForms: normalizeRememberedDecisionForms(settings.rememberedDecisionForms),
+                  rememberedToolFamilies: normalizeRememberedToolFamilies(settings.rememberedToolFamilies),
                   onToolSettingsChange: update
                 }}
                 pickerSummary={t(
@@ -519,6 +535,13 @@ export function ConversationSettings({
                   onChange: (toolDescriptionFileId) => update({ toolDescriptionFileId })
                 }}
                 lockedHint={lockedHint}
+              />
+            )}
+
+            {view === "sandbox" && (
+              <SandboxSettings
+                settings={settings.sandbox}
+                onChange={(sandbox) => update({ sandbox })}
               />
             )}
 

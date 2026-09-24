@@ -140,6 +140,116 @@
   height: 14px;
 }
 
+/* A file sits in the strip at a picture's height, wider, because its name is what identifies it. */
+.image-strip__item--file {
+  width: 184px;
+}
+
+.image-strip__item--file.image-strip__item--compact {
+  width: 172px;
+}
+
+.image-strip__file {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 10px 12px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.image-strip__file:hover {
+  background: var(--hover);
+}
+
+.image-strip__item--compact .image-strip__file {
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 9px;
+  padding: 6px 28px 6px 9px;
+}
+
+.image-strip__file-icon {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--muted);
+}
+
+.image-strip__file-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.image-strip__item--compact .image-strip__file-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: var(--panel);
+}
+
+.image-strip__item--compact .image-strip__file-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.image-strip__file-text {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.image-strip__file-name {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.image-strip__item--compact .image-strip__file-name {
+  display: block;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11.5px;
+}
+
+.image-strip__file-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.image-strip__file-type {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--text);
+  background: var(--panel);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: .02em;
+}
+
+.image-strip__item--pending {
+  display: grid;
+  place-items: center;
+}
+
 .image-viewer {
   position: fixed;
   z-index: 1400;

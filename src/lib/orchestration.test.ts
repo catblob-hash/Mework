@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ASK_USER_PENDING_OUTPUT } from "../types";
+import { ASK_USER_PENDING_OUTPUT } from "../test/fixtures";
 import type { ContextItem, JsonObject, ToolContext } from "../types";
 import {
   answersFromFormattedContent,
@@ -7,7 +7,6 @@ import {
   findPendingQuestion,
   formatQuestionAnswers,
   isClaudeQuestionInput,
-  isOrchestrationToolName,
   isTaskUpdateFor,
   parseWaitOutput,
   questionsFromInput,
@@ -76,15 +75,6 @@ function taskUpdate(
     ...overrides
   });
 }
-
-describe("isOrchestrationToolName", () => {
-  it("recognizes todo protocol calls without classifying ordinary tools", () => {
-    expect(isOrchestrationToolName("todo")).toBe(true);
-    expect(isOrchestrationToolName("task_wait")).toBe(true);
-    expect(isOrchestrationToolName("box")).toBe(true);
-    expect(isOrchestrationToolName("read")).toBe(false);
-  });
-});
 
 describe("findPendingQuestion", () => {
   it("returns the trailing pending ask_user call with question and options parsed from its input", () => {

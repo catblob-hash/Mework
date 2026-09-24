@@ -45,25 +45,25 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const CONFIG_DIRECTORY = ".mework";
-export const SKILLS_DIRECTORY = "skills";
-export const SKILL_MANIFEST = "SKILL.md";
-export const HOOKS_FILE = "hooks.json";
-export const MCP_FILE = "mcp.json";
+const CONFIG_DIRECTORY = ".mework";
+const SKILLS_DIRECTORY = "skills";
+const SKILL_MANIFEST = "SKILL.md";
+const HOOKS_FILE = "hooks.json";
+const MCP_FILE = "mcp.json";
 /** Suffix of the one backup per replaced file, written only on the first run. */
-export const BACKUP_SUFFIX = ".before-fixtures";
+const BACKUP_SUFFIX = ".before-fixtures";
 /** Marks an `mcpServers` key this script owns, so a re-run replaces exactly it. */
-export const FIXTURE_SERVER_PREFIX = "fixture_";
+const FIXTURE_SERVER_PREFIX = "fixture_";
 /** Marks a skill directory this script owns. */
-export const FIXTURE_SKILL_PREFIX = "fixture-";
+const FIXTURE_SKILL_PREFIX = "fixture-";
 /** Any hook handler whose `name` starts with this is replaced on a re-run. */
-export const FIXTURE_HOOK_NAME_PREFIX = "fixture";
+const FIXTURE_HOOK_NAME_PREFIX = "fixture";
 
 // ---- Hooks: <level>/.mework/hooks.json --------------------------------------
 
 export const WORKSPACE_HOOK_EVENT = "PostToolUse";
 /** Both the global and the project hook only care about the local shell tools. */
-export const SHELL_HOOK_MATCHER = "^(powershell|bash)$";
+const SHELL_HOOK_MATCHER = "^(powershell|bash)$";
 
 // On Windows the host runs a hook command through PowerShell, so these are
 // PowerShell one-liners. They only print, because a hook that changed anything
@@ -433,7 +433,7 @@ function levelPaths(base) {
 
 // ---- Argument parsing -------------------------------------------------------
 
-export const USAGE = [
+const USAGE = [
   "用法：node scripts/seed-local-capability-fixtures.mjs [--workspace <path>] [--remove] [--help]",
   "",
   "  （无参数）           写入全局夹具：~/.mework/{hooks.json, skills/fixture-*, mcp.json}",

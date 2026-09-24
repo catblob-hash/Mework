@@ -223,6 +223,13 @@ function renderContentPart(part: Record<string, unknown>, names: string[]): stri
     // provider received; say so rather than letting a reader assume a leak.
     return `[image ${text(part.mediaType)} · attachment reference, bytes not recorded]\n${pretty(part.image)}`;
   }
+  if (type === "mework-file") {
+    names.push("file");
+    // Like an image, a file is recorded as its reference; the text the model
+    // read is inlined only on the way out, so the ledger never holds it.
+    const file = asRecord(part.file);
+    return `[file ${text(file?.name)} · attachment reference, text not recorded]\n${pretty(part.file)}`;
+  }
   return pretty(part);
 }
 
@@ -693,10 +700,8 @@ const WIRE_FIELD_ORDER = [
   "systemDynamic",
   "messages",
   "tools",
-  "toolChoice",
   "maxSteps",
   "maxOutputTokens",
-  "temperature",
   "reasoning",
   "reasoningContent",
   "promptCache",

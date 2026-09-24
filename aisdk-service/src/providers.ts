@@ -29,7 +29,7 @@ import { codexDialectFetch } from "./codex-dialect.js";
 import type { ProviderFamily } from "./protocol.js";
 import { plaintextReasoningFetch } from "./responses-dialect.js";
 
-export interface ProviderTarget {
+interface ProviderTarget {
   family: ProviderFamily;
   /** Host-computed base URL. Omission uses the provider default; Vertex and Bedrock
    * derive endpoints from `settings` project, location, or region values. */
@@ -50,7 +50,7 @@ export interface ProviderTarget {
 
 /** Provider instance and language model used by this request. `provider` supplies
  * native tool factories to `search.ts`. */
-export interface ResolvedModel {
+interface ResolvedModel {
   model: LanguageModel;
   /** Host object for native tool factories; `undefined` means no provider-defined tools. */
   provider: unknown;

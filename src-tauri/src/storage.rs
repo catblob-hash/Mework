@@ -10,6 +10,7 @@ use chrono::Utc;
 
 use crate::{
     catalog::default_document,
+    file_attachments::validate_file_list,
     image_attachments::validate_image_list,
     model::{
         AgentDefinition, AgentDefinitionBinding, AgentDefinitionMemory, AgentDefinitionSource,
@@ -71,6 +72,7 @@ pub fn load_or_initialize(path: &Path) -> Result<AppDocument, String> {
             }
         }
         seed_builtin_capabilities(path, &mut document);
+        seed_local_shell(&mut document);
         seed_conversations(&store, &document)?;
         seed_preset_templates(&store, &document)?;
         save_unchecked(path, &document)?;
@@ -120,6 +122,42 @@ fn apply_builtin_capability_selection(
         }
         preset.settings.skill_ids = selection.skill_ids.clone();
         preset.settings.mcp_ids = selection.mcp_ids.clone();
+    }
+}
+
+/// Gives the shipped presets this machine's most preferred shell and no other.
+///
+/// The seed lists every backend's command tool, because which of them this
+/// machine has is a question only a probe can answer, and the first launch is
+/// the first moment there is a machine to ask. Looking a few names up on
+/// `PATH` is cheap enough to do inline, and it does not wait for
+/// [`crate::machine_shells::install`], which the startup path runs later.
+fn seed_local_shell(document: &mut AppDocument) {
+    let local = crate::machine_shells::probe_local();
+    apply_seeded_shell(document, local.os, &local.backends());
+}
+
+/// Narrows every shipped preset's shell command tools to the first backend in
+/// `os`'s priority order that `available` has. A machine where the probe found
+/// none still gets its OS's first: the tool list hides a shell the machine
+/// lacks, and the user's own install can supply it later.
+fn apply_seeded_shell(
+    document: &mut AppDocument,
+    os: crate::shell_backend::MachineOs,
+    available: &[crate::shell_backend::ShellBackend],
+) {
+    let chosen = crate::shell_backend::preferred_backend(os, available)
+        .or_else(|| crate::shell_backend::backends_for(os).first().copied());
+    for preset in &mut document.presets.conversation_presets {
+        if crate::catalog::seeded_template_id(&preset.id).is_empty() {
+            continue;
+        }
+        preset.settings.enabled_tools.retain(|name| {
+            match crate::shell_backend::ShellBackend::of_command_tool(name) {
+                Some(backend) => Some(backend) == chosen,
+                None => true,
+            }
+        });
     }
 }
 
@@ -288,6 +326,7 @@ pub fn load_or_recover(path: &Path) -> Result<AppDocument, String> {
         }
     }
     seed_builtin_capabilities(path, &mut document);
+    seed_local_shell(&mut document);
     let store = crate::conversation_store::store_for(path)?;
     seed_conversations(&store, &document)?;
     seed_preset_templates(&store, &document)?;
@@ -1921,14 +1960,21 @@ fn validate_conversation_shape(
         if message.id.len() > 128 {
             return Err(format!("对话 {} 的排队消息 ID 过长", conversation.id));
         }
-        if message.content.trim().is_empty() && message.images.is_empty() {
+        if message.content.trim().is_empty()
+            && message.images.is_empty()
+            && message.files.is_empty()
+        {
             return Err(format!(
-                "对话 {} 的排队消息文字与图片不能同时为空",
+                "对话 {} 的排队消息文字、图片与文件不能同时为空",
                 conversation.id
             ));
         }
         validate_image_list(
             &message.images,
+            &format!("对话 {} 的排队消息 {}", conversation.id, message.id),
+        )?;
+        validate_file_list(
+            &message.files,
             &format!("对话 {} 的排队消息 {}", conversation.id, message.id),
         )?;
         if message.content.chars().count() > 100_000 {
@@ -2617,65 +2663,6 @@ fn validate_execution_environments(
             ));
         }
     }
-    // The sandbox's lists reach every machine's agent; bounded so a document
-    // cannot make every command carry an unbounded policy.
-    const MAX_SANDBOX_ENTRIES: usize = 256;
-    let sandbox = &assets.sandbox;
-    for (label, entries) in [
-        ("沙箱网络白名单", &sandbox.network.allow),
-        ("沙箱网络黑名单", &sandbox.network.deny),
-        ("沙箱可写目录", &sandbox.writable),
-        ("沙箱禁读路径", &sandbox.deny_read),
-    ] {
-        if entries.len() > MAX_SANDBOX_ENTRIES {
-            return Err(format!("{label}不能超过 {MAX_SANDBOX_ENTRIES} 条"));
-        }
-        for entry in entries {
-            let entry = entry.trim();
-            if entry.is_empty() || entry.chars().count() > MAX_PATH_FIELD_CHARS {
-                return Err(format!("{label}的条目不能为空或过长"));
-            }
-            if entry.chars().any(char::is_control) {
-                return Err(format!("{label}的条目不能包含控制字符"));
-            }
-        }
-    }
-    for (label, entries) in [("沙箱可写目录", &sandbox.writable), ("沙箱禁读路径", &sandbox.deny_read)] {
-        for entry in entries {
-            let entry = entry.trim();
-            let absolute = entry.starts_with('/')
-                || entry.starts_with('~')
-                || (entry.len() >= 3 && entry.as_bytes()[1] == b':' && entry.as_bytes()[0].is_ascii_alphabetic());
-            if !absolute {
-                return Err(format!("{label} {entry} 必须是绝对路径或以 ~ 开头"));
-            }
-        }
-    }
-    for pattern in sandbox.network.allow.iter().chain(&sandbox.network.deny) {
-        if pattern.trim().chars().any(|c| c.is_whitespace() || c == '/') {
-            return Err(format!("沙箱网络规则 {pattern} 应是主机名（可带 :端口），不能是网址"));
-        }
-    }
-    // Each OS's priority list ranks that OS's registered backends, each once.
-    for os in crate::shell_backend::MachineOs::ALL {
-        let listed = assets.shell_priority.listed(os);
-        for (position, backend) in listed.iter().enumerate() {
-            if !crate::shell_backend::is_registered(os, *backend) {
-                return Err(format!(
-                    "{} 的 shell 优先级表不能包含 {}",
-                    os.display_name(),
-                    backend.display_name()
-                ));
-            }
-            if listed[..position].contains(backend) {
-                return Err(format!(
-                    "{} 的 shell 优先级表重复列出了 {}",
-                    os.display_name(),
-                    backend.display_name()
-                ));
-            }
-        }
-    }
     Ok(())
 }
 
@@ -2844,6 +2831,54 @@ fn validate_capability_ids(label: &str, kind: &str, ids: &[String]) -> Result<()
 /**
  * Validates shared conversation settings used by conversations, workspace snapshots, and template presets.
  */
+/// A conversation's or a preset's sandbox. Its lists reach every machine's
+/// agent with every command, so they are bounded.
+fn validate_sandbox_settings(
+    owner: &str,
+    sandbox: &crate::model::SandboxSettings,
+) -> Result<(), String> {
+    const MAX_SANDBOX_ENTRIES: usize = 256;
+    const MAX_PATH_FIELD_CHARS: usize = 4096;
+    for (label, entries) in [
+        ("沙箱网络白名单", &sandbox.network.allow),
+        ("沙箱网络黑名单", &sandbox.network.deny),
+        ("沙箱可写目录", &sandbox.writable),
+        ("沙箱禁读路径", &sandbox.deny_read),
+    ] {
+        if entries.len() > MAX_SANDBOX_ENTRIES {
+            return Err(format!("{owner}的{label}不能超过 {MAX_SANDBOX_ENTRIES} 条"));
+        }
+        for entry in entries {
+            let entry = entry.trim();
+            if entry.is_empty() || entry.chars().count() > MAX_PATH_FIELD_CHARS {
+                return Err(format!("{owner}的{label}的条目不能为空或过长"));
+            }
+            if entry.chars().any(char::is_control) {
+                return Err(format!("{owner}的{label}的条目不能包含控制字符"));
+            }
+        }
+    }
+    for (label, entries) in [("沙箱可写目录", &sandbox.writable), ("沙箱禁读路径", &sandbox.deny_read)] {
+        for entry in entries {
+            let entry = entry.trim();
+            let absolute = entry.starts_with('/')
+                || entry.starts_with('~')
+                || (entry.len() >= 3 && entry.as_bytes()[1] == b':' && entry.as_bytes()[0].is_ascii_alphabetic());
+            if !absolute {
+                return Err(format!("{owner}的{label} {entry} 必须是绝对路径或以 ~ 开头"));
+            }
+        }
+    }
+    for pattern in sandbox.network.allow.iter().chain(&sandbox.network.deny) {
+        if pattern.trim().chars().any(|c| c.is_whitespace() || c == '/') {
+            return Err(format!(
+                "{owner}的沙箱网络规则 {pattern} 应是主机名（可带 :端口），不能是网址"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_conversation_settings_shape(
     label: &str,
     settings: &ConversationSettings,
@@ -2868,6 +2903,16 @@ fn validate_conversation_settings_shape(
     }
     // Document validation does not bind external selections to assets; runtime execution fails closed.
     validate_conversation_web_search(label, &settings.web_search)?;
+    validate_sandbox_settings(label, &settings.sandbox)?;
+    // Renderer state the host never reads, bounded so it cannot grow without limit.
+    if settings.remembered_tool_families.len() > 8
+        || settings
+            .remembered_tool_families
+            .values()
+            .any(|rows| rows.len() > 64 || rows.iter().any(|row| row.chars().count() > 128))
+    {
+        return Err(format!("{label}记住的工具组过多或过长"));
+    }
     Ok(())
 }
 
@@ -2895,6 +2940,7 @@ fn validate_conversation_preset_settings(
     }
     // Preset web-search settings use the same numeric bounds as conversation settings.
     validate_conversation_web_search(label, &settings.web_search)?;
+    validate_sandbox_settings(label, &settings.sandbox)?;
     Ok(())
 }
 
@@ -3153,12 +3199,14 @@ fn validate_context_scope<'a>(
                 id,
                 content,
                 images,
+                files,
                 ..
             } => {
-                if content.trim().is_empty() && images.is_empty() {
-                    return Err(format!("用户上下文 {id} 的文字与图片不能同时为空"));
+                if content.trim().is_empty() && images.is_empty() && files.is_empty() {
+                    return Err(format!("用户上下文 {id} 的文字、图片与文件不能同时为空"));
                 }
                 validate_image_list(images, &format!("用户上下文 {id}"))?;
+                validate_file_list(files, &format!("用户上下文 {id}"))?;
             }
             ContextItem::Tool { id, result, .. } => {
                 validate_image_list(&result.images, &format!("工具上下文 {id}"))?;
@@ -4480,6 +4528,7 @@ mod tests {
             id: id.into(),
             content: format!("message from {id}"),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
     }
@@ -5067,12 +5116,14 @@ b"
             id: "image-only-user".into(),
             content: String::new(),
             images: vec![image.clone()],
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         });
         conversation.queued_messages.push(QueuedMessage {
             id: "image-only-queued".into(),
             content: String::new(),
             images: vec![image],
+            files: Vec::new(),
             created_at: "2026-07-24T00:00:01Z".into(),
         });
         assert!(validate_shape(&document).is_ok());
@@ -5097,6 +5148,69 @@ b"
         assert!(validate_shape(&forged)
             .unwrap_err()
             .contains("has an invalid image attachment"));
+    }
+
+    #[test]
+    fn file_only_messages_persist_and_invalid_file_lists_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = crate::model::FileAttachment {
+            id: "c".repeat(64),
+            name: "notes.md".into(),
+            format: crate::model::FileAttachmentFormat::Text,
+            bytes: 12,
+            tokens: 3,
+            pages: None,
+        };
+        let mut document = default_document();
+        let conversation = &mut document.workspaces[0].conversations[0];
+        conversation.contexts.push(ContextItem::User {
+            id: "file-only-user".into(),
+            content: String::new(),
+            images: Vec::new(),
+            files: vec![file.clone()],
+            created_at: "2026-07-24T00:00:00Z".into(),
+        });
+        conversation.queued_messages.push(QueuedMessage {
+            id: "file-only-queued".into(),
+            content: String::new(),
+            images: Vec::new(),
+            files: vec![file.clone()],
+            created_at: "2026-07-24T00:00:01Z".into(),
+        });
+        assert!(validate_shape(&document).is_ok());
+        let path = directory.path().join("document.json");
+        save_all(&path, &document).unwrap();
+        assert_eq!(read_document(&path).unwrap(), document);
+
+        let mut duplicated = document.clone();
+        let ContextItem::User { files, .. } = duplicated.workspaces[0].conversations[0]
+            .contexts
+            .last_mut()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        files.push(file.clone());
+        let error = validate_shape(&duplicated).unwrap_err();
+        assert!(error.contains("用户上下文 file-only-user"), "{error}");
+
+        let mut forged_queue = document;
+        forged_queue.workspaces[0].conversations[0].queued_messages[0].files[0].bytes = 0;
+        let error = validate_shape(&forged_queue).unwrap_err();
+        assert!(error.contains("排队消息 file-only-queued"), "{error}");
+        assert!(error.contains("invalid file attachment"), "{error}");
+
+        let mut empty = default_document();
+        empty.workspaces[0].conversations[0]
+            .queued_messages
+            .push(QueuedMessage {
+                id: "empty-queued".into(),
+                content: "  ".into(),
+                images: Vec::new(),
+                files: Vec::new(),
+                created_at: "2026-07-24T00:00:01Z".into(),
+            });
+        assert!(validate_shape(&empty).unwrap_err().contains("不能同时为空"));
     }
 
     #[test]
@@ -5130,6 +5244,7 @@ b"
                 id: "aggregate-user-exact".into(),
                 content: String::new(),
                 images: exact_limit.clone(),
+                files: Vec::new(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             });
         assert!(validate_shape(&exact).is_ok());
@@ -5150,6 +5265,7 @@ b"
                         )
                     })
                     .collect(),
+                files: Vec::new(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             });
         let error = validate_shape(&oversized_user).unwrap_err();
@@ -5163,6 +5279,7 @@ b"
                 id: "aggregate-queue-pixels".into(),
                 content: String::new(),
                 images: (0..5).map(|index| image(index, 1, 4096, 4096)).collect(),
+                files: Vec::new(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             });
         let error = validate_shape(&oversized_queue).unwrap_err();
@@ -5387,6 +5504,67 @@ b"
         assert!(serialized.get("localPreset").is_none());
     }
 
+    /// The first launch keeps one shell in each shipped preset: the first of
+    /// the machine's OS order that its probe found. Any other preset is the
+    /// user's and is left alone.
+    #[test]
+    fn first_launch_keeps_the_machines_most_preferred_shell_in_shipped_presets() {
+        use crate::shell_backend::{MachineOs, ShellBackend};
+        let shells = |document: &AppDocument, preset_id: &str| -> Vec<String> {
+            document
+                .presets
+                .conversation_presets
+                .iter()
+                .find(|preset| preset.id == preset_id)
+                .unwrap()
+                .settings
+                .enabled_tools
+                .iter()
+                .filter(|name| ShellBackend::of_command_tool(name).is_some())
+                .cloned()
+                .collect()
+        };
+        let product = crate::catalog::product_default_document();
+        let mut custom = product.presets.conversation_presets[0].clone();
+        custom.id = "preset_custom".into();
+
+        let mut mac = product.clone();
+        mac.presets.conversation_presets.push(custom);
+        let before = mac.presets.conversation_presets[0].settings.enabled_tools.len();
+        apply_seeded_shell(&mut mac, MachineOs::Macos, &[ShellBackend::Sh, ShellBackend::Bash]);
+        for preset_id in [
+            crate::catalog::CODEX_PRESET_ID,
+            crate::catalog::CLAUDE_CODE_PRESET_ID,
+        ] {
+            assert_eq!(shells(&mac, preset_id), vec!["bash"]);
+        }
+        let seeded = shells(&product, crate::catalog::CODEX_PRESET_ID);
+        assert_eq!(seeded.len(), 4, "the seed lists every backend's command tool");
+        assert_eq!(shells(&mac, "preset_custom"), seeded);
+        // Only shell tools leave the list.
+        assert_eq!(
+            mac.presets.conversation_presets[0].settings.enabled_tools.len(),
+            before - seeded.len() + 1
+        );
+
+        let mut windows = product.clone();
+        apply_seeded_shell(
+            &mut windows,
+            MachineOs::Windows,
+            &[ShellBackend::Bash, ShellBackend::PowerShell],
+        );
+        assert_eq!(shells(&windows, crate::catalog::CLAUDE_CODE_PRESET_ID), vec!["powershell"]);
+
+        let mut linux = product.clone();
+        apply_seeded_shell(&mut linux, MachineOs::Linux, &[ShellBackend::Zsh, ShellBackend::Sh]);
+        assert_eq!(shells(&linux, crate::catalog::CLAUDE_CODE_PRESET_ID), vec!["zsh"]);
+
+        // A probe that found nothing still leaves the OS's first shell.
+        let mut bare = product;
+        apply_seeded_shell(&mut bare, MachineOs::Macos, &[]);
+        assert_eq!(shells(&bare, crate::catalog::CLAUDE_CODE_PRESET_ID), vec!["zsh"]);
+    }
+
     /// Each shipped preset opens with a system prompt, and it is seeded as a
     /// template body in the conversation store rather than carried in the
     /// document — `ConversationPresetSettings` has no prompt field, and a
@@ -5590,8 +5768,8 @@ b"
                 .map(|model| model.id.as_str())
         );
 
-        // Everything on except the names the host derives for itself, and
-        // except the two surfaces a shipped preset withholds on purpose.
+        // Everything on except the names the host derives for itself and the
+        // decision-model tools. The preview tools and `workflow` are on too.
         for preset in &restored.presets.conversation_presets {
             assert!(!preset.settings.allow_roleless_subagents);
             assert_eq!(preset.settings.agent_definitions.len(), 3);
@@ -5601,9 +5779,7 @@ b"
                     || crate::plan_mode::is_plan_mode_tool_name(name)
                     || name == crate::capabilities::SKILL_TOOL
                     || name == crate::capabilities::TOOL_SEARCH_TOOL
-                    || name.starts_with("preview_")
                     || crate::decision_tools::is_decision_tool_name(name)
-                    || name == crate::workflow::WORKFLOW_TOOL
             };
             let enabled = &preset.settings.enabled_tools;
             assert!(enabled.iter().all(|name| !withheld(name)));
@@ -5613,6 +5789,19 @@ b"
                 .filter(|tool| withheld(&tool.name))
                 .count();
             assert_eq!(enabled.len(), restored.tools.len() - withheld_count);
+            assert!(enabled.iter().any(|name| name == "preview_start"));
+            assert!(enabled
+                .iter()
+                .any(|name| name == crate::workflow::WORKFLOW_TOOL));
+            // The memory tools come from the two switches, which are on.
+            assert!(preset.settings.global_memory_enabled);
+            assert!(preset.settings.project_memory_enabled);
+            // Every role follows the preset's list rather than keeping its own.
+            assert!(preset
+                .settings
+                .agent_definitions
+                .iter()
+                .all(|role| role.tools.is_none()));
 
             // Both capability surfaces load on demand rather than inlining
             // every body and schema into the system prompt.
@@ -6169,6 +6358,7 @@ b"
             id: moved.contexts[0].id().to_owned(),
             content: "duplicate".into(),
             images: Vec::new(),
+            files: Vec::new(),
             created_at: "2099-08-24T00:00:00.000Z".into(),
         });
         changed.workspaces[target_index].conversations.push(moved);

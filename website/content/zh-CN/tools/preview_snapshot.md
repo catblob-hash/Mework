@@ -12,7 +12,7 @@
 
 ## 决策模型参数
 
-在对话设置的预览工具窗口里为它打开决策模型选项后，它多出 `query` 与 `threshold`：页面的元素行切成段交给 TypeSafe Jev 决策模型打分，只返回分数不低于 `threshold` 的元素，每个都附上能直接交给 [preview_click](preview_click.html)、[preview_fill](preview_fill.html)、[preview_inspect](preview_inspect.html) 的 CSS 选择器，而不是整份快照。**加上决策模型参数**保留整份快照；**只用决策模型**要求每次都带这两个参数。元素行会发送到 TypeSafe 的 API，需要先在「全局设置 → 决策模型提供商」里填好密钥。
+在对话设置的预览工具窗口里为它打开决策模型选项后，它多出 `query` 与 `threshold`：页面的每一个元素行都由 TypeSafe Jev 决策模型单独打分、许多行共用一次请求，只返回分数不低于 `threshold` 的元素，每个都附上能直接交给 [preview_click](preview_click.html)、[preview_fill](preview_fill.html)、[preview_inspect](preview_inspect.html) 的 CSS 选择器，而不是整份快照。**加上决策模型参数**保留整份快照；**只用决策模型**要求每次都带这两个参数。元素行会发送到 TypeSafe 的 API，需要先在「全局设置 → 决策模型提供商」里填好密钥。
 
 ## 相关
 

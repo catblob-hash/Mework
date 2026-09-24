@@ -27,7 +27,7 @@ import {
   resolveLeaseDirectory,
   tryAcquireWorkspaceLease,
   updateWorkspaceLease,
-  workspaceMutexListenCandidates,
+  workspaceMutexEndpoint,
   workspaceLeaseDirectoryExists
 } from "../workspace-coordinator.mjs";
 import {
@@ -178,28 +178,27 @@ test("the OS mutex endpoint is deterministic across workspace aliases", () => {
   const aliasParent = temporaryWorkspace();
   const aliasRoot = path.join(aliasParent, "workspace-alias");
   symlinkSync(workspaceRoot, aliasRoot, "junction");
-  const directCandidates = workspaceMutexListenCandidates(
+  const directEndpoint = workspaceMutexEndpoint(
     workspaceRoot,
     resolveLeaseDirectory(workspaceRoot, "browser-dev")
   );
-  const aliasCandidates = workspaceMutexListenCandidates(
+  const aliasEndpoint = workspaceMutexEndpoint(
     aliasRoot,
     resolveLeaseDirectory(aliasRoot, "browser-dev")
   );
-  assert.deepEqual(aliasCandidates, directCandidates);
-  assert.equal(directCandidates.length, 1);
+  assert.deepEqual(aliasEndpoint, directEndpoint);
   if (process.platform === "darwin") {
-    assert.equal(directCandidates[0].lockFile, true);
+    assert.equal(directEndpoint.lockFile, true);
     assert.equal(
-      path.dirname(directCandidates[0].path),
+      path.dirname(directEndpoint.path),
       path.join(realpathSync.native(workspaceRoot), ".codex-tmp")
     );
     return;
   }
   assert.equal(
     process.platform === "win32"
-      ? directCandidates[0].path.startsWith("\\\\.\\pipe\\")
-      : directCandidates[0].path.startsWith("\0"),
+      ? directEndpoint.path.startsWith("\\\\.\\pipe\\")
+      : directEndpoint.path.startsWith("\0"),
     true
   );
 });

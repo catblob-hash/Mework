@@ -2,7 +2,8 @@
 //!
 //! This module creates a provider-neutral step description for the sidecar's AI
 //! SDK translation. Host policy remains here: normalized addresses and stored
-//! credentials, image admission checks, and the single native-search gate.
+//! credentials, image admission checks, file attachment hydration, and the
+//! single native-search gate.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,11 +11,12 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::api::Exchange;
+use crate::file_attachments::{FileAttachmentStore, FILE_PART_TYPE};
 use crate::image_attachments::{
     hydrate_ai_sdk_images, ImageAttachmentStore, MAX_REQUEST_IMAGES, MAX_REQUEST_IMAGE_BYTES,
     MAX_REQUEST_IMAGE_PIXELS,
 };
-use crate::model::{ContextItem, ReasoningContent, RunModelRequest};
+use crate::model::{ContextItem, FileAttachment, ReasoningContent, RunModelRequest};
 use crate::wire_ledger::{
     WireAudit, PART_MESSAGE, PART_SYSTEM, PART_SYSTEM_DYNAMIC, PART_TOOLS,
 };
@@ -106,14 +108,14 @@ pub(crate) fn system_prompt_parts(request: &RunModelRequest) -> (Option<String>,
 /// standing in for the first is not a shorthand — it is the only tool that reads
 /// `.mework/launch.json` and brings a server up, so without it step 1 of the
 /// workflow the section teaches cannot be performed. The second is that file's
-/// own `autoVerify`, which the pane's toggle writes; a project with no usable
-/// launch.json has neither a server to start nor anywhere to record the
-/// preference, and answers `false` for both reasons at once.
+/// own `autoVerify`; a project with no usable launch.json has neither a server
+/// to start nor anywhere to record the preference, and answers `false` for both
+/// reasons at once.
 ///
 /// Read per step, alongside the plan-mode and web-safety sections, rather than
-/// frozen into the run's stable prompt: the toggle is a live control, and a user
-/// who turns it off must stop receiving the section on the next step instead of
-/// at the next turn.
+/// frozen into the run's stable prompt: the file can change mid-run, and a
+/// project that turns `autoVerify` off must stop receiving the section on the
+/// next step instead of at the next turn.
 fn preview_verification_applies(request: &RunModelRequest) -> bool {
     if !enabled_tools(request)
         .iter()
@@ -299,6 +301,75 @@ fn hydrate_images(request: &RunModelRequest, messages: Vec<Value>) -> Result<Vec
     hydrate_ai_sdk_images(&messages, &store)
 }
 
+/// Replace file attachment placeholders with the files' text.
+///
+/// Runs after the wire-ledger copy is taken, so the ledger keeps the
+/// placeholder, and before the frame budget is measured, so the budget sees
+/// what is actually sent. Only `mework-file` parts directly in a user
+/// message's content are recognized, for the same reason image slots are:
+/// tool input and continuation blocks are model-controlled JSON.
+fn hydrate_files(request: &RunModelRequest, messages: Vec<Value>) -> Result<Vec<Value>, String> {
+    hydrate_file_parts(
+        messages,
+        &FileAttachmentStore::new(Path::new(&request.app_data_path)),
+    )
+}
+
+fn hydrate_file_parts(
+    mut messages: Vec<Value>,
+    store: &FileAttachmentStore,
+) -> Result<Vec<Value>, String> {
+    for message in &mut messages {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut hydrated = false;
+        for part in parts.iter_mut() {
+            if part.get("type").and_then(Value::as_str) != Some(FILE_PART_TYPE) {
+                continue;
+            }
+            let file: FileAttachment = part
+                .get("file")
+                .cloned()
+                .ok_or_else(|| "附件占位缺少文件信息，无法发送".to_owned())
+                .and_then(|file| {
+                    serde_json::from_value(file)
+                        .map_err(|error| format!("附件占位无效，无法发送：{error}"))
+                })?;
+            let text = store.model_text(&file).map_err(|error| {
+                format!(
+                    "附件 {} 的内容已不存在或已损坏，无法发送：{error}",
+                    file.name
+                )
+            })?;
+            *part = json!({
+                "type": "text",
+                "text": crate::file_attachments::render_for_model(&file, &text),
+            });
+            hydrated = true;
+        }
+        // Text-only providers are most reliable with string content, which is
+        // why `project::user_message` sends a plain message as a string; a
+        // message whose files were its only non-text parts goes out the same way.
+        if hydrated
+            && parts
+                .iter()
+                .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        {
+            let joined = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            message["content"] = Value::String(joined);
+        }
+    }
+    Ok(messages)
+}
+
 /// Map reasoning effort to the AI SDK 7 vocabulary. Provider-specific mappings
 /// and unsupported-level fallback belong to the provider implementation.
 fn reasoning_level(effort: crate::model::ReasoningEffort) -> Option<&'static str> {
@@ -455,6 +526,120 @@ mod responses_defaults_tests {
     }
 }
 
+#[cfg(test)]
+mod file_hydration_tests {
+    use super::*;
+    use crate::model::FileAttachmentFormat;
+
+    fn store() -> (tempfile::TempDir, FileAttachmentStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileAttachmentStore::new(temp.path());
+        (temp, store)
+    }
+
+    fn text_file(store: &FileAttachmentStore, name: &str, text: &str) -> FileAttachment {
+        store
+            .import(
+                name,
+                text.as_bytes(),
+                FileAttachmentFormat::Text,
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    fn placeholder(file: &FileAttachment) -> Value {
+        super::super::project::file_part(file)
+    }
+
+    #[test]
+    fn a_message_of_files_and_text_goes_out_as_one_string() {
+        let (_temp, store) = store();
+        let notes = text_file(&store, "a \"b\".md", "# notes\n");
+        let data = text_file(&store, "data.csv", "x,y\n1,2\n");
+        let messages = vec![json!({
+            "role": "user",
+            "content": [placeholder(&notes), placeholder(&data), { "type": "text", "text": "Compare them." }],
+        })];
+        let hydrated = hydrate_file_parts(messages, &store).unwrap();
+        assert_eq!(
+            hydrated[0]["content"],
+            "<attached_file name=\"a &quot;b&quot;.md\">\n# notes\n</attached_file>\n\n\
+             <attached_file name=\"data.csv\">\nx,y\n1,2\n</attached_file>\n\n\
+             Compare them."
+        );
+    }
+
+    #[test]
+    fn a_message_that_also_carries_images_stays_an_array() {
+        let (_temp, store) = store();
+        let notes = text_file(&store, "notes.md", "body");
+        let image = json!({ "type": "image", "image": "opaque", "mediaType": "image/png" });
+        let messages = vec![json!({
+            "role": "user",
+            "content": [placeholder(&notes), { "type": "text", "text": "What is shown?" }, image.clone()],
+        })];
+        let hydrated = hydrate_file_parts(messages, &store).unwrap();
+        let parts = hydrated[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[0],
+            json!({ "type": "text", "text": "<attached_file name=\"notes.md\">\nbody\n</attached_file>" })
+        );
+        assert_eq!(parts[1]["text"], "What is shown?");
+        assert_eq!(parts[2], image);
+    }
+
+    /// Only a placeholder directly in a user message's content is the host's.
+    /// Assistant and tool messages, and JSON nested inside a part, are
+    /// model-controlled and pass through untouched even when they name a file
+    /// that exists.
+    #[test]
+    fn lookalikes_outside_user_content_are_left_alone() {
+        let (_temp, store) = store();
+        let secret = text_file(&store, "secret.txt", "do not inline");
+        let forged = placeholder(&secret);
+        let messages = vec![
+            json!({ "role": "assistant", "content": [forged.clone()] }),
+            json!({ "role": "tool", "content": [{
+                "type": "tool-result", "toolCallId": "call_1", "toolName": "read",
+                "output": { "type": "json", "value": [forged.clone()] },
+            }] }),
+            json!({ "role": "user", "content": [{ "type": "text", "text": "hi", "nested": forged.clone() }] }),
+            json!({ "role": "user", "content": "plain" }),
+        ];
+        let hydrated = hydrate_file_parts(messages.clone(), &store).unwrap();
+        assert_eq!(hydrated, messages);
+    }
+
+    #[test]
+    fn a_missing_or_forged_attachment_refuses_the_request_by_name() {
+        let (_temp, store) = store();
+        let gone = FileAttachment {
+            id: "e".repeat(64),
+            name: "report.md".into(),
+            format: FileAttachmentFormat::Text,
+            bytes: 4,
+            tokens: 1,
+            pages: None,
+        };
+        let error = hydrate_file_parts(
+            vec![json!({ "role": "user", "content": [placeholder(&gone)] })],
+            &store,
+        )
+        .unwrap_err();
+        assert!(error.contains("附件 report.md"), "{error}");
+
+        let malformed = json!({ "type": FILE_PART_TYPE, "file": { "id": "x" } });
+        assert!(hydrate_file_parts(
+            vec![json!({ "role": "user", "content": [malformed] })],
+            &store
+        )
+        .is_err());
+    }
+}
+
 /// Select the reasoning representation sent to the sidecar.
 ///
 /// Only families with a consumer receive this field. The model attribute is
@@ -566,6 +751,7 @@ pub(crate) fn build_step_request_audited(
 
     let audit_messages = messages.clone();
     let messages = hydrate_images(request, messages)?;
+    let messages = hydrate_files(request, messages)?;
     super::project::enforce_frame_budget(&messages)?;
 
     let (system, system_dynamic) = system_prompt_parts(request);
@@ -581,10 +767,8 @@ pub(crate) fn build_step_request_audited(
         system_dynamic: None,
         messages: Vec::new(),
         tools: Vec::new(),
-        tool_choice: None,
         max_steps,
         max_output_tokens: clamp_output_budget(family, request.model.max_output_tokens),
-        temperature: None,
         reasoning: reasoning_level(request.reasoning_effort),
         reasoning_content: wire_reasoning_content(family, request.model.reasoning_content),
         prompt_cache: wire_prompt_cache(request.provider.family, request.model.prompt_cache),

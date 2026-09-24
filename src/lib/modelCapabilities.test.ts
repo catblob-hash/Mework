@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import modelSource from "../../src-tauri/src/model.rs?raw";
 import type { ProviderFamily, ModelProfile } from "../types";
 import {
-  CHAT_ENDPOINT_TYPES,
   chatEndpointOf,
   derivesBaseUrl,
   ENDPOINT_TYPES,
@@ -121,10 +120,6 @@ function enumVariants(source: string, name: string): string[] {
 describe("endpoint and capability vocabularies mirror Rust", () => {
   it("mirrors EndpointType::CATALOG exactly, including order", () => {
     expect(ENDPOINT_TYPES).toEqual(rustCatalog("EndpointType", "CATALOG"));
-  });
-
-  it("mirrors EndpointType::CHAT exactly, including order", () => {
-    expect(CHAT_ENDPOINT_TYPES).toEqual(rustCatalog("EndpointType", "CHAT"));
   });
 
   it("mirrors ModelCapability::CATALOG exactly, including order", () => {

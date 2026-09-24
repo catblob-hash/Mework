@@ -14,3 +14,4 @@
 - [grep](grep.html) — 搜索文件内容而不是名字
 - [read](read.html) — 打开你找到的文件之一
 - [使用 Mework](../working.html#tools-and-approvals) — 安全层级矩阵
+- [find_files](find_files.html) — 目录树大得读不完时，让决策模型挑出路径

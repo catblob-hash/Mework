@@ -1,10 +1,6 @@
 import { closeTerminal } from "./terminal";
 import type { TerminalSessionState } from "./terminal";
 
-export function terminalSessionIsEmpty(state: TerminalSessionState | undefined): boolean {
-  return !state || (!state.hasHistory && !state.busy);
-}
-
 /**
  * The store key of one terminal. A terminal id is only unique within its
  * conversation — every composer drawer uses the same one — so the pair is the
@@ -12,13 +8,6 @@ export function terminalSessionIsEmpty(state: TerminalSessionState | undefined):
  */
 export function terminalSessionKey(conversationId: string, terminalId: string): string {
   return `${conversationId}/${terminalId}`;
-}
-
-export interface TerminalCloseHandlers {
-  /** Runs once per close task, after the session is removed from the store. */
-  onClosed?: () => void;
-  /** Runs once per close task; the returned promise still rejects afterwards. */
-  onError?: (error: unknown) => void;
 }
 
 export interface TerminalController {
@@ -38,14 +27,9 @@ export interface TerminalController {
   markCommandStarted(conversationId: string, terminalId: string): boolean;
   /**
    * Closes the backend terminal and removes the session. Concurrent calls for
-   * the same terminal share one task: only the caller that created the task
-   * gets its handlers run, matching the original first-caller-wins semantics.
+   * the same terminal share one task.
    */
-  requestClose(
-    conversationId: string,
-    terminalId: string,
-    handlers?: TerminalCloseHandlers
-  ): Promise<void>;
+  requestClose(conversationId: string, terminalId: string): Promise<void>;
 }
 
 export function terminalSessionIsLive(state: TerminalSessionState): boolean {
@@ -115,7 +99,7 @@ export function createTerminalController(): TerminalController {
       notify();
       return true;
     },
-    requestClose(conversationId, terminalId, handlers) {
+    requestClose(conversationId, terminalId) {
       const key = terminalSessionKey(conversationId, terminalId);
       const existing = closePromises.get(key);
       if (existing) return existing;
@@ -124,11 +108,6 @@ export function createTerminalController(): TerminalController {
         .then(() => closeTerminal(conversationId, terminalId))
         .then(() => {
           removeSession(key);
-          handlers?.onClosed?.();
-        })
-        .catch((error) => {
-          handlers?.onError?.(error);
-          throw error;
         })
         .finally(() => {
           if (closePromises.get(key) === closeTask) {

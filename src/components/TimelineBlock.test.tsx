@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { ASK_USER_PENDING_OUTPUT } from "../types";
+import { ASK_USER_PENDING_OUTPUT } from "../test/fixtures";
 import type {
   ContextItem,
   ReasoningContext,

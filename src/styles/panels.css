@@ -108,7 +108,6 @@
 .browser-panel__log-line.is-error { color: var(--danger); }
 .browser-panel__log-line.is-warn { color: var(--warning); }
 .browser-panel__menu-group { margin: 4px 7px 3px; color: var(--browser-menu-muted); font-size: 8.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
-.browser-panel__menu-empty { margin: 2px 7px 6px; color: var(--browser-menu-muted); font-size: 10px; }
 /* One row, one hit target: the strip highlights as a whole and the trailing `Run` is a label the
    row's own button carries. A running row is the only one with a second control in it. */
 .browser-panel__menu-server { display: flex; align-items: center; gap: 4px; padding: 0 3px; border-radius: 7px; }
@@ -151,7 +150,6 @@
   .browser-panel__menu { right: 4px; left: 4px; width: auto; }
 }
 @keyframes menu-pop-in { from { opacity: 0; transform: translateY(-5px) scale(.985); } }
-.settings-section { padding: 16px 15px; border-bottom: 1px solid var(--border); }
 .settings-section__heading { margin-bottom: 11px; }
 .settings-section__heading--split { display: flex; align-items: flex-start; justify-content: space-between; }
 .settings-section__heading--split > div:first-child, .settings-section__heading--split > div:first-child > span { min-width: 0; }
@@ -161,35 +159,12 @@
 .settings-section__heading > div > span { display: flex; flex-direction: column; }
 .settings-section__heading strong { font-size: 11.5px; }
 .settings-section__heading small { margin-top: 1px; color: var(--faint); font-size: 9px; }
-/* Collapsible sections with built-in title rows do not need an inner heading. */
-.collapsible-section { border-bottom: 1px solid var(--border); }
-.collapsible-section__heading { display: flex; align-items: center; gap: 6px; padding: 0 15px 0 11px; }
-.collapsible-section__toggle { flex: 1; min-width: 0; min-height: 42px; padding: 0 4px; display: flex; align-items: center; gap: 7px; background: transparent; text-align: left; }
-.collapsible-section__toggle:hover { background: var(--hover); }
-.collapsible-section__toggle > svg { flex: 0 0 auto; color: var(--muted); }
-.collapsible-section__toggle strong { flex: 0 0 auto; color: var(--text); font-size: 11.5px; }
-.collapsible-section__toggle small { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 9px; }
-.collapsible-section__body { padding: 0 15px 14px; }
-.tool-bulk-actions { display: inline-flex !important; align-items: center !important; gap: 4px !important; }
-.tool-bulk-actions .text-button { min-height: 25px; padding: 0 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--color-fafaf8); font-size: 8.5px; }
-.tool-bulk-actions .text-button:hover:not(:disabled) { background: var(--hover); }
-.tool-bulk-actions--borderless .text-button { border: 0; }
 /* The one-line documentation link the capability and feature pages end their
    heading row with. It is bare text, not a button: nothing on those pages is
    changed by following it. */
 .docs-link { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--faint); font-size: 8.5px; white-space: nowrap; }
 .docs-link:hover { color: var(--text); text-decoration: underline; }
 .docs-link > svg { flex: 0 0 auto; }
-.context-retention-input > span { color: var(--text); font-size: 10.5px; font-weight: 650; }
-.context-retention-controls { display: grid; grid-template-columns: minmax(0, 1fr); align-items: end; gap: 6px; }
-.context-retention-input { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.context-retention-input input { width: 100%; min-width: 0; height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); font: 9px var(--mono); }
-.context-retention-input small { color: var(--faint); font-size: 8.5px; line-height: 1.35; }
-.system-prompt-dialog__input { min-height: 250px; resize: vertical; font-size: 12px; }
-.prompt-actions { min-height: 28px; display: flex; align-items: center; gap: 6px; }
-.prompt-actions > span { margin-left: auto; color: var(--faint); font-size: 8.5px; }
-.scope-note { margin: 8px 0 0; padding: 7px 8px; border-radius: 6px; background: var(--subtle); color: var(--faint); font-size: 8.8px; line-height: 1.4; }
-.scope-note--error { background: var(--danger-soft); color: var(--danger); }
 .tool-settings-group { border-top: 1px solid var(--color-eeeeea); }
 .tool-settings-group:last-child { border-bottom: 1px solid var(--color-eeeeea); }
 .tool-settings-group__heading { width: 100%; min-height: 35px; display: flex; align-items: center; gap: 7px; padding: 0 4px; color: var(--muted); }
@@ -257,9 +232,8 @@
 .tool-toggle-row small { margin-top: 1px; color: var(--faint); font-size: 8.5px; line-height: 1.3; }
 .tool-toggle-row em { padding: 2px 4px; border-radius: 4px; color: var(--warning); background: var(--warning-soft); font-size: 7.5px; font-style: normal; }
 .tool-toggle-row em.tool-toggle-row__decision { color: var(--decision); background: var(--decision-soft); }
-/* A row whose control is a picker rather than a switch. The compact metrics are
-   shared with .tool-bulk-actions buttons so a row carrying both lines up. */
-.tool-toggle-row > .input, .tool-toggle-row .tool-bulk-actions .input {
+/* A row whose control is a picker rather than a switch. */
+.tool-toggle-row > .input {
   flex: 0 0 auto;
   width: auto;
   min-width: 118px;
@@ -268,10 +242,6 @@
   padding: 0 6px;
   font-size: 10px;
 }
-/* A selector row is its own band in the panel, like a collapsed section, but
-   with the label/hint-left, control-right shape of the switch rows. */
-.settings-row { padding: 0 15px; border-bottom: 1px solid var(--border); }
-.settings-row .field__hint--error { display: block; margin: 0 0 8px 9px; }
 .tool-toggle-row--nested { min-height: 40px; }
 .tool-toggle-row--nested strong { font-size: 10px; color: var(--muted); }
 /* A pickable tool row is itself the control, so it resets the button defaults
@@ -288,6 +258,44 @@
    the signs and the chevrons read down one column whatever a row carries. */
 .tool-toggle-row__mark { flex: 0 0 auto; width: 14px; height: 14px; color: var(--faint); }
 .tool-toggle-row--on .tool-toggle-row__mark { color: var(--success); }
+/* A tool family's row: the row itself switches the family on and off, and the
+   gear at its end — in the column the other rows' signs read down — opens the
+   family's window. The pill is drawn by the wrapper so the two buttons read as
+   one row; the switch fills it top to bottom, so the whole row answers a click
+   except the gear. */
+.tool-family-row { align-items: stretch; padding-top: 0; padding-bottom: 0; }
+.tool-family-row__switch {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 0;
+  border: 0;
+  border-radius: 7px 0 0 7px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+.tool-family-row__switch > span:first-child { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.tool-family-row__switch .tool-toggle-row__mark { margin-left: auto; }
+.tool-family-row__settings {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 20px;
+  height: 20px;
+  margin: 0 -3px 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--faint);
+}
+.tool-family-row__settings:hover { background: var(--hover); color: var(--text); }
+.tool-toggle-row--on .tool-family-row__settings { color: var(--success); }
 .tool-settings-group--locked .tool-settings-group__disclosure { color: var(--faint); }
 .tool-lock-note { margin: 3px 4px 5px; color: var(--faint); font-size: 8.5px; line-height: 1.35; }
 /* The search-provider selector shares the unheaded section with the tool rows.

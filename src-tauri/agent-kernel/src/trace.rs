@@ -32,10 +32,6 @@ impl TraceRecorder {
         self.events.push(event);
     }
 
-    pub fn events(&self) -> &[KernelEvent] {
-        &self.events
-    }
-
     pub fn to_prob_json(&self) -> Value {
         let mut transitions = Vec::with_capacity(self.events.len() + 1);
         transitions.push(json!({ "name": "$initialise_machine" }));

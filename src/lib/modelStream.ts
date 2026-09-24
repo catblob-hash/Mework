@@ -114,7 +114,7 @@ export type ToolStreamEvent = Extract<
   }
 >;
 
-export type HookStreamEvent = Extract<
+type HookStreamEvent = Extract<
   ModelStreamEvent,
   { type: "hook_execution_started" | "hook_execution_completed" }
 >;
@@ -171,7 +171,7 @@ export function cumulativeModelRunUsage(run: ModelRunState): ModelUsage {
  * single call id. A depth-one child's key is still its bare call id, so the
  * accounting map's existing entries keep their names.
  */
-export function nestedUsageUpdate(
+function nestedUsageUpdate(
   event: Extract<ModelStreamEvent, { type: "subagent_event" }>
 ): { key: string; round: number; usage: ModelUsage } | null {
   const path: string[] = [];
@@ -232,7 +232,7 @@ function replayPendingToolEvents(
   return next;
 }
 
-export function applyToolStreamEvent(
+function applyToolStreamEvent(
   run: ModelRunState,
   event: ToolStreamEvent,
   round: number,
@@ -426,7 +426,7 @@ export function settleSubagentContexts(contexts: ContextItem[]): ContextItem[] {
 /** Applies one parent-facing lifecycle/progress fragment to a single live
  * child. The same reducer is used at every nesting level so a dispatcher,
  * executor, and page reader retain identical streaming semantics. */
-export function applySubagentChannelDelta(
+function applySubagentChannelDelta(
   live: SubagentLiveState,
   parentToolId: string,
   channel: Extract<ModelStreamEvent, { type: "subagent_delta" }>["channel"],
@@ -498,7 +498,7 @@ function nestedReasoningId(parentToolId: string, round: number, item = 0): strin
 
 /** Projects a normalized nested model event into the same ContextItem stream
  * consumed by the primary conversation renderer. */
-export function applyNestedSubagentEvent(
+function applyNestedSubagentEvent(
   live: SubagentLiveState,
   parentToolId: string,
   event: ModelStreamEvent,
@@ -825,7 +825,7 @@ export function applyNestedSubagentEvent(
  * the front of it can delete every trace of a step that finished early. That
  * step would vanish from the card mid-run, and the totals with it.
  */
-export function applyWorkflowProgress(
+function applyWorkflowProgress(
   run: ModelRunState,
   event: Extract<ModelStreamEvent, { type: "workflow_progress" }>
 ): ModelRunState {
@@ -951,7 +951,7 @@ export function trimLiveContextBudget(run: ModelRunState): ModelRunState {
   return { ...run, streamedToolsByRound };
 }
 
-export function applySubagentDelta(
+function applySubagentDelta(
   run: ModelRunState,
   event: Extract<ModelStreamEvent, { type: "subagent_delta" }>,
   round: number,
@@ -973,7 +973,7 @@ export function applySubagentDelta(
   };
 }
 
-export function applySubagentEvent(
+function applySubagentEvent(
   run: ModelRunState,
   event: Extract<ModelStreamEvent, { type: "subagent_event" }>,
   round: number,
@@ -996,7 +996,7 @@ export function applySubagentEvent(
   };
 }
 
-export function applyHookStreamEvent(
+function applyHookStreamEvent(
   run: ModelRunState,
   event: HookStreamEvent,
   round: number,
@@ -1139,6 +1139,7 @@ export function reduceModelStreamEvent(
       kind: "user",
       content: event.content,
       images: event.images,
+      files: event.files,
       createdAt: event.createdAt
     };
     const duplicateAnywhere = Object.values(run.steeredInputsByRound).some((inputs) =>

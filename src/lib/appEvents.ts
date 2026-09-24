@@ -33,14 +33,6 @@ export type AppPushEvent =
   // replaced each one with an exact local-only marker and saved the rest. The
   // renderer installs the same replacement to keep the audit evidence.
   | { type: "toolContextsQuarantined"; contexts: QuarantinedToolContext[] }
-  // When a proposed conversation state fails conversation-domain validation, the host restores its last committed snapshot (or discards a newly tainted conversation) while saving the remaining document. The host deduplicates by conversation, rejectedUpdatedAt, and error.
-  | {
-      type: "conversationSaveRejected";
-      workspaceId: string;
-      conversationId: string;
-      rejectedUpdatedAt: string;
-      error: string;
-    }
   // Neither shell commands nor web searches begin in the renderer. Their
   // registry changes are the only way these background tasks reach the sidebar;
   // end events carry whole snapshots because rows remain as finished history.

@@ -251,21 +251,4 @@ describe("TerminalShellButton", () => {
     expect(within(menu).getByRole("menuitem", { name: "未探测到可用的 shell" })).toBeDisabled();
     expect(within(menu).getByRole("menuitem", { name: "收起终端面板" })).toBeEnabled();
   });
-
-  it("says why it is unavailable", () => {
-    render(
-      <TerminalShellButton
-        workspaceLabel="api"
-        shells={["zsh"]}
-        paneOpen={false}
-        disabled
-        disabledReason="先发送一条消息再打开终端"
-        onSelect={vi.fn()}
-        onTogglePane={vi.fn()}
-      />
-    );
-    const trigger = screen.getByRole("button", { name: "在 api 打开终端" });
-    expect(trigger).toBeDisabled();
-    expect(trigger).toHaveAttribute("title", "先发送一条消息再打开终端");
-  });
 });

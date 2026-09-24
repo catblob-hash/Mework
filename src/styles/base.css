@@ -41,7 +41,6 @@
   --task-block: color-mix(in srgb, var(--hover) 55%, transparent);
   --task-block-nested: color-mix(in srgb, var(--hover) 30%, transparent);
   --sidebar-width: 264px;
-  --right-sidebar-width: 560px;
   --topbar-height: 56px;
   /* Reserve the classic scrollbar width so fixed headers align with scrolling content. */
   --scrollbar-size: 10px;
@@ -118,7 +117,6 @@ textarea { resize: vertical; }
 .button--danger:hover:not(:disabled) { background: var(--color-ab3030); }
 .text-button { background: transparent; color: var(--accent); padding: 3px 4px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; border-radius: 5px; }
 .text-button:hover { background: var(--accent-soft); }
-.text-button--danger { color: var(--danger); }
 
 /*
  * A field with no frame of its own. The wrapper's `::after` carries a hidden

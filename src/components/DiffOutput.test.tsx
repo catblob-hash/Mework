@@ -1,10 +1,8 @@
 import { render, screen, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   DiffOutput,
-  parseUnifiedDiff,
-  type DiffLineSelection
+  parseUnifiedDiff
 } from "./DiffOutput";
 
 const sampleDiff = [
@@ -88,107 +86,7 @@ describe("DiffOutput", () => {
     expect(parsed.lines.find((line) => line.kind === "addition")?.text).toBe("+++");
   });
 
-  it("selects additions on RIGHT and deletions on LEFT with semantic payloads", async () => {
-    const user = userEvent.setup();
-    const onLineSelect = vi.fn();
-    render(<DiffOutput value={sampleDiff} onLineSelect={onLineSelect} />);
-
-    const deletionRow = screen.getByText("oldValue();").closest(".diff-output__line");
-    const additionRow = screen.getByText("newValue();").closest(".diff-output__line");
-    expect(deletionRow).not.toBeNull();
-    expect(additionRow).not.toBeNull();
-    expect(within(deletionRow as HTMLElement).queryByRole("button", {
-      name: /新文件/
-    })).not.toBeInTheDocument();
-    expect(within(additionRow as HTMLElement).queryByRole("button", {
-      name: /旧文件/
-    })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", {
-      name: "选择 src/example.ts 旧文件第 3 行"
-    }));
-    await user.click(screen.getByRole("button", {
-      name: "选择 src/example.ts 新文件第 3 行"
-    }));
-
-    expect(onLineSelect).toHaveBeenNthCalledWith(1, {
-      path: "src/example.ts",
-      line: 3,
-      side: "LEFT",
-      text: "oldValue();",
-      kind: "deletion"
-    });
-    expect(onLineSelect).toHaveBeenNthCalledWith(2, {
-      path: "src/example.ts",
-      line: 3,
-      side: "RIGHT",
-      text: "newValue();",
-      kind: "addition"
-    });
-  });
-
-  it("addresses a context line on the new side only, now that one column carries it", async () => {
-    const user = userEvent.setup();
-    const onLineSelect = vi.fn();
-    render(<DiffOutput value={sampleDiff} onLineSelect={onLineSelect} />);
-
-    expect(screen.queryByRole("button", {
-      name: "选择 src/example.ts 旧文件第 2 行"
-    })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", {
-      name: "选择 src/example.ts 新文件第 2 行"
-    }));
-
-    expect(onLineSelect).toHaveBeenCalledWith({
-      path: "src/example.ts",
-      line: 2,
-      side: "RIGHT",
-      text: "keep();",
-      kind: "context"
-    });
-  });
-
-  it("supports keyboard activation and a controlled selected state", async () => {
-    const user = userEvent.setup();
-    const onLineSelect = vi.fn();
-    const selection: DiffLineSelection = {
-      path: "src/example.ts",
-      line: 4,
-      side: "RIGHT",
-      text: "extraValue();",
-      kind: "addition"
-    };
-    const view = render(
-      <DiffOutput
-        value={sampleDiff}
-        selectedLine={null}
-        onLineSelect={onLineSelect}
-      />
-    );
-    const button = screen.getByRole("button", {
-      name: "选择 src/example.ts 新文件第 4 行"
-    });
-
-    button.focus();
-    await user.keyboard("{Enter}");
-    expect(onLineSelect).toHaveBeenCalledWith(selection);
-    expect(button).toHaveAttribute("aria-pressed", "false");
-
-    view.rerender(
-      <DiffOutput
-        value={sampleDiff}
-        selectedLine={selection}
-        onLineSelect={onLineSelect}
-      />
-    );
-    expect(screen.getByRole("button", {
-      name: "选择 src/example.ts 新文件第 4 行"
-    })).toHaveAttribute("aria-pressed", "true");
-
-    await user.keyboard(" ");
-    expect(onLineSelect).toHaveBeenCalledTimes(2);
-  });
-
-  it("drops file and hunk rows and keeps meta and generated omission rows non-interactive", () => {
+  it("drops file and hunk rows and keeps meta and generated omission rows", () => {
     const contextLines = Array.from({ length: 810 }, (_, index) => ` line-${index}`);
     const largeDiff = [
       "--- a/src/large.ts",
@@ -197,7 +95,7 @@ describe("DiffOutput", () => {
       ...contextLines,
       "\\ No newline at end of file"
     ].join("\n");
-    render(<DiffOutput value={largeDiff} onLineSelect={() => undefined} />);
+    render(<DiffOutput value={largeDiff} />);
 
     expect(screen.queryByText("--- a/src/large.ts")).not.toBeInTheDocument();
     expect(screen.queryByText("@@ -1,810 +1,810 @@")).not.toBeInTheDocument();
@@ -206,19 +104,5 @@ describe("DiffOutput", () => {
 
     expect(omissionRow).not.toBeNull();
     expect(metaRow).not.toBeNull();
-    for (const row of [omissionRow!, metaRow!]) {
-      expect(within(row as HTMLElement).queryByRole("button")).not.toBeInTheDocument();
-    }
-  });
-
-  it("does not emit a localized placeholder as a review path", () => {
-    render(
-      <DiffOutput
-        value={"@@ -1 +1 @@\n-old\n+new"}
-        onLineSelect={() => undefined}
-      />
-    );
-
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 });

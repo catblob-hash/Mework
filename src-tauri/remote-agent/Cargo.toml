@@ -27,7 +27,7 @@ default = ["agent", "client"]
 # not link it, so none of its platform calls reach the shipped app.
 # Cells (sandboxed sessions) are reached through a link of their own, so the
 # agent carries the client half too.
-agent = ["client", "dep:portable-pty", "dep:sha2", "dep:getrandom"]
+agent = ["client", "dep:portable-pty", "dep:sha2", "dep:getrandom", "dep:libc", "dep:windows-sys"]
 # The host side: one multiplexed, self-healing link per machine.
 client = []
 
@@ -46,13 +46,13 @@ getrandom = { version = "0.3", optional = true }
 sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Process-tree ownership (job objects, a child started suspended until its job
 # holds it), detaching the daemon from the SSH session's job, and the daemon's
 # log handles. Nothing here reaches input, windows or the desktop.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

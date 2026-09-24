@@ -40,7 +40,6 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::{ResolvedLanguage, ToolDescriptionEntry};
@@ -68,10 +67,8 @@ macro_rules! prompt_keys {
             $( $variant, )*
         }
 
-        // The registry's reflective surface (`ALL`, `id`, `placeholders`, `doc`)
-        // feeds the golden exports and the registry tests; production code
-        // reaches texts through `PromptProfile::text`.
-        #[cfg_attr(not(test), allow(dead_code))]
+        // `placeholders` and `doc` feed only the golden exports and the registry
+        // tests; production code reaches texts through `PromptProfile::text`.
         impl PromptKey {
             /// Every key, in documentation order.
             pub const ALL: &'static [PromptKey] = &[ $( PromptKey::$variant, )* ];
@@ -82,11 +79,13 @@ macro_rules! prompt_keys {
             }
 
             /// The placeholders the text may reference as `{name}`.
+            #[cfg(test)]
             pub fn placeholders(self) -> &'static [&'static str] {
                 match self { $( PromptKey::$variant => &[$($placeholder),*], )* }
             }
 
             /// One-line description of where the text is injected.
+            #[cfg(test)]
             pub fn doc(self) -> &'static str {
                 match self { $( PromptKey::$variant => $doc, )* }
             }
@@ -484,10 +483,6 @@ prompt_keys! {
         "System prompt of the isolated executor that runs a provider-native `web_fetch`. Its prose is discarded: the host reads the retrieved pages out of the tool results, so this only has to make the executor call the tool once per URL."),
     WebFetchExecutorTask => ("web.fetch_executor_task", ["urls"],
         "User message given to the isolated web-fetch executor, carrying the URLs to retrieve one per line."),
-    WebSourcesHeading => ("web.sources_heading", [],
-        "Heading of the source list appended to native web-search findings."),
-    WebSourceRow => ("web.source_row", ["label", "url"],
-        "One row of the appended source list."),
     WebSearchWarnings => ("web.search_warnings", ["warnings"],
         "Line appended to native findings when the provider reported search failures."),
     WebFindingsNotice => ("web.findings_notice", [],
@@ -520,8 +515,6 @@ prompt_keys! {
         "Assistant text written when a UserPromptSubmit hook blocked the turn."),
     HookBlockedBy => ("hook.blocked_by", ["name"],
         "Reason given to the model when a hook denied a tool call without a reason of its own."),
-    HookBlockedDefault => ("hook.blocked_default", [],
-        "Reason given to the model when a hook blocked an action and no hook name is available."),
     HookContinueFallback => ("hook.continue_fallback", [],
         "User context injected when a Stop hook asks to continue without giving a reason."),
     HookStopLimitReached => ("hook.stop_limit_reached", ["limit"],
@@ -924,7 +917,7 @@ impl PromptProfile {
     }
 
     /// The complete text table this profile resolves to, in registry order.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn resolved_texts(&self) -> Vec<(PromptKey, String)> {
         PromptKey::ALL
             .iter()
@@ -934,7 +927,7 @@ impl PromptProfile {
 
     /// The profile as a user-file document (name, prompts, tools), with every
     /// key spelled out. This is what the golden export writes.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn to_document(&self) -> Value {
         let prompts = self
             .resolved_texts()
@@ -996,7 +989,7 @@ pub fn render_template(template: &str, args: &[(&str, &str)]) -> String {
 }
 
 /// The placeholders a text references, for the registry tests and the docs.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn placeholders_in(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut rest = text;
@@ -1022,9 +1015,9 @@ pub fn placeholders_in(text: &str) -> Vec<String> {
 }
 
 /// One registry entry as the documentation export describes it.
-#[derive(Serialize, Deserialize)]
+#[cfg(test)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct PromptKeyManifestEntry {
     pub id: String,
     pub placeholders: Vec<String>,
@@ -1032,7 +1025,7 @@ pub struct PromptKeyManifestEntry {
 }
 
 /// The registry as a manifest, in documentation order.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn key_manifest() -> Vec<PromptKeyManifestEntry> {
     PromptKey::ALL
         .iter()

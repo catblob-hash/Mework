@@ -1,8 +1,6 @@
 import { hasBackendRuntime, invoke } from "./backend";
 import type { ConversationWorktree } from "../types";
 
-export type GitReviewView = "changes" | "history" | "branches" | "compare" | "pullRequests";
-
 export type GitFileStatus =
   | "added"
   | "modified"
@@ -133,7 +131,6 @@ export interface GitChangePageRequest {
   query?: string;
   limit?: number;
   selectedPath?: string;
-  expectedStageAllTargetRevision?: string;
 }
 
 export type GitChangeSelection =
@@ -209,14 +206,12 @@ export type GitChangePageResult =
       matchedCount: number;
       nextCursor: string | null;
       selection: GitChangeSelection | null;
-      stageAllTargetRevision?: string;
-      candidateTreeOid?: string;
     };
 
 export type GitDiffRequest =
-  | { type: "working"; path?: string; context?: number; expectedStageAllTargetRevision?: string }
+  | { type: "working"; path?: string; context?: number }
   | { type: "staged"; path?: string; context?: number }
-  | { type: "unstaged"; path?: string; context?: number; expectedStageAllTargetRevision?: string }
+  | { type: "unstaged"; path?: string; context?: number }
   | { type: "compare"; base: string; head: string; path?: string; context?: number };
 
 export interface GitDiffResult {
@@ -228,8 +223,6 @@ export interface GitDiffResult {
   truncated: boolean;
   /** Present for summary requests; callers should lazily request the selected path's patch. */
   files: GitFileChange[];
-  stageAllTargetRevision?: string;
-  candidateTreeOid?: string;
 }
 
 export type GitBranchKind = "local" | "remote";
@@ -251,40 +244,9 @@ export interface GitBranchesResult {
   defaultBranch: string | null;
 }
 
-export interface GitHistoryRequest {
-  limit?: number;
-  cursor?: string;
-  branch?: string;
-  path?: string;
-}
-
-export interface GitCommit {
-  oid: string;
-  shortOid: string;
-  subject: string;
-  body?: string;
-  authorName: string;
-  authorEmail?: string;
-  authoredAt: string;
-  committedAt?: string;
-  parents: string[];
-  refs?: string[];
-}
-
-export interface GitHistoryResult {
-  commits: GitCommit[];
-  nextCursor: string | null;
-}
-
 export type GitAction =
   | { type: "stage"; paths: string[] }
-  | {
-      type: "stage_all";
-      expectedContentRevision: string;
-      expectedTargetRevision: string;
-    }
   | { type: "unstage"; paths: string[] }
-  | { type: "unstage_all"; expectedContentRevision: string }
   | {
       type: "discard";
       paths: string[];
@@ -292,57 +254,7 @@ export type GitAction =
       expectedContentRevision: string;
       expectedTargetRevision: string;
     }
-  | {
-      type: "commit";
-      message: string;
-      expectedTargetRevision: string;
-      expectedTreeOid: string;
-      amend?: boolean;
-    }
-  | {
-      type: "fetch";
-      expectedRepositoryId: string;
-      expectedWorktreeId: string;
-      remote: GitRemote;
-    }
-  | {
-      type: "pull";
-      expectedRepositoryId: string;
-      expectedWorktreeId: string;
-      expectedLocalBranch: string;
-      expectedHead: string;
-      expectedContentRevision: string;
-      upstream: GitUpstream;
-      rebase?: boolean;
-      ffOnly?: boolean;
-    }
-  | {
-      type: "push";
-      expectedRepositoryId: string;
-      expectedWorktreeId: string;
-      remote: GitRemote;
-      expectedLocalBranch: string;
-      remoteBranch: string;
-      expectedHead: string;
-      expectedUpstream: GitUpstream | null;
-      setUpstream?: boolean;
-      forceWithLease?: boolean;
-    }
   | { type: "checkout"; branch: string }
-  | { type: "create_branch"; name: string; startPoint?: string; checkout?: boolean }
-  | {
-      type: "delete_branch";
-      name: string;
-      force?: boolean;
-      expectedHead: string;
-      expectedOid: string;
-    }
-  | {
-      type: "merge";
-      branch: string;
-      expectedHead: string;
-      expectedBranchOid: string;
-    }
   | {
       type: "continue_operation";
       operation: GitRepositoryOperation;
@@ -367,372 +279,16 @@ export type GitAction =
       expectedHead: string;
       expectedOperationRevision: string;
       expectedContentRevision: string;
-    }
-  | { type: "stash"; message?: string; includeUntracked?: boolean }
-  | { type: "stash_pop"; index?: number };
+    };
 
 export interface GitActionResult {
   snapshot: GitWorkspaceSnapshot | null;
   message?: string;
-  committedOid?: string;
 }
 
 export interface GitDiscardPreparation {
   snapshot: GitWorkspaceSnapshot;
   targetRevision: string;
-}
-
-export interface GitStageAllPreparation {
-  snapshot: GitWorkspaceSnapshot;
-  targetRevision: string;
-  candidateTreeOid: string;
-}
-
-export interface GitCommitPreparation {
-  snapshot: GitWorkspaceSnapshot;
-  targetRevision: string;
-  candidateTreeOid: string;
-  messageDigest: string;
-}
-
-export interface GitHubRepository {
-  host: string;
-  owner: string;
-  name: string;
-  nameWithOwner: string;
-  url: string;
-  defaultBranch: string | null;
-  viewerLogin: string | null;
-  authenticated: boolean;
-  ghVersion: string;
-}
-
-export type GitHubPullRequestState = "open" | "closed" | "merged";
-
-export interface GitHubPullRequest {
-  number: number;
-  title: string;
-  state: GitHubPullRequestState;
-  url: string;
-  author: string | null;
-  headRefName: string;
-  baseRefName: string;
-  draft: boolean;
-  mergeable?: boolean | null;
-  updatedAt: string;
-}
-
-export interface GitHubPullRequestDetail extends GitHubPullRequest {
-  headRefOid: string;
-  body: string;
-  additions: number;
-  deletions: number;
-  changedFiles: number;
-  commits: number;
-  reviewDecision?: string | null;
-  statusCheckRollup?: string | null;
-  checks?: GitHubPullRequestCheck[];
-}
-
-export type GitHubPullRequestCheckState =
-  | "success"
-  | "failure"
-  | "pending"
-  | "neutral"
-  | "skipped"
-  | "cancelled";
-
-export interface GitHubPullRequestCheck {
-  name: string;
-  state: GitHubPullRequestCheckState;
-  workflow?: string | null;
-  description?: string | null;
-  link?: string | null;
-  startedAt?: string | null;
-  completedAt?: string | null;
-}
-
-export type GitHubReadinessAvailability = "available" | "unsupported" | "error";
-
-export interface GitHubReadinessPhase<T> {
-  availability: GitHubReadinessAvailability;
-  value: T | null;
-  error: string | null;
-}
-
-export interface GitHubReadinessRepositoryIdentity {
-  host: string;
-  nodeId: string;
-  nameWithOwner: string;
-}
-
-export interface GitHubPullRequestCoreIdentity {
-  repository: GitHubReadinessRepositoryIdentity;
-  pullRequestNodeId: string;
-  number: number;
-  state: string;
-  draft: boolean;
-  baseRepository: GitHubReadinessRepositoryIdentity;
-  headRepository: GitHubReadinessRepositoryIdentity | null;
-  baseRefName: string;
-  baseRefOid: string;
-  headRefName: string;
-  headRefOid: string;
-}
-
-export interface GitHubPullRequestMergePolicy {
-  mergeStateStatus: string;
-  mergeable: string;
-  mergeCommitAllowed: boolean;
-  squashMergeAllowed: boolean;
-  rebaseMergeAllowed: boolean;
-}
-
-export interface GitHubPullRequestViewer {
-  login: string;
-  canUpdate: boolean;
-  canMergeAsAdmin: boolean;
-}
-
-export interface GitHubPullRequestReadinessCheck {
-  nodeId: string;
-  kind: string;
-  name: string;
-  state: string;
-  conclusion: string | null;
-  workflow: string | null;
-  description: string | null;
-  link: string | null;
-  startedAt: string | null;
-  completedAt: string | null;
-  required: boolean;
-}
-
-export interface GitHubPullRequestChecks {
-  totalCount: number;
-  checks: GitHubPullRequestReadinessCheck[];
-}
-
-export interface GitHubPullRequestViewerDefault {
-  mergeMethod: string;
-}
-
-export interface GitHubPullRequestAutoMerge {
-  enabledAt: string | null;
-  mergeMethod: string;
-  commitHeadline: string | null;
-  commitBody: string | null;
-  enabledBy: string | null;
-}
-
-export interface GitHubPullRequestMergeQueueEntry {
-  entryId: string;
-  position: number;
-  state: string;
-  enqueuedAt: string;
-  estimatedTimeToMerge: number | null;
-}
-
-export interface GitHubPullRequestMergeQueueState {
-  enabled: boolean;
-  isInQueue: boolean;
-  entry: GitHubPullRequestMergeQueueEntry | null;
-}
-
-export interface GitHubPullRequestReadiness {
-  identity: GitHubPullRequestCoreIdentity;
-  mergePolicy: GitHubPullRequestMergePolicy;
-  viewer: GitHubPullRequestViewer;
-  checks: GitHubReadinessPhase<GitHubPullRequestChecks>;
-  viewerDefault: GitHubReadinessPhase<GitHubPullRequestViewerDefault>;
-  autoMerge: GitHubReadinessPhase<GitHubPullRequestAutoMerge>;
-  mergeQueue: GitHubReadinessPhase<GitHubPullRequestMergeQueueState>;
-  identityRevision: string;
-  readinessRevision: string;
-}
-
-export interface GitHubPullRequestsResult {
-  pullRequests: GitHubPullRequest[];
-  page: number;
-  pageSize: number;
-  hasMore: boolean;
-  nextPage: number | null;
-}
-
-export interface GitHubPullRequestsRequest {
-  page: number;
-  pageSize: number;
-}
-
-export interface GitHubPullRequestDiff extends GitDiffResult {
-  headRefOid: string;
-}
-
-export type GitHubDiffSide = "LEFT" | "RIGHT";
-
-export interface GitHubPullRequestReviewComment {
-  id: string;
-  author?: string | null;
-  body: string;
-  createdAt: string;
-  updatedAt: string;
-  url: string;
-  replyToId?: string | null;
-}
-
-export interface GitHubPullRequestReviewThread {
-  id: string;
-  path: string;
-  line?: number | null;
-  startLine?: number | null;
-  diffSide: GitHubDiffSide;
-  startDiffSide?: GitHubDiffSide | null;
-  originalLine?: number | null;
-  originalStartLine?: number | null;
-  isResolved: boolean;
-  isOutdated: boolean;
-  viewerCanReply: boolean;
-  viewerCanResolve: boolean;
-  viewerCanUnresolve: boolean;
-  comments: GitHubPullRequestReviewComment[];
-  commentsTotalCount: number;
-  commentsNextCursor?: string | null;
-}
-
-export interface GitHubPullRequestReviewThreadsRequest {
-  number: number;
-  expectedHeadOid: string;
-  cursor?: string;
-  pageSize?: number;
-}
-
-export interface GitHubPullRequestReviewThreadsResult {
-  number: number;
-  headRefOid: string;
-  threads: GitHubPullRequestReviewThread[];
-  totalCount: number;
-  nextCursor: string | null;
-}
-
-export interface GitHubPullRequestReviewThreadCommentsRequest {
-  expectedRepository: GitHubExpectedRepository;
-  expectedViewerLogin: string;
-  number: number;
-  expectedState: GitHubPullRequestState;
-  expectedHeadOid: string;
-  threadId: string;
-  cursor: string;
-  pageSize: number;
-}
-
-export interface GitHubPullRequestReviewThreadCommentsResult {
-  number: number;
-  headRefOid: string;
-  threadId: string;
-  comments: GitHubPullRequestReviewComment[];
-  totalCount: number;
-  nextCursor: string | null;
-}
-
-export interface GitHubPullRequestReviewDraftComment {
-  path: string;
-  line: number;
-  side: GitHubDiffSide;
-  body: string;
-}
-
-export type GitHubPullRequestReviewEvent = "comment" | "approve" | "request_changes";
-
-export interface GitHubExpectedRepository {
-  host: string;
-  owner: string;
-  name: string;
-}
-
-export interface GitHubActionIdentity {
-  expectedRepository: GitHubExpectedRepository;
-  expectedViewerLogin: string;
-}
-
-export type GitHubAction = GitHubActionIdentity & (
-  | {
-      type: "create_pull_request";
-      title: string;
-      body?: string;
-      base?: string;
-      head?: string;
-      draft?: boolean;
-      expectedLocalHeadOid: string;
-      expectedContentRevision: string;
-    }
-  | {
-      type: "checkout_pull_request";
-      number: number;
-      expectedHeadOid: string;
-      expectedState: GitHubPullRequestState;
-      expectedLocalHeadOid: string;
-      expectedContentRevision: string;
-    }
-  | {
-      type: "merge_pull_request";
-      number: number;
-      expectedHeadOid: string;
-      expectedBaseOid: string;
-      expectedState: GitHubPullRequestState;
-      expectedIdentityRevision: string;
-      expectedReadinessRevision: string;
-      method: "merge" | "squash" | "rebase";
-    }
-  | {
-      type: "close_pull_request";
-      number: number;
-      expectedHeadOid: string;
-      expectedState: GitHubPullRequestState;
-    }
-  | {
-      type: "reopen_pull_request";
-      number: number;
-      expectedHeadOid: string;
-      expectedState: GitHubPullRequestState;
-    }
-  | {
-      type: "submit_pull_request_review";
-      number: number;
-      expectedHeadOid: string;
-      expectedState: GitHubPullRequestState;
-      event: GitHubPullRequestReviewEvent;
-      body?: string;
-      comments: GitHubPullRequestReviewDraftComment[];
-    }
-  | {
-      type: "reply_review_thread";
-      number: number;
-      expectedHeadOid: string;
-      expectedState: GitHubPullRequestState;
-      threadId: string;
-      body: string;
-    }
-  | {
-      type: "resolve_review_thread";
-      number: number;
-      expectedHeadOid: string;
-      expectedState: GitHubPullRequestState;
-      threadId: string;
-    }
-  | {
-      type: "unresolve_review_thread";
-      number: number;
-      expectedHeadOid: string;
-      expectedState: GitHubPullRequestState;
-      threadId: string;
-    }
-);
-
-export interface GitHubActionResult {
-  repository: GitHubRepository | null;
-  pullRequest?: GitHubPullRequestDetail | null;
-  snapshot?: GitWorkspaceSnapshot | null;
-  message?: string;
 }
 
 function requireGitRuntime(): void {
@@ -754,33 +310,6 @@ function normalizeDiffResult(value: GitDiffResult | string): GitDiffResult {
 
 function normalizeBranchesResult(value: GitBranchesResult | GitBranch[]): GitBranchesResult {
   return Array.isArray(value) ? { branches: value, defaultBranch: null } : value;
-}
-
-function normalizeHistoryResult(value: GitHistoryResult | GitCommit[]): GitHistoryResult {
-  return Array.isArray(value) ? { commits: value, nextCursor: null } : value;
-}
-
-function normalizePullRequestsResult(
-  value: GitHubPullRequestsResult | GitHubPullRequest[],
-  request: GitHubPullRequestsRequest
-): GitHubPullRequestsResult {
-  if (Array.isArray(value)) {
-    return {
-      pullRequests: value,
-      page: request.page,
-      pageSize: request.pageSize,
-      hasMore: false,
-      nextPage: null
-    };
-  }
-  const hasMore = value.hasMore ?? false;
-  return {
-    pullRequests: value.pullRequests,
-    page: value.page ?? request.page,
-    pageSize: value.pageSize ?? request.pageSize,
-    hasMore,
-    nextPage: value.nextPage ?? (hasMore ? request.page + 1 : null)
-  };
 }
 
 export function gitFileHasStagedChange(file: GitFileChange): boolean {
@@ -848,13 +377,6 @@ export function gitTargetKey(target: GitTarget): string {
   return target.member && target.member > 1
     ? `workspace:${target.workspaceId}#${target.member}`
     : `workspace:${target.workspaceId}`;
-}
-
-export async function getGitWorkspaceSnapshot(
-  target: GitTarget
-): Promise<GitWorkspaceSnapshot | null> {
-  requireGitRuntime();
-  return invoke<GitWorkspaceSnapshot | null>("get_git_workspace_snapshot", { target });
 }
 
 export async function getGitWorkspaceSummary(
@@ -931,18 +453,6 @@ export async function releaseConversationWorktree(conversationId: string): Promi
   return invoke<boolean>("release_conversation_worktree", { conversationId });
 }
 
-export async function getGitHistory(
-  target: GitTarget,
-  request: GitHistoryRequest = {}
-): Promise<GitHistoryResult> {
-  requireGitRuntime();
-  const value = await invoke<GitHistoryResult | GitCommit[]>("get_git_history", {
-    target,
-    request
-  });
-  return normalizeHistoryResult(value);
-}
-
 export async function executeGitAction(
   target: GitTarget,
   action: GitAction
@@ -967,107 +477,4 @@ export async function prepareGitDiscard(
     paths,
     includeUntracked
   });
-}
-
-export async function prepareGitStageAll(
-  target: GitTarget
-): Promise<GitStageAllPreparation> {
-  requireGitRuntime();
-  return invoke<GitStageAllPreparation>("prepare_git_stage_all", { target });
-}
-
-export async function prepareGitCommit(
-  target: GitTarget,
-  message: string
-): Promise<GitCommitPreparation> {
-  requireGitRuntime();
-  return invoke<GitCommitPreparation>("prepare_git_commit", { target, message });
-}
-
-export async function getGitHubRepository(
-  target: GitTarget
-): Promise<GitHubRepository | null> {
-  requireGitRuntime();
-  return invoke<GitHubRepository | null>("get_github_repository", { target });
-}
-
-export async function getGitHubPullRequests(
-  target: GitTarget,
-  request: GitHubPullRequestsRequest = { page: 1, pageSize: 30 }
-): Promise<GitHubPullRequestsResult> {
-  requireGitRuntime();
-  const value = await invoke<GitHubPullRequestsResult | GitHubPullRequest[]>(
-    "get_github_pull_requests",
-    {
-      target,
-      page: request.page,
-      pageSize: request.pageSize
-    }
-  );
-  return normalizePullRequestsResult(value, request);
-}
-
-export async function getGitHubPullRequestDetail(
-  target: GitTarget,
-  number: number
-): Promise<GitHubPullRequestDetail> {
-  requireGitRuntime();
-  return invoke<GitHubPullRequestDetail>("get_github_pull_request_detail", {
-    target,
-    number
-  });
-}
-
-export async function getGitHubPullRequestReadiness(
-  target: GitTarget,
-  number: number
-): Promise<GitHubPullRequestReadiness> {
-  requireGitRuntime();
-  return invoke<GitHubPullRequestReadiness>("get_github_pull_request_readiness", {
-    target,
-    number
-  });
-}
-
-export async function getGitHubPullRequestDiff(
-  target: GitTarget,
-  number: number,
-  path?: string
-): Promise<GitHubPullRequestDiff> {
-  requireGitRuntime();
-  return invoke<GitHubPullRequestDiff>("get_github_pull_request_diff", {
-    target,
-    number,
-    path
-  });
-}
-
-export async function getGitHubPullRequestReviewThreads(
-  target: GitTarget,
-  request: GitHubPullRequestReviewThreadsRequest
-): Promise<GitHubPullRequestReviewThreadsResult> {
-  requireGitRuntime();
-  return invoke<GitHubPullRequestReviewThreadsResult>(
-    "get_github_pull_request_review_threads",
-    { target, request }
-  );
-}
-
-export async function getGitHubPullRequestReviewThreadComments(
-  target: GitTarget,
-  request: GitHubPullRequestReviewThreadCommentsRequest
-): Promise<GitHubPullRequestReviewThreadCommentsResult> {
-  requireGitRuntime();
-  return invoke<GitHubPullRequestReviewThreadCommentsResult>(
-    "get_github_pull_request_review_thread_comments",
-    { target, request }
-  );
-}
-
-export async function executeGitHubAction(
-  target: GitTarget,
-  action: GitHubAction
-): Promise<GitHubActionResult> {
-  requireGitRuntime();
-  return invoke<GitHubActionResult>("execute_github_action", { target, action });
 }

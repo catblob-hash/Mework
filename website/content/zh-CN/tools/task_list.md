@@ -18,3 +18,4 @@
 - [agent_spawn](agent_spawn.html)、[followup_task](followup_task.html)
 - [box](box.html) — 未经收取的结果会自行到达
 - [使用 Mework](../working.html#subagents-workflows-and-tasks)
+- [find_output](find_output.html) — 按描述查找某个 `shell:<id>` 行的输出

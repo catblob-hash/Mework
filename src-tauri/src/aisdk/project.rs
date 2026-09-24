@@ -9,6 +9,15 @@
 //! The shape follows installed `@ai-sdk/provider-utils` type definitions because
 //! documentation may diverge from the installed `ai@7` types.
 //!
+//! User messages carry host-owned placeholders instead of attachment content:
+//! an `ImagePart` whose `image` is an image placeholder, and a
+//! `{ type: "mework-file", file: FileAttachment }` part per attached file.
+//! `aisdk::step` hydrates both after taking the wire-ledger copy, so the ledger
+//! and the incremental projection cache never hold base64 or file text; the
+//! file parts become text parts (or plain string content), which is the only
+//! form every provider family — the text-only `claude-agent` transcript
+//! included — accepts for a document.
+//!
 //! ```text
 //! user      { role, content: string | Array<TextPart | ImagePart | FilePart> }
 //! assistant { role, content: string | Array<TextPart | … | ToolCallPart | ToolResultPart> }
@@ -21,7 +30,7 @@
 
 use serde_json::{json, Value};
 
-use crate::model::ImageAttachment;
+use crate::model::{FileAttachment, ImageAttachment};
 use crate::wire_history::{
     canonical_history, CanonicalAssistantTurn, CanonicalHistoryBlock, CanonicalToolExchange,
 };
@@ -59,17 +68,36 @@ pub(crate) fn image_part(image: &ImageAttachment) -> Value {
     })
 }
 
-fn user_message(content: &str, images: &[ImageAttachment]) -> Option<Value> {
+/// File attachment placeholder.
+///
+/// Carries only the attachment's metadata; `step::hydrate_files` replaces it
+/// with the file's text, read and checked from the store, after the wire ledger
+/// has recorded this form. Like image slots, only this part type in a user
+/// message is recognized — never a lookalike nested in model-controlled JSON.
+pub(crate) fn file_part(file: &FileAttachment) -> Value {
+    json!({
+        "type": crate::file_attachments::FILE_PART_TYPE,
+        "file": file,
+    })
+}
+
+fn user_message(
+    content: &str,
+    images: &[ImageAttachment],
+    files: &[FileAttachment],
+) -> Option<Value> {
     let trimmed = content.trim();
-    if trimmed.is_empty() && images.is_empty() {
+    if trimmed.is_empty() && images.is_empty() && files.is_empty() {
         return None;
     }
-    if images.is_empty() {
+    if images.is_empty() && files.is_empty() {
         // Use string content for text-only messages because it is the most widely
         // exercised provider path.
         return Some(json!({ "role": "user", "content": trimmed }));
     }
-    let mut parts = Vec::new();
+    // Documents precede the question: models answer long-context prompts best
+    // when the material comes first and the ask comes last.
+    let mut parts = files.iter().map(file_part).collect::<Vec<_>>();
     if !trimmed.is_empty() {
         parts.push(json!({ "type": "text", "text": trimmed }));
     }
@@ -305,8 +333,12 @@ fn assistant_messages(family: Family, turn: &CanonicalAssistantTurn, out: &mut V
 /// protocol requirement, so cached projections compose with `Vec::extend`.
 pub(crate) fn project_block(family: Family, block: &CanonicalHistoryBlock, out: &mut Vec<Value>) {
     match block {
-        CanonicalHistoryBlock::User { content, images } => {
-            out.extend(user_message(content, images));
+        CanonicalHistoryBlock::User {
+            content,
+            images,
+            files,
+        } => {
+            out.extend(user_message(content, images, files));
         }
         CanonicalHistoryBlock::Assistant(turn) => assistant_messages(family, turn, out),
         CanonicalHistoryBlock::HostDelivery(delivery) => {
@@ -369,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_plain_user_turn_projects_as_a_string_content() {
-        let message = user_message("你好", &[]).expect("非空用户消息");
+        let message = user_message("你好", &[], &[]).expect("非空用户消息");
         assert_eq!(message["role"], "user");
         // Text-only messages use string content because it is the most exercised
         // provider path.
@@ -379,7 +411,67 @@ mod tests {
     #[test]
     fn an_empty_user_turn_projects_to_nothing() {
         // Empty user messages must not reach upstream providers, which may reject them.
-        assert!(user_message("   ", &[]).is_none());
+        assert!(user_message("   ", &[], &[]).is_none());
+    }
+
+    fn file(name: &str) -> FileAttachment {
+        FileAttachment {
+            id: format!("{:064x}", name.len()),
+            name: name.into(),
+            format: crate::model::FileAttachmentFormat::Text,
+            bytes: 1,
+            tokens: 1,
+            pages: None,
+        }
+    }
+
+    fn image() -> ImageAttachment {
+        ImageAttachment {
+            id: "c".repeat(64),
+            name: "shot.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            short_id: None,
+        }
+    }
+
+    /// Files come first, then the question, then images; the file parts are
+    /// the metadata-only placeholders the ledger records.
+    #[test]
+    fn attachments_project_as_placeholders_before_the_question() {
+        let files = [file("a.md"), file("bb.pdf")];
+        let message = user_message(" 比较一下 ", &[image()], &files).expect("非空用户消息");
+        let parts = message["content"].as_array().expect("带附件时是数组");
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], json!({ "type": "mework-file", "file": files[0] }));
+        assert_eq!(parts[1], json!({ "type": "mework-file", "file": files[1] }));
+        assert_eq!(parts[2], json!({ "type": "text", "text": "比较一下" }));
+        assert_eq!(parts[3]["type"], "image");
+    }
+
+    #[test]
+    fn a_file_alone_is_a_message() {
+        let message = user_message("", &[], &[file("a.md")]).expect("只有文件也是消息");
+        let parts = message["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "mework-file");
+    }
+
+    #[test]
+    fn a_user_context_carries_its_files_through_the_canonical_fold() {
+        let contexts = vec![crate::model::ContextItem::User {
+            id: "u1".into(),
+            content: "看看".into(),
+            images: Vec::new(),
+            files: vec![file("a.md")],
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let messages = project_messages(Family::Anthropic, &contexts);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"][0]["type"], "mework-file");
+        assert_eq!(messages[0]["content"][1]["text"], "看看");
     }
 
     #[test]

@@ -33,7 +33,7 @@ export interface WorkflowProgressMessages {
   progressLabel: (done: number, total: number) => string;
 }
 
-export const defaultWorkflowProgressMessages: WorkflowProgressMessages = {
+const defaultWorkflowProgressMessages: WorkflowProgressMessages = {
   fallbackStepLabel: (index) => `步骤 ${index + 1}`,
   unphasedHeading: "未分组",
   cachedBadge: "已缓存",

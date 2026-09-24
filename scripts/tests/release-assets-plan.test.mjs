@@ -3,7 +3,6 @@ import test from "node:test";
 
 import {
   formatSha256Sums,
-  parseSha256Sums,
   releaseAssetNames
 } from "../release-assets-plan.mjs";
 
@@ -39,45 +38,4 @@ test("rejects invalid checksums and unsafe asset names", () => {
       /asset name/u
     );
   }
-});
-
-test("parses GNU separators, CRLF, comments, and blank lines", () => {
-  assert.deepEqual(
-    parseSha256Sums([
-      "# Release checksums",
-      "",
-      `${SHA_A}  installer.exe`,
-      `${SHA_B} *portable.zip`,
-      ""
-    ].join("\r\n")),
-    [
-      { name: "installer.exe", sha256: SHA_A.toLowerCase() },
-      { name: "portable.zip", sha256: SHA_B }
-    ]
-  );
-});
-
-test("rejects malformed SHA256SUMS lines", () => {
-  for (const text of [
-    `${SHA_B} portable.zip`,
-    `${SHA_B}  name with spaces.zip`,
-    `${"x".repeat(64)}  portable.zip`,
-    "not a checksum"
-  ]) {
-    assert.throws(() => parseSha256Sums(text), /Malformed SHA256SUMS line/u);
-  }
-});
-
-test("round-trips formatted checksum entries", () => {
-  const entries = [
-    { name: "Mework_1.2.3_x64_portable.zip", sha256: SHA_B },
-    { name: "Mework_1.2.3_x64-setup.exe", sha256: SHA_A }
-  ];
-  assert.deepEqual(
-    parseSha256Sums(formatSha256Sums(entries)),
-    [
-      { name: "Mework_1.2.3_x64-setup.exe", sha256: SHA_A.toLowerCase() },
-      { name: "Mework_1.2.3_x64_portable.zip", sha256: SHA_B }
-    ]
-  );
 });

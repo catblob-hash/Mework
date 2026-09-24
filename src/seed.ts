@@ -5,6 +5,7 @@ import type {
   ConversationPreset,
   ConversationWebSearchSettings,
   ModelProfile,
+  ShellBackend,
   ToolDescriptor
 } from "./types";
 import { NATIVE_FETCH_TOOLS, NATIVE_SEARCH_TOOLS } from "./types";
@@ -20,7 +21,8 @@ import {
   CLAUDE_AGENT_REGISTRY
 } from "./lib/claudeAgentProvider";
 import { CODEX_PROVIDER_FAMILY, CODEX_PROVIDER_NAME } from "./lib/codexProvider";
-import { isDecisionToolName, isHostDerivedToolName, isPreviewToolName } from "./lib/taskTools";
+import { backendOfTool, knownShells, preferredBackend } from "./lib/machineShells";
+import { isDecisionToolName, isHostDerivedToolName } from "./lib/taskTools";
 import { createId } from "./lib/id";
 
 export const toolCatalog: ToolDescriptor[] = [
@@ -840,10 +842,43 @@ function seedAgentDefinition(
   };
 }
 
+/**
+ * The one shell a fresh install's presets turn on: this machine's most
+ * preferred. The host probes for it at first launch
+ * (`storage::seed_local_shell`); this seed, which has no probe to ask, reads
+ * the OS off the platform string and takes that OS's first shell.
+ */
+function seedShellBackend(platform: string): ShellBackend {
+  const { os, backends } = knownShells(null, {}, platform);
+  return (os ? preferredBackend(os, backends) : null) ?? backends[0] ?? "bash";
+}
+
+/**
+ * Everything in the catalog except the names the host derives for itself, the
+ * decision-model tools, and every shell but `shell`. Mirrors
+ * `catalog.rs::seed_preset_enabled_tools` narrowed by
+ * `storage::seed_local_shell`.
+ *
+ * The memory tools follow the two memory switches, `skill` follows
+ * `skillToolEnabled`, the two web tools follow `webSearchEnabled`, and the task
+ * tools appear once something can produce a task, so none of them is named
+ * here. The decision-model tools are withheld because none works until the
+ * TypeSafe key is set.
+ */
+function seedPresetEnabledTools(tools: readonly ToolDescriptor[], shell: ShellBackend): string[] {
+  return tools
+    .map((tool) => tool.name)
+    .filter((name) => {
+      if (isHostDerivedToolName(name) || isDecisionToolName(name)) return false;
+      const backend = backendOfTool(name);
+      return backend === null || backend === shell;
+    });
+}
+
 function seedPreset(
   id: string,
   name: string,
-  tools: readonly ToolDescriptor[],
+  enabledTools: string[],
   templateId: string,
   webSearch: ConversationWebSearchSettings,
   agentDefinitions: AgentDefinition[]
@@ -858,25 +893,7 @@ function seedPreset(
     settings: {
       // The host has no default prompt of its own; a fresh conversation sends
       // only its capability sections until the user writes one.
-      // Everything except the names the host derives for itself: the memory
-      // tools follow the two memory switches, `skill` follows `skillToolEnabled`,
-      // the two web tools follow `webSearchEnabled`, and the task tools appear
-      // once something can produce a task.
-      // `preview_*` and `workflow` are withheld separately: nothing strips or
-      // re-derives them, so they would really persist. A first conversation
-      // should not open a dev server or an orchestration pool by itself, and
-      // both are one toggle away in the picker. The decision-model tools are
-      // withheld for a third reason: none works until the TypeSafe key is set.
-      // Mirrors the extra three clauses in `catalog.rs::seed_preset_enabled_tools`.
-      enabledTools: tools
-        .map((tool) => tool.name)
-        .filter(
-          (name) =>
-            !isHostDerivedToolName(name)
-            && !isPreviewToolName(name)
-            && !isDecisionToolName(name)
-            && name !== "workflow"
-        ),
+      enabledTools,
       toolDescriptionFileId: null,
       agentDefinitions,
       // Every child is one of the three named roles, so the model cannot route
@@ -894,8 +911,10 @@ function seedPreset(
       // which of the two web tools that grants follows the resolved backend.
       webSearchEnabled: true,
       securityLevel: "request_approval",
-      globalMemoryEnabled: false,
-      projectMemoryEnabled: false,
+      // Every tool but the decision-model ones is on, and the memory tools are
+      // switched by these two rather than named in the list.
+      globalMemoryEnabled: true,
+      projectMemoryEnabled: true,
       // Both capability surfaces load on demand rather than inlining every
       // selected body and every MCP schema into the system prompt.
       skillToolEnabled: true,
@@ -915,8 +934,10 @@ function seedPreset(
  * so the Claude Code preset ships no fetch backend at all. */
 function seedPresets(
   providers: readonly ApiProvider[],
-  tools: readonly ToolDescriptor[]
+  tools: readonly ToolDescriptor[],
+  platform: string
 ): ConversationPreset[] {
+  const enabledTools = () => seedPresetEnabledTools(tools, seedShellBackend(platform));
   const providerId = (family: string) =>
     providers.find((provider) => provider.family === family)?.id ?? "";
   const codex = providerId(CODEX_PROVIDER_FAMILY);
@@ -941,7 +962,7 @@ function seedPresets(
     excludeDomains: []
   });
   return [
-    seedPreset(CODEX_PRESET_ID, "Codex", tools, CODEX_TEMPLATE_ID, webSearch({ kind: "native" }), [
+    seedPreset(CODEX_PRESET_ID, "Codex", enabledTools(), CODEX_TEMPLATE_ID, webSearch({ kind: "native" }), [
       seedAgentDefinition("sol", codex, "gpt-5.6-sol"),
       seedAgentDefinition("terra", codex, "gpt-5.6-terra"),
       seedAgentDefinition("luna", codex, "gpt-5.6-luna")
@@ -949,7 +970,7 @@ function seedPresets(
     seedPreset(
       CLAUDE_CODE_PRESET_ID,
       "Claude Code",
-      tools,
+      enabledTools(),
       CLAUDE_CODE_TEMPLATE_ID,
       webSearch({ kind: "native" }),
       [
@@ -961,7 +982,9 @@ function seedPresets(
   ];
 }
 
-export const createSeedDocument = (): AppDocument => {
+export const createSeedDocument = (
+  platform: string = globalThis.navigator?.platform ?? ""
+): AppDocument => {
   const tools = freshToolCatalog();
   const now = new Date().toISOString();
   const apiProviders = seedProviders();
@@ -975,7 +998,7 @@ export const createSeedDocument = (): AppDocument => {
       appLanguage: "auto",
       resolvedAppLanguage: "zh-CN",
       theme: "system",
-      conversationPresets: seedPresets(apiProviders, tools),
+      conversationPresets: seedPresets(apiProviders, tools, platform),
       // Storage refuses an empty default once presets exist, so this is written
       // explicitly rather than left to the normalizer's first-preset fallback.
       defaultConversationPresetId: CLAUDE_CODE_PRESET_ID,

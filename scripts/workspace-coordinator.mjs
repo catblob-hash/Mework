@@ -18,7 +18,7 @@ import {
 import { createServer } from "node:net";
 import path from "node:path";
 
-export const WORKSPACE_COORDINATOR_PROTOCOL = "mework-workspace-coordinator-v2";
+const WORKSPACE_COORDINATOR_PROTOCOL = "mework-workspace-coordinator-v2";
 
 // BSD `open(2)` flag that takes an exclusive `flock` atomically with the open.
 // Node does not export it; the value is fixed by macOS's <sys/fcntl.h>.
@@ -70,7 +70,9 @@ function assertOrdinaryDirectoryIfPresent(directory) {
   }
 }
 
-export function workspaceMutexListenCandidates(workspaceRoot, directory) {
+// Exactly one endpoint per platform: contenders that could fall back to different
+// endpoints would each hold "the" mutex on their own.
+export function workspaceMutexEndpoint(workspaceRoot, directory) {
   const normalizedRoot = path.resolve(workspaceRoot);
   const normalizedDirectory = path.resolve(directory);
   const physicalRoot = realpathSync.native(normalizedRoot);
@@ -83,16 +85,16 @@ export function workspaceMutexListenCandidates(workspaceRoot, directory) {
     : `${physicalRoot}\0${physicalDirectory}`;
   const token = createHash("sha256").update(identity, "utf8").digest("hex");
   if (process.platform === "win32") {
-    return [{
+    return {
       path: `\\\\.\\pipe\\mework-workspace-coordinator-${token}`,
       exclusive: true
-    }];
+    };
   }
   if (process.platform === "linux") {
-    return [{
+    return {
       path: `\0mework-workspace-coordinator-${token}`,
       exclusive: true
-    }];
+    };
   }
   if (process.platform === "darwin") {
     // macOS has neither named pipes nor abstract sockets, and a socket file
@@ -100,10 +102,10 @@ export function workspaceMutexListenCandidates(workspaceRoot, directory) {
     // property the other two endpoints provide: the kernel releases it when the
     // descriptor closes, including when its process dies. It lives under the
     // physical root so every alias of the workspace contends for one file.
-    return [{
+    return {
       path: path.join(physicalRoot, ".codex-tmp", `.workspace-mutex-${token}.lock`),
       lockFile: true
-    }];
+    };
   }
   throw new Error("当前平台不支持 Mework 工作区协调 mutex");
 }
@@ -165,21 +167,18 @@ async function tryAcquireWorkspaceMutex(workspaceRoot, directory) {
   const keepAlive = setInterval(() => {}, 1_000);
   let keepAliveTransferred = false;
   try {
-    const candidates = workspaceMutexListenCandidates(workspaceRoot, directory);
-    for (let index = 0; index < candidates.length; index += 1) {
-      const attempt = candidates[index].lockFile
-        ? tryLockWorkspaceMutexFile(candidates[index].path)
-        : await tryListenWorkspaceMutex(candidates[index]);
-      if (attempt.mutex) {
-        keepAliveTransferred = true;
-        return { ...attempt.mutex, keepAlive };
-      }
-      if (attempt.errorCode === "EADDRINUSE") return null;
-      throw new Error(
-        `无法绑定工作区协调 mutex：${attempt.errorCode ?? "unknown"}`
-      );
+    const endpoint = workspaceMutexEndpoint(workspaceRoot, directory);
+    const attempt = endpoint.lockFile
+      ? tryLockWorkspaceMutexFile(endpoint.path)
+      : await tryListenWorkspaceMutex(endpoint);
+    if (attempt.mutex) {
+      keepAliveTransferred = true;
+      return { ...attempt.mutex, keepAlive };
     }
-    throw new Error("没有可用的工作区协调 mutex 端点");
+    if (attempt.errorCode === "EADDRINUSE") return null;
+    throw new Error(
+      `无法绑定工作区协调 mutex：${attempt.errorCode ?? "unknown"}`
+    );
   } finally {
     if (!keepAliveTransferred) clearInterval(keepAlive);
   }

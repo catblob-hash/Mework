@@ -57,7 +57,7 @@ function isObject(value: unknown): value is JsonObject {
 
 /** Provider-options key under which the host tags a replayed reasoning part with
  * the model that produced it. Mirrors `wire_history::REPLAY_TAG_KEY`. */
-export const REPLAY_TAG_KEY = "mework";
+const REPLAY_TAG_KEY = "mework";
 
 /** Placeholder Claude Code inserts when a repair empties an assistant message. */
 const NO_CONTENT_PLACEHOLDER = "(no content)";
@@ -278,7 +278,7 @@ function tolerateFrame(frame: JsonObject): boolean | null {
 }
 
 /** Normalizes one SSE line, returning the same string when no change is needed. */
-export function normalizeAnthropicSseLine(line: string): string | null {
+function normalizeAnthropicSseLine(line: string): string | null {
   if (!line.startsWith("data:")) return line;
   const payload = line.slice("data:".length).trim();
   if (payload.length === 0 || payload === "[DONE]") return line;
@@ -542,7 +542,7 @@ function rewriteAdaptiveThinking(body: unknown): boolean {
 }
 
 /** Return the original text unless its thinking form needs adaptation. */
-export function rewriteAdaptiveThinkingBody(text: string): string {
+function rewriteAdaptiveThinkingBody(text: string): string {
   // Avoid parsing bodies that cannot contain an adaptive thinking request.
   if (!text.includes("adaptive")) return text;
   let body: unknown;
@@ -585,10 +585,10 @@ export function dropUnsignedReasoning(messages: unknown[]): void {
 // ------------------------------------------------------------ Betas
 
 /** Claude Code's interleaved-thinking beta; sent for every model that supports it. */
-export const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
+const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
 
 /** Claude Code's `avt`: every model except Claude 3 and Haiku 4.5 supports interleaved thinking. */
-export function supportsInterleavedThinking(modelId: string): boolean {
+function supportsInterleavedThinking(modelId: string): boolean {
   const id = modelId.toLowerCase();
   return !id.includes("claude-3") && !id.includes("haiku-4-5") && !id.includes("haiku-4.5");
 }
@@ -616,7 +616,7 @@ function setBetas(headers: Headers, betas: string[]): void {
  * `DISABLE_PROMPT_CACHING*` environment; Mework keeps that decision on the
  * model profile and sends it here.
  */
-export interface PromptCacheOptions {
+interface PromptCacheOptions {
   /** `false` turns every breakpoint off. Absent means enabled. */
   enabled?: boolean;
   /**
@@ -824,7 +824,7 @@ type CoverageVerdict =
  * the count; the first healthy turn that shows any cache traffic confirms the
  * endpoint honors markers. Three consecutive large uncached turns fire once.
  */
-export function classifyCacheCoverage(key: string, usage: JsonObject): CoverageVerdict {
+function classifyCacheCoverage(key: string, usage: JsonObject): CoverageVerdict {
   const existing = coverageStates.get(key);
   if (existing?.fired) return { kind: "already_fired" };
   const number = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
@@ -898,11 +898,6 @@ interface HealLatch {
 }
 
 const healLatches = new Map<string, HealLatch>();
-
-/** Forget every learned repair; tests use it between discriminators. */
-export function resetAnthropicHealLatches(): void {
-  healLatches.clear();
-}
 
 function requestUrlOf(input: Parameters<typeof globalThis.fetch>[0]): string {
   try {
@@ -1153,7 +1148,7 @@ function heal(body: JsonObject, headers: Headers, latch: HealLatch, message: str
  * `onWire` reports what left for the endpoint, so the response layer can judge
  * cache coverage against it.
  */
-export function anthropicSelfHealFetch(
+function anthropicSelfHealFetch(
   inner: typeof globalThis.fetch = globalThis.fetch,
   cache: PromptCacheOptions = {},
   onWire?: (context: { key: string; breakpoints: boolean }) => void,

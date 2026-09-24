@@ -201,6 +201,7 @@ impl ProgressLedger {
         }
     }
 
+    #[cfg(test)]
     pub fn rows(&self) -> &[ProgressRow] {
         &self.rows
     }

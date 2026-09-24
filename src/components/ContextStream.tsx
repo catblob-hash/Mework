@@ -18,7 +18,8 @@ import {
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
-import type { AssistantContext, ContextItem, ImageAttachment, InsertableContextKind, JsonObject, SystemContext, ToolContext, ToolDescriptor, UserContext } from "../types";
+import type { AssistantContext, ContextItem, FileAttachment, ImageAttachment, InsertableContextKind, JsonObject, SystemContext, ToolContext, ToolDescriptor, UserContext } from "../types";
+import type { AddMessageAttachments } from "../lib/fileAttachments";
 import type { ContextBranchNavigation } from "../lib/conversationBranches";
 import { turnAnchorIndex } from "../lib/conversationTurns";
 import type { ConversationTurn } from "../lib/conversationTurns";
@@ -105,17 +106,15 @@ export interface ContextStreamProps {
   editor?: TimelineEditorState | null;
   questionEditor?: TimelineQuestionEditorState | null;
   onCancelEdit?: () => void;
-  onSaveText?: (content: string, images?: ImageAttachment[]) => void;
+  onSaveText?: (content: string, images?: ImageAttachment[], files?: FileAttachment[]) => void;
   /**
-   * Takes images pasted into a user message being written or edited, and
-   * returns the ones that were accepted, numbered. Absent when this surface's
-   * model has no image input — which is what keeps the paste from happening at
-   * all, rather than letting it land where the model cannot read it.
+   * Attaches files picked, pasted or dropped into a user message being written
+   * or edited, and returns what was accepted (images numbered) and what was
+   * turned away. Absent where nothing can be attached.
    */
-  onPasteImages?: (
-    files: File[],
-    existing: readonly ImageAttachment[]
-  ) => Promise<ImageAttachment[]>;
+  onAddAttachments?: AddMessageAttachments;
+  /** Whether this surface's model can see images, which decides how a drag of pictures reads. */
+  attachmentImageInput?: boolean;
   onSaveTool?: (toolName: string, input: JsonObject) => Promise<unknown>;
   onSaveToolEdit?: (input: JsonObject, output: string, images: ImageAttachment[]) => Promise<unknown>;
   onSaveQuestion?: (input: JsonObject, answerContent?: string) => void | Promise<void>;
@@ -201,7 +200,8 @@ const contextMeta: Record<InsertableContextKind, {
 function contextVisualLength(item: ContextItem | undefined): number {
   if (!item) return 0;
   if (item.kind === "tool") return item.result.output.length + (item.result.diff?.length ?? 0) + (item.result.images?.length ?? 0) * 200;
-  return (item.content?.length ?? 0) + (item.kind === "user" ? (item.images?.length ?? 0) * 200 : 0);
+  return (item.content?.length ?? 0)
+    + (item.kind === "user" ? ((item.images?.length ?? 0) + (item.files?.length ?? 0)) * 200 : 0);
 }
 
 /** The one line a collapsed system-prompt row shows of the prompt it holds. */
@@ -210,26 +210,20 @@ function firstProseLine(content: string): string | undefined {
 }
 
 function ContextActions({
-  item,
   onEdit,
   onDelete,
-  allowEdit = true,
   disabled = false
 }: {
-  item: ContextItem;
   onEdit: () => void;
   onDelete: () => void;
-  allowEdit?: boolean;
   disabled?: boolean;
 }) {
   const { t } = useI18n();
   return (
     <div className="context-actions">
-      {allowEdit && (
-        <IconButton label={t("编辑上下文", "Edit context")} onClick={onEdit} disabled={disabled}>
-          <Pencil size={14} />
-        </IconButton>
-      )}
+      <IconButton label={t("编辑上下文", "Edit context")} onClick={onEdit} disabled={disabled}>
+        <Pencil size={14} />
+      </IconButton>
       <IconButton label={t("删除上下文", "Delete context")} onClick={onDelete} disabled={disabled}>
         <Trash2 size={14} />
       </IconButton>
@@ -363,7 +357,8 @@ const ContextCard = memo(function ContextCard({
   editing,
   onCancelEdit,
   onSaveText,
-  onPasteImages,
+  onAddAttachments,
+  attachmentImageInput,
   onEditItem,
   onDeleteItem,
   onBranchFromItem,
@@ -381,11 +376,9 @@ const ContextCard = memo(function ContextCard({
   mutationReadOnly: boolean;
   editing: boolean;
   onCancelEdit?: () => void;
-  onSaveText?: (content: string, images?: ImageAttachment[]) => void;
-  onPasteImages?: (
-    files: File[],
-    existing: readonly ImageAttachment[]
-  ) => Promise<ImageAttachment[]>;
+  onSaveText?: (content: string, images?: ImageAttachment[], files?: FileAttachment[]) => void;
+  onAddAttachments?: AddMessageAttachments;
+  attachmentImageInput?: boolean;
   onEditItem?: (item: ContextItem) => void;
   onDeleteItem?: (item: ContextItem) => void;
   onBranchFromItem?: (item: ContextItem) => void;
@@ -435,9 +428,11 @@ const ContextCard = memo(function ContextCard({
         kind={item.kind}
         content={item.content ?? ""}
         images={item.kind === "user" ? item.images : undefined}
+        files={item.kind === "user" ? item.files : undefined}
         onCancel={onCancelEdit!}
         onSave={onSaveText!}
-        onPasteImages={item.kind === "user" ? onPasteImages : undefined}
+        onAddAttachments={item.kind === "user" ? onAddAttachments : undefined}
+        imageInput={attachmentImageInput}
       />
     );
   }
@@ -517,7 +512,9 @@ const ContextCard = memo(function ContextCard({
         </TimelineRow>
       )}
 
-      {item.kind === "user" && !editingInPlace && <ImageStrip images={item.images} className="context-card__images" />}
+      {item.kind === "user" && !editingInPlace && (
+        <ImageStrip images={item.images} files={item.files} className="context-card__images" />
+      )}
       {!editingInPlace && !promptCard && (item.kind === "assistant" || Boolean(displayContent)) && (
         <div className="context-card__content" aria-live={assistantStreaming ? "polite" : undefined}>
           {item.kind === "assistant" || renderUserMarkdown
@@ -526,9 +523,11 @@ const ContextCard = memo(function ContextCard({
                 content={displayContent}
                 deferOffscreen={deferOffscreen}
                 streaming={assistantStreaming}
-                // Only model output is scanned for paths. User text keeps
-                // rendering exactly what was typed, Markdown preference or not.
+                // Only model output is scanned for paths and has its HTML
+                // rendered. User text keeps rendering exactly what was typed,
+                // Markdown preference or not.
                 linkifyPaths={item.kind === "assistant"}
+                renderHtml={item.kind === "assistant"}
                 pathBaseDir={pathBaseDir}
               />
             )
@@ -567,7 +566,6 @@ const ContextCard = memo(function ContextCard({
       {item.kind === "assistant" && !editingInPlace && showMutationActions && (
         <div className="context-card__footer-actions">
           <ContextActions
-            item={item}
             onEdit={onEdit}
             onDelete={onDelete}
             disabled={mutationReadOnly || assistantStreaming}
@@ -678,15 +676,13 @@ function ContextSubmenu({ label, scrollable = false, children }: {
  * they are the same editor inside the same card or row — a separate "add" form
  * would be a second place to learn, and a second place for the two to drift.
  */
-function TimelineInsertEditor({ editor, tools, onCancel, onSaveText, onPasteImages, onSaveTool, onSaveToolEdit }: {
+function TimelineInsertEditor({ editor, tools, onCancel, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit }: {
   editor: Extract<TimelineEditorState, { mode: "insert" }>;
   tools: ToolDescriptor[];
   onCancel: () => void;
-  onSaveText?: (content: string, images?: ImageAttachment[]) => void;
-  onPasteImages?: (
-    files: File[],
-    existing: readonly ImageAttachment[]
-  ) => Promise<ImageAttachment[]>;
+  onSaveText?: (content: string, images?: ImageAttachment[], files?: FileAttachment[]) => void;
+  onAddAttachments?: AddMessageAttachments;
+  attachmentImageInput?: boolean;
   onSaveTool?: (toolName: string, input: JsonObject) => Promise<unknown>;
   onSaveToolEdit?: (input: JsonObject, output: string, images: ImageAttachment[]) => Promise<unknown>;
 }) {
@@ -736,7 +732,8 @@ function TimelineInsertEditor({ editor, tools, onCancel, onSaveText, onPasteImag
       showKind={editor.kind === "user"}
       onCancel={onCancel}
       onSave={onSaveText}
-      onPasteImages={editor.kind === "user" ? onPasteImages : undefined}
+      onAddAttachments={editor.kind === "user" ? onAddAttachments : undefined}
+      imageInput={attachmentImageInput}
     />
   );
   // Reasoning and the system prompt live inside rows, so they are edited as
@@ -797,7 +794,7 @@ function renderNodeContextIds(node: ContextRenderNode): string[] {
   return node.entries.map((entry) => entry.item.id);
 }
 
-export const ContextStream = memo(function ContextStream({ contexts, turns = [], tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, ariaLabel, pendingQuestionId, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onPasteImages, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
+export const ContextStream = memo(function ContextStream({ contexts, turns = [], tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, ariaLabel, pendingQuestionId, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
   const { t } = useI18n();
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -969,7 +966,8 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
         tools={tools}
         onCancel={onCancelEdit}
         onSaveText={onSaveText}
-        onPasteImages={onPasteImages}
+        onAddAttachments={onAddAttachments}
+        attachmentImageInput={attachmentImageInput}
         onSaveTool={onSaveTool}
         onSaveToolEdit={onSaveToolEdit}
       />
@@ -1159,7 +1157,8 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
           editing={editingContextId === node.item.id}
           onCancelEdit={onCancelEdit}
           onSaveText={onSaveText}
-          onPasteImages={onPasteImages}
+          onAddAttachments={onAddAttachments}
+          attachmentImageInput={attachmentImageInput}
           onEditItem={onEdit}
           onDeleteItem={onDelete}
           onBranchFromItem={onBranchFrom}

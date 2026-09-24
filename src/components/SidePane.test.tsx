@@ -70,25 +70,6 @@ describe("SidePane", () => {
     expect(slot.nextElementSibling).toHaveClass("side-pane__controls");
   });
 
-  it("takes the close label from the caller", () => {    render(
-      <SidePane id="tasks" title="任务" closeLabel="收起任务" onClose={() => undefined}>
-        <p>列表</p>
-      </SidePane>
-    );
-
-    expect(screen.getByRole("button", { name: "收起任务" })).toBeInTheDocument();
-  });
-
-  it("omits the close button when the pane may not be closed", () => {
-    render(
-      <SidePane id="review" title="审阅" hideClose onClose={() => undefined}>
-        <p>差异</p>
-      </SidePane>
-    );
-
-    expect(screen.queryByRole("button", { name: "关闭面板" })).not.toBeInTheDocument();
-  });
-
   it("puts trailing controls before the close button", () => {
     render(
       <SidePane
@@ -234,31 +215,6 @@ describe("SidePane", () => {
     const labels = [...container.querySelectorAll(".side-pane__controls button")]
       .map((button) => button.textContent || button.getAttribute("aria-label"));
     expect(labels).toEqual(["自定义", "任务 设置", "展开", "关闭面板"]);
-  });
-
-  /**
-   * The browser pane's body is a native child window that paints above the renderer, so its own
-   * menu is only visible where the host has been told to cut a hole.
-   */
-  it("publishes the pane menu rectangle while it is open and clears it on close", async () => {
-    const user = userEvent.setup();
-    const onMenuRectChange = vi.fn();
-    render(
-      <SidePane
-        id="preview:a" title="预览" onClose={vi.fn()} onMenuRectChange={onMenuRectChange}
-        menuSections={[{ id: "s", items: [{ id: "a", label: "保存屏幕截图" }] }]}
-      ><p>内容</p></SidePane>
-    );
-    expect(onMenuRectChange).not.toHaveBeenCalled();
-
-    await user.click(screen.getByRole("button", { name: "预览 设置" }));
-    expect(onMenuRectChange).toHaveBeenCalledWith(
-      expect.objectContaining({ x: expect.any(Number), y: expect.any(Number), width: expect.any(Number), height: expect.any(Number) })
-    );
-
-    onMenuRectChange.mockClear();
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onMenuRectChange).toHaveBeenLastCalledWith(null);
   });
 
   it("draws no pane menu for a pane that contributes no rows", () => {
