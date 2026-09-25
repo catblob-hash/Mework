@@ -390,42 +390,12 @@ export interface ConversationSettings {
    */
   mcpToolDiscoveryEnabled: boolean;
   /**
-   * How each tool with a decision-model form takes it, keyed by tool name
-   * (`DECISION_PARAMETER_TOOL_NAMES`). A tool with no entry keeps its direct
-   * parameters only; `augment` adds its decision parameters beside them —
-   * `query`, plus `threshold` on the tools that score rather than choose;
-   * `replace` withdraws the direct targeting parameters, so every call goes
-   * through the decision model. Absent on documents written before the field
-   * existed, which means no entries.
-   */
-  decisionParameterModes?: DecisionParameterModes;
-  /**
-   * The element tools (`MISS_SCORING_TOOL_NAMES`) whose "none of the above"
-   * goes on to score every element line the decision model was shown, each
-   * against the description on its own, and hands the lines back ranked by
-   * that score instead of as a plain list. Only a tool with a decision-
-   * parameter mode can miss, so an entry for one without is inert. No schema
-   * changes with it, so the tool lock has no part in it. Absent on documents
-   * written before the field existed, which means no entries.
-   */
-  decisionMissScoring?: string[];
-  /**
-   * The sub-option choices of the tools this conversation has switched off,
-   * keyed by the row the settings draw for the tool (`preview_click`,
-   * `preview_logs`, `bash`, …), so switching a tool back on returns it to the
-   * decision-model form, and the miss scoring, it had. Renderer state: the host
-   * never reads it, since a tool that is off takes no form, and
-   * `decisionParameterModes` with `decisionMissScoring` stay the only answer
-   * for the tools that are on. Absent means nothing is remembered.
-   */
-  rememberedDecisionForms?: RememberedDecisionForms;
-  /**
    * The rows each tool family (`files`, `shell`, `preview`) had on when the
    * family was switched off as a whole, keyed by family, so switching the
    * family back on returns to them. A family with no entry has nothing to
    * return to, and switching it on asks which of its tools to use. Renderer
-   * state like `rememberedDecisionForms`: the host keeps it but never reads
-   * it. Absent means nothing is remembered.
+   * state: the host keeps it but never reads it. Absent means nothing is
+   * remembered.
    */
   rememberedToolFamilies?: RememberedToolFamilies;
   /**
@@ -446,20 +416,6 @@ export interface ConversationSettings {
    */
   toolLock?: ConversationToolLock;
 }
-
-/** How one tool takes its decision-model form. See `ConversationSettings.decisionParameterModes`. */
-export type DecisionParameterMode = "augment" | "replace";
-
-export type DecisionParameterModes = Partial<Record<string, DecisionParameterMode>>;
-
-/** One switched-off tool's sub-option choices. See `ConversationSettings.rememberedDecisionForms`. */
-export interface RememberedDecisionForm {
-  form: DecisionParameterMode;
-  /** Only on the element tools that score their misses (`MISS_SCORING_TOOL_NAMES`). */
-  missScoring?: boolean;
-}
-
-export type RememberedDecisionForms = Partial<Record<string, RememberedDecisionForm>>;
 
 /** Each switched-off tool family's rows. See `ConversationSettings.rememberedToolFamilies`. */
 export type RememberedToolFamilies = Partial<Record<string, string[]>>;
@@ -518,15 +474,6 @@ export interface ConversationToolLock {
   searchProvider: SearchProviderSelection | null;
   /** The backend that has fetched pages here, pinned for the same reason. `null` while no run has granted `web_fetch` at all. */
   fetchProvider: FetchProviderSelection | null;
-  /**
-   * The decision-parameter mode each exposed tool's schema has covered so
-   * far. A tool in `tools` with no entry went out with its direct parameters
-   * only. A floor rather than a pin: it widens (direct and `replace` together
-   * make `augment`) but never narrows, because calls of every shape it covered
-   * may already be in the transcript. Absent on locks written before the field
-   * existed, which means no entries.
-   */
-  decisionParameterModes?: DecisionParameterModes;
 }
 
 /** The reusable subset of conversation settings owned by a conversation preset. */
@@ -558,10 +505,6 @@ export interface ConversationPresetSettings {
   skillToolEnabled: boolean;
   /** MCP tool-discovery template copied into conversations. */
   mcpToolDiscoveryEnabled: boolean;
-  /** Decision-parameter template copied into conversations; absent means no entries. */
-  decisionParameterModes?: DecisionParameterModes;
-  /** Miss-scoring template copied into conversations; absent means no entries. */
-  decisionMissScoring?: string[];
   /** Sandbox template copied into conversations; absent means off. */
   sandbox?: SandboxSettings;
 }
@@ -1995,7 +1938,6 @@ export type SettingsView =
   | "appearance"
   | "providers"
   | "search_providers"
-  | "decision_providers"
   | "mcp"
   | "skills"
   | "shortcuts"

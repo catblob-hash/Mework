@@ -9,15 +9,6 @@ import type {
   SandboxSettings,
   ToolDescriptor
 } from "../types";
-import {
-  decisionMissScoringFor,
-  decisionModesFor,
-  flooredDecisionParameterModes,
-  normalizeDecisionMissScoring,
-  normalizeDecisionParameterModes,
-  sameDecisionMissScoring,
-  sameDecisionParameterModes
-} from "./decisionParameters";
 import { defaultConversationWebSearchSettings, defaultSandboxSettings } from "./runtime";
 import { isHostDerivedToolName } from "./taskTools";
 import { toolLockOf } from "./toolLock";
@@ -39,9 +30,7 @@ export function emptyConversationPresetSettings(): ConversationPresetSettings {
     globalMemoryEnabled: false,
     projectMemoryEnabled: false,
     skillToolEnabled: false,
-    mcpToolDiscoveryEnabled: false,
-    decisionParameterModes: {},
-    decisionMissScoring: []
+    mcpToolDiscoveryEnabled: false
   };
 }
 
@@ -49,8 +38,7 @@ export function emptyConversationPresetSettings(): ConversationPresetSettings {
  * The shell command tools the implicit preset turns on: every backend's. Which
  * of them a conversation actually offers follows its machines — the host
  * withdraws a shell no machine has — so enabling them all is what lets each
- * machine's shells work without a trip to the settings. The scoring variants
- * stay off, as the seeded presets keep every decision tool off.
+ * machine's shells work without a trip to the settings.
  */
 const IMPLICIT_SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", "powershell"]);
 
@@ -144,10 +132,6 @@ function sandboxField(settings: SandboxSettings | undefined): { sandbox?: Sandbo
 export function captureConversationPresetSettings(
   settings: ConversationSettings
 ): ConversationPresetSettings {
-  const decisionParameterModes = decisionModesFor(
-    normalizeDecisionParameterModes(settings.decisionParameterModes),
-    settings.enabledTools
-  );
   return {
     enabledTools: [...settings.enabledTools],
     toolDescriptionFileId: settings.toolDescriptionFileId,
@@ -163,14 +147,6 @@ export function captureConversationPresetSettings(
     projectMemoryEnabled: settings.projectMemoryEnabled,
     skillToolEnabled: settings.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled === true,
-    /* Only the tools the body enables: a form on a tool that is off says nothing. */
-    decisionParameterModes,
-    /* Likewise only the tools with a form: one on its direct form never misses. */
-    decisionMissScoring: decisionMissScoringFor(
-      normalizeDecisionMissScoring(settings.decisionMissScoring),
-      decisionParameterModes,
-      settings.enabledTools
-    ),
     ...sandboxField(settings.sandbox)
   };
 }
@@ -220,14 +196,6 @@ export function sameConversationPresetSettings(
     && sameIdSet(a.mcpIds, b.mcpIds)
     && equalValues(a.agentDefinitions, b.agentDefinitions)
     && equalValues(a.webSearch, b.webSearch)
-    && sameDecisionParameterModes(
-      decisionModesFor(a.decisionParameterModes, a.enabledTools),
-      decisionModesFor(b.decisionParameterModes, b.enabledTools)
-    )
-    && sameDecisionMissScoring(
-      decisionMissScoringFor(a.decisionMissScoring, a.decisionParameterModes, a.enabledTools),
-      decisionMissScoringFor(b.decisionMissScoring, b.decisionParameterModes, b.enabledTools)
-    )
     /* An unstated sandbox is the default one, so leaving it out and writing it
        out in full say the same thing. */
     && equalValues(a.sandbox ?? defaultSandboxSettings(), b.sandbox ?? defaultSandboxSettings());
@@ -289,14 +257,11 @@ export function cloneConversationSettings(
     projectMemoryEnabled: snapshot.projectMemoryEnabled === true,
     skillToolEnabled: snapshot.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true,
-    decisionParameterModes: normalizeDecisionParameterModes(snapshot.decisionParameterModes),
-    decisionMissScoring: normalizeDecisionMissScoring(snapshot.decisionMissScoring),
     ...sandboxField(snapshot.sandbox)
     // `toolLock` is deliberately absent: the new conversation has run nothing
     // yet, so it has exposed nothing and every setting is still free to move.
-    // `rememberedDecisionForms` and `rememberedToolFamilies` are absent too:
-    // the choices a conversation kept for the tools it switched off belong to
-    // that conversation.
+    // `rememberedToolFamilies` is absent too: the rows a conversation kept for
+    // the tool families it switched off belong to that conversation.
   };
 }
 
@@ -317,25 +282,9 @@ export function applyConversationPresetSettings(
   const enabledTools = Array.from(new Set([...lock.tools, ...preset.enabledTools])).filter(
     (name) => (!knownToolNames || knownToolNames.has(name)) && !isHostDerivedToolName(name)
   );
-  /* A form widens over what the transcript holds rather than replacing it:
-     a preset asking for `replace` on a tool whose selector calls already went
-     out gets `augment`, which accepts both. */
-  const decisionParameterModes = flooredDecisionParameterModes(
-    lock,
-    normalizeDecisionParameterModes(preset.decisionParameterModes),
-    enabledTools
-  );
   return {
     ...current,
     enabledTools,
-    decisionParameterModes,
-    /* Miss scoring changes no schema, so the preset's answer simply applies,
-       kept to the tools that come out with a form. */
-    decisionMissScoring: decisionMissScoringFor(
-      normalizeDecisionMissScoring(preset.decisionMissScoring),
-      decisionParameterModes,
-      enabledTools
-    ),
     toolDescriptionFileId: preset.toolDescriptionFileId,
     agentDefinitions: copyAgentDefinitions(preset.agentDefinitions),
     allowRolelessSubagents: preset.allowRolelessSubagents === true,

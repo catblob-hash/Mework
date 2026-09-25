@@ -15,4 +15,3 @@
 - [edit](edit.html) 与 [write](write.html) — 被记住的读取解锁了什么
 - [grep](grep.html) — 先找到那一行，再去读它周围
 - [使用 Mework](../working.html#images) — 图像如何抵达模型
-- [find_content](find_content.html) — 在大文件里先找到值得读的那几行

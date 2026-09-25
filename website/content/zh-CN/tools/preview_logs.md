@@ -19,4 +19,3 @@
 - [preview_start](preview_start.html), [preview_list](preview_list.html), [preview_stop](preview_stop.html)
 - [preview_console_logs](preview_console_logs.html), [preview_network](preview_network.html)
 - [使用 Mework](../working.html#the-built-in-browser)
-- [preview_find_logs](preview_find_logs.html) —— 按描述在这份输出和页面控制台里查找日志行

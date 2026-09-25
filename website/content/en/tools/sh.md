@@ -12,4 +12,3 @@ It runs `sh -c` with no startup files. On this machine a directory change carrie
 
 - [bash](bash.html), [zsh](zsh.html)
 - [Working with Mework](../working.html#tools-and-approvals)
-- [sh_find_output](sh_find_output.html) — only the parts of the output that match a description

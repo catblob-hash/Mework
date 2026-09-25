@@ -12,7 +12,6 @@ import {
 import { implicitConversationPreset } from "./lib/conversationPresets";
 import { toolCatalog } from "./seed";
 import { defaultConversationWebSearchSettings, normalizeDocument } from "./lib/runtime";
-import { isDecisionToolName } from "./lib/taskTools";
 
 describe("seed document", () => {
   it("keeps the Rust and TS schema version constants identical", () => {
@@ -88,7 +87,7 @@ describe("seed document", () => {
 
   it("ships workspace, web, and host-run orchestration tools", () => {
     const tools = createSeedDocument().tools;
-    expect(tools).toHaveLength(56);
+    expect(tools).toHaveLength(48);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     const webTools = tools.filter((tool) => tool.category === "web");
     expect(webTools.map((tool) => tool.name)).toEqual([
@@ -96,7 +95,7 @@ describe("seed document", () => {
       "preview_start", "preview_stop", "preview_list", "preview_logs", "preview_console_logs",
       "preview_screenshot", "preview_snapshot", "preview_inspect", "preview_click",
       "preview_fill", "preview_eval", "preview_network", "preview_resize",
-      "preview_upload_image", "preview_dialog", "preview_find_logs"
+      "preview_upload_image", "preview_dialog"
     ]);
     // preview_list and preview_logs read host-side state the user's own launch.json
     // produced: no page content, no process started or killed.
@@ -157,15 +156,13 @@ describe("seed document", () => {
       expect(preset.settings.allowRolelessSubagents).toBe(false);
       // Everything on except the names the host derives for itself. The two web
       // tools among them: they follow `webSearchEnabled`, and the plan tools
-      // follow the security level, not a tool toggle. The decision-model tools
-      // are withheld: none works until the TypeSafe key is configured. Of the
-      // shells, only this machine's most preferred one.
+      // follow the security level, not a tool toggle. Of the shells, only this
+      // machine's most preferred one.
       expect(preset.settings.enabledTools).toEqual(
         document.tools.map((tool) => tool.name).filter((name) => !(
           document.tools.find((tool) => tool.name === name)!.category === "memory"
           || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
           || ["plan", "exit_plan_mode"].includes(name)
-          || isDecisionToolName(name)
           || ["bash", "sh", "powershell"].includes(name)
         ))
       );
@@ -328,7 +325,7 @@ describe("seed document", () => {
     expect(shellsOn("")).toEqual([["bash"], ["bash"]]);
   });
 
-  it("gives a fresh conversation every backend's shell tool, and no scoring variant", () => {
+  it("gives a fresh conversation every backend's shell tool", () => {
     const implicit = implicitConversationPreset(toolCatalog, "zh-CN").settings;
     expect(implicit.enabledTools.filter((name) => /^(bash|zsh|sh|powershell)/.test(name)).sort())
       .toEqual(["bash", "powershell", "sh", "zsh"]);

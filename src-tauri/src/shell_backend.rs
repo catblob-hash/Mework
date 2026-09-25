@@ -108,25 +108,8 @@ impl ShellBackend {
         self.id()
     }
 
-    /// The tool that runs a command in this backend and scores its output.
-    pub fn find_output_tool_name(self) -> &'static str {
-        match self {
-            Self::Bash => "bash_find_output",
-            Self::Zsh => "zsh_find_output",
-            Self::Sh => "sh_find_output",
-            Self::PowerShell => "powershell_find_output",
-        }
-    }
-
-    /// The backend a shell tool — plain or scoring — runs in.
+    /// The backend a shell tool runs in.
     pub fn of_tool(tool_name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|backend| {
-            backend.tool_name() == tool_name || backend.find_output_tool_name() == tool_name
-        })
-    }
-
-    /// The backend of a plain command tool, excluding the scoring variants.
-    pub fn of_command_tool(tool_name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|backend| backend.tool_name() == tool_name)
@@ -398,9 +381,6 @@ mod tests {
     fn every_tool_name_maps_back_to_its_backend() {
         for backend in ShellBackend::ALL {
             assert_eq!(ShellBackend::of_tool(backend.tool_name()), Some(backend));
-            assert_eq!(ShellBackend::of_tool(backend.find_output_tool_name()), Some(backend));
-            assert_eq!(ShellBackend::of_command_tool(backend.tool_name()), Some(backend));
-            assert_eq!(ShellBackend::of_command_tool(backend.find_output_tool_name()), None);
             assert_eq!(ShellBackend::parse(backend.id()), Some(backend));
             let json = serde_json::to_string(&backend).unwrap();
             assert_eq!(json, format!("\"{}\"", backend.id()));

@@ -85,14 +85,6 @@ fn id_prefix(source: ResourceSource) -> &'static str {
     }
 }
 
-/// Whether `config` comes from the workspace's own `lsp.json` — a command the
-/// project names, which only an approved `lsp` call may start.
-pub fn is_project_config(config: &LspServerConfig) -> bool {
-    config
-        .id
-        .starts_with(&format!("{}_", id_prefix(ResourceSource::Workspace)))
-}
-
 /// The address of one entry: the file, then the JSON pointer of the key.
 pub fn location_for(path: &Path, name: &str) -> String {
     format!("{}#/lspServers/{name}", path.to_string_lossy())

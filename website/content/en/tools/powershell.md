@@ -13,4 +13,3 @@ A prologue sets a UTF-8 `Out-File` default, plus `$OutputEncoding` and plain-tex
 - [bash](bash.html), [read](read.html), [task_wait](task_wait.html)
 - [Working with Mework](../working.html#tools-and-approvals)
 - [Hooks](../hooks.html)
-- [powershell_find_output](powershell_find_output.html) — only the parts of the output that match a description

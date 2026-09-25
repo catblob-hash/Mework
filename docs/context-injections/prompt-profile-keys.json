@@ -1,5 +1,5 @@
 {
-  "keyCount": 262,
+  "keyCount": 254,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -220,21 +220,6 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `find_content` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `find_content` overrides this key.",
-      "id": "tool.find_content.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `find_files` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `find_files` overrides this key.",
-      "id": "tool.find_files.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `find_output` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `find_output` overrides this key.",
-      "id": "tool.find_output.description",
-      "placeholders": []
-    },
-    {
       "description": "Root description of the `lsp` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `lsp` overrides this key.",
       "id": "tool.lsp.description",
       "placeholders": []
@@ -270,16 +255,6 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `bash_find_output` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `bash_find_output` overrides this key.",
-      "id": "tool.bash_find_output.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `powershell_find_output` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `powershell_find_output` overrides this key.",
-      "id": "tool.powershell_find_output.description",
-      "placeholders": []
-    },
-    {
       "description": "Root description of the `zsh` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `zsh` overrides this key.",
       "id": "tool.zsh.description",
       "placeholders": []
@@ -287,16 +262,6 @@
     {
       "description": "Root description of the `sh` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `sh` overrides this key.",
       "id": "tool.sh.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `zsh_find_output` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `zsh_find_output` overrides this key.",
-      "id": "tool.zsh_find_output.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `sh_find_output` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `sh_find_output` overrides this key.",
-      "id": "tool.sh_find_output.description",
       "placeholders": []
     },
     {
@@ -382,11 +347,6 @@
     {
       "description": "Root description of the `preview_dialog` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `preview_dialog` overrides this key.",
       "id": "tool.preview_dialog.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `preview_find_logs` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `preview_find_logs` overrides this key.",
-      "id": "tool.preview_find_logs.description",
       "placeholders": []
     },
     {

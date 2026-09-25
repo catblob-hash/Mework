@@ -39,9 +39,9 @@
 
 {{TOOL_COUNT}} 个内置工具，按组划分——每个工具在[内置工具](tools.html)下都有自己的页面：
 
-- **文件系统** — `ls`、`grep`、`read`、`write`、`edit`、`find`（选择器里的 [`files`](tools.html#files) 一行）、`lsp`，以及凭描述经[决策模型](tools.html#decision-model)查找文件或段落的 `find_files` 与 `find_content`。受限于工作区和受信任根目录；符号链接、联接和 `..` 无法逃逸；写入是原子的，并返回差异。五道写入保护对每个对话、每个子代理恒常开启：对既有文件的 `edit`/`write` 要求先读取过；按文件修改时间已过期的写入会被拒绝，除非它是一次 `edit` 且其搜索文本在文件中仍恰好只匹配一处；你读过的文件的外部改动会在下一轮得到通报；钩子（格式化器）改写后会重新同步宿主对文件的记录；改动过你读过的文件的 Shell 格式化命令会被标记。`lsp` 由语言服务器作答（参见[代码语义导航](lsp.html)）；工作区自己的 `.mework/lsp.json` 点名的服务器会像一条命令那样请求批准，来自 `~/.mework/lsp.json` 或内置预设的则不会。
-- **Shell** — `bash`、`zsh`、`sh`、`powershell`（选择器里的 [`shell`](tools.html#shell) 一行）：每个 shell 后端一个工具，对话中有机器装有该 shell 时才会列出。可在前台或后台（`run_in_background`）运行；批准卡显示的就是命令本身，折叠为一行。每个 shell 还有一个筛选输出形式，即 `bash_find_output` 及其同类，只返回输出里和描述相符的部分；`find_output` 按 `shell:<id>` 地址对本对话运行过的任何 shell 命令做同样的事。
-- **网络** — `web_search`、`web_fetch`，以及 16 个 `preview_*` 工具（选择器里的 [`preview`](tools.html#preview) 一行）：把项目自己的开发服务器跑起来，并操作它渲染出的页面。
+- **文件系统** — `ls`、`grep`、`read`、`write`、`edit`、`find`（选择器里的 [`files`](tools.html#files) 一行）以及 `lsp`。受限于工作区和受信任根目录；符号链接、联接和 `..` 无法逃逸；写入是原子的，并返回差异。五道写入保护对每个对话、每个子代理恒常开启：对既有文件的 `edit`/`write` 要求先读取过；按文件修改时间已过期的写入会被拒绝，除非它是一次 `edit` 且其搜索文本在文件中仍恰好只匹配一处；你读过的文件的外部改动会在下一轮得到通报；钩子（格式化器）改写后会重新同步宿主对文件的记录；改动过你读过的文件的 Shell 格式化命令会被标记。`lsp` 由语言服务器作答（参见[代码语义导航](lsp.html)）；工作区自己的 `.mework/lsp.json` 点名的服务器会像一条命令那样请求批准，来自 `~/.mework/lsp.json` 或内置预设的则不会。
+- **Shell** — `bash`、`zsh`、`sh`、`powershell`（选择器里的 [`shell`](tools.html#shell) 一行）：每个 shell 后端一个工具，对话中有机器装有该 shell 时才会列出。可在前台或后台（`run_in_background`）运行；批准卡显示的就是命令本身，折叠为一行。
+- **网络** — `web_search`、`web_fetch`，以及 15 个 `preview_*` 工具（选择器里的 [`preview`](tools.html#preview) 一行）：把项目自己的开发服务器跑起来，并操作它渲染出的页面。
 - **编排** — `agent_spawn`、`send_message`、`followup_task`、`task_wait`、`task_list`、`box`、`workflow`、`fork`、`skill`、`tool_search`、`todo`、`ask_user`、`plan`、`exit_plan_mode`。
 - **记忆** — `read/create/edit_global_memory`、`read/create/edit_project_memory`。
 
@@ -110,7 +110,7 @@
 
 另外 11 个工具作用在页面上：`preview_snapshot`（无障碍树）、`preview_inspect`（单个选择器的计算样式）、`preview_screenshot`、`preview_console_logs`、`preview_network`、`preview_click`、`preview_fill`、`preview_eval`、`preview_resize`、`preview_dialog` 与 `preview_upload_image`。这里刻意没有导航工具，也没有标签页管理：一个对话只有一个页面，且它来自模型自己启动的那个服务器（`preview_eval` 仍可用 `window.location` 把它挪走）。输入经可信 CDP 送达，并以可见的指针浮层提示；页面里不注入任何东西，远程内容也永远触不到应用的 IPC 表面。
 
-16 个中有 5 个只读宿主自己的状态，从不弹出批准卡：`preview_list`、`preview_logs`、`preview_snapshot`、`preview_inspect` 和 `preview_resize`。其余 11 个在完全访问以下都要询问。
+15 个中有 5 个只读宿主自己的状态，从不弹出批准卡：`preview_list`、`preview_logs`、`preview_snapshot`、`preview_inspect` 和 `preview_resize`。其余 10 个在完全访问以下都要询问。
 
 只要 `.mework/launch.json` 可用且没有写成 `autoVerify: false`（默认就是开的，面板上的开关写的就是这个字段），系统提示词就会多出一段 `<preview_tools>`，讲的是「改完代码怎么验收」：先起服务器、必要时刷新，再读控制台 / 服务器 / 网络日志、取快照、查样式、试交互，最后用截图向你出示结果，而不是让你自己去看。关掉开关会从**下一步**起不再收到这段，而不是等到下一回合；没启用 `preview_start` 的对话同样收不到。
 

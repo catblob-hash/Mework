@@ -14,4 +14,3 @@ The walk never follows symlinks or junctions, and every entry is checked against
 - [grep](grep.html) — search file contents instead of names
 - [read](read.html) — open one of the files you found
 - [Working with Mework](../working.html#tools-and-approvals) — the security-level matrix
-- [find_files](find_files.html) — let the decision model pick paths out of a tree too large to read

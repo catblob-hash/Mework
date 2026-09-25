@@ -153,7 +153,7 @@ fn apply_seeded_shell(
             continue;
         }
         preset.settings.enabled_tools.retain(|name| {
-            match crate::shell_backend::ShellBackend::of_command_tool(name) {
+            match crate::shell_backend::ShellBackend::of_tool(name) {
                 Some(backend) => Some(backend) == chosen,
                 None => true,
             }
@@ -1750,18 +1750,14 @@ pub fn validate_shape(document: &AppDocument) -> Result<(), String> {
         "API 提供商 ID",
     )?;
     for provider in &document.assets.api_providers {
-        // These namespaces are reserved because search-provider and decision-provider
-        // credentials are keyed only by provider ID.
-        let id = provider.id.trim();
-        if id.starts_with(crate::web_search::SEARCH_PROVIDER_ID_PREFIX) {
+        // This namespace is reserved because search-provider credentials are keyed only by provider ID.
+        if provider
+            .id
+            .trim()
+            .starts_with(crate::web_search::SEARCH_PROVIDER_ID_PREFIX)
+        {
             return Err(format!(
                 "API 提供商 ID 不能占用搜索提供商保留命名空间：{}",
-                provider.id
-            ));
-        }
-        if id.starts_with(crate::decision_model::DECISION_PROVIDER_ID_PREFIX) {
-            return Err(format!(
-                "API 提供商 ID 不能占用决策模型提供商保留命名空间：{}",
                 provider.id
             ));
         }
@@ -5145,19 +5141,6 @@ b"
                 "{stolen} 必须因命名空间冲突被拒：{error}"
             );
         }
-        // The decision-model namespace is reserved for the same reason.
-        for stolen in ["decision-provider:typesafe", "decision-provider:"] {
-            let mut colliding = document.clone();
-            let mut provider = colliding.assets.api_providers[0].clone();
-            provider.id = stolen.to_owned();
-            colliding.assets.api_providers.push(provider);
-            colliding.global_settings.active_provider_id = None;
-            let error = validate_shape(&colliding).unwrap_err();
-            assert!(
-                error.contains("决策模型提供商保留命名空间"),
-                "{stolen} 必须因命名空间冲突被拒：{error}"
-            );
-        }
         // Ordinary provider IDs remain valid.
         let mut ordinary = document;
         let mut extra = ordinary.assets.api_providers[0].clone();
@@ -5701,7 +5684,7 @@ b"
                 .settings
                 .enabled_tools
                 .iter()
-                .filter(|name| ShellBackend::of_command_tool(name).is_some())
+                .filter(|name| ShellBackend::of_tool(name).is_some())
                 .cloned()
                 .collect()
         };
@@ -5949,8 +5932,8 @@ b"
                 .map(|model| model.id.as_str())
         );
 
-        // Everything on except the names the host derives for itself and the
-        // decision-model tools. The preview tools and `workflow` are on too.
+        // Everything on except the names the host derives for itself. The
+        // preview tools and `workflow` are on too.
         for preset in &restored.presets.conversation_presets {
             assert!(!preset.settings.allow_roleless_subagents);
             assert_eq!(preset.settings.agent_definitions.len(), 3);
@@ -5960,7 +5943,6 @@ b"
                     || crate::plan_mode::is_plan_mode_tool_name(name)
                     || name == crate::capabilities::SKILL_TOOL
                     || name == crate::capabilities::TOOL_SEARCH_TOOL
-                    || crate::decision_tools::is_decision_tool_name(name)
             };
             let enabled = &preset.settings.enabled_tools;
             assert!(enabled.iter().all(|name| !withheld(name)));

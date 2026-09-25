@@ -12,4 +12,3 @@
 
 - [bash](bash.html)、[zsh](zsh.html)
 - [使用 Mework](../working.html#tools-and-approvals)
-- [sh_find_output](sh_find_output.html) — 只取回输出里和描述相符的部分

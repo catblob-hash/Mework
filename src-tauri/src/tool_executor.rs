@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fs::{self, File},
     io::{Read, Seek},
     path::{Path, PathBuf},
@@ -97,9 +96,7 @@ pub(crate) struct Outcome {
 }
 
 impl Outcome {
-    /// `pub(crate)` for `decision_tools::preview`, whose five tools run host-side and hand back a
-    /// finished `Outcome` rather than a string this module wraps.
-    pub(crate) fn success(output: String) -> Self {
+    fn success(output: String) -> Self {
         Self {
             success: true,
             output,
@@ -251,7 +248,6 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
         handoff,
         profile,
         None,
-        &BTreeSet::new(),
     )
 }
 
@@ -259,11 +255,6 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
 /// guards this turn runs under. Only the run loop has a guard to pass; every
 /// other caller keeps the unguarded contract, where `read` records nothing and
 /// `write`/`edit` check nothing.
-///
-/// `decision_miss_scoring` is the run's `RunModelRequest::decision_miss_scoring`:
-/// the element tools whose "none of the above" goes on to score every element
-/// line. Every other caller passes an empty set, so a miss outside a model turn
-/// costs no more requests than the choice itself.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_with_scope_and_attachments_guarded(
     request: ToolExecutionRequest,
@@ -275,7 +266,6 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
-    decision_miss_scoring: &BTreeSet<String>,
 ) -> VerifiedToolExecutionResponse {
     let started = Instant::now();
     let attachment_store = app_data.map(ImageAttachmentStore::new);
@@ -290,7 +280,6 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
         handoff,
         profile,
         file_guard,
-        decision_miss_scoring,
     )
     .unwrap_or_else(|error| Outcome {
         success: false,
@@ -417,7 +406,6 @@ fn run_tool(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
-    decision_miss_scoring: &BTreeSet<String>,
 ) -> Result<Outcome, String> {
     // A caller that resolved no set is a caller with one workspace: its own
     // request path. Direct IPC, replayed timeline entries and tests all arrive
@@ -460,28 +448,6 @@ fn run_tool(
             "find" => {
                 return crate::remote_files::run_find(&remote, &request.input).map(Outcome::success)
             }
-            "find_files" => {
-                return crate::decision_tools::listing::find_files_remote(
-                    &remote,
-                    &request.input,
-                    cancel,
-                )
-                .map(Outcome::success);
-            }
-            "find_content" => {
-                let path = required_string(&request.input, "path", MAX_PATH_CHARS, false)?;
-                let (display, content) = crate::remote_files::read_text(&remote, &path)?;
-                // No language server is consulted for a file on another machine; its text is cut
-                // by indentation and paragraphs.
-                return crate::decision_tools::files::find_content(
-                    &display,
-                    &content,
-                    || None,
-                    &request.input,
-                    cancel,
-                )
-                .map(Outcome::success);
-            }
             "read" => {
                 return crate::remote_files::run_read(
                     &remote,
@@ -517,12 +483,7 @@ fn run_tool(
         "grep" => run_grep(workspace, &request.input, scope, profile).map(Outcome::success),
         name if ShellKind::of_tool(name).is_some() => {
             let kind = ShellKind::of_tool(name).expect("guarded by the arm");
-            let run = if name == kind.tool_name() {
-                run_shell
-            } else {
-                run_shell_scored
-            };
-            run(
+            run_shell(
                 selected,
                 anchor,
                 &request.input,
@@ -539,14 +500,6 @@ fn run_tool(
         "write" => run_write(workspace, &request.input, scope, profile, file_guard),
         "edit" => run_edit(workspace, &request.input, scope, profile, file_guard),
         "find" => run_find(workspace, &request.input, scope, profile).map(Outcome::success),
-        "find_files" => crate::decision_tools::listing::find_files_local(
-            workspace,
-            &request.input,
-            scope,
-            cancel,
-        )
-        .map(Outcome::success),
-
         "read" => run_read(
             workspace,
             &request.input,
@@ -556,48 +509,8 @@ fn run_tool(
             file_guard,
         ),
         "lsp" => run_lsp(workspace, request, scope, state, profile).map(Outcome::success),
-        // Decision-model tools: the material is gathered here under the usual scope rules and
-        // scored in `decision_tools`, so only the parts that clear the model's threshold return.
-        "find_content" => crate::decision_tools::files::find_content_local(
-            workspace,
-            &request.input,
-            scope,
-            state,
-            profile.language,
-            cancel,
-        )
-        .map(Outcome::success),
-        "find_output" => {
-            crate::decision_tools::output::find_output(request, state, cancel).map(Outcome::success)
-        }
-        // Sixteen preview tools. Four run entirely host-side against the dev-server registry, and
-        // so does `preview_find_logs`. A call that carries `query` to one of the
-        // decision-parameter tools runs host-side too, so the decision model's network calls
-        // never hold the page's automation lock or its 30 s clock — it touches the page only to
-        // read its elements or console and to hand the chosen action back to the ordinary page
-        // tool. Whether this conversation lets a call carry the pair at all was settled before
-        // execution (`decision_tools::parameter_mode_rejection`); the rest resolve a target and
-        // act on the conversation's page.
-        "preview_find_logs" => {
-            crate::decision_tools::preview::find_logs(request, state, workspace, cancel)
-        }
-        name if crate::decision_tools::takes_decision_parameters(name)
-            && crate::decision_tools::carries_decision_parameters(name, &request.input) =>
-        {
-            let decision = crate::decision_tools::preview::Decision::of(name)
-                .ok_or_else(|| format!("Unknown tool: {name}"))?;
-            if let Some(direct) = crate::decision_tools::direct_parameters(name)
-                .iter()
-                .find(|key| request.input.contains_key(**key))
-            {
-                return Err(format!(
-                    "Pass {name} either {direct} or {}, not both.",
-                    crate::decision_tools::decision_parameters(name).join(" and ")
-                ));
-            }
-            let score_misses = decision_miss_scoring.contains(name);
-            decision.run(request, state, workspace, cancel, score_misses)
-        }
+        // Fifteen preview tools. Four run entirely host-side against the dev-server registry;
+        // the rest resolve a target and act on the conversation's page.
         "preview_start" => run_preview_start(request, state, selected, workspace),
         "preview_stop" => run_preview_stop(request, state),
         "preview_list" => run_preview_list(request, state),
@@ -1667,31 +1580,6 @@ fn run_read(
     Ok(Outcome::success(slice.output)
         .with_file_touch(read_touch(file_guard, &file_path, record))
         .with_opened_file(file_path))
-}
-
-/// The text of one workspace file for a tool that scores it rather than shows it: the
-/// display path, the content, and the resolved path a language server is asked about. Same
-/// scope rules and limits as `read`; images are refused
-/// because there is no text to score. No read record is taken, because nothing of the file
-/// is put in front of the model.
-pub(crate) fn read_text_for_scoring(
-    workspace: &Path,
-    input: &JsonObject,
-    scope: &ExecutionScope,
-) -> Result<(String, String, PathBuf), String> {
-    let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
-    let workspace = canonical_workspace(workspace)?;
-    let (mut file, file_path) = secure_open_existing_file_with_scope(&workspace, &path, scope)?;
-    let mut head = Vec::with_capacity(12);
-    std::io::Read::by_ref(&mut file)
-        .take(12)
-        .read_to_end(&mut head)
-        .map_err(|error| format!("Failed to inspect file {}: {error}", file_path.display()))?;
-    if is_supported_image(&head) {
-        return Err(format!("{path} is an image; only text files can be scored"));
-    }
-    let content = read_text_file_handle(&mut file)?;
-    Ok((display_path(&workspace, &file_path), content, file_path))
 }
 
 /// What a `read` hands back for the run loop to commit once the result is
@@ -3164,103 +3052,6 @@ pub(crate) fn trim_incomplete_utf8_tail(bytes: &mut Vec<u8>) {
         if error.error_len().is_none() {
             bytes.truncate(error.valid_up_to());
         }
-    }
-}
-
-/// `bash_find_output` / `powershell_find_output`: run the command exactly as `bash` and
-/// `powershell` run it, then hand the output to the decision model instead of to the
-/// conversation.
-///
-/// The command itself is not a different command, so this is [`run_shell`] verbatim and only
-/// the `output` field of its outcome is replaced. Two things are kept out of the scoring: the
-/// status line, which `score_command_output` keeps verbatim at the top, and the stale-read
-/// hint, which is guidance addressed to the model rather than anything the command said.
-#[allow(clippy::too_many_arguments)]
-fn run_shell_scored(
-    workspace: &crate::workspace_set::ResolvedWorkspace,
-    anchor: &Path,
-    input: &JsonObject,
-    kind: ShellKind,
-    conversation_id: &str,
-    state: &AppState,
-    cancel: &CancelSignal,
-    app_data: Option<&Path>,
-    handoff: Option<&ShellHandoff<'_>>,
-    profile: &PromptProfile,
-    file_guard: Option<FileGuardContext<'_>>,
-) -> Result<Outcome, String> {
-    // A command that reaches its deadline is offered to the task surface just as the base tools
-    // offer it. What comes back then is a receipt naming its new address, not output — scoring
-    // it would throw away the one thing the model needs to follow the command up.
-    let adopted = std::cell::Cell::new(false);
-    let observed = handoff.map(|handoff| {
-        Box::new(|run, guard, context| {
-            let outcome = handoff(run, guard, context);
-            if matches!(outcome, ShellHandoffOutcome::Adopted(_)) {
-                adopted.set(true);
-            }
-            outcome
-        }) as Box<ShellHandoff<'_>>
-    });
-    let outcome = run_shell(
-        workspace,
-        anchor,
-        input,
-        kind,
-        conversation_id,
-        state,
-        cancel,
-        app_data,
-        observed.as_deref(),
-        profile,
-        file_guard,
-    )?;
-    if adopted.get() {
-        return Ok(outcome);
-    }
-    let command = parse_shell_command(input)?;
-    let (output, hint) = split_stale_read_hint(&outcome.output, &command, profile);
-    let mut scored =
-        crate::decision_tools::output::score_command_output(output, outcome.success, input, cancel)?;
-    if let Some(hint) = hint {
-        scored.push('\n');
-        scored.push_str(hint);
-    }
-    Ok(Outcome {
-        output: scored,
-        ..outcome
-    })
-}
-
-/// Splits the hint [`stale_read_hint`] may have appended off the end of a shell result.
-///
-/// The hint is the profile's own sentence, appended as the last line after a formatter-looking
-/// command; both conditions are required here, so a command that could not have produced one
-/// keeps every line of its output even if its last line looks like the template.
-fn split_stale_read_hint<'a>(
-    output: &'a str,
-    command: &str,
-    profile: &PromptProfile,
-) -> (&'a str, Option<&'a str>) {
-    if !looks_like_formatter_command(command) {
-        return (output, None);
-    }
-    let template = profile.text(PromptKey::ToolShellStaleReadHint);
-    let prefix = template.split('{').next().unwrap_or_default();
-    if prefix.is_empty() {
-        return (output, None);
-    }
-    let Some((body, last)) = output.rsplit_once('\n') else {
-        return if output.starts_with(prefix) {
-            ("", Some(output))
-        } else {
-            (output, None)
-        };
-    };
-    if last.starts_with(prefix) {
-        (body, Some(last))
-    } else {
-        (output, None)
     }
 }
 
@@ -5284,61 +5075,6 @@ mod tests {
         );
     }
 
-    /// `find_content` through the executor: the file's blocks go to the decision model, and every
-    /// block that clears the threshold comes back whole, its lines numbered as the file numbers
-    /// them.
-    /// Without a key the call fails with the words that send the user to the settings page.
-    #[test]
-    fn find_content_returns_the_scored_pieces_by_line_range() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = AppState::default();
-        let mut lines = (1..=60)
-            .map(|index| format!("fn helper_{index}() {{ noise(); }}"))
-            .collect::<Vec<_>>();
-        lines[30] = "fn on_login_failed(reason: &str) { record_failure(reason); }".into();
-        lines[31] = "    // shows the LOGIN error banner".into();
-        fs::write(directory.path().join("auth.rs"), lines.join("\n")).unwrap();
-        let input = json!({"path": "auth.rs", "query": "login failure handling", "threshold": 0.6});
-
-        // The credential override is one process-wide slot, so the no-key assertion has to keep
-        // every other installer out while it runs; without the lock another decision-tool test
-        // holding a key would make this call succeed.
-        let absent = crate::decision_model::test_overrides::without_key();
-        let missing = execute(request(directory.path(), "find_content", input.clone()), &state);
-        assert!(!missing.success);
-        assert!(missing.output.contains("Decision model providers"), "{}", missing.output);
-        drop(absent);
-
-        let server = crate::decision_model::jev::fixture::ScoringServer::start(|candidate| {
-            let text = candidate["text"].as_str().unwrap_or_default();
-            if text.contains("LOGIN") || text.contains("login") {
-                3.0
-            } else {
-                0.0
-            }
-        });
-        let _override = crate::decision_model::test_overrides::install("sk-test", &server.endpoint());
-        let result = execute(request(directory.path(), "find_content", input), &state);
-        assert!(result.success, "{}", result.output);
-        // Line 32 is indented under line 31, so the two are one block — the one that comes back,
-        // whole and numbered. The one-liners around it are two paragraphs of their own.
-        assert!(
-            result.output.ends_with(
-                "--- auth.rs lines 31-32 (score 1.000) ---\n    31\tfn on_login_failed(reason: \
-                 &str) { record_failure(reason); }\n    32\t    // shows the LOGIN error banner"
-            ),
-            "{}",
-            result.output
-        );
-        assert!(!result.output.contains("helper_10()"), "losers stay out: {}", result.output);
-        assert!(result.output.starts_with("1 hit at or above 0.600"), "{}", result.output);
-        assert!(result.output.contains("(3 blocks of auth.rs scored, 2 requests)"), "{}", result.output);
-        let requests = server.requests();
-        assert_eq!(requests.len(), 2);
-        assert!(requests.iter().all(|request| request["state"]["query"] == "login failure handling"));
-        assert!(requests.iter().all(|request| request["questions"]["c0"]["type"] == "score"));
-    }
-
     /// A shell command must be addressable while it runs, and must still be *there* once it does
     /// not. Before this, the round simply blocked inside `wait_timeout` and nothing anywhere knew a
     /// command existed; then for a while the row existed but deleted itself at the exact moment it
@@ -7041,131 +6777,5 @@ mod tests {
         // to compare against, so there is nothing to hint about.
         assert!(stale_read_hint(None, workspace, "cargo fmt", started, &profile).is_none());
     }
-
-    /// `bash_find_output` through the executor: the command runs exactly as `bash` runs it, and
-    /// what comes back in place of its output is the pieces of that output which cleared the
-    /// threshold, addressed by the line numbers of the output itself.
-    #[test]
-    fn bash_find_output_returns_the_scored_pieces_of_what_the_command_printed() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = AppState::default();
-        let words = (1..=40)
-            .map(|index| {
-                if index == 31 {
-                    "ERROR_disk_full".to_owned()
-                } else {
-                    format!("line_{index}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let input = json!({
-            "command": format!("printf '%s\\n' {words}"),
-            "query": "why the run failed",
-            "threshold": 0.6,
-        });
-
-        let server = crate::decision_model::jev::fixture::ScoringServer::start(|candidate| {
-            if candidate["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("ERROR")
-            {
-                3.0
-            } else {
-                0.0
-            }
-        });
-        let _override = crate::decision_model::test_overrides::install("sk-test", &server.endpoint());
-        let result = execute(request(directory.path(), "bash_find_output", input), &state);
-        assert!(result.success, "{}", result.output);
-        // 40 one-line records, 32 questions to a request; the ERROR record comes back on its own,
-        // numbered as the output numbers it.
-        assert!(result.output.starts_with("1 hit at or above 0.600"), "{}", result.output);
-        assert!(
-            result.output.contains("(40 records of the command output scored, 2 requests)"),
-            "{}",
-            result.output
-        );
-        assert!(
-            result.output.contains("--- output line 31 (score 1.000) ---\n    31\tERROR_disk_full"),
-            "{}",
-            result.output
-        );
-        assert!(result.output.contains("ERROR_disk_full"), "{}", result.output);
-        assert!(!result.output.contains("line_5"), "losers stay out: {}", result.output);
-    }
-
-    /// `find_files` through the executor: the directory is walked under the usual scope rules,
-    /// its listing is grouped and scored, and only the paths that cleared the threshold return.
-    #[test]
-    fn find_files_returns_the_scored_paths_of_the_directory_listing() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = AppState::default();
-        for path in [
-            "src/auth/login_screen.tsx",
-            "src/util/math.rs",
-            "src/util/text.rs",
-            "docs/readme.md",
-        ] {
-            let file = directory.path().join(path);
-            fs::create_dir_all(file.parent().unwrap()).unwrap();
-            fs::write(file, "x").unwrap();
-        }
-        let input = json!({"query": "the sign-in page", "threshold": 0.6});
-
-        let server = crate::decision_model::jev::fixture::ScoringServer::start(|candidate| {
-            if candidate["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("login")
-            {
-                3.0
-            } else {
-                0.0
-            }
-        });
-        let _override = crate::decision_model::test_overrides::install("sk-test", &server.endpoint());
-        let result = execute(request(directory.path(), "find_files", input), &state);
-        assert!(result.success, "{}", result.output);
-        // Eight entries — four files and their four directories — each scored on its own, all in
-        // one request.
-        assert!(
-            result.output.starts_with("1 hit at or above 0.600 for query \"the sign-in page\" (8 entries under . scored, 1 request)."),
-            "{}",
-            result.output
-        );
-        assert!(
-            result.output.ends_with("src/auth/login_screen.tsx (score 1.000)"),
-            "{}",
-            result.output
-        );
-        assert!(!result.output.contains("math.rs"), "losers stay out: {}", result.output);
-    }
-
-    /// The stale-read hint is guidance for the model, not something the command said, so the
-    /// scored variants lift it off the output before scoring it. Only a formatter-looking
-    /// command can have one, so an ordinary command's last line is never mistaken for it.
-    #[test]
-    fn the_stale_read_hint_is_lifted_off_the_output_before_it_is_scored() {
-        let profile = PromptProfile::builtin_english();
-        let hint = "[This command modified 1 file(s) you've previously read: a.txt. Call read before editing.]";
-        let output = format!("reformatted a.txt\n{hint}");
-        assert_eq!(
-            split_stale_read_hint(&output, "cargo fmt", &profile),
-            ("reformatted a.txt", Some(hint))
-        );
-        // A hint with nothing before it still leaves an empty output rather than scoring itself.
-        assert_eq!(split_stale_read_hint(hint, "cargo fmt", &profile), ("", Some(hint)));
-        // Not a formatter: whatever the last line looks like, it is output.
-        assert_eq!(
-            split_stale_read_hint(&output, "cargo test", &profile),
-            (output.as_str(), None)
-        );
-        // A formatter whose output simply ends in something else keeps every line.
-        assert_eq!(
-            split_stale_read_hint("reformatted a.txt", "cargo fmt", &profile),
-            ("reformatted a.txt", None)
-        );
-    }
 }
+

@@ -18,8 +18,6 @@ import {
 const PRESET_FIELDS = [
   "agentDefinitions",
   "allowRolelessSubagents",
-  "decisionMissScoring",
-  "decisionParameterModes",
   "enabledTools",
   "globalMemoryEnabled",
   "hookIds",
@@ -110,9 +108,7 @@ describe("conversation presets", () => {
       globalMemoryEnabled: false,
       projectMemoryEnabled: false,
       skillToolEnabled: false,
-      mcpToolDiscoveryEnabled: false,
-      decisionParameterModes: {},
-      decisionMissScoring: []
+      mcpToolDiscoveryEnabled: false
     });
     expect(Object.keys(implicitConversationPreset(createSeedDocument().tools).settings).sort())
       .toEqual(PRESET_FIELDS);
@@ -142,9 +138,7 @@ describe("conversation presets", () => {
       globalMemoryEnabled: settings.globalMemoryEnabled,
       projectMemoryEnabled: settings.projectMemoryEnabled,
       skillToolEnabled: settings.skillToolEnabled,
-      mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled,
-      decisionParameterModes: {},
-      decisionMissScoring: []
+      mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled
     });
     // Conversation-only fields do not enter presets; web search, security, and memory tiers do.
     expect(Object.keys(captured).sort()).toEqual(PRESET_FIELDS);
@@ -264,34 +258,6 @@ describe("conversation presets", () => {
     expect(applied.webSearch.fetchProvider).toEqual({ kind: "native" });
     // The rest of the preset's web-search body still applies.
     expect(applied.webSearch.maxSearchesPerCall).toBe(preset.webSearch.maxSearchesPerCall);
-  });
-
-  it("carries miss scoring only for the element tools that have a decision form", () => {
-    const document = createSeedDocument();
-    const current = document.workspaces[0].conversations[0].settings;
-    current.enabledTools = [...current.enabledTools, "preview_click", "preview_fill", "preview_inspect"];
-    current.decisionParameterModes = { preview_click: "augment", preview_inspect: "replace" };
-    // `preview_fill` has no form, so it cannot miss; the snapshot and junk are not element tools.
-    current.decisionMissScoring = ["preview_fill", "preview_inspect", "preview_click", "preview_snapshot"];
-
-    const captured = captureConversationPresetSettings(current);
-    expect(captured.decisionMissScoring).toEqual(["preview_inspect", "preview_click"]);
-    // A stale entry on a tool without a form is not an edit that moves the conversation off it.
-    expect(sameConversationPresetSettings(captured, {
-      ...captured,
-      decisionMissScoring: ["preview_click", "preview_fill", "preview_inspect"]
-    })).toBe(true);
-    expect(sameConversationPresetSettings(captured, { ...captured, decisionMissScoring: ["preview_click"] }))
-      .toBe(false);
-
-    // Applying keeps the preset's answer to the tools that come out with a form.
-    const applied = applyConversationPresetSettings(
-      { ...current, decisionMissScoring: [] },
-      { ...captured, decisionParameterModes: { preview_click: "augment" } }
-    );
-    expect(applied.decisionMissScoring).toEqual(["preview_click"]);
-    expect(cloneConversationSettings({ ...current, decisionMissScoring: ["preview_fill", "x"] }).decisionMissScoring)
-      .toEqual(["preview_fill"]);
   });
 
   it("keeps dangling capability IDs on both sides of a capture/apply round trip", () => {

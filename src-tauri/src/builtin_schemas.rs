@@ -67,182 +67,6 @@ fn server_id_prop() -> Value {
     string_prop("Server ID", 256)
 }
 
-/// The natural-language query every decision-model find tool scores candidates against.
-fn query_prop(description: &str) -> Value {
-    string_prop(description, crate::decision_model::MAX_QUERY_CHARS)
-}
-
-/// The score threshold every decision-model find tool takes: `0..=1`, three decimals. Scores
-/// come back at the same precision, so a reported score can be reused as a threshold.
-fn threshold_prop() -> Value {
-    threshold_prop_with(SCORE_THRESHOLD_DESCRIPTION)
-}
-
-const SCORE_THRESHOLD_DESCRIPTION: &str = "Minimum score, 0 to 1 with at most three decimal places; only pieces scoring at or above it are returned. Start around 0.6 and lower it if nothing comes back.";
-
-fn threshold_prop_with(description: &str) -> Value {
-    json!({
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1,
-        "description": description
-    })
-}
-
-/// What the decision parameters mean on one decision-parameter tool.
-struct DecisionParameterText {
-    query: &'static str,
-    /// `None` on the element tools: they choose one element (or none of the above) rather than
-    /// score, so there is no threshold to cut at.
-    threshold: Option<&'static str>,
-    /// What the tool answers when a call leaves the decision parameters out, for `Augment`'s
-    /// `query`.
-    without: &'static str,
-    /// What a call with the decision parameters does, for the note on the root description.
-    does: &'static str,
-}
-
-/// Where the material goes and what it needs, said once on every moded tool the way the
-/// standalone decision-model tools say it.
-const DECISION_PROVIDER_NOTE: &str = "The material is sent to TypeSafe's API; needs the TypeSafe key from Settings → Decision model providers.";
-
-/// How an element tool's choice declines, said on each of them.
-const NONE_OF_THE_ABOVE: &str = "The model may also answer none of the above, which the host always offers; then nothing is done, and the result reports the closest elements and lists every element line the model was shown, so there is no need to read the page again before the next step.";
-
-fn decision_parameter_text(tool: &str) -> DecisionParameterText {
-    match tool {
-        "preview_console_logs" => DecisionParameterText {
-            query: "What to look for in the console, in plain language. The entries that pass level (the most recent lines of them, or all of them when lines is omitted) are sent to the TypeSafe Jev decision model, whole — an entry is never split — and only the entries scoring at or above threshold come back, numbered by their place among those entries.",
-            threshold: Some(SCORE_THRESHOLD_DESCRIPTION),
-            without: "Leave query and threshold out for the plain listing.",
-            does: "the TypeSafe Jev decision model scores each entry that passes level and only the entries at or above threshold come back, whole",
-        },
-        "preview_snapshot" => DecisionParameterText {
-            query: "The page element to look for, in plain language. Instead of the whole snapshot, its element lines are sent to the TypeSafe Jev decision model and only the elements scoring at or above threshold come back, each with its uid, its snapshot line and a CSS selector for preview_click, preview_fill or preview_inspect.",
-            threshold: Some(SCORE_THRESHOLD_DESCRIPTION),
-            without: "Leave query and threshold out for the whole snapshot.",
-            does: "the TypeSafe Jev decision model scores the page's elements and only those at or above threshold come back, each with a selector",
-        },
-        "preview_click" => DecisionParameterText {
-            query: "Plain-language description of the element to click, e.g. 'the Save button in the dialog'. The page's element lines are sent to the TypeSafe Jev decision model, which chooses the one meant; the result names it, with the model's confidence and the runners-up.",
-            threshold: None,
-            without: "Instead of selector.",
-            does: "the TypeSafe Jev decision model chooses the element query describes, and that element is clicked",
-        },
-        "preview_fill" => DecisionParameterText {
-            query: "Plain-language description of the input to fill, e.g. 'the email field'. The page's element lines are sent to the TypeSafe Jev decision model, which chooses the one meant; the result names it, with the model's confidence and the runners-up.",
-            threshold: None,
-            without: "Instead of selector.",
-            does: "the TypeSafe Jev decision model chooses the input query describes, and that input is filled",
-        },
-        _ => DecisionParameterText {
-            query: "Plain-language description of the element to inspect, e.g. 'the Save button in the dialog'. The page's element lines are sent to the TypeSafe Jev decision model, which chooses the one meant; the result names it, with the model's confidence and the runners-up.",
-            threshold: None,
-            without: "Instead of selector.",
-            does: "the TypeSafe Jev decision model chooses the element query describes, and that element's styles are read",
-        },
-    }
-}
-
-/// `schema` rewritten for one decision-parameter mode of its tool
-/// ([`crate::decision_tools::DECISION_PARAMETER_TOOLS`]).
-///
-/// `Augment` adds the tool's decision parameters ([`crate::decision_tools::decision_parameters`])
-/// as optional properties and releases the direct targeting parameters from `required`, so a
-/// call names its target one way or the other. `Replace` removes the direct parameters and
-/// requires the decision ones. Everything else the tool takes (`value`, `styles`, `doubleClick`,
-/// `level`, `lines`) is untouched.
-///
-/// "Exactly one of `selector` or `query`" and "`threshold` with `query`" stay prose and host
-/// checks (`decision_tools::parameter_mode_rejection`, `decision_model::parse_threshold`) rather
-/// than a root `oneOf`: these tools stay flat objects, which is what every provider's tool dialect
-/// accepts.
-pub(crate) fn with_decision_parameters(
-    mut schema: Value,
-    tool: &str,
-    mode: crate::model::DecisionParameterMode,
-) -> Value {
-    use crate::model::DecisionParameterMode;
-
-    let text = decision_parameter_text(tool);
-    let direct = crate::decision_tools::direct_parameters(tool);
-    let decision = crate::decision_tools::decision_parameters(tool);
-    let named = decision.join(" and ");
-    let Some(object) = schema.as_object_mut() else {
-        return schema;
-    };
-    let instead = if direct.is_empty() {
-        String::new()
-    } else {
-        format!(" instead of {}", direct.join(" and "))
-    };
-    if let Some(Value::String(description)) = object.get_mut("description") {
-        let lead = match mode {
-            DecisionParameterMode::Augment => format!("With {named}{instead}"),
-            DecisionParameterMode::Replace => {
-                format!("In this conversation every call takes {named}{instead}")
-            }
-        };
-        let declines = if text.threshold.is_none() {
-            format!(" {NONE_OF_THE_ABOVE}")
-        } else {
-            String::new()
-        };
-        description.push_str(&format!(
-            "\n\n{lead}: {}.{declines} {DECISION_PROVIDER_NOTE}",
-            text.does
-        ));
-    }
-    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
-        match mode {
-            DecisionParameterMode::Augment => {
-                for key in direct {
-                    if let Some(Value::String(description)) = properties
-                        .get_mut(*key)
-                        .and_then(|property| property.get_mut("description"))
-                    {
-                        description.push_str(&format!(". Or leave it out and give {named}."));
-                    }
-                }
-                properties.insert(
-                    "query".into(),
-                    query_prop(&format!("{} {}", text.without, text.query)),
-                );
-                if let Some(threshold) = text.threshold {
-                    properties.insert(
-                        "threshold".into(),
-                        threshold_prop_with(&format!("Required with query. {threshold}")),
-                    );
-                }
-            }
-            DecisionParameterMode::Replace => {
-                for key in direct {
-                    properties.remove(*key);
-                }
-                properties.insert("query".into(), query_prop(text.query));
-                if let Some(threshold) = text.threshold {
-                    properties.insert("threshold".into(), threshold_prop_with(threshold));
-                }
-            }
-        }
-        if tool == "preview_console_logs" {
-            if let Some(lines) = properties.get_mut("lines") {
-                lines["description"] = json!(match mode {
-                    DecisionParameterMode::Augment => "Max lines to return (default: 50, max: 200). With query: how many of the most recent entries to score (default: every entry that passes level).",
-                    DecisionParameterMode::Replace => "How many of the most recent entries to score (max: 200; default: every entry that passes level).",
-                });
-            }
-        }
-    }
-    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
-        required.retain(|name| !name.as_str().is_some_and(|name| direct.contains(&name)));
-        if mode == DecisionParameterMode::Replace {
-            required.extend(decision.iter().map(|name| json!(name)));
-        }
-    }
-    schema
-}
-
 /// One closed variant of a merged tool's `oneOf`.
 ///
 /// `action` is folded into each variant as a `const` and into its `required`, so the union stays
@@ -456,68 +280,6 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "required": ["path"],
             "additionalProperties": false
         }),
-        "find_content" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolFindContentDescription),
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4096,
-                    "description": "Text file to search, relative to the workspace."
-                },
-                "query": query_prop("What to look for, in plain language, e.g. 'the code that handles a failed login'."),
-                "threshold": threshold_prop(),
-                "start_line": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 1,
-                    "description": "First line to consider, 1-based."
-                },
-                "end_line": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Last line to consider, inclusive; defaults to the end of the file."
-                }
-            },
-            "required": ["path", "query", "threshold"],
-            "additionalProperties": false
-        }),
-        "find_files" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolFindFilesDescription),
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4096,
-                    "default": ".",
-                    "description": "Directory to search, relative to the workspace."
-                },
-                "query": query_prop("What files to look for, in plain language, e.g. 'code that stores provider credentials'."),
-                "threshold": threshold_prop(),
-                "depth": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 8,
-                    "default": 6,
-                    "description": "Recursion depth; 0 lists only the current directory."
-                }
-            },
-            "required": ["query", "threshold"],
-            "additionalProperties": false
-        }),
-        "find_output" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolFindOutputDescription),
-            "properties": {
-                "task": string_prop("The shell task address from task_list, e.g. shell:3.", 64),
-                "query": query_prop("What to look for in the command output, in plain language."),
-                "threshold": threshold_prop()
-            },
-            "required": ["task", "query", "threshold"],
-            "additionalProperties": false
-        }),
         "lsp" => json!({
             "type": "object",
             "description": profile.text(PromptKey::ToolLspDescription),
@@ -656,64 +418,8 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "required": ["command"],
             "additionalProperties": false
         }),
-        "bash_find_output" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolBashFindOutputDescription),
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 65536,
-                    "description": "The Bash command line."
-                },
-                "description": {
-                    "type": "string",
-                    "description": SHELL_DESCRIPTION_PARAMETER
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": shell_timeout_parameter_description()
-                },
-                "query": query_prop("What to look for in the command output, in plain language."),
-                "threshold": threshold_prop()
-            },
-            "required": ["command", "query", "threshold"],
-            "additionalProperties": false
-        }),
         "zsh" => shell_command_schema(profile.text(PromptKey::ToolZshDescription), "The zsh command line."),
         "sh" => shell_command_schema(profile.text(PromptKey::ToolShDescription), "The POSIX sh command line."),
-        "zsh_find_output" => shell_find_output_schema(
-            profile.text(PromptKey::ToolZshFindOutputDescription),
-            "The zsh command line.",
-        ),
-        "sh_find_output" => shell_find_output_schema(
-            profile.text(PromptKey::ToolShFindOutputDescription),
-            "The POSIX sh command line.",
-        ),
-        "powershell_find_output" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolPowershellFindOutputDescription),
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 65536,
-                    "description": "The PowerShell command line."
-                },
-                "description": {
-                    "type": "string",
-                    "description": SHELL_DESCRIPTION_PARAMETER
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": shell_timeout_parameter_description()
-                },
-                "query": query_prop("What to look for in the command output, in plain language."),
-                "threshold": threshold_prop()
-            },
-            "required": ["command", "query", "threshold"],
-            "additionalProperties": false
-        }),
 
         //
         // The schemas mirror Cherry Studio's `shared/ai/builtinTools.ts`: `web_search`
@@ -1003,23 +709,6 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "required": [],
             "additionalProperties": false
         }),
-        "preview_find_logs" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolPreviewFindLogsDescription),
-            "properties": {
-                "serverId": server_id_prop(),
-                "query": query_prop("What to look for in the console and server logs, in plain language."),
-                "threshold": threshold_prop(),
-                "source": {
-                    "type": "string",
-                    "enum": ["all", "console", "server"],
-                    "default": "all",
-                    "description": "Which logs to search: all, console, or server."
-                }
-            },
-            "required": ["query", "threshold"],
-            "additionalProperties": false
-        }),
         "agent_spawn" => agent_spawn_schema(None, false, profile),
         "send_message" => json!({
             "type": "object",
@@ -1290,35 +979,6 @@ fn shell_command_schema(description: &str, command_description: &str) -> Value {
     })
 }
 
-/// The schema of a shell backend's scoring tool, as [`shell_command_schema`]
-/// is to its command tool.
-fn shell_find_output_schema(description: &str, command_description: &str) -> Value {
-    json!({
-        "type": "object",
-        "description": description,
-        "properties": {
-            "command": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 65536,
-                "description": command_description
-            },
-            "description": {
-                "type": "string",
-                "description": SHELL_DESCRIPTION_PARAMETER
-            },
-            "timeout": {
-                "type": "number",
-                "description": shell_timeout_parameter_description()
-            },
-            "query": query_prop("What to look for in the command output, in plain language."),
-            "threshold": threshold_prop()
-        },
-        "required": ["command", "query", "threshold"],
-        "additionalProperties": false
-    })
-}
-
 /// Whether a tool's arguments name a place — a path to act on, or a command
 /// whose working directory and machine follow from where it runs.
 ///
@@ -1337,8 +997,6 @@ pub(crate) fn takes_a_workspace(tool_name: &str) -> bool {
             | "write"
             | "edit"
             | "lsp"
-            | "find_content"
-            | "find_files"
             | "preview_start"
     ) || crate::shell_backend::ShellBackend::of_tool(tool_name).is_some()
 }
@@ -2353,20 +2011,6 @@ mod tests {
                 "ask_user" => {
                     assert!(schema_properties.is_superset(&parameters), "ask_user");
                 }
-                // The catalog lists what the widest form takes: the base schema plus the
-                // decision pair, which is exactly what `Augment` declares.
-                name if crate::decision_tools::takes_decision_parameters(name) => {
-                    let augmented = with_decision_parameters(
-                        schema.clone(),
-                        name,
-                        crate::model::DecisionParameterMode::Augment,
-                    );
-                    assert_eq!(
-                        properties(&augmented),
-                        parameters,
-                        "{name}: augmented schema properties and catalog parameters drifted"
-                    );
-                }
                 _ => {
                     assert_eq!(
                         schema_properties, parameters,
@@ -2378,53 +2022,7 @@ mod tests {
         }
     }
 
-    /// `Augment` keeps every direct parameter and makes the target optional; `Replace` withdraws
-    /// the target and requires the decision parameters. Whatever else the tool takes survives both.
-    #[test]
-    fn decision_parameter_modes_reshape_only_the_target() {
-        use crate::model::DecisionParameterMode::{Augment, Replace};
-        let profile = PromptProfile::builtin_english();
-        let fill = builtin_tool_schema("preview_fill", &profile).unwrap();
-
-        // The element tools choose one element or none of the above: `query`, and no threshold.
-        let augmented = with_decision_parameters(fill.clone(), "preview_fill", Augment);
-        assert_eq!(
-            properties(&augmented),
-            ["query", "selector", "serverId", "value"]
-                .map(String::from)
-                .into_iter()
-                .collect()
-        );
-        assert_eq!(augmented["required"], json!(["value"]));
-        assert!(augmented["description"]
-            .as_str()
-            .unwrap()
-            .contains("none of the above"));
-
-        let replaced = with_decision_parameters(fill, "preview_fill", Replace);
-        assert_eq!(
-            properties(&replaced),
-            ["query", "serverId", "value"]
-                .map(String::from)
-                .into_iter()
-                .collect()
-        );
-        assert_eq!(replaced["required"], json!(["value", "query"]));
-        assert_eq!(replaced["additionalProperties"], false);
-
-        // The console and snapshot tools have no target to withdraw: `Replace` only makes the
-        // decision model mandatory.
-        let snapshot = builtin_tool_schema("preview_snapshot", &profile).unwrap();
-        let replaced = with_decision_parameters(snapshot, "preview_snapshot", Replace);
-        assert_eq!(replaced["required"], json!(["query", "threshold"]));
-        assert!(properties(&replaced).contains("threshold"));
-        let console = builtin_tool_schema("preview_console_logs", &profile).unwrap();
-        let augmented = with_decision_parameters(console, "preview_console_logs", Augment);
-        assert_eq!(augmented["required"], json!([]));
-        assert!(properties(&augmented).contains("level"));
-    }
-
-    /// The preview surface is sixteen independent tools, not one multiplexed one. This
+    /// The preview surface is fifteen independent tools, not one multiplexed one. This
     /// pins the whole set — including the two Mework-only tools the source has no
     /// equivalent for — so a tool cannot be dropped or renamed without a decision.
     #[test]
@@ -2452,7 +2050,6 @@ mod tests {
                 "preview_resize",
                 "preview_upload_image",
                 "preview_dialog",
-                "preview_find_logs",
             ]
         );
         assert!(!tool_catalog().iter().any(|tool| tool.name == "playwright"));

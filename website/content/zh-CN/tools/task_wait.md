@@ -16,4 +16,3 @@
 - [task_list](task_list.html) — 本工具接受的地址
 - [box](box.html) — 未经收取的结果改以何种方式到达
 - [使用 Mework](../working.html#subagents-workflows-and-tasks)
-- [find_output](find_output.html) — 不必等命令结束就查看它的输出

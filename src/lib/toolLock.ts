@@ -1,11 +1,4 @@
 import type { ConversationSettings, ConversationToolLock } from "../types";
-import {
-  decisionModesFor,
-  mergeDecisionParameterModes,
-  normalizeDecisionParameterModes,
-  sameDecisionParameterModes,
-  widenedDecisionParameterModes
-} from "./decisionParameters";
 
 /**
  * Tool exposure is one-way. Every run merges what it showed the model into the
@@ -15,8 +8,8 @@ import {
  *
  * The lock covers every conversation setting that changes which tools reach the
  * wire — the tool list itself, MCP servers, the two memory tiers, on-demand
- * skill loading, web access, and which form each decision-parameter tool's
- * schema takes — so the settings panel can gray out exactly what is spent.
+ * skill loading, and web access — so the settings panel can gray out exactly
+ * what is spent.
  *
  * Three of its fields are pins rather than growing sets, because the thing they
  * hold is not a set of names but a single answer that has already been acted
@@ -37,8 +30,7 @@ export const EMPTY_TOOL_LOCK: ConversationToolLock = {
   skillIds: [],
   promptSkillIds: null,
   searchProvider: null,
-  fetchProvider: null,
-  decisionParameterModes: {}
+  fetchProvider: null
 };
 
 /**
@@ -70,8 +62,7 @@ export function toolLockOf(settings: ConversationSettings): ConversationToolLock
     skillIds: lock.skillIds ?? [],
     promptSkillIds: lock.promptSkillIds ?? null,
     searchProvider: lock.searchProvider ?? null,
-    fetchProvider: lock.fetchProvider ?? null,
-    decisionParameterModes: normalizeDecisionParameterModes(lock.decisionParameterModes)
+    fetchProvider: lock.fetchProvider ?? null
   };
 }
 
@@ -99,11 +90,7 @@ export function toolExposureOf(
     searchProvider: web && settings.webSearch.provider.kind !== "disabled"
       ? settings.webSearch.provider
       : null,
-    fetchProvider: web && context.webFetch ? settings.webSearch.fetchProvider : null,
-    /* The form each enabled decision-parameter tool asks for. The merge joins
-       it with what the lock already covered, which is also what the host
-       exposes: a form never narrows under a transcript. */
-    decisionParameterModes: decisionModesFor(settings.decisionParameterModes, settings.enabledTools)
+    fetchProvider: web && context.webFetch ? settings.webSearch.fetchProvider : null
   };
 }
 
@@ -130,15 +117,7 @@ export function mergeToolLock(
     skillIds: [...new Set([...lock.skillIds, ...exposure.skillIds])],
     promptSkillIds: lock.promptSkillIds ?? exposure.promptSkillIds,
     searchProvider: lock.searchProvider ?? exposure.searchProvider,
-    fetchProvider: lock.fetchProvider ?? exposure.fetchProvider,
-    /* A floor, not a pin: a tool whose calls went out in one form may widen to
-       accept another, and the union of the direct form and `replace` is
-       `augment`. */
-    decisionParameterModes: mergeDecisionParameterModes(
-      lock,
-      exposure.tools,
-      exposure.decisionParameterModes
-    )
+    fetchProvider: lock.fetchProvider ?? exposure.fetchProvider
   };
 }
 
@@ -159,8 +138,7 @@ export function toolLockEngaged(lock: ConversationToolLock): boolean {
     || lock.mcpToolDiscovery
     || lock.webSearch
     || lock.searchProvider !== null
-    || lock.fetchProvider !== null
-    || Object.values(lock.decisionParameterModes ?? {}).some(Boolean);
+    || lock.fetchProvider !== null;
 }
 
 /** Guards the per-run merge so an unchanged lock does not rewrite the conversation. */
@@ -178,8 +156,7 @@ export function sameToolLock(left: ConversationToolLock, right: ConversationTool
     && left.skillIds.every((id) => right.skillIds.includes(id))
     && sameIdList(left.promptSkillIds, right.promptSkillIds)
     && sameSelection(left.searchProvider, right.searchProvider)
-    && sameSelection(left.fetchProvider, right.fetchProvider)
-    && sameDecisionParameterModes(left.decisionParameterModes, right.decisionParameterModes);
+    && sameSelection(left.fetchProvider, right.fetchProvider);
 }
 
 /** Order matters for neither pin, but "set at all" does. */
@@ -231,11 +208,7 @@ export function toolLockAdditions(
        backend afterwards is refused outright, not offered as a widening. */
     promptSkillIds: lock.promptSkillIds === null ? exposure.promptSkillIds : null,
     searchProvider: lock.searchProvider === null ? exposure.searchProvider : null,
-    fetchProvider: lock.fetchProvider === null ? exposure.fetchProvider : null,
-    /* A tool already on the wire whose form would widen redeclares its schema,
-       which is exactly the change a dialect that refuses mid-conversation tool
-       changes cannot take. A newly exposed tool is already an addition by name. */
-    decisionParameterModes: widenedDecisionParameterModes(lock, exposure.decisionParameterModes)
+    fetchProvider: lock.fetchProvider === null ? exposure.fetchProvider : null
   };
 }
 
@@ -255,7 +228,6 @@ export function settingsAtToolLockFloor(settings: ConversationSettings): Convers
     mcpToolDiscoveryEnabled: lock.mcpToolDiscovery,
     webSearchEnabled: lock.webSearch,
     skillIds: settings.skillIds.filter((id) => lockedSkillIds.has(id)),
-    decisionParameterModes: decisionModesFor(lock.decisionParameterModes, lock.tools),
     webSearch: {
       ...settings.webSearch,
       provider: lock.searchProvider ?? settings.webSearch.provider,

@@ -36,8 +36,7 @@ const PREVIEW_PAGE_TOOL_NAMES = [
   "preview_network",
   "preview_resize",
   "preview_upload_image",
-  "preview_dialog",
-  "preview_find_logs"
+  "preview_dialog"
 ] as const;
 
 const PREVIEW_PAGE_TOOL_NAME_SET: ReadonlySet<string> = new Set(PREVIEW_PAGE_TOOL_NAMES);
@@ -56,96 +55,6 @@ export function isPreviewPageToolName(name: string): boolean {
  */
 export function isPreviewToolName(name: string): boolean {
   return name.startsWith("preview_");
-}
-
-/**
- * Catalog names of the tools that run through the decision model. Mirrors Rust
- * `decision_tools::DECISION_TOOL_NAMES`.
- *
- * Each needs the TypeSafe key before it can do anything, so none is on in a
- * seeded preset. `preview_find_logs` still counts as a preview tool everywhere
- * else: the preview settings offer it under `preview_logs`, and the timeline
- * does not offer to re-place a call against a page that is gone.
- */
-const DECISION_TOOL_NAMES = [
-  "find_content",
-  "find_files",
-  "find_output",
-  "bash_find_output",
-  "zsh_find_output",
-  "sh_find_output",
-  "powershell_find_output",
-  "preview_find_logs"
-] as const;
-
-const DECISION_TOOL_NAME_SET: ReadonlySet<string> = new Set(DECISION_TOOL_NAMES);
-
-export function isDecisionToolName(name: string): boolean {
-  return DECISION_TOOL_NAME_SET.has(name);
-}
-
-/**
- * The tools whose decision-model form is a separate catalog tool, each with
- * that tool. The form is read off which of the two are enabled: the base alone
- * is the direct form, both are `augment`, and the variant alone is `replace`.
- * The settings draw each pair as the base tool's row.
- */
-export const DECISION_VARIANT_TOOLS = {
-  preview_logs: "preview_find_logs",
-  bash: "bash_find_output",
-  zsh: "zsh_find_output",
-  sh: "sh_find_output",
-  powershell: "powershell_find_output"
-} as const satisfies Record<string, string>;
-
-/** The variant tool that is `name`'s decision-model form, or `null` when it has none. */
-export function decisionVariantOf(name: string): string | null {
-  return Object.hasOwn(DECISION_VARIANT_TOOLS, name)
-    ? DECISION_VARIANT_TOOLS[name as keyof typeof DECISION_VARIANT_TOOLS]
-    : null;
-}
-
-/**
- * The tools whose decision-model form is parameters of their own rather than a
- * separate tool. Mirrors Rust `decision_tools::DECISION_PARAMETER_TOOLS`. The
- * console and snapshot tools score, so they take `query` and `threshold`; the
- * element tools (click, fill, inspect) have the model choose one element or
- * "none of the above", so they take `query` alone.
- *
- * A conversation decides per tool, in `decisionParameterModes`, whether the
- * pair joins the tool's direct parameters (`augment`) or takes their place
- * (`replace`); a tool with no entry keeps its direct parameters only.
- */
-export const DECISION_PARAMETER_TOOL_NAMES = [
-  "preview_console_logs",
-  "preview_snapshot",
-  "preview_inspect",
-  "preview_click",
-  "preview_fill"
-] as const;
-
-const DECISION_PARAMETER_TOOL_NAME_SET: ReadonlySet<string> = new Set(DECISION_PARAMETER_TOOL_NAMES);
-
-export function takesDecisionParameters(name: string): boolean {
-  return DECISION_PARAMETER_TOOL_NAME_SET.has(name);
-}
-
-/**
- * The decision-parameter tools whose form chooses an element and so can miss:
- * the ones a conversation may ask, in `decisionMissScoring`, to score every
- * element line after a "none of the above". Mirrors Rust
- * `decision_tools::MISS_SCORING_TOOLS`.
- */
-export const MISS_SCORING_TOOL_NAMES = [
-  "preview_inspect",
-  "preview_click",
-  "preview_fill"
-] as const;
-
-const MISS_SCORING_TOOL_NAME_SET: ReadonlySet<string> = new Set(MISS_SCORING_TOOL_NAMES);
-
-export function scoresMisses(name: string): boolean {
-  return MISS_SCORING_TOOL_NAME_SET.has(name);
 }
 
 /**

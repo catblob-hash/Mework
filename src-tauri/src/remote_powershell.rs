@@ -192,7 +192,7 @@ Quit 0
     )
 }
 
-/// `ls` and `find_files`: the entries under the target, `max_depth` levels deep.
+/// `ls`: the entries under the target, `max_depth` levels deep.
 pub(crate) fn listing(target: &Target<'_>, path: &str, max_depth: u64, limit: usize) -> String {
     let mut script = prologue(target, path, Mode::Existing);
     script.push_str("if (-not [System.IO.Directory]::Exists($C)) { Quit 67 }\n");

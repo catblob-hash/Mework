@@ -13,9 +13,9 @@ import {
   captureConversationPresetSettings,
   implicitConversationPreset
 } from "../lib/conversationPresets";
-import { normalizeRememberedDecisionForms, normalizeRememberedToolFamilies } from "../lib/decisionParameters";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
+import { normalizeRememberedToolFamilies } from "../lib/toolFamilies";
 import type {
   CapabilityCatalog,
   ContextItem,
@@ -488,10 +488,6 @@ export function ConversationSettings({
                   lockedTools: lock.tools,
                   onChange: (enabledTools) => update({ enabledTools }),
                   expansionKey: conversation.id,
-                  decisionParameterModes: settings.decisionParameterModes ?? {},
-                  lockedDecisionParameterModes: lock.decisionParameterModes,
-                  decisionMissScoring: settings.decisionMissScoring ?? [],
-                  rememberedDecisionForms: normalizeRememberedDecisionForms(settings.rememberedDecisionForms),
                   rememberedToolFamilies: normalizeRememberedToolFamilies(settings.rememberedToolFamilies),
                   onToolSettingsChange: update
                 }}

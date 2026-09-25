@@ -32,9 +32,6 @@
   --success-soft: var(--color-eaf7f1);
   --warning: var(--color-a56312);
   --warning-soft: var(--color-fff5e5);
-  /* Marks a tool that runs through the decision model, beside the amber review mark. */
-  --decision: var(--color-315eae);
-  --decision-soft: var(--color-eef2f9);
   --danger: var(--color-c43d3d);
   --danger-soft: var(--color-fff0f0);
   /* Keep task backgrounds ordered: base < nested < hover < active. */

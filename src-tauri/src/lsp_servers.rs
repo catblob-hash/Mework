@@ -725,21 +725,6 @@ impl LspRegistry {
         })
     }
 
-    /// Whether the server `config` names is already up for `workspace` on
-    /// `host`, without starting it. For a caller that may use a server someone
-    /// else was allowed to start, but may not start it itself.
-    pub fn is_running(&self, host: &ServerHost, config: &LspServerConfig, workspace: &Path) -> bool {
-        let key = ServerKey {
-            root: ServerRoot::new(host, server_root(config, workspace)),
-            name: config.name.clone(),
-        };
-        self.lock()
-            .servers
-            .get(&key)
-            .and_then(|entry| entry.connection.as_ref())
-            .is_some_and(|connection| connection.is_alive())
-    }
-
     /// Returns a live server for `path`, starting it if this is the first call
     /// that needs it, together with the language id its configuration gives the
     /// file and the root that server indexes. `workspace` is the root a server

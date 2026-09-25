@@ -42,8 +42,7 @@ describe("the shell × OS table", () => {
 
   it("maps every shell tool back to its backend", () => {
     expect(backendOfTool("zsh")).toBe("zsh");
-    expect(backendOfTool("sh_find_output")).toBe("sh");
-    expect(backendOfTool("powershell_find_output")).toBe("powershell");
+    expect(backendOfTool("powershell")).toBe("powershell");
     expect(backendOfTool("read")).toBeNull();
     expect(backendOfTool("shell")).toBeNull();
   });
@@ -67,7 +66,7 @@ describe("what a conversation's machines offer", () => {
     const probes = { local: probe("macos", ["zsh", "bash", "sh"]), "ssh:m1": probe("windows", ["powershell"]) };
     expect(availableShellBackends([local, windows], probes, "MacIntel")).toEqual(["bash", "zsh", "sh", "powershell"]);
     expect(availableShellBackends([windows], probes, "MacIntel")).toEqual(["powershell"]);
-    const tools = ["read", "bash", "bash_find_output", "powershell", "zsh"].map((name) => ({ name }));
+    const tools = ["read", "bash", "powershell", "zsh"].map((name) => ({ name }));
     expect(toolsForShellBackends(tools, ["powershell"]).map((tool) => tool.name)).toEqual(["read", "powershell"]);
   });
 

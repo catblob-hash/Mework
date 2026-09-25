@@ -13,24 +13,13 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import {
-  type DecisionToolSettings,
-  switchToolsOff,
-  switchToolsOn
-} from "../lib/decisionParameters";
-import { isDecisionToolName, isHostDerivedToolName } from "../lib/taskTools";
-import type {
-  DecisionParameterModes,
-  RememberedDecisionForms,
-  RememberedToolFamilies,
-  ToolDescriptor
-} from "../types";
+import { isHostDerivedToolName } from "../lib/taskTools";
+import { type ToolListSettings, switchToolsOff, switchToolsOn } from "../lib/toolFamilies";
+import type { RememberedToolFamilies, ToolDescriptor } from "../types";
 import { ToolDocsLink, ToolFamilyDocsLink } from "./DocsLink";
 import {
   familyRowCounts,
-  familyRowNames,
   familyRowsOn,
-  familyVariantNames,
   TOOL_FAMILIES,
   ToolFamilySettingsDialog,
   type ToolFamily,
@@ -76,9 +65,6 @@ interface PresentFamily {
   members: ToolDescriptor[];
   names: string[];
   nameSet: ReadonlySet<string>;
-  /** What the row switches on in bulk: every member but the variants, which are
-   * choices made in the window rather than tools of their own. */
-  baseNames: string[];
 }
 
 function familyDescriptor({ family, members }: PresentFamily): ToolDescriptor {
@@ -137,10 +123,6 @@ export function ToolSelectionGroups({
   onChange,
   expansionKey,
   lockedTools = [],
-  decisionParameterModes,
-  lockedDecisionParameterModes,
-  decisionMissScoring,
-  rememberedDecisionForms,
   rememberedToolFamilies,
   onToolSettingsChange
 }: {
@@ -156,28 +138,17 @@ export function ToolSelectionGroups({
    */
   lockedTools?: readonly string[];
   /**
-   * The conversation's decision-parameter modes, edited in the family windows.
-   * Omitted — together with `onToolSettingsChange` — where the owner has no
-   * modes of its own, such as a role's tool list, which hides those options
-   * and keeps no choices for tools switched off.
-   */
-  decisionParameterModes?: DecisionParameterModes;
-  lockedDecisionParameterModes?: DecisionParameterModes;
-  /** The element tools whose misses the conversation scores, edited beside the modes. */
-  decisionMissScoring?: readonly string[];
-  /** The sub-option choices the conversation keeps for its switched-off tools. */
-  rememberedDecisionForms?: RememberedDecisionForms;
-  /**
    * The rows each switched-off family had on, which switching it back on
    * returns to. Kept by an owner with `onToolSettingsChange`; any other owner's
-   * are held here for as long as the picker is on screen.
+   * — such as a role's tool list — are held here for as long as the picker is
+   * on screen.
    */
   rememberedToolFamilies?: RememberedToolFamilies;
   /**
-   * A tool-list change with the modes, miss scoring and remembered choices
-   * that go with it, written as one edit. Without it, only the list is written.
+   * A tool-list change with the family rows remembered alongside it, written
+   * as one edit. Without it, only the list is written.
    */
-  onToolSettingsChange?: (next: DecisionToolSettings) => void;
+  onToolSettingsChange?: (next: ToolListSettings) => void;
 }) {
   const { t } = useI18n();
   const instanceId = useId().replace(/:/g, "");
@@ -191,14 +162,7 @@ export function ToolSelectionGroups({
       const members = catalog.filter((tool) => family.owns(tool.name));
       if (!members.length) return [];
       const names = members.map((tool) => tool.name);
-      const variants = familyVariantNames(family);
-      return [{
-        family,
-        members,
-        names,
-        nameSet: new Set(names),
-        baseNames: names.filter((name) => !variants.has(name))
-      }];
+      return [{ family, members, names, nameSet: new Set(names) }];
     });
   }, [tools]);
   const familyByRow = useMemo(
@@ -214,16 +178,9 @@ export function ToolSelectionGroups({
     return folded;
   }, [families]);
   const foldedEnabled = useMemo(() => fold(enabledTools), [enabledTools, fold]);
-  /**
-   * A family's one row, back as the names it stands for: the base tools when
-   * switching on, every member when switching off.
-   */
-  const expandNames = useCallback((candidates: readonly string[], removing = false): string[] => candidates.flatMap(
-    (candidate) => {
-      const present = familyByRow.get(candidate);
-      if (!present) return [candidate];
-      return removing ? present.names : present.baseNames;
-    }
+  /** A family's one row, back as the names it stands for: every member. */
+  const expandNames = useCallback((candidates: readonly string[]): string[] => candidates.flatMap(
+    (candidate) => familyByRow.get(candidate)?.names ?? [candidate]
   ), [familyByRow]);
   /* A family's row never moves to the lock bar: it is how the family's spent
      tools are seen at all, and how the ones still free are reached. */
@@ -232,15 +189,8 @@ export function ToolSelectionGroups({
     [familyByRow, fold, lockedTools]
   );
   const lockedRealNames = useMemo(() => new Set(lockedTools), [lockedTools]);
-  const availableNames = useMemo(() => new Set(tools.map((tool) => tool.name)), [tools]);
-  const settings: DecisionToolSettings = {
-    enabledTools,
-    decisionParameterModes: decisionParameterModes ?? {},
-    decisionMissScoring: [...(decisionMissScoring ?? [])],
-    rememberedDecisionForms: rememberedDecisionForms ?? {},
-    rememberedToolFamilies: rememberedFamilies
-  };
-  const write = (next: DecisionToolSettings) => {
+  const settings: ToolListSettings = { enabledTools, rememberedToolFamilies: rememberedFamilies };
+  const write = (next: ToolListSettings) => {
     if (onToolSettingsChange) {
       onToolSettingsChange(next);
       return;
@@ -266,7 +216,7 @@ export function ToolSelectionGroups({
    * whatever the row says, so it is neither what switching off put away nor
    * what switching on brought back.
    */
-  const withFamilyMemory = (before: DecisionToolSettings, after: DecisionToolSettings): DecisionToolSettings => {
+  const withFamilyMemory = (before: ToolListSettings, after: ToolListSettings): ToolListSettings => {
     const memory: RememberedToolFamilies = { ...(after.rememberedToolFamilies ?? {}) };
     for (const present of families) {
       const wasOn = familyRowsOn(present.family, present.nameSet, freelyOn(before.enabledTools));
@@ -277,15 +227,14 @@ export function ToolSelectionGroups({
     return { ...after, rememberedToolFamilies: memory };
   };
   /**
-   * Writes a narrowed tool list. A decision tool that leaves keeps its form and
-   * miss scoring among the remembered choices, and a family that leaves keeps
-   * its rows, so switching either back on returns to them.
+   * Writes a narrowed tool list. A family that leaves keeps its rows, so
+   * switching it back on returns to them.
    */
   const removeTools = (removed: ReadonlySet<string>) =>
     write(withFamilyMemory(settings, switchToolsOff(settings, removed)));
-  /** Writes a widened tool list, each row coming back to the choices it was switched off with. */
+  /** Writes a widened tool list. */
   const addTools = (rows: readonly string[]) =>
-    write(withFamilyMemory(settings, switchToolsOn(settings, rows, availableNames)));
+    write(withFamilyMemory(settings, switchToolsOn(settings, rows)));
   const groupedTools = useMemo(() => {
     const deduplicated = uniqueTools(tools).filter(
       // Memory, task-runtime, and skill tools are host-derived and cannot be
@@ -343,7 +292,7 @@ export function ToolSelectionGroups({
     // inaccurate count remains. Locked names survive either way: the model has
     // already been handed them and the transcript may already call them.
     const removed = new Set(
-      expandNames([name, ...(NESTED_TOOLS[name] ?? [])], true).filter((tool) => !lockedRealNames.has(tool))
+      expandNames([name, ...(NESTED_TOOLS[name] ?? [])]).filter((tool) => !lockedRealNames.has(tool))
     );
     if (!removed.size) return;
     removeTools(removed);
@@ -361,7 +310,7 @@ export function ToolSelectionGroups({
     const group = groupedTools.find((candidate) => candidate.category === category);
     if (!group) return;
     const candidates = group.allTools.filter((tool) => !lockedNames.has(tool.name)).map((tool) => tool.name);
-    const names = expandNames(candidates, !enabled);
+    const names = expandNames(candidates);
     if (enabled) {
       // Turning a group on is also a way of asking to see it: a collapsed
       // group would otherwise report a new count with nothing to show for it.
@@ -389,8 +338,7 @@ export function ToolSelectionGroups({
   const toggleFamily = (present: PresentFamily) => {
     const freeRows = familyRowsOn(present.family, present.nameSet, freelyOn(enabledTools));
     if (freeRows.length) {
-      const names = freeRows.flatMap((row) => familyRowNames(present.family, row, present.nameSet));
-      removeTools(new Set(names.filter((name) => !lockedRealNames.has(name))));
+      removeTools(new Set(freeRows));
       return;
     }
     const remembered = rememberedRows(present);
@@ -416,10 +364,10 @@ export function ToolSelectionGroups({
      each edit is put away again as the family's kept rows, so nothing it does
      reaches the live list. */
   const parkedSettings = openPresent && openFamily?.parked
-    ? switchToolsOn(settings, rememberedRows(openPresent), availableNames)
+    ? switchToolsOn(settings, rememberedRows(openPresent))
     : null;
   const windowSettings = parkedSettings ?? settings;
-  const writeFromWindow = (next: DecisionToolSettings) => {
+  const writeFromWindow = (next: ToolListSettings) => {
     if (!openPresent || !parkedSettings) {
       write(next);
       return;
@@ -612,10 +560,6 @@ export function ToolSelectionGroups({
           tools={openPresent.members}
           enabledTools={windowSettings.enabledTools}
           lockedTools={lockedTools}
-          decisionParameterModes={onToolSettingsChange ? windowSettings.decisionParameterModes : undefined}
-          lockedDecisionParameterModes={lockedDecisionParameterModes}
-          decisionMissScoring={windowSettings.decisionMissScoring}
-          rememberedDecisionForms={windowSettings.rememberedDecisionForms}
           onChange={writeFromWindow}
           onClose={closeFamily}
           notice={!openFamily?.parked
@@ -708,21 +652,10 @@ function ToolFamilyRow({
   );
 }
 
-/**
- * The marks a tool row carries before its trailing sign: a blue one when the
- * tool runs through the decision model — its calls send content to the
- * decision model provider — and the amber one when its calls are reviewed.
- */
+/** The mark a tool row carries before its trailing sign when its calls are reviewed. */
 function ToolMarks({ tool }: { tool: ToolDescriptor }) {
   const { t } = useI18n();
-  return (
-    <>
-      {isDecisionToolName(tool.name) && (
-        <em className="tool-toggle-row__decision">{t("决策模型", "Decision model")}</em>
-      )}
-      {tool.dangerous && <em>{t("需审查", "Reviewed")}</em>}
-    </>
-  );
+  return tool.dangerous ? <em>{t("需审查", "Reviewed")}</em> : null;
 }
 
 /** A tool-toggle row. Nested tools have no disclosure: their presence is fully

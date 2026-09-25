@@ -673,24 +673,6 @@ impl ShellTaskRegistry {
             .map(|entry| entry.snapshot(shell_task_id))
     }
 
-    /// One command's retained output and how many bytes fell off the front of the tail buffer,
-    /// scoped to the owning conversation like [`Self::task_snapshot`].
-    ///
-    /// Deliberately not `subscribe_output`: `find_output` reads the buffer once for a tool call
-    /// and installs no sink, so a page that is watching the same command keeps its subscription
-    /// and a finished command is read without minting one.
-    pub fn output_snapshot(
-        &self,
-        conversation_id: &str,
-        shell_task_id: &str,
-    ) -> Option<(String, u64)> {
-        self.lock()
-            .entries
-            .get(shell_task_id)
-            .filter(|entry| entry.conversation_id == conversation_id)
-            .map(|entry| (entry.output.snapshot(), entry.output.dropped_head_bytes))
-    }
-
     /// Whether this command is still running. `task_wait` settles on it: a finished row stays in
     /// the registry forever, so presence alone can no longer answer the question.
     pub fn is_running(&self, conversation_id: &str, shell_task_id: &str) -> bool {

@@ -239,15 +239,6 @@ describe("advanced settings", () => {
     expect(screen.queryByRole("radio", { name: /内置浏览器/ })).not.toBeInTheDocument();
   });
 
-  it("renders the decision-model provider page from its navigation item", () => {
-    const { container } = renderProviders(undefined, { initialView: "decision_providers" });
-
-    expect(screen.getByRole("button", { name: "决策模型提供商" })).toHaveClass("settings-nav__item--active");
-    expect(container.querySelector(".decision-provider-page")).toBeInTheDocument();
-    expect(within(container.querySelector(".decision-provider-page")!).getByRole("button", { name: "TypeSafe" }))
-      .toHaveAttribute("aria-current", "true");
-  });
-
   it("lets providers be enabled and disabled", async () => {
     const user = userEvent.setup();
     const { getSettings } = renderProviders();

@@ -1574,7 +1574,7 @@ describe("ConversationSettings", () => {
     }));
     // Saving narrows the pane's whole body back down to exactly what a preset owns.
     expect(Object.keys(onSavePreset.mock.calls.at(-1)![1]).sort()).toEqual([
-      "agentDefinitions", "allowRolelessSubagents", "decisionMissScoring", "decisionParameterModes",
+      "agentDefinitions", "allowRolelessSubagents",
       "enabledTools",
       "globalMemoryEnabled",
       "hookIds", "mcpIds", "mcpToolDiscoveryEnabled", "projectMemoryEnabled", "securityLevel",

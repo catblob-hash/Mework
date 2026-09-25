@@ -195,16 +195,6 @@ pub(crate) fn run_write(
     write_with(&target.workspace.runner, target, input, file_guard)
 }
 
-/// The text of one remote file for a tool that scores it rather than shows it: the display
-/// path and the content. Images and oversized files are refused the way `read` refuses them.
-/// No read record is taken, because nothing of the file is put in front of the model.
-pub(crate) fn read_text(
-    target: &RemoteWorkspace<'_>,
-    path: &str,
-) -> Result<(String, String), String> {
-    read_text_with(&target.workspace.runner, target, path)
-}
-
 pub(crate) fn run_edit(
     target: &RemoteWorkspace<'_>,
     input: &JsonObject,
@@ -570,27 +560,21 @@ pub(crate) fn run_script(
 // ---------------------------------------------------------------------------
 
 fn ls_script(target: &RemoteWorkspace<'_>, path: &str, depth: u64) -> Result<String, String> {
-    listing_script(target, path, depth, MAX_LIST_ENTRIES)
-}
-
-/// The `ls` walk with its cap left open, so a caller that scores the listing rather than
-/// showing it can ask for more entries than a person would ever read.
-fn listing_script(
-    target: &RemoteWorkspace<'_>,
-    path: &str,
-    depth: u64,
-    limit: usize,
-) -> Result<String, String> {
     if let Some(ps) = powershell(target)? {
         check_operand(path, "path")?;
-        return Ok(crate::remote_powershell::listing(&ps, path, depth + 1, limit + 1));
+        return Ok(crate::remote_powershell::listing(
+            &ps,
+            path,
+            depth + 1,
+            MAX_LIST_ENTRIES + 1,
+        ));
     }
     let mut script = prologue(target, path, TargetMode::Existing)?;
     script.push_str(&format!("[ -d \"$C\" ] || exit {EXIT_WRONG_KIND}\n"));
     script.push_str(&format!(
         "{{ find \"$C\" -mindepth 1 -maxdepth {} {MARK_ENTRIES} ; }} 2>/dev/null | head -n {}\n",
         depth + 1,
-        limit + 1
+        MAX_LIST_ENTRIES + 1
     ));
     Ok(script)
 }
@@ -634,24 +618,10 @@ fn render_listing(
     limit_key: PromptKey,
     empty_key: PromptKey,
 ) -> String {
-    let (mut entries, overflowed) = listing_entries(header, payload, MAX_LIST_ENTRIES);
-    if overflowed {
-        entries.push(profile.render(limit_key, &[("limit", &MAX_LIST_ENTRIES.to_string())]));
-    }
-    if entries.is_empty() {
-        profile.text(empty_key).to_owned()
-    } else {
-        entries.join("\n")
-    }
-}
-
-/// The entries of a listing payload, relative to the root and sorted, with whether `limit` cut
-/// the walk short. This is what `ls` renders and what [`list_entries`] hands to the scorer.
-fn listing_entries(header: &Header, payload: &str, limit: usize) -> (Vec<String>, bool) {
     let mut entries = Vec::new();
     let mut overflowed = false;
     for line in payload.lines().filter(|line| !line.is_empty()) {
-        if entries.len() >= limit {
+        if entries.len() >= MAX_LIST_ENTRIES {
             overflowed = true;
             break;
         }
@@ -663,40 +633,14 @@ fn listing_entries(header: &Header, payload: &str, limit: usize) -> (Vec<String>
         entries.push(display);
     }
     entries.sort_unstable();
-    (entries, overflowed)
-}
-
-/// The raw relative entries under `path` on the remote machine, for `find_files`, which scores
-/// the listing instead of showing it. Same walk and same directory marking as `ls`; the cap is
-/// the scoring cap rather than the reading cap, and nothing is rendered — a "reached the limit"
-/// row among the entries would be scored as if it were a path.
-pub(crate) fn list_entries(
-    target: &RemoteWorkspace<'_>,
-    path: &str,
-    depth: u64,
-) -> Result<Vec<String>, String> {
-    list_entries_with(&target.workspace.runner, target, path, depth)
-}
-
-fn list_entries_with(
-    shell: &dyn RemoteShell,
-    target: &RemoteWorkspace<'_>,
-    path: &str,
-    depth: u64,
-) -> Result<Vec<String>, String> {
-    let limit = crate::decision_tools::listing::MAX_FIND_FILES_ENTRIES;
-    let wording =
-        ExitWording::new(path).wrong_kind(format!("find_files target is not a directory: {path}"));
-    let output = run_script(
-        shell,
-        target,
-        &listing_script(target, path, depth, limit)?,
-        None,
-        SEARCH_TIMEOUT,
-        &wording,
-    )?;
-    let (header, rest) = take_header(&output.stdout)?;
-    Ok(listing_entries(&header, &String::from_utf8_lossy(rest), limit).0)
+    if overflowed {
+        entries.push(profile.render(limit_key, &[("limit", &MAX_LIST_ENTRIES.to_string())]));
+    }
+    if entries.is_empty() {
+        profile.text(empty_key).to_owned()
+    } else {
+        entries.join("\n")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,41 +968,6 @@ fn read_with(
             read: Some(record),
         }),
     })
-}
-
-fn read_text_with(
-    shell: &dyn RemoteShell,
-    target: &RemoteWorkspace<'_>,
-    path: &str,
-) -> Result<(String, String), String> {
-    let wording = ExitWording::new(path)
-        .wrong_kind(format!("find_content target is not a file: {path}"))
-        .too_large(format!(
-            "File exceeds the {} MiB limit",
-            MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
-        ));
-    let output = run_script(
-        shell,
-        target,
-        &read_script(target, path)?,
-        None,
-        FILE_TIMEOUT,
-        &wording,
-    )?;
-    let (header, rest) = take_header(&output.stdout)?;
-    let (_meta, body) = take_lines(rest, 2)?;
-    if is_supported_image(body) {
-        return Err(format!("{path} is an image; only text files can be scored"));
-    }
-    if body.len() as u64 > MAX_TEXT_FILE {
-        return Err(format!(
-            "Text file exceeds the {} MiB limit",
-            MAX_TEXT_FILE / 1024 / 1024
-        ));
-    }
-    let content = String::from_utf8(body.to_vec())
-        .map_err(|error| format!("Failed to read text file as UTF-8: {error}"))?;
-    Ok((display_relative(&header.root, &header.canonical), content))
 }
 
 /// The remote clock in whole milliseconds. Seconds are all `stat` promises
@@ -1636,8 +1545,6 @@ pub(crate) mod tests {
         let posix = format!("/{drive}{}/notes/it's.txt", &root[2..]);
         let read = run_read(&target, &input(json!({"path": posix})), None, None).unwrap();
         assert!(read.output.contains("third"), "{}", read.output);
-        let entries = list_entries(&target, ".", 3).unwrap();
-        assert!(entries.iter().any(|entry| entry == "notes/it's.txt"), "{entries:?}");
 
         let cleaned = runner
             .run(
@@ -2125,29 +2032,6 @@ pub(crate) mod tests {
             let outside = read_with(&shell, &target, &input(json!({"path": "../outside.txt"})), None, None).refusal();
             assert!(outside.contains("outside workspace") || outside.contains("No such file"), "{backend}: {outside}");
         }
-    }
-
-    /// `find_files` walks with the same script and the same relative spelling, but takes the
-    /// entries rather than the rendering: nothing is sorted into a "limit reached" row, and
-    /// nothing stands in for an empty directory, because both would be scored as if they were
-    /// paths.
-    #[test]
-    fn list_entries_hands_back_the_paths_ls_would_have_rendered() {
-        let Some(fixture) = fixture() else { return };
-        write_fixture_file(&fixture, "a.txt", b"alpha\n");
-        write_fixture_file(&fixture, "sub/deep/c.txt", b"gamma\n");
-        let harness = Harness::new(&fixture);
-        let target = harness.target(Confinement::Workspace);
-
-        let entries = list_entries_with(&fixture.shell, &target, ".", 6).unwrap();
-        assert_eq!(entries, vec!["a.txt", "sub/", "sub/deep/", "sub/deep/c.txt"]);
-        // Depth counts levels below the target exactly as `ls` counts them.
-        let shallow = list_entries_with(&fixture.shell, &target, ".", 0).unwrap();
-        assert_eq!(shallow, vec!["a.txt", "sub/"]);
-        let empty = list_entries_with(&fixture.shell, &target, "sub/deep", 0).unwrap();
-        assert_eq!(empty, vec!["sub/deep/c.txt"]);
-        let not_a_directory = list_entries_with(&fixture.shell, &target, "a.txt", 1).refusal();
-        assert_eq!(not_a_directory, "find_files target is not a directory: a.txt");
     }
 
     #[test]

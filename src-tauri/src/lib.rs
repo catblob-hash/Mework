@@ -44,8 +44,6 @@ mod conversation_fork;
 mod conversation_store;
 mod conversation_template;
 mod conversations;
-mod decision_model;
-mod decision_tools;
 mod document_store;
 mod dropped_files;
 mod environment_prompt;
@@ -2333,81 +2331,6 @@ async fn delete_search_api_key(
     })
     .await
     .map_err(|error| format!("删除搜索提供商 API Key 的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn save_decision_api_key(
-    state: State<'_, AppState>,
-    provider_kind: String,
-    api_key: String,
-) -> Result<ApiKeyStatus, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
-            .storage_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let api_key = zeroize::Zeroizing::new(api_key);
-        decision_model::save_provider_api_key(&provider_kind, &api_key)
-    })
-    .await
-    .map_err(|error| format!("保存决策模型提供商 API Key 的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn get_decision_key_status(
-    state: State<'_, AppState>,
-    provider_kind: String,
-) -> Result<ApiKeyStatus, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
-            .storage_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        decision_model::get_provider_key_status(&provider_kind)
-    })
-    .await
-    .map_err(|error| format!("读取决策模型提供商 API Key 状态的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn reveal_decision_api_key(
-    state: State<'_, AppState>,
-    provider_kind: String,
-) -> Result<String, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
-            .storage_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        api::allow_credential_prompt();
-        decision_model::reveal_provider_api_key(&provider_kind)
-    })
-    .await
-    .map_err(|error| format!("读取决策模型提供商 API Key 的后台任务失败: {error}"))?
-}
-
-#[cfg(not(test))]
-#[tauri::command]
-async fn delete_decision_api_key(
-    state: State<'_, AppState>,
-    provider_kind: String,
-) -> Result<ApiKeyStatus, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
-            .storage_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        decision_model::delete_provider_api_key(&provider_kind)
-    })
-    .await
-    .map_err(|error| format!("删除决策模型提供商 API Key 的后台任务失败: {error}"))?
 }
 
 #[cfg(not(test))]
@@ -6528,19 +6451,6 @@ fn trusted_run_request(
         Some(lock) if !lock.mcp_ids.is_empty() => lock.mcp_tool_discovery,
         _ => conversation.settings.mcp_tool_discovery_enabled,
     };
-    // Which tools take their decision parameters, and whether beside their direct parameters or
-    // instead of them. Widened by the lock rather than pinned: a schema the model has already
-    // been shown may grow, but never stop accepting calls the transcript holds.
-    request.decision_parameter_modes = decision_tools::effective_parameter_modes(
-        &conversation.settings,
-        &request.enabled_tools,
-    );
-    // Which of those tools score their misses. Kept to the tools with a mode: a tool on its
-    // direct form never asks the decision model, so there is no miss to score.
-    request.decision_miss_scoring = decision_tools::effective_miss_scoring(
-        &conversation.settings,
-        &request.decision_parameter_modes,
-    );
     // The file write guards are unconditional, so nothing is read from the
     // settings for them. What a run still resolves here is the read record it
     // consults: a top-level run's is the conversation's own scope.
@@ -6573,7 +6483,6 @@ fn trusted_run_request(
     // catalog and apply only the separately persisted model-facing description override; never
     // trust a renderer-supplied descriptor that could relabel PowerShell or change its schema.
     request.tools = tools;
-    decision_tools::inject_parameter_schemas(&mut request);
     Ok(request)
 }
 

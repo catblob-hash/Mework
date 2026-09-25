@@ -19,4 +19,3 @@ A server's buffer is discarded the moment its process exits or `preview_stop` ki
 - [preview_start](preview_start.html), [preview_list](preview_list.html), [preview_stop](preview_stop.html)
 - [preview_console_logs](preview_console_logs.html), [preview_network](preview_network.html)
 - [Working with Mework](../working.html#the-built-in-browser)
-- [preview_find_logs](preview_find_logs.html) — find lines by description in this output and the page console

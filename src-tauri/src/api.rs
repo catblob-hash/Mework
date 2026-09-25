@@ -276,11 +276,6 @@ const SUBAGENT_DISABLED_TOOL_NAMES: &[&str] = &[
     // parent conversation's selection, and the call is a lookup in memory. A
     // child doing work the user packaged a skill for should be able to read
     // that skill; a role that disagrees can still exclude it by name.
-    //
-    // The decision-model tools (`decision_tools::DECISION_TOOL_NAMES`) are absent
-    // for the same reason `grep` and `read` are: each is a read of material the
-    // child could read anyway, scored by a provider the user configured, and
-    // delegated research is exactly where keeping bulk out of a context pays.
 ];
 
 fn subagent_tool_is_disabled(name: &str) -> bool {
@@ -3746,7 +3741,7 @@ fn run_model_inner(
                             &shadowed_approval,
                         ) {
                             failed_tool_execution(call, reason)
-                        } else if tool_executor::ShellKind::of_command_tool(&call.name).is_some()
+                        } else if tool_executor::ShellKind::of_tool(&call.name).is_some()
                             && tool_executor::shell_run_in_background_requested(&call.input)
                         {
                             // Consume approval before spawning the background shell
@@ -3847,7 +3842,7 @@ fn run_model_inner(
                             // Declared rather than built inline so the closure
                             // borrows the turn's state instead of moving it; it
                             // must not outlive this one call.
-                            let shell_kind = tool_executor::ShellKind::of_command_tool(&call.name);
+                            let shell_kind = tool_executor::ShellKind::of_tool(&call.name);
                             let shell_call_id = call.id.clone();
                             let shell_command =
                                 tool_executor::parse_shell_command(&call.input).unwrap_or_default();
@@ -5875,7 +5870,6 @@ fn execute_model_tool_with_scope(
         handoff,
         &request.prompt_profile,
         Some(file_guard_context(request, state)),
-        &request.decision_miss_scoring,
     );
     (
         execution.result,
@@ -6353,13 +6347,7 @@ fn automatic_tool_rejection_reason(
     if call.input.contains_key("_raw") {
         return Some("The model supplied tool arguments that are not a JSON object".to_owned());
     }
-    // The executor routes a decision-parameter tool on its arguments alone, so the
-    // conversation's choice of form is enforced here, before approval is even asked for.
-    crate::decision_tools::parameter_mode_rejection(
-        &request.decision_parameter_modes,
-        &call.name,
-        &call.input,
-    )
+    None
 }
 
 fn rejected_tool_execution(
@@ -6551,8 +6539,6 @@ fn web_search_request_template(
         skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
-            decision_parameter_modes: Default::default(),
-            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
         // A search call reports as prose, not through `structured_output`.
@@ -9260,10 +9246,6 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         // and never read those results, so `attach_mcp_tools` re-withholds
         // every one of them and the child searches for its own.
         mcp_tool_discovery: parent.mcp_tool_discovery,
-        // Inherited with the tool descriptors that carry the schemas: a child's `preview_click` is
-        // the parent's, so the arguments it may take are too.
-        decision_parameter_modes: parent.decision_parameter_modes.clone(),
-        decision_miss_scoring: parent.decision_miss_scoring.clone(),
         // The guards are inherited; the read record is not shared. A child gets
         // a scope of its own, seeded from the parent's on first use — the
         // parent's reads are what the child may edit, but what the child then
@@ -10820,7 +10802,7 @@ fn run_background_shell(
     hook_allows_permission: bool,
     round: usize,
 ) -> Result<ToolExecution, String> {
-    let kind = tool_executor::ShellKind::of_command_tool(&call.name)
+    let kind = tool_executor::ShellKind::of_tool(&call.name)
         .expect("dispatch guarantees a shell tool name");
     if parent.subagent_depth >= 1 {
         // Children cannot use `task_wait`; fold is their only delivery path, and
@@ -14873,8 +14855,6 @@ mod tests {
             skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
-            decision_parameter_modes: Default::default(),
-            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model: {
@@ -34156,9 +34136,9 @@ mod tests {
     #[test]
     fn the_main_agent_catalog_exposes_exactly_the_two_web_names() {
         let catalog = catalog::tool_catalog();
-        // The web group has exactly search, fetch, the fifteen preview tools and
-        // `preview_find_logs`; `web_query` remains retired, and so are the four
-        // `_by_description`/`find_element` tools the base tools' `query` form replaced.
+        // The web group has exactly search, fetch and the fifteen preview tools;
+        // `web_query` remains retired, and so are the preview tools that went
+        // through a decision model.
         let web_names = catalog
             .iter()
             .filter(|tool| tool.category == ToolCategory::Web)
@@ -34184,7 +34164,6 @@ mod tests {
                 "preview_resize",
                 "preview_upload_image",
                 "preview_dialog",
-                "preview_find_logs",
             ]
         );
 
@@ -34197,6 +34176,7 @@ mod tests {
             "web_research",
             "preview_find_element",
             "preview_click_by_description",
+            "preview_find_logs",
         ] {
             let call = ToolCall {
                 id: format!("call-main-{retired}"),
@@ -34209,66 +34189,6 @@ mod tests {
                 "{retired} must be unreachable",
             );
         }
-    }
-
-    /// A conversation's decision-parameter modes reach the wire as the tool's own schema, and a
-    /// call that does not fit its tool's mode is refused before execution.
-    #[test]
-    fn decision_parameter_modes_shape_the_schema_and_gate_the_call() {
-        use crate::model::DecisionParameterMode;
-
-        let mut request = run_request(ProviderFamily::OpenaiResponses);
-        request.tools = catalog::tool_catalog();
-        request.enabled_tools = vec!["preview_click".into(), "preview_snapshot".into()];
-        request.decision_parameter_modes = BTreeMap::from([
-            ("preview_click".to_owned(), DecisionParameterMode::Replace),
-            ("preview_snapshot".to_owned(), DecisionParameterMode::Augment),
-        ]);
-        crate::decision_tools::inject_parameter_schemas(&mut request);
-
-        let schema_of = |name: &str| {
-            let tool = request.tools.iter().find(|tool| tool.name == name).unwrap();
-            crate::aisdk::tools::tool_schema(tool, &request.prompt_profile, &request.workspaces)
-        };
-        let click = schema_of("preview_click");
-        assert!(click["properties"].get("selector").is_none());
-        assert!(click["properties"].get("threshold").is_none());
-        assert_eq!(click["required"], json!(["query"]));
-        let snapshot = schema_of("preview_snapshot");
-        assert!(snapshot["properties"].get("query").is_some());
-        assert_eq!(snapshot["required"], json!([]));
-        // A tool the conversation left on its direct form keeps the catalog schema.
-        assert!(request
-            .tools
-            .iter()
-            .find(|tool| tool.name == "preview_fill")
-            .unwrap()
-            .input_schema
-            .is_none());
-
-        let call = |name: &str, input: Value| ToolCall {
-            id: format!("call-{name}"),
-            name: name.into(),
-            input: input.as_object().unwrap().clone(),
-        };
-        assert!(automatic_tool_rejection_reason(
-            &request,
-            &call("preview_click", json!({"selector": "button"}))
-        )
-        .is_some());
-        assert_eq!(
-            automatic_tool_rejection_reason(&request, &call("preview_click", json!({"query": "save"}))),
-            None
-        );
-        assert!(automatic_tool_rejection_reason(
-            &request,
-            &call("preview_click", json!({"query": "save", "threshold": 0.6}))
-        )
-        .is_some());
-        assert_eq!(
-            automatic_tool_rejection_reason(&request, &call("preview_snapshot", json!({}))),
-            None
-        );
     }
 
     /// A cancellation signaled by the probe sink must propagate as `Cancelled`, not
@@ -35135,9 +35055,8 @@ mod tests {
         // everywhere else they are withdrawn rather than advertised to fail.
         let local = crate::machine_shells::local();
         for backend in crate::shell_backend::ShellBackend::ALL {
-            for name in [backend.tool_name(), backend.find_output_tool_name()] {
-                assert_eq!(exposed.contains(name), local.get(backend).is_some(), "{name}");
-            }
+            let name = backend.tool_name();
+            assert_eq!(exposed.contains(name), local.get(backend).is_some(), "{name}");
         }
     }
 
@@ -35841,8 +35760,6 @@ mod tests {
             skills: Vec::new(),
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
-            decision_parameter_modes: Default::default(),
-            decision_miss_scoring: Default::default(),
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model,

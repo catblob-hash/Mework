@@ -14,4 +14,3 @@
 - [grep](grep.html) — 匹配文件内容而不是名字
 - [read](read.html) — 打开搜索翻出来的东西
 - [使用 Mework](../working.html#tools-and-approvals) — 安全层级矩阵
-- [find_files](find_files.html) — 知道文件做什么、却不知道它叫什么时

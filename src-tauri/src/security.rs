@@ -82,7 +82,7 @@ pub fn classify(
     request: &ToolExecutionRequest,
 ) -> Result<SecurityDecision, String> {
     let (effect, path_mode) = match request.tool_name.as_str() {
-        "ls" | "grep" | "find" | "find_files" => (
+        "ls" | "grep" | "find" => (
             OperationEffect::Read,
             Some(PathMode::Existing { default: Some(".") }),
         ),
@@ -90,20 +90,6 @@ pub fn classify(
             OperationEffect::Read,
             Some(PathMode::Existing { default: None }),
         ),
-        // Scores the file's chunks with the decision model and shows only the winners: a read
-        // of the file, judged by the same path rules. The chunks leave for TypeSafe's API,
-        // which the user opted into by configuring that provider.
-        "find_content" => (
-            OperationEffect::Read,
-            Some(PathMode::Existing { default: None }),
-        ),
-        "find_output" => {
-            return Ok(internal_decision(
-                RiskLevel::Low,
-                "host.read_or_coordinate",
-                "只读取本对话一条 shell 命令已保留的输出并交给决策模型打分，不触碰文件、Shell 或外部网络",
-            ));
-        }
         // Code navigation reads one file and asks a language server about it.
         //
         // The read is the call's own boundary, but starting the server is not
@@ -156,17 +142,13 @@ pub fn classify(
                 command,
             );
         }
-        // Sixteen preview tools, one policy each. `dangerous` in the catalog is only the review
+        // Fifteen preview tools, one policy each. `dangerous` in the catalog is only the review
         // marker the settings page draws; the approval line is decided here.
         //
         // Starting or stopping a dev server runs or kills a process the project's launch.json
         // describes, and every tool that drives a page can act on a signed-in origin, so both
         // classify unbounded. Reading the registry, the accessibility tree, one element, or the
         // viewport touches nothing outside the host.
-        //
-        // A decision-parameter tool keeps its own line whichever way it names its target: the
-        // `query` form of `preview_click` still clicks, and scoring a snapshot or the console
-        // reads exactly what the plain form reads. Only the arguments' shapes change.
         "preview_start" => {
             validate_required_string(&request.input, "name", 256, "server name argument")?;
             return Ok(classify_unbounded(level));
@@ -175,37 +157,24 @@ pub fn classify(
             validate_required_string(&request.input, "serverId", 256, "server id argument")?;
             return Ok(classify_unbounded(level));
         }
-        "preview_list" | "preview_logs" | "preview_resize" => {
+        "preview_list" | "preview_logs" | "preview_snapshot" | "preview_resize" => {
             return classify_browser_local(workspace, app_data, additional_directories)
         }
-        "preview_snapshot" => {
-            validate_optional_query(&request.input)?;
-            return classify_browser_local(workspace, app_data, additional_directories);
-        }
         "preview_inspect" => {
-            validate_page_target(&request.input)?;
+            validate_required_string(&request.input, "selector", 2_048, "CSS selector argument")?;
             return classify_browser_local(workspace, app_data, additional_directories);
         }
         // Console lines, network rows and page pixels all carry whatever the signed-in page is
-        // showing, so they share the one boundary that names that risk. Scoring the console
-        // and server logs reads those same lines.
-        "preview_console_logs" => {
-            validate_optional_query(&request.input)?;
-            return Ok(classify_browser_sensitive(level, &request.tool_name));
-        }
-        "preview_network" | "preview_screenshot" => {
+        // showing, so they share the one boundary that names that risk.
+        "preview_console_logs" | "preview_network" | "preview_screenshot" => {
             return Ok(classify_browser_sensitive(level, &request.tool_name))
         }
-        "preview_find_logs" => {
-            validate_required_string(&request.input, "query", 2_000, "query argument")?;
-            return Ok(classify_browser_sensitive(level, &request.tool_name));
-        }
         "preview_click" => {
-            validate_page_target(&request.input)?;
+            validate_required_string(&request.input, "selector", 2_048, "CSS selector argument")?;
             return Ok(classify_unbounded(level));
         }
         "preview_fill" => {
-            validate_page_target(&request.input)?;
+            validate_required_string(&request.input, "selector", 2_048, "CSS selector argument")?;
             // The empty string is how a field is cleared, so `value` is present-but-empty-allowed.
             match request.input.get("value") {
                 Some(Value::String(value)) if value.chars().count() <= 32_768 => {}
@@ -323,7 +292,7 @@ fn trusted_roots(workspace: &Path, app_data: &Path, additional: &[String]) -> Ve
 fn is_filesystem_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "ls" | "grep" | "find" | "find_files" | "read" | "write" | "edit" | "lsp" | "find_content"
+        "ls" | "grep" | "find" | "read" | "write" | "edit" | "lsp"
     )
 }
 
@@ -476,11 +445,11 @@ fn classify_remote_filesystem(
     request: &ToolExecutionRequest,
 ) -> Result<SecurityDecision, String> {
     let (effect, path_mode) = match request.tool_name.as_str() {
-        "ls" | "grep" | "find" | "find_files" => (
+        "ls" | "grep" | "find" => (
             OperationEffect::Read,
             PathMode::Existing { default: Some(".") },
         ),
-        "read" | "lsp" | "find_content" => (
+        "read" | "lsp" => (
             OperationEffect::Read,
             PathMode::Existing { default: None },
         ),
@@ -2326,9 +2295,7 @@ fn classify_unbounded(level: SecurityLevel) -> SecurityDecision {
 
 fn classify_browser_sensitive(level: SecurityLevel, tool_name: &str) -> SecurityDecision {
     let subject = match tool_name {
-        "preview_console_logs" | "preview_find_logs" => {
-            "console and server log lines, which may contain tokens and error context"
-        }
+        "preview_console_logs" => "console logs, which may contain tokens and error context",
         "preview_network" => {
             "network logs, which may contain complete URLs, query parameters, and response bodies"
         }
@@ -2517,25 +2484,6 @@ fn path_argument(input: &JsonObject, key: &str, default: Option<&str>) -> Result
         }
         Some(_) => Err(format!("{key} argument must be a string")),
     }
-}
-
-/// A page tool's target: a CSS selector, or — for a conversation that gave the tool its
-/// decision-model form — a `query` naming the element in plain language. Which of the two this
-/// conversation allows is the run loop's check (`decision_tools::parameter_mode_rejection`); this
-/// one only bounds whichever arrived.
-fn validate_page_target(input: &JsonObject) -> Result<(), String> {
-    if input.contains_key("query") {
-        return validate_required_string(input, "query", 2_000, "query argument");
-    }
-    validate_required_string(input, "selector", 2_048, "CSS selector argument")
-}
-
-/// `query` on a tool whose direct form needs no target, bounded when present.
-fn validate_optional_query(input: &JsonObject) -> Result<(), String> {
-    if input.contains_key("query") {
-        return validate_required_string(input, "query", 2_000, "query argument");
-    }
-    Ok(())
 }
 
 fn validate_required_string(
@@ -3701,7 +3649,7 @@ mod tests {
         }
     }
 
-    /// Sixteen tools, one policy each. `dangerous` in the catalog is only the review marker the
+    /// Fifteen tools, one policy each. `dangerous` in the catalog is only the review marker the
     /// settings page draws, so the approval line is pinned here explicitly.
     #[test]
     fn every_preview_tool_has_a_matching_security_policy() {
@@ -3711,7 +3659,7 @@ mod tests {
             .filter(|tool| tool.name.starts_with("preview_"))
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        assert_eq!(preview_tools.len(), 16);
+        assert_eq!(preview_tools.len(), 15);
         assert!(!crate::catalog::tool_catalog()
             .into_iter()
             .any(|tool| tool.name == "playwright"));
@@ -3767,15 +3715,9 @@ mod tests {
             "preview_console_logs",
             "preview_network",
             "preview_screenshot",
-            "preview_find_logs",
         ] {
-            let input = if tool == "preview_find_logs" {
-                json!({"query":"q","threshold":0.5})
-            } else {
-                json!({})
-            };
             let guarded = fixture
-                .classify(SecurityLevel::AllowEdits, tool, input.clone())
+                .classify(SecurityLevel::AllowEdits, tool, json!({}))
                 .unwrap();
             assert!(guarded.requires_approval, "{tool} must require approval");
             assert_eq!(guarded.effect, OperationEffect::Unbounded);
@@ -3783,7 +3725,7 @@ mod tests {
             assert!(!guarded.reason.is_empty());
 
             let full = fixture
-                .classify(SecurityLevel::FullAccess, tool, input)
+                .classify(SecurityLevel::FullAccess, tool, json!({}))
                 .unwrap();
             assert!(!full.requires_approval);
         }
@@ -3816,9 +3758,6 @@ mod tests {
             ("preview_fill", json!({"selector":"input","value":""})),
             ("preview_eval", json!({"expression":"document.title"})),
             ("preview_dialog", json!({})),
-            // The decision-model form still clicks and fills.
-            ("preview_click", json!({"query":"the save button"})),
-            ("preview_fill", json!({"query":"the email field","value":"x"})),
         ] {
             let decision = fixture
                 .classify(SecurityLevel::RequestApproval, tool, input.clone())
@@ -3849,12 +3788,6 @@ mod tests {
             ("preview_fill", json!({"selector":"input"})),
             ("preview_fill", json!({"selector":"input","value":7})),
             ("preview_inspect", json!({})),
-            ("preview_inspect", json!({"query":"  "})),
-            ("preview_snapshot", json!({"query":""})),
-            ("preview_console_logs", json!({"query": 3})),
-            ("preview_find_logs", json!({})),
-            ("preview_click", json!({"query":""})),
-            ("preview_fill", json!({"query":"the email field"})),
         ] {
             assert!(
                 fixture
@@ -3881,7 +3814,6 @@ mod tests {
             "preview_inspect" | "preview_click" => json!({"selector":"button"}),
             "preview_fill" => json!({"selector":"input","value":"x"}),
             "preview_eval" => json!({"expression":"document.title"}),
-            "preview_find_logs" => json!({"query":"q","threshold":0.5}),
             "preview_upload_image" => json!({"image_id":"1"}),
             _ => json!({}),
         }

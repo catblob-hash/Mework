@@ -115,7 +115,7 @@ pub fn summarize_tool_input(tool_name: &str, input: &JsonObject) -> String {
         // The background marker rides in front of the command so the user
         // approving the card knows this call returns immediately and the
         // command then runs detached from the round.
-        "bash" | "powershell" | "bash_find_output" | "powershell_find_output" => text("command").map(|command| {
+        "bash" | "powershell" => text("command").map(|command| {
             if input.get("run_in_background") == Some(&Value::Bool(true)) {
                 format!("[后台] {command}")
             } else {

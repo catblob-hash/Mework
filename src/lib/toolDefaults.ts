@@ -59,11 +59,8 @@ const englishParameterLabels: Record<string, string> = {
   styles: "CSS properties",
   subject: "Task subject",
   taskId: "Task ID",
-  task: "Task address",
   tasks: "Tasks",
-  source: "Log source",
   target: "Child agent",
-  threshold: "Score threshold",
   timeout_seconds: "Timeout (seconds)",
   value: "Value",
   width: "Width"
@@ -71,37 +68,6 @@ const englishParameterLabels: Record<string, string> = {
 
 const englishParameterHelp: Record<string, string> = {
   "0 仅列出当前目录": "0 lists only the current directory.",
-  "用自然语言描述要找的文件；目录列表会切块送给决策模型打分":
-    "Describe the files to look for in plain language; the directory listing is cut into groups the decision model scores.",
-  "用自然语言描述要找的内容；文件会切块送给决策模型打分":
-    "Describe what to look for in plain language; the file is cut into chunks the decision model scores.",
-  "task_list 里的 shell 任务地址，如 shell:3": "The shell task address from task_list, e.g. shell:3.",
-  "用自然语言描述要在输出里找的内容；输出会切块送给决策模型打分":
-    "Describe what to look for in the output in plain language; the output is cut into chunks the decision model scores.",
-  "用自然语言描述要在命令输出里找的内容；输出会切块送给决策模型打分，只返回过阈值的片段":
-    "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned.",
-  "用自然语言描述要在 Console 里找的内容；按 level 过滤后的日志送给决策模型打分，只返回分数不低于 threshold 的片段。需在对话设置里为本工具开启决策模型参数":
-    "Describe what to look for in the console in plain language; the logs that pass level go to the decision model, and only pieces scoring at or above threshold come back. Needs this tool's decision-model parameters turned on in the conversation settings.",
-  "用自然语言描述要找的页面元素；可访问性快照送给决策模型打分，只返回分数不低于 threshold 的元素及其选择器，而不是整份快照。需在对话设置里为本工具开启决策模型参数":
-    "Describe the page element to look for in plain language; the accessibility snapshot goes to the decision model, and only elements scoring at or above threshold come back with their selectors, instead of the whole snapshot. Needs this tool's decision-model parameters turned on in the conversation settings.",
-  "用自然语言描述要点击的元素，代替 selector；决策模型从页面元素里选出所指的一个并点击，都不符合时会选「以上皆非」，什么也不做。需在对话设置里为本工具开启决策模型参数":
-    "Describe the element to click in plain language, instead of selector; the decision model chooses the one meant and it is clicked, or answers none of the above and nothing is done. Needs this tool's decision-model parameters turned on in the conversation settings.",
-  "用自然语言描述要填写的输入框，代替 selector；决策模型从页面元素里选出所指的一个并填写，都不符合时会选「以上皆非」，什么也不做。需在对话设置里为本工具开启决策模型参数":
-    "Describe the input to fill in plain language, instead of selector; the decision model chooses the one meant and it is filled, or answers none of the above and nothing is done. Needs this tool's decision-model parameters turned on in the conversation settings.",
-  "用自然语言描述要检查的元素，代替 selector；决策模型从页面元素里选出所指的一个并读取它的样式，都不符合时会选「以上皆非」，按未找到回答。需在对话设置里为本工具开启决策模型参数":
-    "Describe the element to inspect in plain language, instead of selector; the decision model chooses the one meant and its styles are read, or answers none of the above and the element is reported as not found. Needs this tool's decision-model parameters turned on in the conversation settings.",
-  "0 到 1，最多三位小数；与 query 一起给出，只返回分数不低于它的片段":
-    "0 to 1 with at most three decimals, given with query; only pieces scoring at or above it are returned.",
-  "0 到 1，最多三位小数；与 query 一起给出，只返回分数不低于它的元素":
-    "0 to 1 with at most three decimals, given with query; only pieces scoring at or above it are returned.",
-  "用自然语言描述要在日志里找的内容；Console 日志和服务器日志会切块送给决策模型打分":
-    "Describe what to look for in the logs in plain language; the console and server logs are cut into chunks the decision model scores.",
-  "要搜索的日志：all（默认）同时搜 Console 与服务器日志，console 只搜页面 Console，server 只搜服务器输出":
-    "Which logs to search: 'all' (default) searches both the page console and the dev server output, 'console' only the page console, 'server' only the server output.",
-  "0 到 1，最多三位小数；只返回分数不低于它的片段":
-    "0 to 1 with at most three decimals; only pieces scoring at or above it are returned.",
-  "从 1 开始": "1-based.",
-  "包含该行；留空到文件末尾": "Inclusive; leave empty for the end of the file.",
   "本对话已选技能的名字，取自 schema 的 enum":
     "Name of a skill this conversation selected; the schema lists them as an enum.",
   "`select:<名字>[,<名字>…]` 按名取，或者用关键词搜索":
@@ -126,15 +92,12 @@ const englishParameterHelp: Record<string, string> = {
   "最多返回行数（默认 50，上限 200）": "Max lines to return (default: 50, max: 200)",
   "返回图像的缩放系数，取值 0.1 到 1；图像越小消耗的 token 越少。preview_click 用的是 preview_snapshot 给出的元素 UID，而不是像素坐标":
     "Scale factor in [0.1, 1] for the returned image; smaller images use fewer tokens. preview_click uses element UIDs from preview_snapshot, not pixel coordinates.",
-  "要检查的元素 CSS 选择器；开启决策模型参数后也可以改用 query":
-    "CSS selector (e.g., '.button', '#header'); with decision-model parameters on, query can name the element instead",
+  "要检查的元素 CSS 选择器": "CSS selector (e.g., '.button', '#header')",
   "要返回的 CSS 属性名数组；不给时返回一组常用属性":
     "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties.",
-  "要点击的元素 CSS 选择器；开启决策模型参数后也可以改用 query":
-    "CSS selector for the element to click; with decision-model parameters on, query can name the element instead",
+  "要点击的元素 CSS 选择器": "CSS selector for the element to click",
   "改为双击": "Perform a double-click",
-  "要填写的输入框 CSS 选择器；开启决策模型参数后也可以改用 query":
-    "CSS selector for the input element; with decision-model parameters on, query can name the element instead",
+  "要填写的输入框 CSS 选择器": "CSS selector for the input element",
   "要填入的值": "Value to fill",
   "在页面上下文里求值的 JavaScript 表达式；返回值按 JSON 序列化":
     "JavaScript expression to evaluate in the page context. Return values are serialized as JSON.",
@@ -186,15 +149,6 @@ const englishParameterHelp: Record<string, string> = {
 };
 
 const englishParameterPlaceholders: Record<string, string> = {
-  "处理登录失败的代码": "The code that handles a failed login",
-  "存放提供商凭据的代码": "The code that stores provider credentials",
-  "shell:3": "shell:3",
-  "有没有编译错误": "Are there compile errors",
-  "测试失败的原因": "Why the tests failed",
-  "顶部导航里的登录按钮": "The login button in the top navigation",
-  "有没有关于 hydration 的报错": "Any errors about hydration",
-  "对话框里的保存按钮": "The Save button in the dialog",
-  "邮箱输入框": "The email field",
   "调查 src/ 下的路由结构并总结关键文件": "Inspect routing under src/ and summarize the key files",
   "调查路由": "Inspect routing",
   "在分叉出的会话里要完成的任务": "The task to complete in the forked conversation",
@@ -219,13 +173,6 @@ const englishToolLabels: Record<string, string> = {
   edit: "Edit file",
   find: "Find files",
   read: "Read file",
-  find_content: "Find content by description",
-  find_files: "Find files by description",
-  find_output: "Find output by description",
-  bash_find_output: "Bash, scored output",
-  powershell_find_output: "PowerShell, scored output",
-  zsh_find_output: "zsh, scored output",
-  sh_find_output: "sh, scored output",
   lsp: "Code navigation",
   web_search: "Web search",
   workflow: "Workflow",
@@ -244,7 +191,6 @@ const englishToolLabels: Record<string, string> = {
   preview_resize: "Resize viewport",
   preview_upload_image: "Upload image",
   preview_dialog: "Answer dialog",
-  preview_find_logs: "Find logs by description",
   agent_spawn: "Subagent",
   send_message: "Send message",
   followup_task: "Follow up",

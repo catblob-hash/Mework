@@ -69,7 +69,6 @@ const UI = {
       availability: "Availability",
       switchable: "Tool picker",
       familyWindow: "Tool picker, in the `{family}` window",
-      variantWindow: "Tool picker, in the `{family}` window as the decision-model form of `{base}`",
       parameters: "Parameters",
       parameter: "Parameter",
       type: "Type",
@@ -111,7 +110,6 @@ const UI = {
       availability: "可用性",
       switchable: "工具选择器",
       familyWindow: "工具选择器，在 `{family}` 窗口里",
-      variantWindow: "工具选择器，在 `{family}` 窗口里作为 `{base}` 的决策模型形式",
       parameters: "参数",
       parameter: "参数",
       type: "类型",
@@ -158,18 +156,8 @@ const DERIVED = {
 // the family's tools under a heading with exactly that id.
 const FAMILIES = {
   files: (name) => ["ls", "find", "grep", "read", "write", "edit"].includes(name),
-  shell: (name) => /^(bash|zsh|sh|powershell)(_find_output)?$/.test(name),
+  shell: (name) => ["bash", "zsh", "sh", "powershell"].includes(name),
   preview: (name) => name.startsWith("preview_"),
-};
-// Decision-model forms that are a tool of their own, chosen under their base
-// tool's row in the family window. Mirrors DECISION_VARIANT_TOOLS in
-// src/lib/taskTools.ts.
-const DECISION_VARIANTS = {
-  preview_find_logs: "preview_logs",
-  bash_find_output: "bash",
-  zsh_find_output: "zsh",
-  sh_find_output: "sh",
-  powershell_find_output: "powershell",
 };
 
 function familyOf(name) {
@@ -240,10 +228,7 @@ function availabilityLabel(lang, name) {
   if (DERIVED[name]) return ui.derived[DERIVED[name]];
   const family = familyOf(name);
   if (!family) return ui.tools.switchable;
-  const base = DECISION_VARIANTS[name];
-  return (base ? ui.tools.variantWindow : ui.tools.familyWindow)
-    .replace("{family}", family)
-    .replace("{base}", base);
+  return ui.tools.familyWindow.replace("{family}", family);
 }
 
 function toolCounts() {

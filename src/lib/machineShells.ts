@@ -52,10 +52,7 @@ export function machineOsLabel(os: MachineOs): string {
 
 /** The backend a shell tool runs in, or `null` for any other tool. Mirrors `ShellBackend::of_tool`. */
 export function backendOfTool(toolName: string): ShellBackend | null {
-  for (const backend of SHELL_BACKENDS) {
-    if (toolName === backend || toolName === `${backend}_find_output`) return backend;
-  }
-  return null;
+  return SHELL_BACKENDS.find((backend) => backend === toolName) ?? null;
 }
 
 export function isRegistered(os: MachineOs, backend: ShellBackend): boolean {

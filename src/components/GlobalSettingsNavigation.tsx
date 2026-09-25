@@ -4,7 +4,6 @@ import {
   Command,
   Download,
   Palette,
-  Scale,
   Search,
   Terminal
 } from "lucide-react";
@@ -30,8 +29,7 @@ const globalSettingsNavigationGroups: Array<{
     id: "providers",
     items: [
       { id: "providers", icon: Cloud },
-      { id: "search_providers", icon: Search },
-      { id: "decision_providers", icon: Scale }
+      { id: "search_providers", icon: Search }
     ]
   },
   {
@@ -68,7 +66,6 @@ export function GlobalSettingsNavigation({
     appearance: t("外观", "Appearance"),
     providers: t("模型提供商", "Model providers"),
     search_providers: t("搜索提供商", "Search providers"),
-    decision_providers: t("决策模型提供商", "Decision model providers"),
     shortcuts: t("快捷键", "Keyboard shortcuts"),
     usage: t("用量统计", "Usage statistics"),
     dependencies: t("环境依赖", "Dependencies"),

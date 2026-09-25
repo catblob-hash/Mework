@@ -3,7 +3,7 @@
   "language": "en-US",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 56,
+  "toolCount": 48,
   "tools": [
     {
       "name": "ls",
@@ -135,98 +135,6 @@
       ]
     },
     {
-      "name": "bash_find_output",
-      "label": "Bash, scored output",
-      "description": "",
-      "category": "shell",
-      "dangerous": true,
-      "parameters": [
-        {
-          "name": "command",
-          "label": "Command",
-          "type": "multiline",
-          "required": true,
-          "placeholder": "git status --short"
-        },
-        {
-          "name": "description",
-          "label": "Description",
-          "type": "string",
-          "required": false,
-          "placeholder": "Show working tree status"
-        },
-        {
-          "name": "timeout",
-          "label": "Timeout (ms)",
-          "type": "number",
-          "required": false,
-          "placeholder": "120000"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "Why the tests failed",
-          "help": "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
-        }
-      ]
-    },
-    {
-      "name": "powershell_find_output",
-      "label": "PowerShell, scored output",
-      "description": "",
-      "category": "shell",
-      "dangerous": true,
-      "parameters": [
-        {
-          "name": "command",
-          "label": "Command",
-          "type": "multiline",
-          "required": true,
-          "placeholder": "Get-ChildItem -Force"
-        },
-        {
-          "name": "description",
-          "label": "Description",
-          "type": "string",
-          "required": false,
-          "placeholder": "List files in the current directory"
-        },
-        {
-          "name": "timeout",
-          "label": "Timeout (ms)",
-          "type": "number",
-          "required": false,
-          "placeholder": "120000"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "Why the tests failed",
-          "help": "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
-        }
-      ]
-    },
-    {
       "name": "zsh",
       "label": "zsh",
       "description": "",
@@ -297,98 +205,6 @@
           "type": "boolean",
           "required": false,
           "defaultValue": false
-        }
-      ]
-    },
-    {
-      "name": "zsh_find_output",
-      "label": "zsh, scored output",
-      "description": "",
-      "category": "shell",
-      "dangerous": true,
-      "parameters": [
-        {
-          "name": "command",
-          "label": "Command",
-          "type": "multiline",
-          "required": true,
-          "placeholder": "ls -la"
-        },
-        {
-          "name": "description",
-          "label": "Description",
-          "type": "string",
-          "required": false,
-          "placeholder": "List files in the current directory"
-        },
-        {
-          "name": "timeout",
-          "label": "Timeout (ms)",
-          "type": "number",
-          "required": false,
-          "placeholder": "120000"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "Why the tests failed",
-          "help": "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
-        }
-      ]
-    },
-    {
-      "name": "sh_find_output",
-      "label": "sh, scored output",
-      "description": "",
-      "category": "shell",
-      "dangerous": true,
-      "parameters": [
-        {
-          "name": "command",
-          "label": "Command",
-          "type": "multiline",
-          "required": true,
-          "placeholder": "ls -la"
-        },
-        {
-          "name": "description",
-          "label": "Description",
-          "type": "string",
-          "required": false,
-          "placeholder": "List files in the current directory"
-        },
-        {
-          "name": "timeout",
-          "label": "Timeout (ms)",
-          "type": "number",
-          "required": false,
-          "placeholder": "120000"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "Why the tests failed",
-          "help": "Describe what to look for in the command's output in plain language; the output is cut into chunks the decision model scores and only pieces above the threshold are returned."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
         }
       ]
     },
@@ -491,125 +307,6 @@
           "type": "number",
           "required": false,
           "help": "Text files only; inclusive."
-        }
-      ]
-    },
-    {
-      "name": "find_content",
-      "label": "Find content by description",
-      "description": "",
-      "category": "filesystem",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "path",
-          "label": "Path",
-          "type": "string",
-          "required": true
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "The code that handles a failed login",
-          "help": "Describe what to look for in plain language; the file is cut into chunks the decision model scores."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
-        },
-        {
-          "name": "start_line",
-          "label": "Start line",
-          "type": "number",
-          "required": false,
-          "defaultValue": 1,
-          "help": "1-based."
-        },
-        {
-          "name": "end_line",
-          "label": "End line",
-          "type": "number",
-          "required": false,
-          "help": "Inclusive; leave empty for the end of the file."
-        }
-      ]
-    },
-    {
-      "name": "find_files",
-      "label": "Find files by description",
-      "description": "",
-      "category": "filesystem",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "path",
-          "label": "Path",
-          "type": "string",
-          "required": false,
-          "defaultValue": "."
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "The code that stores provider credentials",
-          "help": "Describe the files to look for in plain language; the directory listing is cut into groups the decision model scores."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
-        },
-        {
-          "name": "depth",
-          "label": "Recursion depth",
-          "type": "number",
-          "required": false,
-          "defaultValue": 6,
-          "help": "0 lists only the current directory."
-        }
-      ]
-    },
-    {
-      "name": "find_output",
-      "label": "Find output by description",
-      "description": "",
-      "category": "shell",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "task",
-          "label": "Task address",
-          "type": "string",
-          "required": true,
-          "placeholder": "shell:3",
-          "help": "The shell task address from task_list, e.g. shell:3."
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "Are there compile errors",
-          "help": "Describe what to look for in the output in plain language; the output is cut into chunks the decision model scores."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
         }
       ]
     },
@@ -802,22 +499,6 @@
           "required": false,
           "defaultValue": 50,
           "help": "Max lines to return (default: 50, max: 200)"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": false,
-          "placeholder": "Any errors about hydration",
-          "help": "Describe what to look for in the console in plain language; the logs that pass level go to the decision model, and only pieces scoring at or above threshold come back. Needs this tool's decision-model parameters turned on in the conversation settings."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": false,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals, given with query; only pieces scoring at or above it are returned."
         }
       ]
     },
@@ -857,22 +538,6 @@
           "type": "string",
           "required": false,
           "help": "Server ID"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": false,
-          "placeholder": "The login button in the top navigation",
-          "help": "Describe the page element to look for in plain language; the accessibility snapshot goes to the decision model, and only elements scoring at or above threshold come back with their selectors, instead of the whole snapshot. Needs this tool's decision-model parameters turned on in the conversation settings."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": false,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals, given with query; only pieces scoring at or above it are returned."
         }
       ]
     },
@@ -894,9 +559,9 @@
           "name": "selector",
           "label": "CSS selector",
           "type": "string",
-          "required": false,
+          "required": true,
           "placeholder": ".button",
-          "help": "CSS selector (e.g., '.button', '#header'); with decision-model parameters on, query can name the element instead"
+          "help": "CSS selector (e.g., '.button', '#header')"
         },
         {
           "name": "styles",
@@ -905,14 +570,6 @@
           "required": false,
           "placeholder": "[\"padding\",\"color\"]",
           "help": "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": false,
-          "placeholder": "The Save button in the dialog",
-          "help": "Describe the element to inspect in plain language, instead of selector; the decision model chooses the one meant and its styles are read, or answers none of the above and the element is reported as not found. Needs this tool's decision-model parameters turned on in the conversation settings."
         }
       ]
     },
@@ -934,9 +591,9 @@
           "name": "selector",
           "label": "CSS selector",
           "type": "string",
-          "required": false,
+          "required": true,
           "placeholder": "button.primary",
-          "help": "CSS selector for the element to click; with decision-model parameters on, query can name the element instead"
+          "help": "CSS selector for the element to click"
         },
         {
           "name": "doubleClick",
@@ -944,14 +601,6 @@
           "type": "boolean",
           "required": false,
           "help": "Perform a double-click"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": false,
-          "placeholder": "The Save button in the dialog",
-          "help": "Describe the element to click in plain language, instead of selector; the decision model chooses the one meant and it is clicked, or answers none of the above and nothing is done. Needs this tool's decision-model parameters turned on in the conversation settings."
         }
       ]
     },
@@ -973,9 +622,9 @@
           "name": "selector",
           "label": "CSS selector",
           "type": "string",
-          "required": false,
+          "required": true,
           "placeholder": "input[name=email]",
-          "help": "CSS selector for the input element; with decision-model parameters on, query can name the element instead"
+          "help": "CSS selector for the input element"
         },
         {
           "name": "value",
@@ -983,14 +632,6 @@
           "type": "string",
           "required": true,
           "help": "Value to fill"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": false,
-          "placeholder": "The email field",
-          "help": "Describe the input to fill in plain language, instead of selector; the decision model chooses the one meant and it is filled, or answers none of the above and nothing is done. Needs this tool's decision-model parameters turned on in the conversation settings."
         }
       ]
     },
@@ -1163,46 +804,6 @@
           "type": "string",
           "required": false,
           "help": "The answer for an open prompt dialog, used only when accepting."
-        }
-      ]
-    },
-    {
-      "name": "preview_find_logs",
-      "label": "Find logs by description",
-      "description": "",
-      "category": "web",
-      "dangerous": true,
-      "parameters": [
-        {
-          "name": "serverId",
-          "label": "Server ID",
-          "type": "string",
-          "required": false,
-          "help": "Server ID"
-        },
-        {
-          "name": "query",
-          "label": "Query",
-          "type": "string",
-          "required": true,
-          "placeholder": "Any errors about hydration",
-          "help": "Describe what to look for in the logs in plain language; the console and server logs are cut into chunks the decision model scores."
-        },
-        {
-          "name": "threshold",
-          "label": "Score threshold",
-          "type": "number",
-          "required": true,
-          "placeholder": "0.6",
-          "help": "0 to 1 with at most three decimals; only pieces scoring at or above it are returned."
-        },
-        {
-          "name": "source",
-          "label": "Log source",
-          "type": "string",
-          "required": false,
-          "defaultValue": "all",
-          "help": "Which logs to search: 'all' (default) searches both the page console and the dev server output, 'console' only the page console, 'server' only the server output."
         }
       ]
     },

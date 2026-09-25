@@ -239,12 +239,12 @@ export function terminalShellLabel(shell: TerminalShell): string {
  * number.
  */
 const WORKSPACE_SCOPED_TOOLS: ReadonlySet<string> = new Set([
-  "ls", "grep", "find", "read", "write", "edit", "lsp", "find_content", "find_files"
+  "ls", "grep", "find", "read", "write", "edit", "lsp"
 ]);
 
 /** The backend a shell tool runs in. Mirrors `ShellBackend::of_tool`. */
 function shellOfTool(toolName: string): string | null {
-  const match = /^(bash|zsh|sh|powershell)(?:_find_output)?$/.exec(toolName);
+  const match = /^(bash|zsh|sh|powershell)$/.exec(toolName);
   return match ? match[1]! : null;
 }
 
