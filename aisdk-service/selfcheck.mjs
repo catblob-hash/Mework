@@ -21,7 +21,7 @@ const OVERRIDE = process.argv.includes("--sea")
 const BUNDLE = resolve(here, "dist/main.mjs");
 // Protocol generation. Keep this literal because packaged artifacts do not export
 // the constant; a mismatch must fail during the ready handshake.
-const V = 12;
+const V = 13;
 
 let failures = 0;
 const results = [];
@@ -725,7 +725,8 @@ async function handler(req, res) {
     (message) => Array.isArray(message?.content)
       && message.content.some((block) => block?.type === "thinking" || block?.type === "redacted_thinking"),
   );
-  if (model === "claude-selfcheck-replay-keep" || model === "claude-selfcheck-replay-gate" || model === "claude-3-selfcheck-nobeta"
+  if (model === "claude-selfcheck-replay-keep" || model === "claude-selfcheck-replay-gate" || model === "claude-selfcheck-replay-budget"
+    || model === "claude-3-selfcheck-nobeta"
     || model === "claude-selfcheck-cache-layout" || model === "claude-selfcheck-cache-off") {
     anthropicSse(res, "end_turn");
     return;
@@ -1824,6 +1825,23 @@ async function main() {
       && !gateBlocks.some((block) => block?.type === "thinking")
       && gateBlocks.some((block) => block?.type === "text" && block.text === "好的"),
     replayGate.type === "done" ? JSON.stringify(gateBlocks) : JSON.stringify(replayGate.error),
+  );
+  // Claude Code's `[1m]` budget suffix names the same signer: a turn stored under
+  // `…[1m]` keeps its signature once the model runs under its bare id.
+  sc.send(
+    anthropicStep("s-replay-budget", "claude-selfcheck-replay-budget", {
+      messages: signedHistory("claude-selfcheck-replay-budget[1m]"),
+    }),
+  );
+  const replayBudget = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === "s-replay-budget");
+  const budgetBlocks = observed.find((o) => o.body?.model === "claude-selfcheck-replay-budget")?.body?.messages
+    ?.find((message) => message.role === "assistant")?.content;
+  check(
+    "20 签名回放：[1m] 预算后缀不算换模型，签名照常回放",
+    replayBudget.type === "done"
+      && Array.isArray(budgetBlocks)
+      && budgetBlocks.some((block) => block?.type === "thinking" && block.signature === "sig-history"),
+    replayBudget.type === "done" ? JSON.stringify(budgetBlocks) : JSON.stringify(replayBudget.error),
   );
 
   // Check 21: Claude Code's request shape — its betas, its cache breakpoints, and

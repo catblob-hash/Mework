@@ -687,6 +687,35 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
   );
   sc.send({ v: V, type: "release", session: "ca-effort" });
 
+  // 30p: the host sends a bare model id plus its window; the sidecar asks for
+  // the CLI's 1M budget only when the window exceeds 200k, and an id installed
+  // with the suffix by an earlier version passes through. The stub key is a
+  // Console-style login, whose bare-id budget is 200k, and the CLI's 1M budget
+  // shows on the wire as the `context-1m` beta. The suffix itself never does.
+  const budgetOf = async (id, modelId, contextWindow) => {
+    upstream.push({ blocks: [{ type: "text", text: "budget ok" }] });
+    const before = upstream.calls.length;
+    sc.send(stepFrame(id, id, [{ role: "user", content: "hi" }], { modelId, contextWindow }));
+    const frame = await sc.wait(terminal(id), 60000);
+    sc.send({ v: V, type: "release", session: id });
+    const call = upstream.calls.slice(before).find((entry) => (entry.body?.max_tokens ?? 0) > 1);
+    return {
+      done: frame.type === "done",
+      model: call?.body?.model,
+      oneMillion: String(call?.headers?.["anthropic-beta"] ?? "").includes("context-1m"),
+    };
+  };
+  const wide = await budgetOf("ca-budget-1m", "claude-sonnet-5", 1_000_000);
+  const standard = await budgetOf("ca-budget-200k", "claude-sonnet-5", 200_000);
+  const legacy = await budgetOf("ca-budget-legacy", "claude-sonnet-5[1m]", 200_000);
+  check(
+    "30 claude-agent：窗口超过 200k 才给 CLI 补 [1m]（上游见 context-1m），旧的带后缀 id 原样放行，模型名不带后缀",
+    wide.done && wide.oneMillion && wide.model === "claude-sonnet-5"
+      && standard.done && !standard.oneMillion && standard.model === "claude-sonnet-5"
+      && legacy.done && legacy.oneMillion && legacy.model === "claude-sonnet-5",
+    JSON.stringify({ wide, standard, legacy }),
+  );
+
   // 30j: image tool results travel as MCP image content, the host's image bridge
   // rides along, and both land in the tool_result the model sees.
   const PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";

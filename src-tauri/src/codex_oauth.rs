@@ -26,7 +26,9 @@ use zeroize::Zeroizing;
 
 pub const CODEX_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// `client_version` sent to `GET /models`; the backend hides models whose `minimal_client_version` is newer.
-pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.153.4";
+/// That gate is the Codex CLI's release train, which Mework is not on, so this is a ceiling rather than a
+/// Codex release: the list is the backend's whole catalog as it stands, with nothing to bump per release.
+pub const CODEX_MODELS_CLIENT_VERSION: &str = "99.0.0";
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 const KEY_PREFIX: &str = "codex-oauth:v1:";

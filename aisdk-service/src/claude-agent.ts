@@ -773,6 +773,29 @@ function agentEnvOverrides(agent: AgentSession): Record<string, string> {
   return overrides;
 }
 
+/** The context budget the CLI gives a model id without `[1m]` under a Console login. */
+const STANDARD_CONTEXT_BUDGET = 200_000;
+const ONE_MILLION_SUFFIX = /\[1m\]$/i;
+
+/**
+ * The model id the CLI is started with. Mework keeps a model without Claude
+ * Code's `[1m]` suffix and states its context window instead, and the suffix is
+ * derived here: a window above the CLI's standard budget asks for the 1M one.
+ *
+ * The CLI enforces its budget locally, before any request: auto-compact is off,
+ * so a prompt past it ends the step with "Prompt is too long". For a bare id
+ * that budget is 200k under a Console login and 1M under a subscription, so
+ * without the suffix a Console user would hit a wall the host does not plan
+ * for. The suffix never reaches the API (the CLI strips it and sends the 1M
+ * beta header instead), and under a subscription it changes nothing. An id
+ * that already carries it — a model installed by an earlier version — passes
+ * through as it is.
+ */
+function cliModelId(modelId: string, contextWindow: number | undefined): string {
+  if (ONE_MILLION_SUFFIX.test(modelId)) return modelId;
+  return contextWindow !== undefined && contextWindow > STANDARD_CONTEXT_BUDGET ? `${modelId}[1m]` : modelId;
+}
+
 /**
  * The four model variables the CLI consults for its own routing. Only a real
  * model id is pinned: an alias (`sonnet`, `opus[1m]`) is the CLI's own
@@ -1568,6 +1591,9 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       });
     });
 
+    // What the CLI runs; `request.modelId` stays the host's name for the model
+    // (signature tags, served-model stamps).
+    const cliModel = cliModelId(request.modelId, request.contextWindow);
     const resumed = history.length > 0;
     const sessionId = randomUUID();
     const transcript = resumed
@@ -1584,7 +1610,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       cwd: agent.cwd,
       pathToClaudeCodeExecutable: agent.executable,
       spawnClaudeCodeProcess: cli.spawnHook(),
-      env: cliEnv(agent, request.modelId, { maxOutputTokens: request.maxOutputTokens }),
+      env: cliEnv(agent, cliModel, { maxOutputTokens: request.maxOutputTokens }),
       // Rendered fresh on every request, never recorded. By default the CLI records
       // a session's system prompt on its first request and replays that record
       // afterwards, even across a resume that passes different text; the host
@@ -1613,7 +1639,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       canUseTool: async (_toolName, toolInput) => ({ behavior: "allow", updatedInput: toolInput }),
       permissionMode: "default",
       includePartialMessages: true,
-      model: request.modelId,
+      model: cliModel,
       ...reasoningOptions(request.reasoning),
       settings: { totalTokensReminder: "off" },
       ...(resumed

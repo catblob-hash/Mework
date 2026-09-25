@@ -11778,7 +11778,9 @@ fn run_followup_task(
 }
 
 /// The dev servers this conversation may address, exactly as `preview_list`
-/// narrows them: its own, plus the ones no conversation owns.
+/// lists them: in every one of its workspaces, its own plus the ones no
+/// conversation owns, each carrying the workspace number that completes its
+/// address when there are several.
 ///
 /// The registry only ever holds servers that are starting or running — one that
 /// exits is removed by its supervisor thread — so an id that is absent here has
@@ -11786,16 +11788,59 @@ fn run_followup_task(
 fn conversation_preview_servers(
     parent: &RunModelRequest,
     state: &AppState,
-) -> Vec<crate::preview_servers::PreviewServerSnapshot> {
-    state
-        .preview_servers
-        .servers_for_worktree(Path::new(&parent.workspace_path))
-        .into_iter()
-        .filter(|server| {
-            server.session_id.is_none()
-                || server.session_id.as_deref() == Some(parent.conversation_id.as_str())
-        })
-        .collect()
+) -> Vec<tool_executor::AddressableServer> {
+    let fallback;
+    let workspaces = if parent.workspaces.is_empty() {
+        fallback = crate::workspace_set::WorkspaceSet::local_root(&parent.workspace_path);
+        &fallback
+    } else {
+        &parent.workspaces
+    };
+    tool_executor::addressable_preview_servers(state, workspaces, &parent.conversation_id)
+}
+
+/// The task address a dev server answers to — the form `task_list` prints.
+fn preview_task_ref(server: &tool_executor::AddressableServer) -> orchestration::TaskRef {
+    orchestration::TaskRef::Preview {
+        server_id: server.server.server_id.clone(),
+        workspace: server.workspace,
+    }
+}
+
+/// What a `preview:` address names among `servers`. A workspace number in a
+/// conversation with one workspace narrows nothing, so it is dropped rather than
+/// made to miss.
+fn address_preview_task<'a>(
+    servers: &'a [tool_executor::AddressableServer],
+    parent: &RunModelRequest,
+    server_id: &str,
+    workspace: Option<u32>,
+) -> tool_executor::PreviewServerAddress<'a> {
+    let workspace = workspace.filter(|_| parent.workspaces.len() > 1);
+    tool_executor::address_preview_server(servers, server_id, workspace)
+}
+
+/// The dev server a `preview:` address names right now, if exactly one does.
+fn preview_task_server(
+    parent: &RunModelRequest,
+    state: &AppState,
+    server_id: &str,
+    workspace: Option<u32>,
+) -> Option<crate::preview_servers::PreviewServerSnapshot> {
+    let servers = conversation_preview_servers(parent, state);
+    match address_preview_task(&servers, parent, server_id, workspace) {
+        tool_executor::PreviewServerAddress::Found(found) => Some(found.server.clone()),
+        _ => None,
+    }
+}
+
+/// Where a dev server answers, as a task row and an observation say it: its port,
+/// and the machine when that `localhost` is not this computer's.
+fn preview_task_detail(server: &crate::preview_servers::PreviewServerSnapshot) -> String {
+    match &server.machine {
+        Some(machine) => format!("localhost:{} · {machine}", server.port),
+        None => format!("localhost:{}", server.port),
+    }
 }
 
 /// The status word a dev-server row and observation share.
@@ -11852,16 +11897,39 @@ fn resolve_wait_targets(
                 }
                 others.push(task.clone());
             }
-            orchestration::TaskRef::Preview(server_id) => {
-                if conversation_preview_servers(parent, state)
-                    .iter()
-                    .all(|server| &server.server_id != server_id)
-                {
-                    return Err(format!(
-                        "There is no dev server preview:{server_id}; use task_list to see the existing tasks"
-                    ));
+            orchestration::TaskRef::Preview {
+                server_id,
+                workspace,
+            } => {
+                let servers = conversation_preview_servers(parent, state);
+                match address_preview_task(&servers, parent, server_id, *workspace) {
+                    // Watched under the address `task_list` prints, workspace included, so a
+                    // bare id cannot turn ambiguous halfway through the wait when another
+                    // workspace starts a server of the same name.
+                    tool_executor::PreviewServerAddress::Found(found) => {
+                        let canonical = preview_task_ref(found);
+                        if !others.contains(&canonical) {
+                            others.push(canonical);
+                        }
+                    }
+                    tool_executor::PreviewServerAddress::Ambiguous(numbers) => {
+                        let addresses = numbers
+                            .iter()
+                            .map(|number| format!("preview:{server_id}@{number}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(format!(
+                            "preview:{server_id} names dev servers in more than one workspace; wait on one of {addresses}"
+                        ));
+                    }
+                    tool_executor::PreviewServerAddress::Elsewhere(_)
+                    | tool_executor::PreviewServerAddress::Missing => {
+                        return Err(format!(
+                            "There is no dev server {}; use task_list to see the existing tasks",
+                            task.wire()
+                        ));
+                    }
                 }
-                others.push(task.clone());
             }
             orchestration::TaskRef::Shell(shell_task_id) => {
                 // Resolve background shell tasks through pool entries first. Their
@@ -11953,10 +12021,11 @@ fn observe_task(
                 settled,
             }
         }
-        orchestration::TaskRef::Preview(server_id) => {
-            let server = conversation_preview_servers(parent, state)
-                .into_iter()
-                .find(|server| &server.server_id == server_id);
+        orchestration::TaskRef::Preview {
+            server_id,
+            workspace,
+        } => {
+            let server = preview_task_server(parent, state, server_id, *workspace);
             orchestration::TaskObservation {
                 task: task.wire(),
                 label: server
@@ -11966,7 +12035,7 @@ fn observe_task(
                 status_label: profile
                     .text(preview_status_key(server.as_ref().map(|server| server.status)))
                     .to_owned(),
-                detail: server.map(|server| format!("localhost:{}", server.port)),
+                detail: server.as_ref().map(preview_task_detail),
                 settled,
             }
         }
@@ -12018,10 +12087,12 @@ fn non_agent_task_is_settled(
             .terminals
             .task_snapshot(&parent.conversation_id, terminal_id)
             .is_none_or(|snapshot| !snapshot.busy),
-        orchestration::TaskRef::Preview(server_id) => conversation_preview_servers(parent, state)
-            .into_iter()
-            .find(|server| &server.server_id == server_id)
-            .is_none_or(|server| server.status != crate::preview_servers::PreviewServerStatus::Starting),
+        orchestration::TaskRef::Preview {
+            server_id,
+            workspace,
+        } => preview_task_server(parent, state, server_id, *workspace).is_none_or(|server| {
+            server.status != crate::preview_servers::PreviewServerStatus::Starting
+        }),
         // Asked of the registry rather than inferred from the row's absence: a finished command
         // keeps its row now, so presence no longer means "still running".
         orchestration::TaskRef::Shell(shell_task_id) => !state
@@ -12279,17 +12350,19 @@ fn run_task_list(
             latest_update: None,
         })
         .collect::<Vec<_>>();
-    // The dev servers this conversation started, plus any nobody owns. The page
-    // each one is showing is not a row: it is a view of the process, it cannot be
-    // waited on, and closing the server closes it.
+    // The dev servers this conversation started, plus any nobody owns, in every
+    // workspace. The page each one is showing is not a row: it is a view of the
+    // process, it cannot be waited on, and closing the server closes it.
     let preview_rows = conversation_preview_servers(parent, state)
-        .into_iter()
-        .map(|server| orchestration::TaskListRow {
-            task: orchestration::TaskRef::Preview(server.server_id.clone()).wire(),
-            label: server.name,
-            status_label: profile.text(preview_status_key(Some(server.status))).to_owned(),
+        .iter()
+        .map(|addressable| orchestration::TaskListRow {
+            task: preview_task_ref(addressable).wire(),
+            label: addressable.server.name.clone(),
+            status_label: profile
+                .text(preview_status_key(Some(addressable.server.status)))
+                .to_owned(),
             continuable: false,
-            detail: format!("localhost:{}", server.port),
+            detail: preview_task_detail(&addressable.server),
             latest_update: None,
         })
         .collect::<Vec<_>>();
@@ -28914,6 +28987,107 @@ mod tests {
             .contains(PromptKey::TaskGroupShellCommands.builtin_en()));
         assert!(listed.result.output.contains("historical build"));
         assert!(pool.all().is_empty());
+    }
+
+    /// Two workspaces that each run a `dev`: `task_list` prints each under an address carrying its
+    /// workspace, `task_wait` takes that address back, and a bare id is refused as ambiguous
+    /// rather than watching whichever server happened to come first — until only one is left.
+    #[cfg(unix)]
+    #[test]
+    fn dev_servers_in_every_workspace_are_tasks_with_unambiguous_addresses() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for root in [first.path(), second.path()] {
+            let directory = root.join(".mework");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("launch.json"),
+                r#"{"configurations":[{"name":"dev","runtimeExecutable":"/bin/sh","runtimeArgs":["-c","sleep 30"],"port":0,"autoPort":true}]}"#,
+            )
+            .unwrap();
+        }
+        let attached = |root: &Path| crate::model::AttachedWorkspace {
+            machine: None,
+            path: root.to_string_lossy().into_owned(),
+        };
+        let mut request = run_request(ProviderFamily::OpenaiResponses);
+        request.workspace_path = first.path().to_string_lossy().into_owned();
+        request.workspaces = crate::workspace_set::WorkspaceSet::resolve(
+            &Default::default(),
+            &attached(first.path()),
+            &[attached(second.path())],
+        )
+        .unwrap();
+        let state = AppState::default();
+        let mut handles = Vec::new();
+        for root in [first.path(), second.path()] {
+            let crate::preview::PreviewStartOutcome::Server { server, .. } = crate::preview::start(
+                &state.preview_servers,
+                root,
+                Some("dev"),
+                Some(&request.conversation_id),
+            )
+            .unwrap() else {
+                panic!("the entry runs a command");
+            };
+            handles.push(server.handle);
+        }
+        let pool = AgentPool::new();
+
+        let listed = run_task_list(
+            &pool,
+            &request,
+            ToolCall {
+                id: "call-list".into(),
+                name: "task_list".into(),
+                input: Map::new(),
+            },
+            &state,
+        );
+        for address in ["preview:dev@1", "preview:dev@2"] {
+            assert!(
+                listed.result.output.contains(address),
+                "{}",
+                listed.result.output
+            );
+        }
+
+        let resolve = |raw: &str| {
+            resolve_wait_targets(
+                &pool,
+                &request,
+                &state,
+                &orchestration::TaskWaitSpec {
+                    tasks: vec![orchestration::TaskRef::parse(raw).unwrap()],
+                    timeout_seconds: 5,
+                },
+            )
+            .map(|(_, others)| others)
+        };
+        let second_dev = orchestration::TaskRef::Preview {
+            server_id: "dev".into(),
+            workspace: Some(2),
+        };
+        assert_eq!(
+            resolve("preview:dev").unwrap_err(),
+            "preview:dev names dev servers in more than one workspace; wait on one of preview:dev@1, preview:dev@2"
+        );
+        assert_eq!(resolve("preview:DEV@2").unwrap(), vec![second_dev.clone()]);
+        assert!(resolve("preview:dev@3")
+            .unwrap_err()
+            .starts_with("There is no dev server preview:dev@3;"));
+        let observed = observe_task(&second_dev, &request, &state);
+        assert_eq!(observed.task, "preview:dev@2");
+        assert!(observed
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("localhost:")));
+
+        // With workspace 1's server gone the bare id is unambiguous again, and it is watched
+        // under the full address.
+        assert!(state.preview_servers.stop(&handles[0]));
+        assert_eq!(resolve("preview:dev").unwrap(), vec![second_dev]);
+        state.preview_servers.stop_all();
     }
 
     #[test]

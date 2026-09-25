@@ -760,81 +760,237 @@ fn discovery_asks_for_json_so_a_gateway_cannot_answer_with_its_console() {
     assert!(request.contains("accept: application/json"), "{request}");
 }
 
-// ───────────────────────────── Claude Agent registry ─────────────────────────────
+// ───────────────────────────── Claude Agent ─────────────────────────────
 
-#[test]
-fn the_claude_agent_list_is_the_built_in_registry_in_table_order() {
-    // No address, no credential, no subprocess: a stale base URL left in the row
-    // by an older version must neither be contacted nor rejected.
-    let models = fetch_models(&provider(
-        ProviderFamily::ClaudeAgent,
-        "https://api.anthropic.com".into(),
-    ))
-    .unwrap();
+fn row(
+    value: &str,
+    resolved: Option<&str>,
+    display_name: &str,
+    context_window: Option<u64>,
+) -> crate::aisdk::agent::AgentModel {
+    crate::aisdk::agent::AgentModel {
+        value: value.into(),
+        resolved_model: resolved.map(str::to_owned),
+        display_name: display_name.into(),
+        context_window,
+    }
+}
 
-    assert_eq!(models.len(), 17);
-    assert_eq!(
-        ids(&models),
-        vec![
-            "claude-fable-5-1",
-            "claude-fable-5",
-            "claude-opus-5",
-            "claude-opus-5[1m]",
-            "claude-sonnet-5",
-            "claude-opus-4-8",
-            "claude-opus-4-8[1m]",
-            "claude-opus-4-7",
-            "claude-opus-4-7[1m]",
-            "claude-opus-4-6",
-            "claude-opus-4-6[1m]",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-6[1m]",
-            "claude-opus-4-5",
-            "claude-opus-4-1",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5",
-        ]
-    );
-    assert_eq!(models[0].name, "Claude Fable 5.1");
-    assert_eq!(models[3].name, "Claude Opus 5 (1M context)");
+fn claude_agent_models(rows: Vec<crate::aisdk::agent::AgentModel>) -> Vec<ModelProfile> {
+    let provider = provider(ProviderFamily::ClaudeAgent, String::new());
+    finish(&provider, dedup(claude_agent_rows(rows)))
+}
+
+fn windows(models: &[ModelProfile]) -> Vec<Option<u64>> {
+    models.iter().map(|model| model.context_window).collect()
+}
+
+/// What the bundled CLI answered for a Claude Max login on 2026-09-25. The Fable
+/// row is named by an explicit id, so the listing reads no window for it.
+fn subscription_picker() -> Vec<crate::aisdk::agent::AgentModel> {
+    vec![
+        row(
+            "default",
+            Some("claude-opus-5-5[1m]"),
+            "Default (recommended)",
+            Some(1_000_000),
+        ),
+        row(
+            "opus[1m]",
+            Some("claude-opus-5-5[1m]"),
+            "Opus (1M context)",
+            Some(1_000_000),
+        ),
+        row(
+            "claude-fable-5-1[1m]",
+            Some("claude-fable-5-1"),
+            "Fable",
+            None,
+        ),
+        row("sonnet", Some("claude-sonnet-5"), "Sonnet", Some(1_000_000)),
+        row(
+            "haiku",
+            Some("claude-haiku-4-5-20251001"),
+            "Haiku",
+            Some(200_000),
+        ),
+    ]
+}
+
+/// The same CLI under an API key: bare budgets are 200k, and Sonnet is listed
+/// twice, once per budget.
+fn api_key_picker() -> Vec<crate::aisdk::agent::AgentModel> {
+    vec![
+        row(
+            "default",
+            Some("claude-opus-5-5[1m]"),
+            "Default (recommended)",
+            Some(1_000_000),
+        ),
+        row(
+            "opus[1m]",
+            Some("claude-opus-5-5[1m]"),
+            "Opus (1M context)",
+            Some(1_000_000),
+        ),
+        row(
+            "claude-fable-5-1[1m]",
+            Some("claude-fable-5-1[1m]"),
+            "Fable",
+            None,
+        ),
+        row("sonnet", Some("claude-sonnet-5"), "Sonnet", Some(200_000)),
+        row(
+            "sonnet[1m]",
+            Some("claude-sonnet-5[1m]"),
+            "Sonnet (1M context)",
+            Some(1_000_000),
+        ),
+        row(
+            "haiku",
+            Some("claude-haiku-4-5-20251001"),
+            "Haiku",
+            Some(200_000),
+        ),
+    ]
 }
 
 #[test]
-fn an_id_carrying_a_context_budget_suffix_survives_persistence_validation() {
-    // `[1m]` is a CLI concept spelled inside the model id. `finish` drops ids the
-    // document cannot store, so the twins would silently vanish if it rejected
-    // brackets — and the registry would be a table of eleven.
+fn the_cli_picker_becomes_models_without_the_budget_suffix() {
+    let models = claude_agent_models(subscription_picker());
+
+    // An alias never becomes the id, so an installed model keeps meaning the same
+    // model when the CLI moves on; `[1m]` is a budget, not a model.
+    assert_eq!(
+        ids(&models),
+        vec![
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+        ]
+    );
+    let names: Vec<&str> = models.iter().map(|model| model.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "Claude Opus 5.5",
+            "Claude Fable 5.1",
+            "Claude Sonnet 5",
+            "Claude Haiku 4.5",
+        ]
+    );
+    // Fable's window comes from the `[1m]` in the row's value.
+    assert_eq!(
+        windows(&models),
+        vec![
+            Some(1_000_000),
+            Some(1_000_000),
+            Some(1_000_000),
+            Some(200_000)
+        ]
+    );
+    for model in &models {
+        assert!(
+            model
+                .capabilities
+                .contains(&ModelCapability::ImageRecognition),
+            "{} 缺少视觉输入",
+            model.id
+        );
+        assert_eq!(model.group, "claude", "{} 的分组应由 id 推出", model.id);
+    }
+}
+
+#[test]
+fn a_model_listed_at_two_budgets_keeps_the_larger_one() {
+    let models = claude_agent_models(api_key_picker());
+
+    assert_eq!(
+        ids(&models),
+        vec![
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+        ]
+    );
+    // `sonnet` (200k) and `sonnet[1m]` (1M) are one model at the position of its
+    // first row. The login can have 1M, and the window is what asks for it.
+    assert_eq!(
+        windows(&models),
+        vec![
+            Some(1_000_000),
+            Some(1_000_000),
+            Some(1_000_000),
+            Some(200_000)
+        ]
+    );
+}
+
+#[test]
+fn a_row_without_a_window_from_the_cli_keeps_its_place() {
+    let models = claude_agent_models(vec![
+        // An explicit id with no budget suffix that the catalog does not know:
+        // nothing claims a window for it.
+        row("claude-mythos-5-1", None, "Mythos", None),
+        // An unresolved alias is kept as the CLI spells it, under the CLI's label.
+        row("sonnet", None, "Sonnet", Some(1_000_000)),
+    ]);
+    assert_eq!(ids(&models), vec!["claude-mythos-5-1", "sonnet"]);
+    assert_eq!(models[0].context_window, None);
+    assert_eq!(models[0].name, "Claude Mythos 5.1");
+    assert_eq!(models[1].name, "Sonnet");
+    assert_eq!(models[1].context_window, Some(1_000_000));
+}
+
+#[test]
+fn claude_model_names_are_derived_from_the_id() {
+    let cases = [
+        ("claude-opus-5-5", Some("Claude Opus 5.5")),
+        ("claude-fable-5-1", Some("Claude Fable 5.1")),
+        ("claude-sonnet-5", Some("Claude Sonnet 5")),
+        ("claude-haiku-4-5-20251001", Some("Claude Haiku 4.5")),
+        // Older ids put the version first; aliases and custom ids have no version.
+        ("claude-3-5-sonnet-20241022", None),
+        ("sonnet", None),
+        ("claude-opus", None),
+        ("claude-opus-latest", None),
+        ("claude-opus-5[fast]", None),
+    ];
+    for (id, expected) in cases {
+        assert_eq!(claude_model_name(id).as_deref(), expected, "{id}");
+    }
+}
+
+#[test]
+fn a_model_installed_with_the_budget_suffix_still_validates() {
+    // Earlier versions installed ids such as `claude-opus-5[1m]`. They keep
+    // working (the sidecar passes a suffixed id through), so persistence must
+    // keep accepting brackets.
     crate::model::validate_model_id("claude-opus-5[1m]").unwrap();
 }
 
 #[test]
-fn the_registry_limits_win_over_the_catalog_for_both_twins() {
-    let models = fetch_models(&provider(ProviderFamily::ClaudeAgent, String::new())).unwrap();
+fn the_seed_rows_carry_their_table_limits_and_vision() {
+    let models = claude_agent_seed_models(&provider(ProviderFamily::ClaudeAgent, String::new()));
     let limits = |id: &str| {
         let model = models
             .iter()
             .find(|model| model.id == id)
-            .unwrap_or_else(|| panic!("registry 缺少 {id}"));
+            .unwrap_or_else(|| panic!("种子缺少 {id}"));
         (model.context_window, model.max_output_tokens)
     };
 
-    // The catalog knows `claude-opus-5` and lists a 1M window for it; the
-    // registry is the authority for this family and pushes it back to 200k.
+    assert_eq!(models.len(), CLAUDE_AGENT_SEED_MODELS.len());
+    assert_eq!(models[0].id, "claude-fable-5-1");
+    assert_eq!(models[0].name, "Claude Fable 5.1");
+    // The catalog lists a 1M window for `claude-opus-5`; the table says 200k and wins.
     assert_eq!(limits("claude-opus-5"), (Some(200_000), Some(128_000)));
-    // The catalog necessarily misses a bracketed id, so the registry is the only
-    // source of its 1M window.
-    assert_eq!(
-        limits("claude-opus-5[1m]"),
-        (Some(1_000_000), Some(128_000))
-    );
-    assert_eq!(limits("claude-fable-5-1"), (Some(1_000_000), Some(128_000)));
+    assert_eq!(limits("claude-sonnet-5"), (Some(1_000_000), Some(128_000)));
     assert_eq!(limits("claude-opus-4-1"), (Some(200_000), Some(32_000)));
-}
-
-#[test]
-fn every_registry_row_carries_vision() {
-    let models = fetch_models(&provider(ProviderFamily::ClaudeAgent, String::new())).unwrap();
     for model in &models {
+        assert!(!model.id.contains("[1m]"), "{} 带了预算后缀", model.id);
         assert!(
             model
                 .capabilities

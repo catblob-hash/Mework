@@ -3477,7 +3477,7 @@ function App() {
     if (
       previous.length !== mine.length
       || mine.some((server, index) => (
-        previous[index].serverId !== server.serverId || previous[index].status !== server.status
+        previous[index].handle !== server.handle || previous[index].status !== server.status
       ))
     ) {
       setPreviewServers(mine);
@@ -3487,7 +3487,7 @@ function App() {
     // refused, a stack trace the framework printed on the way down — is the whole diagnosis, and
     // the pane's own card offers the restart.
     const stopped = previous.filter((server) => (
-      stoppedIds.includes(server.serverId) && !mine.some((live) => live.serverId === server.serverId)
+      stoppedIds.includes(server.handle) && !mine.some((live) => live.handle === server.handle)
     ));
     for (const server of stopped) {
       await closePagesServedAtRef.current(conversationId, server);
@@ -5042,7 +5042,7 @@ function App() {
     dispatchTerminalTabs({ type: "remove_conversation", conversationId: ownerId });
     // Reads the project off this draft, before it is aimed anywhere else.
     closing.push(draftPreviewServers(draft).then(async (servers) => {
-      await Promise.all(servers.map((server) => stopPreviewServer(server.serverId).catch(() => false)));
+      await Promise.all(servers.map((server) => stopPreviewServer(server.handle).catch(() => false)));
     }));
     // Reads the roster, so it goes before the roster is cleared below.
     closing.push(requestConversationBrowserClose(DRAFT_CONVERSATION_ID));
@@ -7330,7 +7330,7 @@ function App() {
     setStoppingTaskIds((current) => [...current, stoppingKey]);
     try {
       if (item.kind === "preview") {
-        await stopPreviewServer(item.server.serverId);
+        await stopPreviewServer(item.server.handle);
         // The host's own change event closes the page too, but not before this row has already
         // gone; closing here is what makes one click read as one action.
         await closePagesServedAt(conversationId, item.server);

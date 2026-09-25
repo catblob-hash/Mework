@@ -16,7 +16,8 @@ function attachServer(name: string, url: string, port = 0): PreviewConfiguredSer
 
 function runningServer(name: string, port: number): PreviewServerSnapshot {
   return {
-    serverId: `srv-${name}`,
+    handle: `srv-${name}`,
+    serverId: name,
     name,
     port,
     status: "running",

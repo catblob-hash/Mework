@@ -55,6 +55,12 @@ export interface PreviewConfigurationList {
 
 /** Mirror of Rust `preview_servers::PreviewServerSnapshot`. */
 export interface PreviewServerSnapshot {
+  /** The host registry's key for this one process: what the pane stops it and reads it by. */
+  handle: string;
+  /**
+   * What the model addresses it by: its `.mework/launch.json` name, numbered (`dev-2`) when the
+   * file repeats the name. Unique only within one workspace, so it is never a key here.
+   */
   serverId: string;
   name: string;
   port: number;
@@ -82,7 +88,7 @@ export interface PreviewServerSnapshot {
 
 /** Mirror of Rust `preview::PreviewAttachment` — a `url` entry with no command to run. */
 export interface PreviewAttachment {
-  /** Not a process id: it names the preview page, so `preview_stop` and `preview_logs` refuse it. */
+  /** The entry's name, as for a process — but no process answers to it, so `preview_stop` and `preview_logs` refuse it. */
   serverId: string;
   name: string;
   /** `0` whenever the entry states no port, which a non-localhost url never does. */
@@ -178,19 +184,19 @@ export async function startPreviewServer(
 }
 
 /** Stops one dev server and forgets it, buffered output included. False means it was already gone. */
-export async function stopPreviewServer(serverId: string): Promise<boolean> {
+export async function stopPreviewServer(handle: string): Promise<boolean> {
   requireDesktopRuntime();
-  return invoke<boolean>("preview_stop_server", { serverId });
+  return invoke<boolean>("preview_stop_server", { handle });
 }
 
 /** One dev server's buffered output, filtered the way the `preview_logs` tool filters it. */
 export async function readPreviewServerLogs(
-  serverId: string,
+  handle: string,
   query: PreviewLogQuery = {}
 ): Promise<string> {
   requireDesktopRuntime();
   return invoke<string>("preview_server_logs", {
-    serverId,
+    handle,
     errorsOnly: query.errorsOnly ?? null,
     search: query.search ?? null,
     lines: query.lines ?? null

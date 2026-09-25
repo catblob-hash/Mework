@@ -435,7 +435,7 @@
         "description": "Stop a server started with preview_start.",
         "properties": {
           "serverId": {
-            "description": "Server ID to stop",
+            "description": "Server ID to stop: the server's name in .mework/launch.json, numbered (e.g. dev-2) when the file repeats that name",
             "maxLength": 256,
             "minLength": 1,
             "type": "string"
@@ -483,7 +483,7 @@
             "type": "string"
           },
           "serverId": {
-            "description": "Server ID",
+            "description": "Server ID: the server's name in .mework/launch.json, numbered (e.g. dev-2) when the file repeats that name",
             "maxLength": 256,
             "minLength": 1,
             "type": "string"
@@ -953,7 +953,7 @@
           "tasks": {
             "description": "Task addresses to wait on; omitted waits for every child agent, workflow run and background shell command in this conversation (terminals excluded).",
             "items": {
-              "description": "A child agent name, a workflow run name (also accepted as workflow:<name>), shell:<id>, or terminal:<id>.",
+              "description": "A child agent name, a workflow run name (also accepted as workflow:<name>), shell:<id>, terminal:<id>, or preview:<serverId> for a dev server (preview:<serverId>@<workspace> when the conversation has several workspaces).",
               "maxLength": 320,
               "minLength": 1,
               "type": "string"

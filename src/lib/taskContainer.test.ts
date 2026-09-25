@@ -164,6 +164,7 @@ function previewServer(
   overrides: Partial<PreviewServerSnapshot> = {}
 ): PreviewServerSnapshot {
   return {
+    handle: "1",
     serverId: "dev",
     name: "dev",
     port: 5173,
@@ -408,7 +409,7 @@ describe("deriveTaskItems", () => {
     const items = deriveTaskItems({
       agents: [],
       terminals: [],
-      previewServers: [previewServer(), previewServer({ serverId: "api", name: "api", port: 8080, status: "starting" })],
+      previewServers: [previewServer(), previewServer({ handle: "2", serverId: "api", name: "api", port: 8080, status: "starting" })],
       now: NOW
     }, messages);
 

@@ -96,10 +96,11 @@ async function paneMenuItem(user: ReturnType<typeof userEvent.setup>, name: stri
   return await screen.findByRole("menuitemradio", { name });
 }
 
-function devServer(serverId: string, sessionId: string | null): PreviewServerSnapshot {
+function devServer(handle: string, sessionId: string | null): PreviewServerSnapshot {
   return {
-    serverId,
-    name: serverId,
+    handle,
+    serverId: "dev",
+    name: "dev",
     port: 5173,
     status: "running",
     startedAt: "2026-09-09T00:00:00Z",

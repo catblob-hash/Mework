@@ -135,9 +135,10 @@ function configuredServer(name: string, port: number): previewApi.PreviewConfigu
   return { name, command: "npm", args: ["run", "dev"], cwd: "C:\\work\\mework", port };
 }
 
-function runningServer(name: string, port: number, serverId = `srv-${name}`): previewApi.PreviewServerSnapshot {
+function runningServer(name: string, port: number, handle = `srv-${name}`): previewApi.PreviewServerSnapshot {
   return {
-    serverId,
+    handle,
+    serverId: name,
     name,
     port,
     status: "running",
@@ -1288,7 +1289,7 @@ describe("BrowserPanel dev servers", () => {
     await user.click(trigger);
     const reopened = await screen.findByRole("menu", { name: "Browser menu" });
     await user.click(within(reopened).getByRole("menuitem", { name: /Stop all servers/ }));
-    await waitFor(() => expect(stop.mock.calls.map(([serverId]) => serverId).sort())
+    await waitFor(() => expect(stop.mock.calls.map(([handle]) => handle).sort())
       .toEqual(["srv-api", "srv-web"]));
   });
 

@@ -107,11 +107,17 @@ pub enum TaskRef {
     /// A subagent — everything the model addresses by its agent name.
     Agent(String),
     Terminal(String),
-    /// A dev server, by the `serverId` every preview tool already takes.
+    /// A dev server, by the `serverId` every preview tool already takes, and — in a
+    /// conversation with several workspaces — the workspace it runs in, written
+    /// `preview:<serverId>@<workspace>`. A `serverId` is a launch.json name, so two
+    /// workspaces can both run a `dev`; the number is what tells them apart.
     ///
     /// The preview *page* is deliberately not an address: it is a view of this
     /// process, it dies with it, and it holds nothing the model can wait for.
-    Preview(String),
+    Preview {
+        server_id: String,
+        workspace: Option<u32>,
+    },
     /// A running `bash` / `powershell` tool call, by its registry number.
     Shell(String),
     /// A workflow run, by its run id — the name the model gave it. That name is
@@ -130,12 +136,26 @@ impl TaskRef {
             }
             return Ok(Self::Terminal(id.to_owned()));
         }
-        if let Some(id) = raw.strip_prefix("preview:") {
-            let id = id.trim();
-            if id.is_empty() || id.len() > MAX_TASK_REF_CHARS {
+        if let Some(address) = raw.strip_prefix("preview:") {
+            let address = address.trim();
+            if address.is_empty() || address.len() > MAX_TASK_REF_CHARS {
                 return Err("preview: must be followed by a serverId".into());
             }
-            return Ok(Self::Preview(id.to_owned()));
+            // Only the last `@`, and only when a workspace number follows it: the
+            // serverId is a launch.json name, which may hold an `@` of its own.
+            let (server_id, workspace) = match address.rsplit_once('@') {
+                Some((server_id, number)) if !server_id.trim().is_empty() => {
+                    match number.parse::<u32>() {
+                        Ok(number) if number >= 1 => (server_id.trim(), Some(number)),
+                        _ => (address, None),
+                    }
+                }
+                _ => (address, None),
+            };
+            return Ok(Self::Preview {
+                server_id: server_id.to_owned(),
+                workspace,
+            });
         }
         if let Some(id) = raw.strip_prefix("shell:") {
             let id = id.trim();
@@ -174,7 +194,14 @@ impl TaskRef {
         match self {
             Self::Agent(name) => name.clone(),
             Self::Terminal(id) => format!("terminal:{id}"),
-            Self::Preview(server_id) => format!("preview:{server_id}"),
+            Self::Preview {
+                server_id,
+                workspace: None,
+            } => format!("preview:{server_id}"),
+            Self::Preview {
+                server_id,
+                workspace: Some(workspace),
+            } => format!("preview:{server_id}@{workspace}"),
             Self::Shell(id) => format!("shell:{id}"),
             Self::Workflow(run_id) => format!("workflow:{run_id}"),
         }
@@ -3050,9 +3077,32 @@ mod tests {
             "a1",
             "terminal:host-1",
             "preview:dev",
+            "preview:dev@2",
             "workflow:run0a1b",
         ] {
             assert_eq!(TaskRef::parse(raw).unwrap().wire(), raw);
+        }
+        // A dev server's workspace follows the last `@`, and only a number is one.
+        assert_eq!(
+            TaskRef::parse("preview:web-2@3").unwrap(),
+            TaskRef::Preview {
+                server_id: "web-2".into(),
+                workspace: Some(3),
+            }
+        );
+        for (raw, server_id) in [
+            ("preview:api@edge", "api@edge"),
+            ("preview:api@0", "api@0"),
+            ("preview:@2", "@2"),
+        ] {
+            assert_eq!(
+                TaskRef::parse(raw).unwrap(),
+                TaskRef::Preview {
+                    server_id: server_id.into(),
+                    workspace: None,
+                },
+                "{raw}"
+            );
         }
         // Terminal ids may hold characters an agent name never could.
         assert_eq!(

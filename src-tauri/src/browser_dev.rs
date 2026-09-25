@@ -737,6 +737,8 @@ async fn dispatch(
             .await,
         ),
         "list_wsl_distros" => result_value(super::list_wsl_distros().await),
+        "local_sandbox_support" => result_value(super::local_sandbox_support().await),
+        "setup_local_sandbox" => result_value(super::setup_local_sandbox().await),
         "reveal_path_in_file_manager" => result_value(
             super::reveal_path_in_file_manager(arg(args, "path")?, optional_arg(args, "baseDir")?)
                 .await,
@@ -1240,11 +1242,11 @@ async fn dispatch(
             .await,
         ),
         "preview_stop_server" => result_value(
-            super::preview_stop_server(app.state::<AppState>(), arg(args, "serverId")?).await,
+            super::preview_stop_server(app.state::<AppState>(), arg(args, "handle")?).await,
         ),
         "preview_server_logs" => value(super::preview_server_logs(
             app.state::<AppState>(),
-            arg(args, "serverId")?,
+            arg(args, "handle")?,
             optional_arg(args, "errorsOnly")?,
             optional_arg(args, "search")?,
             optional_arg(args, "lines")?,

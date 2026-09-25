@@ -4,7 +4,9 @@
 //!
 //! The sidecar owns the CLI process and its parked tool handlers; the host only
 //! names the session, resolves the executable, and guarantees a `release` frame
-//! when the run ends, whichever way it ends.
+//! when the run ends, whichever way it ends. Questions that run no model turn —
+//! the login probe here and the model picker in [`models`] — the host asks the
+//! CLI itself, without the sidecar.
 //!
 //! The executable is Mework's own: the CLI out of the Agent SDK's platform
 //! package, pinned with the SDK and shipped beside the application. The login is
@@ -24,6 +26,10 @@ use crate::host_platform::host_platform;
 use crate::model::{ApiProvider, ProviderFamily};
 
 use super::protocol::AgentSession;
+
+mod models;
+
+pub(crate) use models::{list_models, AgentModel};
 
 /// Directory under the app data root that serves as the CLI's working
 /// directory. Claude Code keys its transcript folder by cwd, so a fixed private

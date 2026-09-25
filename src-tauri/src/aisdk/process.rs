@@ -173,6 +173,20 @@ fn resolve_binary() -> Result<PathBuf, String> {
         }
         return Err(format!("{BINARY_ENV} 指向的侧车不存在：{}", path.display()));
     }
+    // In development and tests, `current_exe()` is under `target/debug/`, while the sidecar is in
+    // the source tree. Use source-tree artifacts so development and tests do not depend on
+    // environment variables or test execution order.
+    //
+    // Select the newest available artifact. `npm run build` updates `main.mjs`, while
+    // `npm run build:sea` updates `mework-aisdk.exe`; a fixed selection order can silently use a
+    // stale artifact. This runs before the adjacent lookup below because `tauri dev` also copies
+    // the staged executable next to `target/debug/mework`, and that copy only refreshes on a
+    // sidecar build plus a cargo build: preferring it ran a sidecar from an older protocol
+    // generation after `npm run build` alone.
+    #[cfg(debug_assertions)]
+    if let Some(path) = source_tree_sidecar() {
+        return Ok(path);
+    }
     // Production places `externalBin` next to the main executable.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -185,17 +199,6 @@ fn resolve_binary() -> Result<PathBuf, String> {
             }
         }
     }
-    // In development and tests, `current_exe()` is under `target/debug/`, while the sidecar is in
-    // the source tree. Fall back to source-tree artifacts so development and tests do not depend on
-    // environment variables or test execution order.
-    //
-    // Select the newest available artifact. `npm run build` updates `main.mjs`, while
-    // `npm run build:sea` updates `mework-aisdk.exe`; a fixed selection order can silently use a
-    // stale artifact.
-    #[cfg(debug_assertions)]
-    if let Some(path) = source_tree_sidecar() {
-        return Ok(path);
-    }
     Err(format!(
         "找不到 AI SDK 侧车。开发时先在 aisdk-service/ 里 `npm run build`（产出 dist/main.mjs），或 `npm run build:sea` 产出单文件可执行；也可以直接把 {BINARY_ENV} 指向任意一个。"
     ))
@@ -205,7 +208,9 @@ fn resolve_binary() -> Result<PathBuf, String> {
 ///
 /// Separate commands update the JavaScript, SEA executable, and staged executable candidates, so a
 /// fixed candidate order can silently select a stale artifact. This helper exists only in debug
-/// builds because it embeds `CARGO_MANIFEST_DIR`; release builds use adjacent `externalBin`.
+/// builds because it embeds `CARGO_MANIFEST_DIR`; release builds use adjacent `externalBin`. A
+/// debug binary run away from its source tree finds none of these and falls back to the adjacent
+/// copy.
 #[cfg(debug_assertions)]
 pub(crate) fn source_tree_sidecar() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

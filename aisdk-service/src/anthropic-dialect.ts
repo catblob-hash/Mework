@@ -62,6 +62,11 @@ const REPLAY_TAG_KEY = "mework";
 /** Placeholder Claude Code inserts when a repair empties an assistant message. */
 const NO_CONTENT_PLACEHOLDER = "(no content)";
 
+/** The model a signature binds to: the id without Claude Code's `[1m]` budget suffix. */
+function signingModel(modelId: string): string {
+  return modelId.replace(/\[1m\]$/i, "");
+}
+
 function replayModelOf(part: JsonObject): string | undefined {
   const options = part.providerOptions;
   if (!isObject(options)) return undefined;
@@ -78,14 +83,20 @@ function replayModelOf(part: JsonObject): string | undefined {
  * produced it and rejects it anywhere else. An assistant message emptied by the
  * removal keeps Claude Code's `(no content)` placeholder so the turn structure
  * survives. Mutates `messages` in place because it is request-private decoded JSON.
+ *
+ * Claude Code's `[1m]` budget suffix names no other model — the API never sees
+ * it — so `claude-opus-5[1m]` and `claude-opus-5` are one signer. Turns stored
+ * under a suffixed id keep their signatures after the model is re-installed
+ * without it.
  */
 export function dropForeignSignedReasoning(messages: unknown[], modelId: string): void {
+  const signer = signingModel(modelId);
   for (const message of messages) {
     if (!isObject(message) || message.role !== "assistant" || !Array.isArray(message.content)) continue;
     const kept = message.content.filter((part) => {
       if (!isObject(part) || part.type !== "reasoning") return true;
       const model = replayModelOf(part);
-      return model === undefined || model === modelId;
+      return model === undefined || signingModel(model) === signer;
     });
     if (kept.length === message.content.length) continue;
     if (kept.length === 0) kept.push({ type: "text", text: NO_CONTENT_PLACEHOLDER });

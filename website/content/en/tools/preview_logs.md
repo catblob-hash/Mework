@@ -10,7 +10,7 @@ Each server keeps a ring buffer of 1000 entries. An entry is one read from the p
 
 `level: "error"` keeps only stderr entries containing `error`, `exception`, `failed` or `fatal`, matched case-insensitively; a stdout line saying "error" is not one. `search` is a case-sensitive substring filter applied after the level filter. Any `level` other than `all` or `error` fails the call.
 
-Without `serverId` the call falls back to the first starting or running server this conversation may address here. Nothing to read is reported in words, not as a failure: `No logs yet.`, `No server errors found.` or `No logs matching "…"`. An id from an attachment, and a call with no server at all, answer with a sentence pointing back at `preview_list`.
+`serverId` and `workspace` resolve as they do for `preview_stop`. Without `serverId` the call falls back to the first starting or running server this conversation may address — in the named workspace, when one is named. Nothing to read is reported in words, not as a failure: `No logs yet.`, `No server errors found.` or `No logs matching "…"`. An id from an attachment, and a call with no server at all, answer with a sentence pointing back at `preview_list`.
 
 A server's buffer is discarded the moment its process exits or `preview_stop` kills it, so output must be read while the server is alive. Servers run with `FORCE_COLOR=1`, so output can carry ANSI escapes.
 

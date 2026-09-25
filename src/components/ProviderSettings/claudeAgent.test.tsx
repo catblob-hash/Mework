@@ -208,16 +208,16 @@ describe("Claude Agent provider", () => {
     expect(runtimeMocks.claudeAgentLoginStatus).not.toHaveBeenCalled();
   });
 
-  it("discovers the built-in registry instead of an upstream catalog", async () => {
+  it("discovers the seed rows in the browser preview", async () => {
     const user = userEvent.setup();
     const { getSettings } = renderProviders();
 
     await user.click(screen.getByRole("button", { name: "Claude Agent" }));
     await user.click(screen.getByRole("button", { name: "拉取模型" }));
 
-    // The discovery page lists every registry row; installing all of them is
-    // what turns the list into the provider's models.
-    expect(await screen.findByRole("button", { name: "添加到提供商 claude-opus-5[1m]" })).toBeInTheDocument();
+    // The preview has no CLI to ask, so its discovery page lists the seed rows;
+    // installing all of them is what turns the list into the provider's models.
+    expect(await screen.findByRole("button", { name: "添加到提供商 claude-opus-5" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "添加全部结果" }));
 
     await waitFor(() => expect(
@@ -226,13 +226,10 @@ describe("Claude Agent provider", () => {
 
     const models = getSettings().apiProviders.find((provider) => provider.family === "claude_agent")!.models;
     expect(models.map((model) => model.id).sort()).toEqual(CLAUDE_AGENT_REGISTRY.map((entry) => entry.id).sort());
-    // The `[1m]` twins are separate rows with the larger window, not duplicates.
+    // The window, not a `[1m]` id, states the budget.
+    expect(models.some((model) => model.id.includes("[1m]"))).toBe(false);
     expect(models.find((model) => model.id === "claude-opus-5")).toMatchObject({ contextWindow: 200000 });
-    expect(models.find((model) => model.id === "claude-opus-5[1m]")).toMatchObject({
-      name: "Claude Opus 5 (1M context)",
-      contextWindow: 1000000
-    });
-    expect((await screen.findAllByText("Claude Opus 5 (1M context)")).length).toBeGreaterThan(0);
+    expect(models.find((model) => model.id === "claude-sonnet-5")).toMatchObject({ contextWindow: 1000000 });
   });
 });
 

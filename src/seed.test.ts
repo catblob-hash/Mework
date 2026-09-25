@@ -68,7 +68,7 @@ describe("seed document", () => {
     expect(settings.apiProviders[1].id).toMatch(/^provider_/u);
     // Codex has no catalog until the user completes its OAuth flow.
     expect(settings.apiProviders[0].models).toEqual([]);
-    // Claude Agent's catalog is a local built-in table, so it ships installed.
+    // Claude Agent ships its seed rows installed; fetching asks the CLI later.
     const claudeModelIds = settings.apiProviders[1].models.map((model) => model.id);
     expect(claudeModelIds).toContain("claude-opus-5");
     expect(claudeModelIds).toContain("claude-sonnet-5");

@@ -65,12 +65,12 @@ export function previewServerRows(
   const claimed = new Set<string>();
   const live = (name: string) => servers.find(
     (server) => server.name === name
-      && !claimed.has(server.serverId)
+      && !claimed.has(server.handle)
       && (server.status === "running" || server.status === "starting")
   );
   const rows = configurations.map((configuration) => {
     const server = live(configuration.name) ?? null;
-    if (server) claimed.add(server.serverId);
+    if (server) claimed.add(server.handle);
     return {
       name: configuration.name,
       port: server?.port ?? configuration.port,
@@ -84,7 +84,7 @@ export function previewServerRows(
     };
   });
   const orphans = servers
-    .filter((server) => !claimed.has(server.serverId))
+    .filter((server) => !claimed.has(server.handle))
     .filter((server) => server.status === "running" || server.status === "starting")
     .map((server) => ({
       name: server.name,
@@ -224,7 +224,7 @@ export function PreviewStartPage({
             const stoppable = row.running || row.starting;
             const busy = row.starting || row.name === pendingName;
             return (
-              <li key={`${row.name}:${row.server?.serverId ?? "config"}`} aria-busy={busy || undefined}>
+              <li key={`${row.name}:${row.server?.handle ?? "config"}`} aria-busy={busy || undefined}>
                 <button
                   type="button"
                   className="browser-panel__server-open"
@@ -520,7 +520,7 @@ export function PreviewServerMenuItems({
         return (
           <div
             className={`browser-panel__menu-server${stoppable ? " is-running" : ""}`}
-            key={`${row.name}:${row.server?.serverId ?? "config"}`}
+            key={`${row.name}:${row.server?.handle ?? "config"}`}
           >
             <button
               type="button"
@@ -653,7 +653,7 @@ export function usePreviewServers(
   const [stopped, setStopped] = useState<{ label: string; name: string } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [unreachable, setUnreachable] = useState<string | null>(null);
-  const activeServer = useRef<{ serverId: string; name: string; port: number } | null>(null);
+  const activeServer = useRef<{ handle: string; name: string; port: number } | null>(null);
   /** A remote server this pane started, whose page opens once the host says it answers. */
   const pendingOpen = useRef<PreviewServerRow | null>(null);
   const readyCallback = useRef(onServerReady);
@@ -691,7 +691,7 @@ export function usePreviewServers(
         setUnreachable(null);
         const pending = pendingOpen.current;
         if (pending?.server) {
-          const now = running.find((server) => server.serverId === pending.server?.serverId);
+          const now = running.find((server) => server.handle === pending.server?.handle);
           if (!now || now.status === "running") {
             pendingOpen.current = null;
             // Gone before it answered: the stopped card says so, and there is nothing to open.
@@ -699,7 +699,7 @@ export function usePreviewServers(
           }
         }
         const active = activeServer.current;
-        if (active && !running.some((server) => server.serverId === active.serverId)) {
+        if (active && !running.some((server) => server.handle === active.handle)) {
           activeServer.current = null;
           setStopped({ label: `${active.name}:${active.port}`, name: active.name });
         }
@@ -747,12 +747,12 @@ export function usePreviewServers(
         return;
       }
       activeServer.current = {
-        serverId: outcome.server.serverId,
+        handle: outcome.server.handle,
         name: outcome.server.name,
         port: outcome.server.port
       };
       setServers((current) => [
-        ...current.filter((server) => server.serverId !== outcome.server.serverId),
+        ...current.filter((server) => server.handle !== outcome.server.handle),
         outcome.server
       ]);
       const row: PreviewServerRow = {
@@ -782,23 +782,23 @@ export function usePreviewServers(
   }, [target, configurations, refresh]);
 
   const stop = useCallback(async (row: PreviewServerRow) => {
-    const serverId = row.server?.serverId;
-    if (!serverId) return;
-    if (activeServer.current?.serverId === serverId) activeServer.current = null;
-    setServers((current) => current.filter((server) => server.serverId !== serverId));
+    const handle = row.server?.handle;
+    if (!handle) return;
+    if (activeServer.current?.handle === handle) activeServer.current = null;
+    setServers((current) => current.filter((server) => server.handle !== handle));
     try {
-      await stopPreviewServer(serverId);
+      await stopPreviewServer(handle);
     } finally {
       refresh();
     }
   }, [refresh]);
 
   const stopAll = useCallback(async () => {
-    const live = rows.map((row) => row.server?.serverId).filter((id): id is string => Boolean(id));
+    const live = rows.map((row) => row.server?.handle).filter((id): id is string => Boolean(id));
     activeServer.current = null;
     setServers([]);
     try {
-      await Promise.all(live.map((serverId) => stopPreviewServer(serverId).catch(() => false)));
+      await Promise.all(live.map((handle) => stopPreviewServer(handle).catch(() => false)));
     } finally {
       refresh();
     }
@@ -807,7 +807,7 @@ export function usePreviewServers(
   const adopt = useCallback((row: PreviewServerRow) => {
     if (!row.server) return;
     activeServer.current = {
-      serverId: row.server.serverId,
+      handle: row.server.handle,
       name: row.server.name,
       port: row.server.port
     };
@@ -830,10 +830,10 @@ export function usePreviewServers(
 }
 
 /** Polls one server's buffered output on the source's cadence while the drawer is open. */
-export function usePreviewServerLogs(serverId: string | null, enabled: boolean): string[] {
+export function usePreviewServerLogs(handle: string | null, enabled: boolean): string[] {
   const [lines, setLines] = useState<string[]>([]);
   useEffect(() => {
-    if (!enabled || !serverId) {
+    if (!enabled || !handle) {
       setLines([]);
       return;
     }
@@ -841,7 +841,7 @@ export function usePreviewServerLogs(serverId: string | null, enabled: boolean):
     let timer = 0;
     const poll = async () => {
       try {
-        const rendered = await readPreviewServerLogs(serverId, { lines: PREVIEW_MAX_LOG_LINES });
+        const rendered = await readPreviewServerLogs(handle, { lines: PREVIEW_MAX_LOG_LINES });
         if (!cancelled) setLines(previewLogLines(rendered));
       } catch {
         // A stopped server takes its buffer with it; the drawer falls back to its empty state.
@@ -854,6 +854,6 @@ export function usePreviewServerLogs(serverId: string | null, enabled: boolean):
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [serverId, enabled]);
+  }, [handle, enabled]);
   return lines;
 }

@@ -137,6 +137,7 @@ fn request_for(upstream: &Upstream, model_id: &str) -> StepRequest {
         tools: Vec::new(),
         max_steps: 1,
         max_output_tokens: None,
+        context_window: None,
         reasoning: None,
         reasoning_content: None,
         prompt_cache: None,

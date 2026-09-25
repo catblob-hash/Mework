@@ -19,7 +19,7 @@
 //! flag, a missing `cwd`, or another chat's server is the actual problem, and
 //! paraphrasing one turns a diagnosis back into "it didn't start".
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -89,6 +89,9 @@ const PIPE_CHUNK: usize = 8192;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreviewServerConfig {
     pub name: String,
+    /// What the model addresses the server by: `name`, numbered (`dev-2`) when the worktree's
+    /// launch.json repeats the name. [`crate::preview`] decides it; the registry only records it.
+    pub server_id: String,
     /// `None` is an attach-only entry (url with no command). [`crate::preview::start`]
     /// answers those itself, before anything reaches this registry, so one that gets
     /// this far is an entry with no command *and* no url: [`PreviewServerRegistry::start`]
@@ -120,10 +123,15 @@ pub enum PreviewServerStatus {
     Failed,
 }
 
-/// One server as `preview_list` and the pane see it.
+/// One server as the pane sees it. The model reads a narrower view of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewServerSnapshot {
+    /// The registry's key for this one process, which the pane stops it and reads its output by.
+    /// Unique across the registry and never reused.
+    pub handle: String,
+    /// What the model addresses the server by — see [`PreviewServerConfig::server_id`]. Unique
+    /// only among one conversation's servers in one worktree; the workspace says which worktree.
     pub server_id: String,
     pub name: String,
     pub port: u16,
@@ -432,11 +440,10 @@ pub fn port_required_message(
     occupant_text: Option<&str>,
 ) -> String {
     if let Some(occupant) = occupant {
-        let name = sanitize_message_text(&occupant.name);
-        let server_id = &occupant.server_id;
+        let server_id = sanitize_message_text(&occupant.server_id);
         return format!(
             "Port {port} is required by this server (autoPort is false) but is in use by preview \
-             server \"{name}\" ({server_id}). Ask the user if they want to stop \"{name}\" to free \
+             server \"{server_id}\". Ask the user if they want to stop \"{server_id}\" to free \
              port {port}. If yes, call preview_stop with serverId \"{server_id}\" and retry."
         );
     }
@@ -463,7 +470,7 @@ pub fn preview_port_conflict(
     cross_session: bool,
 ) -> PortInUseError {
     if cross_session {
-        let name = occupant.map(|occupant| sanitize_message_text(&occupant.name));
+        let name = occupant.map(|occupant| sanitize_message_text(&occupant.server_id));
         let name = name.as_deref().unwrap_or_default();
         let tail = if auto_port == Some(false) {
             "Ask the user to stop it from that chat, or to change \"autoPort\" in \
@@ -485,9 +492,8 @@ pub fn preview_port_conflict(
     }
     let prefix = match occupant {
         Some(occupant) => format!(
-            "Port {port} is in use by preview server \"{}\" ({}). ",
-            sanitize_message_text(&occupant.name),
-            occupant.server_id
+            "Port {port} is in use by preview server \"{}\". ",
+            sanitize_message_text(&occupant.server_id)
         ),
         None => format!("Port {port} is in use by another preview server. "),
     };
@@ -535,12 +541,11 @@ fn auto_port_reassignment_failed(
     occupant_text: Option<&str>,
 ) -> PortInUseError {
     if let Some(occupant) = occupant {
-        let name = sanitize_message_text(&occupant.name);
-        let server_id = &occupant.server_id;
+        let server_id = sanitize_message_text(&occupant.server_id);
         return PortInUseError::launch(
             port,
             format!(
-                "Port {port} is in use by preview server \"{name}\" ({server_id}) and automatic \
+                "Port {port} is in use by preview server \"{server_id}\" and automatic \
                  reassignment to a fresh port failed. Retry in a moment, or call preview_stop with \
                  serverId \"{server_id}\" to free port {port} and retry."
             ),
@@ -621,7 +626,7 @@ pub fn capacity_error(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewReuseReason {
-    /// The running server answers to the requested configuration's name.
+    /// The running server answers to the requested configuration's server id.
     NameMatch,
     /// It holds the configuration's port, and the caller named nothing.
     PortMatch,
@@ -660,13 +665,14 @@ pub fn running_for_session(
 
 /// Whether to reuse a running server instead of starting another.
 ///
-/// `running` must already be narrowed by [`running_for_session`]. `requested_name` is
-/// what the *caller* passed, not the configuration's name: the port and single-server
-/// arms only apply when the caller named nothing, because naming a server is a request
-/// for that server.
+/// `running` must already be narrowed by [`running_for_session`]. `config_server_id` is the
+/// entry's [`PreviewServerConfig::server_id`] rather than its name, so a launch.json that repeats
+/// a name still has each entry answer only for itself. `requested_name` is what the *caller*
+/// passed: the port and single-server arms only apply when the caller named nothing, because
+/// naming a server is a request for that server.
 pub fn decide_start_action(
     running: &[PreviewServerSnapshot],
-    config_name: &str,
+    config_server_id: &str,
     config_port: u16,
     requested_name: Option<&str>,
     configured_server_count: usize,
@@ -677,7 +683,7 @@ pub fn decide_start_action(
     let named = requested_name.is_some_and(|name| !name.is_empty());
     if let Some(server) = running
         .iter()
-        .find(|server| server.name.eq_ignore_ascii_case(config_name))
+        .find(|server| server.server_id.eq_ignore_ascii_case(config_server_id))
     {
         return PreviewStartAction::Reuse {
             server: server.clone(),
@@ -1468,6 +1474,7 @@ struct PreviewProcess {
 }
 
 struct ServerEntry {
+    handle: String,
     server_id: String,
     name: String,
     port: u16,
@@ -1484,6 +1491,7 @@ struct ServerEntry {
 impl ServerEntry {
     fn snapshot(&self, worktree: &Path) -> PreviewServerSnapshot {
         PreviewServerSnapshot {
+            handle: self.handle.clone(),
             server_id: self.server_id.clone(),
             name: self.name.clone(),
             port: self.port,
@@ -1507,89 +1515,33 @@ impl ServerEntry {
 
 #[derive(Default)]
 struct Registry {
+    /// Each worktree's servers, by handle.
     worktrees: HashMap<PathBuf, HashMap<String, ServerEntry>>,
+    /// Each server's output, by handle.
     logs: HashMap<String, PreviewLogRing>,
-    /// Ids of servers that have been stopped. They are never minted again.
-    ///
-    /// A `preview_start` receipt naming its `serverId` is persisted in the conversation, so a
-    /// reused id would let a model read an old receipt and address a different server than the one
-    /// that receipt reported. It also closes a race: `stop` frees the id before the process dies,
-    /// and a log-drain thread still holding that id would otherwise append the dead process's last
-    /// bytes to whatever ring now sits under it. The set is bounded by how many servers one app
-    /// session starts, and the registry itself does not outlive the process.
-    retired_ids: HashSet<String>,
+    /// The last handle minted. Handles count up and are never reused: `stop` frees a handle
+    /// before the process dies, and a log-drain thread still holding it would otherwise append
+    /// the dead process's last bytes to whatever ring sat under it next.
+    last_handle: u64,
+    /// For each worktree and each name its launch.json repeats (folded to lower case, the way
+    /// names are matched), which of the entries sharing it have been started, by their place in
+    /// the file, in the order they first were. An entry's position here, from 1, is the number
+    /// its server id carries. Kept for as long as the registry, so a restarted entry answers to
+    /// the id it had.
+    repeated_names: HashMap<(PathBuf, String), Vec<usize>>,
 }
 
 impl Registry {
-    /// The id the model addresses this server by: its launch configuration's own name.
-    ///
-    /// That name is the one thing the model already knows — it is what it passed to
-    /// `preview_start` — and it has to quote the id back on every later preview call. A uuid would
-    /// spend 36 characters on each of those calls to say nothing.
-    ///
-    /// Ids have to be free across the whole registry rather than within one worktree, because
-    /// `logs` is a flat map and both `get` and `stop` are given an id alone. Two worktrees can
-    /// hold the same configuration name, and `autoPort` lets a second conversation start another
-    /// process under it, so a name already in use is numbered the way a workflow run's is. The
-    /// loop terminates because the taken set is finite: every entry in it owns a live process.
-    fn mint_server_id(&self, name: &str) -> String {
-        let base = slug_server_id(name);
-        let mut candidate = base.clone();
-        let mut number = 1u32;
-        while self.server_id_taken(&candidate) {
-            number += 1;
-            candidate = format!("{base}-{number}");
-        }
-        candidate
-    }
-
-    fn server_id_taken(&self, server_id: &str) -> bool {
-        self.retired_ids.contains(server_id)
-            || self.logs.contains_key(server_id)
-            || self
-                .worktrees
-                .values()
-                .any(|entries| entries.contains_key(server_id))
-    }
-
-    /// Retires an id so nothing is ever started under it again.
-    fn retire(&mut self, server_id: &str) {
-        self.retired_ids.insert(server_id.to_owned());
+    fn mint_handle(&mut self) -> String {
+        self.last_handle += 1;
+        self.last_handle.to_string()
     }
 }
 
-/// Reduces a launch configuration name to something usable as an id: the model reads it, quotes it
-/// back, and the host uses it as a map key, so spaces, case and punctuation all have to go. A name
-/// with nothing usable in it still needs an id, hence the fallback.
-fn slug_server_id(name: &str) -> String {
-    let mut slug = String::new();
-    for character in name.chars() {
-        match character {
-            'a'..='z' | '0'..='9' | '_' => slug.push(character),
-            'A'..='Z' => slug.push(character.to_ascii_lowercase()),
-            _ if slug.ends_with('-') || slug.is_empty() => {}
-            _ => slug.push('-'),
-        }
-        if slug.len() >= MAX_SERVER_ID_CHARS {
-            break;
-        }
-    }
-    // An id that reads as an attach receipt would make the attach-only paths answer for a real
-    // process. Numbering cannot undo that, because every variant keeps the prefix, so the prefix
-    // is dropped here and process ids are disjoint from attach ids by construction.
-    let slug = slug
-        .trim_matches('-')
-        .trim_start_matches(crate::preview::ATTACH_SERVER_ID_PREFIX)
-        .trim_matches('-');
-    if slug.is_empty() {
-        return "server".to_owned();
-    }
-    slug.to_owned()
+/// Puts servers in the order they were started, which is the order their handles count up in.
+fn sort_by_start(servers: &mut [PreviewServerSnapshot]) {
+    servers.sort_by_key(|server| server.handle.parse::<u64>().unwrap_or(u64::MAX));
 }
-
-/// Long enough for a descriptive configuration name, short enough that repeating it on every
-/// preview call stays cheap.
-const MAX_SERVER_ID_CHARS: usize = 40;
 
 /// Called after every change to the server list, so the pane can redraw.
 ///
@@ -1674,10 +1626,11 @@ impl PreviewServerRegistry {
             .collect()
     }
 
-    /// Every server `session_id` started, in whichever worktree and on whichever machine.
+    /// Every server `session_id` started, in whichever worktree and on whichever machine, in the
+    /// order they were started.
     pub fn servers_owned_by(&self, session_id: &str) -> Vec<PreviewServerSnapshot> {
         let registry = self.lock();
-        registry
+        let mut servers: Vec<PreviewServerSnapshot> = registry
             .worktrees
             .iter()
             .flat_map(|(worktree, entries)| {
@@ -1686,12 +1639,15 @@ impl PreviewServerRegistry {
                     .filter(|entry| entry.session_id.as_deref() == Some(session_id))
                     .map(move |entry| entry.snapshot(worktree))
             })
-            .collect()
+            .collect();
+        sort_by_start(&mut servers);
+        servers
     }
 
+    /// One worktree's servers, in the order they were started.
     pub fn servers_for_worktree(&self, worktree: &Path) -> Vec<PreviewServerSnapshot> {
         let registry = self.lock();
-        registry
+        let mut servers: Vec<PreviewServerSnapshot> = registry
             .worktrees
             .get(worktree)
             .map(|entries| {
@@ -1700,22 +1656,54 @@ impl PreviewServerRegistry {
                     .map(|entry| entry.snapshot(worktree))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        sort_by_start(&mut servers);
+        servers
     }
 
-    pub fn get(&self, server_id: &str) -> Option<PreviewServerSnapshot> {
+    pub fn get(&self, handle: &str) -> Option<PreviewServerSnapshot> {
         let registry = self.lock();
         registry.worktrees.iter().find_map(|(worktree, entries)| {
-            entries.get(server_id).map(|entry| entry.snapshot(worktree))
+            entries.get(handle).map(|entry| entry.snapshot(worktree))
         })
     }
 
+    /// Which of the entries sharing a repeated launch.json `name` in `worktree` have been
+    /// started, by their place among those entries in file order, in the order they first were.
+    /// The entry at position `n - 1` is the one whose server id ends in `-n`.
+    pub fn repeated_name_order(&self, worktree: &Path, name: &str) -> Vec<usize> {
+        self.lock()
+            .repeated_names
+            .get(&(worktree.to_path_buf(), name.to_lowercase()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The number the entry at `occurrence` among those sharing `name` carries in its server id,
+    /// giving it the next one if it has never been started. Numbers count per name and per
+    /// worktree, so another name's entries or another workspace's never move them.
+    pub fn number_repeated_name(&self, worktree: &Path, name: &str, occurrence: usize) -> u32 {
+        let mut registry = self.lock();
+        let order = registry
+            .repeated_names
+            .entry((worktree.to_path_buf(), name.to_lowercase()))
+            .or_default();
+        let position = match order.iter().position(|started| *started == occurrence) {
+            Some(position) => position,
+            None => {
+                order.push(occurrence);
+                order.len() - 1
+            }
+        };
+        u32::try_from(position + 1).unwrap_or(u32::MAX)
+    }
+
     /// The buffered output, oldest first. Empty once the server has exited or stopped.
-    pub fn logs(&self, server_id: &str) -> Vec<PreviewLogEntry> {
+    pub fn logs(&self, handle: &str) -> Vec<PreviewLogEntry> {
         let registry = self.lock();
         registry
             .logs
-            .get(server_id)
+            .get(handle)
             .map(PreviewLogRing::to_vec)
             .unwrap_or_default()
     }
@@ -1934,22 +1922,19 @@ impl PreviewServerRegistry {
             stopped: false,
         }));
 
-        let server_id = {
+        let handle = {
             let mut registry = self.lock();
-            // Minted under the same lock that inserts the entry, so two concurrent starts of one
-            // configuration cannot settle on the same id.
-            let server_id = registry.mint_server_id(&config.name);
-            registry
-                .logs
-                .insert(server_id.clone(), PreviewLogRing::new());
+            let handle = registry.mint_handle();
+            registry.logs.insert(handle.clone(), PreviewLogRing::new());
             registry
                 .worktrees
                 .entry(worktree.to_path_buf())
                 .or_default()
                 .insert(
-                    server_id.clone(),
+                    handle.clone(),
                     ServerEntry {
-                        server_id: server_id.clone(),
+                        handle: handle.clone(),
+                        server_id: config.server_id.clone(),
                         name: config.name.clone(),
                         port: config.port,
                         status: PreviewServerStatus::Starting,
@@ -1960,7 +1945,7 @@ impl PreviewServerRegistry {
                         display_cwd: None,
                     },
                 );
-            server_id
+            handle
         };
         self.emit_change();
 
@@ -1969,14 +1954,14 @@ impl PreviewServerRegistry {
         if let Some(stdout) = stdout {
             drain_pipe(
                 stdout,
-                PreviewLogSink::new(self.clone(), &server_id, PreviewLogStream::Stdout),
+                PreviewLogSink::new(self.clone(), &handle, PreviewLogStream::Stdout),
                 None,
             );
         }
         if let Some(stderr) = stderr {
             drain_pipe(
                 stderr,
-                PreviewLogSink::new(self.clone(), &server_id, PreviewLogStream::Stderr),
+                PreviewLogSink::new(self.clone(), &handle, PreviewLogStream::Stderr),
                 Some((early_stderr.clone(), capturing.clone())),
             );
         }
@@ -1985,7 +1970,7 @@ impl PreviewServerRegistry {
         capturing.store(false, Ordering::Release);
         if let Some(exit_code) = exit {
             let output = self
-                .logs(&server_id)
+                .logs(&handle)
                 .iter()
                 .map(|entry| entry.line.as_str())
                 .collect::<String>()
@@ -1995,7 +1980,7 @@ impl PreviewServerRegistry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            self.remove(worktree, &server_id);
+            self.remove(worktree, &handle);
             self.emit_change();
             return Err(preview_start_failure(
                 PreviewSpawnFailure::EarlyExit {
@@ -2008,14 +1993,14 @@ impl PreviewServerRegistry {
             ));
         }
 
-        self.watch(worktree, &server_id, process);
+        self.watch(worktree, &handle, process);
         self.watch_readiness(
             worktree,
-            &server_id,
+            &handle,
             config.port,
             readiness_is_https(config.url.as_deref()),
         );
-        self.get(&server_id).ok_or_else(|| PreviewStartError {
+        self.get(&handle).ok_or_else(|| PreviewStartError {
             message: dead_reuse_refusal_message(&config.name),
             kind: PreviewStartErrorKind::EarlyExit,
             code: None,
@@ -2056,20 +2041,19 @@ impl PreviewServerRegistry {
             process: remote,
             stopped: AtomicBool::new(false),
         });
-        let server_id = {
+        let handle = {
             let mut registry = self.lock();
-            let server_id = registry.mint_server_id(&config.name);
-            registry
-                .logs
-                .insert(server_id.clone(), PreviewLogRing::new());
+            let handle = registry.mint_handle();
+            registry.logs.insert(handle.clone(), PreviewLogRing::new());
             registry
                 .worktrees
                 .entry(worktree.to_path_buf())
                 .or_default()
                 .insert(
-                    server_id.clone(),
+                    handle.clone(),
                     ServerEntry {
-                        server_id: server_id.clone(),
+                        handle: handle.clone(),
+                        server_id: config.server_id.clone(),
                         name: config.name.clone(),
                         port: config.port,
                         status: PreviewServerStatus::Starting,
@@ -2083,7 +2067,7 @@ impl PreviewServerRegistry {
                         display_cwd: Some(display_cwd.to_owned()),
                     },
                 );
-            server_id
+            handle
         };
         self.emit_change();
 
@@ -2092,14 +2076,14 @@ impl PreviewServerRegistry {
         if let Some(stdout) = stdout {
             drain_pipe(
                 stdout,
-                PreviewLogSink::new(self.clone(), &server_id, PreviewLogStream::Stdout),
+                PreviewLogSink::new(self.clone(), &handle, PreviewLogStream::Stdout),
                 None,
             );
         }
         if let Some(stderr) = stderr {
             drain_pipe(
                 stderr,
-                PreviewLogSink::new(self.clone(), &server_id, PreviewLogStream::Stderr),
+                PreviewLogSink::new(self.clone(), &handle, PreviewLogStream::Stderr),
                 Some((early_stderr.clone(), capturing.clone())),
             );
         }
@@ -2109,7 +2093,7 @@ impl PreviewServerRegistry {
             Ok(Some(exit)) => Some(exit.code),
             Ok(None) => None,
             Err(error) => {
-                self.remove(worktree, &server_id);
+                self.remove(worktree, &handle);
                 self.emit_change();
                 return Err(PreviewStartError {
                     message: format!(
@@ -2129,7 +2113,7 @@ impl PreviewServerRegistry {
             // exit only after both streams ended. The drains still need a moment to hand it over.
             thread::sleep(Duration::from_millis(50));
             let output = self
-                .logs(&server_id)
+                .logs(&handle)
                 .iter()
                 .map(|entry| entry.line.as_str())
                 .collect::<String>()
@@ -2139,7 +2123,7 @@ impl PreviewServerRegistry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            self.remove(worktree, &server_id);
+            self.remove(worktree, &handle);
             self.emit_change();
             // The launch script's own verdicts, which read like the spawn errors a local start
             // reports for the same mistakes.
@@ -2162,10 +2146,10 @@ impl PreviewServerRegistry {
             ));
         }
 
-        self.watch_remote(worktree, &server_id, process);
+        self.watch_remote(worktree, &handle, process);
         let registry = self.clone();
         let readiness_worktree = worktree.to_path_buf();
-        let readiness_id = server_id.clone();
+        let readiness_id = handle.clone();
         let port = config.port;
         let https = readiness_is_https(config.url.as_deref());
         thread::spawn(move || {
@@ -2174,7 +2158,7 @@ impl PreviewServerRegistry {
             host.wait_ready(port, READINESS_TIMEOUT, https);
             registry.promote(&readiness_worktree, &readiness_id);
         });
-        self.get(&server_id).ok_or_else(|| PreviewStartError {
+        self.get(&handle).ok_or_else(|| PreviewStartError {
             message: dead_reuse_refusal_message(&config.name),
             kind: PreviewStartErrorKind::EarlyExit,
             code: None,
@@ -2184,13 +2168,13 @@ impl PreviewServerRegistry {
     }
 
     /// Moves a starting row to running, once.
-    fn promote(&self, worktree: &Path, server_id: &str) {
+    fn promote(&self, worktree: &Path, handle: &str) {
         let promoted = {
             let mut inner = self.lock();
             inner
                 .worktrees
                 .get_mut(worktree)
-                .and_then(|entries| entries.get_mut(server_id))
+                .and_then(|entries| entries.get_mut(handle))
                 .filter(|entry| entry.status == PreviewServerStatus::Starting)
                 .map(|entry| entry.status = PreviewServerStatus::Running)
                 .is_some()
@@ -2203,10 +2187,10 @@ impl PreviewServerRegistry {
     /// Forgets a remote server once it has exited, or once the host can no longer find out how
     /// it ended — its machine reclaimed it, or its link gave up for good. A link that is merely
     /// reconnecting is neither: the process keeps running there, and the wait keeps waiting.
-    fn watch_remote(&self, worktree: &Path, server_id: &str, process: Arc<RemoteServerProcess>) {
+    fn watch_remote(&self, worktree: &Path, handle: &str, process: Arc<RemoteServerProcess>) {
         let registry = self.clone();
         let worktree = worktree.to_path_buf();
-        let server_id = server_id.to_owned();
+        let handle = handle.to_owned();
         thread::spawn(move || {
             loop {
                 if process.stopped.load(Ordering::Acquire) {
@@ -2220,7 +2204,7 @@ impl PreviewServerRegistry {
             if process.stopped.load(Ordering::Acquire) {
                 return;
             }
-            if registry.remove(&worktree, &server_id) {
+            if registry.remove(&worktree, &handle) {
                 registry.emit_change();
             }
         });
@@ -2274,10 +2258,10 @@ impl PreviewServerRegistry {
         }
     }
 
-    fn watch(&self, worktree: &Path, server_id: &str, process: Arc<Mutex<PreviewProcess>>) {
+    fn watch(&self, worktree: &Path, handle: &str, process: Arc<Mutex<PreviewProcess>>) {
         let registry = self.clone();
         let worktree = worktree.to_path_buf();
-        let server_id = server_id.to_owned();
+        let handle = handle.to_owned();
         thread::spawn(move || {
             loop {
                 {
@@ -2293,63 +2277,62 @@ impl PreviewServerRegistry {
                 }
                 thread::sleep(SUPERVISOR_POLL);
             }
-            if registry.remove(&worktree, &server_id) {
+            if registry.remove(&worktree, &handle) {
                 registry.emit_change();
             }
         });
     }
 
-    fn watch_readiness(&self, worktree: &Path, server_id: &str, port: u16, https: bool) {
+    fn watch_readiness(&self, worktree: &Path, handle: &str, port: u16, https: bool) {
         let registry = self.clone();
         let worktree = worktree.to_path_buf();
-        let server_id = server_id.to_owned();
+        let handle = handle.to_owned();
         thread::spawn(move || {
             let alive = {
                 let registry = registry.clone();
                 let worktree = worktree.clone();
-                let server_id = server_id.clone();
+                let handle = handle.clone();
                 move || {
                     registry
                         .lock()
                         .worktrees
                         .get(&worktree)
-                        .is_some_and(|entries| entries.contains_key(&server_id))
+                        .is_some_and(|entries| entries.contains_key(&handle))
                 }
             };
             wait_until_ready_while(port, READINESS_TIMEOUT, https, &alive);
-            registry.promote(&worktree, &server_id);
+            registry.promote(&worktree, &handle);
         });
     }
 
-    fn remove(&self, worktree: &Path, server_id: &str) -> bool {
+    fn remove(&self, worktree: &Path, handle: &str) -> bool {
         let mut registry = self.lock();
         let mut removed = false;
         if let Some(entries) = registry.worktrees.get_mut(worktree) {
-            removed = entries.remove(server_id).is_some();
+            removed = entries.remove(handle).is_some();
             if entries.is_empty() {
                 registry.worktrees.remove(worktree);
             }
         }
-        registry.logs.remove(server_id);
-        registry.retire(server_id);
+        registry.logs.remove(handle);
         removed
     }
 
-    fn append_log(&self, server_id: &str, stream: PreviewLogStream, text: String) {
+    fn append_log(&self, handle: &str, stream: PreviewLogStream, text: String) {
         let mut registry = self.lock();
-        if let Some(buffer) = registry.logs.get_mut(server_id) {
+        if let Some(buffer) = registry.logs.get_mut(handle) {
             buffer.push(text, stream);
         }
     }
 
     /// Stops one server: kills its whole tree and forgets it, buffer included.
-    pub fn stop(&self, server_id: &str) -> bool {
+    pub fn stop(&self, handle: &str) -> bool {
         let process = {
             let mut registry = self.lock();
             let Some(worktree) = registry
                 .worktrees
                 .iter()
-                .find(|(_, entries)| entries.contains_key(server_id))
+                .find(|(_, entries)| entries.contains_key(handle))
                 .map(|(worktree, _)| worktree.clone())
             else {
                 return false;
@@ -2358,19 +2341,18 @@ impl PreviewServerRegistry {
                 .worktrees
                 .get_mut(&worktree)
                 .expect("the worktree was just found");
-            let Some(mut entry) = entries.remove(server_id) else {
+            let Some(mut entry) = entries.remove(handle) else {
                 return false;
             };
             if entries.is_empty() {
                 registry.worktrees.remove(&worktree);
             }
             entry.status = PreviewServerStatus::Stopped;
-            registry.logs.remove(server_id);
-            registry.retire(server_id);
+            registry.logs.remove(handle);
             entry.process.clone()
         };
         kill_server_process(&process);
-        self.emit_stopped(&[server_id.to_owned()]);
+        self.emit_stopped(&[handle.to_owned()]);
         true
     }
 
@@ -2385,17 +2367,14 @@ impl PreviewServerRegistry {
                 .flat_map(|entries| entries.values())
                 .map(|entry| entry.process.clone())
                 .collect();
-            let retiring = registry
+            let stopped = registry
                 .worktrees
                 .values()
                 .flat_map(|entries| entries.keys().cloned())
                 .collect::<Vec<_>>();
-            for server_id in &retiring {
-                registry.retire(server_id);
-            }
             registry.worktrees.clear();
             registry.logs.clear();
-            (processes, retiring)
+            (processes, stopped)
         };
         for process in &processes {
             kill_server_process(process);
@@ -2451,16 +2430,16 @@ fn kill_preview_process(process: &Arc<Mutex<PreviewProcess>>) {
 /// One pipe's write end into a server's ring buffer.
 struct PreviewLogSink {
     registry: PreviewServerRegistry,
-    server_id: String,
+    handle: String,
     stream: PreviewLogStream,
     decoder: ConsoleTextDecoder,
 }
 
 impl PreviewLogSink {
-    fn new(registry: PreviewServerRegistry, server_id: &str, stream: PreviewLogStream) -> Self {
+    fn new(registry: PreviewServerRegistry, handle: &str, stream: PreviewLogStream) -> Self {
         Self {
             registry,
-            server_id: server_id.to_owned(),
+            handle: handle.to_owned(),
             stream,
             decoder: ConsoleTextDecoder::new(),
         }
@@ -2483,7 +2462,7 @@ impl PreviewLogSink {
             return;
         }
         self.registry
-            .append_log(&self.server_id, self.stream, text.to_owned());
+            .append_log(&self.handle, self.stream, text.to_owned());
     }
 }
 
@@ -2545,6 +2524,7 @@ mod tests {
         session_id: Option<&str>,
     ) -> PreviewServerSnapshot {
         PreviewServerSnapshot {
+            handle: format!("handle-{server_id}"),
             server_id: server_id.to_owned(),
             name: name.to_owned(),
             port,
@@ -2558,54 +2538,38 @@ mod tests {
         }
     }
 
-    /// The model quotes a server id back on every later preview call, so the id is the launch
-    /// configuration's own name. Names that are not usable as ids, and names already in use, still
-    /// have to resolve to something unique — and never to something an attach receipt could be.
+    /// Handles only ever count up, so a log drain still holding a stopped server's handle can
+    /// never write into the ring of whatever starts next.
     #[test]
-    fn a_server_id_is_its_configuration_name_made_usable_and_unique() {
-        assert_eq!(slug_server_id("dev"), "dev");
-        assert_eq!(slug_server_id("Dev Server"), "dev-server");
-        assert_eq!(slug_server_id("web_app.2"), "web_app-2");
-        assert_eq!(
-            slug_server_id("npm run dev -- --claude"),
-            "npm-run-dev-claude"
-        );
-        // Nothing usable left, but a server still needs an address.
-        assert_eq!(slug_server_id("  ---  "), "server");
-        assert_eq!(slug_server_id("名字"), "server");
-        assert_eq!(slug_server_id(""), "server");
-        let long = slug_server_id(&"d".repeat(200));
-        assert!(long.len() <= MAX_SERVER_ID_CHARS, "{long}");
-
-        // A process id can never read as an attach receipt, because numbering would keep the
-        // prefix and the attach-only paths would then answer for a live process.
-        for attach_shaped in [
-            "browser-preview-abc",
-            "browser-preview-browser-preview-abc",
-            "Browser Preview abc",
-        ] {
-            let slug = slug_server_id(attach_shaped);
-            assert!(
-                !crate::preview::is_attach_server_id(&slug),
-                "{attach_shaped} → {slug}"
-            );
-        }
-        // Dropping the prefix can leave nothing but the prefix's own stem, which is a perfectly
-        // ordinary id: only the trailing separator makes an id an attach receipt.
-        assert_eq!(slug_server_id("browser-preview-"), "browser-preview");
-        assert!(!crate::preview::is_attach_server_id("browser-preview"));
-
+    fn handles_are_never_reused() {
         let mut registry = Registry::default();
-        assert_eq!(registry.mint_server_id("dev"), "dev");
-        registry.logs.insert("dev".into(), PreviewLogRing::new());
-        assert_eq!(registry.mint_server_id("Dev"), "dev-2");
-        registry.logs.insert("dev-2".into(), PreviewLogRing::new());
-        assert_eq!(registry.mint_server_id("dev"), "dev-3");
-        // A stopped server keeps its id forever: an old `preview_start` receipt in the
-        // conversation names it, and a dying process's log drain may still be holding it.
-        registry.logs.remove("dev");
-        registry.retire("dev");
-        assert_eq!(registry.mint_server_id("dev"), "dev-3");
+        let first = registry.mint_handle();
+        let second = registry.mint_handle();
+        assert_ne!(first, second);
+        registry.logs.remove(&first);
+        assert!(![first, second].contains(&registry.mint_handle()));
+    }
+
+    /// A repeated name numbers its entries in the order they are first started, per name and per
+    /// worktree, and an entry keeps its number when it is started again.
+    #[test]
+    fn a_repeated_name_numbers_its_entries_in_first_start_order() {
+        let registry = PreviewServerRegistry::default();
+        let one = Path::new("/one");
+        let two = Path::new("/two");
+        // The second "dev" in the file is started first, so it is dev-1.
+        assert_eq!(registry.number_repeated_name(one, "dev", 1), 1);
+        // Another name counts on its own.
+        assert_eq!(registry.number_repeated_name(one, "api", 0), 1);
+        assert_eq!(registry.number_repeated_name(one, "Dev", 0), 2);
+        assert_eq!(registry.number_repeated_name(one, "dev", 1), 1);
+        // Another worktree — another workspace — is not a repeat of this one.
+        assert_eq!(registry.number_repeated_name(two, "dev", 0), 1);
+        assert_eq!(registry.repeated_name_order(one, "DEV"), vec![1, 0]);
+        assert_eq!(
+            registry.repeated_name_order(two, "web"),
+            Vec::<usize>::new()
+        );
     }
 
     /// The buffer is a ring, not a queue: once full it overwrites the oldest entry and
@@ -2740,21 +2704,22 @@ mod tests {
     /// is; `true` never reaches this function at all.
     #[test]
     fn the_port_conflict_message_follows_the_auto_port_tri_state() {
-        let occupant = snapshot("srv-1", "frontend", 3000, Some("chat-a"));
+        // A launch.json that repeats "frontend" numbers it, and the id is what the model quotes.
+        let occupant = snapshot("frontend-2", "frontend", 3000, Some("chat-a"));
 
         let explicit = preview_port_conflict(3000, Some(false), Some(&occupant), false);
         assert_eq!(explicit.source, PortConflictSource::Launch);
         assert_eq!(
             explicit.message,
             "Port 3000 is required by this server (autoPort is false) but is in use by preview \
-             server \"frontend\" (srv-1). Ask the user if they want to stop \"frontend\" to free \
-             port 3000. If yes, call preview_stop with serverId \"srv-1\" and retry."
+             server \"frontend-2\". Ask the user if they want to stop \"frontend-2\" to free \
+             port 3000. If yes, call preview_stop with serverId \"frontend-2\" and retry."
         );
 
         let undecided = preview_port_conflict(3000, None, Some(&occupant), false);
         assert!(undecided
             .message
-            .starts_with("Port 3000 is in use by preview server \"frontend\" (srv-1). "));
+            .starts_with("Port 3000 is in use by preview server \"frontend-2\". "));
         assert!(undecided.message.ends_with(&auto_port_hint(3000)));
 
         let unknown_occupant = preview_port_conflict(3000, None, None, false);
@@ -2767,7 +2732,7 @@ mod tests {
     /// offer `preview_stop` — the tool would refuse and the model would loop.
     #[test]
     fn a_cross_chat_occupant_is_named_but_not_offered_for_stopping() {
-        let occupant = snapshot("srv-9", "backend", 3000, Some("chat-b"));
+        let occupant = snapshot("backend", "backend", 3000, Some("chat-b"));
         let message = preview_port_conflict(3000, Some(false), Some(&occupant), true).message;
         assert_eq!(
             message,
@@ -2817,8 +2782,8 @@ mod tests {
     /// reaches the last two: naming is a request for that server, not a hint.
     #[test]
     fn reuse_prefers_the_name_then_the_port_then_the_only_server() {
-        let by_port = snapshot("srv-port", "api", 3000, None);
-        let by_name = snapshot("srv-name", "Frontend", 9999, None);
+        let by_port = snapshot("api", "api", 3000, None);
+        let by_name = snapshot("Frontend", "Frontend", 9999, None);
         let running = [by_port.clone(), by_name.clone()];
 
         assert_eq!(
@@ -2847,9 +2812,28 @@ mod tests {
         );
     }
 
+    /// Two entries sharing a name are two servers: one of them running is no reason to hand it
+    /// back for the other.
+    #[test]
+    fn a_repeated_name_reuses_only_the_entry_it_numbers() {
+        let first = snapshot("dev-1", "dev", 3000, None);
+        let running = std::slice::from_ref(&first);
+        assert_eq!(
+            decide_start_action(running, "dev-2", 3001, Some("dev"), 2),
+            PreviewStartAction::Start
+        );
+        assert_eq!(
+            decide_start_action(running, "dev-1", 3000, Some("dev"), 2),
+            PreviewStartAction::Reuse {
+                server: first.clone(),
+                reason: PreviewReuseReason::NameMatch,
+            }
+        );
+    }
+
     #[test]
     fn a_single_running_server_is_reused_despite_a_mismatch() {
-        let only = snapshot("srv-only", "dev", 5173, None);
+        let only = snapshot("dev", "dev", 5173, None);
         let running = std::slice::from_ref(&only);
         assert_eq!(
             decide_start_action(running, "web", 3000, None, 1),
@@ -3284,6 +3268,7 @@ mod tests {
         let (command, args) = trivial_command(arguments);
         PreviewServerConfig {
             name: name.to_owned(),
+            server_id: name.to_owned(),
             command,
             args,
             cwd: PathBuf::new(),
@@ -3363,21 +3348,22 @@ mod tests {
             .expect("the child outlives the startup gate");
 
         assert_eq!(started.name, "slow");
+        assert_eq!(started.server_id, "slow");
         assert_eq!(started.status, PreviewServerStatus::Starting);
         assert_eq!(started.session_id.as_deref(), Some("chat-a"));
         assert!(changes.load(Ordering::Acquire));
         assert_eq!(registry.servers_for_worktree(&worktree).len(), 1);
-        assert!(registry.get(&started.server_id).is_some());
+        assert!(registry.get(&started.handle).is_some());
 
-        assert!(registry.stop(&started.server_id));
+        assert!(registry.stop(&started.handle));
         assert!(registry.servers().is_empty());
-        assert!(registry.logs(&started.server_id).is_empty());
-        assert!(!registry.stop(&started.server_id));
+        assert!(registry.logs(&started.handle).is_empty());
+        assert!(!registry.stop(&started.handle));
         assert_eq!(
             *stopped_ids
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            vec![started.server_id.clone()]
+            vec![started.handle.clone()]
         );
     }
 }

@@ -10,7 +10,7 @@
 
 `level: "error"` 只保留含有 `error`、`exception`、`failed` 或 `fatal` 的 stderr 段，不区分大小写；stdout 里写着 "error" 的行不算。`search` 是区分大小写的子串过滤，在级别过滤之后施加。`all` 和 `error` 之外的任何 `level` 都会让调用失败。
 
-不给 `serverId` 时，调用回退到本对话在此可寻址的第一台启动中或运行中的服务器。没有可读的内容会以文字说明，而不是作为失败返回：`No logs yet.`、`No server errors found.` 或 `No logs matching "…"`。来自接管的 id，以及一台服务器都没有的调用，都会以一句话应答并指回 `preview_list`。
+`serverId` 与 `workspace` 的解析方式和 `preview_stop` 相同。不给 `serverId` 时，调用回退到本对话可寻址的第一台启动中或运行中的服务器——指定了工作区时，只在那个工作区里找。没有可读的内容会以文字说明，而不是作为失败返回：`No logs yet.`、`No server errors found.` 或 `No logs matching "…"`。来自接管的 id，以及一台服务器都没有的调用，都会以一句话应答并指回 `preview_list`。
 
 服务器的缓冲会在进程退出或被 `preview_stop` 杀掉的那一刻丢弃，所以必须在服务器还活着时读取输出。服务器以 `FORCE_COLOR=1` 运行，因此输出可能带有 ANSI 转义序列。
 

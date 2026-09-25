@@ -46,9 +46,9 @@ describe("preview commands", () => {
       // An unnamed start is the host's "whichever one this project configures", not a server
       // literally named "": the null has to survive the wire.
       ["preview_start_server", { target, name: null }],
-      ["preview_stop_server", { serverId: "srv-1" }],
-      ["preview_server_logs", { serverId: "srv-1", errorsOnly: true, search: "vite", lines: 200 }],
-      ["preview_server_logs", { serverId: "srv-1", errorsOnly: null, search: null, lines: null }]
+      ["preview_stop_server", { handle: "srv-1" }],
+      ["preview_server_logs", { handle: "srv-1", errorsOnly: true, search: "vite", lines: 200 }],
+      ["preview_server_logs", { handle: "srv-1", errorsOnly: null, search: null, lines: null }]
     ]);
   });
 

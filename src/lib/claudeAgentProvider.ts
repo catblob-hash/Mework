@@ -9,12 +9,13 @@ export const CLAUDE_AGENT_LOGIN_COMMAND = "claude auth login";
 export const CLAUDE_AGENT_LEGAL_URL = "https://code.claude.com/docs/en/legal-and-compliance";
 
 /**
- * Model catalog for this family, mirroring the host's built-in registry: there is
- * no `GET /models` behind a local CLI, so both sides carry the same rows.
+ * Starting models for this family, mirroring the host's seed table
+ * (`model_discovery.rs::CLAUDE_AGENT_SEED_MODELS`): what a fresh install ships
+ * with, and the browser preview's fetch fixture. The real model fetch asks the
+ * bundled CLI, so its list follows the user's login rather than these rows.
  *
- * `[1m]` is a Claude Code CLI concept (a per-session 1M context budget) that
- * never reaches the Messages API; it is passed through as the model id. Fable 5 /
- * 5.1 and Sonnet 5 are natively 1M and therefore have no twin.
+ * No id carries Claude Code's `[1m]` budget suffix: the sidecar derives it from
+ * the model's context window (above 200k asks the CLI for its 1M budget).
  */
 export const CLAUDE_AGENT_REGISTRY: ReadonlyArray<{
   id: string;
@@ -25,16 +26,11 @@ export const CLAUDE_AGENT_REGISTRY: ReadonlyArray<{
   { id: "claude-fable-5-1", name: "Claude Fable 5.1", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-fable-5", name: "Claude Fable 5", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-opus-5", name: "Claude Opus 5", contextWindow: 200000, maxOutputTokens: 128000 },
-  { id: "claude-opus-5[1m]", name: "Claude Opus 5 (1M context)", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-opus-4-8", name: "Claude Opus 4.8", contextWindow: 200000, maxOutputTokens: 128000 },
-  { id: "claude-opus-4-8[1m]", name: "Claude Opus 4.8 (1M context)", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-opus-4-7", name: "Claude Opus 4.7", contextWindow: 200000, maxOutputTokens: 128000 },
-  { id: "claude-opus-4-7[1m]", name: "Claude Opus 4.7 (1M context)", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-opus-4-6", name: "Claude Opus 4.6", contextWindow: 200000, maxOutputTokens: 128000 },
-  { id: "claude-opus-4-6[1m]", name: "Claude Opus 4.6 (1M context)", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", contextWindow: 200000, maxOutputTokens: 128000 },
-  { id: "claude-sonnet-4-6[1m]", name: "Claude Sonnet 4.6 (1M context)", contextWindow: 1000000, maxOutputTokens: 128000 },
   { id: "claude-opus-4-5", name: "Claude Opus 4.5", contextWindow: 200000, maxOutputTokens: 64000 },
   { id: "claude-opus-4-1", name: "Claude Opus 4.1", contextWindow: 200000, maxOutputTokens: 32000 },
   { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", contextWindow: 200000, maxOutputTokens: 64000 },

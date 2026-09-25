@@ -1059,7 +1059,7 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     false,
                     None,
                     Some("[\"a1\", \"shell:1\"]"),
-                    Some("任务地址数组：子代理与工作流直接写名称（工作流也可写 workflow:<runId>），后台命令写 shell:<id>，终端写 terminal:<id>，开发服务器写 preview:<serverId>；等待到点名的任务全部给出结果为止，省略时等待本对话全部子代理、工作流与后台命令（不含终端与开发服务器）"),
+                    Some("任务地址数组：子代理与工作流直接写名称（工作流也可写 workflow:<runId>），后台命令写 shell:<id>，终端写 terminal:<id>，开发服务器写 preview:<serverId>（对话有多个工作区时写 preview:<serverId>@<工作区编号>）；等待到点名的任务全部给出结果为止，省略时等待本对话全部子代理、工作流与后台命令（不含终端与开发服务器）"),
                 ),
                 parameter(
                     "timeout_seconds",
@@ -1892,7 +1892,7 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
             "Name returned by agent_spawn."
         }
         ("task_wait", "tasks") => {
-            "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a dev server as preview:<serverId>. The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and dev servers excluded)."
+            "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a dev server as preview:<serverId> (preview:<serverId>@<workspace> when the conversation has several workspaces). The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and dev servers excluded)."
         }
         ("task_wait", "timeout_seconds") => "5-600 seconds; default: 60.",
         ("read_global_memory", "name") | ("read_project_memory", "name") => {
@@ -2015,15 +2015,11 @@ fn builtin_codex_provider() -> ApiProvider {
     }
 }
 
-/// Ships its catalog already installed, because this family's "fetch models" is
-/// a built-in table rather than a request: `model_discovery::fetch_models`
-/// performs no I/O for it, so running the real fetch here is both possible and
-/// the only way to guarantee the seeded rows are identical to what the button
-/// would produce — group, capabilities and reasoning shape included.
-///
-/// The `[1m]` twins are dropped. They are the same model under a CLI-only 1M
-/// context budget, and listing both halves doubles the picker for a distinction
-/// most users never make.
+/// Ships a starting catalog already installed, so a fresh install can talk to
+/// Claude without first fetching. The fetch itself asks the CLI and cannot run
+/// while the default document is built, so the rows come from the seed table,
+/// projected the way a fetch projects rows — group, capabilities and reasoning
+/// shape included.
 fn builtin_claude_agent_provider() -> ApiProvider {
     let mut provider = ApiProvider {
         id: builtin_provider_id(),
@@ -2037,11 +2033,7 @@ fn builtin_claude_agent_provider() -> ApiProvider {
         models: Vec::new(),
         active_model_id: None,
     };
-    provider.models = crate::model_discovery::fetch_models(&provider)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|model| !model.id.contains("[1m]"))
-        .collect();
+    provider.models = crate::model_discovery::claude_agent_seed_models(&provider);
     provider.active_model_id = provider.models.first().map(|model| model.id.clone());
     provider
 }

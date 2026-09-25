@@ -512,9 +512,9 @@ fn run_tool(
         // Fifteen preview tools. Four run entirely host-side against the dev-server registry;
         // the rest resolve a target and act on the conversation's page.
         "preview_start" => run_preview_start(request, state, selected, workspace),
-        "preview_stop" => run_preview_stop(request, state),
-        "preview_list" => run_preview_list(request, state),
-        "preview_logs" => run_preview_logs(request, state),
+        "preview_stop" => run_preview_stop(request, state, workspaces),
+        "preview_list" => run_preview_list(request, state, workspaces),
+        "preview_logs" => run_preview_logs(request, state, workspaces),
         "preview_console_logs"
         | "preview_screenshot"
         | "preview_snapshot"
@@ -615,7 +615,8 @@ pub(crate) fn preview_servers_for_session(
     servers
 }
 
-/// One dev server that this conversation is allowed to address.
+/// One dev server that this conversation is allowed to address, in whichever workspace. The page
+/// tools ask this: a conversation has one page, so any server answering to the id will do.
 pub(crate) fn preview_server_for_session(
     state: &AppState,
     workspace: &Path,
@@ -624,7 +625,179 @@ pub(crate) fn preview_server_for_session(
 ) -> Option<crate::preview_servers::PreviewServerSnapshot> {
     preview_servers_for_session(state, workspace, conversation_id)
         .into_iter()
-        .find(|server| server.server_id == server_id)
+        .find(|server| crate::preview::server_ids_match(&server.server_id, server_id))
+}
+
+/// One dev server this conversation may address, with the number of the workspace it belongs to.
+///
+/// The number is there only when the conversation has several workspaces, because only then is
+/// it part of the address: `serverId` is a launch.json name, and two workspaces can both have a
+/// `dev`. It is also absent for a server the conversation started in a directory that is no longer
+/// one of its workspaces.
+pub(crate) struct AddressableServer {
+    pub workspace: Option<u32>,
+    pub server: crate::preview_servers::PreviewServerSnapshot,
+}
+
+/// Every dev server this conversation may address, workspace by workspace in the order the
+/// conversation numbers them, each workspace's in the order they were started: the ones this
+/// conversation started or nobody did, then the ones it started anywhere else.
+pub(crate) fn addressable_preview_servers(
+    state: &AppState,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    conversation_id: &str,
+) -> Vec<AddressableServer> {
+    let numbered = workspaces.len() > 1;
+    let mut listed: Vec<AddressableServer> = Vec::new();
+    for entry in workspaces.entries() {
+        let Some(key) = crate::preview::registry_key(entry) else {
+            continue;
+        };
+        for server in state.preview_servers.servers_for_worktree(&key) {
+            let mine = server
+                .session_id
+                .as_deref()
+                .is_none_or(|owner| owner == conversation_id);
+            if mine
+                && !listed
+                    .iter()
+                    .any(|listed| listed.server.handle == server.handle)
+            {
+                listed.push(AddressableServer {
+                    workspace: numbered.then_some(entry.index),
+                    server,
+                });
+            }
+        }
+    }
+    for server in state.preview_servers.servers_owned_by(conversation_id) {
+        if !listed
+            .iter()
+            .any(|listed| listed.server.handle == server.handle)
+        {
+            listed.push(AddressableServer {
+                workspace: None,
+                server,
+            });
+        }
+    }
+    listed
+}
+
+/// One dev server as the model reads it: its `serverId`, the workspace that completes the address
+/// when there are several, and what it is doing. The pane's handle and the owning conversation are
+/// left out — neither is anything the model can use.
+fn preview_server_view(addressable: &AddressableServer) -> Value {
+    let server = &addressable.server;
+    let mut view = serde_json::Map::new();
+    view.insert("serverId".to_owned(), json!(server.server_id));
+    if let Some(workspace) = addressable.workspace {
+        view.insert("workspace".to_owned(), json!(workspace));
+    }
+    view.insert("port".to_owned(), json!(server.port));
+    view.insert("status".to_owned(), json!(server.status));
+    if let Some(machine) = &server.machine {
+        view.insert("machine".to_owned(), json!(machine));
+    }
+    view.insert("startedAt".to_owned(), json!(server.started_at));
+    Value::Object(view)
+}
+
+/// What a `serverId`, and the `workspace` beside it, address among a conversation's servers.
+pub(crate) enum PreviewServerAddress<'a> {
+    Found(&'a AddressableServer),
+    /// Nothing answers to it in the workspace named; these other workspaces have one.
+    Elsewhere(Vec<u32>),
+    /// No workspace was named, and more than one has a server answering to it.
+    Ambiguous(Vec<u32>),
+    Missing,
+}
+
+/// Resolves a `serverId`. A `workspace` narrows it to that workspace; without one, the id has to
+/// be unambiguous, so a conversation whose workspaces each run a `dev` is asked which.
+pub(crate) fn address_preview_server<'a>(
+    servers: &'a [AddressableServer],
+    server_id: &str,
+    workspace: Option<u32>,
+) -> PreviewServerAddress<'a> {
+    let matching: Vec<&AddressableServer> = servers
+        .iter()
+        .filter(|candidate| {
+            crate::preview::server_ids_match(&candidate.server.server_id, server_id)
+        })
+        .collect();
+    let mut workspaces: Vec<u32> = matching
+        .iter()
+        .filter_map(|candidate| candidate.workspace)
+        .collect();
+    workspaces.sort_unstable();
+    workspaces.dedup();
+    match workspace {
+        Some(number) => match matching
+            .iter()
+            .find(|candidate| candidate.workspace == Some(number))
+        {
+            Some(found) => PreviewServerAddress::Found(found),
+            None if workspaces.is_empty() => PreviewServerAddress::Missing,
+            None => PreviewServerAddress::Elsewhere(workspaces),
+        },
+        None if workspaces.len() > 1 => PreviewServerAddress::Ambiguous(workspaces),
+        None => matching
+            .first()
+            .map_or(PreviewServerAddress::Missing, |found| {
+                PreviewServerAddress::Found(found)
+            }),
+    }
+}
+
+/// The refusal for an address that resolved to the wrong workspace or to several, or `None` for
+/// one that resolved to a single server or to nothing.
+fn preview_address_refusal(
+    address: &PreviewServerAddress<'_>,
+    server_id: &str,
+    workspace: Option<u32>,
+) -> Option<String> {
+    let list = |numbers: &[u32]| {
+        numbers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match address {
+        PreviewServerAddress::Elsewhere(numbers) => Some(match numbers.as_slice() {
+            [number] => format!(
+                "No server \"{server_id}\" in workspace {}. It runs in workspace {number}; pass that as workspace.",
+                workspace.unwrap_or(1)
+            ),
+            _ => format!(
+                "No server \"{server_id}\" in workspace {}. Servers with that id run in workspaces {}; pass one of those as workspace.",
+                workspace.unwrap_or(1),
+                list(numbers)
+            ),
+        }),
+        PreviewServerAddress::Ambiguous(numbers) => Some(format!(
+            "Servers with id \"{server_id}\" run in workspaces {}. Pass workspace to say which.",
+            list(numbers)
+        )),
+        PreviewServerAddress::Found(_) | PreviewServerAddress::Missing => None,
+    }
+}
+
+/// Whether `server_id` is an attach entry of a workspace the call could mean — the one it named,
+/// or any of them. Asked only once no process answered, so a remote read costs nothing on the
+/// usual path.
+fn preview_attach_entry(
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    workspace: Option<u32>,
+    server_id: &str,
+) -> bool {
+    workspaces
+        .entries()
+        .iter()
+        .filter(|entry| workspace.is_none_or(|number| entry.index == number))
+        .filter_map(crate::preview::workspace_configurations)
+        .any(|list| crate::preview::is_attach_entry(&list, server_id))
 }
 
 /// The server an absent `serverId` falls back to: the first one for this worktree that is running
@@ -811,9 +984,12 @@ fn run_preview_start(
         if let crate::preview::PreviewStartOutcome::Server { server, .. } = &started {
             let deadline = std::time::Instant::now() + REMOTE_READY_WAIT;
             while std::time::Instant::now() < deadline
-                && state.preview_servers.get(&server.server_id).is_some_and(|live| {
-                    live.status == crate::preview_servers::PreviewServerStatus::Starting
-                })
+                && state
+                    .preview_servers
+                    .get(&server.handle)
+                    .is_some_and(|live| {
+                        live.status == crate::preview_servers::PreviewServerStatus::Starting
+                    })
             {
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
@@ -846,6 +1022,10 @@ const REMOTE_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30
 /// What `preview_start` reports, and the page pointed at what it started. `workspace` is the
 /// directory whose configuration is re-read for the entry's url — a local one; a remote start
 /// passes `machine` instead, and its receipt says where the port is.
+///
+/// A few sentences and no snapshot: the model named the server, so its id is the name it passed
+/// and there is nothing to hand back but whether it worked. The one exception is a name the file
+/// repeats, whose entries are numbered — then the id is news, and the receipt leads with it.
 fn preview_start_receipt(
     state: &AppState,
     session_id: &str,
@@ -863,30 +1043,29 @@ fn preview_start_receipt(
     let configured = workspace.map(crate::preview::configurations);
     let entry = configured
         .as_ref()
-        .and_then(|configured| configured.servers.iter().find(|configured| configured.name == server.name));
-    let mut receipt = serde_json::to_value(&server)
-        .map_err(|error| format!("Failed to encode preview server: {error}"))?;
-    if let Value::Object(object) = &mut receipt {
-        object.insert("reused".to_owned(), Value::Bool(reused));
-    }
-    let mut text = serde_json::to_string_pretty(&receipt)
-        .map_err(|error| format!("Failed to encode preview server: {error}"))?;
+        .zip(workspace)
+        .and_then(|(configured, workspace)| {
+            crate::preview::configured_entry(&state.preview_servers, workspace, configured, &server)
+        });
+    let mut lines = Vec::new();
+    lines.extend(repeated_name_notice(&server.server_id, &server.name));
     let port = server.port;
     if reused {
-        text.push_str(
-            "\nServer was already running and has been reused. No new process was started.",
+        lines.push(
+            "Server was already running and has been reused. No new process was started."
+                .to_owned(),
         );
     } else if entry.is_some_and(|entry| entry.port != u32::from(port)) {
         let configured_port = entry.map_or(u32::from(port), |entry| entry.port);
-        text.push_str(&format!(
-            "\nServer started successfully. Configured port {configured_port} was in use, so port {port} was assigned instead (autoPort is enabled). The preview is available at http://localhost:{port}."
+        lines.push(format!(
+            "Server started successfully. Configured port {configured_port} was in use, so port {port} was assigned instead (autoPort is enabled). The preview is available at http://localhost:{port}."
         ));
     } else {
-        text.push_str(&format!("\nServer started successfully on port {port}."));
+        lines.push(format!("Server started successfully on port {port}."));
     }
     if let Some(machine) = machine {
-        text.push_str(&format!(
-            "\nThe server runs on {machine}. The preview page uses that machine's network, so http://localhost:{port} in the page is the server there."
+        lines.push(format!(
+            "The server runs on {machine}. The preview page uses that machine's network, so http://localhost:{port} in the page is the server there."
         ));
     }
 
@@ -899,22 +1078,29 @@ fn preview_start_receipt(
     match state.browser.open_preview_at(&session_id, &target) {
         Ok(()) => {
             if let Some(url) = &configured_url {
-                text.push_str(&format!(
-                    "\nThe preview opened at the configured url {url}."
-                ));
+                lines.push(format!("The preview opened at the configured url {url}."));
             }
         }
-        Err(error) => match &configured_url {
-            Some(url) => text.push_str(&format!("\nThe configured url {url} could not be opened.")),
-            None => text.push_str(&format!(
-                "\nThe preview pane could not be pointed at {target}: {error}"
-            )),
-        },
+        Err(error) => lines.push(match &configured_url {
+            Some(url) => format!("The configured url {url} could not be opened."),
+            None => format!("The preview pane could not be pointed at {target}: {error}"),
+        }),
     }
-    Ok(Outcome::success(text))
+    Ok(Outcome::success(lines.join("\n")))
 }
 
-/// The attach form's receipt: the entry, then the sentence saying no process is behind it.
+/// The sentence that hands the model a numbered id, for the entry of a name the file repeats;
+/// `None` for every other entry, whose id is simply the name the model passed.
+fn repeated_name_notice(server_id: &str, name: &str) -> Option<String> {
+    (server_id != name).then(|| {
+        format!(
+            "This server's serverId is \"{server_id}\": .mework/launch.json has more than one server named \"{name}\", so each is numbered in the order it was first started. Pass \"{server_id}\" to address this one."
+        )
+    })
+}
+
+/// The attach form's receipt: the sentence saying no process is behind it, and where the page
+/// went.
 ///
 /// The navigation leg is `preview_start`'s own, so the configured url passes exactly the gate every
 /// other preview url passes. A refusal is reported rather than raised, the way the source reports
@@ -924,86 +1110,114 @@ fn preview_attach_outcome(
     session_id: &str,
     attached: &crate::preview::PreviewAttachment,
 ) -> Result<Outcome, String> {
-    let mut receipt = serde_json::to_value(attached)
-        .map_err(|error| format!("Failed to encode preview attachment: {error}"))?;
-    if let Value::Object(object) = &mut receipt {
-        object.insert("reused".to_owned(), Value::Bool(false));
-    }
-    let mut text = serde_json::to_string_pretty(&receipt)
-        .map_err(|error| format!("Failed to encode preview attachment: {error}"))?;
-    text.push('\n');
-    text.push_str(crate::preview::ATTACHED_NOTICE);
+    let mut lines = Vec::new();
+    lines.extend(repeated_name_notice(&attached.server_id, &attached.name));
+    lines.push(crate::preview::ATTACHED_NOTICE.to_owned());
     let url = &attached.url;
-    match state.browser.open_preview_at(session_id, url) {
-        Ok(()) => text.push_str(&format!(
-            "\nThe preview opened at the configured url {url}."
-        )),
-        Err(_) => text.push_str(&format!("\nThe configured url {url} could not be opened.")),
-    }
-    Ok(Outcome::success(text))
+    lines.push(match state.browser.open_preview_at(session_id, url) {
+        Ok(()) => format!("The preview opened at the configured url {url}."),
+        Err(_) => format!("The configured url {url} could not be opened."),
+    });
+    Ok(Outcome::success(lines.join("\n")))
+}
+
+/// The `workspace` a server-addressing call named, when the conversation has several; with one,
+/// there is nothing it could narrow.
+fn preview_workspace_argument(
+    request: &ToolExecutionRequest,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+) -> Result<Option<u32>, String> {
+    Ok(workspace_argument(&request.input)?.filter(|_| workspaces.len() > 1))
 }
 
 /// `preview_stop`: kills one dev server and forgets it, buffered output included.
-fn run_preview_stop(request: &ToolExecutionRequest, state: &AppState) -> Result<Outcome, String> {
-    let workspace = Path::new(&request.workspace_path);
+fn run_preview_stop(
+    request: &ToolExecutionRequest,
+    state: &AppState,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+) -> Result<Outcome, String> {
     let server_id = required_string(&request.input, "serverId", 256, false)?;
-    // An attach receipt's id names the conversation's preview page, not a process. Reporting it as
-    // a missing server would send the model looking for one that never existed.
-    if crate::preview::is_attach_server_id(&server_id) {
-        return Err(crate::preview::NO_STOP_FOR_ATTACHMENT.to_owned());
+    let workspace = preview_workspace_argument(request, workspaces)?;
+    let servers = addressable_preview_servers(state, workspaces, &request.conversation_id);
+    let address = address_preview_server(&servers, &server_id, workspace);
+    if let Some(refusal) = preview_address_refusal(&address, &server_id, workspace) {
+        return Err(refusal);
     }
-    let stopped =
-        preview_server_for_session(state, workspace, &request.conversation_id, &server_id)
-            .is_some()
-            && state.preview_servers.stop(&server_id);
-    if stopped {
-        return Ok(Outcome::success(format!("Server {server_id} stopped")));
+    let PreviewServerAddress::Found(found) = address else {
+        // An attach entry's id names no process. Reporting it as a missing server would send the
+        // model looking for one that never existed.
+        if preview_attach_entry(workspaces, workspace, &server_id) {
+            return Err(crate::preview::no_stop_for_attachment(&server_id));
+        }
+        return Err(format!("Server {server_id} not found"));
+    };
+    if state.preview_servers.stop(&found.server.handle) {
+        return Ok(Outcome::success(format!(
+            "Server {} stopped",
+            found.server.server_id
+        )));
     }
     Err(format!("Server {server_id} not found"))
 }
 
-/// `preview_list`: every dev server of this workspace this conversation may address.
+/// `preview_list`: every dev server this conversation may address, each by the `serverId` — and,
+/// with several workspaces, the `workspace` — the other preview tools take.
 ///
 /// Processes only. An attach entry has none — nothing was started for it — so it is never listed
 /// here; `preview_start`'s own receipt is what reports one, and the pane lists it from the
 /// configuration file.
-fn run_preview_list(request: &ToolExecutionRequest, state: &AppState) -> Result<Outcome, String> {
-    let workspace = Path::new(&request.workspace_path);
-    let servers = preview_servers_for_session(state, workspace, &request.conversation_id);
-    encode_browser_tool_result(
-        &serde_json::to_value(&servers)
-            .map_err(|error| format!("Failed to encode preview server list: {error}"))?,
-    )
+fn run_preview_list(
+    request: &ToolExecutionRequest,
+    state: &AppState,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+) -> Result<Outcome, String> {
+    let servers = addressable_preview_servers(state, workspaces, &request.conversation_id);
+    encode_browser_tool_result(&Value::Array(
+        servers.iter().map(preview_server_view).collect(),
+    ))
 }
 
 /// `preview_logs`: one dev server's buffered output, filtered and tail-sliced.
 ///
 /// `serverId` is optional here for the same reason it is on the page tools: the source's own
-/// dispatcher falls back to the first running or starting server for the worktree.
-fn run_preview_logs(request: &ToolExecutionRequest, state: &AppState) -> Result<Outcome, String> {
-    let workspace = Path::new(&request.workspace_path);
+/// dispatcher falls back to the first running or starting server — here, of the workspace named,
+/// or of any when none is.
+fn run_preview_logs(
+    request: &ToolExecutionRequest,
+    state: &AppState,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+) -> Result<Outcome, String> {
     let requested = optional_owned_string(&request.input, "serverId", 256)?;
-    let resolved = match requested {
-        Some(server_id) => Some(server_id),
-        None => first_running_preview_server(state, workspace, &request.conversation_id)
-            .map(|server| server.server_id),
+    let workspace = preview_workspace_argument(request, workspaces)?;
+    let servers = addressable_preview_servers(state, workspaces, &request.conversation_id);
+    let resolved = match &requested {
+        None => servers.iter().find(|candidate| {
+            workspace.is_none_or(|number| candidate.workspace == Some(number))
+                && matches!(
+                    candidate.server.status,
+                    crate::preview_servers::PreviewServerStatus::Running
+                        | crate::preview_servers::PreviewServerStatus::Starting
+                )
+        }),
+        Some(server_id) => {
+            let address = address_preview_server(&servers, server_id, workspace);
+            if let Some(refusal) = preview_address_refusal(&address, server_id, workspace) {
+                return Err(refusal);
+            }
+            match address {
+                PreviewServerAddress::Found(found) => Some(found),
+                // An attach entry's id belongs to a page, and a page has no process output. The
+                // source answers it with the same sentence as an id that resolves to nothing.
+                _ if preview_attach_entry(workspaces, workspace, server_id) => None,
+                _ => return Ok(Outcome::success("No logs yet.".to_owned())),
+            }
+        }
     };
-    let Some(server_id) = resolved else {
+    let Some(server) = resolved else {
         return Ok(Outcome::success(
             crate::preview::NO_SERVER_FOR_LOGS.to_owned(),
         ));
     };
-    // An attach receipt's id belongs to a page, and a page has no process output. The source
-    // answers it with the same sentence as an id that resolves to nothing at all.
-    if crate::preview::is_attach_server_id(&server_id) {
-        return Ok(Outcome::success(
-            crate::preview::NO_SERVER_FOR_LOGS.to_owned(),
-        ));
-    }
-    if preview_server_for_session(state, workspace, &request.conversation_id, &server_id).is_none()
-    {
-        return Ok(Outcome::success("No logs yet.".to_owned()));
-    }
     let level = optional_owned_string(&request.input, "level", 32)?;
     if level
         .as_deref()
@@ -1014,7 +1228,7 @@ fn run_preview_logs(request: &ToolExecutionRequest, state: &AppState) -> Result<
     let lines = optional_u64(&request.input, "lines", 50)?;
     Ok(Outcome::success(crate::preview::logs(
         &state.preview_servers,
-        &server_id,
+        &server.server.handle,
         &crate::preview_servers::PreviewLogQuery {
             errors_only: level.as_deref() == Some("error"),
             search: optional_owned_string(&request.input, "search", 512)?,
@@ -6418,51 +6632,174 @@ mod tests {
         )
         .unwrap();
 
-        let receipt: Value = serde_json::from_str(
-            started
-                .output
-                .split_once("\nAttached")
-                .expect("the attach sentence follows the receipt")
-                .0,
-        )
-        .unwrap();
-        assert_eq!(receipt["name"], json!("docs"));
-        assert_eq!(receipt["url"], json!("https://example.com/docs"));
-        assert_eq!(receipt["port"], json!(0));
-        assert_eq!(receipt["reused"], json!(false));
-        let server_id = receipt["serverId"].as_str().unwrap().to_owned();
-        assert!(crate::preview::is_attach_server_id(&server_id));
-        assert!(started.output.contains(crate::preview::ATTACHED_NOTICE));
+        // Nothing but the attach sentence and where the page went: the id is the name the model
+        // passed, so it is not repeated back.
+        assert_eq!(
+            started.output,
+            format!(
+                "{}\nThe configured url https://example.com/docs could not be opened.",
+                crate::preview::ATTACHED_NOTICE
+            )
+        );
         assert!(!started.output.contains("has no command"));
         // Nothing was spawned, and the navigation leg is the same one every other
         // preview url goes through — which in a test has no window to open.
         assert!(state.preview_servers.servers().is_empty());
-        assert!(started
-            .output
-            .contains("The configured url https://example.com/docs could not be opened."));
 
-        // The id it handed back is a page, not a process, and both id-taking tools say so.
+        // The name is a page, not a process, and both id-taking tools say so.
         let stop_refusal = run_preview_stop(
             &request(
                 workspace.path(),
                 "preview_stop",
-                json!({ "serverId": server_id }),
+                json!({ "serverId": "docs" }),
             ),
             &state,
+            &local,
         )
         .err()
-        .expect("an attach id is not a process id");
-        assert_eq!(stop_refusal, crate::preview::NO_STOP_FOR_ATTACHMENT);
+        .expect("an attach entry is not a process");
+        assert_eq!(stop_refusal, crate::preview::no_stop_for_attachment("docs"));
         let logs = run_preview_logs(
             &request(
                 workspace.path(),
                 "preview_logs",
-                json!({ "serverId": server_id }),
+                json!({ "serverId": "docs" }),
             ),
             &state,
+            &local,
         )
         .unwrap();
         assert_eq!(logs.output, crate::preview::NO_SERVER_FOR_LOGS);
+    }
+
+    /// Two workspaces that each run a `dev`: the list says which workspace each is in, the bare
+    /// id is refused as ambiguous, and the workspace number settles it. A name only one entry has
+    /// comes back as a bare outcome; a name the file repeats comes back with its numbered id.
+    #[cfg(unix)]
+    #[test]
+    fn servers_are_addressed_by_their_name_and_the_workspace_they_run_in() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let dev = r#"{"name":"dev","runtimeExecutable":"/bin/sh","runtimeArgs":["-c","sleep 30"],"port":0,"autoPort":true}"#;
+        let docs = r#"{"name":"docs","url":"https://example.com/docs"}"#;
+        for (root, entries) in [
+            (first.path(), format!("{dev},{docs},{docs}")),
+            (second.path(), dev.to_owned()),
+        ] {
+            let directory = root.join(".mework");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("launch.json"),
+                format!(r#"{{"configurations":[{entries}]}}"#),
+            )
+            .unwrap();
+        }
+        let attached = |root: &Path| crate::model::AttachedWorkspace {
+            machine: None,
+            path: root.to_string_lossy().into_owned(),
+        };
+        let workspaces = crate::workspace_set::WorkspaceSet::resolve(
+            &crate::model::ExecutionEnvironmentAssets::default(),
+            &attached(first.path()),
+            &[attached(second.path())],
+        )
+        .unwrap();
+        let state = AppState::default();
+        let call = |tool: &str, input: Value| request(first.path(), tool, input);
+        let start = |name: &str, number: u32| {
+            let selected = workspaces.select(Some(number)).unwrap();
+            run_preview_start(
+                &call(
+                    "preview_start",
+                    json!({ "name": name, "workspace": number }),
+                ),
+                &state,
+                selected,
+                Path::new(&selected.root),
+            )
+            .unwrap()
+            .output
+        };
+
+        for number in [1, 2] {
+            let receipt = start("dev", number);
+            assert!(
+                receipt.starts_with("Server started successfully"),
+                "{receipt}"
+            );
+            assert!(!receipt.contains("serverId"), "{receipt}");
+        }
+        let numbered = start("docs", 1);
+        assert!(
+            numbered.starts_with("This server's serverId is \"docs-1\""),
+            "{numbered}"
+        );
+
+        let listed: Value = serde_json::from_str(
+            &run_preview_list(&call("preview_list", json!({})), &state, &workspaces)
+                .unwrap()
+                .output,
+        )
+        .unwrap();
+        let listed = listed.as_array().unwrap();
+        let addresses: Vec<(&Value, &Value)> = listed
+            .iter()
+            .map(|server| (&server["serverId"], &server["workspace"]))
+            .collect();
+        assert_eq!(
+            addresses,
+            [(&json!("dev"), &json!(1)), (&json!("dev"), &json!(2))]
+        );
+        for hidden in ["handle", "sessionId", "name", "cwd"] {
+            assert!(listed[0].get(hidden).is_none(), "{hidden}: {}", listed[0]);
+        }
+
+        let ambiguous = run_preview_stop(
+            &call("preview_stop", json!({ "serverId": "dev" })),
+            &state,
+            &workspaces,
+        )
+        .err()
+        .expect("the call is refused");
+        assert_eq!(
+            ambiguous,
+            "Servers with id \"dev\" run in workspaces 1, 2. Pass workspace to say which."
+        );
+        let stopped = run_preview_stop(
+            &call("preview_stop", json!({ "serverId": "dev", "workspace": 2 })),
+            &state,
+            &workspaces,
+        )
+        .unwrap();
+        assert_eq!(stopped.output, "Server dev stopped");
+        let elsewhere = run_preview_logs(
+            &call("preview_logs", json!({ "serverId": "dev", "workspace": 2 })),
+            &state,
+            &workspaces,
+        )
+        .err()
+        .expect("the call is refused");
+        assert_eq!(
+            elsewhere,
+            "No server \"dev\" in workspace 2. It runs in workspace 1; pass that as workspace."
+        );
+        // One is left, so the bare id is enough again.
+        let logs = run_preview_logs(
+            &call("preview_logs", json!({ "serverId": "dev" })),
+            &state,
+            &workspaces,
+        )
+        .unwrap();
+        assert_eq!(logs.output, "No logs yet.");
+        let attach = run_preview_stop(
+            &call("preview_stop", json!({ "serverId": "docs-1" })),
+            &state,
+            &workspaces,
+        )
+        .err()
+        .expect("the call is refused");
+        assert_eq!(attach, crate::preview::no_stop_for_attachment("docs-1"));
+        state.preview_servers.stop_all();
     }
 
     // ---- File write guards ---------------------------------------------------

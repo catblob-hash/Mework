@@ -410,7 +410,7 @@ function previewServerItem(
   const address = previewServerAddress(server);
   return {
     kind: "preview",
-    id: `preview-server:${server.serverId}`,
+    id: `preview-server:${server.handle}`,
     label: server.name,
     // A server on another machine says which: its address is that machine's `localhost`.
     detail: `${server.status === "starting" ? messages.previewStarting : messages.previewRunning} · ${address}${server.machine ? ` · ${server.machine}` : ""}`,
@@ -581,7 +581,7 @@ function taskItemSourceIdentity(item: TaskItem, modelRequestId: string | null = 
   // A dev server is identified by the id the host minted for it, which it never
   // reuses: a restarted `dev` is `dev-2`, so a record can never be read back
   // onto a different process.
-  if (item.kind === "preview") return `preview-server:${item.server.serverId}`;
+  if (item.kind === "preview") return `preview-server:${item.server.handle}`;
   if (item.kind === "browser") {
     return item.automationTool
       ? `browser-automation:${modelRequestId ?? "unknown"}:${item.sessionId}`

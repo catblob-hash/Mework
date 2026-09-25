@@ -12,7 +12,7 @@ use serde_json::Value;
 ///
 /// Increment this when a stale sidecar could silently suppress required behavior;
 /// the generation gate turns that condition into an explicit startup failure.
-pub(crate) const PROTOCOL_VERSION: u32 = 12;
+pub(crate) const PROTOCOL_VERSION: u32 = 13;
 
 /// Maximum line size (16 MiB). Both sides enforce it because neither side trusts
 /// the other.
@@ -160,6 +160,11 @@ pub(crate) struct StepRequest {
     pub(crate) max_steps: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u64>,
+    /// The model's context window, sent only to the `claude-agent` family, where it
+    /// picks the CLI's own context budget: the sidecar asks for the `[1m]` budget
+    /// when the window exceeds the CLI's standard 200k. No other family reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) context_window: Option<u64>,
     /// Reasoning effort using the AI SDK 7 vocabulary (`none`, `low`, `medium`,
     /// `high`, or `xhigh`), not a provider dialect.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -503,7 +508,7 @@ mod tests {
         assert_eq!(parsed.native_search_call_ids, vec!["a", "b"]);
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":-1}"#).is_err());
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":1.5}"#).is_err());
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     /// Provider-executed tool failures use cross-language field names, so pin each
@@ -559,6 +564,7 @@ mod tests {
             tools: vec![],
             max_steps: 1,
             max_output_tokens: None,
+            context_window: None,
             reasoning: None,
             reasoning_content: None,
             prompt_cache: None,
@@ -574,6 +580,7 @@ mod tests {
             "system",
             "systemDynamic",
             "maxOutputTokens",
+            "contextWindow",
             "reasoning",
             "reasoningContent",
             "promptCache",
@@ -608,6 +615,7 @@ mod tests {
             }],
             max_steps: 1,
             max_output_tokens: Some(8),
+            context_window: None,
             reasoning: Some("high"),
             reasoning_content: Some("plaintext"),
             prompt_cache: Some(false),

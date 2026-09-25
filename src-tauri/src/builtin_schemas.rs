@@ -67,6 +67,15 @@ fn server_id_prop() -> Value {
     string_prop("Server ID", 256)
 }
 
+/// The `serverId` of a tool that acts on one server. It says what the id is, because
+/// `preview_start` does not hand it back: it is the name the model started the server by.
+fn named_server_id_prop(description: &str) -> Value {
+    string_prop(
+        &format!("{description}: the server's name in .mework/launch.json, numbered (e.g. dev-2) when the file repeats that name"),
+        256,
+    )
+}
+
 /// One closed variant of a merged tool's `oneOf`.
 ///
 /// `action` is folded into each variant as a `const` and into its `required`, so the union stays
@@ -482,7 +491,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewStopDescription),
             "properties": {
-                "serverId": string_prop("Server ID to stop", 256)
+                "serverId": named_server_id_prop("Server ID to stop")
             },
             "required": ["serverId"],
             "additionalProperties": false
@@ -497,7 +506,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewLogsDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": named_server_id_prop("Server ID"),
                 "level": {
                     "type": "string",
                     "enum": ["all", "error"],
@@ -759,7 +768,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 320,
-                        "description": "A child agent name, a workflow run name (also accepted as workflow:<name>), shell:<id>, or terminal:<id>."
+                        "description": "A child agent name, a workflow run name (also accepted as workflow:<name>), shell:<id>, terminal:<id>, or preview:<serverId> for a dev server (preview:<serverId>@<workspace> when the conversation has several workspaces)."
                     },
                     "description": "Task addresses to wait on; omitted waits for every child agent, workflow run and background shell command in this conversation (terminals excluded)."
                 },
@@ -982,23 +991,27 @@ fn shell_command_schema(description: &str, command_description: &str) -> Value {
 /// Whether a tool's arguments name a place — a path to act on, or a command
 /// whose working directory and machine follow from where it runs.
 ///
-/// `preview_start` is the one preview tool that does: which workspace's
-/// `.mework/launch.json` it reads decides where the server runs — on that
-/// workspace's machine, an SSH machine included. The rest of the preview,
-/// browser and memory tools are absent on purpose: they act on a server by its
-/// id, on a page, or on a Markdown store the host owns, and a workspace number
-/// would advertise a choice that changes nothing.
+/// `preview_start` does: which workspace's `.mework/launch.json` it reads
+/// decides where the server runs — on that workspace's machine, an SSH machine
+/// included. So do the tools that address one server
+/// ([`addresses_a_preview_server`]). The page tools, the browser and memory
+/// tools are absent on purpose: a conversation has one page, and a Markdown
+/// store the host owns is nowhere in particular, so a workspace number would
+/// advertise a choice that changes nothing.
 pub(crate) fn takes_a_workspace(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "ls" | "grep"
-            | "find"
-            | "read"
-            | "write"
-            | "edit"
-            | "lsp"
-            | "preview_start"
-    ) || crate::shell_backend::ShellBackend::of_tool(tool_name).is_some()
+        "ls" | "grep" | "find" | "read" | "write" | "edit" | "lsp" | "preview_start"
+    ) || addresses_a_preview_server(tool_name)
+        || crate::shell_backend::ShellBackend::of_tool(tool_name).is_some()
+}
+
+/// The tools that act on one dev server by its `serverId`. The id is the
+/// server's launch.json name, which two workspaces can share, so the workspace
+/// completes the address — but only when the name alone does not, which is why
+/// their parameter has no default.
+pub(crate) fn addresses_a_preview_server(tool_name: &str) -> bool {
+    matches!(tool_name, "preview_stop" | "preview_logs")
 }
 
 /// Adds the `workspace` parameter naming which workspace a call acts in.
@@ -1033,9 +1046,14 @@ pub(crate) fn with_workspace_parameter(
     let Some(default) = addresses.first().copied() else {
         return schema;
     };
-    let mut description = format!(
-        "Which of this conversation's workspaces this call acts in, named by the number the Environment section gives it. Defaults to {default}."
-    );
+    let addresses_a_server = addresses_a_preview_server(tool_name);
+    let mut description = if addresses_a_server {
+        "Which workspace the server runs in, by the number preview_list gives it. Needed only when servers with this serverId run in more than one workspace.".to_owned()
+    } else {
+        format!(
+            "Which of this conversation's workspaces this call acts in, named by the number the Environment section gives it. Defaults to {default}."
+        )
+    };
     if let Some(backend) = backend.filter(|_| addresses.len() < workspaces.len()) {
         description.push_str(&format!(
             " Only workspaces whose machine has {} are listed; use another shell tool for the others.",
@@ -1048,15 +1066,19 @@ pub(crate) fn with_workspace_parameter(
     else {
         return schema;
     };
-    properties.insert(
-        "workspace".to_owned(),
-        json!({
-            "type": "integer",
-            "enum": addresses,
-            "default": default,
-            "description": description
-        }),
-    );
+    let mut parameter = json!({
+        "type": "integer",
+        "enum": addresses,
+        "default": default,
+        "description": description
+    });
+    if addresses_a_server {
+        // Absent means "whichever workspace runs it", not workspace 1.
+        if let Some(parameter) = parameter.as_object_mut() {
+            parameter.remove("default");
+        }
+    }
+    properties.insert("workspace".to_owned(), parameter);
     schema
 }
 
@@ -1580,7 +1602,7 @@ mod tests {
     #[test]
     fn tools_that_do_not_act_in_a_directory_are_left_alone() {
         let workspaces = mixed_workspaces();
-        for name in ["preview_stop", "preview_screenshot", "ask_user", "todo"] {
+        for name in ["preview_list", "preview_screenshot", "ask_user", "todo"] {
             let schema = schema_with_workspaces(name, &workspaces);
             // `todo` is a `oneOf` with no root properties at all, which is also
             // the shape the injector has to leave untouched rather than crash on.
@@ -1599,6 +1621,31 @@ mod tests {
         let schema = schema_with_workspaces("preview_start", &workspaces);
         assert_eq!(schema["properties"]["workspace"]["enum"], json!([1, 2]));
         assert_eq!(schema["required"], json!(["name"]));
+    }
+
+    /// A server id is a launch.json name, which two workspaces can share, so the
+    /// tools that address one server take the workspace too — with no default,
+    /// because the name alone is enough whenever only one workspace runs it.
+    #[test]
+    fn tools_that_address_a_server_take_its_workspace_without_a_default() {
+        let workspaces = mixed_workspaces();
+        for name in ["preview_stop", "preview_logs"] {
+            let schema = schema_with_workspaces(name, &workspaces);
+            let parameter = &schema["properties"]["workspace"];
+            assert_eq!(parameter["enum"], json!([1, 2]), "{name}");
+            assert!(parameter["default"].is_null(), "{name}: {parameter}");
+            assert!(
+                parameter["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("more than one workspace"),
+                "{name}: {parameter}"
+            );
+        }
+        let single = WorkspaceSet::local_root("C:/work/app");
+        assert!(
+            schema_with_workspaces("preview_stop", &single)["properties"]["workspace"].is_null()
+        );
     }
 
     /// A shell tool lists only the workspaces whose machine has its shell: the

@@ -6,7 +6,13 @@
 //!   `anthropic-version`, and `?limit=1000`.
 //! - The ChatGPT Codex backend uses `GET {base}/models?client_version=…` with
 //!   the OAuth session's Bearer token and `chatgpt-account-id`.
+//! - Claude Agent asks the bundled Claude Code for its own model picker
+//!   directly, over the CLI's control protocol; there is no HTTP catalog behind
+//!   a local CLI, and the sidecar is not involved.
 //! - Other providers use `GET {base}/models` and an OpenAI-compatible envelope.
+//!
+//! Every list is the upstream's current state and drifts with it: a new model
+//! appears the moment the backend, or the CLI under the user's login, offers it.
 //!
 //! [`crate::model_registry`] enriches returned IDs with capabilities and limits;
 //! unmatched entries fall back to response fields and ID-based inference.
@@ -31,8 +37,7 @@ enum Fetcher {
     /// The ChatGPT-subscription Codex backend: one fixed host with its own
     /// query parameter, ordering, and OAuth credential.
     Codex,
-    /// The Claude Agent family's built-in registry, answered without any
-    /// request: neither the host nor the CLI is asked what models exist.
+    /// The bundled Claude Code's own model picker, asked of the CLI directly.
     ClaudeAgent,
     /// Unconditional fallback.
     OpenAiCompatible,
@@ -271,8 +276,9 @@ fn open_ai_compatible(discovery: &Discovery) -> Result<Vec<Fetched>, String> {
 ///
 /// `client_version` is mandatory (the backend answers 400 without it) and gates
 /// the list: entries whose `minimal_client_version` is newer than the value sent
-/// are withheld, so the pinned constant decides which models a user can see.
-/// Entries carry `slug` + `display_name`, which the shared projection already
+/// are withheld. The gate describes the Codex CLI's capabilities, not Mework's,
+/// so the value sent is a ceiling no entry exceeds and the list is the backend's
+/// whole catalog. Entries carry `slug` + `display_name`, which the shared projection already
 /// reads, plus `visibility` (`list` for the picker, `hide` for models still
 /// served but not advertised — both are usable, so both are kept) and
 /// `priority`, the backend's own display order.
@@ -302,68 +308,33 @@ fn open_ai_compatible_as(
     openai_items(&value)
 }
 
-/// The Claude Agent family's built-in model registry: id, display name, context
-/// window, and maximum output tokens, in the order the picker shows them.
-///
-/// It is a fixed table rather than the CLI's own `supportedModels()` because
-/// that list is resolved against `~/.claude`'s account cache, which follows
-/// whichever login the user last switched the CLI to and would drift the model
-/// list with it. An `[1m]` id is a CLI concept — the same model run under a 1M
-/// context budget — and is passed through to the SDK verbatim.
-const CLAUDE_AGENT_MODELS: &[(&str, &str, u64, u64)] = &[
+/// The models a fresh install's Claude Agent row starts with: id, display name,
+/// context window, and maximum output tokens. Seed only — building the default
+/// document cannot start a CLI — and never consulted by the model fetch, which
+/// asks the CLI. Mirrored by `CLAUDE_AGENT_REGISTRY` in the renderer. No id
+/// carries Claude Code's `[1m]` suffix: the window picks the CLI's budget.
+const CLAUDE_AGENT_SEED_MODELS: &[(&str, &str, u64, u64)] = &[
     ("claude-fable-5-1", "Claude Fable 5.1", 1_000_000, 128_000),
     ("claude-fable-5", "Claude Fable 5", 1_000_000, 128_000),
     ("claude-opus-5", "Claude Opus 5", 200_000, 128_000),
-    (
-        "claude-opus-5[1m]",
-        "Claude Opus 5 (1M context)",
-        1_000_000,
-        128_000,
-    ),
     ("claude-sonnet-5", "Claude Sonnet 5", 1_000_000, 128_000),
     ("claude-opus-4-8", "Claude Opus 4.8", 200_000, 128_000),
-    (
-        "claude-opus-4-8[1m]",
-        "Claude Opus 4.8 (1M context)",
-        1_000_000,
-        128_000,
-    ),
     ("claude-opus-4-7", "Claude Opus 4.7", 200_000, 128_000),
-    (
-        "claude-opus-4-7[1m]",
-        "Claude Opus 4.7 (1M context)",
-        1_000_000,
-        128_000,
-    ),
     ("claude-opus-4-6", "Claude Opus 4.6", 200_000, 128_000),
-    (
-        "claude-opus-4-6[1m]",
-        "Claude Opus 4.6 (1M context)",
-        1_000_000,
-        128_000,
-    ),
     ("claude-sonnet-4-6", "Claude Sonnet 4.6", 200_000, 128_000),
-    (
-        "claude-sonnet-4-6[1m]",
-        "Claude Sonnet 4.6 (1M context)",
-        1_000_000,
-        128_000,
-    ),
     ("claude-opus-4-5", "Claude Opus 4.5", 200_000, 64_000),
     ("claude-opus-4-1", "Claude Opus 4.1", 200_000, 32_000),
     ("claude-sonnet-4-5", "Claude Sonnet 4.5", 200_000, 64_000),
     ("claude-haiku-4-5", "Claude Haiku 4.5", 200_000, 64_000),
 ];
 
-/// The Claude Agent family's models, from [`CLAUDE_AGENT_MODELS`].
+/// The seed rows in [`CLAUDE_AGENT_SEED_MODELS`], projected exactly as a fetch
+/// would project them — group, capabilities and reasoning shape included.
 ///
-/// Limits and the vision capability travel through `raw` in the field shapes the shared
-/// projection reads, so this table wins over [`crate::model_registry`] by the
-/// same "upstream declaration beats catalog" rule every other leg obeys: it
-/// pushes `claude-opus-5` back to 200k where the catalog says 1M, and it is the
-/// only source for an `[1m]` twin, which the catalog necessarily misses.
-fn claude_agent() -> Vec<Fetched> {
-    CLAUDE_AGENT_MODELS
+/// Limits travel through `raw`, so the table wins over [`crate::model_registry`]
+/// by the same "upstream declaration beats catalog" rule every leg obeys.
+pub fn claude_agent_seed_models(provider: &ApiProvider) -> Vec<ModelProfile> {
+    let fetched = CLAUDE_AGENT_SEED_MODELS
         .iter()
         .map(|(id, name, context_window, max_output_tokens)| {
             let raw = serde_json::json!({
@@ -373,7 +344,114 @@ fn claude_agent() -> Vec<Fetched> {
             });
             Fetched::new(*id).named(Some(name)).with_raw(&raw)
         })
+        .collect();
+    finish(provider, dedup(fetched))
+}
+
+/// The bundled Claude Code's model picker under the user's current login.
+///
+/// The CLI resolves the list against that login, so it changes when the user
+/// switches accounts or the bundled CLI learns a new model; that is the intended
+/// behaviour. The host asks the CLI itself ([`crate::aisdk::agent::list_models`]).
+fn claude_agent() -> Result<Vec<Fetched>, String> {
+    Ok(claude_agent_rows(crate::aisdk::agent::list_models()?))
+}
+
+/// Project the CLI's picker rows. The id is the model a row resolves to, not its
+/// alias: an installed model must keep meaning the same model after the CLI
+/// moves `opus` on. It never carries Claude Code's `[1m]` budget suffix either —
+/// that is not a different model, and the budget follows the model's context
+/// window instead (the sidecar asks for `[1m]` when the window exceeds 200k). So
+/// `default`, `opus[1m]`, `sonnet` and `sonnet[1m]` fold into their models, each
+/// keeping its first position and the largest window any of its rows offered:
+/// a row the CLI lists at 1M is a budget this login can have.
+///
+/// The name is derived from the id, because the CLI's own labels are
+/// unversioned ("Opus") or vary with the account type (prices for API-key
+/// users); a row whose id does not parse keeps the CLI's label. Every Claude
+/// model reads images.
+fn claude_agent_rows(rows: Vec<crate::aisdk::agent::AgentModel>) -> Vec<Fetched> {
+    let mut models: Vec<(String, String, Option<u64>)> = Vec::new();
+    for row in rows {
+        // The listing reads no window for a row named by an explicit id
+        // (switching to one costs a request); `[1m]` in its value or in the id
+        // it resolves to is the 1M budget by definition.
+        let resolved = row
+            .resolved_model
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| row.value.clone());
+        let one_million =
+            has_one_million_suffix(&row.value) || has_one_million_suffix(&resolved);
+        let window = row.context_window.or(one_million.then_some(1_000_000));
+        let id = without_one_million_suffix(&resolved).to_owned();
+        match models.iter_mut().find(|(known, ..)| *known == id) {
+            Some((_, _, known_window)) => *known_window = (*known_window).max(window),
+            None => {
+                let name = claude_model_name(&id).unwrap_or(row.display_name);
+                models.push((id, name, window));
+            }
+        }
+    }
+    models
+        .into_iter()
+        .map(|(id, name, window)| {
+            let mut raw = serde_json::json!({ "supports_vision": true });
+            if let Some(window) = window {
+                raw["context_window"] = window.into();
+            }
+            Fetched::new(id).named(Some(&name)).with_raw(&raw)
+        })
         .collect()
+}
+
+/// Claude Code's 1M-context budget, spelled inside a model id.
+const ONE_MILLION_SUFFIX: &str = "[1m]";
+
+fn has_one_million_suffix(id: &str) -> bool {
+    id.to_ascii_lowercase().ends_with(ONE_MILLION_SUFFIX)
+}
+
+fn without_one_million_suffix(id: &str) -> &str {
+    if has_one_million_suffix(id) {
+        &id[..id.len() - ONE_MILLION_SUFFIX.len()]
+    } else {
+        id
+    }
+}
+
+/// `claude-opus-5-5` → `Claude Opus 5.5`, `claude-haiku-4-5-20251001` →
+/// `Claude Haiku 4.5`. `None` for any other shape (older `claude-3-5-sonnet-…`
+/// ids, aliases, custom models).
+fn claude_model_name(id: &str) -> Option<String> {
+    let mut parts = id.strip_prefix("claude-")?.split('-');
+    let family = parts.next()?;
+    let mut letters = family.chars();
+    let first = letters.next()?;
+    if !family.chars().all(|character| character.is_ascii_lowercase()) {
+        return None;
+    }
+    let mut version: Vec<&str> = parts.collect();
+    // A dated snapshot names the same model.
+    if version
+        .last()
+        .is_some_and(|part| part.len() == 8 && part.chars().all(|c| c.is_ascii_digit()))
+    {
+        version.pop();
+    }
+    if version.is_empty()
+        || !version
+            .iter()
+            .all(|part| (1..=2).contains(&part.len()) && part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(format!(
+        "Claude {}{} {}",
+        first.to_ascii_uppercase(),
+        letters.as_str(),
+        version.join(".")
+    ))
 }
 
 // ───────────────────────────── Catalog-miss fallback ─────────────────────────────
@@ -551,7 +629,8 @@ fn finish(provider: &ApiProvider, fetched: Vec<Fetched>) -> Vec<ModelProfile> {
 
 /// Fetch models.
 ///
-/// Pressing the button always performs one GET after the Base URL validates.
+/// Pressing the button always performs one GET after the Base URL validates
+/// (for Claude Agent, one question to the CLI instead).
 /// Provider enablement and key presence do not preempt the upstream request;
 /// callers retain the existing model list when fetching fails.
 pub fn fetch_models(provider: &ApiProvider) -> Result<Vec<ModelProfile>, String> {
@@ -560,8 +639,7 @@ pub fn fetch_models(provider: &ApiProvider) -> Result<Vec<ModelProfile>, String>
         Fetcher::Anthropic => anthropic_with_relay_fallback(&discovery_for(provider)?),
         Fetcher::Codex => codex(&discovery_for(provider)?),
         Fetcher::OpenAiCompatible => open_ai_compatible(&discovery_for(provider)?),
-        // No request at all: the list is a built-in registry.
-        Fetcher::ClaudeAgent => Ok(claude_agent()),
+        Fetcher::ClaudeAgent => claude_agent(),
     }?;
     Ok(finish(provider, dedup(fetched)))
 }

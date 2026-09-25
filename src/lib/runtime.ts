@@ -3453,8 +3453,8 @@ export async function fetchModels(provider: ApiProvider): Promise<ModelProfile[]
     ];
   }
   if (provider.family === "claude_agent") {
-    // The Claude Agent family has no `GET /models`: the host serves a built-in
-    // registry, so the preview mirrors it row for row.
+    // The host asks the bundled CLI, which the preview does not have, so the
+    // preview serves the seed rows instead.
     return CLAUDE_AGENT_REGISTRY.map(({ id, name, contextWindow, maxOutputTokens }) => ({
       id,
       name,

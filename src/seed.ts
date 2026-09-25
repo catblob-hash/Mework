@@ -397,7 +397,7 @@ export const toolCatalog: ToolDescriptor[] = [
     category: "orchestration",
     dangerous: false,
     parameters: [
-      { name: "tasks", label: "任务列表", type: "json", required: false, placeholder: "[\"a1\", \"terminal:t1\"]", help: "任务地址数组：子代理与工作流直接写名称（工作流也可写 workflow:<runId>），后台命令写 shell:<id>，终端写 terminal:<id>，开发服务器写 preview:<serverId>；等待到点名的任务全部给出结果为止，省略时等待本对话全部子代理、工作流与后台命令（不含终端与开发服务器）" },
+      { name: "tasks", label: "任务列表", type: "json", required: false, placeholder: "[\"a1\", \"terminal:t1\"]", help: "任务地址数组：子代理与工作流直接写名称（工作流也可写 workflow:<runId>），后台命令写 shell:<id>，终端写 terminal:<id>，开发服务器写 preview:<serverId>（对话有多个工作区时写 preview:<serverId>@<工作区编号>）；等待到点名的任务全部给出结果为止，省略时等待本对话全部子代理、工作流与后台命令（不含终端与开发服务器）" },
       { name: "timeout_seconds", label: "超时秒数", type: "number", required: false, defaultValue: 60, help: "5–600 秒，默认 60" }
     ]
   },
@@ -640,12 +640,9 @@ export const CLAUDE_CODE_PRESET_ID = "preset_claude_code";
 export const CODEX_TEMPLATE_ID = "template_preset_codex";
 export const CLAUDE_CODE_TEMPLATE_ID = "template_preset_claude_code";
 
-/** Mirrors `catalog.rs::builtin_claude_agent_provider`: the whole registry minus
- * the `[1m]` twins, which are the same models under a CLI-only 1M context
- * budget and would double the picker for a distinction most users never make. */
+/** Mirrors `catalog.rs::builtin_claude_agent_provider`: the whole seed table. */
 function claudeAgentSeedModels(): ModelProfile[] {
   return CLAUDE_AGENT_REGISTRY
-    .filter((model) => !model.id.includes("[1m]"))
     .map(({ id, name, contextWindow, maxOutputTokens }) => ({
       id,
       name,

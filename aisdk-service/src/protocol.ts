@@ -11,7 +11,7 @@
  * failures rather than silent loss of reasoning and pause-turn data. Any
  * wire-shape change bumps this constant and the matching host-side literal.
  */
-export const PROTOCOL_VERSION = 12;
+export const PROTOCOL_VERSION = 13;
 
 /** Maximum line size (16 MiB); mirrors the host constant `MAX_SSE_LINE`. */
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
@@ -115,6 +115,11 @@ export interface StepRequest {
    */
   maxSteps: number;
   maxOutputTokens?: number;
+  /**
+   * The model's context window, sent only for the `claude-agent` family, where it
+   * picks the CLI's own context budget (`claude-agent.ts::cliModelId`).
+   */
+  contextWindow?: number;
   /**
    * Reasoning effort in the AI SDK 7 vocabulary, not a provider dialect. Each
    * provider maps it to its own controls, including unsupported-level fallback.

@@ -382,7 +382,7 @@ function BackendBrowserPanel({
     ?? preview.rows.find((row) => row.starting && row.server)
     ?? null
   ), [preview.rows]);
-  const logLines = usePreviewServerLogs(logServer?.server?.serverId ?? null, logsOpen);
+  const logLines = usePreviewServerLogs(logServer?.server?.handle ?? null, logsOpen);
 
   // The machine being away is said once, over whatever the pane is showing. A read that failed for
   // some other reason is only worth a strip when there is nothing else on screen to go by.

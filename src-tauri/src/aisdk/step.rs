@@ -680,6 +680,17 @@ fn clamp_output_budget(family: Family, budget: Option<u64>) -> Option<u64> {
     })
 }
 
+/// The model's window, for the one family that reads it: Claude Code enforces
+/// its own context budget before any request, and the sidecar derives that
+/// budget from this. Every other family's payload is left as it was.
+fn wire_context_window(family: Family, window: Option<u64>) -> Option<u64> {
+    if family == Family::ClaudeAgent {
+        window
+    } else {
+        None
+    }
+}
+
 /// Collect required provider-family settings and return a repairable error for
 /// each missing setting before the request reaches an ambiguous upstream 404.
 pub(crate) fn family_settings(
@@ -769,6 +780,7 @@ pub(crate) fn build_step_request_audited(
         tools: Vec::new(),
         max_steps,
         max_output_tokens: clamp_output_budget(family, request.model.max_output_tokens),
+        context_window: wire_context_window(family, request.model.context_window),
         reasoning: reasoning_level(request.reasoning_effort),
         reasoning_content: wire_reasoning_content(family, request.model.reasoning_content),
         prompt_cache: wire_prompt_cache(request.provider.family, request.model.prompt_cache),
@@ -844,6 +856,34 @@ fn wire_audit(
 /// [`build_step_request_audited`] without the ledger copy. Every path that
 /// actually sends takes the audited form; this exists for callers that only
 /// inspect the assembled request.
+#[cfg(test)]
+mod context_window_tests {
+    use super::*;
+
+    /// The window reaches the wire only where it picks a budget; every other
+    /// family's payload stays byte-for-byte what it was.
+    #[test]
+    fn only_the_claude_agent_family_carries_the_window() {
+        assert_eq!(
+            wire_context_window(Family::ClaudeAgent, Some(1_000_000)),
+            Some(1_000_000)
+        );
+        assert_eq!(wire_context_window(Family::ClaudeAgent, None), None);
+        for family in [
+            Family::Anthropic,
+            Family::OpenaiResponses,
+            Family::OpenaiCodex,
+            Family::OpenaiCompatible,
+        ] {
+            assert_eq!(
+                wire_context_window(family, Some(1_000_000)),
+                None,
+                "{family:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn build_step_request(
     request: &RunModelRequest,

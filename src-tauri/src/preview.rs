@@ -34,24 +34,116 @@ use crate::{
 pub const NO_SERVER_FOR_LOGS: &str =
     "No dev server is running. preview_logs takes a process serverId from preview_list.";
 
-/// Marks the id an attach receipt carries. Nothing was started, so the id names
-/// the conversation's preview page rather than a process, and the prefix is what
-/// lets `preview_stop` and `preview_logs` say so instead of reporting a server
-/// that went stale.
-pub const ATTACH_SERVER_ID_PREFIX: &str = "browser-preview-";
-
 /// What `preview_start` says once it has pointed the preview at an attach entry's
 /// url. The sentence, and the fact that it is the whole report, are the source's.
 pub const ATTACHED_NOTICE: &str =
     "Attached the preview to the configured url; no process was started.";
 
-/// What `preview_stop` answers when handed an attach receipt's id.
-pub const NO_STOP_FOR_ATTACHMENT: &str =
-    "preview_stop takes a process id from preview_list, not the session previewId.";
+/// What `preview_stop` answers when handed an attach entry's id.
+pub fn no_stop_for_attachment(server_id: &str) -> String {
+    format!(
+        "\"{}\" attaches the preview to a url; no process was started for it, so there is nothing to stop.",
+        preview_launch_config::sanitize_for_message(server_id)
+    )
+}
 
-/// Whether `server_id` came from an attach receipt rather than from a process.
-pub fn is_attach_server_id(server_id: &str) -> bool {
-    server_id.starts_with(ATTACH_SERVER_ID_PREFIX)
+/// A repeated name's entry as the model addresses it: the name as the file writes it, and the
+/// number its first start gave it.
+fn numbered_server_id(name: &str, number: u32) -> String {
+    format!("{name}-{number}")
+}
+
+/// Whether `server_id` is what `preview_start` answered for an entry of `list` that attaches
+/// rather than runs: the entry's name, or — for a name the file repeats — the name numbered.
+pub fn is_attach_entry(list: &PreviewConfigurationList, server_id: &str) -> bool {
+    let repeated = |name: &str| {
+        list.servers
+            .iter()
+            .filter(|server| preview_launch_config::names_match(&server.name, name))
+            .count()
+            > 1
+    };
+    list.servers
+        .iter()
+        .filter(|server| server.command.is_none() && server.url.is_some())
+        .any(|server| {
+            preview_launch_config::names_match(&server.name, server_id)
+                || server_id.rsplit_once('-').is_some_and(|(base, number)| {
+                    preview_launch_config::names_match(&server.name, base)
+                        && number.parse::<u32>().is_ok_and(|number| number >= 1)
+                        && repeated(&server.name)
+                })
+        })
+}
+
+/// Whether a `serverId` the model passed is `server_id`. Ids are names, and names are matched the
+/// way `preview_start` matches them.
+pub fn server_ids_match(server_id: &str, requested: &str) -> bool {
+    preview_launch_config::names_match(server_id, requested)
+}
+
+/// The entry of `list` a server was started from: the one with its name, or — for a name the
+/// file repeats — the one its number was given to in `worktree`.
+pub fn configured_entry<'a>(
+    registry: &PreviewServerRegistry,
+    worktree: &Path,
+    list: &'a PreviewConfigurationList,
+    server: &PreviewServerSnapshot,
+) -> Option<&'a PreviewConfiguredServer> {
+    let siblings: Vec<&PreviewConfiguredServer> = list
+        .servers
+        .iter()
+        .filter(|entry| preview_launch_config::names_match(&entry.name, &server.name))
+        .collect();
+    if siblings.len() < 2 {
+        return siblings.first().copied();
+    }
+    let number = server.server_id.rsplit_once('-')?.1.parse::<usize>().ok()?;
+    let occurrence = *registry
+        .repeated_name_order(worktree, &siblings[0].name)
+        .get(number.checked_sub(1)?)?;
+    siblings.get(occurrence).copied()
+}
+
+/// What one of a conversation's workspaces configures, wherever it is. `None` when that cannot be
+/// read right now: a workspace on WSL, or a machine that is away.
+pub fn workspace_configurations(
+    workspace: &crate::workspace_set::ResolvedWorkspace,
+) -> Option<PreviewConfigurationList> {
+    match &workspace.machine {
+        None => Some(configurations(Path::new(&workspace.root))),
+        Some(machine @ crate::model::RunTarget::Ssh { .. }) => remote_configurations(
+            &crate::preview_remote::RemoteMachine::new(
+                workspace.runner.clone(),
+                crate::run_environment::env_key(Some(machine)),
+                workspace.machine_label.clone(),
+            )
+            .with_patience(crate::preview_remote::POLL_PATIENCE),
+            &workspace.root,
+        )
+        .ok(),
+        Some(crate::model::RunTarget::Wsl { .. }) => None,
+    }
+}
+
+/// The registry key of one of a conversation's workspaces: its directory on this computer, or,
+/// for one on an SSH machine, the machine-qualified key its servers are filed under there. `None`
+/// for a workspace on WSL, which has no previews.
+pub fn registry_key(
+    workspace: &crate::workspace_set::ResolvedWorkspace,
+) -> Option<std::path::PathBuf> {
+    match &workspace.machine {
+        None => Some(std::path::PathBuf::from(&workspace.root)),
+        Some(machine @ crate::model::RunTarget::Ssh { .. }) => Some(
+            crate::preview_remote::RemoteMachine::new(
+                workspace.runner.clone(),
+                crate::run_environment::env_key(Some(machine)),
+                workspace.machine_label.clone(),
+            )
+            .worktree_key(&workspace.root),
+        ),
+        Some(crate::model::RunTarget::Wsl { .. }) => None,
+    }
 }
 
 /// One usable entry, as the pane lists it.
@@ -95,7 +187,8 @@ pub struct PreviewConfigurationList {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewAttachment {
-    /// Not a process id — see [`ATTACH_SERVER_ID_PREFIX`].
+    /// The entry's name, numbered when the file repeats it — the id a process of it would have.
+    /// Nothing answers to it but the page, so `preview_stop` and `preview_logs` refuse it.
     pub server_id: String,
     pub name: String,
     /// The parser's `u32`, unchecked, because nothing binds it: the url carries
@@ -139,6 +232,8 @@ impl TryFrom<&ServerConfig> for PreviewServerConfig {
         })?;
         Ok(Self {
             name: config.name.clone(),
+            // The name as the file writes it; a start that finds it repeated numbers it.
+            server_id: config.name.clone(),
             command: config.command.clone(),
             args: config.args.clone(),
             cwd: config.cwd.clone(),
@@ -300,8 +395,16 @@ pub fn start(
     // and every malformed one to explain a name it cannot find.
     let discovery = LaunchConfigDiscovery::new(workspace).discover(None);
     let configured_server_count = discovery.config().map_or(0, |config| config.servers.len());
-    let selected = preview_launch_config::select_server(&discovery, workspace, requested_name)
-        .map_err(|denial| denial.message)?;
+    let running =
+        preview_servers::running_for_session(&registry.servers_for_worktree(workspace), session_id);
+    let (selected, server_id) = address_entry(
+        registry,
+        workspace,
+        &discovery,
+        workspace,
+        requested_name,
+        &running,
+    )?;
 
     // Decided where the source decides it: before reuse, before capacity, and
     // before any port is reserved. An entry that names a url and no command
@@ -312,36 +415,21 @@ pub fn start(
     // keeps a command-less entry when it has a url. One with neither falls through
     // to the registry's own refusal, which is the right message for it.
     if let (None, Some(url)) = (selected.command.as_deref(), selected.url.as_deref()) {
-        return attachment(&selected.name, url, selected.port, session_id)
+        return attachment(server_id, &selected.name, url, selected.port)
             .map(|attached| PreviewStartOutcome::Attached { attached });
     }
 
     let mut config = PreviewServerConfig::try_from(&selected)?;
+    config.server_id = server_id;
 
-    let running =
-        preview_servers::running_for_session(&registry.servers_for_worktree(workspace), session_id);
-    if let PreviewStartAction::Reuse { server, .. } = preview_servers::decide_start_action(
+    if let Some(reused) = reuse(
+        registry,
         &running,
-        &config.name,
-        config.port,
+        &config,
         requested_name,
         configured_server_count,
-    ) {
-        // The decision was made from a snapshot. A server that died in between has
-        // to be reported as gone: respawning it silently would answer a "reuse" with
-        // a different process than the one the caller was told about.
-        return match registry.get(&server.server_id).filter(|live| {
-            matches!(
-                live.status,
-                PreviewServerStatus::Running | PreviewServerStatus::Starting
-            )
-        }) {
-            Some(server) => Ok(PreviewStartOutcome::Server {
-                server,
-                reused: true,
-            }),
-            None => Err(preview_servers::dead_reuse_refusal_message(&server.name)),
-        };
+    )? {
+        return Ok(reused);
     }
 
     registry
@@ -361,6 +449,136 @@ pub fn start(
             reused: false,
         })
         .map_err(|error| error.message)
+}
+
+/// The entry a start addresses, and the server id it answers to.
+///
+/// A name the file gives one entry is that entry, and its id is the name as the file writes it.
+/// A name the file repeats — nothing stops a launch.json from doing that — addresses the first of
+/// its entries that is not running yet, and once every one is, the one first started; each is
+/// numbered (`dev-1`, `dev-2`) in the order its entries were first started in this worktree, so
+/// another workspace's file never counts. A numbered id addresses the entry it was given to,
+/// which is how a particular one is started again.
+///
+/// `worktree` is the registry key, `working_directory` the directory the file's paths resolve
+/// against — the same directory for a workspace on this computer, not for one on another machine.
+/// `running` is the caller's own, narrowed by [`preview_servers::running_for_session`].
+fn address_entry(
+    registry: &PreviewServerRegistry,
+    worktree: &Path,
+    discovery: &preview_launch_config::LaunchDiscovery,
+    working_directory: &Path,
+    requested_name: Option<&str>,
+    running: &[PreviewServerSnapshot],
+) -> Result<(ServerConfig, String), String> {
+    let servers = discovery
+        .config()
+        .map(|config| config.servers.as_slice())
+        .unwrap_or_default();
+    let siblings_of = |name: &str| -> Vec<&ServerConfig> {
+        servers
+            .iter()
+            .filter(|server| preview_launch_config::names_match(&server.name, name))
+            .collect()
+    };
+
+    // A numbered id, unless an entry is literally called that.
+    if let Some(requested) = requested_name.filter(|requested| siblings_of(requested).is_empty()) {
+        if let Some((base, number)) = requested
+            .rsplit_once('-')
+            .and_then(|(base, number)| Some((base, number.parse::<u32>().ok()?)))
+            .filter(|(_, number)| *number >= 1)
+        {
+            let siblings = siblings_of(base);
+            if siblings.len() > 1 {
+                let order = registry.repeated_name_order(worktree, &siblings[0].name);
+                let Some(entry) = usize::try_from(number - 1)
+                    .ok()
+                    .and_then(|position| order.get(position))
+                    .and_then(|occurrence| siblings.get(*occurrence))
+                else {
+                    let name = preview_launch_config::sanitize_for_message(&siblings[0].name);
+                    return Err(format!(
+                        "\"{}\" has not been started. .mework/launch.json has {} servers named \"{name}\"; preview_start with name \"{name}\" starts the next one that is not running, and they are numbered in the order they are first started.",
+                        preview_launch_config::sanitize_for_message(requested),
+                        siblings.len()
+                    ));
+                };
+                return Ok(((*entry).clone(), numbered_server_id(&entry.name, number)));
+            }
+        }
+    }
+
+    let selected =
+        preview_launch_config::select_server(discovery, working_directory, requested_name)
+            .map_err(|denial| denial.message)?;
+    let siblings = siblings_of(&selected.name);
+    if siblings.len() < 2 {
+        let server_id = selected.name.clone();
+        return Ok((selected, server_id));
+    }
+    let key = &siblings[0].name;
+    let order = registry.repeated_name_order(worktree, key);
+    let taken = |occurrence: usize| {
+        let Some(position) = order.iter().position(|started| *started == occurrence) else {
+            return false;
+        };
+        let entry = siblings[occurrence];
+        // An attach entry has no process to be running; once attached, it has had its turn.
+        if entry.command.is_none() {
+            return true;
+        }
+        let server_id =
+            numbered_server_id(&entry.name, u32::try_from(position + 1).unwrap_or(u32::MAX));
+        running
+            .iter()
+            .any(|server| server.server_id.eq_ignore_ascii_case(&server_id))
+    };
+    let occurrence = (0..siblings.len())
+        .find(|occurrence| !taken(*occurrence))
+        .or_else(|| order.first().copied())
+        .unwrap_or(0);
+    let number = registry.number_repeated_name(worktree, key, occurrence);
+    let entry = siblings[occurrence].clone();
+    let server_id = numbered_server_id(&entry.name, number);
+    Ok((entry, server_id))
+}
+
+/// The running server a start hands back instead of spawning another, if there is one.
+///
+/// The decision is made from a snapshot. A server that died in between has to be
+/// reported as gone: respawning it silently would answer a "reuse" with a different
+/// process than the one the caller was told about.
+fn reuse(
+    registry: &PreviewServerRegistry,
+    running: &[PreviewServerSnapshot],
+    config: &PreviewServerConfig,
+    requested_name: Option<&str>,
+    configured_server_count: usize,
+) -> Result<Option<PreviewStartOutcome>, String> {
+    let PreviewStartAction::Reuse { server, .. } = preview_servers::decide_start_action(
+        running,
+        &config.server_id,
+        config.port,
+        requested_name,
+        configured_server_count,
+    ) else {
+        return Ok(None);
+    };
+    match registry.get(&server.handle).filter(|live| {
+        matches!(
+            live.status,
+            PreviewServerStatus::Running | PreviewServerStatus::Starting
+        )
+    }) {
+        Some(server) => Ok(Some(PreviewStartOutcome::Server {
+            server,
+            reused: true,
+        })),
+        None => Err(preview_servers::dead_reuse_refusal_message(
+            &server.server_id,
+        )),
+    }
 }
 
 /// [`start`] for a workspace on another machine, through its agent.
@@ -387,36 +605,32 @@ pub fn start_remote(
     let (discovery, found) = remote_discovery(machine, root)?;
     let resolved_root = discovery.working_directory().to_path_buf();
     let configured_server_count = found.config().map_or(0, |config| config.servers.len());
-    let selected = preview_launch_config::select_server(&found, &resolved_root, requested_name)
-        .map_err(|denial| denial.message)?;
+    let worktree = machine.worktree_key(root);
+    let running =
+        preview_servers::running_for_session(&registry.servers_for_worktree(&worktree), session_id);
+    let (selected, server_id) = address_entry(
+        registry,
+        &worktree,
+        &found,
+        &resolved_root,
+        requested_name,
+        &running,
+    )?;
     if let (None, Some(url)) = (selected.command.as_deref(), selected.url.as_deref()) {
-        return attachment(&selected.name, url, selected.port, session_id)
+        return attachment(server_id, &selected.name, url, selected.port)
             .map(|attached| PreviewStartOutcome::Attached { attached });
     }
 
     let mut config = PreviewServerConfig::try_from(&selected)?;
-    let worktree = machine.worktree_key(root);
-    let running =
-        preview_servers::running_for_session(&registry.servers_for_worktree(&worktree), session_id);
-    if let PreviewStartAction::Reuse { server, .. } = preview_servers::decide_start_action(
+    config.server_id = server_id;
+    if let Some(reused) = reuse(
+        registry,
         &running,
-        &config.name,
-        config.port,
+        &config,
         requested_name,
         configured_server_count,
-    ) {
-        return match registry.get(&server.server_id).filter(|live| {
-            matches!(
-                live.status,
-                PreviewServerStatus::Running | PreviewServerStatus::Starting
-            )
-        }) {
-            Some(server) => Ok(PreviewStartOutcome::Server {
-                server,
-                reused: true,
-            }),
-            None => Err(preview_servers::dead_reuse_refusal_message(&server.name)),
-        };
+    )? {
+        return Ok(reused);
     }
 
     registry
@@ -460,10 +674,10 @@ pub fn start_remote(
 /// boundary violation it would be, because a file that reaches here has already
 /// passed [`preview_launch_config::validate_url`].
 fn attachment(
+    server_id: String,
     name: &str,
     url: &str,
     port: u32,
-    session_id: Option<&str>,
 ) -> Result<PreviewAttachment, String> {
     if preview_launch_config::is_localhost_url(url)
         && !preview_launch_config::is_bare_localhost_origin(url)
@@ -474,30 +688,19 @@ fn attachment(
         ));
     }
     Ok(PreviewAttachment {
-        server_id: attach_server_id(session_id),
+        server_id,
         name: name.to_owned(),
         port,
         url: url.to_owned(),
     })
 }
 
-/// One id per session, because a conversation previews one page: attaching twice
-/// lands on the same surface, so it must answer to the same id.
-fn attach_server_id(session_id: Option<&str>) -> String {
-    match session_id {
-        Some(session_id) => format!("{ATTACH_SERVER_ID_PREFIX}{session_id}"),
-        // The pane's own start, which has no conversation behind it. Nothing looks
-        // the id up, so it only has to be recognisable as an attach.
-        None => format!("{ATTACH_SERVER_ID_PREFIX}pane"),
-    }
-}
-
-/// One server's buffered output, filtered and tail-sliced.
-pub fn logs(registry: &PreviewServerRegistry, server_id: &str, query: &PreviewLogQuery) -> String {
-    if registry.get(server_id).is_none() {
+/// One server's buffered output, filtered and tail-sliced. `handle` is the registry's.
+pub fn logs(registry: &PreviewServerRegistry, handle: &str, query: &PreviewLogQuery) -> String {
+    if registry.get(handle).is_none() {
         return NO_SERVER_FOR_LOGS.to_owned();
     }
-    preview_servers::render_preview_logs(&registry.logs(server_id), query)
+    preview_servers::render_preview_logs(&registry.logs(handle), query)
 }
 
 #[cfg(test)]
@@ -635,7 +838,7 @@ mod tests {
             outcome,
             PreviewStartOutcome::Attached {
                 attached: PreviewAttachment {
-                    server_id: "browser-preview-chat-1".to_owned(),
+                    server_id: "docs".to_owned(),
                     name: "docs".to_owned(),
                     // Non-localhost, so the entry states no port and none is invented.
                     port: 0,
@@ -648,10 +851,10 @@ mod tests {
         assert!(registry.servers().is_empty());
     }
 
-    /// The receipt's id is deliberately not a process id, and every id-taking
-    /// preview surface has to keep answering that way.
+    /// The receipt's id is the entry's name, like a process's, but no process answers to
+    /// it, and every id-taking preview surface has to keep answering that way.
     #[test]
-    fn an_attach_receipt_carries_a_page_id_rather_than_a_process_id() {
+    fn an_attach_receipt_answers_to_the_entry_name_and_no_process() {
         let workspace = tempfile::tempdir().unwrap();
         write_launch_json(
             workspace.path(),
@@ -667,8 +870,13 @@ mod tests {
 
         // A localhost url does supply the port, so the entry reports where it points.
         assert_eq!(attached.port, 8443);
-        assert!(is_attach_server_id(&attached.server_id));
-        assert!(!is_attach_server_id("f2b0c1e4-6f7a-4a1e-9d3c-0b5f2a7c8e11"));
+        assert_eq!(attached.server_id, "api");
+        let listed = configurations(workspace.path());
+        assert!(is_attach_entry(&listed, "api"));
+        assert!(is_attach_entry(&listed, "API"));
+        // Only a repeated name is ever numbered.
+        assert!(!is_attach_entry(&listed, "api-1"));
+        assert!(!is_attach_entry(&listed, "web"));
         assert_eq!(
             logs(&registry, &attached.server_id, &PreviewLogQuery::default()),
             NO_SERVER_FOR_LOGS
@@ -691,16 +899,116 @@ mod tests {
         assert!(listed.servers.is_empty());
 
         let refusal = attachment(
+            "admin".to_owned(),
             "admin",
             "http://localhost:9090/admin/wipe",
             9090,
-            Some("chat-3"),
         )
         .unwrap_err();
 
         assert!(refusal.starts_with("\"admin\" has a localhost \"url\" with a path or query,"));
         assert!(refusal.contains("should have rejected at config parsing"));
-        assert!(attachment("admin", "http://localhost:9090", 9090, None).is_ok());
+        assert!(attachment("admin".to_owned(), "admin", "http://localhost:9090", 9090).is_ok());
+    }
+
+    fn attached_id(outcome: PreviewStartOutcome) -> (String, String) {
+        let PreviewStartOutcome::Attached { attached } = outcome else {
+            panic!("a url with no command is an attach");
+        };
+        (attached.server_id, attached.url)
+    }
+
+    /// A launch.json may repeat a name. Each of its entries is numbered in the order it is first
+    /// started, the name alone reaches the next one not yet started, and a numbered id reaches
+    /// the entry it was given to — while another name keeps its bare id.
+    #[test]
+    fn a_repeated_name_numbers_its_entries_in_the_order_they_are_first_started() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_launch_json(
+            workspace.path(),
+            r#"{"configurations":[
+  {"name":"docs","url":"https://example.com/a"},
+  {"name":"guide","url":"https://example.com/guide"},
+  {"name":"Docs","url":"https://example.com/b"}
+]}"#,
+        );
+        let registry = PreviewServerRegistry::default();
+        let start_named =
+            |name: &str| start(&registry, workspace.path(), Some(name), Some("chat-1"));
+
+        assert_eq!(
+            attached_id(start_named("guide").unwrap()),
+            ("guide".to_owned(), "https://example.com/guide".to_owned())
+        );
+        // Not started yet, so there is nothing numbered 1 to address.
+        let early = start_named("docs-1").unwrap_err();
+        assert!(
+            early.starts_with("\"docs-1\" has not been started."),
+            "{early}"
+        );
+        assert!(early.contains("2 servers named \"docs\""), "{early}");
+
+        assert_eq!(
+            attached_id(start_named("docs").unwrap()),
+            ("docs-1".to_owned(), "https://example.com/a".to_owned())
+        );
+        assert_eq!(
+            attached_id(start_named("docs").unwrap()),
+            ("Docs-2".to_owned(), "https://example.com/b".to_owned())
+        );
+        // Every entry has had its turn: the first one started answers again.
+        assert_eq!(
+            attached_id(start_named("docs").unwrap()),
+            ("docs-1".to_owned(), "https://example.com/a".to_owned())
+        );
+        assert_eq!(
+            attached_id(start_named("docs-2").unwrap()),
+            ("Docs-2".to_owned(), "https://example.com/b".to_owned())
+        );
+        assert!(start_named("docs-3").is_err());
+        assert!(is_attach_entry(&configurations(workspace.path()), "docs-2"));
+        assert!(registry.servers().is_empty());
+    }
+
+    /// With processes behind them, the name starts whichever entry is not running, a running one
+    /// is handed back only for its own id, and a stopped entry comes back under the id it had.
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_name_starts_the_entry_that_is_not_running() {
+        let workspace = tempfile::tempdir().unwrap();
+        let entry = |label: &str| {
+            format!(
+                r#"{{"name":"dev","runtimeExecutable":"/bin/sh","runtimeArgs":["-c","sleep 30 # {label}"],"port":0,"autoPort":true}}"#
+            )
+        };
+        write_launch_json(
+            workspace.path(),
+            &format!(r#"{{"configurations":[{},{}]}}"#, entry("a"), entry("b")),
+        );
+        let registry = PreviewServerRegistry::default();
+        let start_named =
+            |name: &str| match start(&registry, workspace.path(), Some(name), Some("chat-1"))
+                .unwrap()
+            {
+                PreviewStartOutcome::Server { server, reused } => (server, reused),
+                PreviewStartOutcome::Attached { .. } => panic!("these entries run a command"),
+            };
+
+        let (first, reused) = start_named("dev");
+        assert_eq!((first.server_id.as_str(), reused), ("dev-1", false));
+        let (second, reused) = start_named("dev");
+        assert_eq!((second.server_id.as_str(), reused), ("dev-2", false));
+        let (again, reused) = start_named("dev-2");
+        assert_eq!(
+            (again.handle.as_str(), reused),
+            (second.handle.as_str(), true)
+        );
+
+        assert!(registry.stop(&first.handle));
+        let (restarted, reused) = start_named("dev");
+        assert_eq!((restarted.server_id.as_str(), reused), ("dev-1", false));
+        assert_ne!(restarted.handle, first.handle);
+        registry.stop_all();
     }
 
     fn write_launch_json(workspace: &Path, source: &str) {

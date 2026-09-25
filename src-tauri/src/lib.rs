@@ -4644,22 +4644,9 @@ async fn preview_list_servers(
         let spans = target.workspace.is_none();
         let mut servers = Vec::new();
         for entry in entries {
-            let listed = match &entry.machine {
-                None => state
-                    .preview_servers
-                    .servers_for_worktree(Path::new(&entry.root)),
-                Some(machine @ model::RunTarget::Ssh { .. }) => state
-                    .preview_servers
-                    .servers_for_worktree(
-                        &preview_remote::RemoteMachine::new(
-                            entry.runner.clone(),
-                            run_environment::env_key(Some(machine)),
-                            entry.machine_label.clone(),
-                        )
-                        .worktree_key(&entry.root),
-                    ),
-                Some(model::RunTarget::Wsl { .. }) => Vec::new(),
-            };
+            let listed = preview::registry_key(entry)
+                .map(|key| state.preview_servers.servers_for_worktree(&key))
+                .unwrap_or_default();
             servers.extend(listed.into_iter().map(|mut server| {
                 if spans {
                     server.workspace = Some(entry.index);
@@ -4751,18 +4738,19 @@ async fn browser_set_page_network(
 
 /// Stops one dev server and forgets it, buffered output included.
 ///
-/// Addressed by server id alone, like `stop_shell_task`. A stop must keep working
-/// after the workspace record it was started from has been deleted, and resolving
-/// a target first is exactly what would make an orphaned server unstoppable until
-/// the application exits.
+/// Addressed by the registry's handle alone, like `stop_shell_task` — not by the server id the
+/// model uses, which is a launch.json name and needs a workspace beside it. A stop must keep
+/// working after the workspace record it was started from has been deleted, and resolving a
+/// target first is exactly what would make an orphaned server unstoppable until the application
+/// exits.
 #[cfg(not(test))]
 #[tauri::command]
 async fn preview_stop_server(
     state: State<'_, AppState>,
-    server_id: String,
+    handle: String,
 ) -> Result<bool, String> {
     let registry = state.preview_servers.clone();
-    tauri::async_runtime::spawn_blocking(move || registry.stop(&server_id))
+    tauri::async_runtime::spawn_blocking(move || registry.stop(&handle))
         .await
         .map_err(|error| format!("停止预览服务器的后台任务失败: {error}"))
 }
@@ -4772,14 +4760,14 @@ async fn preview_stop_server(
 #[tauri::command]
 fn preview_server_logs(
     state: State<'_, AppState>,
-    server_id: String,
+    handle: String,
     errors_only: Option<bool>,
     search: Option<String>,
     lines: Option<u32>,
 ) -> String {
     preview::logs(
         &state.preview_servers,
-        &server_id,
+        &handle,
         &preview_servers::PreviewLogQuery {
             errors_only: errors_only.unwrap_or(false),
             search,

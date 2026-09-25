@@ -172,6 +172,7 @@ describe("TasksPane", () => {
     const user = userEvent.setup();
     const { pane, onStopItem, onOpenItem } = renderPane({
       previewServers: [{
+        handle: "7",
         serverId: "dev",
         name: "dev",
         port: 5173,
