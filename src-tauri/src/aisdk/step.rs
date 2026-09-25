@@ -857,6 +857,27 @@ fn wire_audit(
 /// actually sends takes the audited form; this exists for callers that only
 /// inspect the assembled request.
 #[cfg(test)]
+pub(crate) fn build_step_request(
+    request: &RunModelRequest,
+    exchanges: &[Exchange],
+    history: Vec<Value>,
+    base_url: &str,
+    api_key: Option<String>,
+    max_steps: u32,
+) -> Result<StepRequest, String> {
+    build_step_request_audited(
+        request,
+        exchanges,
+        history,
+        base_url,
+        api_key,
+        max_steps,
+        |_| {},
+    )
+    .map(|(step, _)| step)
+}
+
+#[cfg(test)]
 mod context_window_tests {
     use super::*;
 
@@ -882,27 +903,6 @@ mod context_window_tests {
             );
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn build_step_request(
-    request: &RunModelRequest,
-    exchanges: &[Exchange],
-    history: Vec<Value>,
-    base_url: &str,
-    api_key: Option<String>,
-    max_steps: u32,
-) -> Result<StepRequest, String> {
-    build_step_request_audited(
-        request,
-        exchanges,
-        history,
-        base_url,
-        api_key,
-        max_steps,
-        |_| {},
-    )
-    .map(|(step, _)| step)
 }
 
 /// Gate the native `web_search` server tool to the one-shot request constructed
