@@ -329,6 +329,14 @@ const READ_INPUT: &str = r#"function Read-Input {
 }
 "#;
 
+/// A script that runs the script it is given on standard input, for a script
+/// too long to travel on the command line itself (see
+/// `run_environment::run_remote_script`). The script is UTF-8 and runs in this
+/// process, so its `exit` is the process's exit status.
+pub(crate) fn run_script_from_input() -> String {
+    format!("{READ_INPUT}Invoke-Expression ([System.Text.Encoding]::UTF8.GetString((Read-Input)))\n")
+}
+
 /// The compare-and-swap write: refuses with 69 unless the file is still what
 /// the probe fingerprinted, then puts standard input in place through a
 /// temporary file beside it and prints the new modification time.

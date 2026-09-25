@@ -44,6 +44,8 @@ import { groupLabel, groupMeta } from "./ToolSelectionGroups";
 import type { ToolCategory } from "./ToolSelectionGroups";
 import { isPreviewToolName } from "../lib/taskTools";
 import { ImageStrip } from "./ImageStrip";
+import { summarizeSpanChanges, TurnChanges, turnChangeSpans } from "./TurnChanges";
+import type { ChangeSpan, TurnChangeSummary } from "./TurnChanges";
 
 // Wide enough to absorb fractional scroll metrics, narrow enough that the user
 // has to actually be at the bottom to re-attach to follow-output.
@@ -74,6 +76,12 @@ export interface ContextStreamProps {
   contexts: ContextItem[];
   /** Frontend-only presentation spans; never used to assemble model context. */
   turns?: ConversationTurn[];
+  /**
+   * Finished stretches of work whose changed files are listed at their end. The
+   * finished `turns` when absent; a transcript without turn records — a
+   * subagent's — derives its own.
+   */
+  changeSpans?: ChangeSpan[];
   tools: ToolDescriptor[];
   enabledTools: string[];
   /** Distinguishes wholesale timeline switches from appended output. */
@@ -794,7 +802,7 @@ function renderNodeContextIds(node: ContextRenderNode): string[] {
   return node.entries.map((entry) => entry.item.id);
 }
 
-export const ContextStream = memo(function ContextStream({ contexts, turns = [], tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, ariaLabel, pendingQuestionId, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
+export const ContextStream = memo(function ContextStream({ contexts, turns = [], changeSpans: changeSpansProp, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, ariaLabel, pendingQuestionId, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
   const { t } = useI18n();
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -850,10 +858,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     const withView = new Set(workflowViewKey ? workflowViewKey.split(" ") : []);
     return buildContextRenderNodes(contexts, turnAnchorIndexes, (callId) => withView.has(callId));
   }, [contexts, turnAnchorIndexes, workflowViewKey]);
-  const turnProjection = useMemo(() => {
-    const noticesAfterNode = new Map<string, ConversationTurn[]>();
-    const leadingTurns: ConversationTurn[] = [];
-    const visibleRunningTurnIds = new Set<string>();
+  const nodeLayout = useMemo(() => {
     const nodesWithIds = renderNodes.map((node) => ({
       node,
       ids: renderNodeContextIds(node),
@@ -863,6 +868,23 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     nodesWithIds.forEach(({ ids }, index) => {
       ids.forEach((id) => nodeIndexByContextId.set(id, index));
     });
+    return { nodesWithIds, nodeIndexByContextId };
+  }, [renderNodes]);
+  /** The drawn node holding the newest of `ids`, which is where a span ends on screen. */
+  const lastDrawnNodeOf = useCallback((ids: readonly string[]) => ids
+    .flatMap((id) => {
+      const index = nodeLayout.nodeIndexByContextId.get(id);
+      return index === undefined ? [] : [index];
+    })
+    .reduce<number | undefined>(
+      (last, index) => (last === undefined || index > last ? index : last),
+      undefined
+    ), [nodeLayout]);
+  const turnProjection = useMemo(() => {
+    const noticesAfterNode = new Map<string, ConversationTurn[]>();
+    const leadingTurns: ConversationTurn[] = [];
+    const visibleRunningTurnIds = new Set<string>();
+    const { nodesWithIds, nodeIndexByContextId } = nodeLayout;
     /**
      * Where a turn sits in the stream. Its anchor is the natural answer, but a
      * turn outlives the deletion of its own anchor: fall back to just before
@@ -910,15 +932,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       // indicator of a live run and the notice explaining why one stopped, and
       // both belong after the last message the round produced.
       if (turn.status !== "running" && !turn.error) continue;
-      const lastOwnedNode = turn.contextIds
-        .flatMap((id) => {
-          const index = nodeIndexByContextId.get(id);
-          return index === undefined ? [] : [index];
-        })
-        .reduce<number | undefined>(
-          (last, index) => (last === undefined || index > last ? index : last),
-          undefined
-        );
+      const lastOwnedNode = lastDrawnNodeOf(turn.contextIds);
       if (lastOwnedNode !== undefined) {
         noticeAfter(nodesWithIds[lastOwnedNode].key, turn);
       } else {
@@ -937,7 +951,31 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     }
 
     return { noticesAfterNode, leadingTurns, visibleRunningTurnIds };
-  }, [contextIndexes, contexts, renderNodes, turns]);
+  }, [contextIndexes, contexts, lastDrawnNodeOf, nodeLayout, turns]);
+  const changeSpans = useMemo(
+    () => changeSpansProp ?? turnChangeSpans(turns),
+    [changeSpansProp, turns]
+  );
+  /**
+   * Each finished span's changed files, after the last node it drew. A span whose
+   * work is no longer on screen — its calls deleted — has nothing to list.
+   */
+  const changesAfterNode = useMemo(() => {
+    const byNode = new Map<string, TurnChangeSummary[]>();
+    const contextFor = (id: string) => {
+      const index = contextIndexes.get(id);
+      return index === undefined ? undefined : contexts[index];
+    };
+    for (const span of changeSpans) {
+      const summary = summarizeSpanChanges(span, contextFor);
+      if (!summary) continue;
+      const lastNode = lastDrawnNodeOf(span.contextIds);
+      if (lastNode === undefined) continue;
+      const key = nodeLayout.nodesWithIds[lastNode].key;
+      byNode.set(key, [...(byNode.get(key) ?? []), summary]);
+    }
+    return byNode;
+  }, [changeSpans, contextIndexes, contexts, lastDrawnNodeOf, nodeLayout]);
   const renderedContextIndexes = useMemo(() => renderNodes.flatMap((node) => {
     if (node.kind === "context") return [node.index];
     if (node.kind === "question") {
@@ -1245,9 +1283,13 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
             {renderNodes.map((node) => {
               const key = renderNodeKey(node);
               const notices = turnProjection.noticesAfterNode.get(key) ?? [];
+              const changes = changesAfterNode.get(key) ?? [];
               return (
                 <Fragment key={`timeline:${key}`}>
                   {renderTimelineNode(node)}
+                  {changes.map((summary) => (
+                    <TurnChanges key={summary.key} summary={summary} pathBaseDir={pathBaseDir} />
+                  ))}
                   {notices.map(renderTurnNotices)}
                 </Fragment>
               );

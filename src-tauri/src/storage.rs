@@ -389,6 +389,7 @@ pub fn read_document(path: &Path) -> Result<AppDocument, String> {
     // rather than failed, and the run applies the clamped answer.
     canonicalize_agent_definition_shaping(&mut document);
     isolate_invalid_loaded_conversations(&mut document);
+    canonicalize_draft_conversation(&mut document);
     validate_shape(&document)?;
     prime_layout_write_cache(path);
     Ok(document)
@@ -545,6 +546,7 @@ pub(crate) fn prepare_save_transition(
     // Runs after `adopt_authoritative_conversations`, which is what decides
     // which conversation settings survive this transition at all.
     canonicalize_agent_definition_shaping(&mut canonical);
+    canonicalize_draft_conversation(&mut canonical);
     // Validate the renderer's proposed shapes before replacing every
     // renderer-owned revision/epoch field with host-derived authority.
     validate_agent_definitions(&canonical)?;
@@ -574,6 +576,32 @@ fn adopt_authoritative_conversations(previous: &AppDocument, canonical: &mut App
             .unwrap_or_default();
     }
     drop_retired_enabled_tools(canonical);
+}
+
+/// Keeps a stored new-task draft from failing the document it rides in.
+///
+/// A draft is disposable, unlike a conversation: retired tool names leave it the
+/// way they leave conversations, and a draft that still does not validate is
+/// discarded rather than making the whole document unloadable or unsaveable.
+fn canonicalize_draft_conversation(document: &mut AppDocument) {
+    let tool_names = document
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let Some(draft) = document.global_settings.draft_conversation.as_mut() else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    draft
+        .settings
+        .enabled_tools
+        .retain(|name| tool_names.contains(name.as_str()) && seen.insert(name.clone()));
+    let invalid = draft.preset_id.len() > 128
+        || validate_conversation_settings_shape("", &draft.settings, &tool_names).is_err();
+    if invalid {
+        document.global_settings.draft_conversation = None;
+    }
 }
 
 /// Drops enabled-tool names that no longer exist in the catalog so archived conversations remain writable.
@@ -1140,6 +1168,11 @@ fn validate_additional_directory_authorizations(
                 previous_by_id.get(conversation.id.as_str()).copied(),
                 state,
             )?;
+            validate_worktree_records(
+                conversation,
+                previous_by_id.get(conversation.id.as_str()).copied(),
+                state,
+            )?;
         }
     }
     Ok(())
@@ -1229,6 +1262,52 @@ pub(crate) fn validate_additional_directories(
                 &workspace.path,
             )
             .map_err(|error| format!("对话 {} 的工作区未获授权: {error}", conversation.id))?;
+    }
+    Ok(())
+}
+
+/// Refuses a worktree record the host did not make.
+///
+/// A record is where the conversation's tools run in place of the workspace it
+/// names, so writing one is as good as granting a directory: a record whose
+/// path is anything but a worktree `create_conversation_worktree` checked out
+/// in this process — which authorizes it, on its machine — is refused, unless
+/// the conversation already held that exact record.
+pub(crate) fn validate_worktree_records(
+    conversation: &Conversation,
+    previous: Option<&Conversation>,
+    state: &AppState,
+) -> Result<(), String> {
+    if conversation.worktrees.len() > MAX_PROJECT_WORKSPACES {
+        return Err(format!(
+            "对话 {} 的隔离工作树超过 {MAX_PROJECT_WORKSPACES} 个",
+            conversation.id
+        ));
+    }
+    let held = previous
+        .map(|previous| previous.worktrees.as_slice())
+        .unwrap_or_default();
+    for worktree in &conversation.worktrees {
+        if held.contains(worktree) {
+            continue;
+        }
+        let machine = worktree
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.machine.as_ref());
+        let authorized = match machine {
+            Some(machine) => state.require_remote_workspace_authorization(
+                &crate::run_environment::env_key(Some(machine)),
+                &worktree.path,
+            ),
+            None => state.require_workspace_authorization(Path::new(&worktree.path)),
+        };
+        authorized.map_err(|error| {
+            format!(
+                "对话 {} 的隔离工作树 {} 不是本应用建立的: {error}",
+                conversation.id, worktree.path
+            )
+        })?;
     }
     Ok(())
 }
@@ -1759,6 +1838,14 @@ pub fn validate_shape(document: &AppDocument) -> Result<(), String> {
             &preset.settings,
             &tool_names,
         )?;
+    }
+    // Checked like a workspace's remembered settings: a draft has not run, so
+    // its roles meet the full check when it becomes a conversation.
+    if let Some(draft) = &document.global_settings.draft_conversation {
+        validate_conversation_settings_shape("未发送的新任务的对话设置", &draft.settings, &tool_names)?;
+        if draft.preset_id.len() > 128 {
+            return Err("未发送的新任务的预设 ID 过长".into());
+        }
     }
 
     unique_nonempty(
@@ -3352,6 +3439,11 @@ pub(crate) fn validate_incoming_conversation(
         previous_entry.map(|(_, previous)| previous),
         state,
     )?;
+    validate_worktree_records(
+        conversation,
+        previous_entry.map(|(_, previous)| previous),
+        state,
+    )?;
     Ok(())
 }
 
@@ -3435,6 +3527,33 @@ fn validate_tool_results(
     Ok(ToolResultValidation { unattested })
 }
 
+/// Where a save looks up the receipts of a directory project's conversation,
+/// and so where they have to be recorded: workspace 1 as registered, and the
+/// conversation's worktree of it when that is on this machine. A forged
+/// worktree record does not widen this — the save refuses records the host did
+/// not make (`validate_worktree_records`).
+///
+/// A workspace 1 on another machine has only its registered root here, though
+/// its calls run from a host-side anchor directory: whoever records a receipt
+/// there has to record it under this root too (`execute_tool`).
+pub(crate) fn tool_receipt_roots<'a>(
+    workspace: &'a Workspace,
+    conversation: &'a Conversation,
+) -> Vec<&'a str> {
+    let primary = crate::model::AttachedWorkspace {
+        machine: workspace.machine.clone(),
+        path: workspace.path.clone(),
+    };
+    std::iter::once(workspace.path.as_str())
+        .chain(
+            conversation
+                .worktree_for(1, &primary)
+                .filter(|_| workspace.machine.is_none())
+                .map(|worktree| worktree.path.as_str()),
+        )
+        .collect()
+}
+
 /// Validates tool-card provenance within one conversation against its prior snapshot.
 fn validate_conversation_tool_cards(
     previous_entry: Option<(&str, &Conversation)>,
@@ -3452,6 +3571,8 @@ fn validate_conversation_tool_cards(
         result: &'a ToolResult,
         subagent: Option<&'a crate::model::SubagentRunRecord>,
     }
+
+    let execution_roots = tool_receipt_roots(workspace, conversation);
 
     let mut previous_tools = HashMap::<&str, PreviousTool<'_>>::new();
     if let Some((previous_workspace_id, previous_conversation)) = previous_entry {
@@ -3602,16 +3723,19 @@ fn validate_conversation_tool_cards(
                     }
                     let has_receipt = {
                         let exact = match (workspace.kind, subagent.as_ref()) {
-                            (WorkspaceKind::Directory, Some(subagent)) => state
-                                .has_context_subagent_receipt(
-                                    &workspace.path,
-                                    &conversation.id,
-                                    tool_name,
-                                    input,
-                                    requested_input.as_ref(),
-                                    result,
-                                    subagent,
-                                ),
+                            (WorkspaceKind::Directory, Some(subagent)) => {
+                                execution_roots.iter().any(|root| {
+                                    state.has_context_subagent_receipt(
+                                        root,
+                                        &conversation.id,
+                                        tool_name,
+                                        input,
+                                        requested_input.as_ref(),
+                                        result,
+                                        subagent,
+                                    )
+                                })
+                            }
                             (_, Some(subagent)) => state
                                 .has_context_subagent_receipt_in_any_workspace(
                                     &conversation.id,
@@ -3621,14 +3745,18 @@ fn validate_conversation_tool_cards(
                                     result,
                                     subagent,
                                 ),
-                            (WorkspaceKind::Directory, None) => state.has_context_receipt(
-                                &workspace.path,
-                                &conversation.id,
-                                tool_name,
-                                input,
-                                requested_input.as_ref(),
-                                result,
-                            ),
+                            (WorkspaceKind::Directory, None) => {
+                                execution_roots.iter().any(|root| {
+                                    state.has_context_receipt(
+                                        root,
+                                        &conversation.id,
+                                        tool_name,
+                                        input,
+                                        requested_input.as_ref(),
+                                        result,
+                                    )
+                                })
+                            }
                             (_, None) => state.has_context_receipt_in_any_workspace(
                                 &conversation.id,
                                 tool_name,
@@ -3638,16 +3766,29 @@ fn validate_conversation_tool_cards(
                             ),
                         };
                         exact
-                            || state.has_context_receipt_or_image_removal(
-                                (workspace.kind == WorkspaceKind::Directory)
-                                    .then_some(workspace.path.as_str()),
-                                &conversation.id,
-                                tool_name,
-                                input,
-                                requested_input.as_ref(),
-                                result,
-                                subagent.as_ref(),
-                            )
+                            || if workspace.kind == WorkspaceKind::Directory {
+                                execution_roots.iter().any(|root| {
+                                    state.has_context_receipt_or_image_removal(
+                                        Some(root),
+                                        &conversation.id,
+                                        tool_name,
+                                        input,
+                                        requested_input.as_ref(),
+                                        result,
+                                        subagent.as_ref(),
+                                    )
+                                })
+                            } else {
+                                state.has_context_receipt_or_image_removal(
+                                    None,
+                                    &conversation.id,
+                                    tool_name,
+                                    input,
+                                    requested_input.as_ref(),
+                                    result,
+                                    subagent.as_ref(),
+                                )
+                            }
                     };
                     if !has_receipt {
                         // Refusing the whole document here is what turned one
@@ -4046,6 +4187,46 @@ mod tests {
                 .all(|name| canonical.tools.iter().any(|tool| &tool.name == name)),
             "其余启用项必须原样保留"
         );
+    }
+
+    /// The unsent new task's settings round-trip through a save; a retired tool
+    /// leaves them, and a draft that still does not validate is dropped rather
+    /// than refusing the whole document.
+    #[test]
+    fn a_stored_draft_sheds_retired_tools_and_never_blocks_the_save() {
+        let state = AppState::default();
+        let retired = "goal";
+        let previous = default_document();
+        let mut settings = previous.workspaces[0].conversations[0].settings.clone();
+        let kept = settings.enabled_tools.clone();
+        settings.enabled_tools.push(retired.into());
+
+        let mut proposal = previous.clone();
+        proposal.global_settings.draft_conversation =
+            Some(crate::model::DraftConversationSnapshot {
+                settings: settings.clone(),
+                preset_id: "preset_codex".into(),
+            });
+        let canonical = prepare_save_transition(&previous, &proposal, &state)
+            .expect("带着已退役工具的草稿不能挡住保存")
+            .document;
+        let draft = canonical
+            .global_settings
+            .draft_conversation
+            .expect("草稿自己的设置必须保留");
+        assert_eq!(draft.settings.enabled_tools, kept, "只丢退役工具名");
+        assert_eq!(draft.preset_id, "preset_codex");
+
+        let mut unusable = proposal.clone();
+        unusable.global_settings.draft_conversation =
+            Some(crate::model::DraftConversationSnapshot {
+                settings,
+                preset_id: "p".repeat(129),
+            });
+        let canonical = prepare_save_transition(&previous, &unusable, &state)
+            .expect("校验不过的草稿直接丢掉，文档照常保存")
+            .document;
+        assert!(canonical.global_settings.draft_conversation.is_none());
     }
 
     /// Conversation writes accept a binding to a removed provider rather than refusing it.
@@ -7356,6 +7537,113 @@ b"
             .refused());
     }
 
+    /// A conversation in a worktree of its first workspace runs its tools there,
+    /// and the receipt of a card run by hand is recorded there too; the card
+    /// has to save.
+    #[test]
+    fn a_card_run_in_the_conversations_worktree_is_attested_by_its_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join(".mework/worktrees/conversations/a1");
+        fs::create_dir_all(&worktree).unwrap();
+        let mut previous = default_document();
+        previous.workspaces[0].kind = WorkspaceKind::Directory;
+        previous.workspaces[0].path = root.path().to_string_lossy().into_owned();
+        previous.workspaces[0].conversations[0].worktrees = vec![crate::model::ConversationWorktree {
+            path: worktree.to_string_lossy().into_owned(),
+            branch: "mework/conv/a1".into(),
+            base_oid: "abc1234".into(),
+            base_branch: None,
+            workspace: None,
+        }];
+        let mut changed = previous.clone();
+        let mut card = changed.workspaces[0].conversations[0].contexts[3].clone();
+        let ContextItem::Tool {
+            id,
+            tool_name,
+            input,
+            result,
+            ..
+        } = &mut card
+        else {
+            panic!("seed context must be a tool call");
+        };
+        *id = "fresh-card-in-worktree".into();
+        let request = ToolExecutionRequest {
+            conversation_id: changed.workspaces[0].conversations[0].id.clone(),
+            // `execute_tool` runs the call in the conversation's effective directory.
+            workspace_path: worktree.to_string_lossy().into_owned(),
+            tool_name: tool_name.clone(),
+            input: input.clone(),
+        };
+        let result = result.clone();
+        changed.workspaces[0].conversations[0].contexts.push(card);
+        let state = AppState::default();
+        assert!(validate_tool_results(&previous, &changed, &state)
+            .unwrap()
+            .refused());
+        state.record_receipt(&request, &result);
+        assert!(!validate_tool_results(&previous, &changed, &state)
+            .unwrap()
+            .refused());
+    }
+
+    /// A card run by hand in a conversation whose first workspace is on another
+    /// machine runs from a host-side anchor directory, while the save knows
+    /// only the registered remote root. A receipt under the anchor alone gets
+    /// the card quarantined on its first save; `execute_tool` records it under
+    /// `tool_receipt_roots` as well.
+    #[test]
+    fn a_card_run_by_hand_in_a_remote_workspace_is_attested_under_its_root() {
+        let anchor = tempfile::tempdir().unwrap();
+        let mut previous = default_document();
+        previous.workspaces[0].kind = WorkspaceKind::Directory;
+        previous.workspaces[0].path = "/srv/app".into();
+        previous.workspaces[0].machine = Some(crate::model::RunTarget::Ssh {
+            machine_id: "m1".into(),
+        });
+        let mut changed = previous.clone();
+        let mut card = changed.workspaces[0].conversations[0].contexts[3].clone();
+        let ContextItem::Tool {
+            id,
+            tool_name,
+            input,
+            result,
+            ..
+        } = &mut card
+        else {
+            panic!("seed context must be a tool call");
+        };
+        *id = "fresh-card-in-remote-workspace".into();
+        let ran = ToolExecutionRequest {
+            conversation_id: changed.workspaces[0].conversations[0].id.clone(),
+            workspace_path: anchor.path().to_string_lossy().into_owned(),
+            tool_name: tool_name.clone(),
+            input: input.clone(),
+        };
+        let result = result.clone();
+        changed.workspaces[0].conversations[0].contexts.push(card);
+
+        let state = AppState::default();
+        state.record_receipt(&ran, &result);
+        assert_eq!(
+            validate_tool_results(&previous, &changed, &state)
+                .unwrap()
+                .refused_context_ids(),
+            ["fresh-card-in-remote-workspace"]
+        );
+
+        let roots = tool_receipt_roots(&changed.workspaces[0], &changed.workspaces[0].conversations[0]);
+        assert_eq!(roots, ["/srv/app"]);
+        let recorded = ToolExecutionRequest {
+            workspace_path: roots[0].to_owned(),
+            ..ran
+        };
+        state.record_receipt(&recorded, &result);
+        assert!(!validate_tool_results(&previous, &changed, &state)
+            .unwrap()
+            .refused());
+    }
+
     #[test]
     fn model_requested_tool_input_requires_an_exact_context_receipt() {
         let previous = default_document();
@@ -8029,6 +8317,50 @@ b"
         sibling.id = "conv_sibling".into();
         borrowed.workspaces[0].conversations.push(sibling);
         assert!(validate_workspace_authorizations(&changed, &borrowed, &fresh).is_err());
+    }
+
+    /// A worktree record is where a conversation's tools run, so only one the
+    /// host made — local or on another machine — may be saved, besides one the
+    /// conversation already held.
+    #[test]
+    fn only_worktrees_the_host_made_may_be_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let made = directory.path().join("made");
+        fs::create_dir(&made).unwrap();
+        let forged = directory.path().join("forged");
+        fs::create_dir(&forged).unwrap();
+        let state = AppState::default();
+        state.authorize_workspace(&made).unwrap();
+        state.authorize_remote_workspace("ssh:m1", "C:/repo/.mework/worktrees/conversations/a1");
+        let record = |path: &str, machine: Option<crate::model::RunTarget>| {
+            crate::model::ConversationWorktree {
+                path: path.into(),
+                branch: "mework/conv/a1".into(),
+                base_oid: "abc1234".into(),
+                base_branch: Some("main".into()),
+                workspace: Some(crate::model::AttachedWorkspace {
+                    machine,
+                    path: "/repo".into(),
+                }),
+            }
+        };
+        let ssh = || Some(crate::model::RunTarget::Ssh { machine_id: "m1".into() });
+        let mut conversation = default_document().workspaces[0].conversations[0].clone();
+        conversation.worktrees = vec![
+            record(&made.to_string_lossy(), None),
+            record("C:/repo/.mework/worktrees/conversations/a1", ssh()),
+        ];
+        validate_worktree_records(&conversation, None, &state).unwrap();
+
+        let mut local_forgery = conversation.clone();
+        local_forgery.worktrees = vec![record(&forged.to_string_lossy(), None)];
+        assert!(validate_worktree_records(&local_forgery, None, &state).is_err());
+        let mut remote_forgery = conversation.clone();
+        remote_forgery.worktrees = vec![record("C:/Windows", ssh())];
+        assert!(validate_worktree_records(&remote_forgery, None, &state).is_err());
+        // A record the conversation already held survives a fresh process.
+        let fresh = AppState::default();
+        validate_worktree_records(&local_forgery, Some(&local_forgery), &fresh).unwrap();
     }
 
     #[test]

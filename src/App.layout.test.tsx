@@ -349,7 +349,7 @@ describe("App model run flow — layout", () => {
     );
     const tabNames = () => screen.queryAllByRole("tab").map((element) => element.textContent);
     const closeControl = (name: string) => within(
-      screen.getByRole("tab", { name }).closest(".terminal-tab") as HTMLElement
+      screen.getByRole("tab", { name }).closest(".page-tab") as HTMLElement
     ).getByRole("button", { name: "关闭终端" });
 
     // The pane opening with nothing in it starts the most preferred shell this machine has.

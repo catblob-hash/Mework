@@ -578,17 +578,17 @@ describe("App Git writes across checkouts", () => {
           content: "检查隔离检出",
           createdAt: "2026-07-20T00:00:00Z"
         }],
-        worktree: {
+        worktrees: [{
           path: "C:/workspace/.mework/worktrees/conversations/isolated",
           branch: "mework/isolated",
           baseOid: "head-oid"
-        }
+        }]
       },
       {
         ...template,
         id: ROOT_ID,
         title: "根检出任务",
-        worktree: null,
+        worktrees: [],
         contexts: [{
           id: "context-git-root",
           kind: "user",

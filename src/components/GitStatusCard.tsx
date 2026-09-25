@@ -23,19 +23,12 @@ export interface GitStatusCardProps {
   git: GitWorkspaceSnapshot;
   gitOpen?: boolean;
   onOpenGitReview?: () => void;
-  /**
-   * Why the review pane cannot open for this repository, when it cannot: a
-   * workspace on another machine reports its status here, but the pane acts on
-   * a checkout in this filesystem. The rows that open it are then disabled.
-   */
-  reviewUnavailableReason?: string;
 }
 
 export function GitStatusCard({
   git,
   gitOpen = false,
-  onOpenGitReview = () => undefined,
-  reviewUnavailableReason
+  onOpenGitReview = () => undefined
 }: GitStatusCardProps) {
   const { t } = useI18n();
   const cardBodyId = useId();
@@ -108,8 +101,6 @@ export function GitStatusCard({
           className={`git-status-card__row${gitOpen ? " git-status-card__row--open" : ""}`}
           aria-current={gitOpen ? "page" : undefined}
           aria-controls={reviewPageDomId}
-          disabled={Boolean(reviewUnavailableReason)}
-          title={reviewUnavailableReason}
           onClick={() => onOpenGitReview()}
         >
           <GitCompareArrows size={14} aria-hidden="true" />
@@ -144,8 +135,6 @@ export function GitStatusCard({
           className={`git-status-card__row${gitOpen ? " git-status-card__row--open" : ""}`}
           aria-current={gitOpen ? "page" : undefined}
           aria-controls={reviewPageDomId}
-          disabled={Boolean(reviewUnavailableReason)}
-          title={reviewUnavailableReason}
           onClick={() => onOpenGitReview()}
         >
           <GitCommitHorizontal size={14} aria-hidden="true" />

@@ -1,0 +1,181 @@
+/* A pane's pages as one row of tabs: the title bar of a pane that shows one page at a time. It
+   fills the pane's 32px title bar, so its metrics are the title bar's: 24px controls, 2px apart. */
+.page-tabs {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* The strip never scrolls: which tabs fit is worked out before they are drawn, and the rest are
+   rows of the overflow menu. `clip` rather than `hidden`, so focusing a tab cannot scroll it
+   either. */
+.page-tabs__strip {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow: clip;
+}
+
+/* A tab is as wide as its name up to the strip's maximum, and ellipsizes past that. It may still
+   shrink, so a measurement a fraction of a pixel off costs a letter rather than the row. */
+.page-tab {
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: var(--page-tab-max-width, 180px);
+  height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 6px;
+  color: var(--muted);
+  user-select: none;
+  transition: background .14s, color .14s;
+}
+.page-tab:hover { background: var(--hover); }
+.page-tab--active { background: var(--active); color: var(--text); }
+
+/* The tab button fills the tab, so the whole of it selects and drags, not just the name. */
+.page-tab__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 0 0 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.page-tab__label:last-child { padding-right: 8px; }
+.page-tab__label:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+.page-tab__icon { flex: 0 0 auto; display: flex; align-items: center; color: var(--faint); }
+/* The composer chip's workspace index, so a page reads as belonging to that chip. */
+.page-tab__badge {
+  flex: 0 0 auto;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: var(--hover);
+  color: var(--muted);
+  font: 600 9.5px/1 var(--mono);
+}
+.page-tab--active .page-tab__badge { background: var(--panel); }
+.page-tab__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Two classes to outrank `.icon-button`'s 32px in the barrel, which loads last. The same rules
+   size the measuring copy's placeholders, which carry these classes on plain spans. */
+.page-tab .page-tab__menu-trigger,
+.page-tab .page-tab__close {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  border-radius: 5px;
+}
+.page-tab__menu { flex: 0 0 auto; display: flex; align-items: center; }
+.page-tab > :last-child:not(.page-tab__label, .page-tab__editor) { margin-right: 3px; }
+/* Present but unlit until the tab is pointed at or in use, so a row of tabs reads as names
+   rather than as a row of controls. */
+.page-tab .page-tab__menu-trigger,
+.page-tab .page-tab__close { opacity: 0; }
+.page-tab:hover .page-tab__menu-trigger,
+.page-tab:focus-within .page-tab__menu-trigger,
+.page-tab .page-tab__menu-trigger.popover-menu__trigger--open,
+.page-tab:hover .page-tab__close,
+.page-tab:focus-within .page-tab__close,
+.page-tab--active .page-tab__close { opacity: 1; }
+.page-tab .page-tab__close:disabled { opacity: .35; }
+
+/* An in-place editor (a rename field) takes the tab's whole box. */
+.page-tab--editing { flex-shrink: 0; background: transparent; }
+.page-tab--editing:hover { background: transparent; }
+.page-tab__editor {
+  width: 128px;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.page-tabs .page-tabs__overflow-trigger { width: 24px; height: 24px; flex: 0 0 24px; }
+.page-tabs__trailing { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.page-tabs__trailing .icon-button { width: 24px; height: 24px; flex: 0 0 24px; }
+
+/* ---- dragging ---- */
+
+.page-tab--dragging,
+.page-tabs__menu-row--dragging { opacity: .45; }
+/* Where the tab will land: a bar at the near edge of the tab it lands beside. */
+.page-tab--drop-before::before,
+.page-tab--drop-after::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  width: 2px;
+  border-radius: 99px;
+  background: var(--accent);
+  pointer-events: none;
+}
+.page-tab--drop-before::before { left: 0; }
+.page-tab--drop-after::after { right: 0; }
+
+/* ---- overflow menu ---- */
+
+.page-tabs__menu { min-width: 160px; }
+.page-tabs__menu-row { position: relative; display: flex; align-items: center; gap: 2px; }
+.page-tabs__menu-item { flex: 1; min-width: 0; }
+.page-tabs__menu-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.page-tabs__menu-hint { max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.page-tabs__menu-row--drop-before::before,
+.page-tabs__menu-row--drop-after::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 2px;
+  border-radius: 99px;
+  background: var(--accent);
+  pointer-events: none;
+}
+.page-tabs__menu-row--drop-before::before { top: -1px; }
+.page-tabs__menu-row--drop-after::after { bottom: -1px; }
+
+/* ---- measuring copy ---- */
+
+/* Every tab at its natural width, laid out where it can neither be seen nor push anything. */
+.page-tabs__measure {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+.page-tabs__measure-row { display: flex; width: max-content; }
+.page-tabs__measure-row > * { flex: none; }
+.page-tabs__measure [data-measure-text]::before { content: attr(data-measure-text); }

@@ -83,6 +83,10 @@ async function fileMenuItemLabels(path: string): Promise<string[]> {
   const items = await screen.findAllByRole("menuitem");
   const labels = items.map((item) => item.textContent ?? "");
   await userEvent.keyboard("{Escape}");
+  // The menu hands focus back to its trigger on the next frame. Letting that frame pass keeps the
+  // refocus from landing after whatever the test clicks next, blurring it — and disarming a
+  // confirmation. The trigger may hold the focus already, so waiting for it proves nothing.
+  await act(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
   return labels;
 }
 
@@ -295,6 +299,90 @@ describe("GitReviewPanel", () => {
     await waitFor(() => expect(git.getGitDiff).toHaveBeenCalledWith(
       gitConversationTarget("conversation-1"),
       { type: "unstaged" }
+    ));
+  });
+
+  it("names a worktree by its real name and opens on everything its branch did since it forked", async () => {
+    const worktreeTarget = gitConversationTarget("conversation-1", 2);
+    const summarySnapshot = {
+      ...snapshot,
+      summaryRevision: "summary-worktree",
+      changedFiles: 1,
+      filesComplete: false,
+      files: []
+    };
+    const committed = {
+      path: "src/committed.ts",
+      status: "added" as const,
+      staged: false,
+      unstaged: false,
+      additions: 12,
+      deletions: 0
+    };
+    git.getGitChangePage.mockImplementation((_, request) => Promise.resolve({
+      kind: "page",
+      revision: request.expectedRevision,
+      files: request.base ? [committed, ...snapshot.files] : snapshot.files,
+      matchedCount: request.base ? 2 : 1,
+      nextCursor: null,
+      selection: null
+    }));
+    render(
+      <GitReviewPanel
+        paneId={"review" as SidePaneId}
+        paneExpanded={false}
+        onPaneToggleExpand={() => undefined}
+        onPaneFocus={() => undefined}
+        onPaneClose={() => undefined}
+        target={worktreeTarget}
+        snapshot={summarySnapshot}
+        checkout={{ worktreeName: "38b8d1d5", baseBranch: "main", baseOid: "abc1234" }}
+        active
+      />
+    );
+
+    // The refs name where the worktree came from and the worktree itself, no placeholder.
+    const scope = screen.getByRole("button", { name: "审阅范围" });
+    expect(scope).toHaveTextContent("main");
+    expect(scope).toHaveTextContent("38b8d1d5");
+    expect(scope).not.toHaveTextContent("工作树");
+    await waitFor(() => expect(git.getGitChangePage).toHaveBeenCalledWith(
+      worktreeTarget,
+      expect.objectContaining({ base: "abc1234" })
+    ));
+    await waitFor(() => expect(git.getGitDiff).toHaveBeenCalledWith(
+      worktreeTarget,
+      { type: "branch", base: "abc1234" }
+    ));
+    expect(await within(fileColumn()).findByText("committed.ts")).toBeInTheDocument();
+
+    // The uncommitted changes alone are still one choice away, and say so.
+    await selectDiffScope("未提交的变更");
+    await waitFor(() => expect(git.getGitDiff).toHaveBeenCalledWith(worktreeTarget, { type: "working" }));
+    expect(screen.getByRole("button", { name: "审阅范围" })).toHaveTextContent("未提交");
+  });
+
+  it("gives the title bar to the pages and moves the scope into the pane menu", async () => {
+    render(
+      <GitReviewPanel
+        paneId={"review" as SidePaneId}
+        paneExpanded={false}
+        onPaneToggleExpand={() => undefined}
+        onPaneFocus={() => undefined}
+        onPaneClose={() => undefined}
+        target={gitConversationTarget("conversation-1")}
+        snapshot={snapshot}
+        pageTabs={<div role="tablist" aria-label="审阅的工作区" />}
+        active
+      />
+    );
+    expect(screen.getByRole("tablist", { name: "审阅的工作区" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "审阅范围" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "审阅 设置" }));
+    await userEvent.click(await screen.findByRole("menuitemradio", { name: /^已暂存的变更/ }));
+    await waitFor(() => expect(git.getGitDiff).toHaveBeenCalledWith(
+      gitConversationTarget("conversation-1"),
+      { type: "staged" }
     ));
   });
 
@@ -527,6 +615,77 @@ describe("GitReviewPanel", () => {
     });
     expect(git.executeGitAction).not.toHaveBeenCalled();
   }, 10_000);
+
+  it("opens a file the timeline asked for on its diff, with the file column folded for that visit", async () => {
+    const paths = Array.from(
+      { length: 250 },
+      (_, index) => `src/bulk/file-${String(index).padStart(3, "0")}.ts`
+    );
+    const wanted = paths[240];
+    const { snapshot: largeSnapshot, files } = createPagedChangesSnapshot(paths);
+    git.getGitChangePage.mockImplementation((_, request) => Promise.resolve({
+      kind: "page",
+      revision: request.expectedRevision,
+      files: files.slice(0, 200),
+      matchedCount: 250,
+      nextCursor: "page-2",
+      selection: request.selectedPath
+        ? { state: "present", file: files.find((file) => file.path === request.selectedPath)! }
+        : null
+    }));
+    const handled = vi.fn();
+    render(
+      <GitReviewPanel
+        paneId={"review" as SidePaneId}
+        paneExpanded={false}
+        onPaneToggleExpand={() => undefined}
+        onPaneFocus={() => undefined}
+        onPaneClose={() => undefined}
+        target={gitConversationTarget("conversation-reveal")}
+        snapshot={largeSnapshot}
+        active
+        revealRequest={{ path: wanted, nonce: 7, collapseTree: true }}
+        onRevealRequestHandled={handled}
+      />
+    );
+
+    // Asked for by name with the first page, and listed although it sorts past it.
+    await waitFor(() => expect(fileCard(wanted)?.querySelector(".diff-viewer__file-toggle"))
+      .toHaveAttribute("aria-expanded", "true"));
+    expect(git.getGitChangePage).toHaveBeenCalledWith(gitConversationTarget("conversation-reveal"), {
+      expectedRevision: "summary-large",
+      limit: 200,
+      selectedPath: wanted
+    });
+    expect(fileCard(paths[0])?.querySelector(".diff-viewer__file-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(handled).toHaveBeenCalledWith(7);
+    expect(screen.getByRole("button", { name: "显示文件" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("navigation", { name: "变更文件" })).toBeNull();
+    // Folded for this visit only: the reader's own choice for the pane is untouched.
+    expect(window.localStorage.getItem("mework.review.showFiles")).toBeNull();
+  });
+
+  it("opens a file asked for while the pane is open and leaves its column as it was", async () => {
+    const props = {
+      paneId: "review" as SidePaneId,
+      paneExpanded: false,
+      onPaneToggleExpand: () => undefined,
+      onPaneFocus: () => undefined,
+      onPaneClose: () => undefined,
+      target: gitConversationTarget("conversation-open-reveal"),
+      snapshot,
+      active: true
+    };
+    const view = render(<GitReviewPanel {...props} />);
+    await waitFor(() => expect(queryFileRow("src/App.tsx")).toBeInTheDocument());
+    expect(fileCard("src/App.tsx")?.querySelector(".diff-viewer__file-toggle")).toHaveAttribute("aria-expanded", "false");
+
+    view.rerender(<GitReviewPanel {...props} revealRequest={{ path: "src/App.tsx", nonce: 1 }} />);
+
+    await waitFor(() => expect(fileCard("src/App.tsx")?.querySelector(".diff-viewer__file-toggle"))
+      .toHaveAttribute("aria-expanded", "true"));
+    expect(screen.getByRole("button", { name: "隐藏文件" })).toHaveAttribute("aria-pressed", "true");
+  });
 
   it("resets backend pagination when the path filter changes", async () => {
     const user = userEvent.setup();

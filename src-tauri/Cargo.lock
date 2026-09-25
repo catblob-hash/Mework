@@ -2446,6 +2446,7 @@ dependencies = [
  "keyring",
  "libc",
  "mework-agent-kernel",
+ "mework-git-core",
  "mework-remote-agent",
  "mework-workflow-core",
  "mework-workflow-script",
@@ -2487,11 +2488,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mework-git-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "wait-timeout",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "mework-remote-agent"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
+ "mework-git-core",
  "portable-pty",
  "serde",
  "serde_json",

@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { GitWorkspaceSnapshot } from "./lib/git";
+import type { GitTarget, GitWorkspaceSnapshot } from "./lib/git";
 import type { AppDocument, MachineShells, ShellBackend } from "./types";
 import { configureI18n } from "./i18n";
 import { documentWithModel, gitMocks, resetAppMocks, runtimeMocks, workspacePickerMocks } from "./test/appMocks";
@@ -188,7 +188,7 @@ describe("composer context chips", () => {
     document.workspaces[0].additionalWorkspaces = [{ path: "D:/shared/design-tokens" }];
     runtimeMocks.loadDocument.mockResolvedValue(document);
     gitMocks.getGitWorkspaceSummary.mockImplementation(async (target: { kind: string; member?: number }) => (
-      summaryResult(snapshot(target.kind === "workspace" && target.member === 2 ? "tokens-main" : "main"))
+      summaryResult(snapshot(target.member === 2 ? "tokens-main" : "main"))
     ));
     const user = userEvent.setup();
     render(<App />);
@@ -200,13 +200,18 @@ describe("composer context chips", () => {
     const menu = await screen.findByRole("menu", { name: "选择工作区" });
     await user.click(within(menu).getByRole("menuitemradio", { name: /^design-tokens/ }));
 
-    // The second workspace is addressed by its number within the project, never by its path.
+    // The second workspace is addressed by its number within the project, never by its path —
+    // as the conversation's own checkout of it, which is its worktree when it has one.
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target))
-      .toContainEqual({ kind: "workspace", workspaceId: document.workspaces[0].id, member: 2 }));
+      .toContainEqual({
+        kind: "conversation",
+        conversationId: document.workspaces[0].conversations[0].id,
+        member: 2
+      }));
     expect(await branchChip("tokens-main")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "工作区：design-tokens" })).toBeInTheDocument();
-    // Worktrees only ever stand in for the project's first workspace.
-    expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
+    // Every workspace of the project can run on a worktree of its own.
+    expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked();
   });
 
   it("reads the Git status of a workspace on an SSH machine the way it reads a local one", async () => {
@@ -219,19 +224,18 @@ describe("composer context chips", () => {
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
 
-    // The host reads the status on the machine; the renderer asks for it as for any checkout.
+    // The host runs Git on the machine; the renderer asks for it as for any checkout.
     const chip = await branchChip("main");
     expect(gitMocks.getGitWorkspaceSummary.mock.calls[0]?.[0]).toEqual({
       kind: "conversation",
       conversationId: document.workspaces[0].conversations[0].id
     });
-    // Everything else the Git surface does acts on a checkout in this filesystem.
-    expect(chip).toBeDisabled();
-    expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
+    // Everything the Git surface does works there too: branches, worktrees, the review pane.
+    expect(chip).toBeEnabled();
+    expect(screen.getByRole("checkbox", { name: /工作树/ })).toBeEnabled();
     const card = await screen.findByRole("complementary", { name: "Git 状态" });
     await user.click(within(card).getByRole("button", { name: "展开 Git 状态卡片" }));
-    expect(within(card).getByRole("button", { name: /^变更/ })).toBeDisabled();
-    expect(gitMocks.getGitBranches).not.toHaveBeenCalled();
+    expect(within(card).getByRole("button", { name: /^变更/ })).toBeEnabled();
   });
 
   it("reads the status of a project's further workspace on an SSH machine by its number", async () => {
@@ -242,7 +246,7 @@ describe("composer context chips", () => {
     ];
     runtimeMocks.loadDocument.mockResolvedValue(document);
     gitMocks.getGitWorkspaceSummary.mockImplementation(async (target: { kind: string; member?: number }) => (
-      summaryResult(snapshot(target.kind === "workspace" && target.member === 2 ? "api-main" : "main"))
+      summaryResult(snapshot(target.member === 2 ? "api-main" : "main"))
     ));
     const user = userEvent.setup();
     render(<App />);
@@ -254,8 +258,68 @@ describe("composer context chips", () => {
     await user.click(within(menu).getByRole("menuitemradio", { name: /^api/ }));
 
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target))
-      .toContainEqual({ kind: "workspace", workspaceId: document.workspaces[0].id, member: 2 }));
-    expect(await branchChip("api-main")).toBeDisabled();
+      .toContainEqual({
+        kind: "conversation",
+        conversationId: document.workspaces[0].conversations[0].id,
+        member: 2
+      }));
+    expect(await branchChip("api-main")).toBeEnabled();
+  });
+
+  it("reviews every workspace of a multi-machine project on a page of its own", async () => {
+    const document = documentWithModel();
+    document.globalSettings.executionEnvironments.sshMachines = [devbox()];
+    document.workspaces[0].additionalWorkspaces = [
+      { machine: { kind: "ssh", machineId: "machine-devbox" }, path: "C:/Users/dev/Project/Test" }
+    ];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const conversationId = document.workspaces[0].conversations[0].id;
+    // Each workspace is its own checkout, with its own identity and its own change.
+    gitMocks.getGitWorkspaceSummary.mockImplementation(async (target: { member?: number }) => {
+      const remote = target.member === 2;
+      const value = {
+        ...snapshot(remote ? "trunk" : "main"),
+        worktreeId: remote ? "worktree-id-remote" : "worktree-id-local",
+        additions: 1,
+        unstaged: 1,
+        isClean: false
+      };
+      const result = summaryResult(value);
+      return { ...result, summary: { ...result.summary, changedFiles: 1, stageable: 1 } };
+    });
+    gitMocks.getGitChangePage.mockImplementation(async (_target: unknown, request: { expectedRevision: string }) => ({
+      kind: "page",
+      revision: request.expectedRevision,
+      files: [{ path: "README.md", status: "modified", staged: false, unstaged: true, additions: 1, deletions: 0 }],
+      matchedCount: 1,
+      nextCursor: null,
+      selection: null
+    }));
+    gitMocks.getGitDiff.mockResolvedValue({
+      patch: "", path: null, additions: 0, deletions: 0, binary: false, truncated: false, files: []
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    // Both checkouts are kept fresh, the remote one on its machine, each addressed by its number.
+    await waitFor(() => expect(gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target))
+      .toContainEqual({ kind: "conversation", conversationId, member: 2 }));
+
+    await user.click(screen.getByRole("button", { name: /^审阅/ }));
+    const pages = await screen.findByRole("tablist", { name: "审阅的工作区" });
+    const tabs = within(pages).getAllByRole("tab");
+    expect(tabs).toHaveLength(2);
+    expect(tabs[1]).toHaveTextContent("Test");
+    expect(tabs[1]).toHaveTextContent("trunk");
+
+    await user.click(tabs[1]!);
+    await waitFor(() => expect(gitMocks.getGitChangePage).toHaveBeenCalledWith(
+      { kind: "conversation", conversationId, member: 2 },
+      expect.anything()
+    ));
+    // The page is its own panel: the strip drawn above it now marks the remote page as open.
+    const reopened = screen.getByRole("tablist", { name: "审阅的工作区" });
+    expect(within(reopened).getAllByRole("tab")[1]).toHaveAttribute("aria-selected", "true");
   });
 
   it("opens a terminal in the selected workspace with a shell its machine was probed to have", async () => {
@@ -682,12 +746,12 @@ describe("composer context chips", () => {
       expect(project?.machine).toEqual({ kind: "ssh", machineId: "machine-devbox" });
       expect(project?.name).toBe("services");
     });
-    // The draft asks for the new project's Git status, which the host reads on the machine; the
-    // branch can only be switched there.
+    // The draft asks for the new project's Git status, which the host reads on the machine, and
+    // switches its branch there too.
     const project = lastSaved()?.workspaces.find((entry) => entry.path === "/home/dev/services");
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary.mock.calls.map(([target]) => target))
       .toContainEqual({ kind: "workspace", workspaceId: project?.id }));
-    expect(await branchChip("main")).toBeDisabled();
+    expect(await branchChip("main")).toBeEnabled();
   });
 
   it("creates a project of several workspaces, each picked on its own machine", async () => {
@@ -717,6 +781,51 @@ describe("composer context chips", () => {
       expect(project?.path).toBe("D:/projects/app");
       expect(project?.additionalWorkspaces).toEqual([{ path: "D:/projects/tokens" }]);
     });
+  });
+
+  it("asks the host about a new project only once the host holds it", async () => {
+    runtimeMocks.loadDocument.mockResolvedValue(draftDocumentWithDevbox());
+    workspacePickerMocks.pickWorkspaceDirectory.mockResolvedValue("D:/projects/fresh");
+    // The host answers only for a project its document holds, and it learns of one only from a
+    // document save — which, left to its debounce, lands after the draft has already asked.
+    const hostProjects = new Set<string>();
+    runtimeMocks.saveDocument.mockImplementation(async (saved: AppDocument) => {
+      hostProjects.clear();
+      for (const workspace of saved.workspaces) hostProjects.add(workspace.id);
+    });
+    const refused: GitTarget[] = [];
+    gitMocks.getGitWorkspaceSummary.mockImplementation(async (target: GitTarget) => {
+      if (target.kind !== "workspace") return summaryResult(snapshot("main"));
+      if (!hostProjects.has(target.workspaceId)) {
+        refused.push(target);
+        throw new Error("Git 摘要请求的工作区不在后端已保存文档中");
+      }
+      return summaryResult(snapshot(target.workspaceId === "ws_mework" ? "main" : "fresh-start"));
+    });
+    const scans: string[][] = [];
+    runtimeMocks.refreshCapabilities.mockImplementation(async () => {
+      scans.push([...hostProjects]);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "新建项目" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "新建项目" });
+    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
+    await within(dialog).findByRole("button", { name: "工作区 1：D:/projects/fresh" });
+    await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
+
+    // The draft it opens on shows the project's Git status at once, rather than a refusal and a
+    // retry's backoff later.
+    await screen.findByRole("button", { name: "项目：fresh" });
+    expect(await branchChip("fresh-start")).toBeInTheDocument();
+    expect(refused).toEqual([]);
+    // The capability scan read a document holding the project, so its `.mework` was looked at.
+    const project = lastSaved()?.workspaces.find((entry) => entry.path === "D:/projects/fresh");
+    expect(project).toBeDefined();
+    expect(scans.at(-1)).toContain(project?.id);
   });
 
   it("reuses the project already registered with the same workspaces", async () => {

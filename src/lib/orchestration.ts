@@ -447,11 +447,17 @@ export function parseWaitOutput(output: string): WaitOutputView {
  * Keep `ctx_agent-result_` to exclude persisted legacy folds represented as
  * user contexts; current task-result folds are tool contexts.
  */
+const STRUCTURED_OUTPUT_NUDGE_PREFIX = "ctx_structured-output-nudge_";
 const HOST_AUTHORED_USER_CONTEXT_PREFIXES = [
   "ctx_agent-result_",
   "ctx_agent-message_",
-  "ctx_structured-output-nudge_"
+  STRUCTURED_OUTPUT_NUDGE_PREFIX
 ] as const;
+
+/** The reminder a schema-bound child gets mid-run when a round ends without its result. */
+export function isStructuredOutputNudge(context: ContextItem): boolean {
+  return context.kind === "user" && context.id.startsWith(STRUCTURED_OUTPUT_NUDGE_PREFIX);
+}
 
 export function isHostAuthoredUserContext(context: ContextItem): boolean {
   return (

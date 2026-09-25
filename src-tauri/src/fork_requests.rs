@@ -359,7 +359,7 @@ pub fn perform_fork(
         queued_messages: Vec::new(),
         branches: Vec::new(),
         user_aborted_tasks: Vec::new(),
-        worktree: source.worktree.clone(),
+        worktrees: source.worktrees.clone(),
         run_target: source.run_target.clone(),
         // The child holds exactly the parent's grants, extra directories included.
         attached_workspaces: source.attached_workspaces.clone(),

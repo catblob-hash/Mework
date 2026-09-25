@@ -8,12 +8,13 @@ import {
   CircleX,
   LoaderCircle,
 } from "lucide-react";
-import { useId } from "react";
+import { useId, useMemo } from "react";
 import { useI18n } from "../i18n";
 import type { ToolDescriptor } from "../types";
 import { subagentAvatarTone } from "../lib/subagents";
 import type { SubagentView, SubagentViewStatus } from "../lib/subagents";
 import { ConversationView } from "./ConversationView";
+import { subagentChangeSpans } from "./TurnChanges";
 import "./SubagentPanel.css";
 
 export interface SubagentPanelProps {
@@ -137,6 +138,11 @@ export function SubagentPanel({
 }: SubagentPanelProps) {
   const { t } = useI18n();
   const titleId = useId();
+  const running = agent.status === "running";
+  const changeSpans = useMemo(
+    () => subagentChangeSpans(agent.contexts, running),
+    [agent.contexts, running]
+  );
 
   return (
     <section
@@ -173,7 +179,8 @@ export function SubagentPanel({
           tools={tools}
           enabledTools={tools.map((tool) => tool.name)}
           editable={false}
-          streaming={agent.status === "running"}
+          streaming={running}
+          changeSpans={changeSpans}
           pathBaseDir={pathBaseDir}
           ariaLabel={t("{label}只读终端", "{label} read-only terminal", { label: agent.label })}
         />

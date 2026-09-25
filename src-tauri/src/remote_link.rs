@@ -372,6 +372,21 @@ pub fn link_for(runner: &ShellRunner, patience: Duration) -> Result<Option<Link>
     }
 }
 
+/// The agent that runs the host's helpers (`mework-remote git`) on the machine
+/// `runner` reaches: the SSH machine's daemon, or the agent Mework starts
+/// inside a WSL distribution. `Ok(None)` when there is none to ask — the
+/// machine is served per command, or this computer's own, which the host
+/// reaches directly — and the caller takes its per-command path.
+pub fn helper_link(runner: &ShellRunner, patience: Duration) -> Result<Option<Link>, String> {
+    match runner {
+        ShellRunner::Ssh { .. } => link_for(runner, patience),
+        // Not remembered as unavailable, as `local_link` explains; the
+        // per-command path serves this call.
+        ShellRunner::Wsl { .. } => Ok(local_link(runner, patience).ok().map(|(link, _)| link)),
+        ShellRunner::Local { .. } => Ok(None),
+    }
+}
+
 fn report_status(host: &str, status: &LinkStatus) {
     if let Some(observer) = HUB.get().and_then(|hub| hub.observer.as_ref()) {
         observer(host, status);

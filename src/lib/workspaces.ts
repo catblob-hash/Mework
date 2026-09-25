@@ -1,6 +1,7 @@
 import type {
   AttachedWorkspace,
   Conversation,
+  ConversationWorktree,
   RunTarget,
   SshMachineConfig,
   ToolDescriptor,
@@ -113,26 +114,76 @@ export function workspaceLocationTitle(
   return label ? `${path} (${label})` : path;
 }
 
+/** Whether two records name the same directory on the same machine. Mirrors the host's `same_location`. */
+export function sameWorkspaceLocation(left: AttachedWorkspace, right: AttachedWorkspace): boolean {
+  const trimmed = (path: string) => path.replace(/[\\/]+$/, "");
+  return sameMachine(left.machine, right.machine) && trimmed(left.path) === trimmed(right.path);
+}
+
+/**
+ * The project's workspaces as registered — never a worktree standing in for one — in order:
+ * its first directory, then the ones added after it.
+ */
+export function registeredProjectWorkspaces(workspace: Workspace | null | undefined): AttachedWorkspace[] {
+  if (!workspace || isTemporaryWorkspace(workspace)) return [];
+  return [
+    { machine: workspace.machine ?? null, path: workspace.path },
+    ...(workspace.additionalWorkspaces ?? [])
+  ];
+}
+
+/**
+ * The worktree standing in for the project workspace at 1-based `member`, registered at
+ * `registered`. Mirrors the host's `Conversation::worktree_for`: a record names its workspace by
+ * machine and path, never by position, and a record with no workspace is workspace 1's.
+ */
+export function worktreeFor(
+  conversation: Pick<Conversation, "worktrees"> | null | undefined,
+  member: number,
+  registered: AttachedWorkspace
+): ConversationWorktree | null {
+  return conversation?.worktrees.find((worktree) => (
+    worktree.workspace ? sameWorkspaceLocation(worktree.workspace, registered) : member === 1
+  )) ?? null;
+}
+
+/**
+ * `worktrees` with the record for the project workspace at `member` (registered at `registered`)
+ * replaced by `worktree`, or removed when it is null.
+ */
+export function withConversationWorktree(
+  worktrees: readonly ConversationWorktree[],
+  member: number,
+  registered: AttachedWorkspace,
+  worktree: ConversationWorktree | null
+): ConversationWorktree[] {
+  const others = worktrees.filter((candidate) => !(
+    candidate.workspace ? sameWorkspaceLocation(candidate.workspace, registered) : member === 1
+  ));
+  return worktree ? [...others, worktree] : others;
+}
+
+/** A worktree's short name: the last segment of its directory, which is what Git calls it. */
+export function worktreeName(worktree: Pick<ConversationWorktree, "path">): string {
+  return workspaceDirectoryLabel(worktree.path);
+}
+
 /**
  * A project's own workspaces in order: its first directory, then the ones added
  * after it. These are the directories every conversation of the project shares.
  *
- * With a conversation, the first entry is the directory that conversation's
- * tools actually use: its isolated worktree when it has one. A temporary
- * project has no shared directory and so no entries.
+ * With a conversation, each entry is the directory that conversation's tools
+ * actually use: its isolated worktree of that workspace when it has one. A
+ * temporary project has no shared directory and so no entries.
  */
 export function projectWorkspaces(
   workspace: Workspace | null | undefined,
-  conversation?: Pick<Conversation, "worktree"> | null
+  conversation?: Pick<Conversation, "worktrees"> | null
 ): AttachedWorkspace[] {
-  if (!workspace || isTemporaryWorkspace(workspace)) return [];
-  return [
-    {
-      machine: conversation?.worktree ? null : workspace.machine ?? null,
-      path: conversation?.worktree?.path ?? workspace.path
-    },
-    ...(workspace.additionalWorkspaces ?? [])
-  ];
+  return registeredProjectWorkspaces(workspace).map((registered, index) => {
+    const worktree = worktreeFor(conversation, index + 1, registered);
+    return worktree ? { machine: registered.machine ?? null, path: worktree.path } : registered;
+  });
 }
 
 /**
@@ -142,14 +193,14 @@ export function projectWorkspaces(
  *
  * This mirrors `workspace_set::WorkspaceSet::resolve` on the host, which is the
  * authority — the renderer reads this only to label chips and to decide what the
- * tool picker may offer. The primary entry uses the worktree when the
- * conversation has one, because that is the directory its tools resolve against.
+ * tool picker may offer. A project entry uses the worktree when the
+ * conversation has one of it, because that is the directory its tools resolve against.
  * A temporary project still counts as workspace 1: the host gives it a scratch
  * directory of its own.
  */
 export function conversationWorkspaces(
   workspace: Workspace | null | undefined,
-  conversation: Pick<Conversation, "worktree" | "attachedWorkspaces"> | null | undefined
+  conversation: Pick<Conversation, "worktrees" | "attachedWorkspaces"> | null | undefined
 ): AttachedWorkspace[] {
   const project: AttachedWorkspace[] = !workspace
     ? []

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createGitController,
+  gitReviewListsPath,
   gitSnapshotBroadcastIds,
   gitSnapshotForWorkspace,
   gitSnapshotRefreshResultFromSummary,
@@ -15,6 +16,7 @@ import {
 } from "./git";
 
 const gitMocks = vi.hoisted(() => ({
+  getGitChangePage: vi.fn(),
   getGitWorkspaceSummary: vi.fn()
 }));
 vi.mock("./git", async (importOriginal) => ({
@@ -32,7 +34,51 @@ function snapshot(overrides: Partial<GitWorkspaceSnapshot> = {}): GitWorkspaceSn
 }
 
 beforeEach(() => {
+  gitMocks.getGitChangePage.mockReset();
   gitMocks.getGitWorkspaceSummary.mockReset();
+});
+
+describe("gitReviewListsPath", () => {
+  it("reads a complete file list without asking the host", async () => {
+    const complete = snapshot({
+      summaryRevision: undefined,
+      files: [
+        { path: "src/a.ts", status: "modified" },
+        { path: "notes.md", status: "untracked", untracked: true }
+      ]
+    });
+    await expect(gitReviewListsPath(conversationTarget, complete, "src/a.ts")).resolves.toBe(true);
+    await expect(gitReviewListsPath(conversationTarget, complete, "notes.md")).resolves.toBe(false);
+    expect(gitMocks.getGitChangePage).not.toHaveBeenCalled();
+  });
+
+  it("asks the host for the one path, once more against a summary that moved on", async () => {
+    gitMocks.getGitChangePage
+      .mockResolvedValueOnce({ kind: "stale", summary: { summaryRevision: "revision-2" } })
+      .mockResolvedValueOnce({
+        kind: "page",
+        revision: "revision-2",
+        files: [],
+        matchedCount: 1,
+        nextCursor: null,
+        selection: { state: "present", file: { path: "src/a.ts", status: "modified" } }
+      });
+    await expect(gitReviewListsPath(conversationTarget, snapshot({ files: [] }), "src/a.ts")).resolves.toBe(true);
+    expect(gitMocks.getGitChangePage.mock.calls.map(([, request]) => request)).toEqual([
+      { expectedRevision: "revision-1", selectedPath: "src/a.ts", limit: 1 },
+      { expectedRevision: "revision-2", selectedPath: "src/a.ts", limit: 1 }
+    ]);
+
+    gitMocks.getGitChangePage.mockResolvedValueOnce({
+      kind: "page",
+      revision: "revision-1",
+      files: [],
+      matchedCount: 0,
+      nextCursor: null,
+      selection: { state: "missing" }
+    });
+    await expect(gitReviewListsPath(conversationTarget, snapshot({ files: [] }), "new.md")).resolves.toBe(false);
+  });
 });
 
 describe("pure snapshot helpers", () => {

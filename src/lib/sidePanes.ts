@@ -1,4 +1,6 @@
-export type SidePaneKind = "terminal" | "review" | "preview" | "files" | "tasks" | "plan" | "history" | "settings" | "subagent" | "shell";
+import { arrangeByIds } from "./reorder";
+
+export type SidePaneKind ="terminal" | "review" | "preview" | "files" | "tasks" | "plan" | "history" | "settings" | "subagent" | "shell";
 export type SidePaneId =
   | "terminal" | "review" | "files" | "tasks" | "plan" | "history" | "settings"
   | `preview:${string}` | `subagent:${string}` | `shell:${string}` | `history:${string}`;
@@ -49,6 +51,11 @@ export type SidePanesAction =
   | { type: "forget_preview"; conversationId: string; sessionId: string }
   /** Moves a page to another workspace — the one whose server it turned out to be showing. */
   | { type: "set_preview_workspace"; conversationId: string; sessionId: string; workspace: number }
+  /**
+   * Puts the conversation's pages in the order their tabs were dragged into. An id the roster does
+   * not hold is ignored, and a page the request leaves out keeps its relative place after the rest.
+   */
+  | { type: "reorder_previews"; conversationId: string; sessionIds: string[] }
   /**
    * Moves the layout a draft accumulated under its placeholder id onto the real
    * conversation it just became, the way the composer's text and attachments move.
@@ -279,6 +286,11 @@ export function sidePanesReducer(state: SidePanesState, action: SidePanesAction)
       if (state.previewWorkspaces[action.sessionId] === action.workspace
         && Object.prototype.hasOwnProperty.call(state.previewWorkspaces, action.sessionId)) return state;
       return { ...state, previewWorkspaces: { ...state.previewWorkspaces, [action.sessionId]: action.workspace } };
+    }
+    case "reorder_previews": {
+      const sessions = arrangeByIds(previewSessionsFor(state, conversationId), action.sessionIds, (id) => id);
+      return sessions === null ? state
+        : { ...state, previewSessions: { ...state.previewSessions, [conversationId]: sessions } };
     }
     case "adopt_conversation": {
       const adopted = Object.prototype.hasOwnProperty.call(state.layoutByConversation, action.from)

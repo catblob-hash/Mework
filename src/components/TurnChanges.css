@@ -1,0 +1,36 @@
+/*
+ * The files one span of work changed, at its end: a heading that folds the list,
+ * then a row per file that opens it.
+ */
+.turn-changes { margin-top: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+/* The card sits between two slots, which hides them from the rule that spaces
+   one slot from the next; what follows it takes that space back. */
+.turn-changes + .context-slot, .turn-changes + .turn-error { margin-top: 16px; }
+.turn-changes__list { margin: 0; padding: 0; list-style: none; }
+.turn-changes__list > li { border-top: 1px solid var(--border); }
+.turn-changes__row {
+  width: 100%; min-height: 32px; padding: 0 8px 0 10px;
+  display: flex; align-items: center; gap: 8px;
+  border: 0; border-radius: 0; background: transparent;
+  color: var(--color-4f4f4a); font: 11.25px/1.5 var(--app-font-family); text-align: left;
+}
+.turn-changes__row:hover { background: var(--color-000000-ap2_6); color: var(--text); }
+.turn-changes__row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.turn-changes__heading { color: var(--color-5f5f5a); font-size: 11.75px; font-weight: 610; }
+.turn-changes__icon { flex: 0 0 auto; color: var(--muted); }
+.turn-changes__name { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The name keeps its room; the directory beside a repeated name gives way first. */
+.turn-changes__row .turn-changes__name { flex-shrink: 0; max-width: 60%; }
+.turn-changes__heading .turn-changes__name, .turn-changes__more .turn-changes__name { max-width: none; flex-shrink: 1; }
+.turn-changes__directory { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 10.5px; }
+.turn-changes__counts {
+  margin-left: auto; padding-left: 10px; flex: 0 0 auto; display: inline-flex; gap: 4px;
+  font: 10px var(--mono); font-variant-numeric: tabular-nums;
+}
+.turn-changes__counts b { color: var(--success); font-weight: 500; }
+.turn-changes__counts em { color: var(--danger); font-style: normal; }
+.turn-changes__chevron { flex: 0 0 auto; color: var(--faint); transition: transform .12s ease; }
+.turn-changes__heading[aria-expanded="true"] .turn-changes__chevron { transform: rotate(90deg); }
+.turn-changes__more { color: var(--muted); }
+.turn-changes__more .turn-changes__chevron { margin-left: auto; }
+.turn-changes__more[aria-expanded="true"] .turn-changes__chevron { transform: rotate(-90deg); }

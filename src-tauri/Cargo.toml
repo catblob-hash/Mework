@@ -12,6 +12,9 @@ members = [
     # it. Cross-compiled for every machine Mework can reach, so its own
     # dependencies stay minimal; the host links only its `client` half.
     "remote-agent",
+    # Git reads and writes, linked by the host and by the remote agent, which
+    # runs the same operations on the machine a remote checkout is on.
+    "git-core",
 ]
 
 [package]
@@ -76,6 +79,9 @@ mework-agent-kernel = { path = "agent-kernel" }
 # The host's link to the agent it keeps on SSH machines. Only the `client` half:
 # the agent's own process and terminal code runs on the remote machine, not here.
 mework-remote-agent = { path = "remote-agent", default-features = false, features = ["client"] }
+# Git status, diffs, review writes and worktrees. The remote agent links the
+# same crate to serve checkouts on other machines (`mework-remote git`).
+mework-git-core = { path = "git-core" }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # Persists the conversation data plane. `bundled` compiles SQLite from source,

@@ -1,11 +1,9 @@
-import { ChevronDown, Plus, X } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import { Plus } from "lucide-react";
+import { useCallback, useState } from "react";
 import { useI18n } from "../i18n";
-import { IconButton } from "./Common";
+import { PageTabs } from "./PageTabs";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuSection } from "./PopoverMenu";
-import "./TerminalTabBar.css";
 
 export interface TerminalTabDescriptor {
   id: string;
@@ -23,6 +21,8 @@ export interface TerminalTabBarProps {
   onSelect: (terminalId: string) => void;
   onClose: (terminalId: string) => void;
   onRename: (terminalId: string, name: string) => void;
+  /** Makes the tab order the user's; receives every terminal id in the new order. */
+  onReorder?: (terminalIds: string[]) => void;
   /**
    * The menu `+` opens: where a new terminal can start — the same choice the top bar's terminal
    * button offers, minus its pane row. `flyout` opens a workspace's shells beside it.
@@ -31,10 +31,10 @@ export interface TerminalTabBarProps {
 }
 
 /**
- * The terminal pane's title bar: a tab per shell, an overflow selector once they stop fitting,
- * and the menu that opens another one. It takes the pane's `header` slot, so the pane draws
- * no title of its own and the bar is the only chrome above the terminal — the reference shell
- * puts nothing else there.
+ * The terminal pane's title bar: a tab per shell on the shared page strip, and the menu that opens
+ * another one. It takes the pane's `header` slot, so the pane draws no title of its own and the bar
+ * is the only chrome above the terminal — the reference shell puts nothing else there. A double
+ * click renames a shell in place.
  */
 export function TerminalTabBar({
   tabs,
@@ -44,35 +44,12 @@ export function TerminalTabBar({
   onSelect,
   onClose,
   onRename,
+  onReorder,
   add
 }: TerminalTabBarProps) {
   const { t } = useI18n();
-  const stripRef = useRef<HTMLDivElement>(null);
-  const [overflowing, setOverflowing] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-
-  // The selector only earns its place once a tab is actually out of reach. The strip's own box
-  // does not change when the tabs inside it stop fitting, so the names are part of the trigger:
-  // the caller passes a fresh array every render and re-measuring on that alone would rebuild
-  // the observer on every keystroke elsewhere in the app.
-  const tabKey = tabs.map((tab) => `${tab.id}\u0000${tab.label}`).join("\u0001");
-  useLayoutEffect(() => {
-    const strip = stripRef.current;
-    if (!strip) return;
-    const measure = () => setOverflowing(strip.scrollWidth - strip.clientWidth > 1);
-    measure();
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
-    observer?.observe(strip);
-    return () => observer?.disconnect();
-  }, [tabKey]);
-
-  useEffect(() => {
-    if (renamingId !== null) return;
-    stripRef.current
-      ?.querySelector(`[data-terminal-tab="${CSS.escape(activeId ?? "")}"]`)
-      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [activeId, renamingId]);
 
   const commitRename = useCallback(() => {
     if (renamingId === null) return;
@@ -80,117 +57,59 @@ export function TerminalTabBar({
     setRenamingId(null);
   }, [draft, onRename, renamingId]);
 
-  const startRename = (tab: TerminalTabDescriptor) => {
+  const startRename = (terminalId: string) => {
+    const tab = tabs.find((candidate) => candidate.id === terminalId);
+    if (!tab) return;
     setDraft(tab.label);
     setRenamingId(tab.id);
   };
 
-  const moveFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
-    const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
-    if (delta === 0) return;
-    event.preventDefault();
-    const next = tabs[(index + delta + tabs.length) % tabs.length];
-    if (next) onSelect(next.id);
-  };
-
   const addLabel = t("新建终端", "New terminal");
-  const moreLabel = t("更多终端", "More terminals");
 
   return (
-    <div className="terminal-tabs">
-      <div className="terminal-tabs__strip" ref={stripRef} role="tablist" aria-label={t("终端标签", "Terminal tabs")}>
-        {tabs.map((tab, index) => {
-          const active = tab.id === activeId;
-          if (tab.id === renamingId) {
-            return (
-              <input
-                key={tab.id}
-                className="terminal-tab__rename"
-                aria-label={t("重命名终端", "Rename terminal")}
-                value={draft}
-                autoFocus
-                onChange={(event) => setDraft(event.target.value)}
-                onBlur={commitRename}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    commitRename();
-                  } else if (event.key === "Escape") {
-                    event.preventDefault();
-                    setRenamingId(null);
-                  }
-                }}
-              />
-            );
-          }
-          return (
-            // The close control cannot live inside the tab button, so the pair shares a
-            // presentational box the tablist looks straight through.
-            <div
-              key={tab.id}
-              role="presentation"
-              className={`terminal-tab${active ? " terminal-tab--active" : ""}`}
-              data-terminal-tab={tab.id}
-            >
-              <button
-                type="button"
-                role="tab"
-                className="terminal-tab__label"
-                aria-selected={active}
-                aria-controls={panelId(tab.id)}
-                tabIndex={active ? 0 : -1}
-                title={tab.label}
-                onClick={() => onSelect(tab.id)}
-                onDoubleClick={() => startRename(tab)}
-                onKeyDown={(event) => moveFocus(event, index)}
-              >
-                {tab.label}
-              </button>
-              <IconButton
-                className="terminal-tab__close"
-                label={t("关闭终端", "Close terminal")}
-                disabled={closingIds?.has(tab.id)}
-                // Keeps the shell from taking a focus change on its way out.
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => onClose(tab.id)}
-              >
-                <X size={11} aria-hidden="true" />
-              </IconButton>
-            </div>
-          );
-        })}
-      </div>
-      {overflowing && tabs.length > 0 && (
+    <PageTabs
+      tabs={tabs.map((tab) => ({ id: tab.id, label: tab.label, closeDisabled: closingIds?.has(tab.id) }))}
+      activeId={activeId}
+      ariaLabel={t("终端标签", "Terminal tabs")}
+      moreLabel={t("更多终端", "More terminals")}
+      panelId={panelId}
+      onSelect={onSelect}
+      onClose={onClose}
+      closeLabel={() => t("关闭终端", "Close terminal")}
+      onReorder={onReorder}
+      onTabDoubleClick={startRename}
+      renderEditor={(tab) => (tab.id !== renamingId ? null : (
+        <input
+          className="page-tab__editor"
+          aria-label={t("重命名终端", "Rename terminal")}
+          value={draft}
+          // biome-ignore lint/a11y/noAutofocus: the field exists only because a double click just asked to type into it.
+          autoFocus
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              commitRename();
+            } else if (event.key === "Escape") {
+              event.preventDefault();
+              setRenamingId(null);
+            }
+          }}
+        />
+      ))}
+      trailing={(
         <PopoverMenu
-          rootClassName="terminal-tabs__overflow"
-          triggerClassName="icon-button terminal-tabs__overflow-trigger"
-          trigger={<ChevronDown size={13} aria-hidden="true" />}
-          triggerLabel={moreLabel}
-          menuLabel={moreLabel}
+          triggerClassName="icon-button"
+          trigger={<Plus size={14} aria-hidden="true" />}
+          triggerLabel={addLabel}
+          menuLabel={addLabel}
           align="end"
           dense
-          sections={[{
-            id: "terminals",
-            items: tabs.map((tab) => ({
-              id: tab.id,
-              label: tab.label,
-              checked: tab.id === activeId,
-              onSelect: () => onSelect(tab.id)
-            }))
-          }]}
+          submenu={add.submenu}
+          sections={add.sections}
         />
       )}
-      <PopoverMenu
-        rootClassName="terminal-tabs__add-menu"
-        triggerClassName="icon-button terminal-tabs__add"
-        trigger={<Plus size={14} aria-hidden="true" />}
-        triggerLabel={addLabel}
-        menuLabel={addLabel}
-        align="end"
-        dense
-        submenu={add.submenu}
-        sections={add.sections}
-      />
-    </div>
+    />
   );
 }

@@ -1,3 +1,4 @@
+import { arrangeByIds } from "./reorder";
 import type { TerminalLaunchChoice } from "./terminal";
 
 /**
@@ -63,6 +64,11 @@ export type TerminalTabsAction =
   | { type: "close"; conversationId: string; terminalId: string }
   | { type: "activate"; conversationId: string; terminalId: string }
   | { type: "rename"; conversationId: string; terminalId: string; name: string }
+  /**
+   * Puts the tabs in the order the strip was dragged into. An id the conversation does not hold
+   * is ignored, and a tab the request leaves out keeps its relative place after the rest.
+   */
+  | { type: "reorder"; conversationId: string; terminalIds: string[] }
   | { type: "remove_conversation"; conversationId: string };
 
 export const initialTerminalTabsState: TerminalTabsState = { byConversation: {} };
@@ -163,6 +169,10 @@ export function terminalTabsReducer(
           candidate.id === action.terminalId ? { ...candidate, name } : candidate
         ))
       });
+    }
+    case "reorder": {
+      const tabs = arrangeByIds(layout.tabs, action.terminalIds, (tab) => tab.id);
+      return tabs === null ? state : withLayout(state, conversationId, { ...layout, tabs });
     }
     case "remove_conversation": {
       if (!Object.prototype.hasOwnProperty.call(state.byConversation, conversationId)) return state;

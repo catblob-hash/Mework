@@ -605,19 +605,29 @@ export interface UserAbortedTaskRecord {
 }
 
 /**
- * An isolated Git worktree used by this conversation.
+ * An isolated Git worktree used by this conversation in place of one of its
+ * project's workspaces.
  *
- * The host runs this conversation's tools against `path`, isolating it from
- * other workspace conversations. It belongs to the conversation instance,
- * not `ConversationSettings`, because settings are copied by presets.
+ * The host runs this conversation's tools against `path` wherever they name
+ * that workspace, isolating it from the project's other conversations. It
+ * belongs to the conversation instance, not `ConversationSettings`, because
+ * settings are copied by presets.
  */
 export interface ConversationWorktree {
-  /** Absolute worktree root path. */
+  /** Absolute worktree root path, on the machine of the workspace it came from. */
   path: string;
   /** Branch created for this worktree. */
   branch: string;
   /** Baseline commit used at release to determine whether extra commits exist. */
   baseOid: string;
+  /** The branch the worktree was forked from; absent for a detached HEAD or an older record. */
+  baseBranch?: string | null;
+  /**
+   * The project workspace this worktree was checked out from — its machine and registered
+   * directory — which it stands in for. Absent on records from before every workspace could
+   * have one: those are workspace 1's.
+   */
+  workspace?: AttachedWorkspace | null;
 }
 
 /**
@@ -656,8 +666,11 @@ export interface Conversation {
   queuedMessages: QueuedMessage[];
   branches: ConversationBranch[];
   userAbortedTasks: UserAbortedTaskRecord[];
-  /** Isolated worktree, or `null` for the workspace root. See {@link ConversationWorktree}. */
-  worktree: ConversationWorktree | null;
+  /**
+   * Isolated worktrees, at most one per project workspace; a workspace without one runs at its
+   * registered directory. See {@link ConversationWorktree} and `worktreeFor`.
+   */
+  worktrees: ConversationWorktree[];
   /** Execution target, or `null` for local execution. See {@link RunTarget}. */
   runTarget: RunTarget | null;
   /**
@@ -667,7 +680,7 @@ export interface Conversation {
    * addresses: the primary is workspace 1 and these follow in order.
    *
    * On the conversation rather than in {@link ConversationSettings} for the same
-   * reason as `worktree`: presets and workspace snapshots copy settings
+   * reason as `worktrees`: presets and workspace snapshots copy settings
    * wholesale, and one conversation's granted path is not another's. Each entry
    * came back from a host directory picker — native for the host machine, the
    * remote browser for a WSL or SSH machine — which is the only thing that
@@ -729,8 +742,8 @@ export interface Workspace {
   /**
    * The project's workspaces after the first. The sidebar entry is a project: one
    * or more directories, each on its own machine. `path` and `machine` above are
-   * the first — workspace 1, the one worktrees and the Git review act on by
-   * default — and these follow it as workspaces 2, 3, … in every conversation
+   * the first — workspace 1, the one the Git chip shows by default — and these
+   * follow it as workspaces 2, 3, … in every conversation
    * of the project, ahead of the conversation's own attached workspaces.
    *
    * Absent on projects registered with a single directory. Each entry came back
@@ -1522,6 +1535,20 @@ export interface GlobalSettings {
   environmentTools: EnvironmentToolDefinition[];
   /** Execution-environment assets: SSH machine catalog and environment-keyed variables. */
   executionEnvironments: ExecutionEnvironmentAssets;
+  /**
+   * The unsent new task's own settings, absent when there is none. The draft
+   * copies a preset once, when it is opened, and from then on owns its
+   * settings like any conversation; keeping them here is what lets it survive a
+   * restart instead of being rebuilt from the preset.
+   */
+  draftConversation?: DraftConversationSnapshot | null;
+}
+
+/** What of the new-task draft outlives the process: its settings and their preset trace. */
+export interface DraftConversationSnapshot {
+  settings: ConversationSettings;
+  /** Same trace semantics as `Conversation.presetId`. */
+  presetId: string;
 }
 
 /**

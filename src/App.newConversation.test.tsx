@@ -180,6 +180,10 @@ function conversationsIn(workspaceId: string): number {
   return savedConversations(workspaceId).length;
 }
 
+function lastSavedDocument(): AppDocument | undefined {
+  return runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined;
+}
+
 describe("draft conversation", () => {
   beforeEach(resetAppMocks);
 
@@ -401,6 +405,49 @@ describe("draft conversation", () => {
           expect.objectContaining({ kind: "user", content: "选工作区前的输入" })
         ])
       }));
+    });
+  });
+
+  it("brings an unsent task back after a restart with its own settings, not its preset's", async () => {
+    const document = documentWithPresetsAndMemory();
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+    const first = render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+    await waitFor(() => expect(securityLevel()).toBe("允许编辑"));
+    await chooseComposerOption(user, "安全层级", "手动");
+
+    const saved = await waitFor(() => {
+      const latest = lastSavedDocument();
+      expect(latest?.globalSettings.draftConversation?.settings.securityLevel).toBe("request_approval");
+      return latest!;
+    });
+
+    // The next run of the app opens the document this one left; the preset still says otherwise.
+    first.unmount();
+    runtimeMocks.loadDocument.mockResolvedValue(saved);
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+    await waitFor(() => expect(securityLevel()).toBe("手动"));
+  });
+
+  it("stops keeping a task as a draft once it is sent", async () => {
+    const document = documentWithPresetsAndMemory();
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.runModel.mockResolvedValue(quietReply);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+    await chooseComposerOption(user, "安全层级", "手动");
+    await waitFor(() => expect(lastSavedDocument()?.globalSettings.draftConversation).toBeTruthy());
+
+    await send(user, "开始");
+    await waitFor(() => {
+      expect(conversationsIn("ws_mework")).toBe(2);
+      expect(lastSavedDocument()?.globalSettings.draftConversation ?? null).toBeNull();
     });
   });
 

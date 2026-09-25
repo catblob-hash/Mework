@@ -1,8 +1,9 @@
 //! Names the source the agent is built from: `MEWORK_AGENT_SOURCE_ID`, a digest
-//! of everything that decides how an agent behaves — its manifest, this script
-//! and every file under `src/`. The host links this crate as a library and so
-//! carries the same name; an agent built from other source carries another,
-//! whatever version number either of them claims (see `SOURCE_ID` in lib.rs).
+//! of everything that decides how an agent behaves — its manifest, this script,
+//! every file under `src/`, and the shared Git crate its `git` helper runs. The
+//! host links this crate as a library and so carries the same name; an agent
+//! built from other source carries another, whatever version number either of
+//! them claims (see `SOURCE_ID` in lib.rs).
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,10 @@ fn main() {
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let mut files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("build.rs")];
     collect(&root, Path::new("src"), &mut files);
+    // The Git helper (`mework-remote git`) is the shared crate's code: an agent
+    // built from other Git source answers the same requests differently.
+    files.push(PathBuf::from("../git-core/Cargo.toml"));
+    collect(&root, Path::new("../git-core/src"), &mut files);
     files.sort();
     let mut hasher = Sha256::new();
     for relative in &files {
@@ -34,6 +39,8 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../git-core/Cargo.toml");
+    println!("cargo:rerun-if-changed=../git-core/src");
 }
 
 /// The Rust files under `root/relative`, as paths relative to `root`. Dot files

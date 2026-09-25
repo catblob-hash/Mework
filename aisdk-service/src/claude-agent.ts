@@ -12,11 +12,15 @@
 //! handlers with the results and streams the following model reply.
 //!
 //! Version. The executable is the CLI inside the Agent SDK's own platform
-//! package, pinned exactly (SDK `0.3.261`, Claude Code `2.1.261`) and shipped
+//! package, pinned exactly (SDK `0.3.282`, Claude Code `2.1.282`) and shipped
 //! beside the application; the host resolves it and sends the path in
 //! `agent.executable`. The user's own install is never consulted. That is what
 //! makes this module's knowledge of CLI behaviour — which switches exist, what the
 //! CLI prepends, how it normalizes a transcript — hold from one run to the next.
+//!
+//! Context. The environment the model sees is the host's, per machine; the CLI's
+//! own environment block, model line and date are left out by a plugin this
+//! module writes and loads (`claude-context-plugin.ts`).
 //!
 //! Tool names. The CLI is started with `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1`, under
 //! which in-process MCP tools register under their bare names, so the model sees
@@ -65,6 +69,7 @@ import {
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import { contextPluginDir } from "./claude-context-plugin.js";
 import { redactError, secretsOf } from "./error-redaction.js";
 import { dropForeignSignedReasoning, stripReplayTags } from "./anthropic-dialect.js";
 import {
@@ -112,7 +117,7 @@ const EVICTION_SWEEP_MS = 60 * 60 * 1000;
  * seen. Mework ships one Claude Code build, so this is that build rather than a
  * guess; a live session still prefers the version its own `init` reported.
  */
-const FALLBACK_CLI_VERSION = "2.1.261";
+const FALLBACK_CLI_VERSION = "2.1.282";
 /**
  * Prompt used when a tool round must continue in a fresh CLI session (the parked
  * session is gone). The transcript then already ends with the tool results, and
@@ -706,17 +711,13 @@ const CLI_CONTROL_ENV: Record<string, string> = {
   CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
   MCP_TOOL_TIMEOUT: String(PARK_TIMEOUT_MS),
   CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
-  // Left to itself the CLI attaches an `# Environment` block of its own (the
-  // directory it was started in, its platform) to the first user message, even
-  // under a custom string system prompt — and that directory is Mework's private
-  // session folder, not a workspace. This switch turns it off, together with the
-  // rest of the "carved slate" static-prompt mode. It is load-bearing rather than
-  // best-effort: the CLI is pinned at 2.1.261, which honours it. (2.1.278 removed
-  // the switch and made the block unconditional, leaving only `--bare`
-  // (`CLAUDE_CODE_SIMPLE`), which also stops the CLI reading its OAuth login and
-  // is therefore unusable here — one more reason the version is Mework's to pick.)
-  // `selfcheck-claude-agent.mjs` asserts the block is absent.
-  CLAUDE_CODE_CARVED_SLATE: "0",
+  // Loads the hooks module of the context plugin (`claude-context-plugin.ts`),
+  // which leaves the CLI's own environment block, model line and date out of the
+  // prompt. Load-bearing rather than best-effort: without it the model is told
+  // about Mework's private session folder as if it were a workspace. The CLI
+  // version is pinned to one that loads function hooks under this switch, and
+  // `selfcheck-claude-agent.mjs` asserts the upstream request carries none of it.
+  CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: "1",
 };
 
 interface CliEnvKnobs {
@@ -1542,6 +1543,8 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
     prompt: SDKUserMessage,
     history: unknown[],
   ): Session {
+    // First, and throwing: a session without the plugin must not start at all.
+    const plugin = contextPluginDir(agent.cwd);
     const tools = request.tools ?? [];
     const knownTools = new Set(tools.map((tool) => tool.name));
     const abort = new AbortController();
@@ -1582,10 +1585,18 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       pathToClaudeCodeExecutable: agent.executable,
       spawnClaudeCodeProcess: cli.spawnHook(),
       env: cliEnv(agent, request.modelId, { maxOutputTokens: request.maxOutputTokens }),
-      systemPrompt: fullSystemPrompt(request) ?? "",
+      // Rendered fresh on every request, never recorded. By default the CLI records
+      // a session's system prompt on its first request and replays that record
+      // afterwards, even across a resume that passes different text; the host
+      // rebuilds its prompt every step (the environment it states follows the
+      // machines a run is on), and only the text it sent may reach the model.
+      systemPrompt: { type: "custom", prompt: fullSystemPrompt(request) ?? "", snapshot: false },
       tools: [],
       settingSources: [],
       strictMcpConfig: true,
+      // The one plugin the CLI loads: `settingSources: []` keeps every installed one
+      // out, and this one is Mework's own (see `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`).
+      plugins: [{ type: "local", path: plugin }],
       mcpServers: {
         [SERVER_NAME]: {
           type: "sdk",

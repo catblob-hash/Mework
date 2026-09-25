@@ -36,6 +36,16 @@ export interface PathOpenRequest {
   baseDir: string | null;
   /** The line the reference named, or null when it named only a file. */
   line: number | null;
+  /**
+   * The workspace number a tool call named, when the path was written against a
+   * workspace other than the surface's own; `baseDir` does not apply to it then.
+   */
+  workspace?: number | null;
+  /**
+   * Set by a turn's list of changed files: a file whose change Git tracks opens
+   * in the review pane on its diff, and only anything else in the file pane.
+   */
+  review?: boolean;
 }
 
 /**
@@ -98,6 +108,26 @@ function pathTarget(event: Event): HTMLElement | null {
   return null;
 }
 
+/**
+ * Opens a path the way a click on it does, and says whether anything took it.
+ *
+ * The app gets first refusal: a file it can show belongs in one of its panes,
+ * and only what the panes cannot reach falls through to the file manager.
+ */
+export function openPath(
+  request: PathOpenRequest,
+  reveal: (path: string, baseDir: string | null) => Promise<void> = revealPath
+): boolean {
+  if (openHandler?.(request)) return true;
+  // A relative path without a working directory cannot be resolved by the
+  // host either, so do not spend an IPC round trip on it.
+  if (!request.baseDir && !isAbsolutePath(request.path)) return false;
+  void reveal(request.path, request.baseDir).catch((error: unknown) => {
+    console.error("打开文件位置失败", error);
+  });
+  return true;
+}
+
 /** Installs the document interceptor and returns its cleanup function. */
 export function installPathLinkInterceptor(
   documentRef: Document = document,
@@ -112,21 +142,9 @@ export function installPathLinkInterceptor(
     const baseDir = owner.closest<HTMLElement>(`[${BASE_ATTRIBUTE}]`)?.getAttribute(BASE_ATTRIBUTE) ?? null;
     const declaredLine = Number.parseInt(owner.getAttribute(LINE_ATTRIBUTE) ?? "", 10);
     const line = Number.isSafeInteger(declaredLine) && declaredLine > 0 ? declaredLine : null;
-    // The app gets first refusal: a file it can show belongs in the file pane,
-    // and only what the pane cannot reach falls through to the file manager.
-    if (openHandler?.({ path, baseDir, line })) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    // A relative path without a working directory cannot be resolved by the
-    // host either, so do not spend an IPC round trip on it.
-    if (!baseDir && !isAbsolutePath(path)) return;
+    if (!openPath({ path, baseDir, line }, reveal)) return;
     event.preventDefault();
     event.stopPropagation();
-    void reveal(path, baseDir).catch((error: unknown) => {
-      console.error("打开文件位置失败", error);
-    });
   };
   documentRef.addEventListener("click", handle, true);
   documentRef.addEventListener("auxclick", handle, true);

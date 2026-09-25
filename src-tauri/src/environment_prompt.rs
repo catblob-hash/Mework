@@ -120,12 +120,13 @@ impl EnvironmentFacts {
     pub fn collect_remote(
         root: &str,
         machine: EnvironmentMachine,
+        is_worktree: bool,
         workspaces: Vec<EnvironmentWorkspace>,
     ) -> Self {
         Self {
             working_directory: root.to_owned(),
             working_machine: machine,
-            is_worktree: false,
+            is_worktree,
             is_git_repository: None,
             workspaces: displayed_workspaces(workspaces),
             platform: crate::host_platform::host_platform().os_tag().to_owned(),
@@ -614,6 +615,7 @@ mod tests {
         let facts = EnvironmentFacts::collect_remote(
             "/home/dev/app",
             EnvironmentMachine::Ssh("devbox".into()),
+            false,
             vec![workspace(1, "/home/dev/app", EnvironmentMachine::Ssh("devbox".into()))],
         );
         assert_eq!(facts.is_git_repository, None);

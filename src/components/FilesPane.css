@@ -26,47 +26,9 @@
 }
 .files-pane__header .files-pane__tree-toggle:hover:not(:disabled) { color: var(--text); }
 
-/* The strip never scrolls: tabs share the bar and the rest move into the overflow menu. */
-.files-pane__tabs {
-  flex: 1; min-width: 0;
-  display: flex; align-items: center; gap: 4px;
-}
-/* A tab wants 192px, settles for 104, and never grows past its own label. */
-.files-pane__tab {
-  position: relative; flex: 0 1 192px; min-width: 104px; max-width: max-content;
-  display: flex; align-items: center; gap: 4px;
-  height: 24px; padding: 2px; border-radius: 5px; color: var(--muted);
-}
-.files-pane__tab:hover { background: var(--hover); }
-.files-pane__tab--active { background: var(--active); color: var(--text); }
-.files-pane__tab-button {
-  flex: 1; min-width: 0; max-width: 140px;
-  display: flex; align-items: center; gap: 4px;
-  height: 100%; padding: 0 2px 0 4px;
-  border: 0; background: none; color: inherit; font: inherit; font-size: 11.5px;
-  text-align: left; cursor: pointer;
-}
-.files-pane__tab-button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; border-radius: 5px; }
-.files-pane__tab-icon { flex: 0 0 13px; width: 13px; height: 13px; opacity: .75; }
-.files-pane__tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* A preview tab is the one slot every single click reuses; italics say it is on loan. */
-.files-pane__tab--preview .files-pane__tab-name { font-style: italic; }
-/* Row actions stay out of the way until the tab is pointed at or holds focus. */
-.files-pane__tab-menu, .files-pane__tab .files-pane__tab-close {
-  opacity: 0; flex: 0 0 auto;
-}
-.files-pane__tab:hover .files-pane__tab-menu,
-.files-pane__tab:hover .files-pane__tab-close,
-.files-pane__tab:focus-within .files-pane__tab-menu,
-.files-pane__tab:focus-within .files-pane__tab-close,
-.files-pane__tab--active .files-pane__tab-close { opacity: 1; }
-.files-pane__tabs .files-pane__tab-menu-trigger,
-.files-pane__tabs .files-pane__tab-close,
-.files-pane__tabs .files-pane__tab-overflow-trigger {
-  width: 20px; height: 20px; flex: 0 0 20px; border-radius: 4px;
-}
-.files-pane__tab-menu { display: flex; align-items: center; }
-.files-pane__tab-overflow { flex: 0 0 auto; display: flex; align-items: center; }
+/* The open files are the shared page strip (PageTabs.css). A preview tab is the one slot every
+   single click reuses; italics say it is on loan. */
+.files-pane__tab--preview .page-tab__text { font-style: italic; }
 
 /* ---- tree column ---- */
 

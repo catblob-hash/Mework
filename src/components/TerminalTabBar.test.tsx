@@ -37,7 +37,7 @@ function tab(name: string) {
   return screen.getByRole("tab", { name });
 }
 function closeControl(name: string) {
-  return within(screen.getByRole("tab", { name }).closest(".terminal-tab") as HTMLElement)
+  return within(screen.getByRole("tab", { name }).closest(".page-tab") as HTMLElement)
     .getByRole("button", { name: "关闭终端" });
 }
 
@@ -78,15 +78,27 @@ describe("TerminalTabBar", () => {
     expect(closeControl("终端 2")).toBeDisabled();
   });
 
-  it("moves between tabs with the arrow keys, wrapping at the ends", async () => {
+  it("moves between tabs with the arrow keys, wrapping at the ends, and focus follows", async () => {
     const user = userEvent.setup();
     const { onSelect } = setup();
 
     tab("终端 1").focus();
-    await user.keyboard("{ArrowRight}");
-    expect(onSelect).toHaveBeenLastCalledWith("terminal-2");
     await user.keyboard("{ArrowLeft}");
     expect(onSelect).toHaveBeenLastCalledWith("terminal-2");
+    expect(tab("终端 2")).toHaveFocus();
+    await user.keyboard("{ArrowRight}");
+    expect(onSelect).toHaveBeenLastCalledWith("terminal-1");
+    expect(tab("终端 1")).toHaveFocus();
+  });
+
+  it("hands the order to the caller when a tab is moved with Ctrl+Shift+Arrow", async () => {
+    const user = userEvent.setup();
+    const onReorder = vi.fn();
+    setup({ onReorder });
+
+    tab("终端 1").focus();
+    await user.keyboard("{Control>}{Shift>}{ArrowRight}{/Shift}{/Control}");
+    expect(onReorder).toHaveBeenCalledExactlyOnceWith(["terminal-2", "terminal-1"]);
   });
 
   describe("renaming", () => {
@@ -121,14 +133,25 @@ describe("TerminalTabBar", () => {
     });
 
     it("appears once a tab is out of reach and reaches it", async () => {
-      vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(400);
-      vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(120);
+      // jsdom lays nothing out: a bar with room for one 100px tab and the selector.
+      vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+        return this.classList.contains("page-tabs") ? 150 : 0;
+      });
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+        const width = this.dataset.measureTab !== undefined ? 100
+          : this.dataset.measureTrigger !== undefined ? 24 : 0;
+        return { x: 0, y: 0, left: 0, top: 0, right: width, bottom: 24, width, height: 24, toJSON: () => ({}) } as DOMRect;
+      });
       const user = userEvent.setup();
       const { onSelect } = setup();
 
+      expect(screen.getAllByRole("tab").map((element) => element.textContent)).toEqual(["终端 1"]);
       await user.click(screen.getByRole("button", { name: "更多终端" }));
-      await user.click(screen.getByRole("menuitemradio", { name: "终端 2" }));
+      const menu = screen.getByRole("menu", { name: "更多终端" });
+      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["终端 2"]);
+      await user.click(within(menu).getByRole("menuitem", { name: "终端 2" }));
       expect(onSelect).toHaveBeenCalledWith("terminal-2");
+      expect(screen.queryByRole("menu", { name: "更多终端" })).not.toBeInTheDocument();
     });
   });
 });

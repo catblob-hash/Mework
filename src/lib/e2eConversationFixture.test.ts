@@ -191,7 +191,7 @@ describe("the conversations the two runners build", () => {
       expect(conversation.queuedMessages).toEqual([]);
       expect(conversation.branches).toEqual([]);
       expect(conversation.userAbortedTasks).toEqual([]);
-      expect(conversation.worktree).toBeNull();
+      expect(conversation.worktrees).toEqual([]);
       expect(conversation.runTarget).toBeNull();
       expect(conversation.parentConversationId).toBeNull();
       expect(conversation.presetId).toBe("");

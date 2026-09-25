@@ -56,6 +56,7 @@ mod file_attachments;
 mod file_read_state;
 mod fork_requests;
 mod git;
+mod git_flight;
 mod hooks;
 mod host_platform;
 mod http_util;
@@ -1902,14 +1903,25 @@ fn execute_tool_blocking(
             .ok_or_else(|| "这个工具操作必须先取得单次批准".to_owned())?;
         state.consume_tool_approval(nonce, &request, &policy.run_environment.fingerprint())?;
     }
-    Ok(tool_executor::execute_with_scope_and_attachments(
+    // The executor records the receipt under the directory the call ran from.
+    // When the save looks elsewhere, the card would be quarantined as
+    // unattested on its first save, so it is recorded there as well.
+    let receipt = policy.receipt_root.clone().map(|root| ToolExecutionRequest {
+        workspace_path: root,
+        ..request.clone()
+    });
+    let result = tool_executor::execute_with_scope_and_attachments(
         request,
         &state,
         decision.scope,
         Some(&app_data),
         &policy.workspaces,
         &policy.prompt_profile,
-    ))
+    );
+    if let Some(receipt) = receipt {
+        state.record_receipt(&receipt, &result);
+    }
+    Ok(result)
 }
 
 #[cfg(not(test))]
@@ -4230,32 +4242,64 @@ async fn browser_action(
     .map_err(|error| format!("浏览器操作后台任务失败: {error}"))?
 }
 
+/// Where a Git request's checkout is, held for as long as this lives.
 #[cfg(not(test))]
-fn trusted_git_workspace_operation(
+enum GitPlace {
+    /// A checkout on this filesystem, under its workspace lease.
+    Local(TrustedWorkspaceOperation),
+    /// A checkout on another machine, reached through its agent. The lease
+    /// orders this host's own reads and writes of it, as the local lease does;
+    /// the machine's Git orders them against everything else there.
+    Remote {
+        checkout: remote_git::RemoteCheckout,
+        _lease: Box<dyn Send>,
+    },
+}
+
+#[cfg(not(test))]
+impl GitPlace {
+    /// The key [`git_flight`] shares this checkout's status reads under.
+    fn flight_key(&self) -> String {
+        match self {
+            Self::Local(operation) => format!("local|{}", operation.canonical_path.display()),
+            Self::Remote { checkout, .. } => format!("{}|{}", checkout.machine_key, checkout.root),
+        }
+    }
+}
+
+/// Resolves a Git read's checkout — on this machine or another — under a
+/// shared lease.
+#[cfg(not(test))]
+fn trusted_git_read_place(
     app: &AppHandle,
     state: &AppState,
     target: &GitTarget,
     request_label: &str,
-    access: TrustedWorkspaceAccess,
-) -> Result<TrustedWorkspaceOperation, String> {
-    trusted_target_workspace_operation(app, state, target, request_label, access, None)
+) -> Result<GitPlace, String> {
+    trusted_git_place(
+        app,
+        state,
+        target,
+        request_label,
+        TrustedWorkspaceAccess::Shared,
+        None,
+    )
 }
 
-/// Entry point for Git writes. In addition to
-/// `trusted_git_workspace_operation`, it rejects writes while a model run writes
-/// the same checkout.
+/// Entry point for Git writes: the checkout under an exclusive lease, refused
+/// while a model run may be writing the same checkout.
 ///
-/// Evaluate the conflict before lease acquisition under the same storage lock as
-/// resolution so the coordinator cannot mask the actual conflict.
+/// The conflict is evaluated before the lease is taken, under the same storage
+/// lock as the resolution, so the coordinator cannot mask the actual conflict.
 #[cfg(not(test))]
-fn trusted_git_write_operation(
+fn trusted_git_write_place(
     app: &AppHandle,
     state: &AppState,
     target: &GitTarget,
     request_label: &str,
     surface: &'static str,
-) -> Result<TrustedWorkspaceOperation, String> {
-    trusted_target_workspace_operation(
+) -> Result<GitPlace, String> {
+    trusted_git_place(
         app,
         state,
         target,
@@ -4265,27 +4309,20 @@ fn trusted_git_write_operation(
     )
 }
 
-/// Whether a Git write conflicts with a model run writing the same checkout.
-///
-/// Conversation addressing checks that conversation. Workspace addressing checks
-/// all conversations running at the workspace root because it has no conversation;
-/// for a project's further workspace that is every conversation in the project,
-/// since none of them has a worktree of it (see `trusted_target_workspace_operation`).
+/// Whether a Git write conflicts with a model run writing the same checkout:
+/// the conversation the request is made for, and every conversation working in
+/// that checkout rather than in a worktree of its own.
 #[cfg(not(test))]
 fn reject_git_write_during_model_run(
     state: &AppState,
-    target: &GitTarget,
-    root_conversation_ids: &[String],
+    checkout: &ResolvedCheckout,
     surface: &str,
 ) -> Result<(), String> {
-    let blocked = match target {
-        GitTarget::Conversation { conversation_id } => {
-            state.conversation_model_run_active(conversation_id)
-        }
-        GitTarget::Workspace { .. } => root_conversation_ids
-            .iter()
-            .any(|conversation_id| state.conversation_model_run_active(conversation_id)),
-    };
+    let blocked = checkout
+        .attribution
+        .iter()
+        .chain(&checkout.writers)
+        .any(|conversation_id| state.conversation_model_run_active(conversation_id));
     if blocked {
         return Err(format!(
             "模型或 Agent 正在运行，{surface} 写操作已锁定；请等本轮结束后重试"
@@ -4294,62 +4331,62 @@ fn reject_git_write_during_model_run(
     Ok(())
 }
 
-/// A workspace on another machine whose Git status is read there.
+/// Resolves a Git request's checkout on whichever machine it is, and takes the
+/// lease `access` asks for.
 #[cfg(not(test))]
-struct RemoteGitWorkspace {
-    runner: run_environment::ShellRunner,
-    /// `run_environment::env_key` of the machine.
-    machine_key: String,
-    /// The root as the workspace records it, on that machine.
-    root: String,
-}
-
-/// The remote workspace a Git status read addresses, or `None` when it is a
-/// checkout on this host, which the caller reads under a lease as before.
-///
-/// Only the status reads come here. Everything else the Git pane does — diffs,
-/// branches, writes, worktrees — still acts on this filesystem alone and keeps
-/// refusing a workspace on another machine
-/// (`trusted_target_workspace_operation`).
-#[cfg(not(test))]
-fn remote_git_workspace(
+fn trusted_git_place(
     app: &AppHandle,
     state: &AppState,
     target: &GitTarget,
     request_label: &str,
-) -> Result<Option<RemoteGitWorkspace>, String> {
+    access: TrustedWorkspaceAccess,
+    write_surface: Option<&str>,
+) -> Result<GitPlace, String> {
+    // The storage lock binds the persisted mapping to the lease acquisition, as
+    // for a local checkout (`trusted_target_workspace_operation`).
     let _guard = state
         .storage_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let document = state.document_store.read(&document_path(app)?)?;
-    let resolved = workspace_lookup::resolve_git_target(&document, target, request_label)?;
-    // A conversation on another machine has no worktree of its own — those
-    // are checked out on this host — so its checkout is the workspace root.
-    let (machine, root) = match resolved {
-        workspace_lookup::ResolvedGitTarget::Conversation { workspace, .. }
-        | workspace_lookup::ResolvedGitTarget::Workspace {
-            workspace,
-            member: None,
-        } => (workspace.machine.as_ref(), &workspace.path),
-        workspace_lookup::ResolvedGitTarget::Workspace {
-            member: Some(member),
-            ..
-        } => (member.machine.as_ref(), &member.path),
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    let checkout = resolve_checkout(&document, &app_data, target, request_label)?;
+    let Some(machine) = checkout.machine.clone() else {
+        return lease_local_checkout(state, checkout, request_label, access, write_surface)
+            .map(GitPlace::Local);
     };
-    let Some(machine) = machine else {
-        return Ok(None);
-    };
+    if let Some(surface) = write_surface {
+        reject_git_write_during_model_run(state, &checkout, surface)?;
+    }
+    // The machine's variables are the registered directory's, as a shell there
+    // would have them: a worktree runs with the variables of what it came from.
     let runner = run_environment::resolve_shell_runner(
         &document.assets.execution_environments,
-        Some(machine),
-        Some(root),
+        Some(&machine),
+        Some(&checkout.registered.path),
     )?;
-    Ok(Some(RemoteGitWorkspace {
-        runner,
-        machine_key: run_environment::env_key(Some(machine)),
-        root: root.clone(),
-    }))
+    let machine_key = run_environment::env_key(Some(&machine));
+    let key = WorkspaceKey::new(format!("{machine_key}|{}", checkout.root));
+    let gate = state.operation_gate();
+    let lease: Box<dyn Send> = match access {
+        TrustedWorkspaceAccess::Shared => {
+            Box::new(gate.begin_workspace_operation(key, checkout.attribution.clone())?)
+        }
+        TrustedWorkspaceAccess::Exclusive => {
+            Box::new(gate.begin_workspace_mutation(key, checkout.attribution.clone())?)
+        }
+    };
+    Ok(GitPlace::Remote {
+        checkout: remote_git::RemoteCheckout {
+            runner,
+            machine_key,
+            root: checkout.root,
+        },
+        _lease: lease,
+    })
 }
 
 #[cfg(not(test))]
@@ -4362,22 +4399,16 @@ async fn get_git_workspace_summary(
 ) -> Result<git::GitWorkspaceSummaryResult, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Some(remote) = remote_git_workspace(&app, &state, &target, "Git 摘要请求")? {
-            return remote_git::workspace_summary(
-                &remote.runner,
-                &remote.machine_key,
-                &remote.root,
-                known_revision,
-            );
-        }
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 摘要请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::workspace_summary(&operation.workspace_path, known_revision)
+        let place = trusted_git_read_place(&app, &state, &target, "Git 摘要请求")?;
+        let key = place.flight_key();
+        git_flight::summary(&key, known_revision.as_deref(), || match &place {
+            GitPlace::Local(operation) => {
+                git_flight::outcome(git::workspace_summary(&operation.workspace_path, None))
+            }
+            GitPlace::Remote { checkout, .. } => {
+                git_flight::outcome(remote_git::summary(checkout, None))
+            }
+        })
     })
     .await
     .map_err(|error| format!("读取 Git 摘要的后台任务失败: {error}"))?
@@ -4393,14 +4424,10 @@ async fn get_git_change_page(
 ) -> Result<git::GitChangePageResult, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 变更页请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::change_page(&operation.workspace_path, request)
+        match trusted_git_read_place(&app, &state, &target, "Git 变更页请求")? {
+            GitPlace::Local(operation) => git::change_page(&operation.workspace_path, request),
+            GitPlace::Remote { checkout, .. } => remote_git::change_page(&checkout, request),
+        }
     })
     .await
     .map_err(|error| format!("读取 Git 变更页的后台任务失败: {error}"))?
@@ -4416,14 +4443,10 @@ async fn get_git_diff(
 ) -> Result<git::GitDiffResponse, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 差异请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::diff(&operation.workspace_path, request)
+        match trusted_git_read_place(&app, &state, &target, "Git 差异请求")? {
+            GitPlace::Local(operation) => git::diff(&operation.workspace_path, request),
+            GitPlace::Remote { checkout, .. } => remote_git::diff(&checkout, request),
+        }
     })
     .await
     .map_err(|error| format!("读取 Git 差异的后台任务失败: {error}"))?
@@ -4851,119 +4874,236 @@ async fn get_git_branches(
 ) -> Result<git::GitBranchesResult, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 分支请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::branches(&operation.workspace_path)
+        match trusted_git_read_place(&app, &state, &target, "Git 分支请求")? {
+            GitPlace::Local(operation) => git::branches(&operation.workspace_path),
+            GitPlace::Remote { checkout, .. } => remote_git::branches(&checkout),
+        }
     })
     .await
     .map_err(|error| format!("读取 Git 分支的后台任务失败: {error}"))?
 }
 
-/// The root directory of a conversation workspace and its registered isolated
-/// worktree. Unlike `TrustedWorkspaceOperation::workspace_path`, this excludes
-/// the isolated worktree because create and release operate on the parent repo.
+/// The short name a conversation's worktree is created under: the first eight
+/// characters of its id's random part. A name already taken in the repository
+/// — another workspace of the same repository, a worktree the user kept — is
+/// stepped past by the creation itself (`<name>-2`, …).
 #[cfg(not(test))]
-fn conversation_workspace_root(
+fn conversation_worktree_name(conversation_id: &str) -> String {
+    let random = conversation_id
+        .strip_prefix("conv_")
+        .unwrap_or(conversation_id)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    if random.is_empty() {
+        "conversation".to_owned()
+    } else {
+        random
+    }
+}
+
+/// A conversation, one of its project's workspaces as registered, and the
+/// worktree it records for that workspace, read under the storage lock with
+/// the registered directory leased exclusively: creating and releasing a
+/// worktree are writes to the repository at that directory.
+#[cfg(not(test))]
+struct WorktreeOperation {
+    conversation_id: String,
+    registered: model::AttachedWorkspace,
+    existing: Option<ConversationWorktree>,
+    place: GitPlace,
+    /// The recorded worktree's own directory, held exclusively for a release:
+    /// a terminal or a dev server still running in it holds it shared, and
+    /// removing a directory out from under them is what this refuses.
+    _worktree_lease: Option<Box<dyn Send>>,
+}
+
+#[cfg(not(test))]
+fn worktree_operation(
     app: &AppHandle,
     state: &AppState,
     conversation_id: &str,
+    member: Option<u32>,
     request_label: &str,
-) -> Result<(String, Option<ConversationWorktree>), String> {
-    let document = state.document_store.read(&document_path(app)?)?;
-    let (workspace, conversation) =
-        trusted_workspace_and_conversation(&document, conversation_id, request_label)?;
-    if workspace.kind != WorkspaceKind::Directory {
-        return Err("只有目录工作区才能使用隔离工作树".into());
-    }
-    if workspace.path.trim().is_empty() {
-        return Err(format!("工作区 {} 的路径为空", workspace.id));
-    }
-    Ok((workspace.path.clone(), conversation.worktree.clone()))
+    hold_worktree: bool,
+) -> Result<WorktreeOperation, String> {
+    let (conversation, registered, existing, target) = {
+        let _guard = state
+            .storage_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let document = state.document_store.read(&document_path(app)?)?;
+        let (workspace, conversation) =
+            trusted_workspace_and_conversation(&document, conversation_id, request_label)?;
+        if workspace.kind != WorkspaceKind::Directory {
+            return Err("只有目录工作区才能使用隔离工作树".into());
+        }
+        let target = GitTarget::Workspace {
+            workspace_id: workspace.id.clone(),
+            member,
+        };
+        let (position, registered) =
+            match workspace_lookup::resolve_git_target(&document, &target, request_label)? {
+                workspace_lookup::ResolvedGitTarget::Workspace {
+                    member: Some(member),
+                    ..
+                } => (member.position, member.workspace.clone()),
+                _ => (1, primary_location(workspace)),
+            };
+        let existing = conversation.worktree_for(position, &registered).cloned();
+        (conversation.id.clone(), registered, existing, target)
+    };
+    // The registered directory itself, held exclusively on behalf of the
+    // conversation: a worktree is made from, and released into, its repository.
+    let place = trusted_git_place(
+        app,
+        state,
+        &target,
+        request_label,
+        TrustedWorkspaceAccess::Exclusive,
+        None,
+    )?;
+    let worktree_key = match (&place, &existing) {
+        (_, None) => None,
+        _ if !hold_worktree => None,
+        (GitPlace::Local(_), Some(worktree)) => std::fs::canonicalize(&worktree.path)
+            .ok()
+            .map(WorkspaceKey::new),
+        (GitPlace::Remote { checkout, .. }, Some(worktree)) => Some(WorkspaceKey::new(format!(
+            "{}|{}",
+            checkout.machine_key, worktree.path
+        ))),
+    };
+    let worktree_lease = match worktree_key {
+        Some(key) => Some(Box::new(
+            state
+                .operation_gate()
+                .begin_workspace_mutation(key, Some(conversation.clone()))?,
+        ) as Box<dyn Send>),
+        None => None,
+    };
+    Ok(WorktreeOperation {
+        conversation_id: conversation,
+        registered,
+        existing,
+        place,
+        _worktree_lease: worktree_lease,
+    })
 }
 
-/// Creates an isolated worktree for a conversation and returns its record.
-/// The caller persists the conversation pointer because document state and the
-/// worktree's filesystem existence are separate facts.
+/// Creates an isolated worktree of one of a conversation's project workspaces
+/// — on whichever machine it is — and returns its record. The caller persists
+/// the record on the conversation, because the document and the worktree's
+/// existence on disk are separate facts.
+///
+/// `member` is the project workspace, 1-based; absent is workspace 1.
 #[cfg(not(test))]
 #[tauri::command]
 async fn create_conversation_worktree(
     app: AppHandle,
     state: State<'_, AppState>,
     conversation_id: String,
+    member: Option<u32>,
     from_branch: Option<String>,
 ) -> Result<ConversationWorktree, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // Creating a worktree requires an exclusive lease within its workspace.
-        //
-        // Create and release require conversation addressing: an isolated
-        // worktree belongs to a conversation and cannot exist without one.
-        let _operation = trusted_workspace_operation(
+        let operation = worktree_operation(
             &app,
             &state,
             &conversation_id,
+            member,
             "隔离工作树创建请求",
-            TrustedWorkspaceAccess::Exclusive,
+            false,
         )?;
-        let (root, existing) =
-            conversation_workspace_root(&app, &state, &conversation_id, "隔离工作树创建请求")?;
-        if let Some(worktree) = existing {
-            if Path::new(&worktree.path).is_dir() {
-                // Reuse an existing worktree. Re-creation only fails because
-                // its branch already exists and provides no useful signal.
-                return Ok(worktree);
+        let from_branch = from_branch.filter(|value| !value.trim().is_empty());
+        let name = conversation_worktree_name(&operation.conversation_id);
+        let created = match &operation.place {
+            GitPlace::Local(_) => {
+                if let Some(worktree) = operation.existing {
+                    if Path::new(&worktree.path).is_dir() {
+                        // Reuse an existing worktree. Re-creation only fails because
+                        // its branch already exists and provides no useful signal.
+                        return Ok(worktree);
+                    }
+                }
+                git::create_conversation_worktree(
+                    Path::new(&operation.registered.path),
+                    &name,
+                    from_branch.as_deref(),
+                )?
+            }
+            GitPlace::Remote { checkout, .. } => {
+                // A record for a remote workspace is trusted rather than checked
+                // (see `usable_worktree`), so it is handed back as it is.
+                if let Some(worktree) = operation.existing {
+                    return Ok(worktree);
+                }
+                remote_git::create_conversation_worktree(checkout, &name, from_branch)?
+            }
+        };
+        git_flight::forget(&operation.place.flight_key());
+        // The record the renderer saves next names this directory as where the
+        // conversation's tools run; only a worktree made here may be saved so.
+        match &operation.place {
+            GitPlace::Local(_) => {
+                state.authorize_workspace(Path::new(&created.path))?;
+            }
+            GitPlace::Remote { checkout, .. } => {
+                state.authorize_remote_workspace(&checkout.machine_key, &created.path);
             }
         }
-        let worktree = git::create_conversation_worktree(
-            Path::new(&root),
-            &conversation_id,
-            from_branch
-                .as_deref()
-                .filter(|value| !value.trim().is_empty()),
-        )?;
         Ok(ConversationWorktree {
-            path: worktree.path.to_string_lossy().into_owned(),
-            branch: worktree.branch,
-            base_oid: worktree.base_oid,
+            path: created.path,
+            branch: created.branch,
+            base_oid: created.base_oid,
+            base_branch: created.base_branch,
+            workspace: Some(operation.registered),
         })
     })
     .await
     .map_err(|error| format!("创建隔离工作树的后台任务失败: {error}"))?
 }
 
-/// Releases a conversation's isolated worktree.
+/// Releases a conversation's isolated worktree of one of its project
+/// workspaces.
 ///
-/// `true` means the worktree and branch were removed. `false` preserves uncommitted
-/// changes or extra commits on disk; in both cases the caller clears the pointer.
+/// `true` means the worktree and branch were removed. `false` preserves
+/// uncommitted changes or extra commits on disk; in both cases the caller
+/// clears the record.
 #[cfg(not(test))]
 #[tauri::command]
 async fn release_conversation_worktree(
     app: AppHandle,
     state: State<'_, AppState>,
     conversation_id: String,
+    member: Option<u32>,
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _operation = trusted_workspace_operation(
+        let operation = worktree_operation(
             &app,
             &state,
             &conversation_id,
+            member,
             "隔离工作树释放请求",
-            TrustedWorkspaceAccess::Exclusive,
+            true,
         )?;
-        let (root, existing) =
-            conversation_workspace_root(&app, &state, &conversation_id, "隔离工作树释放请求")?;
         // No registered worktree means there is nothing to release; this is not
         // an error.
-        let Some(worktree) = existing else {
+        let Some(worktree) = operation.existing else {
             return Ok(true);
         };
-        git::release_conversation_worktree(Path::new(&root), &worktree)
+        let released = match &operation.place {
+            GitPlace::Local(_) => git::release_conversation_worktree(
+                Path::new(&operation.registered.path),
+                &worktree,
+            )?,
+            GitPlace::Remote { checkout, .. } => remote_git::release_worktree(checkout, &worktree)?,
+        };
+        git_flight::forget(&operation.place.flight_key());
+        Ok(released)
     })
     .await
     .map_err(|error| format!("释放隔离工作树的后台任务失败: {error}"))?
@@ -4980,14 +5120,14 @@ async fn prepare_git_discard(
 ) -> Result<git::GitDiscardPreparation, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_git_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "Git 丢弃确认请求",
-            TrustedWorkspaceAccess::Shared,
-        )?;
-        git::prepare_discard(&operation.workspace_path, &paths, include_untracked)
+        match trusted_git_read_place(&app, &state, &target, "Git 丢弃确认请求")? {
+            GitPlace::Local(operation) => {
+                git::prepare_discard(&operation.workspace_path, &paths, include_untracked)
+            }
+            GitPlace::Remote { checkout, .. } => {
+                remote_git::prepare_discard(&checkout, paths, include_untracked)
+            }
+        }
     })
     .await
     .map_err(|error| format!("准备 Git 丢弃确认的后台任务失败: {error}"))?
@@ -5007,8 +5147,14 @@ async fn execute_git_action(
         // storage lock. A model/tool start racing this action therefore loses
         // atomically at the same coordinator rather than slipping through a
         // check/start gap.
-        let operation = trusted_git_write_operation(&app, &state, &target, "Git 操作请求", "Git")?;
-        git::execute_action(&operation.workspace_path, action)
+        let place = trusted_git_write_place(&app, &state, &target, "Git 操作请求", "Git")?;
+        let result = match &place {
+            GitPlace::Local(operation) => git::execute_action(&operation.workspace_path, action),
+            GitPlace::Remote { checkout, .. } => remote_git::execute_action(checkout, action),
+        };
+        // A failed write may still have changed the checkout part of the way.
+        git_flight::forget(&place.flight_key());
+        result
     })
     .await
     .map_err(|error| format!("执行 Git 操作的后台任务失败: {error}"))?
@@ -5142,9 +5288,13 @@ impl<'a> TerminalOwner<'a> {
                 project,
                 conversation,
             } => conversation_workspace_set(document, project, conversation, anchor),
-            Self::Draft { project, .. } => {
-                project_workspace_set(document, project, project.member_workspaces(), anchor)
-            }
+            Self::Draft { project, .. } => project_workspace_set(
+                document,
+                project,
+                None,
+                project.member_workspaces(),
+                anchor,
+            ),
         }
     }
 }
@@ -5229,18 +5379,15 @@ fn terminal_launch_plan(
                 no_op_terminal_command_leases(),
             )
         }
-    } else if let Some(machine) = project
-        .machine
-        .as_ref()
-        .filter(|_| project.kind == WorkspaceKind::Directory)
-    {
-        let runner = crate::run_environment::resolve_shell_runner(
-            &document.assets.execution_environments,
-            Some(machine),
-            Some(&project.path),
-        )?;
+    } else if project.machine.is_some() && project.kind == WorkspaceKind::Directory {
+        // Workspace 1 on another machine: its entry in the set is the
+        // conversation's worktree there, or the recorded root.
+        let workspaces = owner.workspace_set(&document, &anchor)?;
+        let entry = workspaces
+            .primary()
+            .ok_or_else(|| "终端请求的对话没有工作区 1".to_owned())?;
         (
-            terminal::TerminalLaunch::remote(&runner, &project.path, Path::new(&anchor), shell)?,
+            terminal::TerminalLaunch::remote(&entry.runner, &entry.root, Path::new(&anchor), shell)?,
             Box::new(()) as terminal::TerminalCommandLease,
             no_op_terminal_command_leases(),
         )
@@ -6005,7 +6152,7 @@ mod authoritative_contexts_tests {
             queued_messages: Vec::new(),
             branches: Vec::new(),
             user_aborted_tasks: Vec::new(),
-            worktree: None,
+            worktrees: Vec::new(),
             run_target: None,
             additional_directories: Vec::new(),
             parent_conversation_id: None,
@@ -6118,27 +6265,25 @@ fn environment_machine(
 /// only the host-side anchor, and nothing about it — its Git status least of
 /// all — describes where the model is working.
 #[cfg(not(test))]
-fn environment_facts(
-    request: &RunModelRequest,
-    conversation: &Conversation,
-) -> environment_prompt::EnvironmentFacts {
+fn environment_facts(request: &RunModelRequest) -> environment_prompt::EnvironmentFacts {
     let workspaces = environment_workspaces(&request.workspaces);
+    // The set says whether workspace 1 is a worktree after the same fallbacks
+    // the calls take: a recorded worktree whose directory is gone resolved to
+    // the workspace root, and the block must not claim otherwise.
+    let is_worktree = request
+        .workspaces
+        .primary()
+        .is_some_and(|primary| primary.is_worktree);
     match request.workspaces.primary() {
         Some(primary) if !primary.is_local() => environment_prompt::EnvironmentFacts::collect_remote(
             &primary.root,
             environment_machine(primary),
+            is_worktree,
             workspaces,
         ),
         _ => environment_prompt::EnvironmentFacts::collect(
             Path::new(&request.workspace_path),
-            // `effective_workspace_path` returns the worktree path verbatim
-            // when it used one, so equality is the honest test: a recorded
-            // worktree whose directory is gone fell back to the workspace
-            // root, and the block must not claim otherwise.
-            conversation
-                .worktree
-                .as_ref()
-                .is_some_and(|worktree| worktree.path == request.workspace_path),
+            is_worktree,
             workspaces,
         ),
     }
@@ -6268,7 +6413,7 @@ fn trusted_run_request(
         &profile,
         &environment_prompt::environment_section(
             &profile,
-            &environment_facts(&request, conversation),
+            &environment_facts(&request),
         ),
         &runtime.addendum,
         conversation
@@ -6466,6 +6611,11 @@ fn trusted_provider(
 #[cfg(not(test))]
 struct TrustedConversationPolicy {
     workspace_path: String,
+    /// Where the save looks up a manually executed card's receipt when that is
+    /// not `workspace_path`: the registered root of a workspace 1 on another
+    /// machine, whose calls run from a host-side anchor directory instead
+    /// (see `storage::tool_receipt_roots`).
+    receipt_root: Option<String>,
     /// Extra directories this conversation was granted. They widen the
     /// filesystem boundary exactly as the workspace does, so a manually executed
     /// tool card is classified against the same set a model run is.
@@ -6498,30 +6648,176 @@ enum TrustedWorkspaceAccess {
 #[cfg(not(test))]
 struct TrustedWorkspaceOperation {
     workspace_path: PathBuf,
+    /// The canonical form the lease is keyed by.
+    canonical_path: PathBuf,
     /// Held, never read: the operation owns the workspace for as long as it lives.
     _lease: Box<dyn Send>,
 }
 
+/// A Git or file request's checkout, as the trusted document places it.
 #[cfg(not(test))]
-fn trusted_workspace_operation(
-    app: &AppHandle,
-    state: &AppState,
-    requested_conversation: &str,
-    request_label: &str,
-    access: TrustedWorkspaceAccess,
-) -> Result<TrustedWorkspaceOperation, String> {
-    trusted_target_workspace_operation(
-        app,
-        state,
-        &GitTarget::Conversation {
-            conversation_id: requested_conversation.to_owned(),
-        },
-        request_label,
-        access,
-        None,
-    )
+struct ResolvedCheckout {
+    /// Machine the checkout is on; `None` for this one.
+    machine: Option<model::RunTarget>,
+    /// Its root on that machine: the conversation's worktree of the workspace
+    /// when it has a usable one, the registered directory otherwise.
+    root: String,
+    /// The project workspace the checkout belongs to, as registered.
+    registered: model::AttachedWorkspace,
+    /// The conversation the request is made for, which a lease is attributed to.
+    attribution: Option<String>,
+    /// Conversations whose model runs may be writing this checkout — every one
+    /// working in the registered directory rather than a worktree of its own —
+    /// which a Git write has to wait for.
+    writers: Vec<String>,
 }
 
+/// Where the project's workspace 1 is registered.
+#[cfg(not(test))]
+fn primary_location(workspace: &Workspace) -> model::AttachedWorkspace {
+    model::AttachedWorkspace {
+        machine: workspace.machine.clone(),
+        path: workspace.path.clone(),
+    }
+}
+
+/// The worktree that stands in for the project workspace at 1-based
+/// `position`, registered at `registered`, when it can.
+///
+/// On this machine its directory must still exist: a stale record falls back
+/// to the registered directory rather than make the conversation unusable. On
+/// another machine the record is trusted — checking would put a round trip to
+/// the machine in front of every tool call — and a worktree that has gone is
+/// reported by the first thing run in it, and released like any other.
+#[cfg(not(test))]
+fn usable_worktree<'a>(
+    conversation: &'a Conversation,
+    position: usize,
+    registered: &model::AttachedWorkspace,
+) -> Option<&'a ConversationWorktree> {
+    conversation
+        .worktree_for(position, registered)
+        .filter(|worktree| registered.machine.is_some() || Path::new(&worktree.path).is_dir())
+}
+
+/// The conversations of `workspace` working in the project workspace at
+/// `position` itself rather than in a worktree of it.
+#[cfg(not(test))]
+fn conversations_at_registered_root(
+    workspace: &Workspace,
+    position: usize,
+    registered: &model::AttachedWorkspace,
+) -> Vec<String> {
+    workspace
+        .conversations
+        .iter()
+        .filter(|conversation| usable_worktree(conversation, position, registered).is_none())
+        .map(|conversation| conversation.id.clone())
+        .collect()
+}
+
+/// Places a Git or file target's checkout from the trusted document.
+///
+/// A conversation target is the conversation's own checkout of the project
+/// workspace it names — its worktree when it has one — and a workspace target
+/// the workspace's registered directory. A temporary project has only its
+/// conversation's scratch directory.
+#[cfg(not(test))]
+fn resolve_checkout(
+    document: &AppDocument,
+    app_data: &Path,
+    target: &GitTarget,
+    request_label: &str,
+) -> Result<ResolvedCheckout, String> {
+    use workspace_lookup::ResolvedGitTarget;
+    let resolved = workspace_lookup::resolve_git_target(document, target, request_label)?;
+    let (workspace, conversation, position, registered) = match resolved {
+        ResolvedGitTarget::Conversation {
+            workspace,
+            conversation,
+            member,
+        } => match member {
+            Some(member) => (
+                workspace,
+                Some(conversation),
+                member.position,
+                member.workspace.clone(),
+            ),
+            None => (workspace, Some(conversation), 1, primary_location(workspace)),
+        },
+        ResolvedGitTarget::Workspace { workspace, member } => match member {
+            Some(member) => (workspace, None, member.position, member.workspace.clone()),
+            None => (workspace, None, 1, primary_location(workspace)),
+        },
+    };
+    if workspace.kind != WorkspaceKind::Directory {
+        // Only a conversation target reaches a temporary project; its checkout
+        // is the conversation's own scratch directory on this machine.
+        let conversation = conversation.ok_or_else(|| format!("{request_label}只能按目录工作区寻址"))?;
+        return Ok(ResolvedCheckout {
+            machine: None,
+            root: effective_workspace_path(app_data, workspace, conversation)?,
+            registered,
+            attribution: Some(conversation.id.clone()),
+            writers: Vec::new(),
+        });
+    }
+    let worktree = conversation.and_then(|conversation| usable_worktree(conversation, position, &registered));
+    let writers = match worktree {
+        Some(_) => Vec::new(),
+        None => conversations_at_registered_root(workspace, position, &registered),
+    };
+    Ok(ResolvedCheckout {
+        machine: registered.machine.clone(),
+        root: worktree
+            .map(|worktree| worktree.path.clone())
+            .unwrap_or_else(|| registered.path.clone()),
+        attribution: conversation.map(|conversation| conversation.id.clone()),
+        writers,
+        registered,
+    })
+}
+
+/// A checkout on this machine under the lease `access` asks for.
+#[cfg(not(test))]
+fn lease_local_checkout(
+    state: &AppState,
+    checkout: ResolvedCheckout,
+    request_label: &str,
+    access: TrustedWorkspaceAccess,
+    write_surface: Option<&str>,
+) -> Result<TrustedWorkspaceOperation, String> {
+    let workspace_path = PathBuf::from(&checkout.root);
+    // Evaluate before leasing under the storage lock to avoid missing a run that
+    // will write next and to preserve the specific conflict reason.
+    if let Some(surface) = write_surface {
+        reject_git_write_during_model_run(state, &checkout, surface)?;
+    }
+    let canonical_path = std::fs::canonicalize(&workspace_path).map_err(|error| {
+        format!(
+            "{request_label}的工作区路径不存在或无法访问（{}）: {error}",
+            workspace_path.display()
+        )
+    })?;
+    let workspace_key = WorkspaceKey::new(canonical_path.clone());
+    let operation_gate = state.operation_gate();
+    let lease: Box<dyn Send> = match access {
+        TrustedWorkspaceAccess::Shared => Box::new(
+            operation_gate.begin_workspace_operation(workspace_key, checkout.attribution.clone())?,
+        ),
+        TrustedWorkspaceAccess::Exclusive => Box::new(
+            operation_gate.begin_workspace_mutation(workspace_key, checkout.attribution.clone())?,
+        ),
+    };
+    Ok(TrustedWorkspaceOperation {
+        workspace_path,
+        canonical_path,
+        _lease: lease,
+    })
+}
+
+/// A checkout on this filesystem, for what can only act on one: the file
+/// pane and the browser's file picker.
 #[cfg(not(test))]
 fn trusted_target_workspace_operation(
     app: &AppHandle,
@@ -6543,95 +6839,16 @@ fn trusted_target_workspace_operation(
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
-    let resolved_target = workspace_lookup::resolve_git_target(&document, target, request_label)?;
-    // Git, worktrees and the file pane act on a checkout in this filesystem. A
-    // workspace on another machine has none here, and resolving its path
-    // locally would act on whatever sits at the same spelling on this host.
-    // A project's further workspace is held to the same rule by its own
-    // machine, not by workspace 1's.
-    let target_machine = match &resolved_target {
-        workspace_lookup::ResolvedGitTarget::Conversation { workspace, .. }
-        | workspace_lookup::ResolvedGitTarget::Workspace {
-            workspace,
-            member: None,
-        } => workspace.machine.as_ref(),
-        workspace_lookup::ResolvedGitTarget::Workspace {
-            member: Some(member),
-            ..
-        } => member.machine.as_ref(),
-    };
-    if let Some(machine) = target_machine {
+    let checkout = resolve_checkout(&document, &app_data, target, request_label)?;
+    // A workspace on another machine has no checkout here, and resolving its
+    // path locally would act on whatever sits at the same spelling on this host.
+    if let Some(machine) = &checkout.machine {
         return Err(format!(
-            "{request_label}的工作区在另一台机器上（{}），本机的 Git 与文件操作无法作用于它",
+            "{request_label}的工作区在另一台机器上（{}），本机的文件操作无法作用于它",
             workspace_machine_label(&document.assets.execution_environments, machine)
         ));
     }
-    // Workspace-addressed writes have no conversation to inspect, so they collect the
-    // conversations running against the same root checkout; isolated-worktree
-    // conversations use another directory and are excluded. A project's further
-    // workspace has no worktree counterpart — every conversation in the project
-    // reaches the same directory — so all of them count.
-    let (workspace_path, attribution, root_conversation_ids) = match resolved_target {
-        workspace_lookup::ResolvedGitTarget::Conversation {
-            workspace,
-            conversation,
-        } => (
-            effective_workspace_path(&app_data, workspace, conversation)?,
-            Some(conversation.id.clone()),
-            Vec::new(),
-        ),
-        workspace_lookup::ResolvedGitTarget::Workspace {
-            workspace,
-            member: None,
-        } => (
-            workspace.path.clone(),
-            None,
-            workspace
-                .conversations
-                .iter()
-                .filter(|conversation| !conversation_runs_in_its_own_worktree(conversation))
-                .map(|conversation| conversation.id.clone())
-                .collect(),
-        ),
-        workspace_lookup::ResolvedGitTarget::Workspace {
-            workspace,
-            member: Some(member),
-        } => (
-            member.path.clone(),
-            None,
-            workspace
-                .conversations
-                .iter()
-                .map(|conversation| conversation.id.clone())
-                .collect(),
-        ),
-    };
-    let workspace_path = PathBuf::from(workspace_path);
-    // Evaluate before leasing under the storage lock to avoid missing a run that
-    // will write next and to preserve the specific conflict reason.
-    if let Some(surface) = write_surface {
-        reject_git_write_during_model_run(state, target, &root_conversation_ids, surface)?;
-    }
-    let canonical_workspace = std::fs::canonicalize(&workspace_path).map_err(|error| {
-        format!(
-            "{request_label}的工作区路径不存在或无法访问（{}）: {error}",
-            workspace_path.display()
-        )
-    })?;
-    let workspace_key = WorkspaceKey::new(canonical_workspace);
-    let operation_gate = state.operation_gate();
-    let lease: Box<dyn Send> = match access {
-        TrustedWorkspaceAccess::Shared => {
-            Box::new(operation_gate.begin_workspace_operation(workspace_key, attribution)?)
-        }
-        TrustedWorkspaceAccess::Exclusive => {
-            Box::new(operation_gate.begin_workspace_mutation(workspace_key, attribution)?)
-        }
-    };
-    Ok(TrustedWorkspaceOperation {
-        workspace_path,
-        _lease: lease,
-    })
+    lease_local_checkout(state, checkout, request_label, access, write_surface)
 }
 
 /// The name a message shows for a machine: the distribution, or the SSH
@@ -6653,16 +6870,6 @@ fn workspace_machine_label(
                 .unwrap_or(machine_id)
         ),
     }
-}
-
-/// Match `effective_workspace_path` exactly: a conversation runs in its worktree
-/// only when it is registered and the directory exists; otherwise it runs at root.
-#[cfg(not(test))]
-fn conversation_runs_in_its_own_worktree(conversation: &Conversation) -> bool {
-    conversation
-        .worktree
-        .as_ref()
-        .is_some_and(|worktree| Path::new(&worktree.path).is_dir())
 }
 
 #[cfg(not(test))]
@@ -6711,8 +6918,14 @@ fn trusted_conversation_policy_from_document(
     // manually executed tool card addresses the same numbered list.
     let workspaces = conversation_workspace_set(document, workspace, conversation, &workspace_path)?;
     let run_environment = workspaces.primary_runner();
+    // A temporary project's receipts are matched in any directory.
+    let receipt_root = (workspace.kind == WorkspaceKind::Directory)
+        .then(|| storage::tool_receipt_roots(workspace, conversation))
+        .filter(|roots| !roots.contains(&workspace_path.as_str()))
+        .and_then(|roots| roots.first().map(|root| (*root).to_owned()));
     Ok(TrustedConversationPolicy {
         workspace_path,
+        receipt_root,
         additional_directories: workspaces.local_roots(),
         security_level: conversation.settings.security_level,
         enabled_tools,
@@ -6742,7 +6955,7 @@ fn effective_workspace_path(
         app_data,
         workspace,
         &conversation.id,
-        conversation.worktree.as_ref(),
+        conversation.worktree_for(1, &primary_location(workspace)),
     )
 }
 
@@ -6765,9 +6978,8 @@ fn workspace_anchor_path(
             // The host still needs a local directory for its own subsystems —
             // preview, LSP, image staging, the shell's cwd file — so such a
             // conversation anchors in its own scratch directory, and the
-            // remote root reaches the tools through the workspace set instead.
-            // A recorded worktree cannot exist for it: worktrees are Git
-            // checkouts the host makes on this machine.
+            // remote root — or the worktree standing in for it — reaches the
+            // tools through the workspace set instead.
             if workspace.machine.is_some() {
                 return workspace_dirs::ensure_remote_workspace_anchor(app_data, owner_id)
                     .map(|path| path.to_string_lossy().into_owned());
@@ -6796,33 +7008,11 @@ fn workspace_anchor_path(
     }
 }
 
-/// The primary workspace as the numbered set records it: entry 1, on the
-/// machine the workspace is registered on.
-///
-/// `anchor` is what [`effective_workspace_path`] returned. For a workspace on
-/// this machine it is the directory the calls act in — the worktree when the
-/// conversation has one — and it is entry 1 verbatim. For a workspace on
-/// another machine it is only the host-side scratch directory, and entry 1 is
-/// the recorded remote root instead.
-#[cfg(not(test))]
-fn primary_workspace(workspace: &Workspace, anchor: &str) -> model::AttachedWorkspace {
-    match &workspace.machine {
-        Some(machine) if workspace.kind == WorkspaceKind::Directory => model::AttachedWorkspace {
-            machine: Some(machine.clone()),
-            path: workspace.path.clone(),
-        },
-        _ => model::AttachedWorkspace {
-            machine: None,
-            path: anchor.to_owned(),
-        },
-    }
-}
-
 /// A conversation's numbered workspaces, resolved from one read of the document.
 ///
-/// `anchor` is what [`effective_workspace_path`] returned. Workspace 1's
-/// variables are the project's registered directory's, so a conversation in a
-/// worktree runs with the variables of the directory it was checked out from.
+/// `anchor` is what [`effective_workspace_path`] returned. Every project
+/// workspace the conversation has a worktree of is that worktree, with the
+/// variables of the directory it was checked out from.
 #[cfg(not(test))]
 fn conversation_workspace_set(
     document: &AppDocument,
@@ -6833,6 +7023,7 @@ fn conversation_workspace_set(
     Ok(project_workspace_set(
         document,
         workspace,
+        Some(conversation),
         &workspace.conversation_workspaces_after_primary(conversation),
         anchor,
     )?
@@ -6840,25 +7031,68 @@ fn conversation_workspace_set(
 }
 
 /// [`conversation_workspace_set`] with the workspaces after workspace 1 given
-/// directly, for an owner that is not a conversation yet.
+/// directly, for an owner that may not be a conversation yet — a draft, which
+/// has no worktrees.
+///
+/// `anchor` is what [`effective_workspace_path`] returned. For a workspace on
+/// this machine it is the directory the calls act in — the worktree when the
+/// conversation has one — and it is entry 1 verbatim. For a workspace on
+/// another machine it is only the host-side scratch directory, and entry 1 is
+/// the conversation's worktree there, or the recorded remote root.
 #[cfg(not(test))]
 fn project_workspace_set(
     document: &AppDocument,
     workspace: &Workspace,
+    conversation: Option<&model::Conversation>,
     after_primary: &[model::AttachedWorkspace],
     anchor: &str,
 ) -> Result<crate::workspace_set::WorkspaceSet, String> {
-    let primary = primary_workspace(workspace, anchor);
-    let primary_env_path = if workspace.kind == WorkspaceKind::Directory {
-        workspace.path.as_str()
-    } else {
-        primary.path.as_str()
+    use crate::workspace_set::WorkspaceEntry;
+    let stand_in = |position: usize, registered: &model::AttachedWorkspace| {
+        conversation
+            .and_then(|conversation| usable_worktree(conversation, position, registered))
+            .map(|worktree| WorkspaceEntry {
+                workspace: model::AttachedWorkspace {
+                    machine: registered.machine.clone(),
+                    path: worktree.path.clone(),
+                },
+                env_path: registered.path.clone(),
+                is_worktree: true,
+            })
     };
-    let set = crate::workspace_set::WorkspaceSet::resolve_with_primary_env(
+    let primary = match (&workspace.kind, &workspace.machine) {
+        (WorkspaceKind::Directory, Some(_)) => {
+            let registered = primary_location(workspace);
+            stand_in(1, &registered).unwrap_or_else(|| WorkspaceEntry::registered(registered))
+        }
+        // On this machine the anchor already is the worktree when there is one.
+        (WorkspaceKind::Directory, None) => WorkspaceEntry {
+            workspace: model::AttachedWorkspace {
+                machine: None,
+                path: anchor.to_owned(),
+            },
+            env_path: workspace.path.clone(),
+            is_worktree: anchor != workspace.path,
+        },
+        _ => WorkspaceEntry::registered(model::AttachedWorkspace {
+            machine: None,
+            path: anchor.to_owned(),
+        }),
+    };
+    let members = workspace.member_workspaces().len();
+    let entries = std::iter::once(primary)
+        .chain(after_primary.iter().enumerate().map(|(offset, attached)| {
+            // The project's own workspaces come first; a conversation's attached
+            // ones never have worktrees.
+            (offset < members)
+                .then(|| stand_in(offset + 2, attached))
+                .flatten()
+                .unwrap_or_else(|| WorkspaceEntry::registered(attached.clone()))
+        }))
+        .collect::<Vec<_>>();
+    let set = crate::workspace_set::WorkspaceSet::resolve_entries(
         &document.assets.execution_environments,
-        &primary,
-        primary_env_path,
-        after_primary,
+        &entries,
     )?;
     // A WSL distribution is probed for its shells the first time this process
     // runs something for a workspace on it. SSH machines are probed when their
@@ -6869,6 +7103,73 @@ fn project_workspace_set(
         }
     }
     Ok(set)
+}
+
+/// Installs what reaches other machines: the agent link hub — SSH machines
+/// through the agent Mework keeps on them, whose builds ship as resources, and
+/// the agent it starts in a WSL distribution or a sandbox cell here — and the
+/// probe of each machine's shells. The desktop app and the browser-dev backend
+/// both run it, so a remote workspace works the same in each.
+#[cfg(not(test))]
+fn install_machine_links(app: &AppHandle, app_data: &Path) {
+    let mut agent_dirs = Vec::new();
+    if let Ok(resources) = app.path().resource_dir() {
+        agent_dirs.push(resources.join("remote-agents"));
+    }
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        agent_dirs.push(exe_dir.join("remote-agents"));
+    }
+    let push_events = app.state::<AppState>().push_events.clone();
+    remote_link::install(
+        app_data,
+        agent_dirs,
+        Some(Box::new(move |host, status| {
+            use remote_agent::client::LinkStatus;
+            let (state, detail) = match status {
+                LinkStatus::Connecting => (push_events::RemoteLinkState::Connecting, None),
+                LinkStatus::Connected { .. } => (push_events::RemoteLinkState::Connected, None),
+                LinkStatus::Reconnecting { error, .. } => (
+                    push_events::RemoteLinkState::Reconnecting,
+                    Some(error.clone()).filter(|error| !error.is_empty()),
+                ),
+                LinkStatus::Lost { error } => {
+                    (push_events::RemoteLinkState::Lost, Some(error.clone()))
+                }
+                LinkStatus::Unavailable { error } => {
+                    (push_events::RemoteLinkState::Unavailable, Some(error.clone()))
+                }
+                LinkStatus::Closed => return,
+            };
+            push_events.publish(push_events::AppPushEvent::RemoteLinkChanged {
+                host: host.to_owned(),
+                state,
+                detail,
+            });
+        })),
+    );
+    // Each machine's shell backends: this one now, an SSH machine the first
+    // time this process reaches it, a WSL distribution the first time
+    // something runs there.
+    let shells_events = app.state::<AppState>().push_events.clone();
+    machine_shells::install(
+        app_data,
+        Some(Box::new(move |key, shells| {
+            shells_events.publish(push_events::AppPushEvent::MachineShellsChanged {
+                key: key.to_owned(),
+                shells: shells.clone(),
+            });
+        })),
+    );
+    std::thread::spawn(|| {
+        machine_shells::local();
+    });
+    let reach_app = app.clone();
+    remote_link::on_first_reach(Box::new(move |runner| {
+        probe_ssh_endpoint(&reach_app, &runner);
+    }));
 }
 
 #[cfg(not(test))]
@@ -7850,66 +8151,7 @@ pub fn run() {
                     eprintln!("内置提示词档案未能落盘：{error}");
                 }
                 browser_file_preview::sweep_orphans(app_data);
-                // SSH machines are reached through the agent Mework keeps on
-                // them; the builds it installs there ship as resources.
-                let mut agent_dirs = Vec::new();
-                if let Ok(resources) = app.path().resource_dir() {
-                    agent_dirs.push(resources.join("remote-agents"));
-                }
-                if let Some(exe_dir) = std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| exe.parent().map(Path::to_path_buf))
-                {
-                    agent_dirs.push(exe_dir.join("remote-agents"));
-                }
-                let push_events = app.state::<AppState>().push_events.clone();
-                remote_link::install(
-                    app_data,
-                    agent_dirs,
-                    Some(Box::new(move |host, status| {
-                        use remote_agent::client::LinkStatus;
-                        let (state, detail) = match status {
-                            LinkStatus::Connecting => (push_events::RemoteLinkState::Connecting, None),
-                            LinkStatus::Connected { .. } => (push_events::RemoteLinkState::Connected, None),
-                            LinkStatus::Reconnecting { error, .. } => (
-                                push_events::RemoteLinkState::Reconnecting,
-                                Some(error.clone()).filter(|error| !error.is_empty()),
-                            ),
-                            LinkStatus::Lost { error } => {
-                                (push_events::RemoteLinkState::Lost, Some(error.clone()))
-                            }
-                            LinkStatus::Unavailable { error } => {
-                                (push_events::RemoteLinkState::Unavailable, Some(error.clone()))
-                            }
-                            LinkStatus::Closed => return,
-                        };
-                        push_events.publish(push_events::AppPushEvent::RemoteLinkChanged {
-                            host: host.to_owned(),
-                            state,
-                            detail,
-                        });
-                    })),
-                );
-                // Each machine's shell backends: this one now, an SSH machine
-                // the first time this process reaches it, a WSL distribution
-                // the first time something runs there.
-                let shells_events = app.state::<AppState>().push_events.clone();
-                machine_shells::install(
-                    app_data,
-                    Some(Box::new(move |key, shells| {
-                        shells_events.publish(push_events::AppPushEvent::MachineShellsChanged {
-                            key: key.to_owned(),
-                            shells: shells.clone(),
-                        });
-                    })),
-                );
-                std::thread::spawn(|| {
-                    machine_shells::local();
-                });
-                let reach_app = app.handle().clone();
-                remote_link::on_first_reach(Box::new(move |runner| {
-                    probe_ssh_endpoint(&reach_app, &runner);
-                }));
+                install_machine_links(app.handle(), app_data);
             }
             reconcile_image_attachments_on_startup(app.handle()).map_err(std::io::Error::other)?;
             install_background_write_failure_reporting(app.state::<AppState>().inner());

@@ -1,5 +1,7 @@
 import {
+  getGitChangePage,
   getGitWorkspaceSummary,
+  gitSnapshotKeyConversation,
   summaryToGitWorkspaceSnapshot
 } from "./git";
 import type { GitTarget, GitWorkspaceSnapshot, GitWorkspaceSummaryResult } from "./git";
@@ -72,9 +74,10 @@ export function gitSnapshotsAfterWorkspaceMutation(
 }
 
 /**
- * Moves a draft's snapshot to the real conversation key on redemption.
+ * Moves a draft's snapshots — one per project workspace — to the real conversation's keys on
+ * redemption.
  *
- * Both keys refer to the same checkout. Moving the entry prevents the Git
+ * Both keys refer to the same checkout. Moving the entries prevents the Git
  * status card from disappearing until the next poll. If the destination
  * workspace differs, `gitSnapshotForWorkspace` returns `undefined` normally.
  */
@@ -83,10 +86,13 @@ export function gitSnapshotsAfterDraftRedemption(
   draftConversationId: string,
   conversationId: string
 ): GitSnapshots {
-  const entry = current[draftConversationId];
-  if (!entry) return current;
-  const next = { ...current, [conversationId]: entry };
-  delete next[draftConversationId];
+  const moved = Object.keys(current).filter((key) => gitSnapshotKeyConversation(key) === draftConversationId);
+  if (moved.length === 0) return current;
+  const next = { ...current };
+  for (const key of moved) {
+    next[`${conversationId}${key.slice(draftConversationId.length)}`] = current[key];
+    delete next[key];
+  }
   return next;
 }
 
@@ -113,6 +119,33 @@ export function gitSnapshotBroadcastIds(
   // Drafts are absent from workspace conversation lists but read and write the
   // workspace root.
   return shared.includes(actingConversationId) ? shared : [...shared, actingConversationId];
+}
+
+/**
+ * Whether the review pane lists `path` — a tracked file with a change — in the
+ * checkout `snapshot` describes.
+ *
+ * A summary snapshot carries no file list, so the host is asked for that one path
+ * by name, the way the pane itself asks for its selection. A summary gone stale
+ * in the meantime is answered with the current one, which is asked once more.
+ */
+export async function gitReviewListsPath(
+  target: GitTarget,
+  snapshot: GitWorkspaceSnapshot,
+  path: string
+): Promise<boolean> {
+  if (snapshot.filesComplete === true || !snapshot.summaryRevision) {
+    return snapshot.files.some((file) => (
+      file.path === path && !file.untracked && file.status !== "untracked"
+    ));
+  }
+  let revision = snapshot.summaryRevision;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await getGitChangePage(target, { expectedRevision: revision, selectedPath: path, limit: 1 });
+    if (result.kind === "page") return result.selection?.state === "present";
+    revision = result.summary.summaryRevision;
+  }
+  return false;
 }
 
 export function gitReviewSnapshotCacheKey(snapshot: GitWorkspaceSnapshot): string {
@@ -177,10 +210,11 @@ export interface GitController {
   ): void;
   releaseMutationLease(conversationId: string): void;
   /**
-   * Polls the workspace summary. A newer refresh or mutation lease for the
-   * same conversation invalidates this poll's commit (last-token-wins).
+   * Polls the workspace summary. A newer refresh of the same key, or a mutation
+   * lease for its conversation, invalidates this poll's commit (last-token-wins).
    *
-   * `conversationId` is the cache key, `target` is the addressing. For a real
+   * `conversationId` is the cache key — a `gitSnapshotKey`, one per project
+   * workspace of the conversation — and `target` is the addressing. For a real
    * conversation the two say the same thing; the draft conversation caches under
    * its own renderer-only key while asking Git about the workspace it has
    * selected, because the host has never heard of that key.
@@ -226,8 +260,16 @@ export function createGitController(): GitController {
       return state.mutationConversationIds.has(conversationId);
     },
     acquireMutationLease(conversationId, workspaceConversationIds) {
+      // Every workspace of every conversation named: a poll of any of them started before
+      // the lease must not land after the write.
+      const invalidated = new Set(workspaceConversationIds);
+      for (const key of refreshTokens.keys()) {
+        if (invalidated.has(gitSnapshotKeyConversation(key))) {
+          refreshTokens.set(key, (refreshTokens.get(key) ?? 0) + 1);
+        }
+      }
       for (const id of workspaceConversationIds) {
-        refreshTokens.set(id, (refreshTokens.get(id) ?? 0) + 1);
+        if (!refreshTokens.has(id)) refreshTokens.set(id, 1);
       }
       if (state.mutationConversationIds.has(conversationId)) return;
       state = {

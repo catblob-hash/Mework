@@ -236,7 +236,7 @@ describe("FilesPane", () => {
     );
     expect(lines).toEqual(["# Mework", "第二行"]);
     const tab = screen.getByRole("tab", { name: /readme\.txt/ });
-    expect(tab.closest(".files-pane__tab")).toHaveClass("files-pane__tab--preview");
+    expect(tab.closest(".page-tab")).toHaveClass("files-pane__tab--preview");
   });
 
   it("keeps the tree beside the viewer once a file is open", async () => {
@@ -449,7 +449,7 @@ describe("FilesPane", () => {
 
     await user.click(await screen.findByRole("treeitem", { name: rowName("readme.txt") }));
     const preview = await screen.findByRole("tab", { name: /readme\.txt/ });
-    expect(preview.closest(".files-pane__tab")).toHaveClass("files-pane__tab--preview");
+    expect(preview.closest(".page-tab")).toHaveClass("files-pane__tab--preview");
     expect(screen.getAllByRole("tab")).toHaveLength(1);
 
     await user.click(screen.getByRole("treeitem", { name: rowName("src") }));
@@ -457,12 +457,12 @@ describe("FilesPane", () => {
     expect(await screen.findByLabelText("src/App.tsx")).toBeInTheDocument();
     expect(screen.getAllByRole("tab")).toHaveLength(1);
     expect(screen.queryByRole("tab", { name: /readme\.txt/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /App\.tsx/ }).closest(".files-pane__tab"))
+    expect(screen.getByRole("tab", { name: /App\.tsx/ }).closest(".page-tab"))
       .toHaveClass("files-pane__tab--preview");
 
     await user.dblClick(screen.getByRole("treeitem", { name: rowName("readme.txt") }));
     const promoted = screen.getByRole("tab", { name: /readme\.txt/ });
-    expect(promoted.closest(".files-pane__tab")).not.toHaveClass("files-pane__tab--preview");
+    expect(promoted.closest(".page-tab")).not.toHaveClass("files-pane__tab--preview");
 
     await user.click(screen.getByRole("treeitem", { name: rowName("Docs") }));
     await user.click(await screen.findByRole("treeitem", { name: rowName("guide.md") }));
@@ -750,7 +750,7 @@ describe("FilesPane open requests", () => {
 
     expect(await screen.findByLabelText("src/App.tsx")).toBeInTheDocument();
     const tab = screen.getByRole("tab", { name: /App\.tsx/ });
-    expect(tab.closest(".files-pane__tab")).toHaveClass("files-pane__tab--preview");
+    expect(tab.closest(".page-tab")).toHaveClass("files-pane__tab--preview");
   });
 
   /** A request that arrives while the pane is closed is honoured on the mount that follows. */

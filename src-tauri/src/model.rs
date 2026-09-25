@@ -367,6 +367,22 @@ pub struct GlobalSettings {
     /// User-added environment dependencies; built-ins are code constants.
     #[serde(default)]
     pub environment_tools: Vec<EnvironmentToolDefinition>,
+    /// The unsent new task's own settings. The renderer writes it; the host
+    /// only persists and validates it, as it does a workspace's remembered
+    /// settings. Its roles are canonicalized when the draft becomes a
+    /// conversation, not here: nothing runs from a draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_conversation: Option<DraftConversationSnapshot>,
+}
+
+/// What of the renderer's new-task draft outlives the process.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftConversationSnapshot {
+    pub settings: ConversationSettings,
+    /// A trace like `Conversation::preset_id`, never a link.
+    #[serde(default)]
+    pub preset_id: String,
 }
 
 /// Persisted preference for one shortcut.
@@ -2617,10 +2633,19 @@ pub struct Conversation {
     pub branches: Vec<ConversationBranch>,
     #[serde(default)]
     pub user_aborted_tasks: Vec<UserAbortedTaskRecord>,
-    /// Isolated Git worktree for this conversation. It belongs on the
-    /// conversation because copying settings must not copy a worktree path.
-    #[serde(default)]
-    pub worktree: Option<ConversationWorktree>,
+    /// Isolated Git worktrees for this conversation, at most one per project
+    /// workspace: each stands in for the workspace it was checked out from
+    /// (see [`Conversation::worktree_for`]). They belong on the conversation
+    /// because copying settings must not copy a worktree path.
+    ///
+    /// Also read from the pre-multi-workspace `worktree` key, which held one
+    /// record for workspace 1 (see [`deserialize_worktrees`]).
+    #[serde(
+        default,
+        alias = "worktree",
+        deserialize_with = "deserialize_worktrees"
+    )]
+    pub worktrees: Vec<ConversationWorktree>,
     /// Shell execution location. `None` means local execution. It belongs on the
     /// conversation because settings copies must not copy an SSH machine binding.
     ///
@@ -2634,7 +2659,7 @@ pub struct Conversation {
     /// The conversation this one was forked from. `None` is a top-level
     /// conversation. Nesting is a renderer concept: the child's permissions
     /// come from its own `settings`. Lives on the conversation, not in
-    /// `settings`, for the same reason as `worktree`: settings are copied
+    /// `settings`, for the same reason as `worktrees`: settings are copied
     /// wholesale by presets and workspace snapshots.
     #[serde(default)]
     pub parent_conversation_id: Option<String>,
@@ -2657,7 +2682,7 @@ pub struct Conversation {
     /// these follow in order.
     ///
     /// On the conversation rather than in `settings` for the same reason as
-    /// `worktree`: presets and workspace snapshots copy settings wholesale, and a
+    /// `worktrees`: presets and workspace snapshots copy settings wholesale, and a
     /// path that one conversation was granted is not a path another may have.
     /// Each entry passed through the host's directory picker — native for the
     /// host machine, the remote browser for a WSL or SSH machine — which is what
@@ -2675,6 +2700,25 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// The isolated worktree standing in for the project workspace at 1-based
+    /// position `member`, whose registered location is `registered`.
+    ///
+    /// A record names the workspace it was checked out from by machine and
+    /// path, not by position, so a project whose workspaces are reordered or
+    /// removed never hands one workspace's worktree to another: a record whose
+    /// workspace is gone simply stands in for nothing. A record from before
+    /// every workspace could have one names no workspace and is workspace 1's.
+    pub fn worktree_for(
+        &self,
+        member: usize,
+        registered: &AttachedWorkspace,
+    ) -> Option<&ConversationWorktree> {
+        self.worktrees.iter().find(|worktree| match &worktree.workspace {
+            Some(source) => source.same_location(registered),
+            None => member == 1,
+        })
+    }
+
     /// The attached workspaces, with pre-multi-machine grants folded in.
     ///
     /// An archive written before workspaces carried a machine names host-machine
@@ -2731,14 +2775,56 @@ pub struct AttachedWorkspace {
     pub path: String,
 }
 
+impl AttachedWorkspace {
+    /// Whether two records name the same directory on the same machine.
+    ///
+    /// Paths are compared as recorded, less trailing separators: both came
+    /// back from a directory picker, which spells a directory one way.
+    pub fn same_location(&self, other: &AttachedWorkspace) -> bool {
+        crate::run_environment::env_key(self.machine.as_ref())
+            == crate::run_environment::env_key(other.machine.as_ref())
+            && self.path.trim_end_matches(['/', '\\']) == other.path.trim_end_matches(['/', '\\'])
+    }
+}
+
 /// Isolated conversation worktree. Branch and baseline are both required for
 /// safe release and extra-commit detection.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationWorktree {
+    /// Root of the checkout, on the machine of the workspace it came from.
     pub path: String,
     pub branch: String,
     pub base_oid: String,
+    /// The branch the worktree was forked from, which the review shows it
+    /// against. `None` for a detached HEAD, and on records written before it
+    /// was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// The project workspace this worktree was checked out from — its machine
+    /// and registered root — which it stands in for. `None` on records written
+    /// when only workspace 1 could have a worktree: those are workspace 1's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<AttachedWorkspace>,
+}
+
+/// Reads [`Conversation::worktrees`] from either shape it has been written
+/// in: the list, or — under the legacy `worktree` key — one record or `null`.
+pub fn deserialize_worktrees<'de, D>(deserializer: D) -> Result<Vec<ConversationWorktree>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Many(Vec<ConversationWorktree>),
+        One(ConversationWorktree),
+    }
+    Ok(match Option::<Shape>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(Shape::One(worktree)) => vec![worktree],
+        Some(Shape::Many(worktrees)) => worktrees,
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -4782,6 +4868,70 @@ pub enum SubagentChannel {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn conversation_json(worktree_key: &str, worktree: Value) -> Value {
+        let base = crate::catalog::default_document().workspaces[0].conversations[0].clone();
+        let mut value = serde_json::to_value(base).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("worktrees");
+        object.insert(worktree_key.to_owned(), worktree);
+        value
+    }
+
+    /// Worktrees read from every shape they were ever written in: the list,
+    /// the legacy single record for workspace 1, and nothing at all.
+    #[test]
+    fn worktrees_read_from_the_list_and_from_the_legacy_single_record() {
+        let record = json!({ "path": "/w/a", "branch": "mework/conv/a", "baseOid": "abc" });
+        let legacy: Conversation =
+            serde_json::from_value(conversation_json("worktree", record.clone())).unwrap();
+        assert_eq!(legacy.worktrees.len(), 1);
+        assert_eq!(legacy.worktrees[0].workspace, None);
+        let none: Conversation =
+            serde_json::from_value(conversation_json("worktree", Value::Null)).unwrap();
+        assert!(none.worktrees.is_empty());
+        let listed: Conversation =
+            serde_json::from_value(conversation_json("worktrees", json!([record]))).unwrap();
+        assert_eq!(listed.worktrees, legacy.worktrees);
+        let written = serde_json::to_value(&listed).unwrap();
+        assert!(written.get("worktree").is_none());
+        assert_eq!(written["worktrees"][0]["path"], "/w/a");
+    }
+
+    /// A worktree stands in for the workspace it was checked out from, by
+    /// machine and path — never by position — and a legacy record only for
+    /// workspace 1.
+    #[test]
+    fn a_worktree_stands_in_only_for_the_workspace_it_came_from() {
+        let ssh = |path: &str| AttachedWorkspace {
+            machine: Some(RunTarget::Ssh { machine_id: "m1".into() }),
+            path: path.into(),
+        };
+        let local = |path: &str| AttachedWorkspace { machine: None, path: path.into() };
+        let worktree = |path: &str, workspace: Option<AttachedWorkspace>| ConversationWorktree {
+            path: path.into(),
+            branch: "mework/conv/x".into(),
+            base_oid: "abc".into(),
+            base_branch: Some("main".into()),
+            workspace,
+        };
+        let mut conversation: Conversation =
+            serde_json::from_value(conversation_json("worktrees", json!([]))).unwrap();
+        conversation.worktrees = vec![
+            worktree("/w/legacy", None),
+            worktree("C:/w/remote", Some(ssh("C:/repo/"))),
+        ];
+        assert_eq!(
+            conversation.worktree_for(1, &local("/repo")).map(|w| w.path.as_str()),
+            Some("/w/legacy")
+        );
+        assert_eq!(
+            conversation.worktree_for(3, &ssh("C:/repo")).map(|w| w.path.as_str()),
+            Some("C:/w/remote")
+        );
+        // Same path, other machine: not the same workspace.
+        assert!(conversation.worktree_for(2, &local("C:/repo")).is_none());
+    }
 
     /// Catalogs cover each variant exactly once and every slug round-trips. The
     /// TypeScript vocabulary guard reads this file as text, so this test is its

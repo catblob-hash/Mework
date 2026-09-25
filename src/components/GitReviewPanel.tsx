@@ -9,6 +9,7 @@ import {
   Trash2
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
 import {
   executeGitAction,
@@ -47,11 +48,53 @@ import {
 import type { SidePaneId } from "../lib/sidePanes";
 import "./GitReviewPanel.css";
 
+/** A changed file the pane has been asked to show from somewhere outside it. */
+export interface GitReviewRevealRequest {
+  /** Repository-relative path, `/` separated. */
+  path: string;
+  /** Bumped per request, so asking twice for the same file asks twice. */
+  nonce: number;
+  /**
+   * The pane was not open when the file was asked for: it opens on the diff
+   * alone, with the file column folded away. A pane that was already open keeps
+   * its column the way the reader left it.
+   */
+  collapseTree?: boolean;
+}
+
+/** What the checkout under review is, beyond what its snapshot says. */
+export interface GitReviewCheckout {
+  /**
+   * The name of the conversation's isolated worktree when the checkout is one — the last
+   * segment of its directory, which is what Git calls it — or null at a workspace's own
+   * directory, which has nothing to name beyond its branch.
+   */
+  worktreeName: string | null;
+  /** The branch the worktree was forked from, which the review is read against. */
+  baseBranch: string | null;
+  /**
+   * The commit the worktree was forked at. With it the pane offers the branch's whole change
+   * since then — what the conversation committed as well as what it has not — and opens on it.
+   */
+  baseOid: string | null;
+}
+
 export interface GitReviewPanelProps {
   paneId: SidePaneId;
   target: GitTarget;
   snapshot: GitWorkspaceSnapshot;
   active: boolean;
+  checkout?: GitReviewCheckout;
+  /**
+   * The pane's pages — one per workspace under review — when there is more than one. They take
+   * the title bar, where a single checkout shows its refs, and the refs move into each page's
+   * name; the diff scope moves into the pane's `⋮` menu.
+   */
+  pageTabs?: ReactNode;
+  /** A file the timeline asked for, or null while nothing has been clicked. */
+  revealRequest?: GitReviewRevealRequest | null;
+  /** Told once `revealRequest` has been acted on, so a later mount does not act on it again. */
+  onRevealRequestHandled?: (nonce: number) => void;
   mutationDisabledReason?: string | null;
   onSnapshotChange?: (snapshot: GitWorkspaceSnapshot | null) => void;
   onMutationStart?: () => boolean;
@@ -64,7 +107,11 @@ export interface GitReviewPanelProps {
 
 type Translate = ReturnType<typeof useI18n>["t"];
 type RequestState = "idle" | "loading" | "ready" | "error";
-type DiffScope = "working" | "staged" | "unstaged";
+/**
+ * What the pane lists: every uncommitted change, one side of the index, or — for an isolated
+ * worktree — everything its branch has done since it was forked, committed or not.
+ */
+type DiffScope = "working" | "staged" | "unstaged" | "branch";
 const CHANGE_FILE_BATCH_SIZE = 200;
 /** Display settings the pane's `⋮` menu owns; they outlive the conversation. */
 const DIFF_TREE_STORAGE_KEY = "mework.review.showFiles";
@@ -219,6 +266,35 @@ function reviewableFileCount(snapshot: GitWorkspaceSnapshot): number {
   return Math.max(0, changed - snapshot.untracked);
 }
 
+/**
+ * A review page's name as a page tab draws it: the workspace, the branch the checkout is read
+ * against, and — for an isolated worktree — the worktree, joined by arrows. The tab bounds its
+ * width; each segment ellipsizes on its own, the workspace last.
+ */
+export function GitReviewPageLabel({
+  workspace,
+  branch,
+  worktree
+}: {
+  workspace: string;
+  branch: string;
+  worktree: string | null;
+}) {
+  return (
+    <span className="git-review__page-label">
+      <span>{workspace}</span>
+      <ArrowRight size={10} aria-hidden="true" />
+      <span>{branch}</span>
+      {worktree && (
+        <>
+          <ArrowRight size={10} aria-hidden="true" />
+          <span>{worktree}</span>
+        </>
+      )}
+    </span>
+  );
+}
+
 function BusyLabel({ children }: { children: string }) {
   return <><LoaderCircle className="spin" size={12} />{children}</>;
 }
@@ -228,6 +304,10 @@ export function GitReviewPanel({
   target,
   snapshot,
   active,
+  checkout,
+  pageTabs,
+  revealRequest = null,
+  onRevealRequestHandled,
   mutationDisabledReason = null,
   onSnapshotChange = () => undefined,
   onMutationStart = () => true,
@@ -242,8 +322,9 @@ export function GitReviewPanel({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
+  // A pane mounted to show one file asks for that file with its first page.
   const [selectedPath, setSelectedPath] = useState<string | null>(
-    snapshot.files.find(isReviewableChange)?.path ?? null
+    revealRequest?.path ?? snapshot.files.find(isReviewableChange)?.path ?? null
   );
   const [changeFilter, setChangeFilter] = useState("");
   const [changeFiles, setChangeFiles] = useState<GitFileChange[]>(
@@ -258,7 +339,14 @@ export function GitReviewPanel({
   );
   const [changePageError, setChangePageError] = useState<string | null>(null);
   const [changeLoadingMore, setChangeLoadingMore] = useState(false);
-  const [diffScope, setDiffScope] = useState<DiffScope>("working");
+  const branchBase = checkout?.baseOid ?? null;
+  const [diffScope, setDiffScope] = useState<DiffScope>(branchBase ? "branch" : "working");
+  const branchScope = diffScope === "branch" && branchBase !== null;
+  /**
+   * How many files the branch changed since its base, once a page has said: a summary counts
+   * only uncommitted changes, so the branch listing's size is learned from the listing.
+   */
+  const [branchFileCount, setBranchFileCount] = useState<number | null>(null);
   const [diff, setDiff] = useState<GitDiffResult | null>(null);
   const [diffState, setDiffState] = useState<RequestState>("idle");
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -293,7 +381,20 @@ export function GitReviewPanel({
   );
   /** How much context each file has been expanded to, as an index into the steps. */
   const [contextSteps, setContextSteps] = useState<ReadonlyMap<string, number>>(() => new Map());
-  const totalChangedFiles = reviewableFileCount(currentSnapshot);
+  // A branch not listed yet counts as one file, so the listing is asked for and the viewer is
+  // up to show that it is loading.
+  const totalChangedFiles = branchScope
+    ? branchFileCount ?? 1
+    : reviewableFileCount(currentSnapshot);
+  /**
+   * Whether there is anything to list. Effects that only need this depend on it rather than on
+   * the count, so a branch's count arriving with its first page does not read the page again.
+   */
+  const hasChangedFiles = totalChangedFiles > 0;
+  const branchFileCountRef = useRef(branchFileCount);
+  branchFileCountRef.current = branchFileCount;
+  /** What a reset starts the listing's count at: the snapshot's, or the branch's once known. */
+  const resetFileCount = branchScope ? null : totalChangedFiles;
   /**
    * Whether the scope is past the size where one patch is worth asking for.
    *
@@ -306,7 +407,7 @@ export function GitReviewPanel({
    * lock while every other Git read in the pane queues behind it.
    */
   const scopeIsTooLargeToReadAtOnce =
-    currentSnapshot.additions + currentSnapshot.deletions > DIFF_LARGE_LINE_COUNT
+    (!branchScope && currentSnapshot.additions + currentSnapshot.deletions > DIFF_LARGE_LINE_COUNT)
     || totalChangedFiles > DIFF_LAZY_FILE_COUNT;
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
   const [pendingGitAction, setPendingGitAction] = useState<string | null>(null);
@@ -321,6 +422,8 @@ export function GitReviewPanel({
   filePatchesRef.current = filePatches;
   filePatchStatesRef.current = filePatchStates;
   const changePageRequestRef = useRef(0);
+  /** The file a reveal is waiting to show, which a page lists even off its range. */
+  const revealPathRef = useRef<string | null>(revealRequest?.path ?? null);
   const selectedPathRef = useRef(selectedPath);
   selectedPathRef.current = selectedPath;
   const discardPreparationRequestRef = useRef(0);
@@ -355,7 +458,8 @@ export function GitReviewPanel({
     }
   }
   const normalizedChangeFilter = changeFilter.trim().toLowerCase();
-  const changesAreInline = snapshotHasInlineChanges(currentSnapshot);
+  // A branch's listing is always the host's: a snapshot carries only the uncommitted files.
+  const changesAreInline = !branchScope && snapshotHasInlineChanges(currentSnapshot);
   const changePageRevision = currentSnapshot.summaryRevision ?? currentSnapshot.contentRevision;
   const changePageScopeKey = JSON.stringify([
     target,
@@ -365,7 +469,8 @@ export function GitReviewPanel({
     currentSnapshot.worktreeRoot ?? null,
     changePageRevision,
     normalizedChangeFilter,
-    changesAreInline
+    changesAreInline,
+    branchScope ? branchBase : null
   ]);
   const changePageScopeRef = useRef(changePageScopeKey);
   changePageScopeRef.current = changePageScopeKey;
@@ -520,7 +625,8 @@ export function GitReviewPanel({
         ...(cursor ? { cursor } : {}),
         ...(normalizedChangeFilter ? { query: normalizedChangeFilter } : {}),
         limit: CHANGE_FILE_BATCH_SIZE,
-        ...(selectedPath ? { selectedPath } : {})
+        ...(selectedPath ? { selectedPath } : {}),
+        ...(branchScope && branchBase ? { base: branchBase } : {})
       });
       if (
         requestId !== changePageRequestRef.current
@@ -541,9 +647,25 @@ export function GitReviewPanel({
           "The Git change page belongs to another repository revision. Refresh and try again."
         ));
       }
-      const nextFiles = cursor ? [...changeFiles, ...result.files] : result.files;
+      // A file the timeline asked for is listed even when it sorts past the pages
+      // read so far, since opening it is the whole point of the click; the page
+      // that holds it later does not list it twice. Any other selection off the
+      // page stays latent.
+      const listed = new Set(cursor ? changeFiles.map((file) => file.path) : []);
+      let nextFiles = cursor
+        ? [...changeFiles, ...result.files.filter((file) => !listed.has(file.path))]
+        : result.files;
+      const selection = result.selection;
+      if (
+        selection?.state === "present"
+        && selection.file.path === revealPathRef.current
+        && !nextFiles.some((file) => file.path === selection.file.path)
+      ) {
+        nextFiles = [...nextFiles, selection.file];
+      }
       setChangeFiles(nextFiles);
       setChangeMatchedCount(result.matchedCount ?? nextFiles.length);
+      if (branchScope && !normalizedChangeFilter) setBranchFileCount(result.matchedCount);
       setChangeNextCursor(result.nextCursor);
       if (result.selection?.state === "present") {
         setSelectedPath(result.selection.file.path);
@@ -581,6 +703,8 @@ export function GitReviewPanel({
     }
   }, [
     active,
+    branchBase,
+    branchScope,
     busyAction,
     changeFiles,
     changePageScopeKey,
@@ -617,14 +741,16 @@ export function GitReviewPanel({
       return;
     }
     setChangeFiles([]);
-    setChangeMatchedCount(normalizedChangeFilter ? 0 : totalChangedFiles);
+    setChangeMatchedCount(normalizedChangeFilter
+      ? 0
+      : resetFileCount ?? branchFileCountRef.current ?? 1);
     setChangePageState("idle");
   }, [
     changePageScopeKey,
     changesAreInline,
     currentSnapshot.files,
     normalizedChangeFilter,
-    totalChangedFiles
+    resetFileCount
   ]);
 
   useEffect(() => {
@@ -633,7 +759,7 @@ export function GitReviewPanel({
       || busyAction
       || changesAreInline
       || changePageState !== "idle"
-      || totalChangedFiles === 0
+      || !hasChangedFiles
     ) return;
     void loadChangePage();
   }, [
@@ -642,9 +768,68 @@ export function GitReviewPanel({
     changePageScopeKey,
     changePageState,
     changesAreInline,
-    loadChangePage,
-    totalChangedFiles
+    hasChangedFiles,
+    loadChangePage
   ]);
+
+  /**
+   * Opens what the timeline asked for.
+   *
+   * The nonce is kept in a ref so a request that arrived while the pane was
+   * closed is still honoured on the mount that follows; the owner is told once it
+   * has been, so a later mount does not replay it. Declared after the identity
+   * reset above, whose clearing of the selection it has to outlast on mount.
+   */
+  const revealNonceRef = useRef<number | null>(null);
+  const [pendingReveal, setPendingReveal] = useState<{ path: string; seq: number; reread: boolean } | null>(null);
+  const [diffReveal, setDiffReveal] = useState<{ path: string; seq: number } | undefined>(undefined);
+  useEffect(() => {
+    if (!revealRequest || revealNonceRef.current === revealRequest.nonce) return;
+    revealNonceRef.current = revealRequest.nonce;
+    // A pane opened just to show this diff shows the diff: the file column folds
+    // away for this visit without changing what the reader chose for the pane.
+    if (revealRequest.collapseTree) setShowDiffFiles(false);
+    // A filter hiding the file would hide the answer to the click.
+    setChangeFilter("");
+    setSelectedPath(revealRequest.path);
+    revealPathRef.current = revealRequest.path;
+    setPendingReveal({ path: revealRequest.path, seq: revealRequest.nonce, reread: false });
+    onRevealRequestHandled?.(revealRequest.nonce);
+  }, [onRevealRequestHandled, revealRequest]);
+
+  /**
+   * Hands the asked-for file to the viewer once it is a row.
+   *
+   * It may sort past the pages read so far, and those were read without asking
+   * for it by name, so the first page is read once more with it as the selection,
+   * which lists it. A scope that does not hold it — staged-only while the change
+   * is unstaged — gives way to all changes.
+   */
+  useEffect(() => {
+    if (!pendingReveal) return;
+    const settle = () => {
+      revealPathRef.current = null;
+      setPendingReveal(null);
+    };
+    const file = changeFiles.find((candidate) => candidate.path === pendingReveal.path);
+    if (file) {
+      if (
+        (diffScope === "staged" && !gitFileHasStagedChange(file))
+        || (diffScope === "unstaged" && !gitFileHasUnstagedChange(file))
+      ) setDiffScope("working");
+      setDiffReveal({ path: file.path, seq: pendingReveal.seq });
+      settle();
+      return;
+    }
+    if (hasChangedFiles && (changePageState === "idle" || changePageState === "loading")) return;
+    if (changePageState !== "ready" || changesAreInline || pendingReveal.reread) {
+      settle();
+      return;
+    }
+    setSelectedPath(pendingReveal.path);
+    setPendingReveal({ ...pendingReveal, reread: true });
+    setChangePageState("idle");
+  }, [changeFiles, changePageState, changesAreInline, diffScope, hasChangedFiles, pendingReveal]);
 
   const runGitAction = useCallback(async (action: GitAction, key: string) => {
     if (!active || busyAction || mutationDisabledReason) return false;
@@ -838,7 +1023,7 @@ export function GitReviewPanel({
    */
   useEffect(() => {
     if (!active || busyAction) return;
-    if (scopeIsTooLargeToReadAtOnce || totalChangedFiles === 0) {
+    if (scopeIsTooLargeToReadAtOnce || !hasChangedFiles) {
       changeDiffRequestRef.current += 1;
       // Idempotent on purpose: this branch runs on every render the effect is
       // re-created for, and handing React a fresh Map each time would make the
@@ -851,7 +1036,9 @@ export function GitReviewPanel({
     const requestId = ++changeDiffRequestRef.current;
     setDiffState("loading");
     setDiffError(null);
-    const request: GitDiffRequest = { type: diffScope };
+    const request: GitDiffRequest = branchScope && branchBase
+      ? { type: "branch", base: branchBase }
+      : { type: diffScope === "branch" ? "working" : diffScope };
     void getGitDiff(target, request)
       .then((result) => {
         if (requestId !== changeDiffRequestRef.current) return;
@@ -877,12 +1064,14 @@ export function GitReviewPanel({
     };
   }, [
     active,
+    branchBase,
+    branchScope,
     busyAction,
     target,
     diffRevision,
     diffScope,
     scopeIsTooLargeToReadAtOnce,
-    totalChangedFiles,
+    hasChangedFiles,
     t
   ]);
 
@@ -908,9 +1097,9 @@ export function GitReviewPanel({
     changeFilePatchRequestRef.current.set(path, requestId);
     const context = step === undefined ? undefined : DIFF_CONTEXT_STEPS[step];
     setFilePatchStates((current) => new Map(current).set(path, "loading"));
-    const request: GitDiffRequest = diffScope === "staged"
-      ? { type: "staged", path, ...(context !== undefined ? { context } : {}) }
-      : { type: diffScope, path, ...(context !== undefined ? { context } : {}) };
+    const request: GitDiffRequest = branchScope && branchBase
+      ? { type: "branch", base: branchBase, path, ...(context !== undefined ? { context } : {}) }
+      : { type: diffScope === "branch" ? "working" : diffScope, path, ...(context !== undefined ? { context } : {}) };
     void getGitDiff(target, request)
       .then((result) => {
         if (changeFilePatchRequestRef.current.get(path) !== requestId) return;
@@ -940,7 +1129,7 @@ export function GitReviewPanel({
           failureMessage(reason, t("无法读取文件差异", "Unable to load file diff"))
         ));
       });
-  }, [active, diffScope, diffState, t, target]);
+  }, [active, branchBase, branchScope, diffScope, diffState, t, target]);
 
   /** Asks for the next wider `-U` for one file, if there is one left. */
   const expandFileContext = useCallback((path: string) => {
@@ -1130,11 +1319,46 @@ export function GitReviewPanel({
   };
 
   const diffFilesVisible = showDiffFiles && diffCanFitFiles;
-  const scopeHeadLabel = diffScope === "staged"
+  /**
+   * A narrowed scope, named after the refs; the scope the page opens on needs no word — the
+   * branch's whole change for a worktree, every uncommitted change otherwise.
+   */
+  const scopeNote = diffScope === "staged"
     ? t("已暂存", "Staged")
     : diffScope === "unstaged"
       ? t("未暂存", "Unstaged")
-      : t("工作树", "working tree");
+      : diffScope === "working" && branchBase
+        ? t("未提交", "Uncommitted")
+        : null;
+  const branchLabel = checkout?.baseBranch
+    ?? currentSnapshot.branch
+    ?? currentSnapshot.head?.slice(0, 8)
+    ?? t("尚无提交", "No commits yet");
+  const worktreeLabel = checkout?.worktreeName ?? null;
+  const scopeSections = useMemo<PopoverMenuSection[]>(() => [
+    {
+      id: "diff-scope",
+      label: t("差异范围", "Diff scope"),
+      items: ([
+        ...(branchBase
+          ? [[
+            "branch",
+            t("分支上的全部变更", "All changes on the branch"),
+            t("自工作树分出以来，含已提交的", "Since the worktree was forked, commits included")
+          ] as const]
+          : []),
+        ["working", branchBase ? t("未提交的变更", "Uncommitted changes") : t("全部变更", "All changes"), undefined],
+        ["staged", t("已暂存的变更", "Staged changes"), undefined],
+        ["unstaged", t("未暂存的变更", "Unstaged changes"), undefined]
+      ] as const).map(([scope, label, description]) => ({
+        id: `scope-${scope}`,
+        label,
+        description,
+        checked: diffScope === scope,
+        onSelect: () => setDiffScope(scope)
+      }))
+    }
+  ], [branchBase, diffScope, t]);
 
   /**
    * The pane's title bar.
@@ -1154,44 +1378,36 @@ export function GitReviewPanel({
       >
         <PanelLeft size={14} aria-hidden="true" />
       </IconButton>
-      <PopoverMenu
-        rootClassName="git-review__scope"
-        triggerClassName="git-review__scope-trigger"
-        trigger={(
-          <>
-            <span className="git-review__scope-ref">
-              {currentSnapshot.branch ?? currentSnapshot.head?.slice(0, 8) ?? t("尚无提交", "No commits yet")}
-            </span>
-            <ArrowRight size={11} aria-hidden="true" className="git-review__scope-arrow" />
-            <span className="git-review__scope-ref">{scopeHeadLabel}</span>
-          </>
-        )}
-        triggerLabel={t("审阅范围", "Review scope")}
-        menuLabel={t("审阅范围", "Review scope")}
-        sections={[
-          {
-            id: "diff-scope",
-            label: t("差异范围", "Diff scope"),
-            items: ([
-              ["working", t("全部变更", "All changes")],
-              ["staged", t("已暂存的变更", "Staged changes")],
-              ["unstaged", t("未暂存的变更", "Unstaged changes")]
-            ] as const).map(([scope, label]) => ({
-              id: `scope-${scope}`,
-              label,
-              checked: diffScope === scope,
-              onSelect: () => setDiffScope(scope)
-            }))
-          }
-        ]}
-        align="start"
-        dense
-      />
+      {pageTabs ?? (
+        <PopoverMenu
+          rootClassName="git-review__scope"
+          triggerClassName="git-review__scope-trigger"
+          trigger={(
+            <>
+              <span className="git-review__scope-ref" title={branchLabel}>{branchLabel}</span>
+              {worktreeLabel && (
+                <>
+                  <ArrowRight size={11} aria-hidden="true" className="git-review__scope-arrow" />
+                  <span className="git-review__scope-ref" title={worktreeLabel}>{worktreeLabel}</span>
+                </>
+              )}
+              {scopeNote && <span className="git-review__scope-note">{scopeNote}</span>}
+            </>
+          )}
+          triggerLabel={t("审阅范围", "Review scope")}
+          menuLabel={t("审阅范围", "Review scope")}
+          sections={scopeSections}
+          align="start"
+          dense
+        />
+      )}
     </div>
   );
 
   const paneMenuSections = useMemo<PopoverMenuSection[]>(() => {
     const sections: PopoverMenuSection[] = [];
+    // With pages in the title bar the scope has no trigger of its own there.
+    if (pageTabs) sections.push(...scopeSections);
     sections.push({
       id: "diff-file-list",
       items: [{
@@ -1302,6 +1518,8 @@ export function GitReviewPanel({
     diffWordDiff,
     diffWordWrap,
     operationBusy,
+    pageTabs,
+    scopeSections,
     showDiffFiles,
     t
   ]);
@@ -1349,6 +1567,7 @@ export function GitReviewPanel({
           foldAllRequest={diffFoldAll}
           activePath={selectedPath}
           onSelectFile={setSelectedPath}
+          revealRequest={diffReveal}
           renderFileMenu={changeFileMenu}
           onNeedPatch={requestFilePatch}
           onExpandContext={expandFileContext}
@@ -1416,13 +1635,15 @@ export function GitReviewPanel({
       ) : (
         <div className="git-review__empty">
           <Check size={20} />
-          {currentSnapshot.untracked > 0
-            ? t(
-              "没有已跟踪的变更；{count} 个未跟踪文件不在审阅范围内。",
-              "No tracked changes. {count} untracked files are out of review scope.",
-              { count: currentSnapshot.untracked }
-            )
-            : t("工作区没有变更", "Working tree is clean")}
+          {branchScope
+            ? t("自工作树分出以来没有变更", "No changes since the worktree was forked")
+            : currentSnapshot.untracked > 0
+              ? t(
+                "没有已跟踪的变更；{count} 个未跟踪文件不在审阅范围内。",
+                "No tracked changes. {count} untracked files are out of review scope.",
+                { count: currentSnapshot.untracked }
+              )
+              : t("工作区没有变更", "Working tree is clean")}
         </div>
       )}
     </section>

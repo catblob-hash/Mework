@@ -87,8 +87,10 @@ const EXECUTABLE_ENV: &str = "MEWORK_CLAUDE_BIN";
 ///
 /// The user's own Claude Code install is deliberately not consulted. It drifts
 /// with their updates, and CLI releases change behaviour this family depends on —
-/// 2.1.278, for one, dropped the switch that keeps the CLI from attaching an
-/// `# Environment` block of its own. What is *not* bundled is the login: that
+/// 2.1.278, for one, dropped the switch that kept the CLI from attaching an
+/// `# Environment` block of its own, and the replacement (a hooks module that
+/// leaves the block out) needs a CLI that loads function hooks. What is *not*
+/// bundled is the login: that
 /// lives in the user's `~/.claude`, written by their own `claude auth login`, and
 /// the bundled CLI reads it from there like any other.
 ///

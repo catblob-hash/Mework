@@ -171,6 +171,37 @@ describe("terminal tabs", () => {
     });
   });
 
+  describe("reorder", () => {
+    function reorder(state: TerminalTabsState, terminalIds: string[], id = conversationId) {
+      return apply(state, { type: "reorder", conversationId: id, terminalIds });
+    }
+
+    it("puts the tabs in the order the strip was dragged into, keeping the selection", () => {
+      const three = add(add(add(initialTerminalTabsState)));
+      const moved = reorder(three, [terminalTabId(3), terminalTabId(1), terminalTabId(2)]);
+      expect(ids(moved)).toEqual([terminalTabId(3), terminalTabId(1), terminalTabId(2)]);
+      expect(layout(moved).activeId).toBe(terminalTabId(3));
+      // Order is all that moves: names, numbers and the next ordinal stay with their tabs.
+      expect(numbered(moved)).toEqual(["zsh 3", "zsh 1", "zsh 2"]);
+      expect(layout(moved).nextOrdinal).toBe(4);
+    });
+
+    /** A strip a render behind can name a shell that just closed, or miss one that just opened. */
+    it("ignores unknown ids and keeps the tabs a request leaves out, in order, at the end", () => {
+      const four = add(add(add(add(initialTerminalTabsState))));
+      const moved = reorder(four, ["terminal-9", terminalTabId(3), terminalTabId(3), terminalTabId(1)]);
+      expect(ids(moved)).toEqual([terminalTabId(3), terminalTabId(1), terminalTabId(2), terminalTabId(4)]);
+    });
+
+    it("says nothing changed for the order it already has, or a conversation it does not know", () => {
+      const two = add(add(initialTerminalTabsState));
+      expect(reorder(two, [terminalTabId(1), terminalTabId(2)])).toBe(two);
+      expect(reorder(two, [terminalTabId(1)])).toBe(two);
+      expect(reorder(two, [])).toBe(two);
+      expect(reorder(two, [terminalTabId(2), terminalTabId(1)], "conversation-2")).toBe(two);
+    });
+  });
+
   describe("activate", () => {
     it("ignores an unknown tab and a selection that is already current", () => {
       const state = add(add(initialTerminalTabsState));

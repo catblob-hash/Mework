@@ -9,7 +9,8 @@ import {
   projectWorkspaces,
   withWorkspaceArgument,
   workspaceDirectoryLabel,
-  workspaceEnvKey
+  workspaceEnvKey,
+  worktreeFor
 } from "./workspaces";
 
 describe("workspace modes", () => {
@@ -112,15 +113,31 @@ describe("project workspaces", () => {
     expect(projectWorkspaces(createTemporaryWorkspace())).toEqual([]);
   });
 
-  it("lets a conversation's worktree stand in for the first directory only", () => {
+  it("lets a legacy worktree record stand in for the first directory only", () => {
     const worktree = { path: "C:\\platform\\.mework\\worktrees\\c1", branch: "b", baseOid: "o" };
-    expect(projectWorkspaces(project, { worktree })[0]).toEqual({ machine: null, path: worktree.path });
-    expect(projectWorkspaces(project, { worktree })[1].path).toBe("/srv/api");
+    expect(projectWorkspaces(project, { worktrees: [worktree] })[0]).toEqual({ machine: null, path: worktree.path });
+    expect(projectWorkspaces(project, { worktrees: [worktree] })[1].path).toBe("/srv/api");
+  });
+
+  it("lets each workspace's own worktree stand in for it, on its own machine", () => {
+    const registered = projectWorkspaces(project)[1];
+    const worktree = {
+      path: "/srv/api/.mework/worktrees/conversations/c1",
+      branch: "mework/conv/c1",
+      baseOid: "abc1234",
+      workspace: registered
+    };
+    const resolved = projectWorkspaces(project, { worktrees: [worktree] });
+    expect(resolved[0].path).toBe("C:\\platform");
+    expect(resolved[1]).toEqual({ machine: registered.machine, path: worktree.path });
+    expect(worktreeFor({ worktrees: [worktree] }, 2, registered)).toBe(worktree);
+    // The same path on another machine is another workspace.
+    expect(worktreeFor({ worktrees: [worktree] }, 2, { path: "/srv/api" })).toBeNull();
   });
 
   it("numbers the conversation's attached workspaces after every workspace of the project", () => {
     const numbered = conversationWorkspaces(project, {
-      worktree: null,
+      worktrees: [],
       attachedWorkspaces: [{ path: "E:\\notes" }]
     });
     expect(numbered.map((workspace) => workspace.path)).toEqual([
@@ -128,7 +145,7 @@ describe("project workspaces", () => {
     ]);
     // A temporary project still takes number 1, for the scratch directory the host gives it.
     expect(conversationWorkspaces(createTemporaryWorkspace(), {
-      worktree: null,
+      worktrees: [],
       attachedWorkspaces: [{ path: "E:\\notes" }]
     })).toHaveLength(2);
   });

@@ -2854,6 +2854,7 @@ pub(crate) fn product_default_document() -> AppDocument {
             // Empty values use the renderer command catalog's default bindings.
             shortcuts: Default::default(),
             environment_tools: Vec::new(),
+            draft_conversation: None,
         },
         assets: crate::model::AssetLibrary {
             api_providers,
@@ -3002,7 +3003,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                 queued_messages: Vec::new(),
                 branches: Vec::new(),
                 user_aborted_tasks: Vec::new(),
-                worktree: None,
+                worktrees: Vec::new(),
                 run_target: None,
                 additional_directories: Vec::new(),
                 parent_conversation_id: None,

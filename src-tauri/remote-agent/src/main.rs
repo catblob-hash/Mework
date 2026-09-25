@@ -5,6 +5,9 @@
 //! mework-remote daemon                 started by the first proxy, detached
 //! mework-remote version [--json]       what the host checks after an upload
 //! mework-remote net …                  the machine's loopback, for the host (see `agent::net`)
+//! mework-remote git                    one Git operation on a checkout here: a JSON
+//!                                      request on stdin, the reply on stdout
+//!                                      (see `git_core::service`)
 //! mework-remote sandbox-setup          Windows: provisions the sandbox account (one UAC prompt)
 //! mework-remote serve --stdio          a daemon whose one connection is its own
 //!                                      standard input and output: Mework's agent on
@@ -28,10 +31,11 @@ fn main() {
         Some("daemon") => daemon(&arguments[1..]),
         Some("version") => version(&arguments[1..]),
         Some("net") => agent::net::run(&arguments[1..]),
+        Some("git") => git_core::service::run_stdio(),
         Some("serve") => serve(&arguments[1..]),
         Some("sandbox-setup") => agent::sandbox::windows::setup().map(|said| println!("{said}")),
         _ => Err(
-            "usage: mework-remote proxy --sync <nonce> | daemon | serve --stdio | version [--json] | net …".to_owned(),
+            "usage: mework-remote proxy --sync <nonce> | daemon | serve --stdio | version [--json] | net … | git".to_owned(),
         ),
     };
     if let Err(message) = result {

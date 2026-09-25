@@ -39,7 +39,7 @@ function conversation(contexts: ContextItem[]): Conversation {
     queuedMessages: [],
     branches: [],
     userAbortedTasks: [],
-    worktree: null,
+    worktrees: [],
   runTarget: null,
   attachedWorkspaces: [],
     parentConversationId: null,

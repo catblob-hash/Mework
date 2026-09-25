@@ -485,6 +485,33 @@ describe("preview pages across workspaces", () => {
     expect(state.previewWorkspaces).toEqual({ other: 3 });
   });
 
+  it("puts the pages in the order their tabs were dragged into, leaving the layout alone", () => {
+    const second = `${conversationId}#tab_a`;
+    const third = `${conversationId}#tab_b`;
+    const state = stack(previewPaneId(conversationId), previewPaneId(second), previewPaneId(third));
+    const moved = apply(state, { type: "reorder_previews", conversationId, sessionIds: [third, conversationId, second] });
+    expect(previewSessionsFor(moved, conversationId)).toEqual([third, conversationId, second]);
+    expect(moved.layoutByConversation).toBe(state.layoutByConversation);
+    expect(moved.previewWorkspaces).toBe(state.previewWorkspaces);
+
+    // A strip a render behind can name a page that just closed, or miss one that just opened.
+    const stale = apply(state, {
+      type: "reorder_previews", conversationId, sessionIds: ["gone", third, third, second]
+    });
+    expect(previewSessionsFor(stale, conversationId)).toEqual([third, second, conversationId]);
+  });
+
+  it("says nothing changed for the order a roster already has, or a roster that does not exist", () => {
+    const state = stack(previewPaneId(conversationId), previewPaneId(`${conversationId}#tab_a`));
+    const roster = [...previewSessionsFor(state, conversationId)];
+    expect(apply(state, { type: "reorder_previews", conversationId, sessionIds: roster })).toBe(state);
+    expect(apply(state, { type: "reorder_previews", conversationId, sessionIds: roster.slice(0, 1) })).toBe(state);
+    expect(apply(state, { type: "reorder_previews", conversationId, sessionIds: [] })).toBe(state);
+    expect(apply(state, {
+      type: "reorder_previews", conversationId: "other", sessionIds: roster.reverse()
+    })).toBe(state);
+  });
+
   it("fills the conversation's own page first, and opens every further page as a tab", () => {
     expect(newPreviewPageSessionId([], "conv", "tab_x")).toBe("conv");
     expect(newPreviewPageSessionId(["conv#tab_a"], "conv", "tab_x")).toBe("conv");

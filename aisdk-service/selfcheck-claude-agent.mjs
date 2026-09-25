@@ -247,11 +247,12 @@ function textOf(message) {
 }
 
 /**
- * The last message of the conversation proper. Claude Code appends its own
- * `<system-reminder>` block (environment, model identity, date) as a trailing
- * `system`-role message; that is CLI-authored context, not a turn the host
- * projected, so the checks on "what ends the conversation" look past it. Only a
- * reminder is skipped — anything else trailing the conversation must fail.
+ * The last message of the conversation proper. Claude Code may append a
+ * `<system-reminder>` block of its own as a trailing `system`-role message (the
+ * context plugin leaves out the environment, model and date ones it would
+ * otherwise carry); that is CLI-authored context, not a turn the host projected,
+ * so the checks on "what ends the conversation" look past it. Only a reminder is
+ * skipped — anything else trailing the conversation must fail.
  */
 function lastTurnMessage(messages) {
   const list = Array.isArray(messages) ? messages : [];
@@ -364,20 +365,32 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
       && new RegExp(`cc_version=${BUNDLED_CLI_VERSION.replace(/\./g, "\\.")}(\\D|$)`).test(billing ?? ""),
     (billing ?? "(no billing header block)").slice(0, 120),
   );
-  // Left to itself the CLI attaches an `# Environment` of its own (its cwd —
-  // Mework's private session folder — its platform and OS version) as a meta
-  // message on the first user message. `CLAUDE_CODE_CARVED_SLATE=0` removes it,
-  // and the pinned CLI is a version that honours that switch, so the block must
-  // be absent from the request altogether rather than merely out of `system`.
-  // 2.1.278 dropped the switch; if a future pin lands there, this fails loudly
-  // instead of quietly telling the model about a directory it must not use.
-  const CLI_ENVIRONMENT = "You have been invoked in the following environment";
-  const environmentInSystem = systemBlocks.some((block) => (block.text ?? "").includes(CLI_ENVIRONMENT));
-  const environmentAttached = (call1?.messages ?? []).some((message) => textOf(message).includes(CLI_ENVIRONMENT));
+  // Left to itself the CLI attaches context of its own to the first user message:
+  // an `# Environment` block (its cwd — Mework's private session folder — its
+  // platform, shell and OS version), a model-identity line and today's date. The
+  // context plugin's hooks module leaves all three out, so none may appear
+  // anywhere in the request, and the prompt must reach upstream as the host sent
+  // it. The plugin loads only where the pinned CLI honours function hooks; a pin
+  // that stops doing so fails here instead of quietly telling the model about a
+  // directory it must not use.
+  const CLI_CONTEXT = [
+    ["environment block", /You have been invoked in the following environment|^# Environment/m],
+    ["model identity", /You are powered by the model/],
+    ["date", /Today's date is/],
+    ["session folder", new RegExp(cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))],
+  ];
+  const requestText = [systemText, ...(call1?.messages ?? []).map(textOf)].join("\n");
+  const leaked = CLI_CONTEXT.filter(([, pattern]) => pattern.test(requestText)).map(([name]) => name);
+  const firstPrompt = (call1?.messages ?? []).at(-1);
   check(
-    "30 claude-agent：CARVED_SLATE=0 压掉了 CLI 自带的 # Environment，上游请求里一处都没有",
-    !environmentInSystem && !environmentAttached,
-    environmentInSystem ? "leaked into system" : environmentAttached ? "attached to the messages" : "absent",
+    "30 claude-agent：CLI 自带的环境块、模型身份句、日期都被插件略去，上游请求里一处都没有",
+    leaked.length === 0,
+    leaked.length === 0 ? "absent" : `leaked: ${leaked.join(", ")}`,
+  );
+  check(
+    "30 claude-agent：首条用户消息只有宿主发来的内容",
+    firstPrompt?.role === "user" && textOf(firstPrompt).trim() === "Please read a.txt",
+    JSON.stringify(firstPrompt?.content ?? null).slice(0, 300),
   );
   const toolNames = (call1?.tools ?? []).map((tool) => tool.name);
   check(

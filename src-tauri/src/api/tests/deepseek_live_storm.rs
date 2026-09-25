@@ -339,7 +339,7 @@ fn seed_conversation_row(app_data: &std::path::Path, workspace_id: &str, convers
                 queued_messages: Vec::new(),
                 branches: Vec::new(),
                 user_aborted_tasks: Vec::new(),
-                worktree: None,
+                worktrees: Vec::new(),
                 run_target: None,
                 additional_directories: Vec::new(),
                 parent_conversation_id: None,

@@ -33,6 +33,21 @@
 .git-review__scope .git-review__scope-trigger:hover { background: var(--hover); color: var(--text); }
 .git-review__scope-ref { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .git-review__scope-arrow { flex: 0 0 auto; color: var(--faint); }
+.git-review__scope-note {
+  flex: 0 0 auto; padding: 0 5px; border-radius: 4px;
+  background: var(--active); color: var(--text); font-size: 10.5px;
+}
+/* A page tab's name: the workspace, the branch it is read against, and the worktree — the same
+   refs the single checkout's trigger shows, in the tab's own bounded width. */
+.git-review__page-label {
+  min-width: 0; display: flex; align-items: center; gap: 3px;
+  overflow: hidden; white-space: nowrap;
+}
+.git-review__page-label > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.git-review__page-label > span:first-child { flex: 0 1 auto; font-weight: 600; }
+.git-review__page-label > svg { flex: 0 0 auto; color: var(--faint); }
+/* A page whose last read failed keeps its last state, marked as not current. */
+.git-review__page-stale { color: var(--warning); }
 
 .git-review__repository-operation {
   min-height: 42px;

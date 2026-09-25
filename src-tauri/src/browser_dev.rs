@@ -125,6 +125,9 @@ pub(super) fn run() -> i32 {
                 {
                     eprintln!("内置提示词档案未能落盘：{error}");
                 }
+                // Remote workspaces go through the same agents as in the desktop
+                // app, rather than one SSH login per command.
+                super::install_machine_links(app.handle(), app_data);
             }
             super::install_background_write_failure_reporting(app.state::<AppState>().inner());
             app.state::<AppState>()
@@ -1271,6 +1274,7 @@ async fn dispatch(
                 app.clone(),
                 app.state::<AppState>(),
                 arg(args, "conversationId")?,
+                optional_arg(args, "member")?,
                 optional_arg(args, "fromBranch")?,
             )
             .await,
@@ -1280,6 +1284,7 @@ async fn dispatch(
                 app.clone(),
                 app.state::<AppState>(),
                 arg(args, "conversationId")?,
+                optional_arg(args, "member")?,
             )
             .await,
         ),

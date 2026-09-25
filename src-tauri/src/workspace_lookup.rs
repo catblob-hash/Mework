@@ -20,8 +20,15 @@ use crate::model::{AppDocument, AttachedWorkspace, Conversation, Workspace, Work
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum GitTarget {
+    /// A conversation's own checkout of one of its project's workspaces: the
+    /// worktree it has of that workspace, or the workspace's directory.
     #[serde(rename_all = "camelCase")]
-    Conversation { conversation_id: String },
+    Conversation {
+        conversation_id: String,
+        /// Which of the project's workspaces, 1-based, as in `Workspace`.
+        #[serde(default)]
+        member: Option<u32>,
+    },
     /// A project (the `Workspace` row) addressed without a conversation.
     #[serde(rename_all = "camelCase")]
     Workspace {
@@ -35,19 +42,29 @@ pub enum GitTarget {
     },
 }
 
+/// A project workspace after the first, as a target named it.
+#[derive(Clone, Copy)]
+pub struct ProjectMember<'a> {
+    /// Its 1-based position in the project, `>= 2`.
+    pub position: usize,
+    pub workspace: &'a AttachedWorkspace,
+}
+
 /// Resolved coordinates. Workspace targets have no conversation, so callers must
 /// handle operations that belong to no conversation rather than inventing one.
 pub enum ResolvedGitTarget<'a> {
     Conversation {
         workspace: &'a Workspace,
         conversation: &'a Conversation,
+        /// `None` is workspace 1, as for `Workspace`.
+        member: Option<ProjectMember<'a>>,
     },
     Workspace {
         workspace: &'a Workspace,
         /// `None` is workspace 1. `Some` is the project's further workspace the
         /// target's `member` named, whose directory — not `workspace.path` — is
         /// the one the request acts on.
-        member: Option<&'a AttachedWorkspace>,
+        member: Option<ProjectMember<'a>>,
     },
 }
 
@@ -57,12 +74,17 @@ pub fn resolve_git_target<'a>(
     request_label: &str,
 ) -> Result<ResolvedGitTarget<'a>, String> {
     match target {
-        GitTarget::Conversation { conversation_id } => {
+        GitTarget::Conversation {
+            conversation_id,
+            member,
+        } => {
             let (workspace, conversation) =
                 find_workspace_for_conversation(document, conversation_id, request_label)?;
+            let member = resolve_project_member(workspace, *member, request_label)?;
             Ok(ResolvedGitTarget::Conversation {
                 workspace,
                 conversation,
+                member,
             })
         }
         GitTarget::Workspace {
@@ -93,7 +115,7 @@ fn resolve_project_member<'a>(
     workspace: &'a Workspace,
     position: Option<u32>,
     request_label: &str,
-) -> Result<Option<&'a AttachedWorkspace>, String> {
+) -> Result<Option<ProjectMember<'a>>, String> {
     let position = match position {
         None | Some(1) => return Ok(None),
         Some(position) => position,
@@ -115,7 +137,10 @@ fn resolve_project_member<'a>(
             workspace.id
         ));
     }
-    Ok(Some(entry))
+    Ok(Some(ProjectMember {
+        position: position as usize,
+        workspace: entry,
+    }))
 }
 
 /// Resolves a renderer-supplied conversation ID against the persisted document. A caller must
@@ -299,7 +324,15 @@ mod tests {
                 .expect("对话寻址可以反序列化");
         assert!(matches!(
             conversation,
-            GitTarget::Conversation { conversation_id } if conversation_id == "conv_1"
+            GitTarget::Conversation { conversation_id, member: None } if conversation_id == "conv_1"
+        ));
+        let conversation_member: GitTarget = serde_json::from_str(
+            r#"{"kind":"conversation","conversationId":"conv_1","member":3}"#,
+        )
+        .expect("对话的项目成员寻址可以反序列化");
+        assert!(matches!(
+            conversation_member,
+            GitTarget::Conversation { member: Some(3), .. }
         ));
         let workspace: GitTarget =
             serde_json::from_str(r#"{"kind":"workspace","workspaceId":"ws_1"}"#)
@@ -378,8 +411,9 @@ mod tests {
                 member: Some(member),
             } => {
                 assert_eq!(workspace.id, "workspace-a");
-                assert_eq!(member.path, "C:/shared");
-                assert!(member.machine.is_none());
+                assert_eq!(member.position, 2);
+                assert_eq!(member.workspace.path, "C:/shared");
+                assert!(member.workspace.machine.is_none());
             }
             _ => panic!("成员 2 应解析为第一个额外工作区"),
         }
@@ -388,8 +422,9 @@ mod tests {
                 member: Some(member),
                 ..
             } => {
-                assert_eq!(member.path, "~/services");
-                assert!(member.machine.is_some());
+                assert_eq!(member.position, 3);
+                assert_eq!(member.workspace.path, "~/services");
+                assert!(member.workspace.machine.is_some());
             }
             _ => panic!("成员 3 应解析为第二个额外工作区"),
         }

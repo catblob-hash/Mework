@@ -30,7 +30,9 @@ export interface ProjectDialogProps {
   initialName?: string;
   /**
    * The project's workspaces, the first being the primary. In edit mode the
-   * first is locked: worktrees and the Git review hang off it.
+   * first is locked: it is the project's identity — the file pane, its memory
+   * and capability files, and the worktree records written before every
+   * workspace could have one all hang off it.
    */
   initialWorkspaces?: AttachedWorkspace[];
   sshMachines: SshMachineConfig[];

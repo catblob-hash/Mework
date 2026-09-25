@@ -93,7 +93,7 @@ export function createE2eConversation({
     queuedMessages: [],
     branches: [],
     userAbortedTasks: [],
-    worktree: null,
+    worktrees: [],
     runTarget: null,
     attachedWorkspaces: [],
     parentConversationId: null,

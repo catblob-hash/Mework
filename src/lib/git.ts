@@ -131,6 +131,11 @@ export interface GitChangePageRequest {
   query?: string;
   limit?: number;
   selectedPath?: string;
+  /**
+   * List the changes since this commit — committed on the branch and not yet committed alike —
+   * instead of the uncommitted ones: what a worktree has done since it was forked.
+   */
+  base?: string;
 }
 
 export type GitChangeSelection =
@@ -212,7 +217,9 @@ export type GitDiffRequest =
   | { type: "working"; path?: string; context?: number }
   | { type: "staged"; path?: string; context?: number }
   | { type: "unstaged"; path?: string; context?: number }
-  | { type: "compare"; base: string; head: string; path?: string; context?: number };
+  | { type: "compare"; base: string; head: string; path?: string; context?: number }
+  /** From the commit `base` to the working tree: what a branch has done since it was forked. */
+  | { type: "branch"; base: string; path?: string; context?: number };
 
 export interface GitDiffResult {
   patch: string;
@@ -331,10 +338,20 @@ export function gitFileHasUnstagedChange(file: GitFileChange): boolean {
  * Git status belongs to a working directory, not a conversation. Both target
  * forms send only IDs to the host, which resolves paths from persisted documents;
  * the renderer must never supply a repository or Git-directory path. Workspace
- * targets resolve to the workspace root because worktrees belong to conversations.
+ * targets resolve to the registered directory because worktrees belong to
+ * conversations; a conversation target resolves to its worktree of the workspace
+ * when it has one.
  */
 export type GitTarget =
-  | { kind: "conversation"; conversationId: string }
+  | {
+    kind: "conversation";
+    conversationId: string;
+    /**
+     * Which of the project's workspaces, 1-based, as for a workspace target: absent or 1 is
+     * workspace 1. The conversation's checkout of it — its worktree when it has one.
+     */
+    member?: number;
+  }
   | {
     kind: "workspace";
     workspaceId: string;
@@ -346,8 +363,10 @@ export type GitTarget =
     member?: number;
   };
 
-export function gitConversationTarget(conversationId: string): GitTarget {
-  return { kind: "conversation", conversationId };
+export function gitConversationTarget(conversationId: string, member?: number): GitTarget {
+  return member && member > 1
+    ? { kind: "conversation", conversationId, member }
+    : { kind: "conversation", conversationId };
 }
 
 export function gitWorkspaceTarget(workspaceId: string, member?: number): GitTarget {
@@ -371,9 +390,28 @@ export function gitSurfaceProjectId(surfaceKey: string): string {
   return separator < 0 ? surfaceKey : surfaceKey.slice(0, separator);
 }
 
+/**
+ * The key a conversation's snapshot of its project workspace `member` is cached under: the
+ * conversation id itself for workspace 1, and `<conversation id>#<member>` for the others, so
+ * every workspace is polled, fenced and invalidated on its own.
+ */
+export function gitSnapshotKey(conversationId: string, member = 1): string {
+  return member > 1 ? `${conversationId}#${member}` : conversationId;
+}
+
+/** The conversation a {@link gitSnapshotKey} belongs to. */
+export function gitSnapshotKeyConversation(key: string): string {
+  const separator = key.indexOf("#");
+  return separator < 0 ? key : key.slice(0, separator);
+}
+
 /** Stable string suitable for React keys, cache keys, and dependency arrays. */
 export function gitTargetKey(target: GitTarget): string {
-  if (target.kind === "conversation") return `conversation:${target.conversationId}`;
+  if (target.kind === "conversation") {
+    return target.member && target.member > 1
+      ? `conversation:${target.conversationId}#${target.member}`
+      : `conversation:${target.conversationId}`;
+  }
   return target.member && target.member > 1
     ? `workspace:${target.workspaceId}#${target.member}`
     : `workspace:${target.workspaceId}`;
@@ -425,32 +463,35 @@ export async function getGitBranches(target: GitTarget): Promise<GitBranchesResu
 }
 
 /**
- * Create an isolated worktree as the conversation's trusted working directory.
+ * Create an isolated worktree of the conversation's project workspace `member` (1-based) as the
+ * conversation's trusted directory for that workspace, on whichever machine it is.
  *
  * `fromBranch` is the baseline branch, defaulting to the workspace HEAD. Persist
- * the returned record to `Conversation.worktree` so future host resolution uses it.
+ * the returned record in `Conversation.worktrees` so future host resolution uses it.
  */
 export async function createConversationWorktree(
   conversationId: string,
+  member = 1,
   fromBranch?: string
 ): Promise<ConversationWorktree> {
   requireGitRuntime();
   return invoke<ConversationWorktree>("create_conversation_worktree", {
     conversationId,
+    member,
     fromBranch: fromBranch ?? null
   });
 }
 
 /**
- * Release a conversation's isolated worktree.
+ * Release a conversation's isolated worktree of its project workspace `member`.
  *
  * Returns `true` when the worktree and branch were deleted. Returns `false`
  * when uncommitted work or additional commits require retaining it on disk;
  * either result removes the conversation's association.
  */
-export async function releaseConversationWorktree(conversationId: string): Promise<boolean> {
+export async function releaseConversationWorktree(conversationId: string, member = 1): Promise<boolean> {
   requireGitRuntime();
-  return invoke<boolean>("release_conversation_worktree", { conversationId });
+  return invoke<boolean>("release_conversation_worktree", { conversationId, member });
 }
 
 export async function executeGitAction(

@@ -62,6 +62,12 @@ export interface PopoverAnchorOptions {
    * asking about. The first value only establishes the baseline.
    */
   openSignal?: number;
+  /**
+   * Presses outside the panel and its trigger that should leave the panel open. A tab strip
+   * whose tabs can be dragged into its open overflow panel needs one: the press that starts the
+   * drag lands on a tab, and dismissing the panel there would take the drop target away.
+   */
+  keepOpenOnPress?: (target: Node) => boolean;
 }
 
 export interface PopoverAnchor<
@@ -97,7 +103,8 @@ export function usePopoverAnchor<
   width,
   anchorToPointer = false,
   onOpen,
-  openSignal
+  openSignal,
+  keepOpenOnPress
 }: PopoverAnchorOptions = {}): PopoverAnchor<Trigger, Panel> {
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState<PopoverPosition | null>(null);
@@ -107,6 +114,8 @@ export function usePopoverAnchor<
   const openSignalRef = useRef(openSignal);
   const onOpenRef = useRef(onOpen);
   onOpenRef.current = onOpen;
+  const keepOpenOnPressRef = useRef(keepOpenOnPress);
+  keepOpenOnPressRef.current = keepOpenOnPress;
 
   useEffect(() => {
     if (openSignal === undefined || openSignal === openSignalRef.current) return;
@@ -140,6 +149,7 @@ export function usePopoverAnchor<
     const onPointerDown = (event: MouseEvent) => {
       const target = event.target as Node;
       if (triggerRef.current?.contains(target) || panelRef.current?.contains(target)) return;
+      if (keepOpenOnPressRef.current?.(target)) return;
       setOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {

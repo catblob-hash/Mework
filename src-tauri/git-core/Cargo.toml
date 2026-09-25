@@ -1,0 +1,34 @@
+[package]
+name = "mework-git-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+description = "Mework's Git reads and writes, shared by the host and the remote agent."
+
+[lib]
+# Linked by the host (as `crate::git`) and by the remote agent, which runs the
+# same operations on the machine a remote checkout is on (`mework-remote git`).
+name = "git_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Cross-compiled into the remote agent for every machine Mework can reach, so
+# the list stays as short as the agent's own; every version is one the
+# workspace already locks.
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+wait-timeout = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Job objects that end a timed-out Git's whole process tree, and the file
+# identity and removal calls the discard proofs are built on.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

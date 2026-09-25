@@ -56,7 +56,7 @@
   color: var(--muted);
 }
 
-.sandbox-settings-page__status--unavailable { color: var(--danger, #b3261e); }
+.sandbox-settings-page__status--unavailable { color: var(--danger); }
 
 .sandbox-settings-page__list {
   margin: 6px 0 0;

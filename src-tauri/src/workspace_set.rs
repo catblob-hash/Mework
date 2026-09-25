@@ -59,6 +59,33 @@ pub struct ResolvedWorkspace {
     /// the conversation's cell on this workspace's machine (see
     /// [`WorkspaceSet::sandboxed`]).
     pub sandbox: Option<remote_agent::protocol::SandboxSpec>,
+    /// Whether `root` is the conversation's isolated worktree standing in for
+    /// the project workspace at this position, rather than that workspace's
+    /// registered directory.
+    pub is_worktree: bool,
+}
+
+/// One entry to resolve: where it is, and where its variable table is recorded.
+///
+/// The two differ for a worktree, which is checked out elsewhere but runs with
+/// the variables of the registered directory it was checked out from.
+#[derive(Clone, Debug)]
+pub struct WorkspaceEntry {
+    pub workspace: AttachedWorkspace,
+    pub env_path: String,
+    pub is_worktree: bool,
+}
+
+impl WorkspaceEntry {
+    /// A directory that is its own registered location.
+    pub fn registered(workspace: AttachedWorkspace) -> Self {
+        let env_path = workspace.path.clone();
+        Self {
+            workspace,
+            env_path,
+            is_worktree: false,
+        }
+    }
 }
 
 impl ResolvedWorkspace {
@@ -107,25 +134,41 @@ impl WorkspaceSet {
     /// rather than dropping the entry. Dropping it would renumber everything
     /// after it, and a conversation whose "workspace 3" silently became a
     /// different directory is worse than one that says the machine is gone.
+    #[cfg(test)]
     pub fn resolve_with_primary_env(
         assets: &ExecutionEnvironmentAssets,
         primary: &AttachedWorkspace,
         primary_env_path: &str,
         attached: &[AttachedWorkspace],
     ) -> Result<Self, String> {
-        let mut entries = Vec::with_capacity(1 + attached.len());
-        for (position, workspace) in std::iter::once(primary).chain(attached).enumerate() {
+        let primary = WorkspaceEntry {
+            workspace: primary.clone(),
+            env_path: primary_env_path.to_owned(),
+            is_worktree: primary.path != primary_env_path,
+        };
+        let entries = std::iter::once(primary)
+            .chain(attached.iter().cloned().map(WorkspaceEntry::registered))
+            .collect::<Vec<_>>();
+        Self::resolve_entries(assets, &entries)
+    }
+
+    /// Resolves entries whose variable tables are recorded elsewhere than
+    /// their roots: any project workspace the conversation has a worktree of
+    /// runs in the worktree with the registered directory's variables.
+    pub fn resolve_entries(
+        assets: &ExecutionEnvironmentAssets,
+        entries: &[WorkspaceEntry],
+    ) -> Result<Self, String> {
+        let mut resolved = Vec::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
             if position >= MAX_WORKSPACES {
                 break;
             }
-            let env_path = if position == 0 {
-                primary_env_path
-            } else {
-                workspace.path.as_str()
-            };
-            let runner = resolve_shell_runner(assets, workspace.machine.as_ref(), Some(env_path))?;
+            let workspace = &entry.workspace;
+            let runner =
+                resolve_shell_runner(assets, workspace.machine.as_ref(), Some(&entry.env_path))?;
             let (os, shells) = crate::machine_shells::known(workspace.machine.as_ref());
-            entries.push(ResolvedWorkspace {
+            resolved.push(ResolvedWorkspace {
                 index: position as u32 + 1,
                 machine: workspace.machine.clone(),
                 root: workspace.path.clone(),
@@ -134,9 +177,10 @@ impl WorkspaceSet {
                 machine_label: machine_label(assets, workspace.machine.as_ref()),
                 runner,
                 sandbox: None,
+                is_worktree: entry.is_worktree,
             });
         }
-        Ok(Self { entries })
+        Ok(Self { entries: resolved })
     }
 
     /// [`resolve_with_primary_env`](Self::resolve_with_primary_env) for a
@@ -166,6 +210,7 @@ impl WorkspaceSet {
                 shells,
                 machine_label: String::new(),
                 sandbox: None,
+                is_worktree: false,
             }],
         }
     }
@@ -207,6 +252,7 @@ impl WorkspaceSet {
                 machine_label: String::new(),
                 runner,
                 sandbox: None,
+                is_worktree: false,
             }],
         }
     }

@@ -1,5 +1,4 @@
 import {
-  ChevronDown,
   ChevronRight,
   Code2,
   Copy,
@@ -52,6 +51,7 @@ import { parseNotebook } from "../lib/notebook";
 import { revealPath } from "../lib/pathLinks";
 import type { GitTarget } from "../lib/git";
 import { readStoredFlag, writeStoredFlag } from "../lib/paneSettings";
+import { arrangeByIds } from "../lib/reorder";
 import type { SidePaneId } from "../lib/sidePanes";
 import {
   basename,
@@ -81,6 +81,7 @@ import { PdfViewer } from "./FilePreview/PdfViewer";
 import { UnsupportedNotice } from "./FilePreview/UnsupportedNotice";
 import { dataUrlByteLength } from "./FilePreview/format";
 import { MarkdownContent } from "./MarkdownContent";
+import { PageTabs } from "./PageTabs";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuSection } from "./PopoverMenu";
 import { SidePane } from "./SidePane";
@@ -729,16 +730,9 @@ export function FilesPane({
     closeTabs((tab) => tab.path === path);
   }, [closeTabs]);
 
-  const moveTab = useCallback((path: string, delta: number) => {
-    setTabs((current) => {
-      const index = current.findIndex((tab) => tab.path === path);
-      const destination = index + delta;
-      if (index < 0 || destination < 0 || destination >= current.length) return current;
-      const next = [...current];
-      const [moved] = next.splice(index, 1);
-      next.splice(destination, 0, moved);
-      return next;
-    });
+  /** Puts the tabs in the order the strip was dragged or keyed into. */
+  const reorderTabs = useCallback((paths: string[]) => {
+    setTabs((current) => arrangeByIds(current, paths, (tab) => tab.path) ?? current);
   }, []);
 
   /** Opens every directory on the way to `path` and scrolls its row into view. */
@@ -1170,7 +1164,7 @@ export function FilesPane({
             }}
             onKeep={keepTab}
             onClose={closeTab}
-            onMove={moveTab}
+            onReorder={reorderTabs}
             menuSections={fileMenuSections}
           />
         )}
@@ -1632,17 +1626,14 @@ interface FileTabStripProps {
   onActivate: (path: string) => void;
   onKeep: (path: string) => void;
   onClose: (path: string) => void;
-  onMove: (path: string, delta: number) => void;
+  onReorder: (paths: string[]) => void;
   menuSections: (path: string, inTab: boolean) => PopoverMenuSection[];
 }
 
 /**
- * The open files, as tabs in the pane's title bar.
- *
- * The strip never scrolls: tabs shrink to a floor and the ones past it move into
- * an overflow menu, so the bar stays a single 32px row however many files are
- * open. Which tabs overflow is measured rather than counted, because a tab is
- * only as wide as its name.
+ * The open files, as tabs in the pane's title bar: the shared page strip, with a file's own
+ * touches. The one reusable preview tab a single click opens into is drawn in italics, and a
+ * double click on it keeps it. A file costs nothing to reopen, so Delete closes the focused tab.
  */
 function FileTabStrip({
   tabs,
@@ -1651,145 +1642,35 @@ function FileTabStrip({
   onActivate,
   onKeep,
   onClose,
-  onMove,
+  onReorder,
   menuSections
 }: FileTabStripProps) {
   const { t } = useI18n();
-  const stripRef = useRef<HTMLDivElement>(null);
-  const [visibleCount, setVisibleCount] = useState(tabs.length);
-
-  // Minimum readable tab, matching the reference shell's floor.
-  const MIN_TAB_WIDTH = 104;
-  const OVERFLOW_TRIGGER_WIDTH = 28;
-
-  useEffect(() => {
-    const strip = stripRef.current;
-    if (!strip || typeof ResizeObserver === "undefined") {
-      setVisibleCount(tabs.length);
-      return;
-    }
-    const measure = (width: number) => {
-      if (width <= 0) return;
-      const fits = Math.max(1, Math.floor(width / MIN_TAB_WIDTH));
-      if (fits >= tabs.length) {
-        setVisibleCount(tabs.length);
-        return;
-      }
-      const withTrigger = Math.max(1, Math.floor((width - OVERFLOW_TRIGGER_WIDTH) / MIN_TAB_WIDTH));
-      setVisibleCount(Math.min(tabs.length, withTrigger));
-    };
-    measure(strip.clientWidth);
-    const observer = new ResizeObserver(([entry]) => measure(entry?.contentRect.width ?? 0));
-    observer.observe(strip);
-    return () => observer.disconnect();
-  }, [tabs.length]);
-
-  // The active tab is never the one hidden in the overflow menu: a tab you are
-  // looking at that you cannot see is worse than a shorter strip.
-  const ordered = useMemo(() => {
-    const activeIndex = tabs.findIndex((tab) => tab.path === activePath);
-    if (activeIndex < visibleCount) return tabs;
-    const rotated = [...tabs];
-    const [active] = rotated.splice(activeIndex, 1);
-    rotated.splice(Math.max(0, visibleCount - 1), 0, active);
-    return rotated;
-  }, [activePath, tabs, visibleCount]);
-
-  const shown = ordered.slice(0, visibleCount);
-  const overflow = ordered.slice(visibleCount);
-
   return (
-    <div className="files-pane__tabs" role="tablist" aria-label={t("打开的文件", "Open files")} ref={stripRef}>
-      {shown.map((tab) => {
-        const selected = tab.path === activePath;
+    <PageTabs
+      tabs={tabs.map((tab) => {
         const name = basename(tab.path);
-        const absolute = workspacePath ? `${workspacePath}/${tab.path}` : tab.path;
-        return (
-          <div
-            key={tab.path}
-            className={`files-pane__tab${selected ? " files-pane__tab--active" : ""}${tab.preview ? " files-pane__tab--preview" : ""}`}
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              tabIndex={selected ? 0 : -1}
-              className="files-pane__tab-button"
-              title={absolute}
-              data-drag-exclude
-              onClick={() => onActivate(tab.path)}
-              onDoubleClick={() => onKeep(tab.path)}
-              onAuxClick={(event) => {
-                if (event.button !== 1) return;
-                event.preventDefault();
-                onClose(tab.path);
-              }}
-              onKeyDown={(event) => {
-                if ((event.key === "Delete" || event.key === "Backspace") && !event.altKey) {
-                  event.preventDefault();
-                  onClose(tab.path);
-                  return;
-                }
-                if (!event.ctrlKey || !event.shiftKey) return;
-                if (event.key === "ArrowLeft") {
-                  event.preventDefault();
-                  onMove(tab.path, -1);
-                } else if (event.key === "ArrowRight") {
-                  event.preventDefault();
-                  onMove(tab.path, 1);
-                }
-              }}
-            >
-              <FileKindIcon path={tab.path} className="files-pane__tab-icon" />
-              <span className="files-pane__tab-name">{name}</span>
-              {tab.preview && (
-                <span className="sr-only">{t("预览", "preview")}</span>
-              )}
-            </button>
-            <PopoverMenu
-              rootClassName="files-pane__tab-menu"
-              triggerClassName="icon-button files-pane__tab-menu-trigger"
-              trigger={<MoreVertical size={12} aria-hidden="true" />}
-              triggerLabel={t("{name} 的文件操作", "Actions for {name}", { name })}
-              menuLabel={t("{name} 的文件操作", "Actions for {name}", { name })}
-              sections={menuSections(tab.path, true)}
-              align="end"
-              dense
-            />
-            <IconButton
-              className="files-pane__tab-close"
-              label={t("关闭 {name}", "Close {name}", { name })}
-              onClick={(event) => {
-                event.stopPropagation();
-                onClose(tab.path);
-              }}
-            >
-              <X size={12} aria-hidden="true" />
-            </IconButton>
-          </div>
-        );
+        return {
+          id: tab.path,
+          label: name,
+          content: tab.preview ? <>{name}<span className="sr-only">{t("预览", "preview")}</span></> : undefined,
+          title: workspacePath ? `${workspacePath}/${tab.path}` : tab.path,
+          icon: <FileKindIcon path={tab.path} />,
+          hint: parentRelativePath(tab.path) || undefined,
+          className: tab.preview ? "files-pane__tab--preview" : undefined
+        };
       })}
-      {overflow.length > 0 && (
-        <PopoverMenu
-          rootClassName="files-pane__tab-overflow"
-          triggerClassName="icon-button files-pane__tab-overflow-trigger"
-          trigger={<ChevronDown size={13} aria-hidden="true" />}
-          triggerLabel={t("更多文件", "More files")}
-          menuLabel={t("更多文件", "More files")}
-          sections={[{
-            id: "more-files",
-            items: overflow.map((tab) => ({
-              id: tab.path,
-              label: basename(tab.path),
-              hint: parentRelativePath(tab.path) || undefined,
-              checked: tab.path === activePath,
-              onSelect: () => onActivate(tab.path)
-            }))
-          }]}
-          align="end"
-          dense
-        />
-      )}
-    </div>
+      activeId={activePath}
+      ariaLabel={t("打开的文件", "Open files")}
+      moreLabel={t("更多文件", "More files")}
+      onSelect={onActivate}
+      onClose={onClose}
+      closeLabel={(tab) => t("关闭 {name}", "Close {name}", { name: tab.label })}
+      closeOnDeleteKey
+      onReorder={onReorder}
+      onTabDoubleClick={onKeep}
+      tabMenu={(path) => menuSections(path, true)}
+      tabMenuLabel={(tab) => t("{name} 的文件操作", "Actions for {name}", { name: tab.label })}
+    />
   );
 }

@@ -1,15 +1,23 @@
-//! The Git status of a workspace that lives on another machine.
+//! Git for a workspace that lives on another machine.
 //!
-//! The host reads a local checkout's status with its own Git
-//! ([`crate::git::workspace_summary`]). A workspace on a WSL distribution or an
-//! SSH machine has no checkout here, so the same reads — `rev-parse`, `status
-//! --porcelain=v2`, the line counts, the tracked diffs, the local branches'
-//! upstreams, the remotes and the operation in progress — run there instead,
-//! all in one script through that machine's own shell, the transport the
-//! remote file tools use ([`crate::run_environment::run_remote_script`]). One
-//! script rather than one call per read, because a machine the agent does not
-//! serve pays a whole SSH login for each call, and the Git pane asks every few
-//! seconds.
+//! The host reads and writes a local checkout with `git_core` directly. A
+//! workspace on a WSL distribution or an SSH machine has no checkout here, so
+//! the same `git_core` operations run there, next to the repository, in the
+//! agent's `git` helper ([`git_core::service`]): one request, one reply, one
+//! round trip to the machine however many Git invocations the operation makes.
+//! The rules are therefore the host's own — what counts as a repository root,
+//! how revisions and discard proofs are computed, which paths a write may
+//! touch — and so is every message a failure is reported with.
+//!
+//! A machine the agent does not serve (it is still being installed there, or
+//! there is no build for it) still gets its status: the reads the summary
+//! needs — `rev-parse`, `status --porcelain=v2`, the line counts, the tracked
+//! diffs, the local branches' upstreams, the remotes and the operation in
+//! progress — run in one script through that machine's own shell, the
+//! transport the remote file tools use ([`crate::run_environment::run_remote_script`]).
+//! One script rather than one call per read, because such a machine pays a
+//! whole SSH login for each call, and the Git pane asks every few seconds.
+//! Everything else the review pane does needs the agent.
 //!
 //! The script's answer is framed rather than parsed in place: a magic line,
 //! then per read `name exit stdout-length stderr-length` and the two streams'
@@ -18,20 +26,196 @@
 //! the frames with the parsers the local leg uses
 //! ([`crate::git::remote_workspace_snapshot`]).
 //!
-//! Nothing in the script comes from the model or the renderer: the only
-//! variable is the workspace root the host recorded, and it goes through the
-//! quoting of the language it is spliced into.
+//! Nothing sent comes from the model or the renderer unchecked: the root is the
+//! one the host recorded, and every argument an operation carries is validated
+//! on the machine exactly as it is on the host.
 
 use std::collections::HashMap;
 use std::time::Duration;
+
+use git_core::service::{GitServiceOp, GitServiceReply, GitServiceRequest};
+use remote_agent::protocol::SELF_PROGRAM;
+use serde::de::DeserializeOwned;
 
 use crate::cancel::CancelSignal;
 use crate::git::{
     self, GitWorkspaceSnapshot, GitWorkspaceSummaryResult, RemoteGitOutput, RemoteGitProbe,
 };
 use crate::remote_files::RemoteShell;
-use crate::run_environment;
+use crate::run_environment::{self, ShellRunner};
 use crate::shell_backend::ScriptDialect;
+
+/// A checkout on another machine: how to reach the machine, and where the
+/// checkout is on it.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteCheckout {
+    pub runner: ShellRunner,
+    /// `run_environment::env_key` of the machine.
+    pub machine_key: String,
+    /// The checkout's root as recorded, on that machine.
+    pub root: String,
+}
+
+/// How long a status read waits for the machine's link before taking the
+/// probe script instead. Short: the first connection to a machine installs the
+/// agent there, and a poll must not wait on an installation nobody asked for.
+const SUMMARY_LINK_PATIENCE: Duration = Duration::from_secs(2);
+/// How long everything else waits for the link. The review pane asked for
+/// something only the agent can do, so it is worth a first connection.
+const LINK_PATIENCE: Duration = Duration::from_secs(45);
+/// Bound on one read — a change page, a diff — through the agent: its own Git
+/// invocations are bounded on the machine, this bounds the link too.
+const READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bound on one write, which may run hooks (`git checkout`, a rebase step).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Runs one operation on `checkout` through its machine's agent: `Ok(None)`
+/// when no agent serves the machine.
+fn call<T: DeserializeOwned>(
+    checkout: &RemoteCheckout,
+    op: GitServiceOp,
+    timeout: Duration,
+    patience: Duration,
+) -> Result<Option<T>, String> {
+    let Some(link) = crate::remote_link::helper_link(&checkout.runner, patience)? else {
+        return Ok(None);
+    };
+    let request = GitServiceRequest {
+        machine: checkout.machine_key.clone(),
+        root: checkout.root.clone(),
+        op,
+    };
+    let body =
+        serde_json::to_vec(&request).map_err(|error| format!("无法编码远端 Git 请求：{error}"))?;
+    let output = crate::remote_link::run_script_on(
+        &link,
+        &checkout.runner,
+        vec![SELF_PROGRAM.to_owned(), "git".to_owned()],
+        Some(&body),
+        timeout,
+        &CancelSignal::default(),
+    )?;
+    if output.status != Some(0) {
+        return Err(match run_environment::legible_remote_reply(&output.stderr) {
+            Some(reply) => format!("远端 Git 助手失败：{reply}"),
+            None => format!("远端 Git 助手失败（退出码 {:?}）", output.status),
+        });
+    }
+    match serde_json::from_slice::<GitServiceReply>(&output.stdout)
+        .map_err(|error| format!("远端 Git 助手的回答无法解析：{error}"))?
+    {
+        GitServiceReply::Ok(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| format!("远端 Git 助手的回答无法解析：{error}")),
+        GitServiceReply::Err(message) => Err(message),
+    }
+}
+
+/// [`call`] for an operation only the agent can serve.
+fn call_agent<T: DeserializeOwned>(
+    checkout: &RemoteCheckout,
+    op: GitServiceOp,
+    timeout: Duration,
+) -> Result<T, String> {
+    call(checkout, op, timeout, LINK_PATIENCE)?.ok_or_else(|| {
+        "这台机器上的 Mework agent 不可用（可能仍在安装，或没有适合它的构建），\
+         只能读取 Git 状态；稍后再试"
+            .to_owned()
+    })
+}
+
+/// The checkout's status summary, through the agent when it serves the
+/// machine and through the probe script when it does not (yet).
+pub(crate) fn summary(
+    checkout: &RemoteCheckout,
+    known_revision: Option<String>,
+) -> Result<GitWorkspaceSummaryResult, String> {
+    let op = GitServiceOp::Summary {
+        known_revision: known_revision.clone(),
+    };
+    match call(checkout, op, READ_TIMEOUT, SUMMARY_LINK_PATIENCE)? {
+        Some(result) => Ok(result),
+        None => workspace_summary(
+            &checkout.runner,
+            &checkout.machine_key,
+            &checkout.root,
+            known_revision,
+        ),
+    }
+}
+
+pub(crate) fn change_page(
+    checkout: &RemoteCheckout,
+    request: git::GitChangePageRequest,
+) -> Result<git::GitChangePageResult, String> {
+    call_agent(checkout, GitServiceOp::ChangePage { request }, READ_TIMEOUT)
+}
+
+pub(crate) fn diff(
+    checkout: &RemoteCheckout,
+    request: git::GitDiffRequest,
+) -> Result<git::GitDiffResponse, String> {
+    call_agent(checkout, GitServiceOp::Diff { request }, READ_TIMEOUT)
+}
+
+pub(crate) fn branches(checkout: &RemoteCheckout) -> Result<git::GitBranchesResult, String> {
+    call_agent(checkout, GitServiceOp::Branches, READ_TIMEOUT)
+}
+
+pub(crate) fn prepare_discard(
+    checkout: &RemoteCheckout,
+    paths: Vec<String>,
+    include_untracked: bool,
+) -> Result<git::GitDiscardPreparation, String> {
+    call_agent(
+        checkout,
+        GitServiceOp::PrepareDiscard {
+            paths,
+            include_untracked,
+        },
+        READ_TIMEOUT,
+    )
+}
+
+pub(crate) fn execute_action(
+    checkout: &RemoteCheckout,
+    action: git::GitAction,
+) -> Result<git::GitActionResult, String> {
+    call_agent(checkout, GitServiceOp::Action { action }, WRITE_TIMEOUT)
+}
+
+/// Creates a conversation worktree of the repository at `checkout`'s root.
+pub(crate) fn create_conversation_worktree(
+    checkout: &RemoteCheckout,
+    name: &str,
+    from_branch: Option<String>,
+) -> Result<git::CreatedConversationWorktree, String> {
+    call_agent(
+        checkout,
+        GitServiceOp::CreateConversationWorktree {
+            name: name.to_owned(),
+            from_branch,
+        },
+        WRITE_TIMEOUT,
+    )
+}
+
+/// Releases a worktree of the repository at `checkout`'s root, with the
+/// host's retain-on-change rule: `false` when it was kept.
+pub(crate) fn release_worktree(
+    checkout: &RemoteCheckout,
+    worktree: &crate::model::ConversationWorktree,
+) -> Result<bool, String> {
+    call_agent(
+        checkout,
+        GitServiceOp::ReleaseWorktree {
+            path: worktree.path.clone(),
+            branch: worktree.branch.clone(),
+            base_oid: worktree.base_oid.clone(),
+        },
+        WRITE_TIMEOUT,
+    )
+}
 
 /// How long one probe may take. Generous next to the local reads' own limits
 /// because it carries all of them and a link that is not fast; the Git pane
@@ -602,6 +786,216 @@ mod tests {
         crate::remote_link::shutdown();
     }
 
+    /// The review pane's whole surface against a real Windows machine over SSH,
+    /// through the agent's Git helper rather than the probe script: the
+    /// summary, a change page, a diff, a write, and a conversation worktree
+    /// whose committed change is listed since its base. Set
+    /// `MEWORK_E2E_SSH_WINDOWS_HOST` (and `MEWORK_E2E_SSH_PORT`,
+    /// `MEWORK_E2E_SSH_KEY` as needed) and run with `--ignored`; the machine
+    /// needs Git for Windows, and this host a Windows agent build staged in
+    /// `src-tauri/remote-agents/`.
+    #[test]
+    #[ignore]
+    fn over_real_ssh_the_agent_serves_the_review_and_worktrees() {
+        use crate::run_environment::ShellRunner;
+        use crate::shell_backend::AgentShell;
+        let host =
+            std::env::var("MEWORK_E2E_SSH_WINDOWS_HOST").expect("MEWORK_E2E_SSH_WINDOWS_HOST");
+        let port = std::env::var("MEWORK_E2E_SSH_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(0);
+        let identity_file = std::env::var("MEWORK_E2E_SSH_KEY").unwrap_or_default();
+        let app_data = tempfile::tempdir().unwrap();
+        crate::remote_link::install(app_data.path(), Vec::new(), None);
+        let bash = ShellRunner::Ssh {
+            agent_shell: AgentShell::default(),
+            host: host.clone(),
+            port,
+            identity_file,
+            env: Default::default(),
+        };
+        let sh = |script: &str| {
+            let output = bash
+                .run(script, None, PROBE_TIMEOUT, &CancelSignal::default())
+                .unwrap();
+            assert_eq!(output.status, Some(0), "{script}: {}", output.stderr);
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let root = sh(
+            "R=~/mework-e2e-git-review && rm -rf \"$R\" && mkdir -p \"$R\" && cd \"$R\" \\
+             && git init -q -b main && printf 'one\\n' >a.txt && git add a.txt \\
+             && git -c user.name=e2e -c user.email=e2e@example.com commit -q -m first \\
+             && printf 'two\\n' >>a.txt && cygpath -m \"$R\"",
+        );
+        let checkout = RemoteCheckout {
+            runner: bash.clone(),
+            machine_key: "ssh:e2e".into(),
+            root: root.clone(),
+        };
+
+        // Through the agent, not the probe script.
+        let summary = match call::<GitWorkspaceSummaryResult>(
+            &checkout,
+            GitServiceOp::Summary {
+                known_revision: None,
+            },
+            READ_TIMEOUT,
+            LINK_PATIENCE,
+        )
+        .unwrap()
+        .expect("the agent serves the machine")
+        {
+            GitWorkspaceSummaryResult::Snapshot { summary } => summary,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(summary.branch.as_deref(), Some("main"));
+        assert_eq!((summary.additions, summary.unstaged), (1, 1));
+        // The agent and the probe agree on who the checkout is.
+        let probed = workspace_snapshot(&bash, "ssh:e2e", &root).unwrap().unwrap();
+        assert_eq!(summary.repository_id, probed.repository_id);
+        assert_eq!(summary.worktree_id, probed.worktree_id);
+
+        let page = change_page(
+            &checkout,
+            git::GitChangePageRequest {
+                expected_revision: summary.summary_revision.clone(),
+                cursor: None,
+                query: None,
+                limit: 50,
+                selected_path: Some("a.txt".into()),
+                base: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&page, git::GitChangePageResult::Page { files, .. } if files.len() == 1),
+            "{page:?}"
+        );
+        let patch = diff(
+            &checkout,
+            git::GitDiffRequest::Working {
+                path: Some("a.txt".into()),
+                context: None,
+            },
+        )
+        .unwrap()
+        .patch;
+        assert!(patch.contains("+two"), "{patch}");
+        let staged = execute_action(
+            &checkout,
+            git::GitAction::Stage {
+                paths: vec!["a.txt".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(staged.snapshot.map(|snapshot| snapshot.staged), Some(1));
+
+        let worktree = create_conversation_worktree(&checkout, "e2ewt", None).unwrap();
+        assert!(worktree.path.ends_with("/.mework/worktrees/conversations/e2ewt"), "{}", worktree.path);
+        assert_eq!(worktree.base_branch.as_deref(), Some("main"));
+        sh(&format!(
+            "cd '{}' && printf 'x\\n' >b.txt && git add b.txt \\
+             && git -c user.name=e2e -c user.email=e2e@example.com commit -q -m work",
+            worktree.path
+        ));
+        let in_worktree = RemoteCheckout {
+            root: worktree.path.clone(),
+            ..checkout.clone()
+        };
+        let revision = match summary_of(&in_worktree) {
+            GitWorkspaceSummaryResult::Snapshot { summary } => summary.summary_revision,
+            other => panic!("{other:?}"),
+        };
+        let branch_page = change_page(
+            &in_worktree,
+            git::GitChangePageRequest {
+                expected_revision: revision,
+                cursor: None,
+                query: None,
+                limit: 50,
+                selected_path: None,
+                base: Some(worktree.base_oid.clone()),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&branch_page, git::GitChangePageResult::Page { files, .. }
+                if files.iter().any(|file| file.path == "b.txt")),
+            "{branch_page:?}"
+        );
+        let record = crate::model::ConversationWorktree {
+            path: worktree.path.clone(),
+            branch: worktree.branch.clone(),
+            base_oid: worktree.base_oid.clone(),
+            base_branch: worktree.base_branch.clone(),
+            workspace: None,
+        };
+        // A worktree with a commit of its own is kept.
+        assert!(!release_worktree(&checkout, &record).unwrap());
+        sh("rm -rf ~/mework-e2e-git-review");
+        crate::remote_link::shutdown();
+    }
+
+    fn summary_of(checkout: &RemoteCheckout) -> GitWorkspaceSummaryResult {
+        summary(checkout, None).unwrap()
+    }
+
+    /// The probe without the agent, through a Windows machine whose sshd
+    /// hands the line to `cmd.exe`: the PowerShell probe is far longer than the
+    /// 8191 characters `cmd.exe` takes, so it has to travel on standard input
+    /// (`run_environment::run_remote_script`). Set
+    /// `MEWORK_E2E_SSH_WINDOWS_HOST` and run with `--ignored`; no agent link is
+    /// installed, so every call is a fresh SSH login.
+    #[test]
+    #[ignore]
+    fn over_real_ssh_the_probe_reaches_windows_without_the_agent() {
+        use crate::run_environment::ShellRunner;
+        use crate::shell_backend::{AgentShell, ShellBackend};
+        let host =
+            std::env::var("MEWORK_E2E_SSH_WINDOWS_HOST").expect("MEWORK_E2E_SSH_WINDOWS_HOST");
+        let powershell = ShellRunner::Ssh {
+            agent_shell: AgentShell::new(ShellBackend::PowerShell, "powershell.exe"),
+            host,
+            port: std::env::var("MEWORK_E2E_SSH_PORT")
+                .ok()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(0),
+            identity_file: std::env::var("MEWORK_E2E_SSH_KEY").unwrap_or_default(),
+            env: Default::default(),
+        };
+        let setup = powershell
+            .run(
+                "$R = Join-Path $HOME 'mework-e2e-git-ps'\n\
+                 if (Test-Path $R) { Remove-Item -Recurse -Force $R }\n\
+                 New-Item -ItemType Directory $R | Out-Null; Set-Location $R\n\
+                 git init -q -b main; Set-Content -Path a.txt -Value 'one'; git add a.txt\n\
+                 git -c user.name=e2e -c user.email=e2e@example.com commit -q -m first\n\
+                 Add-Content -Path a.txt -Value 'two'\n\
+                 [Console]::Out.Write(($R -replace '\\\\', '/'))\n",
+                None,
+                PROBE_TIMEOUT,
+                &CancelSignal::default(),
+            )
+            .unwrap();
+        assert_eq!(setup.status, Some(0), "{}", setup.stderr);
+        let root = String::from_utf8_lossy(&setup.stdout).trim().to_owned();
+        let snapshot = workspace_snapshot(&powershell, "ssh:e2e", &root)
+            .unwrap()
+            .expect("a repository");
+        assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        assert_eq!((snapshot.additions, snapshot.unstaged), (1, 1));
+        let cleanup = powershell
+            .run(
+                "Remove-Item -Recurse -Force (Join-Path $HOME 'mework-e2e-git-ps')\n",
+                None,
+                PROBE_TIMEOUT,
+                &CancelSignal::default(),
+            )
+            .unwrap();
+        assert_eq!(cleanup.status, Some(0), "{}", cleanup.stderr);
+    }
+
     #[test]
     fn outside_a_repository_root_there_is_no_repository() {
         let Some(shell) = LocalBash::find() else {
@@ -626,3 +1020,4 @@ mod tests {
             .contains("不存在"));
     }
 }
+

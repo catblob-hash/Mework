@@ -407,11 +407,11 @@ describe("draft conversation Git surface", () => {
     const workspace = appDocument.workspaces[0];
     const peer = {
       ...workspace.conversations[0],
-      worktree: {
+      worktrees: [{
         path: "C:/workspace/.mework/worktrees/conversations/peer",
         branch: "mework/peer",
         baseOid: "head-oid"
-      }
+      }]
     };
     workspace.conversations = [peer];
     runtimeMocks.loadDocument.mockResolvedValue(appDocument);

@@ -46,6 +46,7 @@ import type {
   ConversationToolLock,
   ConversationWorktree,
   ConversationWebSearchSettings,
+  DraftConversationSnapshot,
   EnvironmentToolDefinition,
   EnvironmentToolSnapshot,
   ExecutionEnvironmentAssets,
@@ -359,13 +360,35 @@ function normalizeSecurityLevel(value: unknown, fallback: SecurityLevel = "reque
 function normalizeConversationWorktree(value: unknown): ConversationWorktree | null {
   const worktree = record(value);
   if (!worktree) return null;
-  const { path, branch, baseOid } = worktree;
+  const { path, branch, baseOid, baseBranch } = worktree;
   if (
     typeof path !== "string" || !path.trim() || path.length > 4096
     || typeof branch !== "string" || !branch.trim() || branch.length > 512
     || typeof baseOid !== "string" || !/^[0-9a-f]{7,64}$/.test(baseOid)
   ) return null;
-  return { path, branch, baseOid };
+  const workspace = normalizeAttachedWorkspaces([worktree.workspace], undefined)[0] ?? null;
+  return {
+    path,
+    branch,
+    baseOid,
+    ...(typeof baseBranch === "string" && baseBranch.trim() && baseBranch.length <= 512
+      ? { baseBranch }
+      : {}),
+    ...(workspace ? { workspace } : {})
+  };
+}
+
+/**
+ * A conversation's worktrees from either shape they were written in: the list, or — from
+ * before every workspace could have one — a single `worktree` record, which is workspace 1's.
+ * An invalid record is dropped, so its workspace runs at its registered directory.
+ */
+function normalizeConversationWorktrees(list: unknown, legacy: unknown): ConversationWorktree[] {
+  const values = Array.isArray(list) ? list : legacy ? [legacy] : [];
+  return values.flatMap((value) => {
+    const worktree = normalizeConversationWorktree(value);
+    return worktree ? [worktree] : [];
+  });
 }
 
 /**
@@ -1637,7 +1660,10 @@ export function normalizeDocument(value: unknown): AppDocument {
               })
             : [],
           settings: baseSettings,
-          worktree: normalizeConversationWorktree(conversationInput?.worktree),
+          worktrees: normalizeConversationWorktrees(
+            conversationInput?.worktrees,
+            (conversationInput as { worktree?: unknown } | undefined)?.worktree
+          ),
           runTarget: normalizeRunTarget(conversationInput?.runTarget),
           attachedWorkspaces: normalizeAttachedWorkspaces(
             conversationInput?.attachedWorkspaces,
@@ -1724,10 +1750,24 @@ export function normalizeDocument(value: unknown): AppDocument {
     temporaryWorkspace ?? createTemporaryWorkspace()
   ];
   const executionEnvironments = globalSettings.executionEnvironments;
+  // The draft is a conversation that has not been sent yet, so its settings take
+  // the same path a conversation's do.
+  const draftInput = record(globalInput?.draftConversation);
+  const draftConversation: DraftConversationSnapshot | null = draftInput && record(draftInput.settings)
+    ? {
+        settings: normalizeConversationSettingsValue(draftInput.settings),
+        presetId: typeof draftInput.presetId === "string"
+          && draftInput.presetId.trim()
+          && draftInput.presetId.length <= 128
+          ? draftInput.presetId
+          : ""
+      }
+    : null;
   return {
     schemaVersion: fallback.schemaVersion,
     globalSettings: {
       ...globalSettings,
+      draftConversation,
       executionEnvironments: {
         ...executionEnvironments,
         envVars: spreadMachineEnvVars(executionEnvironments.envVars, workspaces)
@@ -2325,6 +2365,7 @@ interface PersistedAppDocument {
     appearance: AppearancePreferences;
     shortcuts: GlobalSettings["shortcuts"];
     environmentTools: EnvironmentToolDefinition[];
+    draftConversation?: DraftConversationSnapshot | null;
   };
   assets: {
     apiProviders: AppDocument["globalSettings"]["apiProviders"];

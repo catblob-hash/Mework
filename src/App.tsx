@@ -131,6 +131,7 @@ import {
   isReservedWorkspace,
   machineUsage,
   projectWorkspaces,
+  registeredProjectWorkspaces,
   terminalShellLabel,
   runEnvKey,
   sameMachine,
@@ -138,7 +139,10 @@ import {
   withWorkspaceArgument,
   workspaceDirectoryLabel,
   workspaceEnvKey,
-  workspaceLocationTitle
+  workspaceLocationTitle,
+  withConversationWorktree,
+  worktreeFor,
+  worktreeName
 } from "./lib/workspaces";
 import {
   settingsAtToolLockFloor,
@@ -178,11 +182,13 @@ import {
 import type { SubagentView } from "./lib/subagents";
 import { BrowserPanel, splitBrowserAddress } from "./components/BrowserPanel";
 import { PreviewPageTabs } from "./components/PreviewPageTabs";
-import { GitReviewPanel } from "./components/GitReviewPanel";
+import { GitReviewPageLabel, GitReviewPanel } from "./components/GitReviewPanel";
+import { PageTabs } from "./components/PageTabs";
+import type { GitReviewRevealRequest } from "./components/GitReviewPanel";
 import { ShellTaskPanel } from "./components/ShellTaskPanel";
 import { FilesPane } from "./components/FilesPane";
 import type { FilesPaneOpenRequest } from "./components/FilesPane";
-import { setPathOpenHandler } from "./lib/pathLinks";
+import { revealPath, setPathOpenHandler } from "./lib/pathLinks";
 import { workspaceRelativePath } from "./lib/workspaceFiles";
 import { HistoryPane } from "./components/HistoryPane";
 import { PaneTiles } from "./components/PaneTiles";
@@ -246,13 +252,19 @@ import {
   getGitBranches,
   gitConversationTarget,
   gitPeerBlocksMutation,
+  gitSnapshotKey,
+  gitSnapshotKeyConversation,
   gitSurfaceKey,
   gitSurfaceProjectId,
   gitWorkspaceTarget,
   releaseConversationWorktree
 } from "./lib/git";
+import { useGitSurfacePolling } from "./lib/gitPolling";
+import type { GitPollSurface } from "./lib/gitPolling";
+import type { GitRefreshHandlers } from "./lib/gitController";
 import {
   createGitController,
+  gitReviewListsPath,
   gitReviewSnapshotCacheKey,
   gitSnapshotBroadcastIds,
   gitSnapshotForWorkspace,
@@ -821,6 +833,23 @@ function App() {
    * composer's terminal button opens a shell. Kept per conversation for the session only.
    */
   const [selectedWorkspaceMembers, setSelectedWorkspaceMembers] = useState<Record<string, number>>({});
+  /**
+   * The review pane's open page for each conversation — the project workspace it reviews,
+   * 1-based — when the reader chose one. Absent follows the composer's workspace chip.
+   */
+  const [reviewPageMembers, setReviewPageMembers] = useState<Record<string, number>>({});
+  /**
+   * The order the reader dragged each conversation's review pages into, by workspace number.
+   * Workspaces missing from it keep the project's order after the ones it names; reordering a
+   * page never renumbers a workspace, which is how the model addresses it.
+   */
+  const [reviewPageOrders, setReviewPageOrders] = useState<Record<string, number[]>>({});
+  /**
+   * Why the last read of each checkout failed, by its `gitSnapshotKey`, until one succeeds. The
+   * snapshot it had stays on screen — a machine that went to sleep is still the checkout it was —
+   * and its review page says the state is not current.
+   */
+  const [gitSurfaceFailures, setGitSurfaceFailures] = useState<Record<string, string>>({});
   /** The project whose edit dialog is open, from the sidebar's project menu. */
   const [projectEditor, setProjectEditor] = useState<string | null>(null);
   const editedProject = projectEditor
@@ -918,6 +947,27 @@ function App() {
   /** Event handlers read the draft ref because they cannot wait for the next render. */
   const draftConversationRef = useRef<DraftConversationState | null>(draftConversation);
   draftConversationRef.current = draftConversation;
+  /* The draft owns its settings from the moment it is opened, the way any conversation does, so
+   * they are kept with the document: a restart brings back what the user set on it rather than
+   * rebuilding it from the preset it was copied from. Only the settings and their preset trace are
+   * kept; its text, grants and shells belong to this run of the app. */
+  const draftSettings = draftConversation?.settings ?? null;
+  const draftPresetId = draftConversation?.presetId ?? "";
+  useEffect(() => {
+    if (!draftSettings) return;
+    documentStore.update((current) => {
+      if (!current) return current;
+      const stored = current.globalSettings.draftConversation;
+      if (stored?.settings === draftSettings && stored.presetId === draftPresetId) return current;
+      return {
+        ...current,
+        globalSettings: {
+          ...current.globalSettings,
+          draftConversation: { settings: draftSettings, presetId: draftPresetId }
+        }
+      };
+    });
+  }, [documentStore, draftPresetId, draftSettings]);
   /**
    * The id the host knows a conversation's terminals and preview page by: its own, or for the
    * draft the id it will materialize as. Terminal tabs, terminal sessions and browser sessions are
@@ -1027,7 +1077,12 @@ function App() {
     || modelRunController.hasPerformingRun(conversationId)
     || modelRunController.hasPreparingRun(conversationId)
   ), []);
-  const beginGitMutation = useCallback((conversationId: string): boolean => {
+  /**
+   * Takes the Git mutation lease for a write to the conversation's project workspace `member`
+   * (1-based). Another conversation blocks it only while it may be working in the same checkout
+   * of that workspace — not in a worktree of its own — which is how the host decides too.
+   */
+  const beginGitMutation = useCallback((conversationId: string, member = 1): boolean => {
     if (modelRunController.current()[conversationId] || contextMutationIsBlocked(conversationId)) return false;
     // Drafts are absent from workspace conversations, so resolve their selected workspace directly.
     const draftWorkspaceId = isDraftConversationId(conversationId)
@@ -1039,19 +1094,22 @@ function App() {
         candidate.conversations.some((conversation) => conversation.id === conversationId)
       ));
     if (!workspace) return false;
+    const registered = registeredProjectWorkspaces(workspace)[member - 1];
+    const surface = gitSurfaceKey(workspace.id, member);
     const snapshots = gitController.current().snapshots;
+    const isolated = (conversation: Pick<Conversation, "worktrees"> | undefined) => Boolean(
+      registered && worktreeFor(conversation, member, registered)
+    );
     // A peer running a model in its own checkout is not writing here, which is
     // also how the host decides. The draft has no worktree of its own.
     const acting: GitCheckoutRef = {
-      snapshot: gitSnapshotForWorkspace(snapshots[conversationId], workspace.id),
-      isolated: Boolean(workspace.conversations.find((conversation) => (
-        conversation.id === conversationId
-      ))?.worktree)
+      snapshot: gitSnapshotForWorkspace(snapshots[gitSnapshotKey(conversationId, member)], surface),
+      isolated: isolated(workspace.conversations.find((conversation) => conversation.id === conversationId))
     };
     // The draft aimed here is a peer at the root checkout too, though no list holds it.
-    const peers: Array<{ id: string; worktree: Conversation["worktree"] }> = [
+    const peers: Array<Pick<Conversation, "id" | "worktrees">> = [
       ...workspace.conversations,
-      ...(draftWorksIn(workspace) ? [{ id: DRAFT_CONVERSATION_ID, worktree: null }] : [])
+      ...(draftWorksIn(workspace) ? [{ id: DRAFT_CONVERSATION_ID, worktrees: [] }] : [])
     ];
     if (
       peers.some((peer) => (
@@ -1059,8 +1117,8 @@ function App() {
         && gitPeerBlocksMutation({
           acting,
           peer: {
-            snapshot: gitSnapshotForWorkspace(snapshots[peer.id], workspace.id),
-            isolated: Boolean(peer.worktree)
+            snapshot: gitSnapshotForWorkspace(snapshots[gitSnapshotKey(peer.id, member)], surface),
+            isolated: isolated(peer)
           },
           peerModelRunActive: conversationModelRunIsActive(peer.id),
           peerGitMutationActive: gitController.mutationIsActive(peer.id)
@@ -1342,25 +1400,27 @@ function App() {
   );
 
   /**
-   * `surfaceKey` is what the snapshot is stored under: a project id, or a project id with the
-   * member number when the snapshot is of another of the project's workspaces.
+   * `snapshotKey` is the conversation's `gitSnapshotKey` for the workspace; `surfaceKey` is what
+   * the snapshot is stored under: a project id, or a project id with the member number when the
+   * snapshot is of another of the project's workspaces.
    */
   const refreshGitSnapshot = useCallback(async (
-    conversationId: string,
+    snapshotKey: string,
     surfaceKey: string,
-    target: GitTarget
+    target: GitTarget,
+    handlers?: GitRefreshHandlers
   ): Promise<GitWorkspaceSnapshot | null | undefined> => {
     const projectId = gitSurfaceProjectId(surfaceKey);
     const workspace = documentStore.current()?.workspaces.find((candidate) => candidate.id === projectId);
     if (
       !hasBackendRuntime()
       // Drafts can hold mutation leases despite being absent from workspace conversation lists.
-      || gitController.mutationIsActive(conversationId)
+      || gitController.mutationIsActive(gitSnapshotKeyConversation(snapshotKey))
       || workspace?.conversations.some((conversation) => (
         gitController.mutationIsActive(conversation.id)
       ))
     ) return undefined;
-    return gitController.refresh(conversationId, surfaceKey, target);
+    return gitController.refresh(snapshotKey, surfaceKey, target, handlers);
   }, [gitController]);
 
   const browserSessionDeletionIsActive = useCallback((conversationId: string): boolean => (
@@ -2334,10 +2394,15 @@ function App() {
       ))
     )
   );
-  /** The project's own workspaces as this conversation uses them: its worktree stands in for the first. */
+  /** The project's own workspaces as this conversation uses them: its worktree of each stands in for it. */
   const activeProjectWorkspaces = useMemo(
     () => projectWorkspaces(activeWorkspace, activeConversation),
     [activeWorkspace, activeConversation]
+  );
+  /** The project's workspaces as registered: what worktrees are made from, and named after. */
+  const activeRegisteredWorkspaces = useMemo(
+    () => registeredProjectWorkspaces(activeWorkspace),
+    [activeWorkspace]
   );
   /**
    * The project workspace the composer's workspace chip has selected, 1-based. A selection
@@ -2357,7 +2422,9 @@ function App() {
   const activeGitSurfaceKey = activeWorkspace
     ? gitSurfaceKey(activeWorkspace.id, activeWorkspaceMember)
     : undefined;
-  const activeGitSnapshotEntry = activeConversation ? gitSnapshots[activeConversation.id] : undefined;
+  const activeGitSnapshotEntry = activeConversation
+    ? gitSnapshots[gitSnapshotKey(activeConversation.id, activeWorkspaceMember)]
+    : undefined;
   const activeGitSnapshotState = gitSnapshotForWorkspace(
     activeGitSnapshotEntry,
     activeGitSurfaceKey
@@ -2372,47 +2439,64 @@ function App() {
   const activeGitWorkspaceId = activeWorkspace?.id ?? null;
   const activeGitWorkspaceKind = activeWorkspace?.kind ?? null;
   /**
-   * Whether the active workspace's directory is on another machine. The review
-   * pane, the worktree toggle and the file pane act on a checkout in this
-   * filesystem; a remote workspace has none here, and the host refuses to
-   * resolve its path locally. Its Git status is still read — on its machine.
+   * Whether the active project's first workspace is on another machine. The file pane and the
+   * browser's file picker read this computer's filesystem, so they have nothing to show for one;
+   * Git works there all the same, on its machine.
    */
   const activeWorkspaceIsRemote = Boolean(activeWorkspace?.machine);
   /**
-   * The conversation's own checkout — the project's first workspace, or its worktree — wherever
-   * it is. Only its status is read through this; see `activePrimaryGitTarget`.
+   * The Git target of the conversation's checkout of its project workspace `member` (1-based),
+   * wherever it is: its worktree of that workspace when it has one. A draft has no worktrees yet
+   * and addresses the registered directory. Another workspace is addressed by its number within
+   * the project, never by path.
    */
-  const activePrimaryGitCheckout = useMemo((): GitTarget | null => {
+  const gitTargetForMember = useCallback((member: number): GitTarget | null => {
     if (!activeGitConversationId) return null;
-    if (!draftActive) return gitConversationTarget(activeGitConversationId);
+    if (!draftActive) return gitConversationTarget(activeGitConversationId, member);
     if (!activeGitWorkspaceId || activeGitWorkspaceKind !== "directory") return null;
-    return gitWorkspaceTarget(activeGitWorkspaceId);
+    return gitWorkspaceTarget(activeGitWorkspaceId, member);
   }, [activeGitConversationId, activeGitWorkspaceId, activeGitWorkspaceKind, draftActive]);
+  /** The conversation's checkout of its first workspace, wherever it is. */
+  const activePrimaryGitCheckout = useMemo(() => gitTargetForMember(1), [gitTargetForMember]);
   /**
-   * The conversation's own checkout when it is on this host. The file pane, previews and worktree
-   * bookkeeping act on this one whatever the chip has selected.
+   * The conversation's own checkout when it is on this host. The file pane and the browser's file
+   * picker act on this one whatever the chip has selected.
    */
   const activePrimaryGitTarget = activeWorkspaceIsRemote ? null : activePrimaryGitCheckout;
-  /** Whether the selected workspace's directory is on another machine, where the host has no checkout. */
-  const activeSelectedWorkspaceIsRemote = Boolean(activeSelectedWorkspace?.machine);
   /**
-   * The checkout the Git chip and the status card describe: the selected workspace, on whichever
-   * machine it is — the host reads a remote workspace's status there, the way it reads a local
-   * one here. Another workspace of the project is addressed by its number within the project,
-   * never by path.
+   * The checkout the Git chip, the status card, the branch menu and the Git writes act on: the
+   * selected workspace, on whichever machine it is — the host runs a remote workspace's Git there
+   * through its agent, the way it runs a local one here.
    */
-  const activeGitStatusTarget = useMemo((): GitTarget | null => {
-    if (activeWorkspaceMember === 1) return activePrimaryGitCheckout;
-    if (!activeGitConversationId || !activeGitWorkspaceId) return null;
-    return gitWorkspaceTarget(activeGitWorkspaceId, activeWorkspaceMember);
-  }, [activeGitConversationId, activeGitWorkspaceId, activePrimaryGitCheckout, activeWorkspaceMember]);
+  const activeGitStatusTarget = useMemo(
+    () => gitTargetForMember(activeWorkspaceMember),
+    [activeWorkspaceMember, gitTargetForMember]
+  );
+  const activeGitTarget = activeGitStatusTarget;
   /**
-   * The checkout the review pane, the branch menu and the Git writes act on: the one the status
-   * describes, when it is on this host. A remote one has only its status here.
+   * Every project workspace the conversation has a Git surface for, with where its snapshot is
+   * kept and the worktree standing in for it. A temporary project's conversation has its scratch
+   * directory as workspace 1; a draft aimed at no project has none.
    */
-  const activeGitTarget = activeWorkspaceMember === 1
-    ? activePrimaryGitTarget
-    : activeSelectedWorkspaceIsRemote ? null : activeGitStatusTarget;
+  const activeGitMembers = useMemo(() => {
+    if (!activeConversation || !activeWorkspace) return [];
+    const registered = activeWorkspace.kind === "directory"
+      ? activeRegisteredWorkspaces
+      : draftActive ? [] : [{ machine: null, path: activeWorkspace.path }];
+    return registered.flatMap((workspace, index) => {
+      const member = index + 1;
+      const target = gitTargetForMember(member);
+      if (!target) return [];
+      return [{
+        member,
+        registered: workspace,
+        worktree: draftActive ? null : worktreeFor(activeConversation, member, workspace),
+        key: gitSnapshotKey(activeConversation.id, member),
+        surfaceKey: gitSurfaceKey(activeWorkspace.id, member),
+        target
+      }];
+    });
+  }, [activeConversation, activeRegisteredWorkspaces, activeWorkspace, draftActive, gitTargetForMember]);
   /**
    * Whether the conversation has started. The project it belongs to is settled from then on,
    * so the composer stops offering to change it.
@@ -2451,55 +2535,80 @@ function App() {
     });
     openPane("terminal");
   }, [dispatchTerminalTabs, hostConversationId, openPane]);
-  useEffect(() => {
-    const conversationId = activeConversation?.id;
-    const workspaceId = activeGitSurfaceKey;
-    if (!conversationId || !workspaceId || !activeGitStatusTarget || !hasBackendRuntime()) return;
-    let cancelled = false;
-    let inFlight = false;
-    let refreshQueued = false;
-    let timer: number | null = null;
-    const refresh = async () => {
-      if (cancelled || window.document.visibilityState === "hidden") return;
-      if (inFlight) {
-        refreshQueued = true;
-        return;
-      }
-      inFlight = true;
-      try {
-        await refreshGitSnapshot(conversationId, workspaceId, activeGitStatusTarget);
-      } finally {
-        inFlight = false;
-        if (refreshQueued && !cancelled) {
-          refreshQueued = false;
-          void refresh();
+  /**
+   * The project workspace the review pane shows, 1-based: the page the reader opened, or the one
+   * the composer's workspace chip has selected. A page past the end falls back to the chip's.
+   */
+  const activeReviewMember = (() => {
+    const chosen = activeConversation ? reviewPageMembers[activeConversation.id] : undefined;
+    return chosen && activeGitMembers.some((entry) => entry.member === chosen)
+      ? chosen
+      : activeWorkspaceMember;
+  })();
+  /**
+   * Every checkout of the conversation is kept fresh, each on its own loop: the review pane's
+   * pages all show where they stand, and a slow machine holds up nobody else's. The one the chip
+   * shows, and the review pane's open page, poll fast; the rest at a background cadence.
+   */
+  const gitPollSurfaces = useMemo((): GitPollSurface[] => activeGitMembers.map((entry) => ({
+    key: entry.key,
+    surfaceKey: entry.surfaceKey,
+    target: entry.target,
+    foreground: entry.member === activeWorkspaceMember
+      || (gitReviewPanelOpen && entry.member === activeReviewMember)
+  })), [activeGitMembers, activeReviewMember, activeWorkspaceMember, gitReviewPanelOpen]);
+  useGitSurfacePolling(
+    gitPollSurfaces,
+    async (surface) => {
+      let failure: string | null = null;
+      const snapshot = await refreshGitSnapshot(surface.key, surface.surfaceKey, surface.target, {
+        onError: (reason) => {
+          failure = failureMessage(reason, t("无法读取 Git 状态", "Could not read the Git status"));
         }
-      }
+      });
+      // A read skipped for a write in flight says nothing either way.
+      if (failure === null && snapshot === undefined) return true;
+      setGitSurfaceFailures((current) => {
+        if ((current[surface.key] ?? null) === failure) return current;
+        const next = { ...current };
+        if (failure === null) delete next[surface.key];
+        else next[surface.key] = failure;
+        return next;
+      });
+      return failure === null;
+    },
+    hasBackendRuntime()
+  );
+  /**
+   * The review pane's pages: every project workspace that is a Git repository, in the order the
+   * reader dragged them into, with the project's order for the rest.
+   */
+  const activeReviewPages = useMemo(() => {
+    const pages = activeGitMembers.flatMap((entry) => {
+      const snapshot = gitSnapshotForWorkspace(gitSnapshots[entry.key], entry.surfaceKey);
+      return snapshot ? [{ ...entry, snapshot }] : [];
+    });
+    const order = activeConversation ? reviewPageOrders[activeConversation.id] ?? [] : [];
+    const rank = (member: number) => {
+      const position = order.indexOf(member);
+      return position < 0 ? order.length + member : position;
     };
-    const poll = async () => {
-      await refresh();
-      if (!cancelled) timer = window.setTimeout(() => void poll(), 4000);
-    };
-    const refreshWhenVisible = () => {
-      if (window.document.visibilityState !== "hidden") void refresh();
-    };
-    void poll();
-    window.addEventListener("focus", refreshWhenVisible);
-    window.document.addEventListener("visibilitychange", refreshWhenVisible);
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-      window.removeEventListener("focus", refreshWhenVisible);
-      window.document.removeEventListener("visibilitychange", refreshWhenVisible);
-    };
-  }, [activeConversation?.id, activeGitStatusTarget, activeGitSurfaceKey, refreshGitSnapshot]);
-  // A workspace that stopped being a Git repository has no review pane to show. Leaving it up
-  // would strand the user on a pane whose panel has nothing to render.
+    return [...pages].sort((left, right) => rank(left.member) - rank(right.member));
+  }, [activeConversation, activeGitMembers, gitSnapshots, reviewPageOrders]);
+  /**
+   * Whether Git has answered for every workspace of the conversation and none of them is a
+   * repository — as opposed to answers still on their way.
+   */
+  const activeGitHasNoRepository = activeGitMembers.every((entry) => (
+    gitSnapshotForWorkspace(gitSnapshots[entry.key], entry.surfaceKey) === null
+  ));
+  // A conversation none of whose workspaces is a Git repository has no review pane to show.
+  // Leaving it up would strand the user on a pane whose panel has nothing to render.
   useEffect(() => {
-    if (!activeConversation || activeGitSnapshotState !== null) return;
+    if (!activeConversation || !activeGitHasNoRepository) return;
     if (!paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, activeConversation.id), "review")) return;
     dispatchSidePanes({ type: "close", conversationId: activeConversation.id, pane: "review" });
-  }, [activeConversation, activeGitSnapshotState, dispatchSidePanes]);
+  }, [activeConversation, activeGitHasNoRepository, dispatchSidePanes]);
   // The file pane reads this machine's filesystem; a conversation moved to a
   // remote workspace has nothing for it to show.
   useEffect(() => {
@@ -2513,10 +2622,15 @@ function App() {
    * Deliberately unconditional: the status card's rows all point at the same pane, and returning
    * early when it was already open used to make a second click do nothing at all.
    */
-  const openGitReview = useCallback(() => {
-    if (!activeConversation || !activeGitSnapshot || !activeGitTarget) return;
+  const openGitReview = useCallback((member?: number) => {
+    if (!activeConversation) return;
+    const page = member ?? activeReviewMember;
+    if (!activeReviewPages.some((entry) => entry.member === page)) return;
+    setReviewPageMembers((current) => (
+      current[activeConversation.id] === page ? current : { ...current, [activeConversation.id]: page }
+    ));
     openPane("review");
-  }, [activeConversation, activeGitSnapshot, activeGitTarget, openPane]);
+  }, [activeConversation, activeReviewMember, activeReviewPages, openPane]);
   const activeComposerDraft = activeConversation ? composerDrafts[activeConversation.id] ?? "" : "";
   const activeComposerImages = activeConversation ? composerImageDrafts[activeConversation.id] ?? [] : [];
   const activeComposerFiles = activeConversation ? composerFileDrafts[activeConversation.id] ?? [] : [];
@@ -2564,34 +2678,45 @@ function App() {
     : null;
   /** The workspace's conversations and the draft aimed at it, as Git sees the root checkout. */
   const activeWorkspacePeers = useMemo(
-    () => [
+    (): Array<Pick<Conversation, "id" | "worktrees">> => [
       ...(activeWorkspace?.conversations ?? []),
-      ...(activeWorkspaceDraft ? [{ id: DRAFT_CONVERSATION_ID, worktree: null }] : [])
+      ...(activeWorkspaceDraft ? [{ id: DRAFT_CONVERSATION_ID, worktrees: [] }] : [])
     ],
     [activeWorkspace, activeWorkspaceDraft]
   );
   const activeWorkspaceGitMutationRunning = activeWorkspacePeers.some((peer) => (
     gitMutationConversationIds.has(peer.id)
   ));
-  // Mirrors `beginGitMutation` through the same predicate, so a button never offers a write the
-  // synchronous gate then refuses.
-  const activeWorkspacePeerOperationRunning = Boolean(
-    activeConversation && activeWorkspacePeers.some((peer) => (
+  /**
+   * Whether another task of the project may be writing the conversation's checkout of project
+   * workspace `member`, which holds a Git write to it back. Mirrors `beginGitMutation` through the
+   * same predicate, so a button never offers a write the synchronous gate then refuses.
+   */
+  const gitPeerOperationRunningFor = (member: number) => {
+    if (!activeConversation || !activeWorkspace) return false;
+    const registered = activeRegisteredWorkspaces[member - 1];
+    const surface = gitSurfaceKey(activeWorkspace.id, member);
+    // The draft has no worktrees of its own; a peer's count whichever conversation is acting.
+    const isolated = (conversation: Pick<Conversation, "worktrees">) => Boolean(
+      registered && worktreeFor(conversation, member, registered)
+    );
+    return activeWorkspacePeers.some((peer) => (
       peer.id !== activeConversation.id
       && gitPeerBlocksMutation({
         acting: {
-          snapshot: activeGitSnapshotState,
-          isolated: Boolean(activeConversation.worktree)
+          snapshot: gitSnapshotForWorkspace(gitSnapshots[gitSnapshotKey(activeConversation.id, member)], surface),
+          isolated: isolated(activeConversation)
         },
         peer: {
-          snapshot: gitSnapshotForWorkspace(gitSnapshots[peer.id], activeGitSurfaceKey),
-          isolated: Boolean(peer.worktree)
+          snapshot: gitSnapshotForWorkspace(gitSnapshots[gitSnapshotKey(peer.id, member)], surface),
+          isolated: isolated(peer)
         },
         peerModelRunActive: Boolean(modelRunSummaries[peer.id]),
         peerGitMutationActive: gitMutationConversationIds.has(peer.id)
       })
-    ))
-  );
+    ));
+  };
+  const activeWorkspacePeerOperationRunning = gitPeerOperationRunningFor(activeWorkspaceMember);
   const activeWorkspaceTerminalBusy = Boolean(
     activeWorkspace && Object.values(terminalSessions).some((session) => (
       session.busy
@@ -2757,24 +2882,31 @@ function App() {
   );
   const activeReasoningEffort = activeConversation?.settings.reasoningEffort ?? reasoningEffortOptions[0];
   const activeReasoningEffortLabel = reasoningEffortLabel(activeReasoningEffort);
-  /** Isolated worktree for this conversation; null runs at the workspace root. */
-  const activeWorktree = activeConversation?.worktree ?? null;
+  /** The conversation's isolated worktree of its first workspace; null runs at the registered root. */
+  const activePrimaryWorktree = activeGitMembers.find((entry) => entry.member === 1)?.worktree ?? null;
+  /** The worktree standing in for the workspace the chip has selected; null runs at its registered root. */
+  const activeWorktree = activeGitMembers.find((entry) => entry.member === activeWorkspaceMember)?.worktree ?? null;
   /** A draft checkbox records an intent; its worktree cannot exist until the draft materializes. */
   const activeWorktreeChecked = draftActive
-    ? Boolean(draftConversation?.worktreeRequested)
+    ? Boolean(draftConversation?.worktreeMembers.includes(activeWorkspaceMember))
     : Boolean(activeWorktree);
   /** A worktree displays its own branch because that is where the Agent writes, not the workspace-root HEAD. */
-  const activeBranchLabel = (activeWorkspaceMember === 1 ? activeWorktree?.branch : undefined)
+  const activeBranchLabel = activeWorktree?.branch
     ?? activeGitSnapshot?.branch
     ?? null;
   /** The directory a path written in this conversation's transcript is written against. */
-  const timelinePathBaseDir = activeWorktree?.path
-    ?? (activeWorkspaceMember === 1 && !activeWorkspaceIsRemote ? activeGitSnapshot?.worktreeRoot : undefined)
+  const timelinePathBaseDir = activePrimaryWorktree?.path
+    ?? (!activeWorkspaceIsRemote
+      ? gitSnapshotForWorkspace(
+        activeConversation ? gitSnapshots[gitSnapshotKey(activeConversation.id, 1)] : undefined,
+        activeWorkspace ? gitSurfaceKey(activeWorkspace.id, 1) : undefined
+      )?.worktreeRoot
+      : undefined)
     ?? activeWorkspace?.path
     ?? null;
   /** The checkout the file pane browses, which is what the pane can show a file from. */
   // A remote workspace has no host directory for the file pane or a timeline path click to open.
-  const filesPaneRoot = activeWorkspaceIsRemote ? null : activeWorktree?.path ?? activeWorkspace?.path ?? null;
+  const filesPaneRoot = activeWorkspaceIsRemote ? null : activePrimaryWorktree?.path ?? activeWorkspace?.path ?? null;
   /**
    * Whether the file pane has a checkout to browse. A draft browses its project's root, as its Git
    * surface does; one aimed at no project has no directory until it is sent, and gets its own
@@ -2786,45 +2918,19 @@ function App() {
   >(null);
   const filesPaneRequestNonce = useRef(0);
 
-  /**
-   * A file path clicked anywhere in a transcript opens in the file pane.
-   *
-   * The interceptor that catches the click lives outside React, so this is where
-   * the two meet: the handler is what knows which workspace is open and can turn
-   * an address written against the conversation's working directory into a path
-   * inside the checkout the pane browses. Anything that does not resolve to one —
-   * a file elsewhere on the disk, a click while no workspace is open — is left
-   * for the file manager by answering false.
-   */
-  useEffect(() => {
-    const conversationId = activeConversation?.id ?? null;
-    // Without a checkout to browse — a draft aimed at no project — a path clicked goes to the file
-    // manager like any other path the pane cannot show.
-    if (conversationId === null || !filesPaneAvailable || filesPaneRoot === null) return;
-    return setPathOpenHandler(({ path, baseDir, line }) => {
-      const relative = workspaceRelativePath(path, baseDir ?? timelinePathBaseDir, filesPaneRoot);
-      if (relative === null) return false;
-      filesPaneRequestNonce.current += 1;
-      // A pane opened only to show this file opens on the file, tree folded; one
-      // already open keeps its tree the way the reader left it.
-      const paneWasOpen = paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, conversationId), "files");
-      setFilesPaneRequest({
-        conversationId,
-        path: relative,
-        line,
-        nonce: filesPaneRequestNonce.current,
-        collapseTree: !paneWasOpen
-      });
-      openPane("files");
-      return true;
-    });
-  }, [activeConversation?.id, filesPaneAvailable, filesPaneRoot, openPane, timelinePathBaseDir]);
+  const [reviewPaneRequest, setReviewPaneRequest] = useState<
+    (GitReviewRevealRequest & { conversationId: string; member: number }) | null
+  >(null);
+  const reviewPaneRequestNonce = useRef(0);
   /**
    * A request is acted on once: without this, closing the pane and opening it
    * again from the toolbar would replay the last file the timeline asked for.
    */
   const onFilesPaneRequestHandled = useCallback((nonce: number) => {
     setFilesPaneRequest((current) => (current?.nonce === nonce ? null : current));
+  }, []);
+  const onReviewPaneRequestHandled = useCallback((nonce: number) => {
+    setReviewPaneRequest((current) => (current?.nonce === nonce ? null : current));
   }, []);
   const branchChipDisabled = Boolean(
     !activeGitSnapshot
@@ -2840,15 +2946,112 @@ function App() {
    * that decide it, so a streaming turn does not rebuild it.
    */
   const activeAttachedWorkspaces = activeConversation?.attachedWorkspaces ?? null;
+  const activeWorktrees = activeConversation?.worktrees ?? null;
   const activeConversationWorkspaces = useMemo(
     () => conversationWorkspaces(
       activeWorkspace,
       activeAttachedWorkspaces
-        ? { worktree: activeWorktree, attachedWorkspaces: activeAttachedWorkspaces }
+        ? { worktrees: activeWorktrees ?? [], attachedWorkspaces: activeAttachedWorkspaces }
         : null
     ),
-    [activeWorkspace, activeAttachedWorkspaces, activeWorktree]
+    [activeWorkspace, activeAttachedWorkspaces, activeWorktrees]
   );
+  /**
+   * A file path clicked anywhere in a transcript opens in the file pane, and a
+   * file a turn changed opens on its diff in the review pane when Git tracks the
+   * change.
+   *
+   * The interceptor that catches the click lives outside React, so this is where
+   * the two meet: the handler is what knows which workspace is open and can turn
+   * an address written against the conversation's working directory into a path
+   * inside the checkout a pane shows. Anything that does not resolve to one — a
+   * file elsewhere on the disk, a click while no workspace is open — is left for
+   * the file manager by answering false.
+   */
+  useEffect(() => {
+    const conversationId = activeConversation?.id ?? null;
+    if (conversationId === null) return;
+    // Without a checkout to browse — a draft aimed at no project — a path clicked goes to the file
+    // manager like any other path the pane cannot show.
+    const filesRoot = filesPaneAvailable ? filesPaneRoot : null;
+    // Each project workspace that is a repository has a review page, on whichever machine it is;
+    // Git reads it at its root, which is the conversation's checkout of that workspace.
+    const reviewPages = activeReviewPages;
+    if (filesRoot === null && reviewPages.length === 0) return;
+    // A pane opened only to show this file opens on the file, its file column folded; one
+    // already open keeps its column the way the reader left it.
+    const paneWasOpen = (pane: SidePaneId) => (
+      paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, conversationId), pane)
+    );
+    const showInFiles = (relative: string, line: number | null) => {
+      filesPaneRequestNonce.current += 1;
+      setFilesPaneRequest({
+        conversationId,
+        path: relative,
+        line,
+        nonce: filesPaneRequestNonce.current,
+        collapseTree: !paneWasOpen("files")
+      });
+      openPane("files");
+    };
+    const showInReview = (member: number, relative: string) => {
+      reviewPaneRequestNonce.current += 1;
+      setReviewPageMembers((current) => (
+        current[conversationId] === member ? current : { ...current, [conversationId]: member }
+      ));
+      setReviewPaneRequest({
+        conversationId,
+        member,
+        path: relative,
+        nonce: reviewPaneRequestNonce.current,
+        collapseTree: !paneWasOpen("review")
+      });
+      openPane("review");
+    };
+    return setPathOpenHandler(({ path, baseDir, line, workspace, review }) => {
+      const number = typeof workspace === "number" && workspace >= 1 ? workspace : 1;
+      const named = activeConversationWorkspaces[number - 1] ?? null;
+      if (number > 1 && !named) return false;
+      // A call that named another workspace wrote its path against that workspace's directory.
+      const base = number > 1 ? named?.path ?? null : baseDir ?? timelinePathBaseDir;
+      const remote = Boolean(named?.machine);
+      // The file pane and the file manager only reach this computer's disk.
+      const filesRelative = remote || filesRoot === null ? null : workspaceRelativePath(path, base, filesRoot);
+      const page = review ? reviewPages.find((entry) => entry.member === number) : undefined;
+      const reviewRelative = page && named ? workspaceRelativePath(path, base, named.path) : null;
+      const revealElsewhere = () => {
+        void revealPath(path, base).catch((error: unknown) => {
+          console.error("Failed to reveal the file", error);
+        });
+      };
+      if (!page || reviewRelative === null) {
+        if (filesRelative !== null) showInFiles(filesRelative, line);
+        // Nothing here can show a file on another machine outside its review page.
+        else if (remote) return true;
+        else if (number > 1) revealElsewhere();
+        else return false;
+        return true;
+      }
+      // Only Git knows whether it tracks the file, so the pane is picked once it has answered.
+      void gitReviewListsPath(page.target, page.snapshot, reviewRelative)
+        .catch(() => false)
+        .then((listed) => {
+          if (activeConversationIdRef.current !== conversationId) return;
+          if (listed) showInReview(page.member, reviewRelative);
+          else if (filesRelative !== null) showInFiles(filesRelative, line);
+          else if (!remote) revealElsewhere();
+        });
+      return true;
+    });
+  }, [
+    activeConversation?.id,
+    activeConversationWorkspaces,
+    activeReviewPages,
+    filesPaneAvailable,
+    filesPaneRoot,
+    openPane,
+    timelinePathBaseDir
+  ]);
   /**
    * The workspaces a terminal can be opened in, in the conversation's numbering. The host knows
    * a draft's project workspaces and nothing it attached, so those wait until it is sent.
@@ -3510,12 +3713,13 @@ function App() {
   }, [activeConversation, selectedSubagentView, externalStepBodies, modelRunController]);
   const activeTimelineMutationBlocked = activeModelRunBusy
     || activeWorkspaceLifecycleOperationRunning;
-  const gitMutationDisabledReason = activeModelRunBusy
+  /** Why a Git write to the conversation's checkout of project workspace `member` cannot run now. */
+  const gitMutationDisabledReasonFor = (member: number) => activeModelRunBusy
     ? t(
       "模型或子代理正在使用工作区，结束后才能执行 Git 写操作",
       "A model or subagent is using the workspace. Wait for it to finish before changing Git state."
     )
-      : activeWorkspacePeerOperationRunning
+      : gitPeerOperationRunningFor(member)
           ? t(
             "同一项目中的另一项任务正在运行，暂不能执行 Git 写操作",
             "Another task in this project is running, so Git changes are temporarily unavailable."
@@ -3531,6 +3735,7 @@ function App() {
             "Git changes are unavailable while the project is being deleted."
           )
           : null;
+  const gitMutationDisabledReason = gitMutationDisabledReasonFor(activeWorkspaceMember);
   // The mirror of `gitMutationDisabledReason`: a Git write is rewriting the very checkout the
   // shell is sitting in, so the terminal stops taking input until it lands. The terminal→Git
   // direction is the branch above; both have to hold or the two can still interleave.
@@ -4089,7 +4294,7 @@ function App() {
       };
       // Apply the same updater to draft projections so settings and timeline surfaces need not
       // special-case drafts. Settings and content are the draft's own; `worktree` is not, because a
-      // worktree belongs to a persisted conversation id and the draft carries `worktreeRequested`.
+      // worktree belongs to a persisted conversation id and the draft carries `worktreeMembers`.
       const draft = draftConversationRef.current;
       if (draft && isDraftConversationId(activeConversationIdRef.current)) {
         setDraftConversation((current) => {
@@ -4164,8 +4369,9 @@ function App() {
     const conversationId = activeConversationId;
     const workspaceId = activeGitSurfaceKey;
     const target = activeGitTarget;
+    const member = activeWorkspaceMember;
     if (!conversationId || !workspaceId || !target) return;
-    if (!beginGitMutation(conversationId)) {
+    if (!beginGitMutation(conversationId, member)) {
       setBranchChipError(t(
         "工作区里还有别的操作在进行，请稍后再切换分支",
         "Another operation is running in this workspace; try switching branches later"
@@ -4180,12 +4386,13 @@ function App() {
       setBranchChipError(failureMessage(reason, t("切换分支失败", "Could not switch branches")));
     } finally {
       endGitMutation(conversationId);
-      await refreshGitSnapshot(conversationId, workspaceId, target);
+      await refreshGitSnapshot(gitSnapshotKey(conversationId, member), workspaceId, target);
     }
   }, [
     activeConversationId,
     activeGitTarget,
     activeGitSurfaceKey,
+    activeWorkspaceMember,
     beginGitMutation,
     endGitMutation,
     refreshGitSnapshot,
@@ -4392,24 +4599,27 @@ function App() {
   }, [documentStore]);
 
   /**
-   * Create worktrees from the current workspace HEAD and persist their record for trusted host path resolution.
-   * On disable, release before clearing the conversation pointer because the host uses that record to find the tree.
+   * Creates or releases the conversation's worktree of the workspace the chip has selected, on
+   * whichever machine it is, and persists the record the host resolves that workspace through.
+   * On disable, release before clearing the record because the host uses it to find the tree.
    * Drafts retain only the request until they materialize before their first send.
    */
   const toggleConversationWorktree = useCallback(async (enabled: boolean) => {
     const conversationId = activeConversationId;
-    const workspaceId = activeWorkspaceId;
-    const target = activePrimaryGitTarget;
-    if (!conversationId || !workspaceId || !target) return;
+    const member = activeWorkspaceMember;
+    const entry = activeGitMembers.find((candidate) => candidate.member === member);
+    if (!conversationId || !entry) return;
     if (draftConversationRef.current && isDraftConversationId(conversationId)) {
       setBranchChipError(null);
-      setDraftConversation((current) => (
-        current ? { ...current, worktreeRequested: enabled } : current
-      ));
+      setDraftConversation((current) => {
+        if (!current) return current;
+        const others = current.worktreeMembers.filter((candidate) => candidate !== member);
+        return { ...current, worktreeMembers: enabled ? [...others, member].sort((a, b) => a - b) : others };
+      });
       setBranchPicker(null);
       return;
     }
-    if (!beginGitMutation(conversationId)) {
+    if (!beginGitMutation(conversationId, member)) {
       setBranchChipError(t(
         "工作区里还有别的操作在进行，请稍后再切换工作树",
         "Another operation is running in this workspace; try toggling the worktree later"
@@ -4419,12 +4629,18 @@ function App() {
     setBranchChipError(null);
     try {
       if (enabled) {
-        const worktree = await createConversationWorktree(conversationId);
-        updateActiveConversation((conversation) => ({ ...conversation, worktree }));
+        const worktree = await createConversationWorktree(conversationId, member);
+        updateActiveConversation((conversation) => ({
+          ...conversation,
+          worktrees: withConversationWorktree(conversation.worktrees, member, entry.registered, worktree)
+        }));
       } else {
-        const removed = await releaseConversationWorktree(conversationId);
-        // Clear the pointer even when uncommitted work keeps the tree; retained files belong to the user, not this conversation.
-        updateActiveConversation((conversation) => ({ ...conversation, worktree: null }));
+        const removed = await releaseConversationWorktree(conversationId, member);
+        // Clear the record even when uncommitted work keeps the tree; retained files belong to the user, not this conversation.
+        updateActiveConversation((conversation) => ({
+          ...conversation,
+          worktrees: withConversationWorktree(conversation.worktrees, member, entry.registered, null)
+        }));
         if (!removed) {
           setBranchChipError(t(
             "工作树里还有未提交的改动，目录与分支已保留",
@@ -4442,14 +4658,17 @@ function App() {
       ));
     } finally {
       endGitMutation(conversationId);
-      await refreshGitSnapshot(conversationId, workspaceId, target);
+      // The host resolves the checkout from the saved record, so the next read has to follow it.
+      await flushLatestDocument();
+      await refreshGitSnapshot(entry.key, entry.surfaceKey, entry.target);
     }
   }, [
     activeConversationId,
-    activePrimaryGitTarget,
-    activeWorkspaceId,
+    activeGitMembers,
+    activeWorkspaceMember,
     beginGitMutation,
     endGitMutation,
+    flushLatestDocument,
     refreshGitSnapshot,
     t,
     updateActiveConversation
@@ -4736,7 +4955,7 @@ function App() {
         queuedMessages: [],
         branches: [],
         userAbortedTasks: [],
-        worktree: null,
+        worktrees: [],
         runTarget: runTargetOverride ?? null,
         attachedWorkspaces: attachedWorkspacesOverride,
         parentConversationId,
@@ -4834,16 +5053,22 @@ function App() {
     for (const sessionId of previewSessionsFor(sidePanesStateRef.current, DRAFT_CONVERSATION_ID)) {
       dispatchSidePanes({ type: "forget_preview", conversationId: DRAFT_CONVERSATION_ID, sessionId });
     }
-    setSelectedWorkspaceMembers((current) => {
+    const forget = <T,>(current: Record<string, T>) => {
       if (!(DRAFT_CONVERSATION_ID in current)) return current;
       const next = { ...current };
       delete next[DRAFT_CONVERSATION_ID];
       return next;
-    });
+    };
+    setSelectedWorkspaceMembers(forget);
+    setReviewPageMembers(forget);
+    setReviewPageOrders(forget);
     updateGitSnapshots((current) => {
-      if (!current[DRAFT_CONVERSATION_ID]) return current;
+      const drafts = Object.keys(current).filter((key) => (
+        gitSnapshotKeyConversation(key) === DRAFT_CONVERSATION_ID
+      ));
+      if (drafts.length === 0) return current;
       const next = { ...current };
-      delete next[DRAFT_CONVERSATION_ID];
+      for (const key of drafts) delete next[key];
       return next;
     });
     return {
@@ -4946,14 +5171,23 @@ function App() {
       void requestDraftRetarget(aimedAt, show);
       return;
     }
-    const resolved = resolveNewConversationSettings(target, source);
+    // A draft left unsent by an earlier run of the app comes back with the settings it had: it
+    // copied its preset once, when it was opened, and has owned them since. Only a task that has
+    // never been opened is made from a preset.
+    const stored = current.globalSettings.draftConversation;
+    const resolved = stored
+      ? {
+        settings: cloneConversationSettings(stored.settings, new Set(current.tools.map((tool) => tool.name))),
+        presetId: stored.presetId
+      }
+      : resolveNewConversationSettings(target, source);
     if (!resolved) return;
     setDraftConversation({
       workspaceId: target?.id ?? null,
       materializesAs: createId("conv"),
       settings: resolved.settings,
       createdAt: new Date().toISOString(),
-      worktreeRequested: false,
+      worktreeMembers: [],
       runTarget: null,
       attachedWorkspaces: [],
       contexts: [],
@@ -4982,7 +5216,7 @@ function App() {
    */
   const adoptDraftConversationId = useCallback((
     conversationId: string,
-    options: { migrateGitSnapshot?: boolean } = {}
+    options: { worktreeMembers?: readonly number[] } = {}
   ) => {
     dispatchSidePanes({
       type: "adopt_conversation", conversationId, from: DRAFT_CONVERSATION_ID
@@ -5022,24 +5256,34 @@ function App() {
       delete next[DRAFT_CONVERSATION_ID];
       return next;
     });
-    // The workspace chip's choice is where the draft's terminals and Git surface were pointed.
-    setSelectedWorkspaceMembers((current) => {
+    // The workspace chip's choice is where the draft's terminals and Git surface were pointed,
+    // and the review pane's page and page order are the reader's; all three carry over.
+    const adopt = <T,>(current: Record<string, T>) => {
       if (!(DRAFT_CONVERSATION_ID in current)) return current;
-      const next = { ...current, [conversationId]: current[DRAFT_CONVERSATION_ID] };
+      const next = { ...current, [conversationId]: current[DRAFT_CONVERSATION_ID]! };
       delete next[DRAFT_CONVERSATION_ID];
       return next;
+    };
+    setSelectedWorkspaceMembers(adopt);
+    setReviewPageMembers(adopt);
+    setReviewPageOrders(adopt);
+    updateGitSnapshots((current) => {
+      const next = gitSnapshotsAfterDraftRedemption(current, DRAFT_CONVERSATION_ID, conversationId);
+      // A workspace the draft asked a worktree of moves to another checkout: the root's snapshot
+      // would describe the wrong one until the next poll.
+      const stale = (options.worktreeMembers ?? []).map((member) => gitSnapshotKey(conversationId, member));
+      if (!stale.some((key) => next[key])) return next;
+      const pruned = { ...next };
+      for (const key of stale) delete pruned[key];
+      return pruned;
     });
-    if (options.migrateGitSnapshot === false) return;
-    updateGitSnapshots((current) => (
-      gitSnapshotsAfterDraftRedemption(current, DRAFT_CONVERSATION_ID, conversationId)
-    ));
   }, [composerController, updateGitSnapshots]);
 
   /** Turn the draft into a conversation in the project it names, or the temporary one when it names none. */
   const materializeDraft = useCallback((): {
     conversationId: string;
     workspaceId: string;
-    worktreeRequested: boolean;
+    worktreeMembers: number[];
   } | null => {
     const draft = draftConversationRef.current;
     if (!draft) return null;
@@ -5050,16 +5294,22 @@ function App() {
     // a new task opened before the next render must not find it still waiting.
     draftConversationRef.current = null;
     setDraftConversation(null);
-    const worktreeRequested = draft.worktreeRequested
-      && documentStore.current()?.workspaces.find(
-        (workspace) => workspace.id === workspaceId
-      )?.kind === "directory";
-    adoptDraftConversationId(created, { migrateGitSnapshot: !worktreeRequested });
+    // Its settings live on the conversation now, so there is no draft left to bring back.
+    documentStore.update((current) => current?.globalSettings.draftConversation
+      ? { ...current, globalSettings: { ...current.globalSettings, draftConversation: null } }
+      : current);
+    const project = documentStore.current()?.workspaces.find((workspace) => workspace.id === workspaceId);
+    // Only a directory project's own workspaces can have worktrees; discard an unrealizable
+    // request — a temporary project, a workspace removed since it was ticked — before it can
+    // block sending.
+    const worktreeMembers = project?.kind === "directory"
+      ? draft.worktreeMembers.filter((member) => member >= 1 && member <= registeredProjectWorkspaces(project).length)
+      : [];
+    adoptDraftConversationId(created, { worktreeMembers });
     return {
       conversationId: created,
       workspaceId,
-      // Only directory workspaces can create worktrees; discard an unrealizable request before it can block sending.
-      worktreeRequested
+      worktreeMembers
     };
   }, [adoptDraftConversationId, createConversation, documentStore]);
 
@@ -5078,29 +5328,41 @@ function App() {
   ): Promise<{ conversationId: string; workspaceId: string } | null> => {
     const redeemed = materializeDraft();
     if (!redeemed) return null;
-    if (!redeemed.worktreeRequested) {
+    if (redeemed.worktreeMembers.length === 0) {
       if (persist) await flushLatestDocument({ durable: true });
       return redeemed;
     }
     // The host resolves a conversation only from its saved document, worktree requests included.
     await flushLatestDocument({ durable: true });
-    const worktree = await createConversationWorktree(redeemed.conversationId);
-    updateConversation(
-      redeemed.workspaceId,
-      redeemed.conversationId,
-      (conversation) => ({ ...conversation, worktree })
-    );
-    // The host also reads the persisted worktree record for trusted path resolution; without it,
-    // the work would run at the workspace root.
+    const project = documentStore.current()?.workspaces.find((workspace) => workspace.id === redeemed.workspaceId);
+    const registered = registeredProjectWorkspaces(project);
+    // One after another: two worktrees of one repository must not race for a name.
+    for (const member of redeemed.worktreeMembers) {
+      const workspace = registered[member - 1];
+      if (!workspace) continue;
+      const worktree = await createConversationWorktree(redeemed.conversationId, member);
+      updateConversation(
+        redeemed.workspaceId,
+        redeemed.conversationId,
+        (conversation) => ({
+          ...conversation,
+          worktrees: withConversationWorktree(conversation.worktrees, member, workspace, worktree)
+        })
+      );
+    }
+    // The host also reads the persisted worktree records for trusted path resolution; without
+    // them, the work would run at the workspace roots.
     await flushLatestDocument({ durable: true });
-    // Refresh the Git snapshot after moving from the workspace root to a different worktree checkout.
-    void refreshGitSnapshot(
-      redeemed.conversationId,
-      redeemed.workspaceId,
-      gitConversationTarget(redeemed.conversationId)
-    );
+    // Refresh the Git snapshots after moving from the workspace roots to the worktree checkouts.
+    for (const member of redeemed.worktreeMembers) {
+      void refreshGitSnapshot(
+        gitSnapshotKey(redeemed.conversationId, member),
+        gitSurfaceKey(redeemed.workspaceId, member),
+        gitConversationTarget(redeemed.conversationId, member)
+      );
+    }
     return redeemed;
-  }, [flushLatestDocument, materializeDraft, refreshGitSnapshot, updateConversation]);
+  }, [documentStore, flushLatestDocument, materializeDraft, refreshGitSnapshot, updateConversation]);
 
   /* Conversation templates.
    *
@@ -5626,6 +5888,12 @@ function App() {
     };
     const next = { ...current, workspaces: [...current.workspaces, workspace] };
     documentStore.update(() => next);
+    /* Everything below asks the host about the new project by id — the capability scan, and the
+     * draft aimed at it the moment it is: its Git status, its dev servers, its file pane — and the
+     * host answers only for a project its document holds. Left to the debounced save, the project
+     * reaches the host after all of them, each is refused, and Git only asks again once its
+     * backoff runs out. A save that fails is the save status's to report; the draft still opens. */
+    await awaitWorkspaceAtHost(documentStore, workspace.id).catch(() => undefined);
     /* A new project adds a whole configuration level: its first directory's `.mework`
      * may already hold skills, MCP servers and hooks that nothing has scanned
      * yet. A failure here only leaves the catalog as stale as it already was.
@@ -5658,8 +5926,10 @@ function App() {
 
   /**
    * Changes an existing project's name and the workspaces after its first. The first workspace
-   * is the project's identity — its conversations' worktrees, files pane and capability files
-   * hang off it — so the dialog never offers to change it and this never does.
+   * is the project's identity — the files pane, capability files and the worktree records from
+   * before every workspace could have one hang off it — so the dialog never offers to change it
+   * and this never does. A further workspace removed here takes its conversations' worktrees of
+   * it out of use: they name the workspace they came from, never a position.
    */
   const updateProject = (projectId: string, name: string, workspaces: AttachedWorkspace[]) => {
     documentStore.update((current) => {
@@ -7189,6 +7459,11 @@ function App() {
                 type: "activate", conversationId: ownerId, terminalId
               })}
               onClose={(terminalId) => closeTerminalTab(conversationId, terminalId)}
+              onReorder={(terminalIds) => dispatchTerminalTabs({
+                type: "reorder",
+                conversationId: ownerId,
+                terminalIds
+              })}
               onRename={(terminalId, name) => {
                 const tab = terminals.tabs.find((candidate) => candidate.id === terminalId);
                 // Submitting the name the terminal already shows is not a rename: it keeps
@@ -7278,6 +7553,11 @@ function App() {
               activeId={target}
               onSelect={(sessionId) => void openBrowserTab(sessionId)}
               onClose={(sessionId) => void closePreviewPage(sessionId)}
+              onReorder={(sessionIds) => dispatchSidePanes({
+                type: "reorder_previews",
+                conversationId,
+                sessionIds
+              })}
               add={multipleWorkspaces
                 ? previewWorkspaceMenuItems({
                   workspaces: activeTerminalWorkspaces,
@@ -7348,17 +7628,77 @@ function App() {
     }
 
     if (kind === "review") {
-      if (!activeWorkspace || !activeGitSnapshot || !activeGitTarget) return null;
-      const workspace = activeWorkspace;
-      const snapshot = activeGitSnapshot;
+      if (!activeWorkspace || activeReviewPages.length === 0) return null;
+      const page = activeReviewPages.find((entry) => entry.member === activeReviewMember)
+        ?? activeReviewPages[0]!;
+      const sshMachines = document.globalSettings.executionEnvironments.sshMachines;
+      // A page is named after what it reviews: the workspace, the branch — the one a worktree
+      // was forked from, which is what its changes are read against — and the worktree itself.
+      const pageName = (entry: typeof page) => ({
+        workspace: workspaceDirectoryLabel(entry.registered.path),
+        branch: entry.worktree?.baseBranch
+          ?? entry.snapshot.branch
+          ?? entry.snapshot.head?.slice(0, 8)
+          ?? t("尚无提交", "No commits yet"),
+        worktree: entry.worktree ? worktreeName(entry.worktree) : null
+      });
+      const pageTabs = activeReviewPages.length > 1 ? (
+        <PageTabs
+          ariaLabel={t("审阅的工作区", "Workspaces under review")}
+          moreLabel={t("更多工作区", "More workspaces")}
+          maxTabWidth={220}
+          tabs={activeReviewPages.map((entry) => {
+            const name = pageName(entry);
+            const failure = gitSurfaceFailures[entry.key];
+            return {
+              id: String(entry.member),
+              label: [name.workspace, name.branch, name.worktree].filter(Boolean).join(" → "),
+              content: <GitReviewPageLabel {...name} />,
+              title: [
+                workspaceLocationTitle(entry.registered.path, entry.registered.machine, sshMachines),
+                entry.worktree?.path,
+                failure && t("最近一次读取失败，显示的是上次的状态：{reason}", "The last read failed; this is the state from before: {reason}", {
+                  reason: failure
+                })
+              ].filter(Boolean).join("\n"),
+              icon: failure
+                ? <CircleAlert size={11} className="git-review__page-stale" />
+                : entry.registered.machine ? machineIcon(entry.registered.machine, 11) : undefined
+            };
+          })}
+          activeId={String(page.member)}
+          onSelect={(id) => setReviewPageMembers((current) => ({ ...current, [conversationId]: Number(id) }))}
+          onReorder={(ids) => setReviewPageOrders((current) => ({
+            ...current,
+            [conversationId]: ids.map(Number)
+          }))}
+        />
+      ) : undefined;
+      // The conversations sharing this page's checkout: every one working in the workspace's own
+      // directory, unless this conversation reviews a worktree of its own.
+      const pagePeers = activeWorkspacePeers.map((peer) => ({
+        id: peer.id,
+        worktree: worktreeFor(peer, page.member, page.registered)
+      }));
       return (
         <GitReviewPanel
-          key={gitReviewSnapshotCacheKey(snapshot)}
+          key={`${page.member}:${gitReviewSnapshotCacheKey(page.snapshot)}`}
           paneId={pane}
-          target={activeGitTarget}
-          snapshot={snapshot}
+          target={page.target}
+          snapshot={page.snapshot}
           active
-          mutationDisabledReason={gitMutationDisabledReason}
+          checkout={{
+            worktreeName: page.worktree ? worktreeName(page.worktree) : null,
+            baseBranch: page.worktree?.baseBranch ?? null,
+            baseOid: page.worktree?.baseOid ?? null
+          }}
+          pageTabs={pageTabs}
+          revealRequest={reviewPaneRequest?.conversationId === conversationId
+            && reviewPaneRequest.member === page.member
+            ? reviewPaneRequest
+            : null}
+          onRevealRequestHandled={onReviewPaneRequestHandled}
+          mutationDisabledReason={gitMutationDisabledReasonFor(page.member)}
           paneExpanded={expanded}
           onPaneToggleExpand={onToggleExpand}
           onPaneFocus={onFocus}
@@ -7366,22 +7706,15 @@ function App() {
           onSnapshotChange={(next) => updateGitSnapshots((current) => (
             gitSnapshotsAfterWorkspaceMutation(
               current,
-              // Broadcast Git snapshots only to conversations using the same checkout. Drafts use the workspace root; worktree conversations do not.
-              // A worktree only ever stands in for the project's first workspace, so every
-              // conversation of the project shares the checkout of any other one.
-              gitSnapshotBroadcastIds(
-                // The draft aimed here reads the same checkout, though no list holds it.
-                activeWorkspacePeers.map((peer) => (
-                  activeWorkspaceMember === 1 ? peer : { ...peer, worktree: null }
-                )),
-                conversationId,
-                activeWorkspaceMember === 1 && Boolean(activeWorktree)
-              ),
-              activeGitSurfaceKey ?? workspace.id,
+              // Broadcast Git snapshots only to conversations using the same checkout. Drafts use
+              // the workspace root; worktree conversations do not.
+              gitSnapshotBroadcastIds(pagePeers, conversationId, Boolean(page.worktree))
+                .map((id) => gitSnapshotKey(id, page.member)),
+              page.surfaceKey,
               next
             )
           ))}
-          onMutationStart={() => beginGitMutation(conversationId)}
+          onMutationStart={() => beginGitMutation(conversationId, page.member)}
           onMutationEnd={() => endGitMutation(conversationId)}
         />
       );
@@ -7751,14 +8084,12 @@ function App() {
                       activeLabel: t("审阅（有未提交改动）", "Review (uncommitted changes)"),
                       icon: <GitCompareArrows size={18} aria-hidden="true" />,
                       pressed: gitReviewPanelOpen,
-                      activity: Boolean(activeGitSnapshot && activeGitSnapshot.files.length > 0),
-                      // Without a snapshot and a target there is no repository to review.
-                      disabled: !(activeGitSnapshot && activeGitTarget),
-                      title: activeSelectedWorkspaceIsRemote
-                        ? t("工作区在另一台机器上，本机的 Git 面板不可用", "This workspace is on another machine; the host's Git pane is unavailable")
-                        : !(activeGitSnapshot && activeGitTarget)
-                          ? t("当前工作区不是 Git 仓库", "This workspace is not a Git repository")
-                          : undefined,
+                      activity: activeReviewPages.some((entry) => !entry.snapshot.isClean),
+                      // Without a repository among the conversation's workspaces there is nothing to review.
+                      disabled: activeReviewPages.length === 0,
+                      title: activeReviewPages.length === 0
+                        ? t("这个任务的工作区都不是 Git 仓库", "None of this task's workspaces is a Git repository")
+                        : undefined,
                       onToggle: () => (gitReviewPanelOpen
                         ? closePane("review")
                         : openGitReview())
@@ -8088,8 +8419,9 @@ function App() {
                             }))
                           }]}
                         />
-                        {/* Worktrees are checked out on this host, so a remote workspace has none to offer. */}
-                        {activeWorkspaceMember === 1 && !activeWorkspaceIsRemote && <>
+                        {/* Each workspace of a directory project can run on a worktree of its own, on
+                            whichever machine it is; the box is the selected workspace's. */}
+                        {activeWorkspace?.kind === "directory" && <>
                         <span className="composer-chip-group__divider" aria-hidden="true" />
                         <label
                           className="composer-worktree"
@@ -8222,11 +8554,8 @@ function App() {
                     {activeGitSnapshot && (
                       <GitStatusCard
                         git={activeGitSnapshot}
-                        gitOpen={gitReviewPanelOpen}
-                        onOpenGitReview={openGitReview}
-                        reviewUnavailableReason={activeGitTarget
-                          ? undefined
-                          : t("工作区在另一台机器上，本机的 Git 面板不可用", "This workspace is on another machine; the host's Git pane is unavailable")}
+                        gitOpen={gitReviewPanelOpen && activeReviewMember === activeWorkspaceMember}
+                        onOpenGitReview={() => openGitReview(activeWorkspaceMember)}
                       />
                     )}
                   </div>

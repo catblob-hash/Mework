@@ -482,7 +482,8 @@ CREATE TABLE IF NOT EXISTS conversation (
     updated_at   TEXT NOT NULL,
     order_key    REAL NOT NULL,
     settings     TEXT NOT NULL,
-    -- 隔离工作树记录的 JSON；NULL = 跑在工作区根上。
+    -- 隔离工作树记录的 JSON 数组，每个项目工作区至多一条；NULL = 都跑在工作区根上。
+    -- 旧版只存一条（工作区 1 的）对象，读取时按数组的一项处理。
     -- 单独一列而不是塞进 settings：settings 会被预设与工作区快照整份复制，
     -- 而一条工作树路径复制给另一个对话就是错的。
     worktree     TEXT,
@@ -958,9 +959,10 @@ impl ConversationStore {
         let settings: ConversationSettings = serde_json::from_str(&settings_json)
             .map_err(|error| format!("对话设置无法解析：{error}"))?;
         // An unreadable worktree record falls back to the workspace root, which is the safe target.
-        let worktree = worktree_json
+        let worktrees = worktree_json
             .as_deref()
-            .and_then(|value| serde_json::from_str::<ConversationWorktree>(value).ok());
+            .map(read_worktrees)
+            .unwrap_or_default();
         // An unreadable run target must not fall back to local execution. Bind it to a nonexistent
         // machine so dispatch fails explicitly until the user selects a valid target.
         let run_target = run_target_json.as_deref().map(|value| {
@@ -1079,7 +1081,7 @@ impl ConversationStore {
             queued_messages,
             branches,
             user_aborted_tasks,
-            worktree,
+            worktrees,
             run_target,
             parent_conversation_id,
             preset_id: preset_id.unwrap_or_default(),
@@ -3145,6 +3147,19 @@ fn put_conversation_tx(
     record_timeline_event_tx(tx, &conversation.id, TimelineEventKind::Edit, None)
 }
 
+/// The `worktree` column: a list of records, or — written before every
+/// project workspace could have one — a single record, which is workspace 1's.
+/// An unreadable value reads as none, so the conversation runs at its
+/// workspace roots rather than somewhere a damaged record points.
+fn read_worktrees(value: &str) -> Vec<ConversationWorktree> {
+    if let Ok(worktrees) = serde_json::from_str::<Vec<ConversationWorktree>>(value) {
+        return worktrees;
+    }
+    serde_json::from_str::<ConversationWorktree>(value)
+        .map(|worktree| vec![worktree])
+        .unwrap_or_default()
+}
+
 /// Inserts or updates the conversation's own row. A new conversation goes to the end of its
 /// workspace; an existing one keeps its sidebar position.
 fn put_conversation_row_tx(
@@ -3154,12 +3169,16 @@ fn put_conversation_row_tx(
 ) -> Result<(), String> {
     let settings = serde_json::to_string(&conversation.settings)
         .map_err(|error| format!("对话设置无法序列化：{error}"))?;
-    let worktree = conversation
-        .worktree
-        .as_ref()
-        .map(|value| serde_json::to_string(value))
-        .transpose()
-        .map_err(|error| format!("对话工作树记录无法序列化：{error}"))?;
+    // NULL rather than `[]` for the common case, so a conversation without one
+    // reads the same as it did before worktrees were per workspace.
+    let worktree = if conversation.worktrees.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&conversation.worktrees)
+                .map_err(|error| format!("对话工作树记录无法序列化：{error}"))?,
+        )
+    };
     let run_target = conversation
         .run_target
         .as_ref()
@@ -3362,7 +3381,7 @@ mod tests {
             queued_messages: Vec::new(),
             branches: Vec::new(),
             user_aborted_tasks: Vec::new(),
-            worktree: None,
+            worktrees: Vec::new(),
             run_target: None,
             parent_conversation_id: None,
             preset_id: String::new(),
@@ -3407,6 +3426,16 @@ mod tests {
     /// The point of recording history at all: a row the user later deleted, and a
     /// row they later rewrote, both still read the way they did at the time. A
     /// snapshot rebuilt from the current timeline could not do this.
+    /// The worktree column holds the list, and still reads the single record
+    /// it held when only workspace 1 could have a worktree.
+    #[test]
+    fn the_worktree_column_reads_the_list_and_the_legacy_single_record() {
+        let record = r#"{"path":"/w/a","branch":"mework/conv/a","baseOid":"abc"}"#;
+        assert_eq!(read_worktrees(record).len(), 1);
+        assert_eq!(read_worktrees(&format!("[{record},{record}]")).len(), 2);
+        assert!(read_worktrees("not json").is_empty());
+    }
+
     #[test]
     fn an_earlier_snapshot_keeps_rows_a_later_edit_removed_and_rewrote() {
         let (_dir, store) = temp_store();

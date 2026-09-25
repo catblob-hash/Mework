@@ -78,6 +78,12 @@ export interface DiffViewerProps {
   foldAllRequest?: { collapsed: boolean; seq: number };
   activePath: string | null;
   onSelectFile: (path: string) => void;
+  /**
+   * A file asked for from outside the viewer, opened and scrolled to the way a
+   * click on its row does. Bumping `seq` asks again; a path not among the entries
+   * yet waits for them.
+   */
+  revealRequest?: { path: string; seq: number };
   /** Rows for the file column's and the file header's `⋮`. */
   renderFileMenu?: (path: string) => PopoverMenuSection[];
   /** Chrome the caller owns at the top and bottom of the file column — a filter, a load-more. */
@@ -146,7 +152,7 @@ function collapseChains(nodes: TreeNode[]): TreeNode[] {
   });
 }
 
-function EntryIcon({ path, className }: { path: string; className?: string }) {
+export function EntryIcon({ path, className }: { path: string; className?: string }) {
   const props = { size: 13, "aria-hidden": true as const, className };
   switch (fileIconKind(path)) {
     case "code": return <FileCode2 {...props} />;
@@ -273,6 +279,7 @@ export function DiffViewer({
   foldAllRequest,
   activePath,
   onSelectFile,
+  revealRequest,
   renderFileMenu,
   listHeader,
   listFooter,
@@ -442,6 +449,14 @@ export function DiffViewer({
     requestFile(path);
     setScrollTarget(path);
   }, [onSelectFile, requestFile]);
+
+  const revealSeqRef = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (!revealRequest || revealSeqRef.current === revealRequest.seq) return;
+    if (!entries.some((entry) => entry.path === revealRequest.path)) return;
+    revealSeqRef.current = revealRequest.seq;
+    scrollToFile(revealRequest.path);
+  }, [entries, revealRequest, scrollToFile]);
 
   /**
    * Jumps to the file the column picked, once its card is open.

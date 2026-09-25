@@ -39,7 +39,7 @@ describe("PreviewPageTabs", () => {
     const { onSelect, onClose } = setup();
     await user.click(screen.getByRole("tab", { name: /localhost:5173/ }));
     expect(onSelect).toHaveBeenCalledWith("conv#tab_a");
-    const second = screen.getByRole("tab", { name: /localhost:5173/ }).closest(".preview-page-tab") as HTMLElement;
+    const second = screen.getByRole("tab", { name: /localhost:5173/ }).closest(".page-tab") as HTMLElement;
     await user.click(within(second).getByRole("button", { name: "关闭页面 localhost:5173" }));
     expect(onClose).toHaveBeenCalledWith("conv#tab_a");
   });

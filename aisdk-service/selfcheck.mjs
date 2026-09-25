@@ -21,7 +21,7 @@ const OVERRIDE = process.argv.includes("--sea")
 const BUNDLE = resolve(here, "dist/main.mjs");
 // Protocol generation. Keep this literal because packaged artifacts do not export
 // the constant; a mismatch must fail during the ready handshake.
-const V = 11;
+const V = 12;
 
 let failures = 0;
 const results = [];

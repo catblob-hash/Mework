@@ -31,20 +31,20 @@ export interface DraftConversationState {
   settings: ConversationSettings;
   createdAt: string;
   /**
-   * Whether the user requested a worktree for this draft.
+   * The project workspaces (1-based) the user ticked the worktree box for.
    *
-   * This is intent only: worktrees belong to persisted conversation IDs. Create
-   * it after materializing the conversation and before the first message, when
-   * all tool calls must already target the isolated checkout.
+   * This is intent only: worktrees belong to persisted conversation IDs. They
+   * are created after the conversation materializes and before the first
+   * message, when all tool calls must already target the isolated checkouts.
    */
-  worktreeRequested: boolean;
+  worktreeMembers: number[];
   /** The draft's run location, persisted directly in `Conversation.runTarget` when materialized. */
   runTarget: RunTarget | null;
   /**
    * Workspaces the draft may work in besides its primary one, persisted directly
    * in `Conversation.attachedWorkspaces` when materialized.
    *
-   * Unlike `worktreeRequested` this is not just intent: the host authorized each
+   * Unlike `worktreeMembers` this is not just intent: the host authorized each
    * one when its picker returned it, so the list is already the real grant.
    */
   attachedWorkspaces: AttachedWorkspace[];
@@ -109,7 +109,7 @@ export function draftAsConversation(
     queuedMessages: [],
     branches: [],
     userAbortedTasks: [],
-    worktree: null,
+    worktrees: [],
     runTarget: draft.runTarget,
     attachedWorkspaces: draft.attachedWorkspaces,
     parentConversationId: null,

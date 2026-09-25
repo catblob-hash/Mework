@@ -618,8 +618,35 @@ pub fn run_remote_script(
             return result;
         }
     }
+    // `cmd.exe`, the login shell a Windows sshd usually hands the line to,
+    // caps a command line at 8191 characters, and `-EncodedCommand` carries a
+    // script at close to three characters a byte. A script past that — the Git
+    // status probe is one — travels on standard input behind a short bootstrap
+    // that reads and runs it, when it has no input of its own to read.
+    if stdin.is_none() && powershell_line_is_too_long(runner, script) {
+        let bootstrap = crate::remote_powershell::run_script_from_input();
+        let child = spawn_remote_script(runner, &bootstrap, true)?;
+        return pump_remote_child(child, runner, Some(script.as_bytes()), timeout, cancel);
+    }
     let child = spawn_remote_script(runner, script, stdin.is_some())?;
     pump_remote_child(child, runner, stdin, timeout, cancel)
+}
+
+/// The longest line `cmd.exe` accepts, less room for the SSH client's own
+/// quoting of it.
+const CMD_LINE_LIMIT: usize = 8_000;
+
+/// Whether `script` would not fit on the one line an SSH machine's PowerShell
+/// is started with.
+fn powershell_line_is_too_long(runner: &ShellRunner, script: &str) -> bool {
+    let ShellRunner::Ssh { agent_shell, env, .. } = runner else {
+        return false;
+    };
+    if agent_shell.dialect() != ScriptDialect::PowerShell {
+        return false;
+    }
+    let prologue = powershell_env_prologue(env);
+    crate::remote_shell::powershell_line(&format!("{prologue}{script}")).len() > CMD_LINE_LIMIT
 }
 
 /// The host program and arguments that run `script` on the machine `runner`
