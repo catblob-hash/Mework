@@ -6,6 +6,10 @@
 
 📖 **Documentation:** [catblob-hash.github.io/Mework](https://catblob-hash.github.io/Mework/en/index.html)
 
+![Mework running DeepSeek-V4.1-Flash: the agent adds a dark mode toggle to a small site, starts its dev server, and clicks the toggle in the built-in browser to check it](.github/assets/demo.en.gif)
+
+<sub>DeepSeek-V4.1-Flash adds a dark mode toggle, then clicks it in Mework's built-in browser to check. Recorded on macOS; the agent's steps are sped up.</sub>
+
 Mework is a desktop coding agent for Windows. It does what you would expect from Claude Code — reads and edits your project, runs commands, searches the web, spawns subagents, checks its own work in a browser — but as a local app where you choose the model, and where nothing the model is told is hidden from you or off limits to edit.
 
 You bring your own API key or subscription. Everything else runs and stays on your machine.
