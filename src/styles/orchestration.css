@@ -1,7 +1,6 @@
 .insertion-line { height: 0; position: relative; z-index: 10; border-top: 2px solid var(--accent); animation: insert-in .12s ease-out; }
 @keyframes insert-in { from { transform: scaleX(.65); opacity: 0; } }
 @keyframes dialog-pop-in { from { opacity: 0; transform: translateY(8px) scale(.985); } }
-.context-stream__hint { margin: auto 0 0; padding-top: 30px; text-align: center; color: var(--faint); font-size: 10.5px; }
 
 /* The floating context row scrolls timeline cards behind it, so a scrim rising
    from the composer fades them out under the chips; pointer-events stay with

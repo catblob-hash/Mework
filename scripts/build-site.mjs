@@ -12,16 +12,15 @@
 //
 // - `{{TOOL_TABLE:<name>,<name>,…}}` on the tools page — an index table of the
 //   named tools, each linking to its own page under tools/. The page's headings
-//   are the groups: every catalog tool must sit in exactly one table, and a
-//   tool family's tools under the heading whose id is the family's (see
-//   FAMILIES). Each tool page's breadcrumb is the heading path it sits under.
+//   are the groups: every catalog tool must sit in exactly one table. Each tool
+//   page's breadcrumb is the heading path it sits under.
 // - tools/<name>.html — one page per catalog tool: the hand-written notes, the
-//   parameter table from the schema baseline, and the description the selected
-//   built-in profile gives the model.
+//   parameter table from the schema baseline, and the description the built-in
+//   profile gives the model.
 // - `{{PROMPT_KEYS_LIST}}` on the prompt-profiles page — the injection-point
 //   reference (key, placeholders, where it is injected), grouped by prefix. The
-//   built-in texts themselves are in the downloadable profile files.
-// - `{{PROFILE_FILE_LINKS}}` — download links for those files.
+//   built-in texts themselves are in the downloadable profile file.
+// - `{{PROFILE_FILE_LINKS}}` — download links for that file and the key manifest.
 // - `{{TOOL_COUNT}}` / `{{SWITCHABLE_TOOL_COUNT}}` / `{{DERIVED_TOOL_COUNT}}` —
 //   the catalog sizes, so prose never carries a stale number.
 
@@ -44,8 +43,8 @@ function option(name, fallback) {
 const outRoot = path.resolve(repo, option("--out", "website/dist"));
 
 const LANGUAGES = [
-  { code: "en", label: "English", htmlLang: "en", dir: "en", profile: "en-US" },
-  { code: "zh-CN", label: "简体中文", htmlLang: "zh-CN", dir: "zh-CN", profile: "zh-CN" },
+  { code: "en", label: "English", htmlLang: "en", dir: "en", catalog: "en-US" },
+  { code: "zh-CN", label: "简体中文", htmlLang: "zh-CN", dir: "zh-CN", catalog: "zh-CN" },
 ];
 const PAGES = ["index", "working", "tools", "prompt-profiles", "skills", "mcp", "lsp", "hooks"];
 // Short navigation labels; page titles (first heading) stay descriptive.
@@ -61,14 +60,13 @@ const UI = {
     languages: "Language",
     footer: "Mework is released under GPL-3.0-or-later. This site is built from website/content in the repository.",
     keyTable: { id: "Key", placeholders: "Placeholders", where: "Where it is injected" },
-    downloads: { english: "Download the built-in English profile (prompt-profile.en-US.json)", chinese: "Download the built-in Chinese profile (prompt-profile.zh-CN.json)", manifest: "Download the key manifest (prompt-profile-keys.json)" },
+    downloads: { builtin: "Download the built-in profile (prompt-profile.en-US.json)", manifest: "Download the key manifest (prompt-profile-keys.json)" },
     tools: {
       tool: "Tool",
       name: "Name",
       summary: "What it does",
       availability: "Availability",
       switchable: "Tool picker",
-      familyWindow: "Tool picker, in the `{family}` window",
       parameters: "Parameters",
       parameter: "Parameter",
       type: "Type",
@@ -80,7 +78,7 @@ const UI = {
       noParameters: "This tool takes no parameters.",
       variants: "The call takes one of these shapes, selected by",
       modelText: "What the model is told",
-      modelTextNote: "This is the tool's root schema description from the built-in profile of this page's language. A tool-description file can replace it with `schemaNotes`.",
+      modelTextNote: "This is the tool's root schema description from the built-in profile. A tool-description file can replace it with `schemaNotes`.",
       profileKey: "Profile key",
       backToIndex: "All tools",
       reviewed: "Reviewed",
@@ -93,6 +91,7 @@ const UI = {
       web: "Derived from the conversation's web-access switch",
       skill: "Derived from the on-demand skill switch",
       tool_search: "Derived from the MCP tool-discovery switch",
+      preview: "Follows the other preview tools: on whenever any of them is enabled",
     },
   },
   "zh-CN": {
@@ -102,14 +101,13 @@ const UI = {
     languages: "语言",
     footer: "Mework 以 GPL-3.0-or-later 许可发布。本站由仓库中的 website/content 构建。",
     keyTable: { id: "键", placeholders: "占位符", where: "注入位置" },
-    downloads: { english: "下载内置英文文件（prompt-profile.en-US.json）", chinese: "下载内置中文文件（prompt-profile.zh-CN.json）", manifest: "下载键清单（prompt-profile-keys.json）" },
+    downloads: { builtin: "下载内置档案（prompt-profile.en-US.json）", manifest: "下载键清单（prompt-profile-keys.json）" },
     tools: {
       tool: "工具",
       name: "名称",
       summary: "作用",
       availability: "可用性",
       switchable: "工具选择器",
-      familyWindow: "工具选择器，在 `{family}` 窗口里",
       parameters: "参数",
       parameter: "参数",
       type: "类型",
@@ -121,7 +119,7 @@ const UI = {
       noParameters: "这个工具没有参数。",
       variants: "调用取以下形态之一，由此字段选择：",
       modelText: "模型读到的描述",
-      modelTextNote: "这是本页语言对应的内置档案里该工具的 schema 根描述。工具描述文件可以用 `schemaNotes` 替换它。",
+      modelTextNote: "这是内置档案里该工具的 schema 根描述，模型读到的就是这段英文。工具描述文件可以用 `schemaNotes` 替换它。",
       profileKey: "档案键",
       backToIndex: "全部工具",
       reviewed: "需审查",
@@ -134,12 +132,15 @@ const UI = {
       web: "派生自对话的联网开关",
       skill: "派生自技能按需加载开关",
       tool_search: "派生自 MCP 工具发现开关",
+      preview: "跟随其余预览工具：只要启用了其中任何一个就启用",
     },
   },
 };
 
-// Tools the host derives from a switch instead of listing in the tool picker.
-// Mirrors src/lib/taskTools.ts (isHostDerivedToolName) and src/lib/memoryTools.ts.
+// Tools the tool picker does not list: the host derives them from a switch, or,
+// for the preview lifecycle tools, the picker keeps them in step with the other
+// preview tools. Mirrors src/lib/taskTools.ts (isHostDerivedToolName,
+// isPreviewLifecycleToolName) and src/lib/memoryTools.ts.
 const DERIVED = {
   read_global_memory: "memory", read_project_memory: "memory", create_global_memory: "memory",
   create_project_memory: "memory", edit_global_memory: "memory", edit_project_memory: "memory",
@@ -148,22 +149,8 @@ const DERIVED = {
   web_search: "web", web_fetch: "web",
   skill: "skill",
   tool_search: "tool_search",
+  preview_start: "preview", preview_stop: "preview", preview_list: "preview",
 };
-// The tool picker gathers each family's tools behind one row, and the row opens
-// the family's own settings window. Mirrors TOOL_FAMILIES in
-// src/components/ToolFamilySettings.tsx. The picker links each family row to
-// tools.html#<family> (src/components/DocsLink.tsx), so the tools page must list
-// the family's tools under a heading with exactly that id.
-const FAMILIES = {
-  files: (name) => ["ls", "find", "grep", "read", "write", "edit"].includes(name),
-  shell: (name) => ["bash", "zsh", "sh", "powershell"].includes(name),
-  preview: (name) => name.startsWith("preview_"),
-};
-
-function familyOf(name) {
-  return Object.keys(FAMILIES).find((family) => FAMILIES[family](name)) ?? null;
-}
-
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
@@ -184,17 +171,16 @@ function slugify(text) {
     .replace(/^-+|-+$/g, "") || "section";
 }
 
-/** The catalog, schema baseline and both profiles, read once. */
+/** The catalog, the schema baseline, the built-in profile's texts and the key
+ * manifest, read once. The profile is English on every page: it is what the
+ * model reads, whatever language the site is in. */
 const baseline = {
   catalog: Object.fromEntries(LANGUAGES.map((language) => [
     language.code,
-    readJson(path.join(baselineRoot, `builtin-tool-catalog.${language.profile}.json`)).tools,
+    readJson(path.join(baselineRoot, `builtin-tool-catalog.${language.catalog}.json`)).tools,
   ])),
   schemas: Object.fromEntries(readJson(path.join(baselineRoot, "builtin-tool-schemas.json")).tools.map((tool) => [tool.name, tool.schema])),
-  profiles: Object.fromEntries(LANGUAGES.map((language) => [
-    language.code,
-    readJson(path.join(baselineRoot, `prompt-profile.${language.profile}.json`)).prompts,
-  ])),
+  prompts: readJson(path.join(baselineRoot, "prompt-profile.en-US.json")).prompts,
   keys: readJson(path.join(baselineRoot, "prompt-profile-keys.json")).keys,
 };
 
@@ -205,9 +191,8 @@ function toolDescriptionKey(name) {
   return `tool.${name}.description`;
 }
 
-function toolDescription(lang, name) {
-  const key = toolDescriptionKey(name);
-  return baseline.profiles[lang][key] ?? baseline.profiles.en[key] ?? baseline.schemas[name]?.description ?? "";
+function toolDescription(name) {
+  return baseline.prompts[toolDescriptionKey(name)] ?? baseline.schemas[name]?.description ?? "";
 }
 
 function firstSentence(text) {
@@ -226,9 +211,7 @@ function inlineCode(text) {
 function availabilityLabel(lang, name) {
   const ui = UI[lang];
   if (DERIVED[name]) return ui.derived[DERIVED[name]];
-  const family = familyOf(name);
-  if (!family) return ui.tools.switchable;
-  return ui.tools.familyWindow.replace("{family}", family);
+  return ui.tools.switchable;
 }
 
 function toolCounts() {
@@ -245,7 +228,7 @@ function toolTable(lang, names) {
     return `<tr>
   <td><a href="tools/${escapeHtml(tool.name)}.html"><code>${escapeHtml(tool.name)}</code></a></td>
   <td>${escapeHtml(tool.label)}</td>
-  <td>${inlineCode(firstSentence(toolDescription(lang, tool.name)))}</td>
+  <td>${inlineCode(firstSentence(toolDescription(tool.name)))}</td>
   <td class="availability">${inlineCode(availabilityLabel(lang, tool.name))}</td>
 </tr>`;
   });
@@ -272,8 +255,7 @@ function headingAnchor(source) {
  * Expands the tools page's `{{TOOL_TABLE:…}}` placeholders and works out where
  * each tool sits: the path of headings (h2 down to h4) above its table, which
  * its own page shows as a breadcrumb. Refuses a page that leaves a catalog tool
- * out, lists one twice, names one the catalog does not have, or puts a family's
- * tool anywhere but under that family's heading.
+ * out, lists one twice, or names one the catalog does not have.
  */
 function placeTools(markdown, lang) {
   const catalog = new Set(baseline.catalog[lang].map((tool) => tool.name));
@@ -292,12 +274,7 @@ function placeTools(markdown, lang) {
       for (const name of names) {
         if (!catalog.has(name)) throw new Error(`${lang}/tools.md lists a tool the catalog does not have: ${name}`);
         if (placements.has(name)) throw new Error(`${lang}/tools.md lists ${name} twice`);
-        const trail = path.filter(Boolean).map((entry) => ({ ...entry }));
-        const underFamily = trail.find((entry) => Object.hasOwn(FAMILIES, entry.id))?.id ?? null;
-        if (underFamily !== familyOf(name)) {
-          throw new Error(`${lang}/tools.md: ${name} belongs under #${familyOf(name) ?? "(no family heading)"}, found under #${underFamily ?? "(no family heading)"}`);
-        }
-        placements.set(name, trail);
+        placements.set(name, path.filter(Boolean).map((entry) => ({ ...entry })));
       }
       return toolTable(lang, names);
     });
@@ -385,7 +362,7 @@ function parameterSection(lang, name) {
 
 function renderToolPage(lang, tool, notesMarkdown, trail) {
   const ui = UI[lang];
-  const description = toolDescription(lang, tool.name);
+  const description = toolDescription(tool.name);
   const key = toolDescriptionKey(tool.name);
   const { html: notesHtml, outline } = renderMarkdown(notesMarkdown, lang);
   const breadcrumb = [
@@ -452,8 +429,7 @@ ${rows.join("\n")}
 function profileFileLinks(lang) {
   const labels = UI[lang].downloads;
   return `<ul class="downloads">
-<li><a href="../files/prompt-profile.en-US.json" download>${labels.english}</a></li>
-<li><a href="../files/prompt-profile.zh-CN.json" download>${labels.chinese}</a></li>
+<li><a href="../files/prompt-profile.en-US.json" download>${labels.builtin}</a></li>
 <li><a href="../files/prompt-profile-keys.json" download>${labels.manifest}</a></li>
 </ul>`;
 }
@@ -565,7 +541,7 @@ function build() {
   fs.copyFileSync(path.join(repo, "src", "mework-icon-small.svg"), path.join(outRoot, "assets", "mework-icon-small.svg"));
   const filesDir = path.join(outRoot, "files");
   fs.mkdirSync(filesDir, { recursive: true });
-  for (const name of ["prompt-profile.en-US.json", "prompt-profile.zh-CN.json", "prompt-profile-keys.json"]) {
+  for (const name of ["prompt-profile.en-US.json", "prompt-profile-keys.json"]) {
     fs.copyFileSync(path.join(baselineRoot, name), path.join(filesDir, name));
   }
   fs.writeFileSync(path.join(outRoot, ".nojekyll"), "");

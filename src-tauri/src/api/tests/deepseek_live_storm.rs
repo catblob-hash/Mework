@@ -343,6 +343,7 @@ fn seed_conversation_row(app_data: &std::path::Path, workspace_id: &str, convers
                 run_target: None,
                 additional_directories: Vec::new(),
                 parent_conversation_id: None,
+                fork_of: None,
                 preset_id: String::new(),
                 template_id: String::new(),
                 attached_workspaces: Vec::new(),

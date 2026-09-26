@@ -265,6 +265,11 @@ pub(crate) fn update(
             .map(crate::model::ContextItem::id)
             .eq(expected_context_ids.iter().map(String::as_str));
     let mut next = proposal.clone();
+    // The host just wrote a title (the local helper model's) that this commit
+    // was built before hearing about: keep the host's.
+    if state.helper_model.is_stale_title(&proposal.id, &next.title, &current.title) {
+        next.title = current.title.clone();
+    }
     if !in_sync {
         // A renderer read model may lag the host. Preserve host prose and accept
         // only the proposed metadata changes.

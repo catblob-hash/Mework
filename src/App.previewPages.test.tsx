@@ -84,6 +84,30 @@ describe("preview pages across a conversation's workspaces", () => {
     expect(browserMocks.setBrowserPageNetwork).toHaveBeenCalledWith(conversationId, { conversationId });
   });
 
+  /**
+   * The host can refuse an open (a page it is still creating, a full set of live pages). The pane
+   * used to stay open with nothing in it and the button pressed, so the next click closed it and
+   * only the one after that opened the page.
+   */
+  it("closes the pane when the host refuses the open, so one click tries again", async () => {
+    runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
+    browserMocks.openBrowser.mockRejectedValueOnce(
+      new Error("this browser task page is being created or restored; try again shortly")
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    const preview = within(toolbar()).getByRole("button", { name: "预览" });
+
+    await user.click(preview);
+    await waitFor(() => expect(browserMocks.openBrowser).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(preview).toHaveAttribute("aria-pressed", "false"));
+
+    await user.click(preview);
+    await waitFor(() => expect(browserMocks.openBrowser).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(preview).toHaveAttribute("aria-pressed", "true"));
+  });
+
   it("opens a page for the workspace picked from the top bar, on that workspace's machine", async () => {
     const document = documentWithRemoteWorkspace();
     runtimeMocks.loadDocument.mockResolvedValue(document);

@@ -13,7 +13,10 @@ use std::path::Path;
 
 use crate::{
     api::{failed_tool_execution, ToolCall, ToolExecution},
-    model::{ConversationPlan, JsonObject, PlanStatus, RunModelRequest, SecurityLevel, ToolResult},
+    model::{
+        ConversationPlan, JsonObject, PlanStatus, ResolvedLanguage, RunModelRequest, SecurityLevel,
+        ToolResult,
+    },
     push_events::AppPushEvent,
     security::RiskLevel,
     state::AppState,
@@ -311,15 +314,27 @@ pub(crate) fn run_exit_plan_mode_tool(
         Err(error) => return failed_tool_execution(call, error),
     };
 
+    let language = crate::api::approval_card_language(state, &request.app_data_path);
+    let english = language == ResolvedLanguage::EnUs;
     let card = PendingToolPrompt {
         // Minted by the registry; see `ToolPromptRegistry::ask_answer`.
         prompt_id: String::new(),
         tool_name: EXIT_PLAN_MODE_TOOL.to_owned(),
         kind: PromptKind::PlanExit,
-        label: "计划已就绪".to_owned(),
+        label: if english {
+            "Plan ready"
+        } else {
+            "计划已就绪"
+        }
+        .to_owned(),
         summary: plan_title(&plan.markdown),
-        risk_level: RiskLevel::Low.label_zh().to_owned(),
-        reason: "模型已写好计划，等待你决定是否开始实施".to_owned(),
+        risk_level: RiskLevel::Low.label(language).to_owned(),
+        reason: if english {
+            "The model has written a plan and is waiting for you to decide whether to implement it"
+        } else {
+            "模型已写好计划，等待你决定是否开始实施"
+        }
+        .to_owned(),
         requester: None,
         source_agent: None,
         source_call_id: None,

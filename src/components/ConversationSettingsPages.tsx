@@ -17,6 +17,7 @@ import type { ReactNode } from "react";
 import { type TranslationFunction, useI18n } from "../i18n";
 import { hasUsableAgentDefinition } from "../lib/agentDefinitions";
 import { useCatalogOrder } from "../lib/catalogOrder";
+import { isBuiltinConversationPreset } from "../lib/conversationPresets";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
 import { isImeKeyEvent } from "../lib/shortcuts";
@@ -533,7 +534,6 @@ export function ConversationPresetsPage({
   listId,
   presets,
   appliedId,
-  editable,
   error = null,
   onApply,
   onOpen,
@@ -544,8 +544,6 @@ export function ConversationPresetsPage({
   listId: string;
   presets: ConversationPreset[];
   appliedId: string;
-  /** False for the implicit built-in shown when nothing is saved: it has no row on disk. */
-  editable: boolean;
   /** The last failed apply. Applying is the only action here that can fail. */
   error?: string | null;
   onApply: (id: string) => void;
@@ -576,6 +574,10 @@ export function ConversationPresetsPage({
         {ordered.map((preset) => {
           const isApplied = preset.id === appliedId;
           const isRenaming = renaming?.id === preset.id;
+          /* The built-in ships with the build: the host rewrites it on every
+             start and keeps it through every save, so it has no rename or
+             delete to offer. Its window saves a copy instead. */
+          const editable = !isBuiltinConversationPreset(preset.id);
           return (
             <CatalogRow
               key={preset.id}
@@ -586,8 +588,8 @@ export function ConversationPresetsPage({
               detail={rowDetail(
                 preset.description,
                 !editable && t(
-                  "内置默认值，没有保存成一份预设，所以不能改名或删除。",
-                  "The built-in default. It is not a saved preset, so it cannot be renamed or deleted."
+                  "内置预设，随 Mework 版本更新，不能改名、修改或删除。",
+                  "Built in. It updates with Mework and cannot be renamed, edited or deleted."
                 )
               )}
               icon={<SlidersHorizontal size={13} aria-hidden="true" />}

@@ -1,8 +1,9 @@
 import type { ProviderFamily, ApiProvider, AppDocument, ConversationPreset } from "../types";
-import { implicitConversationPreset } from "./conversationPresets";
+import { emptyConversationPresetSettings } from "./conversationPresets";
 
 /** Fixed ID so repeated seeding replaces the same record rather than adding another. */
 const MEMORY_E2E_PRESET_ID = "memory-e2e-full-access";
+const MEMORY_E2E_SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", "powershell"]);
 
 const PROTOCOLS = [
   "openai_responses",
@@ -133,7 +134,14 @@ export function seedMemoryE2EDocument(
     description: "记忆 E2E 专用：新任务免审批",
     templateId: "",
     settings: {
-      ...implicitConversationPreset(next.tools, "zh-CN").settings,
+      ...emptyConversationPresetSettings(),
+      // The file tools, every shell's command tool (a run offers the ones its
+      // machines have) and web access. Nothing else: the flow under test turns
+      // on what it exercises.
+      enabledTools: next.tools
+        .filter((tool) => tool.category === "filesystem" || MEMORY_E2E_SHELL_TOOLS.has(tool.name))
+        .map((tool) => tool.name),
+      webSearchEnabled: true,
       securityLevel: "full_access"
     }
   };

@@ -7,7 +7,6 @@ import {
   CircleAlert,
   Copy,
   GitBranch,
-  MessageSquare,
   Pencil,
   Shield,
   Trash2,
@@ -26,6 +25,7 @@ import type { ConversationTurn } from "../lib/conversationTurns";
 import type { WorkflowRunView } from "../lib/workflowRuns";
 import type { LiveReasoningView } from "../lib/runContexts";
 import { EmptyState, IconButton } from "./Common";
+import { MeworkIcon } from "./MeworkIcon";
 import { buildContextRenderNodes, TimelineBlock, TimelineRow } from "./TimelineBlock";
 import type { ContextRenderNode } from "./TimelineBlock";
 import { InlineTextEditor } from "./InlineTextEditor";
@@ -37,6 +37,8 @@ import { useFloatingSurface } from "../lib/floatingSurfaces";
 import { textWithoutAppendedImagePlaceholders } from "../lib/imageShortIds";
 import { stripSelectedElementBlocks } from "../lib/selectedElement";
 import { useAppearance } from "../lib/appearance";
+import { stepFollowGlide } from "../lib/followGlide";
+import type { FollowGlide } from "../lib/followGlide";
 import { MarkdownContent } from "./MarkdownContent";
 import { QuestionTimelineCard } from "./QuestionTimelineCard";
 import { StreamWaitingIndicator } from "./StreamWaitingIndicator";
@@ -50,6 +52,30 @@ import type { ChangeSpan, TurnChangeSummary } from "./TurnChanges";
 // Wide enough to absorb fractional scroll metrics, narrow enough that the user
 // has to actually be at the bottom to re-attach to follow-output.
 const SCROLL_BOTTOM_EPSILON = 16;
+
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+
+/** Keys that scroll a page up when nothing editable has them. */
+const UPWARD_SCROLL_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
+
+/**
+ * Whether scrolling up from `target` — a wheel over it, or a key while it has
+ * focus — moves `scroller` itself, rather than a code block or an output pane
+ * inside it that still has room to scroll.
+ */
+function upwardScrollMovesScroller(target: EventTarget | null, scroller: HTMLElement): boolean {
+  for (let element = target instanceof Element ? target : null; element && element !== scroller; element = element.parentElement) {
+    if (element.scrollHeight <= element.clientHeight || element.scrollTop <= 0) continue;
+    const overflow = window.getComputedStyle(element).overflowY;
+    if (overflow === "auto" || overflow === "scroll") return false;
+  }
+  return scroller.scrollTop > 0;
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement
+    && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+}
 
 /**
  * Everything the stream-level right-click can place an insertion against: the
@@ -101,6 +127,9 @@ export interface ContextStreamProps {
   /** Live "request failed, retrying" notice for the streaming round. A
    * transient hint only — never part of the timeline contexts. */
   retryNotice?: { attempt: number; maxAttempts: number; message: string } | null;
+  /** Rows the tasks pane lists as running, narrated beside the cat as a link to that pane. */
+  runningTaskCount?: number;
+  onOpenTasks?: () => void;
   ariaLabel?: string;
   /** The `ask_user` tool context currently awaiting an answer, if any. */
   pendingQuestionId?: string | null;
@@ -134,6 +163,9 @@ export interface ContextStreamProps {
   branchSwitchDisabledReason?: string | null;
   /** Places a new context, naming the tool when a call is what is being placed. */
   onInsert?: (index: number, kind: InsertableContextKind, toolName?: string) => void;
+  /** Opens a new conversation holding the contexts above the insertion line at `index`. */
+  onForkAt?: (index: number) => void;
+  forkDisabledReason?: string | null;
   /** Opens the read-only child conversation for a subagent tool call. */
   onOpenSubagent?: (subagentId: string) => void;
   /**
@@ -802,7 +834,7 @@ function renderNodeContextIds(node: ContextRenderNode): string[] {
   return node.entries.map((entry) => entry.item.id);
 }
 
-export const ContextStream = memo(function ContextStream({ contexts, turns = [], changeSpans: changeSpansProp, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, ariaLabel, pendingQuestionId, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
+export const ContextStream = memo(function ContextStream({ contexts, turns = [], changeSpans: changeSpansProp, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, runningTaskCount = 0, onOpenTasks, ariaLabel, pendingQuestionId, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onForkAt, forkDisabledReason = null, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
   const { t } = useI18n();
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -811,6 +843,8 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
   const scrollTopRef = useRef(0);
   const scrollTimelineRef = useRef(timelineId);
   const scrollFrameRef = useRef<number | null>(null);
+  const glideRef = useRef<FollowGlide | null>(null);
+  const streamContentRef = useRef<HTMLDivElement>(null);
   const previousTimelineRef = useRef<{
     timelineId: string | undefined;
     length: number;
@@ -1060,6 +1094,72 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     });
   }, [menu]);
 
+  /** Stops any follow-output frame, jump or glide, before it runs. */
+  const stopFollowing = useCallback(() => {
+    if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
+    scrollFrameRef.current = null;
+    glideRef.current = null;
+  }, []);
+
+  /** Takes the page to the bottom in one step on the next frame. */
+  const jumpToBottom = useCallback(() => {
+    stopFollowing();
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      const current = streamRef.current;
+      if (!current || !scrollPinnedRef.current) return;
+      current.scrollTop = current.scrollHeight;
+      // The next scroll event compares against where follow-output left the
+      // reader, so a jump the browser never reported cannot read as an upward
+      // scroll and detach on its own.
+      scrollTopRef.current = current.scrollTop;
+    });
+  }, [stopFollowing]);
+
+  /**
+   * Glides the page down to the bottom (`followGlide.ts`). A glide already
+   * under way just carries on: it reads the bottom afresh every frame, so a
+   * commit landing mid-glide re-aims it rather than restarting it.
+   */
+  const glideToBottom = useCallback(() => {
+    const scroller = streamRef.current;
+    if (glideRef.current || !scroller) return;
+    if (window.matchMedia?.(REDUCED_MOTION_QUERY).matches) {
+      jumpToBottom();
+      return;
+    }
+    stopFollowing();
+    glideRef.current = { position: scroller.scrollTop, velocity: 0, time: null };
+    const frame = (now: number) => {
+      scrollFrameRef.current = null;
+      const current = streamRef.current;
+      const glide = glideRef.current;
+      if (!current || !glide || !scrollPinnedRef.current) {
+        glideRef.current = null;
+        return;
+      }
+      // Something else moved the page — the browser clamping a page that got
+      // shorter, or the reader scrolling further down — so go on from there.
+      const position = Math.abs(current.scrollTop - glide.position) > 1 ? current.scrollTop : glide.position;
+      const next = stepFollowGlide({ ...glide, position }, Math.max(0, current.scrollHeight - current.clientHeight), now);
+      current.scrollTop = next.position;
+      scrollTopRef.current = current.scrollTop;
+      if (next.done) {
+        glideRef.current = null;
+        return;
+      }
+      glideRef.current = next;
+      scrollFrameRef.current = window.requestAnimationFrame(frame);
+    };
+    scrollFrameRef.current = window.requestAnimationFrame(frame);
+  }, [jumpToBottom, stopFollowing]);
+
+  /** The reader is heading up: let go of the bottom before the next frame pulls them back. */
+  const releaseBottom = useCallback(() => {
+    scrollPinnedRef.current = false;
+    stopFollowing();
+  }, [stopFollowing]);
+
   useEffect(() => {
     const scroller = streamRef.current;
     const previous = previousTimelineRef.current;
@@ -1071,14 +1171,13 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       lastVisualLength: contextVisualLength(last)
     };
     previousTimelineRef.current = next;
-    if (scrollFrameRef.current !== null) {
-      window.cancelAnimationFrame(scrollFrameRef.current);
-      scrollFrameRef.current = null;
-    }
     const timelineChanged = previous !== null && previous.timelineId !== next.timelineId;
     // The owning conversation surface restores its saved scroll position after
     // a switch. Do not reinterpret the new timeline as appended output.
-    if (timelineChanged || !scroller || contexts.length === 0 || menu || !scrollPinnedRef.current) return;
+    if (timelineChanged || !scroller || contexts.length === 0 || menu || !scrollPinnedRef.current) {
+      stopFollowing();
+      return;
+    }
 
     const initialTimeline = previous === null;
     const appended = previous !== null && next.length > previous.length;
@@ -1090,25 +1189,36 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       && streaming
       && next.length >= previous.length
       && next.lastId === previous.lastId;
-    if (!initialTimeline && !appended && !growingTail && !streamingUpdate) return;
+    if (!initialTimeline && !appended && !growingTail && !streamingUpdate) {
+      // A glide may finish the distance it was already covering, but never
+      // past a tail that went away: it could outlive the deletion and close a
+      // context menu opened right after it.
+      if (!glideRef.current || next.length < previous.length) stopFollowing();
+      return;
+    }
+    // What a stream writes glides, and so does whatever lands while a glide is
+    // still moving, the stream's own settling included. Anything else — a
+    // conversation opening, a card placed by hand — jumps.
+    if (!initialTimeline && (streaming || glideRef.current)) glideToBottom();
+    else jumpToBottom();
+  }, [contexts, glideToBottom, jumpToBottom, menu, stopFollowing, streaming, timelineId]);
 
-    scrollFrameRef.current = window.requestAnimationFrame(() => {
-      scrollFrameRef.current = null;
-      const current = streamRef.current;
-      if (!current || !scrollPinnedRef.current) return;
-      // Keep follow-output instant. A smooth scroll can outlive a tail deletion
-      // and close a context menu opened immediately after it.
-      current.scrollTop = current.scrollHeight;
-      // The next scroll event compares against where follow-output left the
-      // reader, so a jump the browser never reported cannot read as an upward
-      // scroll and detach on its own.
-      scrollTopRef.current = current.scrollTop;
+  // Commits are not the only thing that grows a live page: a body opening
+  // under its row, a formula typesetting, the waiting line changing shape.
+  // While the stream runs, whatever grows the page is followed the same way.
+  useEffect(() => {
+    const content = streamContentRef.current;
+    if (!streaming || menu || !content || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      // Until the page reports a scroll on this timeline, its position is the
+      // one the owning surface is restoring, not one to follow from.
+      if (scrollPinnedRef.current && scrollTimelineRef.current === timelineId) glideToBottom();
     });
-  }, [contexts, menu, streaming, timelineId]);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [glideToBottom, menu, streaming, timelineId]);
 
-  useEffect(() => () => {
-    if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
-  }, []);
+  useEffect(() => stopFollowing, [stopFollowing]);
 
   const openMenu = useCallback((event: React.MouseEvent | React.KeyboardEvent, index: number) => {
     if (mutationReadOnly) return;
@@ -1220,7 +1330,14 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
   const renderTurnNotices = (turn: ConversationTurn): ReactNode => (
     <Fragment key={`turn:${turn.id}`}>
       {streaming && turn.status === "running" && (
-        <StreamWaitingIndicator contexts={contexts} tools={tools} thinking={thinking} retryNotice={retryNotice} />
+        <StreamWaitingIndicator
+          contexts={contexts}
+          tools={tools}
+          thinking={thinking}
+          retryNotice={retryNotice}
+          runningTaskCount={runningTaskCount}
+          onOpenTasks={onOpenTasks}
+        />
       )}
       {turn.error && (
         <TurnErrorNotice
@@ -1243,6 +1360,20 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       data-main-context-stream={!readOnly || undefined}
       role={ariaLabel ? "region" : undefined}
       aria-label={ariaLabel}
+      onWheel={(event) => {
+        if (scrollPinnedRef.current && event.deltaY < 0 && upwardScrollMovesScroller(event.target, event.currentTarget)) {
+          releaseBottom();
+        }
+      }}
+      onKeyDown={(event) => {
+        if (
+          scrollPinnedRef.current
+          && UPWARD_SCROLL_KEYS.has(event.key)
+          && !event.defaultPrevented
+          && !isEditableTarget(event.target)
+          && upwardScrollMovesScroller(event.target, event.currentTarget)
+        ) releaseBottom();
+      }}
       onScroll={(event) => {
         const scroller = event.currentTarget;
         const top = scroller.scrollTop;
@@ -1270,12 +1401,12 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
         openMenu(event, Number.isInteger(nearestIndex) ? nearestIndex : contexts.length);
       }}
     >
-      <div className="context-stream">
+      <div ref={streamContentRef} className="context-stream">
         {!insertEditor && renderNodes.length === 0 && turnProjection.leadingTurns.length === 0 ? (
           <EmptyState
-            icon={<MessageSquare size={22} />}
+            icon={<MeworkIcon plate={false} size={44} />}
             title={t("这段对话还没有消息", "This conversation has no messages yet")}
-            description={t("会话内容会显示在这里。", "Conversation content will appear here.")}
+            description={mutationReadOnly ? undefined : t("在上下文之间右键，可精确插入新内容", "Right-click between contexts to insert content precisely")}
           />
         ) : (
           <>
@@ -1297,11 +1428,17 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
           </>
         )}
         {streaming && turnProjection.visibleRunningTurnIds.size === 0 && (
-          <StreamWaitingIndicator contexts={contexts} tools={tools} thinking={thinking} retryNotice={retryNotice} />
+          <StreamWaitingIndicator
+            contexts={contexts}
+            tools={tools}
+            thinking={thinking}
+            retryNotice={retryNotice}
+            runningTaskCount={runningTaskCount}
+            onOpenTasks={onOpenTasks}
+          />
         )}
         {insertEditorIndex === contexts.length && insertEditor}
         {!mutationReadOnly && displayInsertionIndex === contexts.length && renderNodes.length > 0 && <div className="insertion-line" />}
-        {!mutationReadOnly && <p className="context-stream__hint">{t("在上下文之间右键，可精确插入新内容", "Right-click between contexts to insert content precisely")}</p>}
       </div>
 
       {!mutationReadOnly && menu && (
@@ -1435,6 +1572,24 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
               </div>
             );
           })}
+          {onForkAt && (
+            <>
+              <div className="context-menu__divider" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled={menu.index === 0 || Boolean(forkDisabledReason)}
+                title={forkDisabledReason
+                  ?? (menu.index === 0 ? t("分割线上方没有可分叉的上下文", "There is nothing above the line to fork") : undefined)}
+                onClick={() => {
+                  onForkAt(menu.index);
+                  setMenu(null);
+                }}
+              >
+                {t("分叉会话", "Fork conversation")}
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>

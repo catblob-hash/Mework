@@ -15,6 +15,10 @@ members = [
     # Git reads and writes, linked by the host and by the remote agent, which
     # runs the same operations on the machine a remote checkout is on.
     "git-core",
+    # The local helper model (Qwen3.5-0.8B) that names conversations and explains
+    # shell commands: tokenizer, weight conversion, and the Core ML (Apple Neural
+    # Engine) and llama.cpp backends with their scheduler.
+    "local-model",
 ]
 
 [package]
@@ -143,7 +147,14 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win3
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# The local helper model on llama.cpp (CPU, and a GPU where one is usable).
+mework-local-model = { path = "local-model", features = ["llama"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
+# The local helper model on the Neural Engine (Core ML) or the GPU (MLX, built
+# into a library the app loads at run time); no llama.cpp here.
+mework-local-model = { path = "local-model", features = ["mlx"] }
 # Holds exactly one login-keychain item, the master key of `src/credential_vault.rs`;
 # every other credential is sealed under it, so macOS asks about one item instead of
 # one per credential.
@@ -173,3 +184,21 @@ tempfile = "3"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 browser-dev = ["dep:axum", "dep:futures-util"]
+# GPU backends for the local helper model's llama.cpp build (Windows, Linux).
+# Vulkan and CUDA link their runtimes into the executable; `local-model-dynamic`
+# loads each backend as a module instead, but then the llama/ggml libraries must
+# be packaged beside the executable (see local-model/Cargo.toml).
+local-model-vulkan = ["mework-local-model/llama-vulkan"]
+local-model-cuda = ["mework-local-model/llama-cuda"]
+local-model-dynamic = ["mework-local-model/llama-dynamic"]
+
+# The local helper model converts 1.5 GB of weights and runs its sampling and
+# state copies in tight loops; unoptimized, a dev build takes minutes for what
+# release does in seconds.
+[profile.dev.package.mework-local-model]
+opt-level = 3
+
+# Model downloads are checked with SHA-256 (1.5 GB files); unoptimized, that
+# takes a minute per file in a development build.
+[profile.dev.package.sha2]
+opt-level = 3

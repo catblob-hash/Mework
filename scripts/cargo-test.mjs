@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { superviseCargoTest } from "./cargo-test-lifecycle.mjs";
 import { windowsNativeBuildEnvironment } from "./windows-native-build-tools.mjs";
 import { withCefBuildEnvironment } from "./cef-environment.mjs";
+import { autoPruneCargoTarget } from "./prune-cargo-target.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -63,6 +64,7 @@ const environment = withRuntimeDllDirectory(
   targetDir,
   profile,
 );
+autoPruneCargoTarget(targetDir);
 
 // Spawned without a shell on purpose: the pid recorded here has to be cargo's own, because a
 // Ctrl+C is answered by killing the tree rooted at it. A `cmd.exe` in between usually exits

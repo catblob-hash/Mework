@@ -1507,20 +1507,25 @@ describe("App model run flow — agents", () => {
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
 
     act(() => emit({ type: "reasoning_delta", round: 1, delta: "先检查结构，再验证行为。" }));
-    // A row, not a card: the wire name `think`, one line of the thought, and
-    // the whole of it in the body the streaming round leaves open.
+    // A row, not a card: the wire name `think` and one line of the thought.
+    // The body waits behind the row while the round streams, so it does not
+    // pull the page down every commit.
     const streamingSummary = await screen.findByRole("button", { name: "think · 正在思考" });
     const reasoningRow = streamingSummary.closest("article")!;
     expect(reasoningRow).toHaveAttribute("data-row-kind", "reasoning");
     expect(within(streamingSummary).getByText("think")).toBeInTheDocument();
     expect(within(streamingSummary).getByText("先检查结构，再验证行为。")).toBeVisible();
+    expect(streamingSummary).toHaveAttribute("aria-expanded", "false");
+    expect(reasoningRow.querySelector(".timeline-row__prose")).toBeNull();
+    // Opened by the reader, it stays open through settlement. The disclosure
+    // names the phase while the round streams. This model declares encrypted
+    // reasoning, so the settled live card says so; only the host's own
+    // persisted card, which carries no form at all, reads as plain reasoning.
+    // Figures sit outside the button, so the name is stable.
+    await user.click(streamingSummary);
+    expect(streamingSummary).toHaveAttribute("aria-expanded", "true");
     expect(reasoningRow.querySelector(".timeline-row__prose"))
       .toHaveTextContent("先检查结构，再验证行为。");
-    // The disclosure names the phase while the round streams. This model
-    // declares encrypted reasoning, so the settled live card says so; only the
-    // host's own persisted card, which carries no form at all, reads as plain
-    // reasoning. Figures sit outside the button, so the name is stable.
-    expect(streamingSummary).toHaveAttribute("aria-expanded", "true");
 
     act(() => emit({ type: "reasoning_done", round: 1 }));
     await waitFor(() => expect(screen.getByRole("button", { name: "think · 加密思考" })).toHaveAttribute("aria-expanded", "true"));

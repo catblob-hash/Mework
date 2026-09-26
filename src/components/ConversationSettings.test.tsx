@@ -8,8 +8,9 @@ import {
   DEFAULT_SEARCH_COMPRESSION_CUTOFF,
   DEFAULT_SEARCH_MAX_RESULTS
 } from "../lib/searchProviders";
-import { isHostDerivedToolName } from "../lib/taskTools";
+import { isHostDerivedToolName, isPreviewLifecycleToolName } from "../lib/taskTools";
 import { createTestDocument as createSeedDocument } from "../test/fixtures";
+import { BUILTIN_PRESET_ID } from "../seed";
 import type {
   CapabilityCatalog,
   ContextItem,
@@ -60,6 +61,7 @@ function SettingsHarness({
   onRenamePreset = vi.fn(),
   onDeletePreset = vi.fn(),
   onSavePreset = vi.fn(),
+  onSavePresetCopy = vi.fn(),
   onSaveAsPreset = vi.fn(),
   onBindPresetTemplate = vi.fn(),
   templates = [],
@@ -81,6 +83,7 @@ function SettingsHarness({
   onRenamePreset?: (presetId: string, name: string) => void;
   onDeletePreset?: (presetId: string) => void;
   onSavePreset?: (presetId: string, settings: ConversationPresetSettings) => void;
+  onSavePresetCopy?: (presetId: string, settings: ConversationPresetSettings) => void;
   onSaveAsPreset?: () => void;
   onBindPresetTemplate?: (presetId: string, templateId: string) => void;
   templates?: ConversationTemplateSummary[];
@@ -118,6 +121,7 @@ function SettingsHarness({
       onRenamePreset={onRenamePreset}
       onDeletePreset={onDeletePreset}
       onSavePreset={onSavePreset}
+      onSavePresetCopy={onSavePresetCopy}
       onSaveAsPreset={onSaveAsPreset}
       onBindPresetTemplate={onBindPresetTemplate}
       templates={templates}
@@ -332,10 +336,14 @@ describe("ConversationSettings", () => {
     expect(seed.globalSettings.conversationPresets[0].name).toBe("");
   });
 
-  it("renders English controls and the implicit built-in preset without persisting a name", async () => {
+  it("renders English controls and offers no rename or delete for the built-in preset", async () => {
     configureI18n("en-US");
     const seed = createSeedDocument();
-    seed.globalSettings.conversationPresets = [];
+    seed.globalSettings.conversationPresets.unshift({
+      ...seed.globalSettings.conversationPresets[0],
+      id: BUILTIN_PRESET_ID,
+      name: "mework"
+    });
     const user = userEvent.setup();
 
     render(
@@ -353,13 +361,51 @@ describe("ConversationSettings", () => {
       .toBeInTheDocument();
 
     await openPage(user, /^Conversation presets/);
-    // Nothing is saved, so the page draws the implicit built-in the host supplies;
-    // it has no row on disk, so renaming or deleting it is offered but spent.
-    const row = screen.getByRole("button", { name: /^Open preset Built-in engineering defaults$/ })
+    // The built-in ships with the build, so renaming or deleting it is offered
+    // but spent; a preset of the user's own keeps both.
+    const builtin = screen.getByRole("button", { name: /^Open preset mework$/ })
       .closest(".catalog-row") as HTMLElement;
-    expect(within(row).getByRole("button", { name: "Rename" })).toBeDisabled();
-    expect(within(row).getByRole("button", { name: "Delete preset Built-in engineering defaults" })).toBeDisabled();
-    expect(seed.globalSettings.conversationPresets).toEqual([]);
+    expect(within(builtin).getByRole("button", { name: "Rename" })).toBeDisabled();
+    expect(within(builtin).getByRole("button", { name: "Delete preset mework" })).toBeDisabled();
+    const own = screen.getByRole("button", { name: /^Open preset 默认$/ })
+      .closest(".catalog-row") as HTMLElement;
+    expect(within(own).getByRole("button", { name: "Rename" })).toBeEnabled();
+  });
+
+  it("saves an edited built-in preset as a new preset, never in place", async () => {
+    const seed = createSeedDocument();
+    seed.globalSettings.conversationPresets.unshift({
+      ...seed.globalSettings.conversationPresets[0],
+      id: BUILTIN_PRESET_ID,
+      name: "mework",
+      templateId: "template_preset_mework"
+    });
+    const onSavePreset = vi.fn();
+    const onSavePresetCopy = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+        onSavePreset={onSavePreset}
+        onSavePresetCopy={onSavePresetCopy}
+      />
+    );
+
+    await openPage(user, /^对话预设/);
+    await user.click(screen.getByRole("button", { name: "打开预设 mework" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(/内置预设随 Mework 版本更新/)).toBeInTheDocument();
+    const nestedNav = within(dialog).getByRole("navigation", { name: "对话设置分类" });
+    expect(within(nestedNav).queryByRole("button", { name: "保存预设" })).toBeNull();
+    await user.click(within(nestedNav).getByRole("button", { name: "另存为新预设" }));
+    expect(onSavePresetCopy).toHaveBeenCalledWith(BUILTIN_PRESET_ID, expect.objectContaining({
+      enabledTools: seed.globalSettings.conversationPresets[0].settings.enabledTools
+    }));
+    expect(onSavePreset).not.toHaveBeenCalled();
   });
 
   it("is a pane, not a dialog, and offers no preset-managed or conversation-only zone", () => {
@@ -389,10 +435,13 @@ describe("ConversationSettings", () => {
 
   it("counts only catalog tools, links the docs, and exposes group expansion state", async () => {
     const seed = createSeedDocument();
-    // Memory tools derive from memory-tier switches and are excluded from the count.
+    // Memory tools derive from memory-tier switches and are excluded from the
+    // count, as are the preview lifecycle tools, which follow the other preview tools.
     const toolNames = Array.from(new Set(
       seed.tools
-        .filter((tool) => tool.category !== "memory" && !isHostDerivedToolName(tool.name))
+        .filter((tool) => tool.category !== "memory"
+          && !isHostDerivedToolName(tool.name)
+          && !isPreviewLifecycleToolName(tool.name))
         .map((tool) => tool.name)
     ));
     const conversation = {
@@ -459,7 +508,7 @@ describe("ConversationSettings", () => {
     // a role query would stay green no matter what the picker drew. The positive
     // half is what keeps that true: if picker rows ever stop carrying the
     // attribute, this goes red instead of the guard quietly becoming a no-op.
-    expect(document.querySelector('[data-tool-name="files"]')).not.toBeNull();
+    expect(document.querySelector('[data-tool-name="read"]')).not.toBeNull();
     expect(document.querySelector('[data-tool-name="read_global_memory"]')).toBeNull();
     // The credential channels are gone, not merely off by default.
     expect(screen.queryByText("允许联网搜索使用我的登录凭证")).toBeNull();
@@ -738,11 +787,11 @@ describe("ConversationSettings", () => {
     // shows what it found and never offers a place to author entries.
     const section = picker.closest("section") as HTMLElement;
     expect(within(section).queryByRole("textbox")).toBeNull();
-    // The conversation selects nothing, which the host renders with the English
+    // The conversation selects nothing, which the host renders with the
     // built-in; the picker says so instead of showing an empty selection.
     expect(picker).toHaveValue("tooldesc_builtin_en_us");
-    expect(within(picker).getByRole("option", { name: "Mework 内置（英文）" })).toBeInTheDocument();
-    expect(within(picker).getByRole("option", { name: "Mework 内置（中文）" })).toBeInTheDocument();
+    expect(within(picker).getByRole("option", { name: "Mework 内置" })).toBeInTheDocument();
+    expect(within(picker).getAllByRole("option")).toHaveLength(2);
 
     await user.selectOptions(picker, "tooldesc_user_main_0f0f0f0f");
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -767,7 +816,7 @@ describe("ConversationSettings", () => {
     // `data-tool-name` whose accessible name is "{label}已启用/已关闭" — neither a
     // switch nor the bare name — so only the attribute can catch a regression.
     expect(seed.tools.some((tool) => tool.name === "skill")).toBe(true);
-    expect(document.querySelector('[data-tool-name="files"]')).not.toBeNull();
+    expect(document.querySelector('[data-tool-name="read"]')).not.toBeNull();
     expect(document.querySelector('[data-tool-name="skill"]')).toBeNull();
     expect(screen.queryByRole("button", { name: "长期记忆" })).toBeNull();
   });
@@ -1379,8 +1428,8 @@ describe("ConversationSettings", () => {
   it("renames a saved preset in the row itself, committing when the field is left", async () => {
     const user = userEvent.setup();
     const seed = createSeedDocument();
-    // A saved preset, not the implicit built-in: only a row on disk offers the
-    // rename and delete actions, which the built-in draws disabled.
+    // A preset of the user's own: only those offer the rename and delete
+    // actions, which the built-in draws disabled.
     seed.globalSettings.conversationPresets.push({
       ...seed.globalSettings.conversationPresets[0],
       id: "conversation_team",

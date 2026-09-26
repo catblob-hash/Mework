@@ -138,7 +138,7 @@ function ToolApprovalDockContent({
             it has no risk level to report. */}
         {!planExit && (
           <span className="tool-approval-dock__risk">
-            {t("风险 {level}", "Risk {level}", { level: pending.riskLevel })}
+            {t("风险 {level}", "{level} risk", { level: pending.riskLevel })}
           </span>
         )}
       </header>

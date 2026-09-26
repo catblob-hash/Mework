@@ -326,8 +326,9 @@ pub struct McpServerConfig {
 pub struct PresetLibrary {
     #[serde(default)]
     pub conversation_presets: Vec<ConversationPreset>,
-    /// New conversations link to this preset; empty when the implicit blank
-    /// default is active.
+    /// New conversations link to this preset. Never empty in a real document:
+    /// the built-in preset is always there, and storage re-points a default
+    /// that no longer resolves at it.
     #[serde(default)]
     pub default_conversation_preset_id: String,
 }
@@ -340,14 +341,14 @@ pub struct GlobalSettings {
     pub app_language: AppLanguage,
     /// What `app_language` currently resolves to, mirrored here by the renderer.
     ///
-    /// This resolved value determines both host-rendered UI text (hook descriptors)
-    /// and the language a *user-written* prompt profile is treated as being in:
-    /// such a file declares none of its own, and the built-in that fills the keys it
-    /// omits follows from this. Selecting one of the two built-in profiles — or
-    /// selecting nothing, which is the English built-in — pins the language to
-    /// that profile instead. Only the renderer can resolve `auto` — the host
-    /// links no OS-locale crate — so it writes the resolved value here and the
-    /// backend reads this field rather than re-deriving it.
+    /// This resolved value determines host-rendered UI text (language-server
+    /// descriptors) and the language a *user-written* prompt profile carries: such
+    /// a file declares none of its own, so its tool labels and fork bindings follow
+    /// this, while the keys it omits keep the built-in English wording. Selecting
+    /// the built-in profile — or selecting nothing, which is the same thing — pins
+    /// the language to English instead. Only the renderer can resolve `auto` —
+    /// the host links no OS-locale crate — so it writes the resolved value here
+    /// and the backend reads this field rather than re-deriving it.
     #[serde(default)]
     pub resolved_app_language: ResolvedLanguage,
     /// Missing values belong to records that predate this field and retain the old day theme.
@@ -446,6 +447,34 @@ pub struct AppearancePreferences {
     pub single_dollar_math: bool,
     #[serde(default)]
     pub custom_css: String,
+    /// The fourth theme choice: the user's picture behind glass panes. The light or
+    /// dark look of the glass still comes from `GlobalSettings::theme`.
+    #[serde(default)]
+    pub custom_background: bool,
+    /// Id of the imported picture in `background_images`; empty before one is picked.
+    /// Kept when `custom_background` is turned off so turning it back on needs no re-pick.
+    #[serde(default)]
+    pub background_image: String,
+    /// The local helper model's uses and prompts (Appearance → Local model).
+    #[serde(default)]
+    pub local_model: LocalModelPreferences,
+}
+
+/// What the local helper model is used for, and its system prompts. Empty
+/// prompts mean the built-in ones in the app language.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalModelPreferences {
+    /// Name conversations from their first message.
+    #[serde(default)]
+    pub titles: bool,
+    /// Describe each shell command in one line on its card.
+    #[serde(default)]
+    pub shell_explanations: bool,
+    #[serde(default)]
+    pub title_prompt: String,
+    #[serde(default)]
+    pub shell_prompt: String,
 }
 
 fn default_zoom() -> f64 {
@@ -484,6 +513,9 @@ impl Default for AppearancePreferences {
             code_block_wrappable: false,
             single_dollar_math: true,
             custom_css: String::new(),
+            custom_background: false,
+            background_image: String::new(),
+            local_model: LocalModelPreferences::default(),
         }
     }
 }
@@ -2600,6 +2632,16 @@ pub struct UserAbortedTaskRecord {
     pub reason: String,
 }
 
+/// Which conversation a timeline fork was taken from, and which of its forks it
+/// is. Forks of a fork name the same origin, so one conversation's forks share
+/// one numbering.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationForkOrigin {
+    pub conversation_id: String,
+    pub number: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
@@ -2647,6 +2689,13 @@ pub struct Conversation {
     /// wholesale by presets and workspace snapshots.
     #[serde(default)]
     pub parent_conversation_id: Option<String>,
+    /// Set on a conversation forked from the timeline's context menu while its
+    /// title is still the one named after its origin; the renderer names and
+    /// renames it (`lib/conversationForks.ts`) and clears this when the user
+    /// renames the fork. A trace like `preset_id`: it may dangle once the origin
+    /// is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<ConversationForkOrigin>,
     /// Conversation preset most recently applied. Empty means an unnamed draft.
     /// A trace, not a link: it is never validated against the catalog, never
     /// disables a field, and may dangle after its preset is deleted.
@@ -2918,19 +2967,6 @@ pub struct ConversationSettings {
     /// purpose.
     #[serde(default)]
     pub mcp_tool_discovery_enabled: bool,
-    /// The rows each tool family (`files`, `shell`, `preview`) had on when the
-    /// family was switched off as a whole, keyed by family, so switching it
-    /// back on returns to them.
-    ///
-    /// Renderer state: a family that is off grants nothing, so the host never
-    /// reads it, and the field exists here so a settings round trip through
-    /// the store does not drop it.
-    #[serde(
-        default,
-        deserialize_with = "lenient_remembered_tool_families",
-        skip_serializing_if = "BTreeMap::is_empty"
-    )]
-    pub remembered_tool_families: BTreeMap<String, Vec<String>>,
     /// Whether this conversation's commands run in the operating system's
     /// sandbox, and what it lets through. One cell per conversation and machine
     /// ([`crate::workspace_set::WorkspaceSet::sandboxed`]), so a conversation's
@@ -3022,29 +3058,6 @@ pub struct ConversationToolLock {
     /// The backend that has fetched pages for this conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_provider: Option<FetchProviderSelection>,
-}
-
-/// Keeps each family's row names out of whatever a newer or damaged renderer
-/// wrote, instead of refusing the whole document over one malformed entry.
-fn lenient_remembered_tool_families<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, Vec<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let values = Option::<BTreeMap<String, Value>>::deserialize(deserializer)?;
-    Ok(values
-        .into_iter()
-        .flatten()
-        .filter_map(|(family, rows)| {
-            let rows: Vec<String> = rows
-                .as_array()?
-                .iter()
-                .filter_map(|row| row.as_str().map(str::to_owned))
-                .collect();
-            (!rows.is_empty()).then_some((family, rows))
-        })
-        .collect())
 }
 
 /// Hand-written so a lock pinned by a build that still had the `auto` fetch
@@ -6196,33 +6209,18 @@ mod tests {
     }
 
     #[test]
-    fn remembered_tool_families_round_trip_and_drop_unreadable_entries() {
+    fn settings_from_the_tool_family_picker_load_and_drop_its_remembered_rows() {
+        // The picker no longer gathers tools into families, so the rows it kept
+        // for a switched-off family are read past and not written back.
         let settings: ConversationSettings = serde_json::from_value(json!({
             "enabledTools": [],
-            "rememberedToolFamilies": {
-                "preview": ["preview_start", 7, "preview_click"],
-                "shell": "bash",
-                "files": []
-            }
+            "rememberedToolFamilies": { "preview": ["preview_start", "preview_click"] }
         }))
         .expect("settings with remembered families");
-        assert_eq!(
-            settings.remembered_tool_families,
-            BTreeMap::from([(
-                "preview".to_owned(),
-                vec!["preview_start".to_owned(), "preview_click".to_owned()]
-            )])
-        );
-        assert_eq!(
-            serde_json::to_value(&settings).unwrap()["rememberedToolFamilies"],
-            json!({ "preview": ["preview_start", "preview_click"] })
-        );
-        let empty: ConversationSettings =
-            serde_json::from_value(json!({ "enabledTools": [] })).unwrap();
-        let serialized = serde_json::to_value(&empty).unwrap();
+        let serialized = serde_json::to_value(&settings).unwrap();
         assert!(serialized.get("rememberedToolFamilies").is_none());
         // An unstated sandbox is the default one, and is not written out.
         assert!(serialized.get("sandbox").is_none());
-        assert_eq!(empty.sandbox, SandboxSettings::default());
+        assert_eq!(settings.sandbox, SandboxSettings::default());
     }
 }

@@ -75,6 +75,27 @@ function mcpDescriptor(label: string, name = MCP_WIRE_NAME): ToolDescriptor {
   return { name, label, description: "", category: "mcp", dangerous: false, parameters: [] };
 }
 
+describe("shell command explanations", () => {
+  const en = (zh: string, en: string, params?: Record<string, string | number>) => translate("en-US", zh, en, params);
+  const zh = (zh: string, en: string, params?: Record<string, string | number>) => translate("zh-CN", zh, en, params);
+
+  it("replaces a shell card's title with the shell and the explanation", () => {
+    const item = tool("bash", { command: "ls -la" }, "total 0");
+    expect(getToolPresentation(item, undefined, en, "List directory contents").title).toBe("Bash: List directory contents");
+    expect(getToolPresentation(item, undefined, zh, "列出文件详细信息").title).toBe("Bash：列出文件详细信息");
+    expect(getToolPresentation(tool("powershell", { command: "Get-Process" }, ""), undefined, en, "List processes").title)
+      .toBe("PowerShell: List processes");
+  });
+
+  it("keeps the original title without an explanation, and marks failures", () => {
+    const item = tool("zsh", { command: "false" }, "", { success: false });
+    expect(getToolPresentation(item, undefined, en).title).toBe("zsh command failed");
+    expect(getToolPresentation(item, undefined, en, "Run false").title).toBe("zsh: Run false (failed)");
+    // Only shell tools take one.
+    expect(getToolPresentation(tool("read", { path: "a.txt" }, "x"), undefined, en, "ignored").title).toBe("Read file");
+  });
+});
+
 describe("tool view registry", () => {
   it("shows actual thumbnails for image-producing read results", async () => {
     const image = await previewPixel("diagram.png");

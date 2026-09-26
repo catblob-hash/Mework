@@ -27,6 +27,7 @@ import {
   requestBrowserDevStop
 } from "./browser-dev-coordinator.mjs";
 import { chooseDevServerPorts, parsePort } from "./dev-server-port.mjs";
+import { autoPruneCargoTarget } from "./prune-cargo-target.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { client, stopOnly } = parseBrowserDevArguments(process.argv.slice(2));
@@ -540,6 +541,9 @@ function startRustBackend() {
   });
 }
 
+autoPruneCargoTarget(
+  path.resolve(rustEnvironment.CARGO_TARGET_DIR || path.join(root, "src-tauri", "target"))
+);
 startRustBackend();
 
 if (browserDevCoordination.shared) {

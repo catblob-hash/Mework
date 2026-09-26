@@ -234,6 +234,41 @@ describe("StreamWaitingIndicator", () => {
     expect(container.querySelector("[data-stream-waiting]")).not.toHaveAttribute("data-stream-thinking");
   });
 
+  it("narrates the tasks still running as a line that opens the tasks pane", () => {
+    const onOpenTasks = vi.fn();
+    const { container, getByRole } = render(
+      <StreamWaitingIndicator
+        contexts={[]}
+        tools={[]}
+        thinking={{ startedAt: "2026-09-04T00:00:00.000Z" }}
+        runningTaskCount={2}
+        onOpenTasks={onOpenTasks}
+      />
+    );
+
+    const link = getByRole("button", { name: "2 个任务正在运行" });
+    // Below what the round is doing, not instead of it.
+    expect(container.querySelector(".stream-waiting__activities")!.lastElementChild).toBe(link);
+    expect(container.querySelector(".stream-waiting__activity-title")).toHaveTextContent("正在思考");
+    expect(container.querySelector("[data-stream-waiting]")).toHaveAttribute("aria-label", "正在思考；2 个任务正在运行");
+    act(() => link.click());
+    expect(onOpenTasks).toHaveBeenCalledTimes(1);
+  });
+
+  it("draws the task line with nothing else to say, and none without a pane to open", () => {
+    const { container, getByRole, rerender } = render(
+      <StreamWaitingIndicator contexts={[]} tools={[]} runningTaskCount={1} onOpenTasks={() => {}} />
+    );
+
+    expect(getByRole("button", { name: "1 个任务正在运行" })).toBeInTheDocument();
+    expect(container.querySelector("[data-stream-waiting]")).toHaveAttribute("aria-label", "模型正在生成；1 个任务正在运行");
+
+    rerender(<StreamWaitingIndicator contexts={[]} tools={[]} runningTaskCount={1} />);
+    expect(container.querySelector(".stream-waiting__tasks")).toBeNull();
+    rerender(<StreamWaitingIndicator contexts={[]} tools={[]} runningTaskCount={0} onOpenTasks={() => {}} />);
+    expect(container.querySelector(".stream-waiting__tasks")).toBeNull();
+  });
+
   it("starts the round at work, and names its mood on the drawing", () => {
     const { container } = render(<StreamWaitingIndicator contexts={[]} tools={[]} />);
 

@@ -15,6 +15,7 @@ import logoSvg from "../logo.svg?raw";
 import iconSvg from "../mework-icon.svg?raw";
 import smallIconSvg from "../mework-icon-small.svg?raw";
 import markSvg from "../mework-mark.svg?raw";
+import terminalCss from "../styles/terminal.css?raw";
 
 /** The box a `translate(x y) scale(s)` puts the 120 × 200 mark in. */
 function markBox(transform: string) {
@@ -31,6 +32,12 @@ describe("brand assets", () => {
     for (const svg of [markSvg, logoSvg, iconSvg, smallIconSvg]) {
       expect(svg).toContain(`d="${MARK_PATH}"`);
     }
+  });
+
+  it("draws the terminal cursor from the one mark", () => {
+    // The stylesheet's masks are data URIs: the filled mark and its hollow twin, which draws
+    // the path twice (clip and stroke).
+    expect(terminalCss.split(`d='${MARK_PATH}'`)).toHaveLength(4);
   });
 
   it("lays out the lockup and the icons as the in-app copies do", () => {

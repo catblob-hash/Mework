@@ -721,7 +721,7 @@
       "placeholders": []
     },
     {
-      "description": "Heading of the status roll-up that ends a `task_wait` result. The renderer recognizes the built-in English and Chinese headings.",
+      "description": "Heading of the status roll-up that ends a `task_wait` result. The renderer recognizes the built-in English heading, and the Chinese one in transcripts older builds wrote.",
       "id": "task.wait_status_heading",
       "placeholders": []
     },

@@ -120,14 +120,14 @@ pub(super) fn run() -> i32 {
                 app.state::<AppState>()
                     .install_attestation_key(app_data)
                     .map_err(std::io::Error::other)?;
-                if let Err(error) =
-                    super::prompt_profile_files::materialize_builtin_profiles(app_data)
-                {
-                    eprintln!("内置提示词档案未能落盘：{error}");
-                }
                 // Remote workspaces go through the same agents as in the desktop
                 // app, rather than one SSH login per command.
                 super::install_machine_links(app.handle(), app_data);
+            }
+            if let Ok(local_data) = app.path().app_local_data_dir() {
+                app.state::<AppState>()
+                    .helper_model
+                    .initialize(super::helper_model::root_dir(&local_data));
             }
             super::install_background_write_failure_reporting(app.state::<AppState>().inner());
             app.state::<AppState>()
@@ -765,6 +765,44 @@ async fn dispatch(
         "cancel_app_update_download" => {
             result_value(super::cancel_app_update_download(app.state::<AppState>()))
         }
+        "local_model_status" => result_value(Ok(super::local_model_status(app.state::<AppState>()))),
+        "local_model_install" => {
+            result_value(super::local_model_install(
+                app.clone(),
+                app.state::<AppState>(),
+                arg(args, "variant")?,
+                arg(args, "chinaMirror")?,
+            ))
+        }
+        "local_model_activate" => {
+            result_value(super::local_model_activate(app.clone(), app.state::<AppState>(), arg(args, "variant")?))
+        }
+        "local_model_cancel_install" => {
+            result_value(Ok(super::local_model_cancel_install(app.state::<AppState>())))
+        }
+        "local_model_remove" => {
+            result_value(super::local_model_remove(app.state::<AppState>(), arg(args, "variant")?).await)
+        }
+        "local_model_prompt_info" => result_value(
+            super::local_model_prompt_info(
+                app.clone(),
+                app.state::<AppState>(),
+                arg(args, "task")?,
+                optional_arg(args, "prompt")?,
+            )
+            .await,
+        ),
+        "local_model_default_prompts" => {
+            result_value(super::local_model_default_prompts(app.clone(), app.state::<AppState>()))
+        }
+        "settle_conversation_title" => result_value(super::settle_conversation_title(
+            app.clone(),
+            app.state::<AppState>(),
+            arg(args, "conversationId")?,
+        )),
+        "get_tool_explanations" => {
+            result_value(super::get_tool_explanations(app.clone(), arg(args, "conversationId")?))
+        }
         "install_app_update" => result_value(
             super::install_app_update(app.clone(), app.state::<AppState>(), arg(args, "path")?)
                 .await,
@@ -997,6 +1035,26 @@ async fn dispatch(
             app.clone(),
             arg(args, "imageId")?,
         )),
+        "background_image_put" => result_value(
+            super::background_image_put(
+                app.clone(),
+                optional_arg(args, "uploadId")?,
+                arg(args, "data")?,
+            )
+            .await,
+        ),
+        "background_image_commit" => result_value(
+            super::background_image_commit(app.clone(), arg(args, "uploadId")?).await,
+        ),
+        "background_image_data" => result_value(
+            super::background_image_data(
+                app.clone(),
+                arg(args, "imageId")?,
+                arg(args, "width")?,
+                arg(args, "height")?,
+            )
+            .await,
+        ),
         "file_attachment_upload" => result_value(
             super::file_attachment_upload(
                 app.clone(),

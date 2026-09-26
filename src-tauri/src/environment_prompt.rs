@@ -564,10 +564,27 @@ mod tests {
     }
 
     #[test]
-    fn the_chinese_profile_reports_the_same_facts() {
-        let profile = PromptProfile::builtin_chinese();
+    fn a_reworded_profile_reports_the_same_facts() {
+        let profile = PromptProfile::from_file(
+            "test".into(),
+            "Test".into(),
+            ResolvedLanguage::ZhCn,
+            [
+                (
+                    PromptKey::SystemEnvironmentSection,
+                    "# 环境\n你被调用时所处的环境如下：\n{facts}".to_owned(),
+                ),
+                (
+                    PromptKey::SystemEnvironmentWorkingDirectory,
+                    "主工作目录：{path}".to_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            Vec::new(),
+        );
         let section = environment_section(&profile, &facts());
-        assert!(section.contains("C:/work/app"), "{section}");
+        assert!(section.contains("主工作目录：C:/work/app"), "{section}");
         assert!(section.contains("Windows 10.0.26100"), "{section}");
         assert!(section.contains("2026-01-02"), "{section}");
         assert_eq!(section.lines().count(), 7, "{section}");

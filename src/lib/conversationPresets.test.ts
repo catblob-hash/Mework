@@ -9,10 +9,10 @@ import {
   conversationPresetById,
   defaultConversationPreset,
   emptyConversationPresetSettings,
-  implicitConversationPreset,
-  IMPLICIT_CONVERSATION_PRESET_ID,
+  isBuiltinConversationPreset,
   sameConversationPresetSettings
 } from "./conversationPresets";
+import { BUILTIN_PRESET_ID } from "../seed";
 
 /** Reusable preset fields after flattening. */
 const PRESET_FIELDS = [
@@ -71,29 +71,24 @@ describe("conversation presets", () => {
     expect(defaultConversationPreset(document.globalSettings)?.id).toBe(second.id);
   });
 
-  it("enables every backend's shell tool in the implicit preset", () => {
+  it("falls back to the first preset, and to none when there is none", () => {
     const document = createSeedDocument();
-    // Memory and web tools derive from their conversation switches, not the list.
-    const defaultTools = document.tools
-      .filter((tool) => tool.category === "filesystem")
-      .map((tool) => tool.name);
-    expect(defaultTools).not.toContain("preview_start");
-    // Turning the switch on is what grants the web tools.
-    expect(implicitConversationPreset(document.tools).settings.webSearchEnabled).toBe(true);
-
-    // Every backend's command tool is on — a conversation offers only the ones
-    // its machines have — and the default set does not depend on the UI language.
-    const shellTools = document.tools
-      .filter((tool) => ["bash", "zsh", "sh", "powershell"].includes(tool.name))
-      .map((tool) => tool.name);
-    expect([...shellTools].sort()).toEqual(["bash", "powershell", "sh", "zsh"]);
-    expect(implicitConversationPreset(document.tools, "zh-CN").settings.enabledTools)
-      .toEqual([...defaultTools, ...shellTools]);
-    expect(implicitConversationPreset(document.tools, "en-US").settings.enabledTools)
-      .toEqual(implicitConversationPreset(document.tools, "zh-CN").settings.enabledTools);
+    document.globalSettings.defaultConversationPresetId = "preset-gone";
+    expect(defaultConversationPreset(document.globalSettings)?.id)
+      .toBe(document.globalSettings.conversationPresets[0].id);
+    // The host keeps the built-in preset in every document, so an empty list
+    // only answers a document that never went through it: nothing to apply.
+    document.globalSettings.conversationPresets = [];
+    expect(defaultConversationPreset(document.globalSettings)).toBeNull();
   });
 
-  it("keeps the empty and implicit preset shapes flat", () => {
+  it("recognizes the built-in preset by its id alone", () => {
+    expect(isBuiltinConversationPreset(BUILTIN_PRESET_ID)).toBe(true);
+    expect(isBuiltinConversationPreset("preset_codex")).toBe(false);
+    expect(isBuiltinConversationPreset("")).toBe(false);
+  });
+
+  it("keeps the empty preset shape flat", () => {
     expect(emptyConversationPresetSettings()).toEqual({
       enabledTools: [],
       toolDescriptionFileId: null,
@@ -110,8 +105,7 @@ describe("conversation presets", () => {
       skillToolEnabled: false,
       mcpToolDiscoveryEnabled: false
     });
-    expect(Object.keys(implicitConversationPreset(createSeedDocument().tools).settings).sort())
-      .toEqual(PRESET_FIELDS);
+    expect(Object.keys(emptyConversationPresetSettings()).sort()).toEqual(PRESET_FIELDS);
   });
 
   it("captures the reusable subset from one settings argument", () => {
@@ -312,7 +306,7 @@ describe("conversation presets", () => {
     expect(cloned.hookIds).not.toBe(snapshot.hookIds);
   });
 
-  it("resolves a preset id leniently, including the reserved built-in one", () => {
+  it("resolves a preset id leniently", () => {
     const document = createSeedDocument();
     document.globalSettings.conversationPresets = [
       {
@@ -328,11 +322,6 @@ describe("conversation presets", () => {
     // Missing and empty IDs resolve to no preset rather than throwing or falling back.
     expect(conversationPresetById(document.globalSettings, "preset-gone")).toBeNull();
     expect(conversationPresetById(document.globalSettings, "")).toBeNull();
-    expect(conversationPresetById(
-      document.globalSettings,
-      IMPLICIT_CONVERSATION_PRESET_ID,
-      document.tools
-    )?.id).toBe(IMPLICIT_CONVERSATION_PRESET_ID);
   });
 
   it("treats reordered tool and resource lists as the same preset body", () => {

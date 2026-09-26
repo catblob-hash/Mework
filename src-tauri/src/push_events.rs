@@ -197,6 +197,26 @@ pub enum AppPushEvent {
         conversation_id: String,
         plan: Option<crate::model::ConversationPlan>,
     },
+    /// The host wrote a conversation's title: the chosen message as a
+    /// placeholder, then the local helper model's title (`settled`).
+    #[serde(rename_all = "camelCase")]
+    ConversationTitleChanged {
+        conversation_id: String,
+        title: String,
+        settled: bool,
+    },
+    /// The local helper model described a shell command. `context_id` is the
+    /// tool card's id (which may not be saved yet); `call_id` the provider's.
+    #[serde(rename_all = "camelCase")]
+    ToolExplained {
+        conversation_id: String,
+        context_id: String,
+        call_id: String,
+        text: String,
+    },
+    /// The local helper model's install or runtime status changed
+    /// (`helper_model::Status`).
+    LocalModelChanged { status: serde_json::Value },
 }
 
 impl AppPushEvent {
@@ -222,6 +242,12 @@ impl AppPushEvent {
             }
             | AppPushEvent::ConversationPlanUpdated {
                 conversation_id, ..
+            }
+            | AppPushEvent::ConversationTitleChanged {
+                conversation_id, ..
+            }
+            | AppPushEvent::ToolExplained {
+                conversation_id, ..
             } => Some(conversation_id),
             AppPushEvent::ForkRequested { request } => Some(&request.source_conversation_id),
             AppPushEvent::ForkResolved {
@@ -233,7 +259,8 @@ impl AppPushEvent {
             | AppPushEvent::PreviewServersChanged { .. }
             | AppPushEvent::RemoteLinkChanged { .. }
             | AppPushEvent::MachineShellsChanged { .. }
-            | AppPushEvent::ToolContextsQuarantined { .. } => None,
+            | AppPushEvent::ToolContextsQuarantined { .. }
+            | AppPushEvent::LocalModelChanged { .. } => None,
         }
     }
 }

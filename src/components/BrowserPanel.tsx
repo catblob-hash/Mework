@@ -41,6 +41,7 @@ import type { GitTarget } from "../lib/git";
 import type { SidePaneId } from "../lib/sidePanes";
 import { previewServerAddress, type PreviewTarget } from "../lib/preview";
 import { IconButton } from "./Common";
+import { dataUrlBytes } from "./FilePreview/format";
 import { SidePane, type SidePaneBounds } from "./SidePane";
 import { SketchOverlay } from "./Sketch";
 import {
@@ -125,11 +126,13 @@ export function splitBrowserAddress(url: string): { host: string; path: string }
   }
 }
 
-/** The annotated composite as a composer attachment; the send pipeline only takes files. */
-async function annotationImageFile(dataUrl: string): Promise<File> {
-  const response = await fetch(dataUrl);
-  const blob = await response.blob();
-  return new File([blob], "page-annotation.png", { type: "image/png" });
+/**
+ * The annotated composite as a composer attachment; the send pipeline only takes files.
+ * Decoded in place: `fetch` of a `data:` URL is a connection, and the renderer CSP's
+ * `connect-src` has only IPC (WebKit rejects it as "Load failed").
+ */
+function annotationImageFile(dataUrl: string): File {
+  return new File([dataUrlBytes(dataUrl)], "page-annotation.png", { type: "image/png" });
 }
 
 type EmbeddedUiTheme = "day" | "night";
@@ -817,7 +820,7 @@ function BackendBrowserPanel({
     setAnnotateBackdrop(null);
     if (!onAttachImage) return;
     try {
-      await onAttachImage(await annotationImageFile(dataUrl));
+      await onAttachImage(annotationImageFile(dataUrl));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }

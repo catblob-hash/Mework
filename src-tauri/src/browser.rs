@@ -174,6 +174,9 @@ const BROWSING_DATA_CLEAR_TIMEOUT: Duration = Duration::from_secs(45);
 const BROWSER_SLEEP_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 const BROWSER_DESTROY_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_DESTROY_POLL: Duration = Duration::from_millis(10);
+/// How long an open polls for a reservation another caller holds outside the session lock. The
+/// page creation itself is waited out on that lock, not counted against this.
+const BROWSER_PAGE_CREATION_WAIT: Duration = Duration::from_secs(2);
 /// A cold-close snapshot is deliberately bounded even though Chromium also enforces per-cookie
 /// limits. Values stay in process memory only and are never persisted by Mework.
 const MAX_COLD_CLOSE_COOKIE_COUNT: usize = 4_096;
@@ -2301,6 +2304,7 @@ impl BrowserRuntime {
                 return Err(error);
             }
         }
+        self.await_page_creation_locked(session_id, &session);
         let _reservation = self.reserve_live_slot_locked(session_id, &session)?;
         let (previous_id, previous) = {
             let state = lock_unpoison(&self.state);
@@ -3182,6 +3186,27 @@ impl BrowserRuntime {
 
     fn touch_session(&self, session_id: &str) {
         touch_manager_state(&mut lock_unpoison(&self.state), session_id);
+    }
+
+    /// Lets an open queue behind a page someone else is creating or restoring for this session,
+    /// instead of being refused by their reservation. `preview_start` and the Agent's tools
+    /// reserve the slot under the manager lock but create the page under the session's own
+    /// lifecycle lock only, so a user opening the pane meanwhile was turned away and the pane
+    /// stayed open with nothing in it. Waiting here keeps the established manager-then-session
+    /// lock order (see `suspend`). The poll only covers the moments either side of the creation
+    /// holding the session lock; the creation itself is waited out on the lock.
+    fn await_page_creation_locked(&self, session_id: &str, session: &BrowserSession) {
+        let deadline = Instant::now() + BROWSER_PAGE_CREATION_WAIT;
+        loop {
+            drop(session.lock_lifecycle());
+            let reserved = lock_unpoison(&self.state)
+                .live_reservations
+                .contains(session_id);
+            if !reserved || session.status().has_page || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn reserve_live_slot_locked(
@@ -7874,7 +7899,9 @@ return {
     /// Runs `capture` with the page guaranteed to be compositing frames. WebView2 can indefinitely
     /// defer `Page.captureScreenshot` while its controller or parent window is invisible, so a
     /// task-space page the user never opened is rendered offscreen without being focused, then
-    /// restored to its exact hidden geometry.
+    /// put back where a page out of the user's sight lives: parked, not hidden (see
+    /// `AttestedPage::park`). Hiding it stopped Chromium acknowledging input, so the Agent's next
+    /// `preview_click` after a screenshot waited out the CDP timeout.
     #[cfg(any(windows, target_os = "macos"))]
     fn with_composited_surface<T>(
         &self,
@@ -7891,7 +7918,6 @@ return {
             .then(|| window.outer_position().ok())
             .flatten();
         let restore_hidden_surface = || {
-            let _ = page.hide();
             if let Some(position) = original_page_position {
                 let _ = page.set_position(position);
             }
@@ -7900,6 +7926,16 @@ return {
                 if let Some(position) = original_window_position {
                     let _ = window.set_position(position);
                 }
+            }
+            // Without a host there is nowhere to park; a page that cannot be parked is at least
+            // kept from showing over the renderer.
+            let parked = host.is_some()
+                && self
+                    .app_handle()
+                    .and_then(|app| self.park_attested_page(&app))
+                    .is_ok();
+            if !parked {
+                let _ = page.hide();
             }
         };
 
@@ -14069,6 +14105,52 @@ mod tests {
         let status = session.lock_state().status.clone();
         assert!(!status.has_page);
         assert!(!status.open);
+    }
+
+    /// `preview_start` reserves the slot, then creates the page under the session's own lock.
+    /// An open landing in between — before that lock is taken, or while it is held — waits for
+    /// the page instead of being refused with "being created or restored".
+    #[test]
+    fn an_open_waits_for_a_page_another_caller_is_creating() {
+        let runtime = BrowserRuntime::default();
+        let session = runtime
+            .session("preview-starting")
+            .expect("test session should be created");
+        // No native page exists in a unit test; the recorded status stands in for it.
+        session.lock_state().synthetic_surface = true;
+        lock_unpoison(&runtime.state)
+            .live_reservations
+            .insert("preview-starting".into());
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let creator = {
+            let runtime_state = runtime.state.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                // The reservation is already held here, the session lock not yet.
+                std::thread::sleep(Duration::from_millis(40));
+                let lifecycle = session.lock_lifecycle();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(80));
+                session.lock_state().status.has_page = true;
+                drop(lifecycle);
+                std::thread::sleep(Duration::from_millis(20));
+                lock_unpoison(&runtime_state)
+                    .live_reservations
+                    .remove("preview-starting");
+            })
+        };
+
+        let _manager_lifecycle = lock_unpoison(&runtime.lifecycle);
+        runtime.await_page_creation_locked("preview-starting", &session);
+        locked_rx
+            .try_recv()
+            .expect("the open must not return before the creation took the session lock");
+        assert!(session.status().has_page);
+        assert!(runtime
+            .reserve_live_slot_locked("preview-starting", &session)
+            .expect("the created page needs no reservation")
+            .is_none());
+        creator.join().unwrap();
     }
 
     #[test]

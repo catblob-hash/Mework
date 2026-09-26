@@ -37,6 +37,43 @@
   background: transparent;
 }
 
+/* The cursor is the brand mark — the cell with cat's ears that the app icon puts after its
+   prompt — in every terminal in the app. xterm paints its block (unfocused, its outline) on the
+   cell itself; that paint is dropped and the mark drawn behind the glyph, stretched to the cell
+   as the block is. xterm still colors the covered glyph, and the mark blinks on its beat: both
+   animations start with the cursor's span. DECSCUSR's bar and underline stay xterm's own.
+   `MeworkIcon.test.tsx` pins the path to `MARK_PATH`. The hollow mark is the filled one's inner
+   edge, clipped to the shape so the ear notch is no thicker than the sides.
+   xterm's sheet comes later and holds the block color with !important, hence both here. A
+   colored cell loses its own background under the cursor, so the ear notch shows the ground. */
+.xterm .xterm-screen .xterm-rows span.xterm-cursor.xterm-cursor-block,
+.xterm .xterm-screen .xterm-rows span.xterm-cursor.xterm-cursor-outline {
+  position: relative;
+  z-index: 0;
+  background-color: transparent !important;
+  outline: none !important;
+}
+.xterm .xterm-screen .xterm-rows span.xterm-cursor.xterm-cursor-block::before,
+.xterm .xterm-screen .xterm-rows span.xterm-cursor.xterm-cursor-outline::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-color: var(--color-c98a1b);
+  --terminal-cursor-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 200' preserveAspectRatio='none'%3E%3Cpath d='M0 190V12Q0 0 8.5 8.5L45.8 45.8Q50 50 56 50H64Q70 50 74.2 45.8L111.5 8.5Q120 0 120 12V190A10 10 0 0 1 110 200H10A10 10 0 0 1 0 190Z'/%3E%3C/svg%3E");
+  -webkit-mask: var(--terminal-cursor-mark) 0 0 / 100% 100% no-repeat;
+  mask: var(--terminal-cursor-mark) 0 0 / 100% 100% no-repeat;
+}
+.xterm .xterm-screen .xterm-rows span.xterm-cursor.xterm-cursor-outline::before {
+  --terminal-cursor-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 200' preserveAspectRatio='none'%3E%3CclipPath id='m'%3E%3Cpath d='M0 190V12Q0 0 8.5 8.5L45.8 45.8Q50 50 56 50H64Q70 50 74.2 45.8L111.5 8.5Q120 0 120 12V190A10 10 0 0 1 110 200H10A10 10 0 0 1 0 190Z'/%3E%3C/clipPath%3E%3Cpath d='M0 190V12Q0 0 8.5 8.5L45.8 45.8Q50 50 56 50H64Q70 50 74.2 45.8L111.5 8.5Q120 0 120 12V190A10 10 0 0 1 110 200H10A10 10 0 0 1 0 190Z' fill='none' stroke='%23000' stroke-width='2.4' vector-effect='non-scaling-stroke' clip-path='url(%23m)'/%3E%3C/svg%3E");
+}
+.xterm .xterm-screen .xterm-rows.xterm-focus span.xterm-cursor.xterm-cursor-blink.xterm-cursor-block::before {
+  animation: terminal-cursor-blink 1s step-end infinite;
+}
+@keyframes terminal-cursor-blink {
+  50% { opacity: 0; }
+}
+
 /* While connecting or terminating the body dims behind a centered spinner. */
 .terminal-panel__veil {
   position: absolute;

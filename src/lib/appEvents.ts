@@ -9,6 +9,7 @@ import type {
   ContextItem,
   ConversationPlan,
   ForkDecisionRecord,
+  LocalModelStatus,
   MachineShells,
   PendingForkRequest,
   PendingToolPrompt,
@@ -96,7 +97,15 @@ export type AppPushEvent =
   // the conversation without writing back: the host already committed it.
   | { type: "conversationSecurityLevelChanged"; conversationId: string; securityLevel: SecurityLevel }
   // The conversation's plan document was written, approved, sent back, or cleared.
-  | { type: "conversationPlanUpdated"; conversationId: string; plan: ConversationPlan | null };
+  | { type: "conversationPlanUpdated"; conversationId: string; plan: ConversationPlan | null }
+  // The host wrote a conversation's title: the chosen message as a placeholder,
+  // then the local helper model's title (`settled`). Mirrored without writing back.
+  | { type: "conversationTitleChanged"; conversationId: string; title: string; settled: boolean }
+  // The local helper model described a shell command. `contextId` is the tool
+  // card's id (the card may not be saved yet); `callId` the provider's call id.
+  | { type: "toolExplained"; conversationId: string; contextId: string; callId: string; text: string }
+  // The local helper model's install or runtime status changed.
+  | { type: "localModelChanged"; status: LocalModelStatus };
 
 type AppPushEventListener = (event: AppPushEvent) => void;
 

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { RefObject } from "react";
 import type { ContextItem, ToolDescriptor } from "../types";
 import { useI18n } from "../i18n";
 import { formatCompactTokenCount } from "../lib/contextTokens";
+import { subscribeToolExplanations, toolExplanation, toolExplanationVersion } from "../lib/localModel";
 import type { LiveReasoningView } from "../lib/runContexts";
 import { RollingNumber } from "./RollingNumber";
 import {
@@ -220,8 +221,8 @@ function StreamWaitingCat() {
       data-cat-mood={mood}
     >
       <g className="stream-cat" ref={root}>
-        {/* One pixel thick at the size the stylesheet draws the cat, like the composer border it stands in for. */}
-        <rect className="stream-cat-ledge" x={300} y={CAT_LEDGE_Y} width={690} height={13.5} rx={6.75} />
+        {/* One pixel thick at the size the stylesheet draws the cat — 16px of a 610-unit scene. */}
+        <rect className="stream-cat-ledge" x={300} y={CAT_LEDGE_Y} width={690} height={38.125} rx={19.0625} />
         <path className="stream-cat-tail" d={CAT_TAIL} />
         <path className="stream-cat-laptop" transform={CAT_ON_LEDGE} d={CAT_LAPTOP} />
         <g className="stream-cat-figure">
@@ -258,6 +259,12 @@ export interface StreamWaitingIndicatorProps {
   thinking?: LiveReasoningView | null;
   /** Transient "request failed, retrying" hint for the live round. */
   retryNotice?: { attempt: number; maxAttempts: number; message: string } | null;
+  /**
+   * Rows the tasks pane lists as running. Narrated as one more line, which
+   * opens that pane; drawn only when there is a pane to open.
+   */
+  runningTaskCount?: number;
+  onOpenTasks?: () => void;
 }
 
 /** One in-flight call, reduced to the line the indicator narrates it with. */
@@ -283,7 +290,7 @@ function toolActivities(contexts: ContextItem[], tools: ToolDescriptor[], t: Tra
   for (const context of contexts) {
     if (context.kind !== "tool" || !isHoistedToolCall(context)) continue;
     const descriptor = tools.find((candidate) => candidate.name === context.toolName);
-    const presentation = getToolPresentation(context, descriptor, t);
+    const presentation = getToolPresentation(context, descriptor, t, toolExplanation(context.id));
     activities.push({
       id: context.id,
       toolName: context.toolName,
@@ -354,12 +361,26 @@ function ThinkingActivityLine({ thinking, label }: { thinking: LiveReasoningView
 /**
  * Stable end-of-timeline activity surface for a live model round. The cat never
  * changes identity while the run is active; the calls in flight are layered
- * onto it as one line each, for as long as each one lasts.
+ * onto it as one line each, for as long as each one lasts, and the tasks still
+ * running beside the round as one more, which opens the tasks pane.
  */
-export function StreamWaitingIndicator({ contexts, tools, thinking = null, retryNotice = null }: StreamWaitingIndicatorProps) {
+export function StreamWaitingIndicator({
+  contexts,
+  tools,
+  thinking = null,
+  retryNotice = null,
+  runningTaskCount = 0,
+  onOpenTasks
+}: StreamWaitingIndicatorProps) {
   const { t } = useI18n();
+  useSyncExternalStore(subscribeToolExplanations, toolExplanationVersion);
   const activities = toolActivities(contexts, tools, t);
   const thinkingLabel = t("正在思考", "Thinking");
+  const tasksLabel = runningTaskCount > 0 && onOpenTasks
+    ? runningTaskCount === 1
+      ? t("1 个任务正在运行", "1 task running")
+      : t("{count} 个任务正在运行", "{count} tasks running", { count: runningTaskCount })
+    : null;
 
   if (retryNotice) {
     const label = t(
@@ -396,31 +417,37 @@ export function StreamWaitingIndicator({ contexts, tools, thinking = null, retry
     ...(thinking ? [thinkingLabel] : []),
     ...activities.map(activityLabel)
   ];
+  const generatingLabel = t("模型正在生成", "Model is generating");
+  const announced = [
+    ...(narrated.length ? narrated : [generatingLabel]),
+    ...(tasksLabel ? [tasksLabel] : [])
+  ];
 
   return (
     <div
       className={`stream-waiting${narrated.length ? " stream-waiting--tool" : ""}`}
       role="status"
       aria-live="polite"
-      aria-label={
-        narrated.length
-          ? narrated.join(t("；", "; "))
-          : t("模型正在生成", "Model is generating")
-      }
+      aria-label={announced.join(t("；", "; "))}
       data-stream-waiting="true"
       data-stream-thinking={thinking ? "true" : undefined}
       data-pending-tool={activities[activities.length - 1]?.toolName}
     >
       <StreamWaitingCat />
-      {narrated.length ? (
+      {narrated.length || tasksLabel ? (
         <span className="stream-waiting__activities">
           {thinking && <ThinkingActivityLine thinking={thinking} label={thinkingLabel} />}
           {activities.map((activity) => (
             <ToolActivityLine activity={activity} key={activity.id} />
           ))}
+          {tasksLabel && (
+            <button type="button" className="stream-waiting__tasks" onClick={onOpenTasks}>
+              {tasksLabel}
+            </button>
+          )}
         </span>
       ) : (
-        <span className="sr-only">{t("模型正在生成", "Model is generating")}</span>
+        <span className="sr-only">{generatingLabel}</span>
       )}
     </div>
   );

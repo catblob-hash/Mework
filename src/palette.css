@@ -30,7 +30,12 @@
   --color-000000-ap7: rgb(0 0 0 / 7%);
   --color-000000-ap8: rgb(0 0 0 / 8%);
   --color-000000-ap9: rgb(0 0 0 / 9%);
+  --color-060604: #060604;
+  --color-0a0a08: #0a0a08;
+  --color-141410: #141410;
+  --color-1a1a16: #1a1a16;
   --color-1b1b1a: #1b1b1a;
+  --color-1d1d18: #1d1d18;
   --color-1d1d1a-ap7: rgb(29 29 26 / 7%);
   --color-1e1e1c-ap24: rgb(30 30 28 / 24%);
   --color-1e1e1c-ap30: rgb(30 30 28 / 30%);
@@ -38,6 +43,7 @@
   --color-218a62: #218a62;
   --color-242423: #242423;
   --color-246b4e: #246b4e;
+  --color-252520: #252520;
   --color-267f99: #267f99;
   --color-252520-ap18: rgb(37 37 32 / 18%);
   --color-252520-ap9: rgb(37 37 32 / 9%);
@@ -50,6 +56,7 @@
   --color-315eae: #315eae;
   --color-315eae-ap35: rgb(49 94 174 / 35%);
   --color-342e34: #342e34;
+  --color-34342e: #34342e;
   --color-343431: #343431;
   --color-343432: #343432;
   --color-356449: #356449;
@@ -62,7 +69,6 @@
   --color-50504c: #50504c;
   --color-514a51: #514a51;
   --color-555550: #555550;
-  --color-5b5b57: #5b5b57;
   --color-5f5f5a: #5f5f5a;
   --color-5f5f5a-ap10: rgb(95 95 90 / 10%);
   --color-5f5f5a-ap12: rgb(95 95 90 / 12%);
@@ -75,6 +81,7 @@
   --color-6a636a: #6a636a;
   --color-6b6b66: #6b6b66;
   --color-6b6b67: #6b6b67;
+  --color-6d6d67: #6d6d67;
   --color-725c3c: #725c3c;
   --color-776f77: #776f77;
   --color-777771: #777771;
@@ -89,6 +96,7 @@
   --color-92600d: #92600d;
   --color-94948d: #94948d;
   --color-989892: #989892;
+  --color-989894: #989894;
   --color-994040: #994040;
   --color-a0a099: #a0a099;
   --color-a23737: #a23737;
@@ -100,6 +108,7 @@
   --color-ab3030: #ab3030;
   --color-ab7d3c: #ab7d3c;
   --color-aeb9d2: #aeb9d2;
+  --color-b7b7b2: #b7b7b2;
   --color-b8b8b1: #b8b8b1;
   --color-bdbdb6: #bdbdb6;
   --color-c0c0ba: #c0c0ba;
@@ -131,6 +140,7 @@
   --color-e0e0db: #e0e0db;
   --color-e4e4df: #e4e4df;
   --color-e5e5e0: #e5e5e0;
+  --color-e5e5e4: #e5e5e4;
   --color-e7e7e2: #e7e7e2;
   --color-e8e7e8: #e8e7e8;
   --color-e8e8e3: #e8e8e3;
@@ -147,6 +157,10 @@
   --color-efcfcb: #efcfcb;
   --color-efd0cd: #efd0cd;
   --color-efefeb: #efefeb;
+  --color-efefeb-ap66: rgb(239 239 235 / 66%);
+  --color-efefeb-ap74: rgb(239 239 235 / 74%);
+  --color-efefeb-ap80: rgb(239 239 235 / 80%);
+  --color-efefeb-ap86: rgb(239 239 235 / 86%);
   --color-f1f1ee: #f1f1ee;
   --color-f3f3f0: #f3f3f0;
   --color-f6dedb: #f6dedb;
@@ -154,6 +168,8 @@
   --color-f7f7f4: #f7f7f4;
   --color-f7f7f5: #f7f7f5;
   --color-f7f7f5-ap10: rgb(247 247 245 / 10%);
+  --color-f7f7f5-ap78: rgb(247 247 245 / 78%);
+  --color-f7f7f5-ap84: rgb(247 247 245 / 84%);
   --color-f7f7f5-ap92: rgb(247 247 245 / 92%);
   --color-f8f8f6: #f8f8f6;
   --color-fafaf8: #fafaf8;
@@ -168,7 +184,9 @@
   --color-fff9ec: #fff9ec;
   --color-ffffff: #ffffff;
   --color-ffffff-ap10: rgb(255 255 255 / 10%);
+  --color-ffffff-ap28: rgb(255 255 255 / 28%);
   --color-ffffff-ap34: rgb(255 255 255 / 34%);
+  --color-ffffff-ap45: rgb(255 255 255 / 45%);
   --color-ffffff-ap64: rgb(255 255 255 / 64%);
   --color-ffffff-ap98: rgb(255 255 255 / 98%);
 }
@@ -187,7 +205,12 @@
   --color-000000-ap7: rgb(255 255 255 / 7%);
   --color-000000-ap8: rgb(255 255 255 / 8%);
   --color-000000-ap9: rgb(255 255 255 / 9%);
+  --color-060604: #fbfbf9;
+  --color-0a0a08: #f7f7f5;
+  --color-141410: #efefeb;
+  --color-1a1a16: #e9e9e5;
   --color-1b1b1a: #e5e5e4;
+  --color-1d1d18: #e7e7e2;
   --color-1d1d1a-ap7: rgb(229 229 226 / 7%);
   --color-1e1e1c-ap24: rgb(227 227 225 / 24%);
   --color-1e1e1c-ap30: rgb(227 227 225 / 30%);
@@ -195,6 +218,7 @@
   --color-218a62: #75deb6;
   --color-242423: #dcdcdb;
   --color-246b4e: #94dbbe;
+  --color-252520: #dfdfda;
   --color-267f99: #66bfd9;
   --color-252520-ap18: rgb(223 223 218 / 18%);
   --color-252520-ap9: rgb(223 223 218 / 9%);
@@ -207,6 +231,7 @@
   --color-315eae: #517ece;
   --color-315eae-ap35: rgb(81 126 206 / 35%);
   --color-342e34: #d1cbd1;
+  --color-34342e: #d1d1cb;
   --color-343431: #cececb;
   --color-343432: #cdcdcb;
   --color-356449: #9bcaaf;
@@ -219,7 +244,6 @@
   --color-50504c: #b3b3af;
   --color-514a51: #b5aeb5;
   --color-555550: #afafaa;
-  --color-5b5b57: #a8a8a4;
   --color-5f5f5a: #a5a5a0;
   --color-5f5f5a-ap10: rgb(165 165 160 / 10%);
   --color-5f5f5a-ap12: rgb(165 165 160 / 12%);
@@ -232,6 +256,7 @@
   --color-6a636a: #9c959c;
   --color-6b6b66: #999994;
   --color-6b6b67: #989894;
+  --color-6d6d67: #989892;
   --color-725c3c: #c3ad8d;
   --color-776f77: #908890;
   --color-777771: #8e8e88;
@@ -246,6 +271,7 @@
   --color-92600d: #f2c06d;
   --color-94948d: #72726b;
   --color-989892: #6d6d67;
+  --color-989894: #6b6b67;
   --color-994040: #bf6666;
   --color-a0a099: #66665f;
   --color-a23737: #c85d5d;
@@ -257,6 +283,7 @@
   --color-ab3030: #cf5454;
   --color-ab7d3c: #c39554;
   --color-aeb9d2: #2d3851;
+  --color-b7b7b2: #4d4d48;
   --color-b8b8b1: #4e4e47;
   --color-bdbdb6: #494942;
   --color-c0c0ba: #45453f;
@@ -288,6 +315,7 @@
   --color-e0e0db: #24241f;
   --color-e4e4df: #20201b;
   --color-e5e5e0: #1f1f1a;
+  --color-e5e5e4: #1b1b1a;
   --color-e7e7e2: #1d1d18;
   --color-e8e7e8: #181718;
   --color-e8e8e3: #1c1c17;
@@ -304,6 +332,10 @@
   --color-efcfcb: #341410;
   --color-efd0cd: #321310;
   --color-efefeb: #141410;
+  --color-efefeb-ap66: rgb(20 20 16 / 66%);
+  --color-efefeb-ap74: rgb(20 20 16 / 74%);
+  --color-efefeb-ap80: rgb(20 20 16 / 80%);
+  --color-efefeb-ap86: rgb(20 20 16 / 86%);
   --color-f1f1ee: #11110e;
   --color-f3f3f0: #0f0f0c;
   --color-f6dedb: #240c09;
@@ -311,6 +343,8 @@
   --color-f7f7f4: #0b0b08;
   --color-f7f7f5: #0a0a08;
   --color-f7f7f5-ap10: rgb(10 10 8 / 10%);
+  --color-f7f7f5-ap78: rgb(10 10 8 / 78%);
+  --color-f7f7f5-ap84: rgb(10 10 8 / 84%);
   --color-f7f7f5-ap92: rgb(10 10 8 / 92%);
   --color-f8f8f6: #090907;
   --color-fafaf8: #070705;
@@ -325,7 +359,9 @@
   --color-fff9ec: #130d00;
   --color-ffffff: #000000;
   --color-ffffff-ap10: rgb(0 0 0 / 10%);
+  --color-ffffff-ap28: rgb(0 0 0 / 28%);
   --color-ffffff-ap34: rgb(0 0 0 / 34%);
+  --color-ffffff-ap45: rgb(0 0 0 / 45%);
   --color-ffffff-ap64: rgb(0 0 0 / 64%);
   --color-ffffff-ap98: rgb(0 0 0 / 98%);
 }

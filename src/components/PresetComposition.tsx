@@ -1,19 +1,17 @@
 import { type TranslationFunction, useI18n } from "../i18n";
 import type { ResourceDescriptor } from "../types";
 
-/** Id of the built-in English profile; selecting nothing means selecting it. */
-const BUILTIN_EN_US_TOOL_DESCRIPTION_ID = "tooldesc_builtin_en_us";
-const BUILTIN_ZH_CN_TOOL_DESCRIPTION_ID = "tooldesc_builtin_zh_cn";
+/** Id of the built-in profile; selecting nothing means selecting it. */
+const BUILTIN_TOOL_DESCRIPTION_ID = "tooldesc_builtin_en_us";
 
-/** Display title of a prompt profile: the two built-ins are localized here
- * because the host names them in one language; files keep their own name. */
+/** Display title of a prompt profile: the built-in is localized here because
+ * the host names it in one language; files keep their own name. */
 function toolDescriptionProfileTitle(
   resource: ResourceDescriptor | undefined,
   t: TranslationFunction
 ): string | undefined {
   if (!resource) return undefined;
-  if (resource.id === BUILTIN_EN_US_TOOL_DESCRIPTION_ID) return t("Mework 内置（英文）", "Mework built-in (English)");
-  if (resource.id === BUILTIN_ZH_CN_TOOL_DESCRIPTION_ID) return t("Mework 内置（中文）", "Mework built-in (Chinese)");
+  if (resource.id === BUILTIN_TOOL_DESCRIPTION_ID) return t("Mework 内置", "Mework built-in");
   return resource.name;
 }
 
@@ -21,7 +19,7 @@ function toolDescriptionProfileTitle(
  *
  * Conversations pick a profile and nothing else, so they get the provider-row
  * shape rather than a list of checkboxes. Selecting nothing still means the
- * built-in English profile, which is why that entry is what a `null` id shows. */
+ * built-in profile, which is why that entry is what a `null` id shows. */
 export function ToolDescriptionSelectRow({
   resources,
   selectedId,
@@ -43,7 +41,7 @@ export function ToolDescriptionSelectRow({
       <select
         className="input"
         aria-label={t("工具描述", "Tool descriptions")}
-        value={dangling ?? selectedId ?? BUILTIN_EN_US_TOOL_DESCRIPTION_ID}
+        value={dangling ?? selectedId ?? BUILTIN_TOOL_DESCRIPTION_ID}
         onChange={(event) => onChange(event.target.value)}
       >
         {resources.map((resource) => {

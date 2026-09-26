@@ -1,10 +1,27 @@
 /* Main conversation */
 .main-pane { grid-column: auto; min-width: 0; height: 100%; display: flex; flex-direction: column; background: var(--app); }
-.topbar { height: var(--topbar-height); flex: 0 0 var(--topbar-height); padding: 0 12px 0 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: var(--color-f7f7f5-ap92); }
+.topbar { height: var(--topbar-height); flex: 0 0 var(--topbar-height); padding: 0 12px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--color-f7f7f5-ap92); transition: padding-left var(--shell-collapse-duration, .24s) var(--shell-collapse-easing, ease); }
+/* With the sidebar closed, `ShellNav` floats over the bar's left end; the title starts after it. */
+.app-shell--sidebar-closed .topbar { padding-left: calc(var(--shell-nav-inset) + var(--shell-nav-closed-width) + 14px); }
+:root[data-window-chrome="windows"] .app-shell--sidebar-closed .topbar { padding-left: 16px; }
+.app-shell--resizing .topbar { transition: none; }
 .topbar__leading, .topbar__actions { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.conversation-title { min-width: 0; padding-left: 2px; }
-.conversation-title > div { height: 15px; display: flex; align-items: center; gap: 3px; font-size: 10px; color: var(--faint); }
-.conversation-title h1 { max-width: 420px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 650; }
+.topbar__leading { flex: 1 1 auto; }
+.topbar__actions { flex: 0 0 auto; }
+/* One line: the title, which renames in place, then its project in the quiet colour. */
+/* The title's hover box reaches 6px past the text on either side, so the row starts 6px early. */
+.conversation-title { min-width: 0; margin-left: -6px; display: flex; align-items: center; gap: 3px; }
+.conversation-title__heading { flex: 0 1 auto; min-width: 0; margin: 0; font-size: 13.5px; line-height: 20px; font-weight: 650; }
+.conversation-title__name { max-width: 100%; height: 26px; padding: 0 6px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 6px; background: transparent; font: inherit; line-height: 26px; text-align: left; }
+button.conversation-title__name:hover:not(:disabled) { background: var(--hover); cursor: text; }
+button.conversation-title__name:disabled { opacity: 1; cursor: default; }
+/* While renaming, the field is as wide as its text, so a title turns into the field where it stands and
+   widens as it grows, up to a cap. A hidden copy of the text in the same grid cell sets that width: its
+   6px sides match the button's padding and the field's 5px plus border, and 2px more hold the caret (WebKit scrolls with less). */
+.conversation-title__field { max-width: 420px; display: grid; grid-template-columns: minmax(0, 1fr); }
+.conversation-title__field::after { content: attr(data-value); grid-area: 1 / 1; min-width: 3em; height: 0; padding: 0 8px 0 6px; overflow: hidden; visibility: hidden; white-space: pre; }
+.conversation-title__input { grid-area: 1 / 1; width: 100%; min-width: 0; height: 26px; padding: 0 5px; border: 1px solid var(--color-aeb9d2); border-radius: 6px; outline: 0; background: var(--panel); color: var(--text); font: inherit; box-shadow: 0 0 0 2px var(--color-5f5f5a-ap10); }
+.conversation-title__project { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--faint); }
 .topbar__empty { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
 .topbar__empty-title { font-size: 15px; margin: 0; }
 .topbar__empty-tagline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--faint); }
@@ -67,56 +84,59 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .markdown-content { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 
 /*
- * Streaming reveal: each 100 ms commit fades its newly arrived tail in from
- * left to right, so text appears to be written rather than to blink into place
- * a block at a time.
+ * Streaming reveal: the text each 100 ms commit adds sweeps in from left to
+ * right, so it appears to be written rather than to blink into place a run at a
+ * time. `lib/streamReveal.ts` wraps only the new text in `.stream-fresh`, and
+ * spreads one commit's worth of spans across one sweep in reading order.
  *
- * A mask, not opacity: opacity would dim the already-settled text too. The
- * sweep runs from `--stream-reveal-from` (where the previous commit's text
- * ended) to the end, so only the new tail moves. `--stream-reveal` has to be
- * registered with @property — an unregistered custom property is a plain token
- * and jumps rather than interpolating.
+ * A mask, not opacity, so the edge is a gradient moving across the words. On a
+ * span that wraps, the mask runs along the line fragments laid end to end, so
+ * the sweep follows the text onto the next line. `--stream-fresh-edge` has to
+ * be registered with @property — an unregistered custom property is a plain
+ * token and jumps rather than interpolating — and its resting value leaves the
+ * text fully shown.
  *
- * The two tick values carry identical keyframes. Alternating between them is
- * what restarts the animation each commit: re-setting the same animation name
- * does not replay a running animation.
+ * The two tick classes carry identical keyframes. React keeps the same span
+ * from one commit to the next, and alternating the name is what replays the
+ * sweep: re-setting a running animation's name does not.
  */
-@property --stream-reveal {
-  syntax: "<percentage>";
+@property --stream-fresh-edge {
+  syntax: "<length-percentage>";
   inherits: false;
-  initial-value: 100%;
+  initial-value: 200%;
 }
 
-@keyframes markdown-stream-reveal-a {
-  from { --stream-reveal: var(--stream-reveal-from, 0%); }
-  to { --stream-reveal: 100%; }
+@keyframes stream-fresh-0 {
+  from { --stream-fresh-edge: 0%; }
+  to { --stream-fresh-edge: calc(100% + 2em); }
 }
-@keyframes markdown-stream-reveal-b {
-  from { --stream-reveal: var(--stream-reveal-from, 0%); }
-  to { --stream-reveal: 100%; }
+@keyframes stream-fresh-1 {
+  from { --stream-fresh-edge: 0%; }
+  to { --stream-fresh-edge: calc(100% + 2em); }
 }
 
-.markdown-content[data-stream-tick] {
+.stream-fresh {
   -webkit-mask-image: linear-gradient(
     to right,
-    var(--color-000000) var(--stream-reveal),
-    transparent calc(var(--stream-reveal) + 9%)
+    var(--color-000000) calc(var(--stream-fresh-edge) - 2em),
+    transparent var(--stream-fresh-edge)
   );
   mask-image: linear-gradient(
     to right,
-    var(--color-000000) var(--stream-reveal),
-    transparent calc(var(--stream-reveal) + 9%)
+    var(--color-000000) calc(var(--stream-fresh-edge) - 2em),
+    transparent var(--stream-fresh-edge)
   );
   animation-duration: 100ms;
   animation-timing-function: linear;
-  animation-fill-mode: forwards;
+  /* Hidden through its delay, shown for good once its turn is over. */
+  animation-fill-mode: both;
 }
-.markdown-content[data-stream-tick="0"] { animation-name: markdown-stream-reveal-a; }
-.markdown-content[data-stream-tick="1"] { animation-name: markdown-stream-reveal-b; }
+.stream-fresh--0 { animation-name: stream-fresh-0; }
+.stream-fresh--1 { animation-name: stream-fresh-1; }
 
 @media (prefers-reduced-motion: reduce) {
   /* The reveal is decoration; text must still land fully opaque without it. */
-  .markdown-content[data-stream-tick] { -webkit-mask-image: none; mask-image: none; animation: none; }
+  .stream-fresh { -webkit-mask-image: none; mask-image: none; animation: none; }
 }
 .markdown-content > :first-child { margin-top: 0; }
 .markdown-content > :last-child { margin-bottom: 0; }
@@ -192,11 +212,13 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .markdown-content summary { cursor: pointer; }
 .markdown-content mark { padding: 0 .15em; border-radius: 3px; background: var(--color-fff5e5); color: inherit; }
 .markdown-content sup, .markdown-content sub { line-height: 0; }
-.stream-waiting { min-height: 30px; margin-top: 12px; padding: 2px 3px; display: flex; align-items: center; gap: 9px; color: var(--color-65655f); --pulse-color: var(--color-343431); }
+/* The cat is drawn one text line tall, so the line height is pinned rather than
+   left to the font: `normal` differs between Inter and the CJK fallback. */
+.stream-waiting { --stream-waiting-line: 16px; margin-top: 12px; padding: 2px 3px; display: flex; align-items: center; gap: 6px; color: var(--color-65655f); --pulse-color: var(--color-343431); }
 /* One line per call in flight. Usually there is exactly one; async tools are
    what make it a column rather than a single row. */
 .stream-waiting__activities { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.stream-waiting__activity { min-width: 0; display: inline-flex; align-items: baseline; gap: 5px; overflow: hidden; white-space: nowrap; font-size: 11.5px; font-weight: 570; animation: stream-waiting-activity-in .22s cubic-bezier(.2, .75, .25, 1); }
+.stream-waiting__activity { min-width: 0; display: inline-flex; align-items: baseline; gap: 5px; overflow: hidden; white-space: nowrap; font-size: 11.5px; font-weight: 570; line-height: var(--stream-waiting-line); animation: stream-waiting-activity-in .22s cubic-bezier(.2, .75, .25, 1); }
 .stream-waiting__activity-title { flex: 0 0 auto; }
 .stream-waiting__activity-target { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 10.5px/1.5 var(--mono); color: var(--faint); }
 .stream-waiting__activity-count { flex: 0 0 auto; font: 500 10.5px/1.5 var(--mono); color: var(--faint); }
@@ -204,6 +226,9 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .stream-waiting__dots i { width: 2.5px; height: 2.5px; display: block; border-radius: 50%; background: currentColor; animation: stream-waiting-dot 1.2s ease-in-out infinite; }
 .stream-waiting__dots i:nth-child(2) { animation-delay: .14s; }
 .stream-waiting__dots i:nth-child(3) { animation-delay: .28s; }
+/* Tasks still running beside the round: a link to the tasks pane, not a wait. */
+.stream-waiting__tasks { align-self: flex-start; max-width: 100%; padding: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: none; color: var(--color-315eae); font-size: 11.5px; font-weight: 570; line-height: var(--stream-waiting-line); text-align: left; text-underline-offset: 2px; animation: stream-waiting-activity-in .22s cubic-bezier(.2, .75, .25, 1); }
+.stream-waiting__tasks:hover { text-decoration: underline; }
 .stream-waiting--retry { color: var(--color-92600d); --pulse-color: var(--color-92600d); }
 .stream-waiting--retry .stream-waiting__cat { color: var(--color-c98a1b); }
 .stream-waiting__retry-message { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ab7d3c); font-size: 10px; }
@@ -213,9 +238,10 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 /*
  * Streaming mascot: the composer's cat, at its laptop.
  *
- * The same drawing in the same scene as `.composer-cat`, and at the same size,
- * lying on a ledge of its own. `transform-box: view-box` makes every origin below
- * a raw scene coordinate: the figure and the tail turn about points on the ledge
+ * The same drawing in the same scene as `.composer-cat`, lying on a ledge of its
+ * own, but only one line of the waiting text tall, about a third of the
+ * composer's. `transform-box: view-box` makes every origin below a raw scene
+ * coordinate: the figure and the tail turn about points on the ledge
  * (y=730.9), and the far paw about the wrist it was cut round, which sits inside
  * the group that lowers the cat onto the ledge and so is written in the
  * drawing's own coordinates — `CAT_WRIST` in catArt.ts, compared by test.
@@ -226,7 +252,8 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
  * every one of them starts and ends at rest: the change waits for that moment,
  * so tearing them down never jumps.
  */
-.stream-waiting__cat { width: 53.41px; height: 45px; flex: 0 0 53.41px; color: var(--color-343431); fill: currentColor; }
+/* The scene's 724:610 at one line; the ledge's thickness in StreamWaitingIndicator.tsx assumes 16px. */
+.stream-waiting__cat { width: calc(var(--stream-waiting-line) * 724 / 610); height: var(--stream-waiting-line); flex: 0 0 auto; color: var(--color-343431); fill: currentColor; }
 .stream-cat-ledge { fill: var(--border-strong); }
 .stream-cat-figure, .stream-cat-tail, .stream-cat-paw, .stream-cat-gaze, .stream-cat-pupils,
 .stream-cat-lids, .stream-cat-blink { transform-box: view-box; }
@@ -439,7 +466,13 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 /* The bare editor stands in for a card that had its own width and side, so it
    keeps them: otherwise an edit reads as a full-width strip where the card was. */
 .inline-text-editor--assistant { width: 86%; }
-.inline-text-editor--user { width: 78%; margin-left: auto; }.context-slot--inserting { padding: 4px 0; }
+.inline-text-editor--user { width: 78%; margin-left: auto; }
+/* The editor mounts already holding focus, which keeps a `content-visibility: auto`
+   slot rendered without WebKit ever measuring whether it is on screen. Pressing
+   Save blurs the textarea first, WebKit then skips the slot's contents, and the
+   release lands on the empty slot: no click, and the editor returns on the next
+   interaction. The slot holds one editor, so there is nothing to defer. */
+.context-slot--inserting { padding: 4px 0; content-visibility: visible; }
 
 /*
  * One shape for a call, read or edited: each thing worth knowing named at the

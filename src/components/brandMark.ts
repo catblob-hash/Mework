@@ -56,6 +56,12 @@ export const ICON_PROMPT_PATH = "M29.5 41.5 40.5 52 29.5 62.5";
 export const ICON_MARK_TRANSFORM = "translate(50.5 31) scale(0.19)";
 
 /**
+ * The prompt and the mark without the plate: its middle 60 units, which holds both with room for
+ * the prompt's round caps and keeps them centred as the plate does.
+ */
+export const ICON_BARE_VIEWBOX = "20 20 60 60";
+
+/**
  * The mark alone on the plate, for frames of 24px and below, where the prompt's stroke would
  * be thinner than a pixel.
  */

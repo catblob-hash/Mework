@@ -2144,8 +2144,8 @@ mod tests {
     }
 
     /// The launch.json template and its prose are one text, owned by
-    /// `preview_launch_config`. `preview_start`'s description quotes them, and both
-    /// built-in profiles must quote the same bytes — a paraphrase there would teach the
+    /// `preview_launch_config`. `preview_start`'s description quotes them, and the
+    /// built-in profile must quote the same bytes — a paraphrase there would teach the
     /// model a file format the parser rejects.
     #[test]
     fn preview_start_descriptions_quote_the_launch_json_format_verbatim() {
@@ -2158,9 +2158,6 @@ mod tests {
             PromptProfile::builtin_english().text(PromptKey::ToolPreviewStartDescription),
             english
         );
-        assert!(PromptProfile::builtin_chinese()
-            .text(PromptKey::ToolPreviewStartDescription)
-            .contains(crate::preview_launch_config::LAUNCH_JSON_FORMAT));
     }
 
     #[test]

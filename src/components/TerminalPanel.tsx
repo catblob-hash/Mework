@@ -7,6 +7,7 @@ import { useI18n } from "../i18n";
 import { installCspStyleNonce } from "../lib/cspStyleNonce";
 import { detachTerminal, openTerminal, resizeTerminal, writeTerminal } from "../lib/terminal";
 import { mirrorLightnessHex } from "../lib/themeMirror";
+import { BRAND_AMBER } from "./brandMark";
 import type {
   TerminalCommandState,
   TerminalEvent,
@@ -18,11 +19,14 @@ import type {
 type TerminalUiTheme = "day" | "night";
 
 /* The chrome around the grid, kept in step with `--color-e8e7e8`/`--color-272227`
-   in the palette; the selection is xterm's own and has no token. */
+   in the palette; the selection is xterm's own and has no token. The cursor is the brand
+   mark in its amber, `--color-c98a1b` — `terminal.css` cuts xterm's block into the mark's
+   shape — and the glyph it covers is `cursorAccent`. */
 const TERMINAL_DAY_COLORS = {
   background: "#e8e7e8",
   foreground: "#272227",
-  cursor: "#272227",
+  cursor: BRAND_AMBER,
+  cursorAccent: "#272227",
   selectionBackground: "#af957388",
 } as const;
 
@@ -34,6 +38,9 @@ export function terminalUiColors(
     background: mirrorLightnessHex(TERMINAL_DAY_COLORS.background),
     foreground: mirrorLightnessHex(TERMINAL_DAY_COLORS.foreground),
     cursor: mirrorLightnessHex(TERMINAL_DAY_COLORS.cursor),
+    // Amber stays mid-light at night, so the covered glyph keeps the dark ink rather than
+    // mirroring to a light one it could not be read against: the night ground.
+    cursorAccent: mirrorLightnessHex(TERMINAL_DAY_COLORS.background),
     selectionBackground: mirrorLightnessHex(TERMINAL_DAY_COLORS.selectionBackground),
   };
 }

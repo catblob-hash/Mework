@@ -6,7 +6,7 @@ import {
   Trash2,
   Webhook
 } from "lucide-react";
-import { Fragment, memo, useEffect, useId, useMemo, useState } from "react";
+import { Fragment, memo, useEffect, useId, useMemo, useState, useSyncExternalStore } from "react";
 import type { ComponentType, ReactNode } from "react";
 import { useI18n } from "../i18n";
 import type {
@@ -21,6 +21,7 @@ import type {
 } from "../types";
 import { useAppearance } from "../lib/appearance";
 import { estimateContextTokens, formatCompactTokenCount } from "../lib/contextTokens";
+import { subscribeToolExplanations, toolExplanation, toolExplanationVersion } from "../lib/localModel";
 import { isEncryptedReasoning } from "../lib/modelCapabilities";
 import { isHostAuthoredUserContext } from "../lib/orchestration";
 import { agentTimelineRouteId, agentTimelineRunStatus } from "../lib/subagents";
@@ -30,6 +31,7 @@ import { IconButton } from "./Common";
 import { InlineTextEditor } from "./InlineTextEditor";
 import { InlineToolEditor } from "./InlineToolEditor";
 import { MarkdownContent } from "./MarkdownContent";
+import { StreamRevealText } from "./StreamRevealText";
 import {
   getToolPresentation,
   isHoistedToolCall,
@@ -358,6 +360,7 @@ export function TimelineRow({
   icon: Icon,
   name,
   line,
+  lineStreaming = false,
   stat,
   status,
   accessibleName,
@@ -378,6 +381,8 @@ export function TimelineRow({
   icon: ComponentType<{ size?: number; className?: string }>;
   name: string;
   line?: string;
+  /** The line is still being written: what each commit adds sweeps in. */
+  lineStreaming?: boolean;
   stat?: string;
   status?: RowStatus;
   /** What the disclosure button is called; the row shows an identifier, not a sentence. */
@@ -450,7 +455,11 @@ export function TimelineRow({
           >
             <span className="timeline-row__icon" aria-hidden="true"><Icon size={14} /></span>
             <span className="timeline-row__name">{name}</span>
-            {line && <span className="timeline-row__line">{line}</span>}
+            {line && (
+              <span className="timeline-row__line">
+                {lineStreaming ? <StreamRevealText text={line} /> : line}
+              </span>
+            )}
             {/* Against the end of the row's own words, not at the far edge of
                 the line: the arrow belongs to what it opens. */}
             {expandable && (
@@ -547,7 +556,8 @@ function ToolRow({
 }) {
   const { t } = useI18n();
   const { item, index } = entry;
-  const presentation = getToolPresentation(item, descriptor, t);
+  useSyncExternalStore(subscribeToolExplanations, toolExplanationVersion);
+  const presentation = getToolPresentation(item, descriptor, t, toolExplanation(item.id));
   const status = toolRowStatus(item, presentation.family, t);
   const transient = item.streaming === true;
   const editing = item.id === callbacks.editingContextId;
@@ -675,10 +685,11 @@ function ReasoningRow({
   const encrypted = isEncryptedReasoning(item);
   const editing = item.id === callbacks.editingContextId;
   const editable = !callbacks.readOnly && !streaming;
-  // Reasoning opens itself while it is arriving so the round narrates in place;
-  // afterwards the appearance preference decides, until the reader says
-  // otherwise.
-  const [expanded, setExpanded] = useState(streaming || !collapseReasoning);
+  // The appearance preference decides, streaming or not, until the reader says
+  // otherwise. A closed row still narrates the round: its line is the newest
+  // thought, and it does so without a body growing under it and pulling the
+  // page down every commit.
+  const [expanded, setExpanded] = useState(!collapseReasoning);
   const expandable = content.length > 0 || editing;
   const open = expandable && (expanded || editing) && groupExpanded;
   const tokenText = item.tokens ? `${formatCompactTokenCount(item.tokens)} tokens` : undefined;
@@ -688,9 +699,6 @@ function ReasoningRow({
   const stat = tokenText ?? rowTokenStat(item, t);
   const line = reasoningLine(content, streaming);
 
-  useEffect(() => {
-    if (streaming) setExpanded(true);
-  }, [streaming]);
   useEffect(() => {
     if (editing) setExpanded(true);
   }, [editing]);
@@ -706,6 +714,7 @@ function ReasoningRow({
       // for thinking it never wrote down — has its token count as the whole of
       // what it can say for itself, so that takes the line instead.
       line={line ?? tokenText}
+      lineStreaming={streaming && line !== undefined}
       stat={line ? stat : undefined}
       status={streaming ? { tone: "running", label: t("正在思考", "Thinking"), icon: LoaderCircle } : undefined}
       accessibleName={streaming

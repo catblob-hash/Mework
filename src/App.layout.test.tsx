@@ -35,13 +35,14 @@ function onMacHost() {
   onTestFinished(() => platform.mockRestore());
 }
 
-/** Shows or hides the terminal pane from the composer's terminal button: the row after its shells. */
+/** Shows or hides the terminal pane from the top bar's terminal button: the row after its shells. */
 async function toggleTerminalPane(
   user: ReturnType<typeof userEvent.setup>,
-  name: "打开终端面板" | "收起终端面板"
+  name: "显示终端面板" | "收起终端面板"
 ) {
-  await user.click(screen.getByRole("button", { name: /打开终端$/ }));
-  await user.click(within(await screen.findByRole("menu", { name: "用哪个 shell" }))
+  const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
+  await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+  await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
     .getByRole("menuitem", { name }));
 }
 
@@ -123,7 +124,7 @@ describe("App model run flow — layout", () => {
     const { container } = render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
 
-    fireEvent.contextMenu(container.querySelector(".context-stream__hint")!, {
+    fireEvent.contextMenu(container.querySelector(".context-stream")!, {
       clientX: 20,
       clientY: 20
     });
@@ -311,7 +312,7 @@ describe("App model run flow — layout", () => {
     // Nothing is opened before anyone asks for a terminal.
     expect(window.document.getElementById(domId)).toBeNull();
 
-    await toggleTerminalPane(user, "打开终端面板");
+    await toggleTerminalPane(user, "显示终端面板");
     const opened = window.document.getElementById(domId);
     expect(opened).not.toBeNull();
     expect(opened?.closest(".pane-tiles__tile")).not.toHaveAttribute("hidden");
@@ -323,7 +324,7 @@ describe("App model run flow — layout", () => {
     expect(tile).toHaveAttribute("hidden");
     expect(tile).toHaveAttribute("inert");
 
-    await toggleTerminalPane(user, "打开终端面板");
+    await toggleTerminalPane(user, "显示终端面板");
     expect(window.document.getElementById(domId)).toBe(opened);
     expect(opened?.closest(".pane-tiles__tile")).not.toHaveAttribute("hidden");
     // Reopening shows the terminals there are rather than adding one.
@@ -353,7 +354,7 @@ describe("App model run flow — layout", () => {
     ).getByRole("button", { name: "关闭终端" });
 
     // The pane opening with nothing in it starts the most preferred shell this machine has.
-    await toggleTerminalPane(user, "打开终端面板");
+    await toggleTerminalPane(user, "显示终端面板");
     expect(tabNames()).toEqual(["zsh 1"]);
     expect(panel("terminal-1")).toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "zsh" }));
     await user.click(screen.getByRole("button", { name: "新建终端" }));
@@ -375,7 +376,7 @@ describe("App model run flow — layout", () => {
     expect(tabNames()).toEqual([]);
     expect(panel("terminal-1")).not.toBeNull();
 
-    await toggleTerminalPane(user, "打开终端面板");
+    await toggleTerminalPane(user, "显示终端面板");
     expect(tabNames()).toEqual(["zsh 1", "zsh 2"]);
 
     // A tab's × ends that shell, and only that one. The survivor keeps its number: each shell
@@ -393,7 +394,7 @@ describe("App model run flow — layout", () => {
 
     // Asking for the pane again asks for a terminal to put in it, on an id never used before,
     // and the count goes on from where it was.
-    await toggleTerminalPane(user, "打开终端面板");
+    await toggleTerminalPane(user, "显示终端面板");
     expect(tabNames()).toEqual(["zsh 3"]);
     expect(panel("terminal-3")).not.toBeNull();
   });
@@ -420,7 +421,7 @@ describe("App model run flow — layout", () => {
     );
     const tabNames = () => screen.queryAllByRole("tab").map((element) => element.textContent);
 
-    await toggleTerminalPane(user, "打开终端面板");
+    await toggleTerminalPane(user, "显示终端面板");
     await user.click(screen.getByRole("button", { name: "新建终端" }));
     await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
       .getByRole("menuitem", { name: "zsh" }));

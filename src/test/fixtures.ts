@@ -240,21 +240,13 @@ export function createTestDocument(): AppDocument {
     source: "user",
     available: true
   });
-  // The host always lists the two compiled-in profiles first, then files.
+  // The host always lists the compiled-in profile first, then files.
   document.capabilities.toolDescriptionFiles.push(
     {
       id: "tooldesc_builtin_en_us",
-      name: "Mework built-in (English)",
-      description: "Built-in English prompts and tool descriptions",
+      name: "Mework built-in",
+      description: "Built-in prompts and tool descriptions; ships with this version of Mework",
       location: "builtin:en-US",
-      source: "builtin",
-      available: true
-    },
-    {
-      id: "tooldesc_builtin_zh_cn",
-      name: "Mework 内置（中文）",
-      description: "内置中文提示词与工具描述",
-      location: "builtin:zh-CN",
       source: "builtin",
       available: true
     },

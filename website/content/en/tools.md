@@ -2,11 +2,11 @@
 
 Mework ships {{TOOL_COUNT}} built-in tools. Each has its own page with what it does for you, when it asks for approval, its parameters as the model sees them, and the description the built-in prompt profile gives the model. The tool names are the ones the model calls and the ones a [tool-description file](prompt-profiles.html) refers to.
 
-The tools below are grouped the way the tool picker groups them. Three sets of tools are one capability split into many calls — the files, the shells and the preview — and the picker shows each set as a single row, `files`, `shell` or `preview`, that opens a window of its own; each of the three has its own section here, and the book icon beside that row in the picker leads to it.
+The tools below are grouped the way the tool picker groups them. Every switchable tool is a row of its own there, and the book icon at the start of the row leads to its page here.
 
 ## How a tool becomes available
 
-{{SWITCHABLE_TOOL_COUNT}} of the tools are switches in the **Enabled tools** list of a conversation or preset (the sliders icon next to the composer, or Settings → Conversation presets). The other {{DERIVED_TOOL_COUNT}} are **derived** by the host from another setting and never appear in that list:
+{{SWITCHABLE_TOOL_COUNT}} of the tools are switches in the **Enabled tools** list of a conversation or preset (the sliders icon next to the composer, or Settings → Conversation presets). The other {{DERIVED_TOOL_COUNT}} are **derived** from another setting or tool and never appear in that list:
 
 | Derived tools | Follow |
 |---|---|
@@ -17,6 +17,7 @@ The tools below are grouped the way the tool picker groups them. Three sets of t
 | `skill` | the **Load skills on demand** switch, when at least one skill is selected |
 | `tool_search` | the **Tool discovery** switch (MCP), when a run is holding MCP tool schemas back |
 | `plan`, `exit_plan_mode` | the **security level** being Plan mode |
+| `preview_start`, `preview_stop`, `preview_list` | any other `preview_*` tool being enabled |
 
 Tool exposure is one-way within a conversation. Once a run has shown the model a tool — or an MCP server, a memory tier, on-demand skill loading, web access — that surface stays on for the rest of the conversation and the settings pane grays it out: a transcript that already calls a tool cannot be replayed to a model that no longer has it. Later rounds can widen the surface, never narrow it.
 
@@ -26,11 +27,11 @@ Every call is classified on the host before it runs — as a read, a write, or a
 
 ## Files and search {#group-filesystem}
 
-The picker's **Files and search** group: the `files` row, and `lsp`, which keeps a row of its own.
+The picker's **Files and search** group: the six file tools, and `lsp`.
 
-### `files` — file tools {#files}
+### File tools {#files}
 
-The six tools that list, search, read and change the workspace's files are one row in the picker, `files`. Its count says how many of the six are on; clicking it opens the **File tools** window, where each has its own switch, and the **+** on the group heading switches all six on together with the rest of the group. `write` and `edit` are marked **Reviewed**. All six are bounded to the workspace and the roots granted to the conversation, and the write guards under [Tools and approvals](working.html#tools-and-approvals) apply to every one of them.
+The six tools that list, search, read and change the workspace's files. `write` and `edit` are marked **Reviewed**. All six are bounded to the workspace and the roots granted to the conversation, and the write guards under [Tools and approvals](working.html#tools-and-approvals) apply to every one of them.
 
 {{TOOL_TABLE:ls,find,grep,read,write,edit}}
 
@@ -42,19 +43,19 @@ The six tools that list, search, read and change the workspace's files are one r
 
 ## Shell {#group-shell}
 
-### `shell` — shell tools {#shell}
+### Shell tools {#shell}
 
-One tool per shell backend — `bash`, `zsh`, `sh` and `powershell` — behind one row in the picker, `shell`. Its window lists only the shells found on the conversation's machines: a Windows machine can offer `powershell` and `bash`, a macOS, Linux or WSL machine `zsh`, `bash` and `sh`. The **+** on the group heading switches the shells on. Every shell tool is marked **Reviewed**, and every one produces tasks, so the task tools come with it.
+One tool per shell backend — `bash`, `zsh`, `sh` and `powershell`. The picker lists only the shells found on the conversation's machines: a Windows machine can offer `powershell` and `bash`, a macOS, Linux or WSL machine `zsh`, `bash` and `sh`. Every shell tool is marked **Reviewed**, and every one produces tasks, so the task tools come with it.
 
 {{TOOL_TABLE:bash,zsh,sh,powershell}}
 
-## Control {#group-web}
+## Preview {#group-web}
 
-The picker's **Control** group holds the `preview` row. The two web tools sit here too, though they never appear in the picker.
+The picker's **Preview** group holds the preview tools. The two web tools sit here too, though they never appear in the picker.
 
-### `preview` — preview tools {#preview}
+### Preview tools {#preview}
 
-The `preview_*` tools run the project's dev server and act on the page it serves in the built-in browser; the picker shows them as one row, `preview`. Its window has three pages, one table each below. `preview_screenshot` and `preview_upload_image` are only offered to models that can see images. Servers start from the configurations in `.mework/launch.json` — see [The built-in browser](working.html#the-built-in-browser).
+The `preview_*` tools run the project's dev server and act on the page it serves in the built-in browser. `preview_start`, `preview_stop` and `preview_list` have no row in the picker: they are on whenever any other preview tool is. `preview_screenshot` and `preview_upload_image` are only offered to models that can see images. Servers start from the configurations in `.mework/launch.json` — see [The built-in browser](working.html#the-built-in-browser).
 
 #### Dev servers {#preview-servers}
 

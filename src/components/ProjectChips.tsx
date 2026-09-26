@@ -4,7 +4,6 @@ import {
   FolderClock,
   FolderKanban,
   FolderPlus,
-  PanelRight,
   Server,
   Settings,
   SquareTerminal
@@ -98,6 +97,7 @@ export function ProjectSelector({
       disabled={sourceDeleting}
       menuLabel={t("选择项目", "Select project")}
       menuWidth={252}
+      placement="above"
       sections={[
         {
           id: "projects",
@@ -152,7 +152,7 @@ export function ProjectSelector({
  *
  * Choosing one changes nothing in the conversation — every workspace of the project stays
  * reachable by its number. It only decides which directory the Git chip beside it describes
- * and where the terminal button opens a shell.
+ * and where the terminal pane starts a shell when it opens with none.
  *
  * Each machine heading carries a gear for that machine's settings, and each workspace a gear
  * for its environment variables: the variables belong to the workspace, not to its machine.
@@ -238,6 +238,7 @@ export function WorkspaceMemberSelector({
       triggerTitle={workspaceLocationTitle(current.path, current.machine, sshMachines)}
       menuLabel={t("选择工作区", "Select workspace")}
       menuWidth={260}
+      placement="above"
       sections={sections}
     />
   );
@@ -325,64 +326,4 @@ export function previewWorkspaceMenuItems({
     disabled,
     onSelect: () => onSelect(index + 1)
   }));
-}
-
-/**
- * The composer's terminal button: opens a new terminal in the selected workspace, in the shell
- * picked from its menu. Which shells are offered follows what that workspace's machine was
- * probed to have. The row after them shows or hides the pane, whose terminals are already open.
- */
-export function TerminalShellButton({
-  workspaceLabel,
-  shells,
-  paneOpen,
-  disabled = false,
-  onSelect,
-  onTogglePane
-}: {
-  /** The directory the shell will start in, for the button's name. */
-  workspaceLabel: string;
-  shells: readonly TerminalShell[];
-  /** Whether the terminal pane is on screen, which decides what its row says. */
-  paneOpen: boolean;
-  disabled?: boolean;
-  onSelect: (shell: TerminalShell) => void;
-  onTogglePane: () => void;
-}) {
-  const { t } = useI18n();
-  const label = t("在 {name} 打开终端", "Open a terminal in {name}", { name: workspaceLabel });
-  return (
-    <PopoverMenu
-      rootClassName="terminal-shell-button"
-      triggerClassName="composer-chip composer-chip--icon"
-      trigger={<SquareTerminal size={13} />}
-      triggerLabel={label}
-      triggerTitle={label}
-      disabled={disabled}
-      menuLabel={t("用哪个 shell", "Which shell")}
-      menuWidth={200}
-      dense
-      sections={[
-        {
-          id: "shells",
-          items: terminalShellMenuItems(
-            shells,
-            onSelect,
-            t("未探测到可用的 shell", "No shells detected")
-          )
-        },
-        {
-          id: "pane",
-          items: [{
-            id: "toggle",
-            label: paneOpen
-              ? t("收起终端面板", "Hide the terminal pane")
-              : t("打开终端面板", "Open the terminal pane"),
-            icon: <PanelRight size={14} />,
-            onSelect: onTogglePane
-          }]
-        }
-      ]}
-    />
-  );
 }

@@ -1,0 +1,65 @@
+[package]
+name = "mework-local-model"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+description = "Mework's local helper model: Qwen3.5-0.8B weights, tokenizer and inference backends."
+build = "build.rs"
+
+[lib]
+# The host imports this crate as `local_model`.
+name = "local_model"
+path = "src/lib.rs"
+
+[features]
+# The MLX backend (`local_model::mlx::MlxBackend`) for Apple silicon: fetches
+# Apple's prebuilt MLX at build time and builds `mlx/mework_mlx.cpp` against it
+# (see build.rs). Nothing on other targets.
+mlx = []
+# The llama.cpp backend (`local_model::llama`), for Windows and Linux; Apple
+# platforms use Core ML and never build llama.cpp unless this is enabled.
+# Building it needs CMake and a C++ toolchain.
+llama = ["dep:llama-cpp-sys-2"]
+# GPU backends compiled into the binary. A static Vulkan or CUDA build links
+# the GPU runtime (vulkan-1.dll / libvulkan.so.1, cudart) into the executable,
+# which then fails to start where that runtime is missing; see `llama-dynamic`.
+llama-vulkan = ["llama", "llama-cpp-sys-2/vulkan"]
+llama-cuda = ["llama", "llama-cpp-sys-2/cuda"]
+# Metal is always on in llama.cpp's Apple build; this only states it.
+llama-metal = ["llama", "llama-cpp-sys-2/metal"]
+# Builds llama.cpp as shared libraries and every ggml backend (each CPU
+# variant, Vulkan, CUDA) as a module loaded at run time from
+# `LlamaOptions::backend_dir`; a module whose GPU runtime is missing is skipped
+# instead of stopping the app. The libraries must ship next to the executable.
+llama-dynamic = ["llama", "llama-cpp-sys-2/dynamic-backends"]
+
+[dependencies]
+memmap2 = "0.9"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+unicode-normalization = "0.1"
+# Exact version: the bundled llama.cpp revision is part of the prefix-state
+# format (`llama::LLAMA_CPP_SYS_VERSION`), and must support the qwen35 arch.
+llama-cpp-sys-2 = { version = "=0.1.157", default-features = false, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Core ML is the only public route onto the Apple Neural Engine. Same objc2
+# generation as the host's AppKit bindings.
+block2 = "0.6"
+libc = "0.2"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSFileManager"] }
+objc2-core-ml = { version = "0.3.2", default-features = false, features = ["std", "block2", "MLModel", "MLModelConfiguration", "MLModel_MLModelCompilation", "MLModel_MLState", "MLState", "MLMultiArray", "MLFeatureValue", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLPredictionOptions", "MLOptimizationHints", "MLSpecializationStrategy", "MLComputeDeviceProtocol", "MLNeuralEngineComputeDevice"] }
+
+[build-dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "build_release"
+required-features = ["mlx"]

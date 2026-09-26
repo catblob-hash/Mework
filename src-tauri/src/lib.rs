@@ -7,10 +7,13 @@ mod api;
 mod aisdk;
 mod app_exit;
 #[cfg(target_os = "macos")]
+mod app_keys;
+#[cfg(target_os = "macos")]
 mod app_menu;
 mod app_tray;
 mod app_update;
 mod approval;
+mod background_images;
 mod browser;
 #[cfg(all(feature = "browser-dev", not(test)))]
 mod browser_dev;
@@ -55,6 +58,7 @@ mod file_read_state;
 mod fork_requests;
 mod git;
 mod git_flight;
+mod helper_model;
 mod hooks;
 mod host_platform;
 mod http_util;
@@ -96,7 +100,6 @@ mod process_groups;
 mod project_import_trust;
 mod project_memory;
 mod prompt_profile;
-mod prompt_profile_files;
 mod push_events;
 mod remote_directory;
 mod remote_files;
@@ -350,6 +353,18 @@ fn preview_conversation_template(
     conversations::store(&path)?.template_contexts(&template_id)
 }
 
+/// The built-in preset's template ships with the build and is rewritten from
+/// it on every start (`storage::install_builtin_preset`), so an edit or a
+/// delete would be undone without a word. Refused instead, like every other
+/// change to that preset.
+#[cfg(not(test))]
+fn refuse_builtin_preset_template(template_id: &str) -> Result<(), String> {
+    if template_id == catalog::BUILTIN_PRESET_TEMPLATE_ID {
+        return Err("内置对话预设的模板随版本更新，不能修改或删除".into());
+    }
+    Ok(())
+}
+
 /// Writes a renderer-edited body onto a template, creating it if that id has no
 /// row yet.
 ///
@@ -393,6 +408,7 @@ fn update_conversation_template(
         .storage_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    refuse_builtin_preset_template(&template_id)?;
     let path = document_path(&app)?;
     let store = conversations::store(&path)?;
     // An unknown id reads as an empty body, and that empty read is what tells a
@@ -422,6 +438,7 @@ fn delete_conversation_template(
     state: State<'_, AppState>,
     template_id: String,
 ) -> Result<(), String> {
+    refuse_builtin_preset_template(&template_id)?;
     let _guard = state
         .storage_lock
         .lock()
@@ -1063,6 +1080,9 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
         .flush(std::time::Duration::from_secs(30))?;
     storage::purge_conversation_bodies(&path)?;
     let mut document = catalog::default_document();
+    // The purge took the built-in preset's template with it, and the default
+    // document has none of this machine's parts yet.
+    storage::install_builtin_preset(&path, &mut document)?;
     document.capabilities = capabilities::discover(&document, app_data);
     // Reset is the recovery path: commit through the store so the in-memory
     // authority is replaced too, and block until the default document is
@@ -1557,6 +1577,124 @@ async fn check_app_update(app: AppHandle) -> Result<app_update::UpdateCheck, Str
 /// is written, so the renderer cannot turn this into a download from elsewhere. Installer
 /// downloads land in the app's local-data `updates` directory; a portable archive goes to the
 /// user's Downloads folder because they will unpack it by hand.
+/// The document's global settings as the host last saved them.
+#[cfg(not(test))]
+fn current_global_settings(app: &AppHandle, state: &AppState) -> Result<model::GlobalSettings, String> {
+    let path = document_path(app)?;
+    Ok(state.document_store.current_snapshot(&path)?.global_settings.clone())
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+fn local_model_status(state: State<'_, AppState>) -> helper_model::Status {
+    state.helper_model.status()
+}
+
+#[cfg(not(test))]
+fn local_model_variant(variant: &str) -> Result<helper_model::VariantId, String> {
+    helper_model::VariantId::parse(variant).ok_or_else(|| format!("未知的本地模型版本：{variant}"))
+}
+
+/// Starts downloading one build of the local helper model, from the mirrors
+/// in mainland China with `china_mirror`; progress arrives as
+/// `localModelChanged` push events.
+#[cfg(not(test))]
+#[tauri::command]
+fn local_model_install(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    variant: String,
+    china_mirror: bool,
+) -> Result<helper_model::Status, String> {
+    let settings = current_global_settings(&app, &state)?;
+    state.helper_model.install(local_model_variant(&variant)?, china_mirror, state.push_events.clone(), settings)?;
+    Ok(state.helper_model.status())
+}
+
+/// Switches the local helper model to another installed build.
+#[cfg(not(test))]
+#[tauri::command]
+fn local_model_activate(app: AppHandle, state: State<'_, AppState>, variant: String) -> Result<helper_model::Status, String> {
+    let settings = current_global_settings(&app, &state)?;
+    state.helper_model.activate(local_model_variant(&variant)?, state.push_events.clone(), settings)?;
+    Ok(state.helper_model.status())
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+fn local_model_cancel_install(state: State<'_, AppState>) {
+    state.helper_model.cancel_install();
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+async fn local_model_remove(state: State<'_, AppState>, variant: String) -> Result<helper_model::Status, String> {
+    let variant = local_model_variant(&variant)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state.helper_model.remove(variant, &state.push_events)?;
+        Ok(state.helper_model.status())
+    })
+    .await
+    .map_err(|error| format!("删除本地模型的后台任务失败: {error}"))?
+}
+
+/// Caches the prefix state of `prompt` (or of the prompt in effect for
+/// `task`) and reports its token count and size. May load the model first.
+#[cfg(not(test))]
+#[tauri::command]
+async fn local_model_prompt_info(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task: String,
+    prompt: Option<String>,
+) -> Result<helper_model::PromptReport, String> {
+    let task = match task.as_str() {
+        "title" => local_model::prompts::Task::Title,
+        "shell" => local_model::prompts::Task::Shell,
+        _ => return Err("未知的本地模型用途".into()),
+    };
+    let settings = current_global_settings(&app, &state)?;
+    let prompt = prompt
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| helper_model::prompt_for(&settings, task));
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = state.helper_model.prompt_report(&prompt)?;
+        state.helper_model.prune_prompt_caches(&settings);
+        // The report may have loaded the model: let the renderer see where it runs.
+        state.helper_model.publish_with_runtime(&state.push_events);
+        Ok(report)
+    })
+    .await
+    .map_err(|error| format!("计算提示词缓存的后台任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+fn local_model_default_prompts(app: AppHandle, state: State<'_, AppState>) -> Result<helper_model::DefaultPrompts, String> {
+    Ok(helper_model::default_prompts(&current_global_settings(&app, &state)?))
+}
+
+/// The user named the conversation: its title is final and the local helper
+/// model will not replace it.
+#[cfg(not(test))]
+#[tauri::command]
+fn settle_conversation_title(app: AppHandle, state: State<'_, AppState>, conversation_id: String) -> Result<(), String> {
+    let path = document_path(&app)?;
+    let _guard = state.storage_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    conversations::store(&path)?.set_title_settled(&conversation_id, true)
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+fn get_tool_explanations(
+    app: AppHandle,
+    conversation_id: String,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    conversations::store(&document_path(&app)?)?.tool_explanations(&conversation_id)
+}
+
 #[cfg(not(test))]
 #[tauri::command]
 async fn download_app_update(
@@ -1665,6 +1803,30 @@ fn open_external_url_in_background(url: String) {
 }
 
 /// What the main window does with a navigation it is about to commit.
+/// Takes the system title bar off the main window on macOS and Windows; the renderer draws the
+/// window's top row itself, and `src/lib/windowChrome.ts` makes the same platform split.
+///
+/// macOS keeps its traffic lights, over a transparent title bar the content runs under: they
+/// sit in the sidebar's first row, centred on its 44 px (`--topbar-height`), and the renderer
+/// leaves room for them (`--shell-nav-inset` in `chrome.css`). Windows drops the frame
+/// altogether and the renderer draws the caption buttons; the system still resizes the
+/// frameless window from its edges and keeps its shadow. Anywhere else the frame stays.
+fn main_window_chrome(
+    #[allow(unused_mut)] mut config: tauri::utils::config::WindowConfig,
+) -> tauri::utils::config::WindowConfig {
+    #[cfg(target_os = "macos")]
+    {
+        config.title_bar_style = tauri::TitleBarStyle::Overlay;
+        config.hidden_title = true;
+        config.traffic_light_position = Some(tauri::utils::config::LogicalPosition { x: 16.0, y: 24.0 });
+    }
+    #[cfg(windows)]
+    {
+        config.decorations = false;
+    }
+    config
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum MainWindowNavigation {
     /// Commit the navigation in the window.
@@ -1982,8 +2144,8 @@ async fn request_tool_approval(
                 &request.tool_name,
                 &api::public_tool_input(&request.tool_name, &request.input),
             ),
-            risk_level: decision.risk_level.label_zh().to_owned(),
-            reason: decision.reason.clone(),
+            risk_level: decision.risk_level.label(policy.ui_language).to_owned(),
+            reason: decision.reason.text(policy.ui_language).to_owned(),
             requester: None,
             // Renderer-initiated calls have no subagent origin.
             source_agent: None,
@@ -2654,6 +2816,15 @@ async fn run_model(
         state.finish_model_run(&request_id, &cancellation);
         state.recheck_task_wake(&wake_conversation_id);
         return Err(error);
+    }
+    if let Ok(settings) = current_global_settings(&app, &state) {
+        helper_model::uses::on_run_started(
+            &state,
+            Path::new(&request.app_data_path),
+            &request.conversation_id,
+            &request.contexts,
+            &settings,
+        );
     }
     let settle_conversation_id = request.conversation_id.clone();
     let state = state.inner().clone();
@@ -3407,6 +3578,10 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
                     }
                 }
             }
+            // Only the background the settings point at is kept; an import the
+            // app quit in the middle of leaves a staging directory behind.
+            background_images::BackgroundImageStore::new(app_data)
+                .reconcile(&document.global_settings.appearance.background_image);
             // Normal deletion occurs in the save transaction; remove only
             // orphaned workflow directories left by an interrupted deletion.
             let reaped = workflow_store::reap_conversation_orphans(app_data, document);
@@ -3456,6 +3631,83 @@ fn image_attachment_upload(
 #[tauri::command]
 fn image_attachment_data(app: AppHandle, image_id: String) -> Result<String, String> {
     image_attachment_store(&app)?.data_url_by_id(&image_id)
+}
+
+/// Adds one tier of a background image being imported; see `background_images`.
+///
+/// A tier is at most 24 MiB, so it is decoded and written on a blocking worker.
+#[cfg(not(test))]
+#[tauri::command]
+async fn background_image_put(
+    app: AppHandle,
+    upload_id: Option<String>,
+    data: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let max_encoded = background_images::MAX_TIER_BYTES
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(4);
+        if data.len() > max_encoded {
+            return Err(format!(
+                "背景图片单级超过 {} MiB",
+                background_images::MAX_TIER_BYTES / 1024 / 1024
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .map_err(|error| format!("背景图片 base64 无效: {error}"))?;
+        background_image_store(&app)?.put(upload_id.as_deref(), &bytes)
+    })
+    .await
+    .map_err(|error| format!("背景图片上传任务失败: {error}"))?
+}
+
+/// Finishes an import. The image the saved settings point at is kept alongside the
+/// new one until the settings stop pointing at it; every other image is removed.
+#[cfg(not(test))]
+#[tauri::command]
+async fn background_image_commit(
+    app: AppHandle,
+    upload_id: String,
+) -> Result<background_images::BackgroundImage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let referenced = document_path(&app)
+            .and_then(|path| app.state::<AppState>().document_store.current_snapshot(&path))
+            .map(|document| document.global_settings.appearance.background_image.clone())
+            .ok()
+            .filter(|id| !id.is_empty());
+        background_image_store(&app)?.commit(&upload_id, referenced.as_deref())
+    })
+    .await
+    .map_err(|error| format!("背景图片保存任务失败: {error}"))?
+}
+
+/// The tier of a background image that covers a window of this many device pixels.
+#[cfg(not(test))]
+#[tauri::command]
+async fn background_image_data(
+    app: AppHandle,
+    image_id: String,
+    width: u32,
+    height: u32,
+) -> Result<background_images::BackgroundImageData, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        background_image_store(&app)?.data(&image_id, width, height)
+    })
+    .await
+    .map_err(|error| format!("背景图片读取任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+fn background_image_store(
+    app: &AppHandle,
+) -> Result<background_images::BackgroundImageStore, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    Ok(background_images::BackgroundImageStore::new(&app_data))
 }
 
 #[cfg(not(test))]
@@ -5846,10 +6098,18 @@ mod prompt_tests {
 
     #[test]
     fn empty_host_sections_contribute_nothing() {
-        for profile in [
-            PromptProfile::builtin_english(),
-            PromptProfile::builtin_chinese(),
-        ] {
+        let file = PromptProfile::from_file(
+            "test".into(),
+            "Test".into(),
+            crate::model::ResolvedLanguage::ZhCn,
+            [(
+                crate::prompt_profile::PromptKey::SystemAppDataDir,
+                "应用数据目录：{path}".to_owned(),
+            )]
+            .into(),
+            Vec::new(),
+        );
+        for profile in [PromptProfile::builtin_english(), file.clone()] {
             assert_eq!(assemble_system_prompt(&profile, "", "", None), "");
             assert_eq!(assemble_system_prompt(&profile, " ", "  \n ", None), "");
             assert_eq!(
@@ -5858,12 +6118,7 @@ mod prompt_tests {
             );
         }
         assert_eq!(
-            assemble_system_prompt(
-                &PromptProfile::builtin_chinese(),
-                "",
-                "",
-                Some("C:/app-data")
-            ),
+            assemble_system_prompt(&file, "", "", Some("C:/app-data")),
             "应用数据目录：C:/app-data"
         );
     }
@@ -5913,7 +6168,7 @@ mod prompt_tests {
         // Only the named tool moves.
         assert_eq!(
             wire_description(&profile, "write"),
-            wire_description(&PromptProfile::builtin_chinese(), "write")
+            wire_description(&PromptProfile::builtin_english(), "write")
         );
     }
 
@@ -5947,14 +6202,14 @@ mod prompt_tests {
         assert_eq!(description_of("read"), "USAGE ONLY");
         assert_eq!(
             wire_description(&profile, "read"),
-            wire_description(&PromptProfile::builtin_chinese(), "read")
+            wire_description(&PromptProfile::builtin_english(), "read")
         );
         // The two halves land on their own carriers rather than being concatenated
         // into one: notes are what the tool is, guidance is how to use it.
         assert_eq!(wire_description(&profile, "write"), "SCHEMA ONLY");
         assert_eq!(description_of("write"), "AND USAGE");
         // A profile with no entries at all leaves both layers alone.
-        let untouched = tool_catalog_with_descriptions(&PromptProfile::builtin_chinese());
+        let untouched = tool_catalog_with_descriptions(&PromptProfile::builtin_english());
         assert_eq!(
             untouched
                 .iter()
@@ -5966,23 +6221,41 @@ mod prompt_tests {
     }
 
     /// The defect this whole slot exists for: selecting a different profile has
-    /// to change what the model is told the tools are. Both built-ins ship with
-    /// no `tools[]` entries, so if the description did not come from the registry
-    /// the two would be byte-identical and switching would do nothing.
+    /// to change what the model is told the tools are. The file below has no
+    /// `tools[]` entries, only `prompts`, so if a description did not come from
+    /// the registry it would read the same as the built-in's and selecting the
+    /// file would do nothing.
     #[test]
-    fn switching_between_the_builtin_profiles_changes_every_tool_description() {
-        let english = PromptProfile::builtin_english();
-        let chinese = PromptProfile::builtin_chinese();
-        assert!(english.tools.is_empty() && chinese.tools.is_empty());
+    fn a_selected_profile_changes_every_tool_description() {
+        let builtin = PromptProfile::builtin_english();
+        let overrides = crate::catalog::tool_catalog()
+            .iter()
+            .map(|tool| {
+                let key = crate::prompt_profile::PromptKey::for_tool_description(&tool.name)
+                    .unwrap_or_else(|| panic!("{} has no description key", tool.name));
+                (key, format!("FILE {}", tool.name))
+            })
+            .collect();
+        let file = PromptProfile::from_file(
+            "test".into(),
+            "Test".into(),
+            crate::model::ResolvedLanguage::EnUs,
+            overrides,
+            Vec::new(),
+        );
+        assert!(builtin.tools.is_empty() && file.tools.is_empty());
         for tool in crate::catalog::tool_catalog() {
-            let en = wire_description(&english, &tool.name);
-            let zh = wire_description(&chinese, &tool.name);
-            assert!(!en.is_empty(), "{} has no English description", tool.name);
-            assert_ne!(en, zh, "{} reads the same under both built-ins", tool.name);
+            let shipped = wire_description(&builtin, &tool.name);
+            let selected = wire_description(&file, &tool.name);
             assert!(
-                zh.chars()
-                    .any(|character| ('\u{4E00}'..='\u{9FFF}').contains(&character)),
-                "{} is not translated in the built-in Chinese profile",
+                !shipped.is_empty(),
+                "{} has no built-in description",
+                tool.name
+            );
+            assert_ne!(selected, shipped, "{} ignores the selected file", tool.name);
+            assert!(
+                selected.contains(&format!("FILE {}", tool.name)),
+                "{}: {selected}",
                 tool.name
             );
         }
@@ -6004,7 +6277,7 @@ mod prompt_tests {
         }];
         let profile = profile_with(entries.to_vec(), crate::model::ResolvedLanguage::EnUs);
         assert_eq!(wire_description(&profile, "read"), "CUSTOM ENGLISH DEFAULT");
-        // A file overriding one tool leaves the rest on its language's built-in.
+        // A file overriding one tool leaves the rest on the built-in.
         assert_eq!(
             wire_description(&profile, "write"),
             wire_description(&PromptProfile::builtin_english(), "write")
@@ -6067,6 +6340,7 @@ mod authoritative_contexts_tests {
             run_target: None,
             additional_directories: Vec::new(),
             parent_conversation_id: None,
+            fork_of: None,
             preset_id: String::new(),
             template_id: String::new(),
             attached_workspaces: Vec::new(),
@@ -6533,6 +6807,9 @@ struct TrustedConversationPolicy {
     /// worded by the same profile; resolving it here keeps the IPC path from
     /// silently falling back to the built-in English wording.
     prompt_profile: prompt_profile::PromptProfile,
+    /// The app's UI language, which words the approval card. The profile above
+    /// is the model's language and may differ.
+    ui_language: crate::model::ResolvedLanguage,
 }
 
 #[cfg(not(test))]
@@ -6830,6 +7107,7 @@ fn trusted_conversation_policy_from_document(
         run_environment,
         workspaces,
         prompt_profile,
+        ui_language: document.global_settings.resolved_app_language,
     })
 }
 
@@ -8041,16 +8319,13 @@ pub fn run() {
                 app.state::<AppState>()
                     .install_attestation_key(app_data)
                     .map_err(std::io::Error::other)?;
-                // The two built-in prompt profiles live on disk as editable
-                // files; a damaged one is reported, not fatal, because the
-                // compiled copy still serves every run.
-                if let Err(error) = prompt_profile_files::materialize_builtin_profiles(app_data) {
-                    eprintln!("内置提示词档案未能落盘：{error}");
-                }
                 browser_file_preview::sweep_orphans(app_data);
                 install_machine_links(app.handle(), app_data);
             }
             reconcile_image_attachments_on_startup(app.handle()).map_err(std::io::Error::other)?;
+            if let Ok(local_data) = app.path().app_local_data_dir() {
+                app.state::<AppState>().helper_model.initialize(helper_model::root_dir(&local_data));
+            }
             install_background_write_failure_reporting(app.state::<AppState>().inner());
             app.state::<AppState>()
                 .browser
@@ -8065,6 +8340,7 @@ pub fn run() {
                 .iter()
                 .find(|window| window.label == BROWSER_RENDERER_MOUNT_MAIN_LABEL)
                 .cloned()
+                .map(main_window_chrome)
                 .ok_or_else(|| std::io::Error::other("缺少 main WebView 配置"))?;
             if main_window.create {
                 return Err(std::io::Error::other(
@@ -8106,6 +8382,14 @@ pub fn run() {
                 })
                 .build()
                 .map_err(std::io::Error::other)?;
+            // An arrow the page leaves unhandled would otherwise be typed into the
+            // field as a box (see app_keys).
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window(BROWSER_RENDERER_MOUNT_MAIN_LABEL) {
+                if let Err(error) = app_keys::install(&window) {
+                    eprintln!("无法拦截网页未处理的按键，方向键可能在输入框里打出方块：{error}");
+                }
+            }
             // The process outlives its window from here on: closing the window
             // hides it and the tray is the way back in or out. Without a tray
             // the close handler keeps quitting, so a failure here is only logged.

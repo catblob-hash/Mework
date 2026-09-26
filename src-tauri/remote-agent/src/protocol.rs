@@ -500,6 +500,14 @@ pub struct ExitInfo {
     /// Final length of each output stream: the host has everything once it
     /// has received this much.
     pub ends: StreamEnds,
+    /// How long the process ran, from its start to its reaping, by the
+    /// agent's own monotonic clock. The host's view of the same span also
+    /// holds the round trips, the draining of output the process wrote last,
+    /// and any time the link was down before this reached it; this one holds
+    /// none of that, and needs no agreement between the two machines' clocks.
+    /// `None` from an agent older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

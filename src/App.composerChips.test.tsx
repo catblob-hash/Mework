@@ -1,6 +1,6 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import App from "./App";
 import type { GitTarget, GitWorkspaceSnapshot } from "./lib/git";
 import type { AppDocument, MachineShells, ShellBackend } from "./types";
@@ -117,11 +117,6 @@ function devbox() {
   };
 }
 
-/** The seed project's name, which is what the composer's terminal button names its workspace by. */
-function document_workspaceName(): string {
-  return "Mework";
-}
-
 /** Wait for and return the branch chip in the input header row. */
 async function branchChip(branch: string) {
   return await screen.findByRole("button", { name: `分支：${branch}` });
@@ -165,6 +160,50 @@ describe("composer context chips", () => {
     expect(box).not.toContainElement(row as HTMLElement);
     expect(row!.closest(".composer-wrap")).toBe(box!.closest(".composer-wrap"));
     expect(row!.compareDocumentPosition(box!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("opens every chip's menu above it, its bottom-left corner on the chip's top-left", async () => {
+    // jsdom lays nothing out. Stand each chip low enough that its menu would fit below it too, so
+    // only the chips' own choice of side puts the menus above.
+    const chip = { left: 120, top: 300, width: 90, height: 25 };
+    const panel = { left: 0, top: 0, width: 200, height: 120 };
+    const layout = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement
+    ) {
+      const box = this.classList.contains("popover-menu__panel")
+        ? panel
+        : this.getAttribute("aria-haspopup") === "menu" && this.closest(".composer-context")
+          ? chip
+          : { left: 0, top: 0, width: 0, height: 0 };
+      return {
+        ...box,
+        x: box.left,
+        y: box.top,
+        right: box.left + box.width,
+        bottom: box.top + box.height,
+        toJSON: () => box
+      } as DOMRect;
+    });
+    onTestFinished(() => layout.mockRestore());
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await branchChip("main");
+
+    for (const [trigger, menuName] of [
+      [/^项目：/, "选择项目"],
+      [/^工作区：/, "选择工作区"],
+      ["分支：main", "切换分支"],
+      ["附加工作区", "在哪台机器上选目录"]
+    ] as const) {
+      await user.click(screen.getByRole("button", { name: trigger }));
+      const menu = await screen.findByRole("menu", { name: menuName });
+      expect(menu).toHaveClass("popover-menu__panel--flipped");
+      expect(menu.style.left).toBe(`${chip.left}px`);
+      expect(menu.style.top).toBe(`${chip.top - 6 - panel.height}px`);
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("menu", { name: menuName })).toBeNull());
+    }
   });
 
   it("hides the project chip once the conversation has started", async () => {
@@ -322,37 +361,6 @@ describe("composer context chips", () => {
     expect(within(reopened).getAllByRole("tab")[1]).toHaveAttribute("aria-selected", "true");
   });
 
-  it("opens a terminal in the selected workspace with a shell its machine was probed to have", async () => {
-    machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["zsh", "sh", "bash"]) };
-    const document = documentWithWslWorkspace();
-    runtimeMocks.loadDocument.mockResolvedValue(document);
-    const user = userEvent.setup();
-    render(<App />);
-    await screen.findByLabelText("向 Agent 发送消息");
-
-    // The terminal button under the input is gone; this one, beside the workspace chip, is it.
-    expect(screen.queryAllByRole("button", { name: "终端" })
-      .filter((button) => button.classList.contains("composer-option"))).toEqual([]);
-
-    await user.click(screen.getByRole("button", { name: /^工作区：/ }));
-    await user.click(within(await screen.findByRole("menu", { name: "选择工作区" }))
-      .getByRole("menuitemradio", { name: /^services/ }));
-
-    // The distribution's probed shells, in WSL's priority order, then the pane — and nothing in
-    // the menu opens a menu of its own.
-    await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
-    const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
-    await waitFor(() => expect(menuTexts(menu)).toEqual(["bash", "zsh", "sh", "打开终端面板"]));
-    expect(within(menu).queryAllByRole("menuitem")
-      .filter((item) => item.hasAttribute("aria-haspopup"))).toEqual([]);
-    await user.click(within(menu).getByRole("menuitem", { name: "sh" }));
-
-    const conversationId = document.workspaces[0].conversations[0].id;
-    const panel = window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`);
-    expect(panel).toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "sh" }));
-    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh 1"]);
-  });
-
   it("opens the pane on the selected workspace's most preferred shell when it has no terminal", async () => {
     machineShellProbes.current = { "wsl:Ubuntu": probe("wsl", ["zsh", "bash"]) };
     const document = documentWithWslWorkspace();
@@ -364,10 +372,13 @@ describe("composer context chips", () => {
     await user.click(screen.getByRole("button", { name: /^工作区：/ }));
     await user.click(within(await screen.findByRole("menu", { name: "选择工作区" }))
       .getByRole("menuitemradio", { name: /^services/ }));
-    await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
-    const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
-    await waitFor(() => expect(menuTexts(menu)[0]).toBe("bash"));
-    await user.click(within(menu).getByRole("menuitem", { name: "打开终端面板" }));
+    const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
+    await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+    const menu = await screen.findByRole("menu", { name: "新建终端" });
+    // The distribution's probe has arrived once its shells show beside it.
+    await user.click(within(menu).getByRole("menuitem", { name: /^services/ }));
+    await waitFor(() => expect(menuTexts(screen.getByRole("menu", { name: "services" }))[0]).toBe("bash"));
+    await user.click(within(menu).getByRole("menuitem", { name: "显示终端面板" }));
 
     // No default "Terminal" page: the pane opens on a real shell, in the workspace chosen.
     const conversationId = document.workspaces[0].conversations[0].id;
@@ -376,8 +387,8 @@ describe("composer context chips", () => {
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["bash 1"]);
 
     // The same row now puts the pane away rather than adding a terminal.
-    await user.click(screen.getByRole("button", { name: "在 services 打开终端" }));
-    await user.click(within(await screen.findByRole("menu", { name: "用哪个 shell" }))
+    await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+    await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
       .getByRole("menuitem", { name: "收起终端面板" }));
     expect(screen.queryAllByRole("tab")).toEqual([]);
     expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-2`)).toBeNull();
@@ -390,10 +401,10 @@ describe("composer context chips", () => {
       render(<App />);
       await screen.findByLabelText("向 Agent 发送消息");
 
-      const project = document_workspaceName();
-      await user.click(screen.getByRole("button", { name: `在 ${project} 打开终端` }));
-      const menu = await screen.findByRole("menu", { name: "用哪个 shell" });
-      expect(menuTexts(menu)).toEqual(["PowerShell", "bash", "打开终端面板"]);
+      const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
+      await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+      const menu = await screen.findByRole("menu", { name: "新建终端" });
+      expect(menuTexts(menu)).toEqual(["PowerShell", "bash", "显示终端面板"]);
     } finally {
       platform.mockRestore();
     }
@@ -604,9 +615,9 @@ describe("composer context chips", () => {
     expect(add.closest(".composer-context")).toBe(
       screen.getByRole("button", { name: /^项目：/ }).closest(".composer-context")
     );
-    // The terminal button sits immediately before it.
-    const terminal = screen.getByRole("button", { name: /打开终端$/ });
-    expect(terminal.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Opening a terminal is the top bar's; this row only says where things run.
+    expect(within(add.closest(".composer-context") as HTMLElement)
+      .queryByRole("button", { name: /终端/ })).toBeNull();
 
     await user.click(add);
     const menu = await screen.findByRole("menu", { name: "在哪台机器上选目录" });

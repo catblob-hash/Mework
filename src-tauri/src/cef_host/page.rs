@@ -750,10 +750,10 @@ fn host_view(host: &BrowserHost) -> Option<&'static NSView> {
 
 /// Places `view` at `frame`, which is in the trusted renderer's coordinates: CSS pixels from the
 /// top-left of the React WKWebView's viewport, as the pane measures its page box. That viewport
-/// is not the webview's frame. Under a standard title bar the content view — and the webview
-/// filling it — spans the whole window, and WebKit insets its viewport by the title bar's safe
-/// area; the page box is therefore resolved against the webview's safe-area rect, converted to
-/// the coordinates of the superview the page shares with it.
+/// is not always the webview's frame: when the content view — and the webview filling it — runs
+/// under the title bar, the title bar's height is safe-area inset, and whether WebKit's viewport
+/// honours it depends on the bar (see `renderer_viewport`). The page box is resolved against
+/// that viewport, converted to the coordinates of the superview the page shares with it.
 fn set_view_frame(view: &NSView, frame: LogicalFrame) {
     let Some(parent) = (unsafe { view.superview() }) else {
         return;
@@ -771,15 +771,29 @@ fn set_view_frame(view: &NSView, frame: LogicalFrame) {
     ));
 }
 
-/// The trusted renderer's CSS viewport — the safe-area rect of the WKWebView sibling every page
-/// shares its superview with — in that superview's coordinates.
+/// The trusted renderer's CSS viewport, in the coordinates of the superview every page shares
+/// with the React WKWebView.
+///
+/// Under an opaque title bar WebKit insets its viewport by the webview's safe area, so the
+/// viewport is the safe-area rect. Under a transparent one — the main window's on macOS, see
+/// `main_window_chrome` in `lib.rs` — the page runs to the window's top edge beneath the traffic
+/// lights while the safe area still stops at the title bar's bottom, so the viewport is the
+/// webview's whole bounds; the safe-area rect would put every page a title bar too high.
 fn renderer_viewport(parent: &NSView) -> Option<NSRect> {
     let webview_class = AnyClass::get(c"WKWebView")?;
     let subviews = parent.subviews();
     let webview = subviews
         .iter()
         .find(|subview| subview.isKindOfClass(webview_class))?;
-    Some(parent.convertRect_fromView(webview.safeAreaRect(), Some(&webview)))
+    let under_transparent_title_bar = webview
+        .window()
+        .is_some_and(|window| window.titlebarAppearsTransparent());
+    let viewport = if under_transparent_title_bar {
+        webview.bounds()
+    } else {
+        webview.safeAreaRect()
+    };
+    Some(parent.convertRect_fromView(viewport, Some(&webview)))
 }
 
 fn remove_view_now(browser: &Browser) {

@@ -1,6 +1,5 @@
 import { BookOpen, ExternalLink } from "lucide-react";
 import { useI18n } from "../i18n";
-import type { ToolFamilyId } from "./ToolFamilySettings";
 
 /**
  * A one-line link to the published configuration documentation.
@@ -75,14 +74,4 @@ function ToolDocsAnchor({ path, label }: { path: string; label: string }) {
  */
 export function ToolDocsLink({ name, label }: { name: string; label: string }) {
   return <ToolDocsAnchor path={`tools/${encodeURIComponent(name)}.html`} label={label} />;
-}
-
-/**
- * The head of a tool family's section on the tools page, for the one picker row
- * that stands for the whole family. scripts/build-site.mjs keeps a heading with
- * the family's id there and refuses to build a page that lists the family's
- * tools anywhere else.
- */
-export function ToolFamilyDocsLink({ family, label }: { family: ToolFamilyId; label: string }) {
-  return <ToolDocsAnchor path={`tools.html#${encodeURIComponent(family)}`} label={label} />;
 }

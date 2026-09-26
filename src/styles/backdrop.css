@@ -1,0 +1,118 @@
+/*
+ * Custom background (Appearance → Custom background).
+ *
+ * `AppBackdrop` paints the user's picture as a fixed layer at `z-index: -1`, which
+ * sits above the canvas and beneath every box in the window — so the surfaces that
+ * used to paint the theme's ground (`body`, the frame, the shell, the main pane, the
+ * tile gutter) turn transparent, and the ones that hold content turn to glass: a
+ * tinted, blurred pane with a light edge and a faint top-lit sheen. The tint is the
+ * surface's own palette colour at partial alpha, so light and dark glass come from
+ * the same night mirror as everything else.
+ *
+ * Kept deliberately quiet: no refraction, no animated highlights, and enough tint
+ * that text reads the same as it does on the plain theme.
+ */
+:root[data-backdrop="image"] {
+  --glass-blur: 22px;
+  --glass-saturate: 130%;
+  --glass-tile: var(--color-f7f7f5-ap78);
+  --glass-pane: var(--color-efefeb-ap80);
+  --glass-frame: var(--color-efefeb-ap66);
+  --glass-edge: var(--color-ffffff-ap45);
+  --glass-sheen: var(--color-ffffff-ap28);
+  --glass-shadow: var(--color-000000-ap13);
+}
+/* Mirroring would turn the edge and sheen dark and the shadow light; night glass
+   still catches light on its rim and still casts a shadow, so it takes the tokens
+   whose night side is the light (or dark) one. Dark glass over a bright picture lets
+   far more colour through than light glass does, so it is also a little denser. */
+:root[data-backdrop="image"][data-theme="night"] {
+  --glass-tile: var(--color-f7f7f5-ap84);
+  --glass-pane: var(--color-efefeb-ap86);
+  --glass-frame: var(--color-efefeb-ap74);
+  --glass-edge: var(--color-000000-ap13);
+  --glass-sheen: var(--color-000000-ap6);
+  --glass-shadow: var(--color-ffffff-ap34);
+}
+/* `[data-theme]` outranks base.css's night gutter, which is declared at the same weight. */
+:root[data-backdrop="image"][data-theme] { --gutter: transparent; }
+
+.app-backdrop {
+  position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none;
+  background: var(--app);
+}
+.app-backdrop__image {
+  width: 100%; height: 100%; display: block;
+  object-fit: cover; object-position: center;
+  user-select: none;
+  animation: app-backdrop-in .42s ease-out;
+}
+@keyframes app-backdrop-in { from { opacity: 0; } }
+
+:root[data-backdrop="image"] body,
+:root[data-backdrop="image"] .window-frame,
+:root[data-backdrop="image"] .app-shell,
+:root[data-backdrop="image"] .main-pane,
+:root[data-backdrop="image"] .topbar { background: transparent; }
+
+/* The top bar sits on the picture itself. A strip of frame glass behind it, fading out
+   downwards, keeps its title and buttons legible on any picture without boxing the
+   bar in. The strip is a pseudo-element so the mask does not reach the bar's content;
+   the content is lifted over it. */
+:root[data-backdrop="image"] .topbar { position: relative; }
+:root[data-backdrop="image"] .topbar > * { position: relative; z-index: 1; }
+:root[data-backdrop="image"] .topbar::before {
+  content: ""; position: absolute; inset: 0 0 -8px; pointer-events: none;
+  background: var(--glass-frame);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  /* A mask reads only alpha; any opaque token will do. */
+  -webkit-mask-image: linear-gradient(180deg, var(--color-000000) 45%, transparent);
+  mask-image: linear-gradient(180deg, var(--color-000000) 45%, transparent);
+}
+
+/* The glass itself. Both spellings: WebKit before Safari 18 only knows the prefixed one. */
+:root[data-backdrop="image"] .sidebar,
+:root[data-backdrop="image"] .window-titlebar,
+:root[data-backdrop="image"] .pane-tiles > .pane-tiles__chat,
+:root[data-backdrop="image"] .side-pane {
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+}
+
+/* The frame — sidebar, and the Windows title bar above it — is the thinnest glass, so
+   the picture reads through it most. */
+:root[data-backdrop="image"] .sidebar {
+  background: linear-gradient(180deg, var(--glass-sheen), transparent 30%), var(--glass-frame);
+  border-right-color: var(--glass-edge);
+}
+:root[data-backdrop="image"] .window-titlebar { background: var(--glass-frame); }
+
+/* Tiles: the conversation and every side pane. */
+:root[data-backdrop="image"] .pane-tiles > .pane-tiles__chat {
+  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-tile);
+  box-shadow:
+    inset 0 0 0 1px var(--glass-edge),
+    0 10px 30px var(--glass-shadow);
+}
+:root[data-backdrop="image"] .side-pane {
+  border-color: var(--glass-edge);
+  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-pane);
+  box-shadow: 0 10px 30px var(--glass-shadow);
+}
+
+/* Pane contents that painted the ground over their tile now let the glass through. */
+:root[data-backdrop="image"] .subagent-panel-content,
+:root[data-backdrop="image"] .git-review-panel,
+:root[data-backdrop="image"] .conversation-settings__page { background: transparent; }
+
+/* The scrim under the composer's floating context row faded cards into the theme's
+   ground; over glass it would paint a band of doubled tint, so the timeline itself
+   fades out over the same 46px instead and the glass shows through. The stops match
+   the scrim's: clear 46px above the composer, gone 12px above it. */
+:root[data-backdrop="image"] .composer-wrap { background: transparent; }
+:root[data-backdrop="image"] .composer-wrap::before { display: none; }
+:root[data-backdrop="image"] .conversation-pane .context-scroll {
+  -webkit-mask-image: linear-gradient(180deg, var(--color-000000) calc(100% - 46px), transparent calc(100% - 12px));
+  mask-image: linear-gradient(180deg, var(--color-000000) calc(100% - 46px), transparent calc(100% - 12px));
+}

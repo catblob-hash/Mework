@@ -21,7 +21,6 @@ import {
 import { ASK_USER_PENDING_OUTPUT, createTestDocument as createSeedDocument } from "./fixtures";
 import { configureI18n } from "../i18n";
 import { CONVERSATION_TURNS_STORAGE_KEY } from "../lib/conversationTurns";
-import { SIDEBAR_COLLAPSED_PARENTS_STORAGE_KEY } from "../components/Sidebar";
 import { previewPaneId, sidePaneDomId } from "../lib/sidePanes";
 import type {
   AppDocument,
@@ -496,7 +495,6 @@ export function resetAppMocks() {
   window.localStorage.removeItem("mework.sidebar-width");
   window.localStorage.removeItem("naiword.sidebar-width");
   window.localStorage.removeItem(CONVERSATION_TURNS_STORAGE_KEY);
-  window.localStorage.removeItem(SIDEBAR_COLLAPSED_PARENTS_STORAGE_KEY);
   Object.defineProperty(window, "innerWidth", {
     configurable: true,
     writable: true,

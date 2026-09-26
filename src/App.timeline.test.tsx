@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -429,11 +429,12 @@ describe("App model run flow — timeline", () => {
     const branch = conversations.find((candidate) => candidate.id !== conversation.id)!;
     expect(branch.contexts.map((context) => context.id))
       .toEqual(["copied-sys", "copied-u1", "copied-a1"]);
-    // ...nests under the conversation it came from in the sidebar...
+    // ...remembers where it came from, yet the sidebar lists it as an ordinary conversation...
     expect(branch.parentConversationId).toBe(conversation.id);
     const parentRow = window.document.querySelector(`[data-conversation-id="${conversation.id}"]`) as HTMLElement;
-    expect(within(parentRow).getByRole("button", { name: "收起子会话" })).toBeInTheDocument();
-    expect(window.document.querySelector(`[data-conversation-id="${branch.id}"]`)).toHaveClass("conversation-row--nested");
+    const branchRow = window.document.querySelector(`[data-conversation-id="${branch.id}"]`) as HTMLElement;
+    expect(branchRow.parentElement).toBe(parentRow.parentElement);
+    expect(within(parentRow).queryByRole("button", { name: "收起子会话" })).toBeNull();
 
     // ...and the original is untouched.
     const original = conversations.find((candidate) => candidate.id === conversation.id)!;
@@ -482,6 +483,73 @@ describe("App model run flow — timeline", () => {
         (candidate) => candidate.contexts.some((context) => context.id === "order-copied-a1")
       )
     ))).toBe(true));
+  });
+
+  it("forks the timeline above the insertion line into a conversation named after its origin", async () => {
+    const document = documentWithModel();
+    const conversation = document.workspaces[0].conversations[0];
+    conversation.title = "修复登录";
+    conversation.settings.enabledTools = ["read"];
+    conversation.contexts = [
+      { id: "fork-u1", kind: "user", content: "第一问", createdAt: "2026-07-20T00:00:01Z" },
+      { id: "fork-a1", kind: "assistant", content: "第一答", createdAt: "2026-07-20T00:00:02Z" },
+      { id: "fork-u2", kind: "user", content: "第二问", createdAt: "2026-07-20T00:00:03Z" }
+    ];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.forkConversationContexts.mockImplementation(async ({ sourceContexts, throughContextId }) => {
+      const cut = sourceContexts.findIndex((context) => context.id === throughContextId);
+      const copy = runtimeMocks.forkConversationContexts.mock.calls.length;
+      return sourceContexts.slice(0, cut + 1).map((context) => ({ ...context, id: `${context.id}-copy${copy}` }));
+    });
+    const saved = () => runtimeMocks.saveDocument.mock.calls
+      .map(([snapshot]) => snapshot as AppDocument)
+      .at(-1)?.workspaces[0].conversations ?? [];
+    const savedTitled = (title: string) => saved().find((candidate) => candidate.title === title);
+
+    const user = userEvent.setup();
+    render(<App />);
+    const answer = (await screen.findByText("第一答")).closest("article")!;
+    const header = window.document.querySelector<HTMLElement>(".topbar")!;
+    // The lower half of the answer puts the line under it.
+    fireEvent.contextMenu(answer, { clientX: 40, clientY: 1 });
+    await user.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: "分叉会话" }));
+
+    expect(await within(header).findByRole("button", { name: "对话标题：修复登录-fork-1，点击重命名" })).toBeInTheDocument();
+    await waitFor(() => expect(runtimeMocks.forkConversationContexts).toHaveBeenCalledTimes(1));
+    expect(runtimeMocks.forkConversationContexts.mock.calls[0][0]).toMatchObject({
+      sourceConversationId: conversation.id,
+      throughContextId: "fork-a1"
+    });
+    await waitFor(() => expect(savedTitled("修复登录-fork-1")?.contexts.map((context) => context.id))
+      .toEqual(["fork-u1-copy1", "fork-a1-copy1"]));
+    const first = savedTitled("修复登录-fork-1")!;
+    expect(first.forkOf).toEqual({ conversationId: conversation.id, number: 1 });
+    // It carries on the source's work, so it keeps the source's settings.
+    expect(first.settings.enabledTools).toEqual(["read"]);
+    // Nothing is handed to the composer, and the source keeps its whole timeline.
+    expect(screen.getByRole("textbox", { name: "向 Agent 发送消息" })).toHaveValue("");
+    expect(saved().find((candidate) => candidate.id === conversation.id)?.contexts).toHaveLength(3);
+
+    // A fork of the fork is numbered and named under the same origin.
+    fireEvent.contextMenu(window.document.querySelector(".context-stream")!, { clientX: 40, clientY: 400 });
+    await user.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: "分叉会话" }));
+    expect(await within(header).findByRole("button", { name: "对话标题：修复登录-fork-2，点击重命名" })).toBeInTheDocument();
+    await waitFor(() => expect(runtimeMocks.forkConversationContexts).toHaveBeenCalledTimes(2));
+    expect(runtimeMocks.forkConversationContexts.mock.calls[1][0]).toMatchObject({
+      sourceConversationId: first.id,
+      throughContextId: "fork-a1-copy1"
+    });
+    await waitFor(() => expect(savedTitled("修复登录-fork-2")?.forkOf)
+      .toEqual({ conversationId: conversation.id, number: 2 }));
+
+    // Renaming the origin renames its forks.
+    const originRow = window.document.querySelector<HTMLElement>(`[data-conversation-id="${conversation.id}"]`)!;
+    await user.click(within(originRow).getByText("修复登录"));
+    await user.click(within(header).getByRole("button", { name: "对话标题：修复登录，点击重命名" }));
+    await user.clear(within(header).getByRole("textbox", { name: "对话标题" }));
+    await user.keyboard("修复注册{Enter}");
+    await waitFor(() => expect(saved().map((candidate) => candidate.title))
+      .toEqual(expect.arrayContaining(["修复注册", "修复注册-fork-1", "修复注册-fork-2"])));
   });
 
   it("branches the first message into an empty conversation without copying history", async () => {

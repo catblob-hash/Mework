@@ -1,4 +1,4 @@
-import { Minus, Monitor, Moon, Plus, RotateCcw, Sun } from "lucide-react";
+import { ImagePlus, LoaderCircle, Minus, Plus, RotateCcw } from "lucide-react";
 import type { ChangeEvent, JSX, PointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { resolveApplicationLanguage, useI18n } from "../../i18n";
@@ -16,6 +16,11 @@ import {
   UI_FONT_PRESETS,
   ZOOM_STEP
 } from "../../lib/appearance";
+import {
+  backgroundImageData,
+  importBackgroundImage,
+  useBackgroundImportGeneration
+} from "../../lib/backgroundImage";
 import { bindingsConflict, shortcutKeyCaps } from "../../lib/shortcuts";
 import type {
   AppearancePreferences,
@@ -26,6 +31,9 @@ import type {
 } from "../../types";
 import { IconButton, Switch } from "../Common";
 import { SettingsPageHeading } from "../SettingsPageHeading";
+import { LocalModelSettings } from "./LocalModelSettings";
+import { SettingRow, SettingsCard } from "./rows";
+import { ThemeSample } from "./ThemeSample";
 import "./AppearanceSettings.css";
 
 type AppearanceSettingsProps = {
@@ -38,53 +46,6 @@ type AppearanceSettingsProps = {
 type AppearanceUpdater = (
   current: AppearancePreferences
 ) => AppearancePreferences;
-
-function SettingsCard({
-  title,
-  children
-}: {
-  title: string;
-  children: React.ReactNode;
-}): JSX.Element {
-  return (
-    <section className="settings-card">
-      <div className="settings-card__heading">
-        <div>
-          <span>
-            <strong>{title}</strong>
-          </span>
-        </div>
-      </div>
-      <div className="appearance-settings-page__card-body">{children}</div>
-    </section>
-  );
-}
-
-function SettingRow({
-  title,
-  description,
-  children,
-  vertical = false
-}: {
-  title: string;
-  description?: string;
-  children: React.ReactNode;
-  vertical?: boolean;
-}): JSX.Element {
-  return (
-    <div
-      className={`appearance-settings-page__row${
-        vertical ? " appearance-settings-page__row--vertical" : ""
-      }`}
-    >
-      <div className="appearance-settings-page__row-copy">
-        <strong>{title}</strong>
-        {description && <small>{description}</small>}
-      </div>
-      <div className="appearance-settings-page__row-control">{children}</div>
-    </div>
-  );
-}
 
 function FontCombobox({
   label,
@@ -223,6 +184,13 @@ export function AppearanceSettings({
     appearance.messageFontSize
   );
   const committedFontSizeRef = useRef(appearance.messageFontSize);
+  const pictureInputRef = useRef<HTMLInputElement>(null);
+  const [importingPicture, setImportingPicture] = useState(false);
+  const [pictureError, setPictureError] = useState<string | null>(null);
+  const [picturePreview, setPicturePreview] = useState<{ id: string; dataUrl: string } | null>(null);
+  /** The saved picture's id when its files could not be read back; choosing it re-picks. */
+  const [unreadablePicture, setUnreadablePicture] = useState<string | null>(null);
+  const importGeneration = useBackgroundImportGeneration();
 
   useEffect(() => {
     setColorDraft(appearance.themeColor);
@@ -232,6 +200,32 @@ export function AppearanceSettings({
     setFontSizeDraft(appearance.messageFontSize);
     committedFontSizeRef.current = appearance.messageFontSize;
   }, [appearance.messageFontSize]);
+
+  // The custom-background card shows the picture itself; the smallest tier is plenty.
+  useEffect(() => {
+    const imageId = appearance.backgroundImage;
+    if (!imageId) {
+      setPicturePreview(null);
+      return;
+    }
+    // Re-read after any import, which may have restored this very id's files.
+    void importGeneration;
+    let cancelled = false;
+    backgroundImageData(imageId, 480, 270)
+      .then((tier) => {
+        if (cancelled) return;
+        setPicturePreview({ id: imageId, dataUrl: tier.dataUrl });
+        setUnreadablePicture(null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setPicturePreview(null);
+        setUnreadablePicture(imageId);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [appearance.backgroundImage, importGeneration]);
 
   const updateAppearance = (update: AppearanceUpdater): void => {
     onChange((current) => ({
@@ -247,8 +241,67 @@ export function AppearanceSettings({
     updateAppearance((current) => ({ ...current, [key]: value }));
   };
 
+  /** A plain theme card: that scheme, and no picture behind the window. */
   const setTheme = (theme: ThemePreference): void => {
+    onChange((current) => ({
+      ...current,
+      theme,
+      appearance: current.appearance.customBackground
+        ? { ...current.appearance, customBackground: false }
+        : current.appearance
+    }));
+  };
+
+  /** Glass tone under a custom background: the same preference, without leaving the picture. */
+  const setGlassTone = (theme: ThemePreference): void => {
     onChange((current) => ({ ...current, theme }));
+  };
+
+  const pickPicture = (): void => {
+    if (importingPicture) return;
+    pictureInputRef.current?.click();
+  };
+
+  const pictureAvailable = appearance.backgroundImage !== ""
+    && unreadablePicture !== appearance.backgroundImage;
+
+  const chooseCustomBackground = (): void => {
+    if (pictureAvailable) setAppearanceValue("customBackground", true);
+    else pickPicture();
+  };
+
+  const importPicture = async (file: File): Promise<void> => {
+    setImportingPicture(true);
+    setPictureError(null);
+    try {
+      const image = await importBackgroundImage(file);
+      updateAppearance((current) => ({
+        ...current,
+        customBackground: true,
+        backgroundImage: image.id
+      }));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      setPictureError(
+        reason === "unreadable"
+          ? t(
+            "无法读取这张图片，请换一张 PNG、JPEG、WebP 或 HEIC 图片。",
+            "This picture can't be read. Try a PNG, JPEG, WebP or HEIC file."
+          )
+          : t("背景图片导入失败：{reason}", "Couldn't import the picture: {reason}", { reason })
+      );
+    } finally {
+      setImportingPicture(false);
+    }
+  };
+
+  const removePicture = (): void => {
+    setPictureError(null);
+    updateAppearance((current) => ({
+      ...current,
+      customBackground: false,
+      backgroundImage: ""
+    }));
   };
 
   const setLanguage = (appLanguage: AppLanguage): void => {
@@ -282,15 +335,15 @@ export function AppearanceSettings({
     : t("英语", "English");
   const normalizedThemeColor = normalizeHexColor(appearance.themeColor) ?? "";
   const colorPickerValue = normalizedThemeColor || THEME_COLOR_PRESETS[0];
-  const themeChoices: Array<{
-    value: ThemePreference;
-    label: string;
-    icon: typeof Sun;
-  }> = [
-    { value: "day", label: t("浅色", "Light"), icon: Sun },
-    { value: "night", label: t("深色", "Dark"), icon: Moon },
-    { value: "system", label: t("跟随系统", "Follow system"), icon: Monitor }
+  const customBackgroundActive = appearance.customBackground && appearance.backgroundImage !== "";
+  const themeChoices: Array<{ value: ThemePreference; label: string }> = [
+    { value: "day", label: t("浅色", "Light") },
+    { value: "night", label: t("深色", "Dark") },
+    { value: "system", label: t("跟随系统", "Follow system") }
   ];
+  const shownPicture = picturePreview?.id === appearance.backgroundImage
+    ? picturePreview.dataUrl
+    : null;
   const newlineChoices = COMPOSER_SHORTCUT_CHOICES.filter(
     (choice) => !bindingsConflict(choice, appearance.sendShortcut)
   );
@@ -302,28 +355,112 @@ export function AppearanceSettings({
         description={t("主题、字体与消息渲染。", "Theme, fonts, and message rendering.")}
       />
 
-      <SettingsCard title={t("主题", "Theme")}>
+      <SettingsCard label={t("主题", "Theme")}>
         <SettingRow title={t("主题", "Theme")} vertical>
-          <div className="appearance-settings-page__theme-grid">
-            {themeChoices.map((choice) => {
-              const ThemeIcon = choice.icon;
-              return (
+          <div className="appearance-settings-page__themes">
+            <div className="appearance-settings-page__theme-grid">
+              {themeChoices.map((choice) => (
                 <button
                   key={choice.value}
                   type="button"
                   className="appearance-settings-page__theme-preview"
-                  aria-pressed={settings.theme === choice.value}
+                  aria-pressed={!customBackgroundActive && settings.theme === choice.value}
                   onClick={() => setTheme(choice.value)}
                 >
-                  <span className="appearance-settings-page__theme-preview-surface">
-                    <ThemeIcon size={19} />
-                  </span>
+                  {choice.value === "system" ? (
+                    <span className="appearance-settings-page__theme-preview-surface appearance-settings-page__theme-preview-surface--split">
+                      <ThemeSample scheme="current" />
+                      <ThemeSample scheme="opposite" className="theme-sample--second-half" />
+                    </span>
+                  ) : (
+                    <span className="appearance-settings-page__theme-preview-surface">
+                      <ThemeSample scheme={choice.value} />
+                    </span>
+                  )}
                   <strong>{choice.label}</strong>
                 </button>
-              );
-            })}
+              ))}
+              <button
+                type="button"
+                className="appearance-settings-page__theme-preview"
+                aria-pressed={customBackgroundActive}
+                aria-busy={importingPicture || undefined}
+                disabled={importingPicture}
+                onClick={chooseCustomBackground}
+              >
+                <span className="appearance-settings-page__theme-preview-surface">
+                  <ThemeSample scheme="current" glass picture={shownPicture} />
+                  {(importingPicture || !pictureAvailable) && (
+                    <span className="appearance-settings-page__theme-badge">
+                      {importingPicture
+                        ? <LoaderCircle size={15} className="spin" />
+                        : <ImagePlus size={15} />}
+                    </span>
+                  )}
+                </span>
+                <strong>{t("自定义背景", "Custom background")}</strong>
+              </button>
+            </div>
+            <input
+              ref={pictureInputRef}
+              type="file"
+              accept="image/*"
+              hidden
+              tabIndex={-1}
+              aria-hidden="true"
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                event.currentTarget.value = "";
+                if (file) void importPicture(file);
+              }}
+            />
+            {pictureError && (
+              <p className="appearance-settings-page__theme-error" role="alert">{pictureError}</p>
+            )}
           </div>
         </SettingRow>
+        {customBackgroundActive && (
+          <>
+            <SettingRow
+              title={t("背景图片", "Background picture")}
+              description={t(
+                "按窗口比例裁切，不拉伸。导入时按多级分辨率逐级缩小保存，窗口按屏幕像素取刚好够用的一级。",
+                "Cropped to the window's shape, never stretched. Importing saves it at several resolutions, and the window uses the smallest one that covers its pixels."
+              )}
+            >
+              <div className="appearance-settings-page__background-actions">
+                <button
+                  type="button"
+                  className="button button--secondary button--small"
+                  disabled={importingPicture}
+                  onClick={pickPicture}
+                >
+                  {t("更换图片…", "Change picture…")}
+                </button>
+                <button
+                  type="button"
+                  className="button button--ghost button--small"
+                  disabled={importingPicture}
+                  onClick={removePicture}
+                >
+                  {t("移除", "Remove")}
+                </button>
+              </div>
+            </SettingRow>
+            <SettingRow title={t("玻璃色调", "Glass tone")}>
+              <select
+                className="input"
+                aria-label={t("玻璃色调", "Glass tone")}
+                value={settings.theme}
+                onChange={(event) => setGlassTone(event.target.value as ThemePreference)}
+              >
+                {themeChoices.map((choice) => (
+                  <option key={choice.value} value={choice.value}>{choice.label}</option>
+                ))}
+              </select>
+            </SettingRow>
+          </>
+        )}
         <SettingRow title={t("主色", "Accent color")} vertical>
           <div className="appearance-settings-page__color-controls">
             <button
@@ -602,6 +739,13 @@ export function AppearanceSettings({
           />
         </SettingRow>
       </SettingsCard>
+
+      <LocalModelSettings
+        preferences={appearance.localModel}
+        onChange={(update) =>
+          updateAppearance((current) => ({ ...current, localModel: update(current.localModel) }))
+        }
+      />
 
       <SettingsCard title={t("数学", "Math")}>
         <SettingRow

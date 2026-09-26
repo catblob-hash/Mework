@@ -38,7 +38,8 @@
   --task-block: color-mix(in srgb, var(--hover) 55%, transparent);
   --task-block-nested: color-mix(in srgb, var(--hover) 30%, transparent);
   --sidebar-width: 264px;
-  --topbar-height: 56px;
+  /* The window's top row: the chat's top bar, and the sidebar's first row beside it. */
+  --topbar-height: 44px;
   /* Reserve the classic scrollbar width so fixed headers align with scrolling content. */
   --scrollbar-size: 10px;
   --mono: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;

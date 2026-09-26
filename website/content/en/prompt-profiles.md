@@ -4,16 +4,15 @@ Everything Mework itself says to a model — the section that lists your MCP ser
 
 Your conversation's own system prompt is *not* part of this. That is a system card you write in the conversation itself; write none and the model reads only the host's own sections.
 
-Two profiles are compiled into the app and can never be removed:
+One profile is compiled into the app and can never be removed:
 
 | Profile | Id | What it is |
 |---|---|---|
-| Mework built-in (English) | `tooldesc_builtin_en_us` | The defaults, compiled in from `src-tauri/prompt-profiles/en-US.json`. A conversation that selects nothing uses this one. |
-| Mework built-in (Chinese) | `tooldesc_builtin_zh_cn` | The same file format, with every text in Chinese, compiled in from `src-tauri/prompt-profiles/zh-CN.json`. |
+| Mework built-in | `tooldesc_builtin_en_us` | The defaults, in English. A conversation that selects nothing uses this one. |
 
-Your own files add a third kind. They override any subset of the registry and fall back to a built-in for the rest.
+The built-in is part of the app's code, so it ships with each version of Mework and changes with it: an update brings the new wording along. It is not edited in place, and nothing is written to disk for it.
 
-Both built-ins are also written out as editable JSON under the app-data directory, as `prompt-profiles/en-US.json` and `prompt-profiles/zh-CN.json`. A run renders a built-in from that file, so a text you change there reaches the model on the next turn without a rebuild. Startup fills in the keys a newer build declares and never rewrites a text the file already carries; a file that does not parse is left exactly as it is and the compiled texts are used for that run.
+Your own files are the other kind. They override any subset of the registry and fall back to the built-in for the rest, so the keys a file leaves out keep following the built-in as Mework updates. To change what the model is told, write a file with only the keys you want different and select it.
 
 {{PROFILE_FILE_LINKS}}
 
@@ -22,7 +21,7 @@ Both built-ins are also written out as editable JSON under the app-data director
 A profile declares two things:
 
 1. **`prompts`** — the wording of every host injection point, keyed by a stable id such as `system.mcp_section` or `task.wait_idle`. The complete list is the [key reference](#key-reference) at the end of this page; it is generated from the registry, so it cannot drift from the code.
-2. **`tools`** — per-tool description overrides. A built-in tool's description has two halves and a profile owns both: what the tool *is* lives in the root of its JSON Schema and is itself a registry key (`tool.ls.description`, `tool.bash.description`, …), so `schemaNotes` replaces it outright; `usageGuidance` fills `function.description`, which ships empty. This is why selecting the built-in Chinese profile changes the tool descriptions the model reads and not just the receipts.
+2. **`tools`** — per-tool description overrides. A built-in tool's description has two halves and a profile owns both: what the tool *is* lives in the root of its JSON Schema and is itself a registry key (`tool.ls.description`, `tool.bash.description`, …), so `schemaNotes` replaces it outright; `usageGuidance` fills `function.description`, which ships empty. This is why a file that rewrites the `tool.*.description` keys changes the tool descriptions the model reads and not just the receipts.
 
 A profile deliberately does **not** control:
 
@@ -43,9 +42,9 @@ Mework scans for `*.json` files in two places (symlinks are ignored):
 
 Unlike skills, MCP servers and hooks, the list is not narrowed to the conversation's own workspace: every file found under either scope is offered to every conversation.
 
-Each file is one profile. Its id is derived from its file name and location, so changing the `name` inside keeps selections while renaming or moving the file breaks them (the selection then shows as *no longer in the catalog* and the conversation falls back to the English built-in).
+Each file is one profile. Its id is derived from its file name and location, so changing the `name` inside keeps selections while renaming or moving the file breaks them (the selection then shows as *no longer in the catalog* and the conversation falls back to the built-in).
 
-Select a profile in the **Tool descriptions** row of the conversation settings pane or of a preset. The list always starts with the two built-ins; files follow. The app never creates, edits or deletes the files you add — edit them in your editor and start a new turn; the host rereads the selected file at the start of every turn.
+Select a profile in the **Tool descriptions** row of the conversation settings pane or of a preset. The list always starts with the built-in; files follow. The app never creates, edits or deletes the files you add — edit them in your editor and start a new turn; the host rereads the selected file at the start of every turn.
 
 ## File format
 
@@ -77,29 +76,28 @@ Select a profile in the **Tool descriptions** row of the conversation settings p
 
 Files larger than 64 KiB are not read. The file must be UTF-8 JSON.
 
-A file does not declare a language. It inherits the application language, which also decides which built-in fills the keys it leaves out and which language tool labels use in approval cards.
+A file does not declare a language. It inherits the application language, which decides the language of tool labels in approval cards. It does not change any text: the keys the file leaves out keep the built-in's English wording.
 
 ### Fallback order
 
 For every key the host resolves the text in this order:
 
 1. the selected file's `prompts[key]`, if present (including an empty string);
-2. the built-in profile of the application language — Chinese when the app is in Chinese, English otherwise;
-3. the built-in English text.
+2. the built-in text.
 
-So three overrides in a file on a Chinese app give a fully Chinese experience with three sentences changed. A dangling or unreadable selection resolves to the English built-in.
+So a file with three overrides changes three sentences and leaves everything else as shipped. For a model that reads Chinese throughout, the file has to translate every key — start from the downloaded built-in. A dangling or unreadable selection resolves to the built-in.
 
 ### Placeholders
 
 A text may reference the placeholders its key declares, as `{name}`. The host substitutes them in one pass: a value never gets re-scanned, so a task result that happens to contain `{seconds}` cannot trigger a second substitution. You may omit a placeholder (the value is simply not shown) but you cannot invent one — an unknown `{word}` is left as written. Braces that do not form a `{name}` token, such as a JSON example, are left alone.
 
-Lists (hook names, task addresses, status roll-ups) are joined with `format.list_separator`, which is `", "` in English and `"、"` in Chinese.
+Lists (hook names, task addresses, status roll-ups) are joined with `format.list_separator`, which is `", "` in the built-in; a Chinese file would set it to `"、"`.
 
 ### Empty overrides, and keys that start empty {#empty-overrides}
 
 An empty string removes a text: `"task.notification.completed": ""` drops the `<summary>` line from a background-task delivery, and the `<task-notification>` block still arrives carrying the task id, the status and the result. Structural surroundings always stay.
 
-Four keys are already empty in both built-ins, so the host says nothing at those points until you fill them in:
+Four keys are empty in the built-in, so the host says nothing at those points until you fill them in:
 
 | Key | What filling it in gets you |
 |---|---|
@@ -116,11 +114,11 @@ They ship empty because the search backend is one *you* configured, and Mework t
 - The **child addendum** of subagents and workflow steps follows the parent conversation's profile at spawn time. A conversation the `fork` tool creates snapshots the rendered prompt and renders from that snapshot for the rest of its life.
 - **Receipts** already in the history keep the wording they were written with; the model reads mixed wording if you switch mid-conversation, which is harmless.
 - **Background-task deliveries** replay identically on every later turn: one shared builder rebuilds both the notification body and the fabricated `box` call id from the persisted delivery card, so the turn that produced the delivery and every replay of it cannot drift apart.
-- The timeline card for `task_wait` recognizes the status roll-up heading of both built-ins (`Current status:` / `当前状态：`). With a custom heading the roll-up is shown inside the last envelope instead — a cosmetic difference.
+- The timeline card for `task_wait` recognizes the built-in status roll-up heading (`Current status:`). With a custom heading the roll-up is shown inside the last envelope instead — a cosmetic difference.
 
 ## Writing a profile from scratch
 
-1. Download the built-in file for the language you want as a starting point (links at the top of this page).
+1. Download the built-in file as a starting point (link at the top of this page).
 2. Delete every key you do not intend to change; keeping a full copy only makes future diffs against the built-in harder.
 3. Keep the declared placeholders of the keys you edit (the reference below lists them).
 4. Save it under `~/.mework/tool-descriptions/<anything>.json`, open the conversation settings pane, and select it.
@@ -136,6 +134,6 @@ Tips that follow from how the texts are used:
 
 ## Key reference {#key-reference}
 
-Generated from `src-tauri/src/prompt_profile.rs`: every key, the placeholders it may use, and where the host injects it. The built-in texts themselves are in the two downloadable profile files at the top of this page; each tool's description key is also shown on its [tool page](tools.html) under "What the model is told".
+Generated from `src-tauri/src/prompt_profile.rs`: every key, the placeholders it may use, and where the host injects it. The built-in texts themselves are in the downloadable profile file at the top of this page; each tool's description key is also shown on its [tool page](tools.html) under "What the model is told".
 
 {{PROMPT_KEYS_LIST}}

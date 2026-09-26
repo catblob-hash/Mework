@@ -14,7 +14,7 @@ MCP 服务器**不**在应用内注册。它们和大多数 MCP 客户端一样�
 <workspace>/.mework/mcp.json       工作区范围——仅该工作区
 ```
 
-全新安装会在用户文件里写入四个条目——`builtin_sequential_thinking`、`builtin_context7`、`builtin_fetch` 与 `builtin_time`——随附的两个预设都勾选了它们。每个条目都经 `npx` 或 `uvx` 启动，不需要任何凭据。
+全新安装会在用户文件里写入四个条目——`builtin_sequential_thinking`、`builtin_context7`、`builtin_fetch` 与 `builtin_time`——内置的 **mework** 预设勾选了它们。每个条目都经 `npx` 或 `uvx` 启动，不需要任何凭据。
 
 文件形状就是 Claude Code 的 `.mcp.json`：顶层一个 `mcpServers` 对象，以服务器名为键。
 
@@ -84,7 +84,7 @@ mcp__<server-slug>_<server-digest>__<tool-slug>__<tool-digest>
 - **关闭，开关读作*全部声明*。**每个已发现工具的完整 schema 随每个请求发出，与内置工具完全一样。
 - **开启，*按需取回*——经 [`tool_search` 工具](tools/tool_search.html)取回。**不声明任何 MCP schema。上下文改为携带一个 `<deferred-tools>` 块，按声明它们的服务器分组列出被扣留的名字（[提示词档案](prompt-profiles.html)中的 `tool_search.announcement` 与 `tool_search.announcement_row`）。`tool_search` 接受一个 `query`：`select:<name>[,<name>…]` 返回那些确切的定义，其他写法则是对被扣留名字、其服务器及其描述的关键词搜索（`+term` 是每个结果都必须包含的词，其余用于排序），结果数以 `max_results` 为上限，默认 5。定义已经取回的工具从下一步起正常声明，像其他工具一样直接调用；调用一个 schema 还没取回的工具会被拒绝，拒绝消息带着那个能修好它的 `select:` 调用（`tool_search.not_loaded`）。
 
-新对话从它起始的预设继承这个开关；随附的两个预设 **Codex** 与 **Claude Code** 开局就是开的。任何服务器被拨通之后开关就冻结，与技能传递同理：转录已经按其中一种方式携带着工具。公告在整个运行期间固定，所以某个名字在它的 schema 到达之后仍留在名单里。子代理继承该模式，并把继承到的每个工具重新扣留一次，因为它从空历史起步，从没读过父对话的 `tool_search` 结果。
+新对话从它起始的预设继承这个开关；内置的 **mework** 预设开局就是开的。任何服务器被拨通之后开关就冻结，与技能传递同理：转录已经按其中一种方式携带着工具。公告在整个运行期间固定，所以某个名字在它的 schema 到达之后仍留在名单里。子代理继承该模式，并把继承到的每个工具重新扣留一次，因为它从空历史起步，从没读过父对话的 `tool_search` 结果。
 
 `tool_search` 是派生出来的，不在工具选择器中：它恰好出现在开关开启且本次运行至少扣留了一个工具的时候。
 

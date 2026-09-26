@@ -72,7 +72,10 @@ export function defaultAppearancePreferences(): AppearancePreferences {
     codeBlockCollapsible: false,
     codeBlockWrappable: false,
     singleDollarMath: true,
-    customCss: ""
+    customCss: "",
+    customBackground: false,
+    backgroundImage: "",
+    localModel: { titles: false, shellExplanations: false, titlePrompt: "", shellPrompt: "" }
   };
 }
 
@@ -99,6 +102,11 @@ export function normalizeHexColor(input: string): string | null {
     : body;
   if (expanded.length !== 6) return null;
   return `#${expanded.toUpperCase()}`;
+}
+
+/** Whether the window shows the user's picture behind glass instead of a plain theme. */
+export function hasCustomBackground(appearance: AppearancePreferences): boolean {
+  return appearance.customBackground && appearance.backgroundImage !== "";
 }
 
 export function clampZoom(value: number): number {
@@ -202,10 +210,14 @@ export function applyAppearance(appearance: AppearancePreferences): void {
     // hexadecimal alpha is CSP-independent.
     style.setProperty("--accent-soft", `${themeColor}1F`);
     style.setProperty("--focus", themeColor);
+    // Theme previews draw the other scheme next to this one; a chosen accent is the
+    // same in both, the palette accent is not, so they need to know which it is.
+    style.setProperty("--accent-custom", themeColor);
   } else {
     style.removeProperty("--accent");
     style.removeProperty("--accent-soft");
     style.removeProperty("--focus");
+    style.removeProperty("--accent-custom");
   }
 
   style.setProperty("--app-font-family", fontFamilyValue(appearance.uiFontFamily, DEFAULT_UI_FONT_STACK));
@@ -221,6 +233,10 @@ export function applyAppearance(appearance: AppearancePreferences): void {
   root.dataset.wideMessages = appearance.wideMessages ? "true" : "false";
   root.dataset.codeWrap = appearance.codeBlockWrappable ? "true" : "false";
   root.dataset.codeCollapse = appearance.codeBlockCollapsible ? "true" : "false";
+  // `AppBackdrop` paints the picture; this switches the panes to glass over it. It is set
+  // as soon as the choice is made, not when the picture arrives, so the layout does
+  // not restyle a second time under the reader.
+  root.dataset.backdrop = hasCustomBackground(appearance) ? "image" : "none";
 
   applyCustomCss(appearance.customCss);
 }

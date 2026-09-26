@@ -3,26 +3,22 @@ import {
   Folder,
   FolderClock,
   FolderPlus,
-  MessageSquarePlus,
-  PanelLeftClose,
   Pencil,
   Plus,
   Server,
   Settings,
   SquareTerminal
 } from "lucide-react";
-import { Fragment, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   KeyboardEvent as ReactKeyboardEvent,
-  PointerEvent as ReactPointerEvent,
-  ReactNode
+  PointerEvent as ReactPointerEvent
 } from "react";
 import { useI18n } from "../i18n";
 import type { Conversation, SshMachineConfig, Workspace } from "../types";
 import { ConfirmDeleteButton, IconButton } from "./Common";
 import { WorkspaceOptionsMenu } from "./WorkspaceOptionsMenu";
 import type { WorkspacePresetOption } from "./WorkspaceOptionsMenu";
-import { buildConversationTree, conversationAncestorIds } from "../lib/conversationTree";
 import { visibleConversations } from "../lib/draftConversation";
 import {
   isReservedWorkspace,
@@ -35,7 +31,7 @@ import { isImeKeyEvent } from "../lib/shortcuts";
 import { isBrowserDevRuntime } from "../lib/backend";
 import { usePointerDrag } from "./usePointerDrag";
 import type { DragPoint } from "./usePointerDrag";
-import { MeworkLockup } from "./MeworkIcon";
+import { MeworkMark } from "./MeworkIcon";
 
 export const SIDEBAR_DEFAULT_WIDTH = 264;
 const SIDEBAR_MIN_WIDTH = 220;
@@ -46,37 +42,13 @@ export function clampSidebarWidth(width: number): number {
 }
 
 /**
- * Parents whose nested conversations are hidden. This is a per-machine view
- * preference, like the sidebar width, so it lives in `localStorage` instead of the
- * conversation document the host owns. The version suffix lets a future shape change
- * start from an empty set rather than misread the old one.
+ * What a conversation's row mark says, most urgent first when several hold at once:
+ * `blocked` — the run waits on the user (an approval, a question, a fork request);
+ * `running` — something is under way (a model stream, a background command, a busy terminal);
+ * `completed` — a run finished while the user was looking at another conversation;
+ * `idle` — none of these.
  */
-export const SIDEBAR_COLLAPSED_PARENTS_STORAGE_KEY = "mework.sidebar-collapsed-parents.v1";
-
-function loadCollapsedParents(): Set<string> {
-  if (typeof window === "undefined") return new Set();
-  try {
-    const raw = window.localStorage.getItem(SIDEBAR_COLLAPSED_PARENTS_STORAGE_KEY);
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((id): id is string => typeof id === "string" && id.length > 0));
-  } catch {
-    // Corrupt or unreadable storage falls back to the default: every fork visible.
-    return new Set();
-  }
-}
-
-function saveCollapsedParents(ids: Set<string>): void {
-  if (typeof window === "undefined") return;
-  try {
-    // Ids of conversations this session has not loaded are kept, so a workspace
-    // that is still loading cannot erase a branch collapsed elsewhere.
-    window.localStorage.setItem(SIDEBAR_COLLAPSED_PARENTS_STORAGE_KEY, JSON.stringify([...ids]));
-  } catch {
-    // A view preference must never take the sidebar down with it.
-  }
-}
+export type ConversationStatus = "idle" | "running" | "blocked" | "completed";
 
 interface SidebarProps {
   workspaces: Workspace[];
@@ -94,18 +66,16 @@ interface SidebarProps {
   onDeleteConversation: (conversation: Conversation, workspace: Workspace) => void;
   isConversationRunning: (conversationId: string) => boolean;
   /**
-   * Whether this conversation currently has activity: model streaming, an unfinished
-   * background command, or a terminal executing a command. Unlike
-   * `isConversationRunning`, this only controls the title's slow-pulsing indicator.
+   * What the mark before the conversation's title shows. Unlike `isConversationRunning`,
+   * which locks deletion, this only paints the mark.
    */
-  hasLiveActivity?: (conversationId: string) => boolean;
+  conversationStatus?: (conversationId: string) => ConversationStatus;
   /** Conversation presets available in the workspace menu, in display order. */
   conversationPresets?: WorkspacePresetOption[];
   /** Sets a workspace's default conversation preset. An empty `presetId` clears it. */
   onSetWorkspaceDefaultPreset?: (workspaceId: string, presetId: string) => void;
   isWorkspaceDeleting: (workspaceId: string) => boolean;
   onOpenSettings: () => void;
-  onClose: () => void;
   open?: boolean;
   width?: number;
   onWidthChange?: (width: number) => void;
@@ -185,10 +155,7 @@ function getSidebarDropTarget(point: DragPoint, item: DragItem): DropTarget | nu
   const headingRect = heading ? getVisibleRect(heading) : null;
   if (!headingRect || point.y < headingRect.bottom) return null;
 
-  // Nested child rows are not reorderable, so they are never insertion targets.
-  const conversations = Array.from(
-    sourceGroup.element.querySelectorAll<HTMLElement>("[data-conversation-id]:not(.conversation-row--nested)")
-  )
+  const conversations = Array.from(sourceGroup.element.querySelectorAll<HTMLElement>("[data-conversation-id]"))
     .filter((element) => element.dataset.conversationId !== item.conversationId)
     .map((element) => ({ element, rect: getVisibleRect(element) }))
     .filter((candidate): candidate is { element: HTMLElement; rect: DOMRect } => candidate.rect !== null);
@@ -202,29 +169,23 @@ function getSidebarDropTarget(point: DragPoint, item: DragItem): DropTarget | nu
   };
 }
 
-function relativeTime(iso: string, t: ReturnType<typeof useI18n>["t"]): string {
-  const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60_000));
-  if (minutes < 1) return t("刚刚", "Just now");
-  if (minutes < 60) {
-    return t(
-      "{count} 分钟",
-      minutes === 1 ? "{count} minute" : "{count} minutes",
-      { count: minutes }
-    );
-  }
-  if (minutes < 1440) {
-    const hours = Math.round(minutes / 60);
-    return t(
-      "{count} 小时",
-      hours === 1 ? "{count} hour" : "{count} hours",
-      { count: hours }
-    );
-  }
-  const days = Math.round(minutes / 1440);
-  return t(
-    "{count} 天",
-    days === 1 ? "{count} day" : "{count} days",
-    { count: days }
+/**
+ * The brand mark as a status light: an outline while idle, a blinking cursor while working,
+ * amber while it waits on the user and blue once a run finished unseen.
+ */
+function ConversationStatusMark({ status }: { status: ConversationStatus }) {
+  const { t } = useI18n();
+  const label = status === "running" ? t("正在进行", "In progress")
+    : status === "blocked" ? t("等待你处理", "Waiting for you")
+      : status === "completed" ? t("已完成", "Finished")
+        : null;
+  return (
+    <span
+      className={`conversation-status conversation-status--${status}`}
+      {...(label ? { role: "img", "aria-label": label, title: label } : { "aria-hidden": true })}
+    >
+      <MeworkMark className="conversation-status__mark" />
+    </span>
   );
 }
 
@@ -241,12 +202,11 @@ export function Sidebar({
   onDeleteWorkspace,
   onDeleteConversation,
   isConversationRunning,
-  hasLiveActivity = () => false,
+  conversationStatus = () => "idle",
   conversationPresets = [],
   onSetWorkspaceDefaultPreset = () => undefined,
   isWorkspaceDeleting,
   onOpenSettings,
-  onClose,
   open = true,
   width = SIDEBAR_DEFAULT_WIDTH,
   onWidthChange = () => undefined,
@@ -256,8 +216,6 @@ export function Sidebar({
 }: SidebarProps) {
   const { t } = useI18n();
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
-  /** Parents whose children are hidden. Absence means expanded, so forks show up by default. */
-  const [collapsedParents, setCollapsedParents] = useState<Set<string>>(loadCollapsedParents);
   const [renameDraft, setRenameDraft] = useState<RenameDraft | null>(null);
   const [dragAnnouncement, setDragAnnouncement] = useState("");
   const resizeSessionRef = useRef<{
@@ -387,38 +345,6 @@ export function Sidebar({
     });
   };
 
-  const toggleConversationChildren = (id: string) => {
-    setCollapsedParents((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
-  // The active conversation may never sit inside a collapsed parent.
-  useEffect(() => {
-    if (!activeConversationId) return;
-    const workspace = workspaces.find((item) => item.conversations.some(
-      (conversation) => conversation.id === activeConversationId
-    ));
-    if (!workspace) return;
-    const ancestors = conversationAncestorIds(workspace.conversations, activeConversationId);
-    if (!ancestors.length) return;
-    setCollapsedParents((current) => {
-      if (!ancestors.some((id) => current.has(id))) return current;
-      const next = new Set(current);
-      for (const id of ancestors) next.delete(id);
-      return next;
-    });
-  }, [activeConversationId, workspaces]);
-
-  // Saved from the state rather than from either writer, so the disclosure and the
-  // automatic ancestor expansion above both survive a remount.
-  useEffect(() => {
-    saveCollapsedParents(collapsedParents);
-  }, [collapsedParents]);
-
   const finishRename = () => {
     if (!renameDraft) return;
     const title = renameDraft.value.trim();
@@ -435,12 +361,9 @@ export function Sidebar({
       aria-hidden={!open || undefined}
       {...(!open ? { inert: true } : {})}
     >
-      <div className="sidebar__brand">
-        <MeworkLockup className="brand-lockup" />
-        <IconButton label={t("收起侧栏", "Collapse sidebar")} onClick={onClose}>
-          <PanelLeftClose size={18} />
-        </IconButton>
-      </div>
+      {/* The window's top row. The traffic lights and the shell's navigation float over it
+        * (`ShellNav` in App), so it only holds their room and moves the window. */}
+      <div className="sidebar__chrome-row" data-tauri-drag-region="deep" />
 
       <button
         className="new-task-button"
@@ -451,14 +374,14 @@ export function Sidebar({
           : undefined}
         onClick={() => onNewConversation()}
       >
-        <MessageSquarePlus size={17} />
+        <Plus size={15} />
         <span>{t("新建任务", "New task")}</span>
       </button>
 
       <div className="sidebar__section-heading">
         <span>{t("项目", "Projects")}</span>
         <IconButton label={t("新建项目", "New project")} onClick={onAddWorkspace}>
-          <FolderPlus size={16} />
+          <FolderPlus size={15} />
         </IconButton>
       </div>
 
@@ -471,152 +394,12 @@ export function Sidebar({
             : workspace.name;
           const isCollapsed = collapsed.has(workspace.id);
           // An unsent draft slot has nothing to show yet, so the list withholds it until it does.
+          // A fork is listed like any other conversation of its project, in the project's order.
           const listed = visibleConversations(workspace.conversations);
           const isWorkspaceRunning = workspace.conversations.some((conversation) => isConversationRunning(conversation.id));
           const isDeleting = isWorkspaceDeleting(workspace.id);
           const isLifecycleLocked = isDeleting;
           const isWorkspaceDeleteBlocked = isWorkspaceRunning || isDeleting;
-          const tree = buildConversationTree(listed);
-          const renderConversationRow = (conversation: Conversation, depth: number): ReactNode => {
-            const children = tree.childrenOf.get(conversation.id) ?? [];
-            const isNested = depth > 0;
-            const isRenaming = renameDraft?.workspaceId === workspace.id && renameDraft.conversationId === conversation.id;
-            const isRunning = isLifecycleLocked || isConversationRunning(conversation.id);
-            const isLive = hasLiveActivity(conversation.id);
-            // Only top-level rows take part in reordering; children follow their parent.
-            const isSortable = !isNested && !isRunning;
-            const childrenExpanded = !collapsedParents.has(conversation.id);
-            const row = (
-              <div
-                className={`conversation-row ${
-                  workspace.id === activeWorkspaceId && conversation.id === activeConversationId ? "conversation-row--active" : ""
-                } ${isRenaming ? "conversation-row--editing" : ""} ${isSortable ? "sortable-surface" : ""} ${dragItem?.kind === "conversation" && dragItem.conversationId === conversation.id ? "conversation-row--dragging" : ""} ${dropTarget?.kind === "conversation" && dropTarget.workspaceId === workspace.id && dropTarget.conversationId === conversation.id ? `drop-target--${dropTarget.position}` : ""}${isNested ? " conversation-row--nested" : ""}`}
-                key={conversation.id}
-                data-conversation-id={conversation.id}
-                {...(isNested ? { "data-drag-exclude": "" } : {})}
-                {...(isSortable ? pointerDrag.bind({ kind: "conversation", workspaceId: workspace.id, conversationId: conversation.id }) : {})}
-              >
-                {isRenaming ? (
-                  <input
-                    className="conversation-row__rename-input"
-                    aria-label={t(
-                      "重命名 {title}",
-                      "Rename {title}",
-                      { title: conversation.title }
-                    )}
-                    autoFocus
-                    value={renameDraft?.value ?? ""}
-                    onChange={(event) => setRenameDraft((current) => current ? { ...current, value: event.target.value } : current)}
-                    onFocus={(event) => event.currentTarget.select()}
-                    onBlur={finishRename}
-                    onKeyDown={(event) => {
-                      if (isImeKeyEvent(event.nativeEvent)) return;
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        event.currentTarget.blur();
-                      } else if (event.key === "Escape") {
-                        event.preventDefault();
-                        setRenameDraft(null);
-                      }
-                    }}
-                  />
-                ) : (
-                  <button
-                    type="button"
-                    className="conversation-row__main"
-                    onClick={() => onSelectConversation(workspace.id, conversation.id)}
-                    aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
-                    onKeyDown={(event) => {
-                      if (isRunning || isNested || !event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
-                      event.preventDefault();
-                      moveConversationByKeyboard(workspace.id, conversation.id, event.key === "ArrowUp" ? -1 : 1);
-                    }}
-                  >
-                    {/* The row reserves fixed left padding for this indicator, so rendering it
-                      * only during activity does not shift the title. */}
-                    {isLive && (
-                      <span
-                        className="conversation-row__pulse"
-                        role="img"
-                        aria-label={t("正在进行", "In progress")}
-                        title={t("正在进行", "In progress")}
-                      />
-                    )}
-                    <span className="conversation-row__title">{conversation.title}</span>
-                    <span className="conversation-row__time">{relativeTime(conversation.updatedAt, t)}</span>
-                  </button>
-                )}
-                {/* A sibling of the main button rather than a child: a button may not contain a
-                  * button. It trails the title and leads the hover actions. */}
-                {children.length > 0 && (
-                  <button
-                    type="button"
-                    className="conversation-row__disclosure"
-                    data-drag-exclude
-                    aria-expanded={childrenExpanded}
-                    aria-controls={`conversation-children-${conversation.id}`}
-                    aria-label={childrenExpanded
-                      ? t("收起子会话", "Collapse child conversations")
-                      : t("展开子会话", "Expand child conversations")}
-                    onPointerDown={(event) => event.stopPropagation()}
-                    onClick={(event) => {
-                      // Toggling the disclosure must neither select the row nor start a drag.
-                      event.stopPropagation();
-                      event.preventDefault();
-                      toggleConversationChildren(conversation.id);
-                    }}
-                  >
-                    <ChevronRight className={`disclosure-chevron${childrenExpanded ? " disclosure-chevron--open" : ""}`} size={13} />
-                  </button>
-                )}
-                <div className="conversation-row__actions">
-                  <IconButton
-                    label={t("重命名 {title}", "Rename {title}", { title: conversation.title })}
-                    className="conversation-row__rename"
-                    disabled={isRenaming || isLifecycleLocked}
-                    onClick={() => setRenameDraft({
-                      workspaceId: workspace.id,
-                      conversationId: conversation.id,
-                      original: conversation.title,
-                      value: conversation.title
-                    })}
-                  >
-                    <Pencil size={14} />
-                  </IconButton>
-                  <ConfirmDeleteButton
-                    label={t("删除 {title}", "Delete {title}", { title: conversation.title })}
-                    confirmLabel={t("确认删除 {title}", "Confirm deleting {title}", { title: conversation.title })}
-                    className="conversation-row__delete"
-                    size={14}
-                    disabled={isRunning}
-                    title={isRunning
-                      ? t(
-                        "当前操作结束后才能删除",
-                        "Wait for the current operation to finish before deleting"
-                      )
-                      : undefined}
-                    onDelete={() => onDeleteConversation(conversation, workspace)}
-                  />
-                </div>
-              </div>
-            );
-            if (!children.length) return row;
-            return (
-              <Fragment key={conversation.id}>
-                {row}
-                <div
-                  id={`conversation-children-${conversation.id}`}
-                  className={`collapse-region ${childrenExpanded ? "" : "collapse-region--closed"}`}
-                  aria-hidden={!childrenExpanded || undefined}
-                  inert={!childrenExpanded || undefined}
-                >
-                  <div className="collapse-region__inner conversation-list conversation-list--nested">
-                    {children.map((child) => renderConversationRow(child, depth + 1))}
-                  </div>
-                </div>
-              </Fragment>
-            );
-          };
           return (
             <section
               className={`workspace-group ${dragItem?.kind === "workspace" && dragItem.workspaceId === workspace.id ? "workspace-group--dragging" : ""} ${dropTarget?.kind === "workspace" && dropTarget.workspaceId === workspace.id ? `drop-target--${dropTarget.position}` : ""}`}
@@ -630,6 +413,7 @@ export function Sidebar({
               >
                 <button
                   type="button"
+                  className="workspace-heading__toggle"
                   onClick={() => toggleWorkspace(workspace.id)}
                   title={temporary
                     ? workspaceDisplayName
@@ -645,15 +429,19 @@ export function Sidebar({
                     moveWorkspaceByKeyboard(workspace.id, event.key === "ArrowUp" ? -1 : 1);
                   }}
                 >
-                  <ChevronRight className={`disclosure-chevron${isCollapsed ? "" : " disclosure-chevron--open"}`} size={15} />
                   {temporary
-                    ? <FolderClock size={15} />
+                    ? <FolderClock size={14} />
                     : !workspace.machine
-                      ? <Folder size={15} />
+                      ? <Folder size={14} />
                       : workspace.machine.kind === "wsl"
-                        ? <SquareTerminal size={15} />
-                        : <Server size={15} />}
+                        ? <SquareTerminal size={14} />
+                        : <Server size={14} />}
                   <span className="workspace-heading__name">{workspaceDisplayName}</span>
+                  <ChevronRight
+                    className={`workspace-heading__chevron${isCollapsed ? "" : " workspace-heading__chevron--open"}`}
+                    size={13}
+                    aria-hidden="true"
+                  />
                 </button>
                 <WorkspaceOptionsMenu
                   workspaceName={workspaceDisplayName}
@@ -669,13 +457,13 @@ export function Sidebar({
                   title={isDeleting ? t("项目正在删除", "Project is being deleted") : undefined}
                   onClick={() => onNewConversation(workspace.id, "workspace")}
                 >
-                  <Plus size={15} />
+                  <Plus size={14} />
                 </IconButton>
                 {!reserved && <ConfirmDeleteButton
                   label={t("删除项目 {name}", "Delete project {name}", { name: workspaceDisplayName })}
                   confirmLabel={t("确认删除项目 {name}", "Confirm deleting project {name}", { name: workspaceDisplayName })}
                   className="workspace-heading__delete"
-                  size={14}
+                  size={13}
                   disabled={isWorkspaceDeleteBlocked}
                   title={isDeleting
                     ? t("项目正在删除", "Project is being deleted")
@@ -688,18 +476,100 @@ export function Sidebar({
                   onDelete={() => onDeleteWorkspace(workspace)}
                 />}
               </div>
+              {/* Opens and closes at once: a project is a list to scan, not a panel to reveal. */}
               <div
                 id={`workspace-conversations-${workspace.id}`}
-                className={`collapse-region ${isCollapsed ? "collapse-region--closed" : ""}`}
-                aria-hidden={isCollapsed || undefined}
-                inert={isCollapsed || undefined}
+                className={`conversation-list${isCollapsed ? " conversation-list--closed" : ""}`}
+                hidden={isCollapsed}
               >
-                <div className="collapse-region__inner conversation-list">
-                  {tree.roots.map((conversation) => renderConversationRow(conversation, 0))}
-                  {listed.length === 0 && (
-                    <p className="conversation-list__empty">{t("还没有任务", "No tasks yet")}</p>
-                  )}
-                </div>
+                {listed.map((conversation) => {
+                  const isRenaming = renameDraft?.workspaceId === workspace.id && renameDraft.conversationId === conversation.id;
+                  const isRunning = isLifecycleLocked || isConversationRunning(conversation.id);
+                  const isSortable = !isRunning;
+                  return (
+                    <div
+                      className={`conversation-row ${
+                        workspace.id === activeWorkspaceId && conversation.id === activeConversationId ? "conversation-row--active" : ""
+                      } ${isRenaming ? "conversation-row--editing" : ""} ${isSortable ? "sortable-surface" : ""} ${dragItem?.kind === "conversation" && dragItem.conversationId === conversation.id ? "conversation-row--dragging" : ""} ${dropTarget?.kind === "conversation" && dropTarget.workspaceId === workspace.id && dropTarget.conversationId === conversation.id ? `drop-target--${dropTarget.position}` : ""}`}
+                      key={conversation.id}
+                      data-conversation-id={conversation.id}
+                      {...(isSortable ? pointerDrag.bind({ kind: "conversation", workspaceId: workspace.id, conversationId: conversation.id }) : {})}
+                    >
+                      <ConversationStatusMark status={conversationStatus(conversation.id)} />
+                      {isRenaming ? (
+                        <input
+                          className="conversation-row__rename-input"
+                          aria-label={t(
+                            "重命名 {title}",
+                            "Rename {title}",
+                            { title: conversation.title }
+                          )}
+                          autoFocus
+                          value={renameDraft?.value ?? ""}
+                          onChange={(event) => setRenameDraft((current) => current ? { ...current, value: event.target.value } : current)}
+                          onFocus={(event) => event.currentTarget.select()}
+                          onBlur={finishRename}
+                          onKeyDown={(event) => {
+                            if (isImeKeyEvent(event.nativeEvent)) return;
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              event.currentTarget.blur();
+                            } else if (event.key === "Escape") {
+                              event.preventDefault();
+                              setRenameDraft(null);
+                            }
+                          }}
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          className="conversation-row__main"
+                          onClick={() => onSelectConversation(workspace.id, conversation.id)}
+                          aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+                          onKeyDown={(event) => {
+                            if (isRunning || !event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+                            event.preventDefault();
+                            moveConversationByKeyboard(workspace.id, conversation.id, event.key === "ArrowUp" ? -1 : 1);
+                          }}
+                        >
+                          <span className="conversation-row__title">{conversation.title}</span>
+                        </button>
+                      )}
+                      <div className="conversation-row__actions">
+                        <IconButton
+                          label={t("重命名 {title}", "Rename {title}", { title: conversation.title })}
+                          className="conversation-row__rename"
+                          disabled={isRenaming || isLifecycleLocked}
+                          onClick={() => setRenameDraft({
+                            workspaceId: workspace.id,
+                            conversationId: conversation.id,
+                            original: conversation.title,
+                            value: conversation.title
+                          })}
+                        >
+                          <Pencil size={13} />
+                        </IconButton>
+                        <ConfirmDeleteButton
+                          label={t("删除 {title}", "Delete {title}", { title: conversation.title })}
+                          confirmLabel={t("确认删除 {title}", "Confirm deleting {title}", { title: conversation.title })}
+                          className="conversation-row__delete"
+                          size={13}
+                          disabled={isRunning}
+                          title={isRunning
+                            ? t(
+                              "当前操作结束后才能删除",
+                              "Wait for the current operation to finish before deleting"
+                            )
+                            : undefined}
+                          onDelete={() => onDeleteConversation(conversation, workspace)}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+                {listed.length === 0 && (
+                  <p className="conversation-list__empty">{t("还没有任务", "No tasks yet")}</p>
+                )}
               </div>
             </section>
           );

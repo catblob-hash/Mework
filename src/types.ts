@@ -390,15 +390,6 @@ export interface ConversationSettings {
    */
   mcpToolDiscoveryEnabled: boolean;
   /**
-   * The rows each tool family (`files`, `shell`, `preview`) had on when the
-   * family was switched off as a whole, keyed by family, so switching the
-   * family back on returns to them. A family with no entry has nothing to
-   * return to, and switching it on asks which of its tools to use. Renderer
-   * state: the host keeps it but never reads it. Absent means nothing is
-   * remembered.
-   */
-  rememberedToolFamilies?: RememberedToolFamilies;
-  /**
    * Whether this conversation's commands run in the operating system's
    * sandbox, and what it lets through. Absent is off, with the default
    * network allowlist waiting for when it is switched on.
@@ -416,9 +407,6 @@ export interface ConversationSettings {
    */
   toolLock?: ConversationToolLock;
 }
-
-/** Each switched-off tool family's rows. See `ConversationSettings.rememberedToolFamilies`. */
-export type RememberedToolFamilies = Partial<Record<string, string[]>>;
 
 /**
  * The tool surface a conversation has already exposed. Each run merges its own
@@ -525,6 +513,20 @@ export interface ConversationBranch {
   contexts: ContextItem[];
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * The conversation a timeline fork was taken from, and which of its forks this is.
+ *
+ * A fork is titled `<origin title>-fork-<number>` and keeps following the
+ * origin's title (see `lib/conversationForks.ts`). A fork of a fork names the
+ * same origin, so all forks of one conversation share one numbering — keyed by
+ * the origin's id, never its title, so two conversations with the same title
+ * count separately.
+ */
+export interface ConversationForkOrigin {
+  conversationId: string;
+  number: number;
 }
 
 /** Retained solely to deserialize persisted `webSearch` abort records. */
@@ -645,6 +647,12 @@ export interface Conversation {
    * renders the child at top level.
    */
   parentConversationId: string | null;
+  /**
+   * Set on a conversation forked from the timeline's context menu while its
+   * title is still the one named after its origin. Renaming the fork clears
+   * it: a name the user chose no longer follows anything.
+   */
+  forkOf?: ConversationForkOrigin | null;
   /**
    * Conversation preset most recently applied. Empty means an unnamed draft:
    * either nothing was ever applied, or a preset-owned field has since changed.
@@ -1282,6 +1290,103 @@ export interface AppearancePreferences {
   singleDollarMath: boolean;
   /** User-defined CSS applied through a constructable stylesheet, not a `<style>` element. */
   customCss: string;
+  /**
+   * The fourth theme choice: {@link backgroundImage} behind glass panes. Light or dark
+   * glass still follows {@link GlobalSettings.theme}.
+   */
+  customBackground: boolean;
+  /** Host id of the imported background picture; empty before one is picked. */
+  backgroundImage: string;
+  /** The local helper model's uses and prompts (Appearance → Local model). */
+  localModel: LocalModelPreferences;
+}
+
+/** Mirror of Rust `model::LocalModelPreferences`. Empty prompts mean the built-in ones. */
+export interface LocalModelPreferences {
+  /** Name conversations from their first message. */
+  titles: boolean;
+  /** Describe each shell command in one line on its card. */
+  shellExplanations: boolean;
+  titlePrompt: string;
+  shellPrompt: string;
+}
+
+/** Mirror of Rust `helper_model::Phase` (serde tag `phase`). */
+/** Mirror of Rust `helper_model::VariantId`: one build of the model per inference backend. */
+export type LocalModelVariantId = "ane" | "mlx" | "llama";
+
+/** Mirror of Rust `helper_model::Unavailable`: why a build cannot run on this machine. */
+export type LocalModelUnavailable =
+  | "needsAppleSilicon"
+  | "noNeuralEngine"
+  | "needsMacos14"
+  | "needsMacos15"
+  | "notInThisBuild";
+
+export type LocalModelPhase =
+  | { phase: "missing" }
+  | { phase: "unsupported"; reason: LocalModelUnavailable }
+  | { phase: "downloading"; received: number; total: number; source: "huggingFace" | "hfMirror" | "mirror" }
+  | { phase: "preparing"; step: "compile" | "verify"; done: number; total: number }
+  | { phase: "ready" }
+  | { phase: "failed"; message: string };
+
+/** Mirror of Rust `helper_model::VariantStatus`. */
+export type LocalModelVariantStatus = LocalModelPhase & {
+  id: LocalModelVariantId;
+  downloadBytes: number;
+  diskBytes: number;
+};
+
+/** Mirror of Rust `helper_model::Machine`. */
+export interface LocalModelMachine {
+  chip: string | null;
+  model: string | null;
+  osVersion: string | null;
+  appleSilicon: boolean;
+  neuralEngineCores: number | null;
+}
+
+/** Mirror of Rust `helper_model::Status`. */
+export interface LocalModelStatus {
+  machine: LocalModelMachine;
+  /** Every build this app knows, best first. */
+  variants: LocalModelVariantStatus[];
+  active: LocalModelVariantId | null;
+  recommended: LocalModelVariantId | null;
+  /** The active build is loading and caching its prompts. */
+  warming: boolean;
+  device: string | null;
+  loaded: boolean;
+  running: number;
+  queued: number;
+  slots: number;
+  context: number;
+  diskBytes: number;
+  lastError: string | null;
+}
+
+/** Mirror of Rust `helper_model::PromptReport`. */
+export interface LocalModelPromptReport {
+  tokens: number;
+  cacheBytes: number;
+  maxTokens: number;
+}
+
+/** A background picture the host has stored, as its largest tier. */
+export interface BackgroundImage {
+  id: string;
+  width: number;
+  height: number;
+}
+
+/** One tier of a background picture, ready to paint. */
+export interface BackgroundImageData {
+  dataUrl: string;
+  width: number;
+  height: number;
+  /** No larger tier exists. */
+  largest: boolean;
 }
 
 /** User-added executable to monitor on PATH; built-in definitions are code constants. */
@@ -1462,7 +1567,7 @@ export interface GlobalSettings {
   /** Persisted appearance preference. `system` follows the current Windows theme. */
   theme: ThemePreference;
   conversationPresets: ConversationPreset[];
-  /** New conversations link to this preset; empty when the implicit blank default is active. */
+  /** New conversations link to this preset. The host keeps the built-in preset in every document and points a default that no longer resolves at it. */
   defaultConversationPresetId: string;
   /** Default inherited by the next conversation; each conversation keeps its own value. */
   lastReasoningEffort: ReasoningEffort;

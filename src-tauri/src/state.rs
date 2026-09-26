@@ -169,6 +169,8 @@ pub struct AppState {
     /// which is the only file `install_app_update` will launch. Process-local by design — a
     /// restart is the moment an update has either applied or been abandoned.
     pub app_update: Arc<crate::app_update::UpdateSession>,
+    /// The local helper model (conversation titles, shell explanations).
+    pub helper_model: Arc<crate::helper_model::HelperModel>,
     /// Paths of the current native drag onto the main window, recorded from the
     /// window's own events. The drop commands answer only for these, so reading
     /// a dropped file never becomes reading any file the renderer names.
@@ -369,6 +371,7 @@ impl AppState {
             shell_sessions: Arc::default(),
             file_read_state: Arc::default(),
             app_update: Arc::default(),
+            helper_model: Arc::default(),
             drag_drop: Arc::default(),
         }
     }

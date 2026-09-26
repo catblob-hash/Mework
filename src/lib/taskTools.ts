@@ -50,11 +50,48 @@ export function isPreviewPageToolName(name: string): boolean {
  * server tools alike.
  *
  * The prefix is the whole test rather than a list, so a tool added to the
- * catalog is covered the day it lands: the settings gather all of them behind
- * the one preview row, and none of them is a call the timeline offers to place.
+ * catalog is covered the day it lands: none of them is a call the timeline
+ * offers to place.
  */
 export function isPreviewToolName(name: string): boolean {
   return name.startsWith("preview_");
+}
+
+/**
+ * The preview tools that start, stop and list dev servers.
+ *
+ * The tool picker has no row for them: they are on exactly while any other
+ * preview tool is, because every other one needs a server to have been started
+ * and a way to find or stop it again, and none of the three does anything for
+ * a model that has no other preview tool.
+ */
+const PREVIEW_LIFECYCLE_TOOL_NAMES = ["preview_start", "preview_stop", "preview_list"] as const;
+
+const PREVIEW_LIFECYCLE_TOOL_NAME_SET: ReadonlySet<string> = new Set(PREVIEW_LIFECYCLE_TOOL_NAMES);
+
+export function isPreviewLifecycleToolName(name: string): boolean {
+  return PREVIEW_LIFECYCLE_TOOL_NAME_SET.has(name);
+}
+
+/**
+ * `enabledTools` with the preview lifecycle tools brought in step with the
+ * other preview tools: each one in `available` added while any other preview
+ * tool is on, and all of them taken off otherwise. A `locked` name counts as
+ * on and is never taken off, because the model has already been handed it.
+ */
+export function withPreviewLifecycleTools(
+  enabledTools: readonly string[],
+  available: ReadonlySet<string>,
+  locked: ReadonlySet<string> = new Set()
+): string[] {
+  const previewOn = [...enabledTools, ...locked].some(
+    (name) => isPreviewToolName(name) && !isPreviewLifecycleToolName(name)
+  );
+  if (!previewOn) return enabledTools.filter((name) => !isPreviewLifecycleToolName(name) || locked.has(name));
+  return Array.from(new Set([
+    ...enabledTools,
+    ...PREVIEW_LIFECYCLE_TOOL_NAMES.filter((name) => available.has(name))
+  ]));
 }
 
 /**

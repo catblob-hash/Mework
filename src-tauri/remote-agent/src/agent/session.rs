@@ -104,6 +104,9 @@ pub struct SessionState {
     /// Set when the process was reaped; the exit is published once the
     /// streams are done too.
     reaped: Option<(Option<i32>, Option<i32>)>,
+    /// How long the process ran, taken when it was reaped rather than when
+    /// the exit is published: output still draining is not run time.
+    runtime: Option<Duration>,
     pub exit: Option<ExitInfo>,
     pub exited_at: Option<Instant>,
     /// Why the daemon itself ended the process, if it did.
@@ -119,6 +122,7 @@ impl SessionState {
             stdout_done: false,
             stderr_done: !has_stderr,
             reaped: None,
+            runtime: None,
             exit: None,
             exited_at: None,
             kill_reason: None,
@@ -153,6 +157,9 @@ impl SessionState {
             signal,
             reason: self.kill_reason.unwrap_or(ExitReason::Exited),
             ends: self.ends(),
+            runtime_ms: self
+                .runtime
+                .map(|runtime| runtime.as_millis().min(u128::from(u64::MAX)) as u64),
         });
         self.exited_at = Some(Instant::now());
         true
@@ -370,10 +377,11 @@ impl Session {
         }
     }
 
-    fn reaped(&self, code: Option<i32>, signal: Option<i32>) {
+    fn reaped(&self, code: Option<i32>, signal: Option<i32>, runtime: Duration) {
         let settled = {
             let mut state = lock(&self.state);
             state.reaped = Some((code, signal));
+            state.runtime = Some(runtime);
             state.settle()
         };
         if settled {
@@ -539,7 +547,7 @@ fn spawn_pipes(
                 Ok(status) => exit_parts(status),
                 Err(_) => (None, None),
             };
-            waiter.reaped(code, signal);
+            waiter.reaped(code, signal, waiter.started.elapsed());
         })
         .map_err(|error| Failure::new(FailureKind::Io, format!("Cannot start a thread: {error}")))?;
     Ok(session)
@@ -640,6 +648,9 @@ fn spawn_terminal(
         .name(format!("wait-{}", spec.sid))
         .spawn(move || {
             let (code, signal) = wait_terminal_child(child);
+            // Measured before the drain below, which is the terminal's and
+            // not the shell's.
+            let runtime = waiter.started.elapsed();
             // Let the last output drain, then stop reading: a background job
             // holding the terminal open must not keep the session alive.
             let deadline = Instant::now() + TERMINAL_DRAIN;
@@ -650,7 +661,7 @@ fn spawn_terminal(
             // Windows: closing the pseudo console is what ends its reader.
             #[cfg(windows)]
             drop(lock(&waiter.master).take());
-            waiter.reaped(code, signal);
+            waiter.reaped(code, signal, runtime);
         })
         .map_err(|error| Failure::new(FailureKind::Io, format!("Cannot start a thread: {error}")))?;
     Ok(session)
@@ -727,12 +738,22 @@ pub fn spawn_relayed(
     std::thread::Builder::new()
         .name(format!("wait-{}", spec.sid))
         .spawn(move || {
-            let (code, signal) = match process.wait() {
-                Ok(exit) => (exit.code, exit.signal),
+            let (code, signal, runtime) = match process.wait() {
+                // The cell timed the process from its own spawn, which this
+                // session only learned of a round trip later.
+                Ok(exit) => (
+                    exit.code,
+                    exit.signal,
+                    exit.runtime_ms.map(Duration::from_millis),
+                ),
                 // The cell is gone, and the process with it.
-                Err(_) => (None, None),
+                Err(_) => (None, None, None),
             };
-            waiter.reaped(code, signal);
+            waiter.reaped(
+                code,
+                signal,
+                runtime.unwrap_or_else(|| waiter.started.elapsed()),
+            );
         })
         .map_err(|error| Failure::new(FailureKind::Io, format!("Cannot start a thread: {error}")))?;
     Ok(session)

@@ -50,10 +50,12 @@ export function ConversationView({
   const stableOnBranchFrom = useStableCallback(timelineProps.onBranchFrom);
   const stableOnSelectBranch = useStableCallback(timelineProps.onSelectBranch);
   const stableOnInsert = useStableCallback(timelineProps.onInsert);
+  const stableOnForkAt = useStableCallback(timelineProps.onForkAt);
   const stableOnOpenSubagent = useStableCallback(timelineProps.onOpenSubagent);
   const stableOnOpenWorkflowRun = useStableCallback(timelineProps.onOpenWorkflowRun);
   const stableOnRetryTurnError = useStableCallback(timelineProps.onRetryTurnError);
   const stableOnDismissTurnError = useStableCallback(timelineProps.onDismissTurnError);
+  const stableOnOpenTasks = useStableCallback(timelineProps.onOpenTasks);
 
   return (
     <div
@@ -77,10 +79,12 @@ export function ConversationView({
         onBranchFrom={timelineProps.onBranchFrom ? stableOnBranchFrom : undefined}
         onSelectBranch={timelineProps.onSelectBranch ? stableOnSelectBranch : undefined}
         onInsert={timelineProps.onInsert ? stableOnInsert : undefined}
+        onForkAt={timelineProps.onForkAt ? stableOnForkAt : undefined}
         onOpenSubagent={timelineProps.onOpenSubagent ? stableOnOpenSubagent : undefined}
         onOpenWorkflowRun={timelineProps.onOpenWorkflowRun ? stableOnOpenWorkflowRun : undefined}
         onRetryTurnError={timelineProps.onRetryTurnError ? stableOnRetryTurnError : undefined}
         onDismissTurnError={timelineProps.onDismissTurnError ? stableOnDismissTurnError : undefined}
+        onOpenTasks={timelineProps.onOpenTasks ? stableOnOpenTasks : undefined}
       />
       {editable ? composer : null}
     </div>

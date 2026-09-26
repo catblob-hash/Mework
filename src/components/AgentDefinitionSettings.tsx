@@ -14,6 +14,7 @@ import {
 } from "../lib/agentDefinitions";
 import type { UserAgentDefinitionDraft } from "../lib/agentDefinitions";
 import { supportsVision } from "../lib/modelCapabilities";
+import { isPreviewLifecycleToolName } from "../lib/taskTools";
 import {
   DEFAULT_SEARCH_COMPRESSION_CUTOFF,
   DEFAULT_SEARCH_MAX_RESULTS
@@ -308,9 +309,10 @@ export function AgentDefinitionSettings({
    * child already bound to this role over a capability it never actually held.
    * They must not be COUNTED, though. Counting the raw array would make the
    * header report tools the picker is not drawing, and would leave "Enable all"
-   * disabled while visible switches are still off. */
+   * disabled while visible switches are still off. The preview lifecycle tools
+   * have no switch of their own either: they follow the other preview tools. */
   const visibleSelectedCount = (names: readonly string[]) =>
-    names.filter((name) => selectableToolNameSet.has(name)).length;
+    names.filter((name) => selectableToolNameSet.has(name) && !isPreviewLifecycleToolName(name)).length;
   const explicitModelOptions = useMemo<ExplicitModelOption[]>(() => {
     const result: ExplicitModelOption[] = [];
     for (const provider of providers) {
@@ -1183,7 +1185,7 @@ export function AgentDefinitionSettings({
                             "{enabled} / {total} selected",
                             {
                               enabled: visibleSelectedCount(editor.draft.tools),
-                              total: selectableToolNames.length
+                              total: selectableToolNames.filter((name) => !isPreviewLifecycleToolName(name)).length
                             }
                           )}
                       web={{

@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { configureI18n } from "../i18n";
 import type { PendingToolPrompt } from "../types";
 import { ToolApprovalDock } from "./ToolApprovalDock";
 
@@ -18,6 +19,8 @@ function prompt(overrides: Partial<PendingToolPrompt> = {}): PendingToolPrompt {
 }
 
 describe("ToolApprovalDock", () => {
+  afterEach(() => configureI18n("zh-CN"));
+
   it("renders nothing when no call is waiting", () => {
     const { container } = render(<ToolApprovalDock pending={null} onDecide={vi.fn()} />);
     expect(container).toBeEmptyDOMElement();
@@ -35,6 +38,13 @@ describe("ToolApprovalDock", () => {
     const actions = Array.from(dialog.querySelectorAll("footer button"))
       .map((button) => button.textContent);
     expect(actions).toEqual(["拒绝", "总是允许", "允许"]);
+  });
+
+  it("frames the host's risk level as English copy in the English UI", () => {
+    configureI18n("en-US");
+    render(<ToolApprovalDock pending={prompt({ riskLevel: "Medium" })} onDecide={vi.fn()} />);
+
+    expect(screen.getByRole("dialog", { name: "Your approval is needed" })).toHaveTextContent("Medium risk");
   });
 
   it("reports the chosen decision", async () => {

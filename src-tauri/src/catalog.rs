@@ -2080,19 +2080,102 @@ pub fn default_api_providers() -> Vec<ApiProvider> {
     ]
 }
 
-pub(crate) const CODEX_PRESET_ID: &str = "preset_codex";
-pub(crate) const CLAUDE_CODE_PRESET_ID: &str = "preset_claude_code";
+/// Id of the one conversation preset Mework ships.
+///
+/// The preset belongs to the build, not to the user's data. Storage rewrites
+/// it from [`builtin_preset`] on every start (`storage::install_builtin_preset`)
+/// and holds every save to what it wrote (`storage::keep_builtin_preset`), so
+/// it can be neither edited nor deleted and always matches the running version.
+/// A user who wants something different applies it and saves the result as a
+/// preset of their own.
+pub(crate) const BUILTIN_PRESET_ID: &str = "preset_mework";
 
-/// One seeded role: everything on, thinking on, and nothing said about itself.
+/// The template the built-in preset opens with.
+///
+/// Fixed rather than minted: storage has to find its own row to rewrite it on
+/// every start, and the renderer seed has to name the same one.
+pub(crate) const BUILTIN_PRESET_TEMPLATE_ID: &str = "template_preset_mework";
+
+/// Presets earlier builds seeded into the document as ordinary user data, each
+/// with the template it opened with. The built-in preset replaces them, so
+/// storage removes both on load.
+pub(crate) const RETIRED_SEEDED_PRESETS: &[(&str, &str)] = &[
+    ("preset_codex", "template_preset_codex"),
+    ("preset_claude_code", "template_preset_claude_code"),
+];
+
+/// The system prompt the built-in preset opens with: the one `System` row of
+/// its template, which `aisdk::step::system_prompt_parts` lifts into the
+/// request's system half.
+///
+/// Engineering practice only. Where the model runs, with which tools and on
+/// which machines, is what the host's own sections say, so this says none of it.
+pub(crate) const BUILTIN_PRESET_PROMPT: &str = "\
+    You are a software engineer working in the user's codebase. You help with engineering tasks: fixing bugs, building features, refactoring, explaining code and reviewing changes.\n\
+    \n\
+    # How to work\n\
+    - Read before you write. Look at the relevant code, its callers and the conventions around it before changing anything, and make new code read like its surroundings: the same naming, idioms and comment density.\n\
+    - Do what was asked, no less and no more. Don't quietly narrow the task, and don't add features, refactors, files or abstractions nobody requested. If you notice a real problem outside the task, mention it briefly instead of fixing it.\n\
+    - Prefer the smallest change that fully solves the problem, and fix causes rather than symptoms. Leave no dead code, debug output or commented-out blocks behind.\n\
+    - Check what you can check. Don't guess at an API, a path, a flag or a behaviour when the code, its documentation or a quick run can tell you.\n\
+    - Don't introduce security problems: validate untrusted input at the boundary, never assemble commands or queries from it by string concatenation, and keep credentials out of code and logs.\n\
+    \n\
+    # Verify before you claim\n\
+    - Saying something is done, fixed or passing needs evidence: build it, run the tests or the program, and read the output. If you could not verify something, say so and say why.\n\
+    - Report failures as they are, with their output. Never weaken, skip or delete a test to make it pass unless that is the task.\n\
+    \n\
+    # Actions with consequences\n\
+    - Confirm with the user before anything destructive or hard to reverse (deleting or overwriting files, discarding changes, rewriting history, force-pushing) and before anything others will see (pushing, publishing, sending messages). An approval covers the action it was given for, not later ones.\n\
+    - Look at what you are about to delete or overwrite before you do it. Don't commit or push unless asked.\n\
+    \n\
+    # Delegating\n\
+    - Hand self-contained, independently checkable pieces of work to subagents, and run independent ones in parallel. Keep work that needs judgement across the whole task in the main thread.\n\
+    - A subagent sees only the prompt you give it: include the goal, the relevant paths and constraints, and what to return. Treat what comes back as a claim to check, not a fact.\n\
+    \n\
+    # Communicating\n\
+    - Lead with the answer or the outcome, then the evidence, then anything still open. Be concise and skip preamble and recaps.\n\
+    - Reply in the language the user writes in. Cite code as `path:line`.\n\
+    - When a request is ambiguous in a way that changes the result, ask. Otherwise make a sensible choice, say what it was, and proceed.";
+
+/// The built-in preset's roles: name, the provider family it runs on, its
+/// model, and what it is for.
+///
+/// Each role is bound to one model, and the binding is kept while that model
+/// does not exist yet — Codex lists nothing until the user signs in — so the
+/// role starts working the moment its model shows up. The descriptions reach
+/// the model as the role listing on `agent_spawn`/`workflow`, so they say when
+/// to pick each role, following how its maker positions the model.
+const BUILTIN_ROLES: &[(&str, ProviderFamily, &str, &str)] = &[
+    (
+        "Opus",
+        ProviderFamily::ClaudeAgent,
+        "claude-opus-5-5",
+        "Claude Opus 5.5 (Anthropic). Strongest at long, sprawling engineering work: codebase-wide migrations and audits, hard debugging, and changes that need careful judgement and checking its own work. Pick it for the largest and hardest tasks.",
+    ),
+    (
+        "Sol",
+        ProviderFamily::OpenaiCodex,
+        "gpt-6-sol",
+        "GPT-6 Sol (OpenAI). Built for complex coding and agentic workflows that need strong reasoning: multi-step implementation, refactoring and debugging across several files. Pick it for demanding coding tasks.",
+    ),
+    (
+        "Luna",
+        ProviderFamily::OpenaiCodex,
+        "gpt-6-luna",
+        "GPT-6 Luna (OpenAI). Fast and low-cost, for focused, high-volume work: well-scoped edits, searches and lookups, running tests and summarizing their output. Pick it for repeatable tasks at scale and for many parallel workers.",
+    ),
+];
+
+/// One role of the built-in preset: everything on and thinking on.
 ///
 /// `tools: None` rather than an explicit allowlist, so the role tracks whatever
-/// its preset enables instead of freezing today's catalog into six copies.
-fn seed_agent_definition(name: &str, provider_id: &str, model_id: &str) -> AgentDefinition {
+/// the preset enables instead of freezing today's catalog into three copies.
+fn builtin_role(name: &str, provider_id: &str, model_id: &str, description: &str) -> AgentDefinition {
     AgentDefinition {
         enabled: true,
         deleted: false,
         name: name.into(),
-        description: String::new(),
+        description: description.into(),
         source: AgentDefinitionSource::User,
         source_key: String::new(),
         revision: 1,
@@ -2116,69 +2199,113 @@ fn seed_agent_definition(name: &str, provider_id: &str, model_id: &str) -> Agent
     }
 }
 
-/// Everything in the catalog except the names the host derives for itself.
+/// The tools the built-in preset enables out of a document's catalog `tools`:
+/// every built-in tool except the names the host derives for itself, and of
+/// the shell command tools only `shell`'s — all of them when `shell` is `None`,
+/// which only a probe of the machine can narrow (`storage::install_builtin_preset`).
+///
+/// Drawn from the document's catalog rather than this build's alone, because a
+/// preset naming a tool the document does not list fails validation, and that
+/// list moves with the renderer's saves. MCP tools the document also lists are
+/// not built-in and are left out.
 ///
 /// The memory tools follow the two memory switches, `skill` follows
 /// `skill_tool_enabled`, `tool_search` follows `mcp_tool_discovery_enabled`,
 /// the task-runtime tools appear only once something can produce a task, and
 /// the plan tools follow the security level. Listing any of them here would be
 /// inert at best: the renderer strips them again when the preset is applied.
-/// Mirrors the renderer's `isHostDerivedToolName`.
-///
-/// Every shell's command tool is listed here; the first launch narrows them to the one this machine prefers
-/// (`storage::seed_local_shell`), which only a probe of the machine can say.
-/// The renderer mirror is `src/seed.ts::seedPresetEnabledTools`.
-fn seed_preset_enabled_tools(tools: &[ToolDescriptor]) -> Vec<String> {
+/// Mirrors the renderer's `isHostDerivedToolName` and `seedPresetEnabledTools`.
+pub(crate) fn builtin_preset_enabled_tools(
+    tools: &[ToolDescriptor],
+    shell: Option<crate::shell_backend::ShellBackend>,
+) -> Vec<String> {
+    let built_in = tool_catalog()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<std::collections::HashSet<_>>();
     tools
         .iter()
-        .filter(|tool| {
-            !crate::mework_memory::is_memory_tool(&tool.name)
-                && !crate::agents::is_task_runtime_tool_name(&tool.name)
-                && !crate::plan_mode::is_plan_mode_tool_name(&tool.name)
-                && tool.name != crate::capabilities::SKILL_TOOL
-                && tool.name != crate::capabilities::TOOL_SEARCH_TOOL
+        .map(|tool| tool.name.as_str())
+        .filter(|name| {
+            built_in.contains(*name)
+                && !crate::mework_memory::is_memory_tool(name)
+                && !crate::agents::is_task_runtime_tool_name(name)
+                && !crate::plan_mode::is_plan_mode_tool_name(name)
+                && *name != crate::capabilities::SKILL_TOOL
+                && *name != crate::capabilities::TOOL_SEARCH_TOOL
+                && match crate::shell_backend::ShellBackend::of_tool(name) {
+                    Some(backend) => shell.map_or(true, |shell| shell == backend),
+                    None => true,
+                }
         })
-        .map(|tool| tool.name.clone())
+        .map(str::to_owned)
         .collect()
 }
 
-fn seed_preset(
-    id: &str,
-    name: &str,
+/// The built-in preset as this build defines it, against the providers and the
+/// tool catalog of the document it goes into.
+///
+/// Two parts are this machine's and are filled in by storage instead: the
+/// built-in skill and MCP ids, which hash absolute paths
+/// (`capability_seed`), and the one shell, which takes a probe. A role whose
+/// provider row the document lacks is left out rather than bound to nothing —
+/// validation refuses an empty provider id — and returns on the first start
+/// after the renderer puts the row back.
+pub(crate) fn builtin_preset(
+    providers: &[ApiProvider],
     tools: &[ToolDescriptor],
-    web_search: crate::model::ConversationWebSearchSettings,
-    agent_definitions: Vec<AgentDefinition>,
+    shell: Option<crate::shell_backend::ShellBackend>,
 ) -> ConversationPreset {
+    let agent_definitions = BUILTIN_ROLES
+        .iter()
+        .filter_map(|(name, family, model_id, description)| {
+            let provider = providers
+                .iter()
+                .find(|provider| provider.family == *family)?;
+            Some(builtin_role(name, &provider.id, model_id, description))
+        })
+        .collect();
     ConversationPreset {
-        id: id.into(),
-        name: name.into(),
+        id: BUILTIN_PRESET_ID.into(),
+        name: "mework".into(),
         description: String::new(),
-        // Both shipped presets open with the system prompt seeded alongside
-        // them; `storage::seed_preset_templates` writes the body the first time
-        // this document is initialized, and a dangling id reads as "no template".
-        template_id: seeded_template_id(id).into(),
+        template_id: BUILTIN_PRESET_TEMPLATE_ID.into(),
         settings: ConversationPresetSettings {
-            enabled_tools: seed_preset_enabled_tools(tools),
+            enabled_tools: builtin_preset_enabled_tools(tools, shell),
             tool_description_file_id: None,
             agent_definitions,
-            // Every child is one of the three named roles, so the model cannot
-            // route around them by spawning an anonymous one.
+            // Every child is one of the named roles, so the model cannot route
+            // around them by spawning an anonymous one.
             allow_roleless_subagents: false,
-            // The built-in capability files are written and their ids minted by
-            // `capability_seed` at first launch, which then fills these in — the
-            // ids hash an absolute path this function cannot know. Hooks stay
-            // unselected on purpose: a dangling hook id fails every run closed,
-            // and the built-ins are meant to be deletable.
+            // Filled in by storage; see above. Hooks stay unselected on purpose:
+            // a dangling hook id fails every run closed, and the built-in hooks
+            // are meant to be deletable.
             hook_ids: Vec::new(),
             skill_ids: Vec::new(),
             mcp_ids: Vec::new(),
-            web_search,
-            // The shipped presets mirror CLIs that search the web, so the switch
-            // is on; which of the two web tools that grants follows the backend.
+            // Native search and fetch, resolved against the conversation
+            // model's family at run time.
+            web_search: crate::model::ConversationWebSearchSettings {
+                max_searches_per_call: 0,
+                provider: crate::model::SearchProviderSelection::Native,
+                fetch_provider: crate::model::FetchProviderSelection::Native,
+                // The basic versions. A newer one is a choice with its own
+                // costs, not a default to hand every new conversation.
+                native_search_tool: crate::model::NativeSearchTool::default(),
+                native_fetch_tool: crate::model::NativeFetchTool::default(),
+                max_results: crate::model::DEFAULT_SEARCH_MAX_RESULTS,
+                compression_cutoff: crate::model::DEFAULT_SEARCH_CUTOFF_LIMIT,
+                // A shipped domain list would be this application deciding what
+                // the web is allowed to say, so the filter is off and both lists
+                // are the user's to write.
+                domain_filter: crate::model::SearchDomainFilterMode::Off,
+                include_domains: Vec::new(),
+                exclude_domains: Vec::new(),
+            },
             web_search_enabled: true,
             security_level: Default::default(),
-            // Every tool is on, and the memory tools are switched by these two
-            // rather than named in the list.
+            // The memory tools are switched by these two rather than named in
+            // the list.
             global_memory_enabled: true,
             project_memory_enabled: true,
             // Both capability surfaces load on demand rather than inlining every
@@ -2190,91 +2317,11 @@ fn seed_preset(
     }
 }
 
-/// The template id a shipped preset opens with, or `""` for any other preset.
-///
-/// Fixed rather than minted, because `storage::seed_preset_templates` has to
-/// recognize its own rows across restarts to stay idempotent, and a random id
-/// would leave the renderer seed unable to name the same template.
-pub(crate) fn seeded_template_id(preset_id: &str) -> &'static str {
-    match preset_id {
-        CODEX_PRESET_ID => "template_preset_codex",
-        CLAUDE_CODE_PRESET_ID => "template_preset_claude_code",
-        _ => "",
-    }
-}
-
-/// The two shipped presets, each mirroring the agent fleet of the CLI it is
-/// named after.
-///
-/// The Codex roles are bound to models that do not exist until the user signs
-/// in and fetches the catalog. That is deliberate and is why a dangling
-/// `Explicit` pair is now kept verbatim: the binding waits, and the role starts
-/// working the moment its model shows up.
-///
-/// The two web legs differ because the families differ, not by oversight.
-/// Search is `Native` for both. Fetch is `Native` only for Codex, whose family
-/// folds retrieval into its one `web_search` tool — that is the family's own
-/// shape, so it grants one web tool rather than two. `ClaudeAgent` supports
-/// neither native leg (`web_search::family_supports_native_fetch`), so the
-/// Claude Code preset ships no fetch backend at all: its model answers from
-/// what it knows, and the user picks a fetch backend when one is wanted.
 fn product_default_presets(providers: &[ApiProvider], tools: &[ToolDescriptor]) -> PresetLibrary {
-    let provider_id = |family: ProviderFamily| {
-        providers
-            .iter()
-            .find(|provider| provider.family == family)
-            .map(|provider| provider.id.as_str())
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let codex = provider_id(ProviderFamily::OpenaiCodex);
-    let claude_agent = provider_id(ProviderFamily::ClaudeAgent);
-    let web_search = |fetch_provider| crate::model::ConversationWebSearchSettings {
-        max_searches_per_call: 0,
-        provider: crate::model::SearchProviderSelection::Native,
-        fetch_provider,
-        // Factory presets ship the basic versions. A newer one is a choice with
-        // its own costs, not a default to hand every new conversation.
-        native_search_tool: crate::model::NativeSearchTool::default(),
-        native_fetch_tool: crate::model::NativeFetchTool::default(),
-        max_results: crate::model::DEFAULT_SEARCH_MAX_RESULTS,
-        compression_cutoff: crate::model::DEFAULT_SEARCH_CUTOFF_LIMIT,
-        // A shipped domain list would be this application deciding what the web
-        // is allowed to say, so the filter is off and both lists are the user's
-        // to write.
-        domain_filter: crate::model::SearchDomainFilterMode::Off,
-        include_domains: Vec::new(),
-        exclude_domains: Vec::new(),
-    };
     PresetLibrary {
-        conversation_presets: vec![
-            seed_preset(
-                CODEX_PRESET_ID,
-                "Codex",
-                tools,
-                web_search(crate::model::FetchProviderSelection::Native),
-                vec![
-                    seed_agent_definition("sol", &codex, "gpt-5.6-sol"),
-                    seed_agent_definition("terra", &codex, "gpt-5.6-terra"),
-                    seed_agent_definition("luna", &codex, "gpt-5.6-luna"),
-                ],
-            ),
-            seed_preset(
-                CLAUDE_CODE_PRESET_ID,
-                "Claude Code",
-                tools,
-                web_search(crate::model::FetchProviderSelection::Native),
-                vec![
-                    seed_agent_definition("opus", &claude_agent, "claude-opus-5"),
-                    seed_agent_definition("sonnet", &claude_agent, "claude-sonnet-5"),
-                    seed_agent_definition("haiku", &claude_agent, "claude-haiku-4-5"),
-                ],
-            ),
-        ],
-        // Claude Agent is the one built-in that is usable without a sign-in, so
-        // it is the default. Storage refuses an empty default once presets
-        // exist, so this cannot be left blank.
-        default_conversation_preset_id: CLAUDE_CODE_PRESET_ID.into(),
+        conversation_presets: vec![builtin_preset(providers, tools, None)],
+        // Storage refuses an empty default once presets exist.
+        default_conversation_preset_id: BUILTIN_PRESET_ID.into(),
     }
 }
 
@@ -2440,7 +2487,6 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                     project_memory_enabled: false,
                     skill_tool_enabled: false,
                     mcp_tool_discovery_enabled: false,
-                    remembered_tool_families: Default::default(),
                     sandbox: Default::default(),
                     tool_lock: None,
                 },
@@ -2452,6 +2498,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                 run_target: None,
                 additional_directories: Vec::new(),
                 parent_conversation_id: None,
+                fork_of: None,
                 preset_id: String::new(),
                 template_id: String::new(),
                 attached_workspaces: Vec::new(),

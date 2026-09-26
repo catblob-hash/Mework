@@ -78,19 +78,32 @@
   box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
+/* The grid's own width decides the column count; the settings dialog is not the window. */
+.appearance-settings-page__themes {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  container: appearance-themes / inline-size;
+}
+
 .appearance-settings-page__theme-grid {
   width: 100%;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 9px;
 }
 
+@container appearance-themes (max-width: 520px) {
+  .appearance-settings-page__theme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 .appearance-settings-page__theme-preview {
-  min-height: 106px;
-  padding: 8px;
+  min-width: 0;
+  padding: 6px 6px 7px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 6px;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--panel);
@@ -110,19 +123,159 @@
   color: var(--accent);
 }
 
+.appearance-settings-page__theme-preview:disabled { cursor: progress; }
+
 .appearance-settings-page__theme-preview-surface {
-  flex: 1;
-  min-height: 62px;
-  display: grid;
-  place-items: center;
-  border-radius: 7px;
-  background: var(--subtle);
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--border);
+}
+
+/* Follow system: the scheme on screen on the left, the other one on the right. */
+.appearance-settings-page__theme-preview-surface > .theme-sample--second-half { clip-path: inset(0 0 0 50%); }
+.appearance-settings-page__theme-preview-surface--split::after {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px;
+  transform: translateX(-50%); background: var(--border-strong);
+}
+
+.appearance-settings-page__theme-badge {
+  position: absolute; left: 50%; top: 50%; width: 28px; height: 28px;
+  display: grid; place-items: center; transform: translate(-50%, -50%);
+  border-radius: 50%; background: var(--panel); color: var(--text);
+  box-shadow: 0 2px 8px var(--color-000000-ap16);
 }
 
 .appearance-settings-page__theme-preview strong {
   font-size: 10.5px;
   font-weight: 600;
 }
+
+.appearance-settings-page__theme-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.appearance-settings-page__background-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/*
+ * The window in miniature (ThemeSample.tsx). Every colour is a palette token: the
+ * scheme on screen reads the tokens as they are, the other scheme reads the tokens
+ * whose value on this side of the mirror is that scheme's colour (--color-0a0a08 is
+ * the night app ground by day, and the day one by night).
+ */
+.theme-sample {
+  --s-app: var(--color-f7f7f5);
+  --s-sidebar: var(--color-efefeb);
+  --s-pane: var(--color-efefeb);
+  --s-gutter: var(--color-e7e7e2);
+  --s-panel: var(--color-ffffff);
+  --s-text: var(--color-1b1b1a);
+  --s-muted: var(--color-6b6b67);
+  --s-faint: var(--color-989892);
+  --s-border: var(--color-dfdfda);
+  --s-border-strong: var(--color-d1d1cb);
+  --s-hover: var(--color-e9e9e5);
+  --s-accent: var(--accent-custom, var(--color-4d4d48));
+  position: absolute; inset: 0; display: block; overflow: hidden;
+  background: var(--s-app);
+}
+.theme-sample[data-scheme="opposite"],
+:root:not([data-theme="night"]) .theme-sample[data-scheme="night"],
+:root[data-theme="night"] .theme-sample[data-scheme="day"] {
+  --s-app: var(--color-0a0a08);
+  --s-sidebar: var(--color-141410);
+  --s-pane: var(--color-141410);
+  --s-panel: var(--color-000000);
+  --s-text: var(--color-e5e5e4);
+  --s-muted: var(--color-989894);
+  --s-faint: var(--color-6d6d67);
+  --s-border: var(--color-252520);
+  --s-border-strong: var(--color-34342e);
+  --s-hover: var(--color-1a1a16);
+  --s-accent: var(--accent-custom, var(--color-b7b7b2));
+}
+/* The night gutter is named rather than mirrored (see base.css), so it is spelled out
+   on both sides of the mirror too. */
+:root[data-theme="night"] .theme-sample { --s-gutter: var(--color-fbfbf9); }
+:root:not([data-theme="night"]) .theme-sample:is([data-scheme="opposite"], [data-scheme="night"]) { --s-gutter: var(--color-060604); }
+:root[data-theme="night"] .theme-sample:is([data-scheme="opposite"], [data-scheme="day"]) { --s-gutter: var(--color-1d1d18); }
+
+.theme-sample span { position: absolute; display: block; }
+.theme-sample__bar { height: 4%; border-radius: 999px; background: var(--s-faint); }
+
+.theme-sample__sidebar { left: 0; top: 0; bottom: 0; width: 24%; background: var(--s-sidebar); box-shadow: 1px 0 0 var(--s-border); }
+.theme-sample .theme-sample__new { left: 12%; top: 15%; width: 46%; background: var(--s-text); opacity: .72; }
+.theme-sample__selection { left: 6%; right: 6%; top: 36.5%; height: 8%; border-radius: 2px; background: var(--s-hover); }
+.theme-sample__nav { left: 12%; }
+.theme-sample__nav--1 { top: 28%; width: 62%; }
+.theme-sample__nav--2 { top: 38.5%; width: 54%; }
+.theme-sample__nav--3 { top: 49%; width: 68%; }
+.theme-sample__nav--4 { top: 59.5%; width: 44%; }
+
+.theme-sample__topbar { left: 24%; right: 0; top: 0; height: 12%; }
+.theme-sample .theme-sample__title { left: 5%; top: 33%; width: 20%; height: 34%; background: var(--s-text); opacity: .72; }
+.theme-sample__actions { right: 4%; top: 33%; width: 10%; height: 34%; border-radius: 999px; background: var(--s-faint); opacity: .6; }
+
+.theme-sample span.theme-sample__tiles {
+  left: 24%; right: 0; top: 12%; bottom: 0; padding: 1.6%;
+  display: flex; gap: 2.4%; background: var(--s-gutter);
+}
+.theme-sample span.theme-sample__chat { position: relative; flex: 1.85 1 0; border-radius: 3px; background: var(--s-app); }
+.theme-sample span.theme-sample__pane { position: relative; flex: 1 1 0; border-radius: 3px; background: var(--s-pane); box-shadow: inset 0 0 0 1px var(--s-border); }
+
+.theme-sample__bubble { right: 7%; top: 9%; width: 38%; height: 11%; border-radius: 3px; background: var(--s-hover); }
+.theme-sample__line { left: 7%; height: 4.2%; }
+.theme-sample__line--1 { top: 29%; width: 74%; }
+.theme-sample__line--2 { top: 38%; width: 82%; }
+.theme-sample__line--3 { top: 47%; width: 48%; }
+.theme-sample__composer { left: 7%; right: 7%; bottom: 7%; height: 19%; border-radius: 4px; background: var(--s-panel); box-shadow: inset 0 0 0 1px var(--s-border-strong); }
+.theme-sample__send { right: 3%; top: 24%; height: 52%; aspect-ratio: 1; border-radius: 50%; background: var(--s-accent); }
+
+.theme-sample .theme-sample__pane-title { left: 10%; top: 8%; width: 42%; background: var(--s-muted); opacity: .8; }
+.theme-sample__task { left: 10%; right: 10%; height: 11%; border-radius: 2px; background: var(--s-hover); }
+.theme-sample__task--1 { top: 21%; box-shadow: inset 2px 0 0 var(--s-accent); }
+.theme-sample__task--2 { top: 36%; }
+.theme-sample__task--3 { top: 51%; }
+
+/* Custom background: the picture behind the same window, its surfaces turned to glass
+   with the tints and edge `styles/backdrop.css` gives the real one. The blur is the
+   window's scaled down with it. */
+.theme-sample[data-glass] {
+  --s-glass-tile: var(--color-f7f7f5-ap78);
+  --s-glass-pane: var(--color-efefeb-ap80);
+  --s-glass-frame: var(--color-efefeb-ap66);
+  --s-glass-edge: var(--color-ffffff-ap45);
+  background: var(--s-gutter);
+}
+:root[data-theme="night"] .theme-sample[data-glass] {
+  --s-glass-tile: var(--color-f7f7f5-ap84);
+  --s-glass-pane: var(--color-efefeb-ap86);
+  --s-glass-frame: var(--color-efefeb-ap74);
+  --s-glass-edge: var(--color-000000-ap13);
+}
+.theme-sample .theme-sample__picture { position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: cover; }
+.theme-sample__picture--placeholder { background: linear-gradient(135deg, var(--color-315eae), var(--color-6254aa) 55%, var(--color-279070)); }
+.theme-sample[data-glass] .theme-sample__sidebar,
+.theme-sample[data-glass] span.theme-sample__chat,
+.theme-sample[data-glass] span.theme-sample__pane {
+  -webkit-backdrop-filter: blur(3px) saturate(130%);
+  backdrop-filter: blur(3px) saturate(130%);
+}
+.theme-sample[data-glass] .theme-sample__sidebar { background: var(--s-glass-frame); box-shadow: 1px 0 0 var(--s-glass-edge); }
+.theme-sample[data-glass] span.theme-sample__tiles { background: transparent; }
+.theme-sample[data-glass] span.theme-sample__chat { background: var(--s-glass-tile); box-shadow: inset 0 0 0 1px var(--s-glass-edge); }
+.theme-sample[data-glass] span.theme-sample__pane { background: var(--s-glass-pane); box-shadow: inset 0 0 0 1px var(--s-glass-edge); }
 
 .appearance-settings-page__color-controls {
   width: 100%;
@@ -271,6 +424,196 @@
   font-family: var(--mono);
   font-size: 10px;
   line-height: 1.55;
+}
+
+/* Appearance → Local model → Manage (portalled out of the page). */
+.local-model-dialog__section {
+  padding: 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--subtle);
+}
+
+.local-model-dialog__section:first-child { padding-top: 0; border-top: 0; }
+
+.local-model-dialog__model {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.local-model-dialog__model-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.local-model-dialog__model-copy strong,
+.local-model-dialog__prompt-heading strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.local-model-dialog__model-copy small {
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.local-model-dialog__model-copy .local-model-dialog__status { color: var(--muted); }
+
+.local-model-dialog__actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+}
+
+.local-model-dialog__progress-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.local-model-dialog__progress {
+  flex: 1;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--subtle);
+}
+
+.local-model-dialog__progress > span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width .18s ease-out;
+}
+
+.local-model-dialog__progress-text {
+  flex: 0 0 auto;
+  min-width: 110px;
+  color: var(--muted);
+  font: 9px var(--mono);
+  text-align: right;
+}
+
+.local-model-dialog__progress-row .icon-button {
+  width: 26px;
+  height: 26px;
+  flex-basis: 26px;
+}
+
+.local-model-dialog__prompt-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.local-model-dialog__prompt.input {
+  width: 100%;
+  min-height: 180px;
+  padding: 10px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.local-model-dialog__info {
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.local-model-dialog__info--error { color: var(--danger); }
+
+.local-model-dialog__machine {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.local-model-variant {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--subtle);
+  border-radius: 8px;
+}
+
+.local-model-variant--active { border-color: color-mix(in srgb, var(--accent) 45%, var(--subtle)); }
+
+.local-model-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.local-model-choice__option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--subtle);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.local-model-choice__option:has(input:checked) { border-color: var(--accent); }
+
+.local-model-choice__option--disabled {
+  cursor: default;
+  opacity: .55;
+}
+
+.local-model-choice__option input { margin: 2px 0 0; accent-color: var(--accent); }
+
+.local-model-choice__copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.local-model-choice__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.local-model-choice__copy small {
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.local-model-choice__copy .local-model-choice__meta { color: var(--muted); }
+
+.local-model-choice__badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+
+.local-model-choice__title .local-model-choice__badge { margin-left: 0; }
+
+.local-model-choice__badge--quiet {
+  background: var(--subtle);
+  color: var(--muted);
 }
 
 @media (max-width: 760px) {

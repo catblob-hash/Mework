@@ -18,7 +18,6 @@ function structuralShape(element: Element): unknown {
     ".timeline-row__actions",
     ".user-message-toolbar__edit",
     ".user-message-toolbar__delete",
-    ".context-stream__hint",
     ".insertion-line"
   ].join(", ");
   return {

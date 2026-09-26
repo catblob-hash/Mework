@@ -36,6 +36,20 @@ export interface ShellTaskSnapshot {
    * fixtures without the field stay valid; the host always sends it.
    */
   background?: boolean;
+  /**
+   * Root of the workspace the command ran in, on that workspace's machine, as it was when the
+   * command started. A conversation with more than one workspace names each row's by it; it is
+   * recorded rather than read off the workspace's number because numbers shift when a workspace
+   * is detached. Null on a row recorded before the host kept it.
+   */
+  workspaceRoot?: string | null;
+  /**
+   * How long the process ran, as the machine that ran it measured it — set once an SSH or
+   * sandboxed command has ended. The row ticks on the host's clock while the command runs, but
+   * that span also holds the link's round trips and any time the exit spent reaching the host,
+   * so once this arrives it is the duration the row reports.
+   */
+  durationMs?: number | null;
 }
 
 function requireDesktopRuntime(): void {

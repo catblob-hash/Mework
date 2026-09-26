@@ -12,7 +12,6 @@ import {
   LoaderCircle,
   ListChecks,
   Monitor,
-  PanelLeft,
   PanelRight,
   RotateCcw,
   ShieldCheck,
@@ -53,12 +52,21 @@ import {
   Sidebar,
   SIDEBAR_DEFAULT_WIDTH
 } from "./components/Sidebar";
+import type { ConversationStatus } from "./components/Sidebar";
+import { ShellNav, useWindowFullscreen, WindowFrame } from "./components/WindowChrome";
+import { ConversationSearch } from "./components/ConversationSearch";
+import { windowChromeKind } from "./lib/windowChrome";
+import {
+  conversationHistoryTarget,
+  EMPTY_CONVERSATION_HISTORY,
+  visitConversation
+} from "./lib/conversationHistory";
+import type { ConversationHistory } from "./lib/conversationHistory";
 import { RemoteDirectoryPicker } from "./components/RemoteDirectoryPicker";
 import {
   machineIcon,
   previewWorkspaceMenuItems,
   ProjectSelector,
-  TerminalShellButton,
   terminalShellMenuItems,
   terminalWorkspaceMenuItems,
   WorkspaceMemberSelector
@@ -79,6 +87,7 @@ import {
 } from "./components/TaskContainer";
 import { deriveWorkflowProgress } from "./lib/workflowProgress";
 import type { WorkflowProgressView } from "./lib/workflowProgress";
+import { countRunningTasks, deriveTaskItems, shellTaskTitle } from "./lib/taskContainer";
 import type { TaskSources } from "./lib/taskContainer";
 import { reorderItems } from "./components/usePointerDrag";
 import { createId } from "./lib/id";
@@ -129,6 +138,7 @@ import {
   conversationWorkspaces,
   hostIsWindows,
   isReservedWorkspace,
+  isTemporaryWorkspace,
   machineUsage,
   projectWorkspaces,
   registeredProjectWorkspaces,
@@ -154,10 +164,12 @@ import {
   draftAsConversation,
   DRAFT_CONVERSATION_ID,
   isDraftConversationId,
-  isUnsentConversation
+  isUnsentConversation,
+  visibleConversations
 } from "./lib/draftConversation";
 import type { DraftConversationState } from "./lib/draftConversation";
-import { listWslDistros } from "./lib/runtime";
+import { listWslDistros, settleConversationTitle } from "./lib/runtime";
+import { loadToolExplanations } from "./lib/localModel";
 import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, previewConversationTemplate, probeMcpServer, refreshCapabilities, revealCapabilityLocation, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, skipWorkflowStep, workflowStepRecord } from "./lib/runtime";
 import { SECURITY_LEVEL_OPTIONS, securityLevelLabel } from "./lib/securityLevels";
 import {
@@ -328,15 +340,15 @@ import {
   cloneConversationSettings,
   conversationPresetById,
   defaultConversationPreset,
-  implicitConversationPreset,
-  sameConversationPresetSettings,
-  IMPLICIT_CONVERSATION_PRESET_ID
+  isBuiltinConversationPreset,
+  sameConversationPresetSettings
 } from "./lib/conversationPresets";
 import {
   contextBranchNavigations,
   isConversationBranchFork,
   switchConversationBranch
 } from "./lib/conversationBranches";
+import { forkOrigin, forkTitle, nextForkNumber, staleForkTitles } from "./lib/conversationForks";
 import {
   TIMELINE_START_ANCHOR,
   annotateTurnFailure,
@@ -359,6 +371,7 @@ import type {
   ConversationTemplateSummary,
   ContextItem,
   Conversation,
+  ConversationForkOrigin,
   ConversationPlan,
   ConversationPreset,
   ConversationPresetSettings,
@@ -620,6 +633,16 @@ function ErrorView({ message, onReset }: { message: string; onReset: () => void 
 function App() {
   const { resolvedLanguage, t } = useI18n();
   const platform = typeof navigator === "undefined" ? "" : navigator.platform;
+  /** Who draws the window's frame (see `lib/windowChrome.ts`); fixed for the process's life. */
+  const [windowChrome] = useState(windowChromeKind);
+  const windowFullscreen = useWindowFullscreen(windowChrome === "mac");
+  // On the root, so the stylesheet can place the top row and portaled layers alike.
+  useLayoutEffect(() => {
+    const root = window.document.documentElement;
+    root.dataset.windowChrome = windowChrome;
+    if (windowFullscreen) root.dataset.windowFullscreen = "true";
+    else delete root.dataset.windowFullscreen;
+  }, [windowChrome, windowFullscreen]);
   useEffect(() => {
     const suppressNativeContextMenu = (event: MouseEvent) => {
       if (event.defaultPrevented || allowsNativeContextMenu(event.target)) return;
@@ -1217,6 +1240,11 @@ function App() {
     ));
   }, [activeConversationId]);
 
+  // Shell command explanations are stored beside the cards; read them once per conversation.
+  useEffect(() => {
+    if (activeConversationId) void loadToolExplanations(activeConversationId);
+  }, [activeConversationId]);
+
   const updateConversationTurns = useCallback((updater: (current: ConversationTurns) => ConversationTurns) => {
     // Every writer funnels through here, so this is where a round that produced
     // nothing stops being a record. Sweeping it centrally is what keeps the next
@@ -1789,11 +1817,19 @@ function App() {
       const opened = await openBuiltInBrowser(conversationId, targetSessionId, intentEpoch);
       if (
         activeConversationIdRef.current !== conversationId
-        || browserController.visibleSession() !== targetSessionId
         || !browserIntentIsCurrent(targetSessionId, intentEpoch, "open")
       ) {
         return;
       }
+      const visible = browserController.visibleSession();
+      if (visible === null && !opened) {
+        // The host refused the open, and the refusal took the page off the visible slot. The
+        // page itself is still this conversation's, so only the pane goes: left open it drew
+        // nothing, showed the button pressed, and took two more clicks to open.
+        dispatchSidePanes({ type: "close", conversationId, pane: previewPaneId(targetSessionId) });
+        return;
+      }
+      if (visible !== targetSessionId) return;
       if (!opened) {
         dispatchSidePanes({ type: "forget_preview", conversationId, sessionId: targetSessionId });
       }
@@ -2273,6 +2309,22 @@ function App() {
                 ...conversation,
                 settings: { ...conversation.settings, securityLevel: event.securityLevel }
               }
+              : conversation
+          ))
+        }))
+      } : current);
+      return;
+    }
+    if (event.type === "conversationTitleChanged") {
+      // The host wrote it (placeholder, then the local helper model's title);
+      // mirrored without writing back, like the security level above.
+      documentStore.update((current) => current ? {
+        ...current,
+        workspaces: current.workspaces.map((workspace) => ({
+          ...workspace,
+          conversations: workspace.conversations.map((conversation) => (
+            conversation.id === event.conversationId && conversation.title !== event.title
+              ? { ...conversation, title: event.title }
               : conversation
           ))
         }))
@@ -3675,6 +3727,12 @@ function App() {
     previewServers,
     subagents
   ]);
+  /** What the waiting line beside a live round says is still running, read off the rows the tasks pane draws. */
+  const runningTaskCount = useMemo(
+    () => countRunningTasks(deriveTaskItems(taskSources, taskMessages)),
+    [taskMessages, taskSources]
+  );
+  const openTasksPane = useCallback(() => openPane("tasks"), [openPane]);
 
   /** The agent whose read-only transcript the focused subagent pane is showing, if any. */
   const selectedSubagentView = useMemo(() => (
@@ -3763,6 +3821,9 @@ function App() {
   // that is not going away underneath it.
   const branchFromDisabledReason = activeWorkspaceDeletionRunning
     ? t("项目正在删除，无法创建分支", "Cannot create a branch while the project is being deleted")
+    : null;
+  const forkDisabledReason = activeWorkspaceDeletionRunning
+    ? t("项目正在删除，无法分叉会话", "Cannot fork the conversation while the project is being deleted")
     : null;
 
   const syncBrowserPanelBounds = useCallback((bounds: { x: number; y: number; width: number; height: number }) => {
@@ -4833,6 +4894,133 @@ function App() {
     });
   };
 
+  const renameConversation = useCallback((workspaceId: string, conversationId: string, title: string) => {
+    updateConversation(workspaceId, conversationId, (conversation) => ({
+      ...conversation,
+      title,
+      // A fork the user names stops following its origin's title.
+      ...(conversation.forkOf ? { forkOf: null } : {}),
+      updatedAt: new Date().toISOString()
+    }));
+    // A name the user chose is final: the local helper model must not replace it.
+    settleConversationTitle(conversationId).catch((error) => console.error("Could not settle the conversation title", error));
+  }, [updateConversation]);
+
+  /**
+   * Forks follow their origin's title however it changed — a rename here, the
+   * first message's excerpt, the local helper model's title, a language switch.
+   * A title is written once per change of target: a commit the host refuses
+   * comes back as the old title, and writing the same target again would loop.
+   */
+  const forkTitleTargetsRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    if (!document) return;
+    for (const update of staleForkTitles(document)) {
+      if (forkTitleTargetsRef.current.get(update.conversationId) === update.title) continue;
+      forkTitleTargetsRef.current.set(update.conversationId, update.title);
+      updateConversation(update.workspaceId, update.conversationId, (conversation) => ({
+        ...conversation,
+        title: update.title
+      }));
+    }
+  }, [document, updateConversation]);
+
+  /** The top bar's title while it is being renamed in place. */
+  const [titleDraft, setTitleDraft] = useState<{ conversationId: string; value: string } | null>(null);
+  const [conversationSearchOpen, setConversationSearchOpen] = useState(false);
+
+  /** See `lib/conversationHistory.ts`. Only real conversations are recorded; the draft is not. */
+  const [conversationHistory, setConversationHistory] = useState<ConversationHistory>(EMPTY_CONVERSATION_HISTORY);
+  useEffect(() => {
+    if (!activeWorkspaceId || !activeConversationId || isDraftConversationId(activeConversationId)) return;
+    setConversationHistory((current) => visitConversation(current, {
+      workspaceId: activeWorkspaceId,
+      conversationId: activeConversationId
+    }));
+  }, [activeWorkspaceId, activeConversationId]);
+  /** Where each listed conversation lives now; a history entry may have moved project since. */
+  const listedConversationWorkspaces = useMemo(() => {
+    const workspaceIds = new Map<string, string>();
+    for (const workspace of document?.workspaces ?? []) {
+      for (const conversation of visibleConversations(workspace.conversations)) {
+        workspaceIds.set(conversation.id, workspace.id);
+      }
+    }
+    return workspaceIds;
+  }, [document?.workspaces]);
+  const locateConversation = useCallback(
+    (conversationId: string) => listedConversationWorkspaces.get(conversationId) ?? null,
+    [listedConversationWorkspaces]
+  );
+  const historyBack = conversationHistoryTarget(conversationHistory, activeConversationId, -1, locateConversation);
+  const historyForward = conversationHistoryTarget(conversationHistory, activeConversationId, 1, locateConversation);
+  const stepConversationHistory = (target: typeof historyBack) => {
+    if (!target) return;
+    setConversationHistory((current) => ({ ...current, index: target.index }));
+    selectConversation(target.workspaceId, target.conversationId);
+  };
+  const stepConversationHistoryRef = useRef<(step: -1 | 1) => void>(() => undefined);
+  stepConversationHistoryRef.current = (step) => stepConversationHistory(step < 0 ? historyBack : historyForward);
+  // A mouse's own back and forward buttons walk the same history.
+  useEffect(() => {
+    const onMouseUp = (event: MouseEvent) => {
+      if (event.button !== 3 && event.button !== 4) return;
+      event.preventDefault();
+      stepConversationHistoryRef.current(event.button === 3 ? -1 : 1);
+    };
+    window.addEventListener("mouseup", onMouseUp);
+    return () => window.removeEventListener("mouseup", onMouseUp);
+  }, []);
+
+  /**
+   * Conversations whose run finished while another one was open. Their mark turns blue until
+   * they are opened; this is the renderer's own notice, so a restart forgets it.
+   */
+  const [unseenCompletions, setUnseenCompletions] = useState<ReadonlySet<string>>(() => new Set());
+  const runningConversationIdsRef = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    const running = new Set(Object.keys(modelRunSummaries).filter((id) => modelRunSummaries[id]));
+    const finished = [...runningConversationIdsRef.current].filter((id) => (
+      !running.has(id) && id !== activeConversationIdRef.current
+    ));
+    runningConversationIdsRef.current = running;
+    if (!finished.length) return;
+    setUnseenCompletions((current) => new Set([...current, ...finished]));
+  }, [modelRunSummaries]);
+  useEffect(() => {
+    if (!activeConversationId) return;
+    setUnseenCompletions((current) => {
+      if (!current.has(activeConversationId)) return current;
+      const next = new Set(current);
+      next.delete(activeConversationId);
+      return next;
+    });
+  }, [activeConversationId]);
+  /** Conversations waiting on the user: an approval card, an unanswered question, a fork request. */
+  const blockedConversationIds = useMemo(() => {
+    const blocked = new Set<string>();
+    for (const [conversationId, prompts] of Object.entries(toolPrompts)) {
+      if (prompts.length) blocked.add(conversationId);
+    }
+    for (const request of forkRequests) blocked.add(request.sourceConversationId);
+    // The open conversation's question comes from its live run; the others' from what they saved.
+    if (activeConversationId && pendingQuestion) blocked.add(activeConversationId);
+    for (const workspace of document?.workspaces ?? []) {
+      for (const conversation of workspace.conversations) {
+        if (conversation.id !== activeConversationId && findPendingQuestion(conversation.contexts)) {
+          blocked.add(conversation.id);
+        }
+      }
+    }
+    return blocked;
+  }, [activeConversationId, document?.workspaces, forkRequests, pendingQuestion, toolPrompts]);
+  const conversationStatus = useCallback((conversationId: string): ConversationStatus => (
+    blockedConversationIds.has(conversationId) ? "blocked"
+      : conversationHasLiveActivity(conversationId) ? "running"
+        : unseenCompletions.has(conversationId) ? "completed"
+          : "idle"
+  ), [blockedConversationIds, conversationHasLiveActivity, unseenCompletions]);
+
   /**
    * Drafts and persisted conversations must resolve settings identically so materialization preserves draft edits.
    * Workspace creation prefers an explicit workspace preset, then remembered settings, then the global default;
@@ -4873,12 +5061,7 @@ function App() {
       mcpToolDiscoveryEnabled: false
     };
     const workspacePreset = source === "workspace" && target
-      ? conversationPresetById(
-        document.globalSettings,
-        target.defaultConversationPresetId,
-        document.tools,
-        resolvedLanguage
-      )
+      ? conversationPresetById(document.globalSettings, target.defaultConversationPresetId)
       : null;
     const remembered = source === "workspace" && target && !workspacePreset
       ? target.lastConversationSettings
@@ -4893,16 +5076,13 @@ function App() {
     if (remembered) {
       return { settings: cloneConversationSettings(remembered, knownToolNames), presetId: "" };
     }
-    const fallbackPreset = defaultConversationPreset(
-      document.globalSettings,
-      document.tools,
-      resolvedLanguage
-    );
+    const fallbackPreset = defaultConversationPreset(document.globalSettings);
+    if (!fallbackPreset) return { settings: blankSettings, presetId: "" };
     return {
       settings: applyConversationPresetSettings(blankSettings, fallbackPreset.settings, knownToolNames),
       presetId: fallbackPreset.id
     };
-  }, [documentStore, resolvedLanguage]);
+  }, [documentStore]);
 
   const createConversation = useCallback((
     workspaceId?: string,
@@ -4920,7 +5100,9 @@ function App() {
     /** Workspaces the draft was granted; only a materialized draft supplies them. */
     attachedWorkspacesOverride: AttachedWorkspace[] = [],
     /** The id a materialized draft was minted with, which its terminals are already open under. */
-    conversationIdOverride?: string
+    conversationIdOverride?: string,
+    /** A timeline fork's name and origin; see `lib/conversationForks.ts`. */
+    fork?: { title: string; forkOf: ConversationForkOrigin }
   ): string | null => {
     // The store, not the rendered snapshot: a workspace registered in this same
     // event — the directory the user just picked — is in the store already and
@@ -4947,7 +5129,8 @@ function App() {
       if (!current) return current;
       const conversation: Conversation = {
         id: conversationId,
-        title: t("新任务", "New task"),
+        title: fork?.title ?? t("新任务", "New task"),
+        ...(fork ? { forkOf: fork.forkOf } : {}),
         createdAt: now,
         updatedAt: now,
         settings: resolvedSettings,
@@ -5487,9 +5670,7 @@ function App() {
   const applyPresetToActiveConversation = useCallback((presetId: string) => {
     const current = documentStore.current();
     if (!current || !activeConversation) return;
-    const preset = presetId === IMPLICIT_CONVERSATION_PRESET_ID
-      ? implicitConversationPreset(current.tools, resolvedLanguage)
-      : current.globalSettings.conversationPresets.find((item) => item.id === presetId);
+    const preset = conversationPresetById(current.globalSettings, presetId);
     if (!preset) return;
     if (preset.templateId && templateSwitchNeedsConfirmation()) {
       setTemplateSwitchPrompt({ presetId: preset.id });
@@ -5500,7 +5681,6 @@ function App() {
     activeConversation,
     applyPresetBody,
     documentStore,
-    resolvedLanguage,
     templateSwitchNeedsConfirmation
   ]);
 
@@ -5599,7 +5779,7 @@ function App() {
 
   /** Renames a saved preset. Conversations cite it by id, so the trace follows. */
   const renameConversationPreset = useCallback((presetId: string, name: string) => {
-    if (!name.trim()) return;
+    if (!name.trim() || isBuiltinConversationPreset(presetId)) return;
     handleGlobalSettingsChange((current) => ({
       ...current,
       conversationPresets: current.conversationPresets.map((preset) => (
@@ -5617,6 +5797,8 @@ function App() {
    * belongs to exactly one owner now — so leaving it would be leaving a row no
    * surface can ever reach again. */
   const deleteConversationPreset = useCallback((presetId: string) => {
+    // The host would put it back on save anyway; not asking is the honest answer.
+    if (isBuiltinConversationPreset(presetId)) return;
     const doomed = documentStore.current()?.globalSettings.conversationPresets.find(
       (preset) => preset.id === presetId
     );
@@ -5648,6 +5830,7 @@ function App() {
     presetId: string,
     settings: ConversationPresetSettings
   ) => {
+    if (isBuiltinConversationPreset(presetId)) return;
     handleGlobalSettingsChange((current) => ({
       ...current,
       conversationPresets: current.conversationPresets.map((preset) => (
@@ -5656,11 +5839,35 @@ function App() {
     }));
   }, [handleGlobalSettingsChange]);
 
+  /* Saves what the user made of a preset they cannot change — the built-in one —
+   * as a new preset of their own, named after it. The copy opens with no
+   * template: its body is written on its own page, which is also what mints the
+   * id, the same as for any new preset. */
+  const saveConversationPresetCopy = useCallback((
+    presetId: string,
+    settings: ConversationPresetSettings
+  ) => {
+    handleGlobalSettingsChange((current) => {
+      const source = current.conversationPresets.find((preset) => preset.id === presetId);
+      return {
+        ...current,
+        conversationPresets: [...current.conversationPresets, {
+          id: createId("preset"),
+          name: t("{name} 副本", "{name} copy", { name: source?.name ?? "" }).trim(),
+          description: "",
+          templateId: "",
+          settings
+        }]
+      };
+    });
+  }, [handleGlobalSettingsChange, t]);
+
   /* Records which template a preset opens with, the moment its body is written.
    * It is deliberately not part of `saveConversationPreset`: the body is already
    * on disk by then, and waiting for the preset dialog's own Save would leave a
    * window in which closing that dialog stranded a body nothing cites. */
   const bindPresetTemplate = useCallback((presetId: string, templateId: string) => {
+    if (isBuiltinConversationPreset(presetId)) return;
     handleGlobalSettingsChange((current) => ({
       ...current,
       conversationPresets: current.conversationPresets.map((preset) => (
@@ -7086,6 +7293,86 @@ function App() {
     }
   };
 
+  /**
+   * Forks the active conversation at a gap in its timeline: everything above
+   * the insertion line is copied into a new conversation, which opens. Unlike a
+   * branch from a user message nothing is handed to the composer, and the fork
+   * keeps the source's settings — it carries on that work rather than starting
+   * a new task. The copy is the host's, on the same terms as a branch's.
+   *
+   * The fork is named after its origin (`lib/conversationForks.ts`), and the
+   * name is settled at once so the local helper model never retitles it.
+   */
+  const forkConversationAt = async (index: number) => {
+    const workspaceId = activeWorkspaceId;
+    const conversationId = activeConversationId;
+    const latest = documentStore.current();
+    if (!latest || !workspaceId || !conversationId || index <= 0) return;
+    const located = findConversation(latest, workspaceId, conversationId);
+    if (!located.workspace || !located.conversation) return;
+    const source = located.conversation;
+    const through = source.contexts[Math.min(index, source.contexts.length) - 1];
+    if (!through) return;
+    const origin = forkOrigin(latest, source);
+    const forkOf = { conversationId: origin.conversationId, number: nextForkNumber(latest, origin.conversationId) };
+
+    // Created before any await, like a branch: `createConversation` reads the
+    // render-time document. It nests under the source's root in the sidebar.
+    const created = createConversation(
+      workspaceId,
+      "global",
+      source.settings,
+      undefined,
+      source.parentConversationId ?? source.id,
+      [],
+      source.presetId,
+      "",
+      [],
+      undefined,
+      { title: forkTitle(origin.title, forkOf.number), forkOf }
+    );
+    if (!created) return;
+    try {
+      // The host copies from its own committed document, so the new
+      // conversation and any pending edit must be on disk before it reads.
+      await flushLatestDocument();
+      settleConversationTitle(created).catch((error) => console.error("Could not settle the fork's title", error));
+      const contexts = await forkConversationContexts({
+        workspaceId,
+        sourceConversationId: conversationId,
+        targetConversationId: created,
+        throughContextId: through.id,
+        sourceContexts: source.contexts
+      });
+      const current = documentStore.current();
+      if (!current) return;
+      const next: AppDocument = {
+        ...current,
+        workspaces: current.workspaces.map((workspace) => workspace.id === workspaceId ? {
+          ...workspace,
+          conversations: workspace.conversations.map((conversation) => (
+            conversation.id === created
+              ? { ...conversation, contexts, updatedAt: new Date().toISOString() }
+              : conversation
+          ))
+        } : workspace)
+      };
+      // Receipts issued by the fork are consumed by this save, so it must not
+      // wait for the debounce.
+      await persistDocumentImmediately(next);
+      setContextUsage((currentUsage) => ({
+        ...currentUsage,
+        [created]: estimateActiveContextUsage(contexts)
+      }));
+      window.requestAnimationFrame(() => window.document
+        .querySelector<HTMLElement>('[data-main-context-stream="true"]')
+        ?.scrollTo({ top: 1e9 }));
+    } catch (error) {
+      // The fork exists even if its history could not be copied; the user can fork again.
+      console.error("Could not copy the forked history", error);
+    }
+  };
+
 
   const selectConversationBranch = async (forkContextId: string, branchId: string) => {
     const workspaceId = activeWorkspaceId;
@@ -7352,19 +7639,27 @@ function App() {
     }
   };
 
-  if (loadError) return <ErrorView message={loadError} onReset={async () => { const next = await resetDocument(); documentStore.load(next); setLoadError(null); }} />;
+  if (loadError) {
+    return (
+      <WindowFrame chrome={windowChrome} bare>
+        <ErrorView message={loadError} onReset={async () => { const next = await resetDocument(); documentStore.load(next); setLoadError(null); }} />
+      </WindowFrame>
+    );
+  }
   if (!document) {
     return (
-      <div className="app-loading">
-        <MeworkMark className="app-loading__mark" /><p>{t("正在打开 Mework…", "Opening Mework…")}</p>
-      </div>
+      <WindowFrame chrome={windowChrome} bare>
+        <div className="app-loading">
+          <MeworkMark className="app-loading__mark" /><p>{t("正在打开 Mework…", "Opening Mework…")}</p>
+        </div>
+      </WindowFrame>
     );
   }
 
   /**
-   * Where a new terminal can start. With one workspace, the same choice as the composer's
-   * terminal button; with more, the workspace first and then, beside it, the shells its machine
-   * was probed to have. The top-right terminal button and the terminal pane's `+` both open it.
+   * Where a new terminal can start: the shells a workspace's machine was probed to have, and with
+   * more than one workspace, the workspace first and its shells beside it. The top-right terminal
+   * button and the terminal pane's `+` both open it.
    */
   const newTerminalMenu: { sections: PopoverMenuSection[]; submenu?: "flyout" } = activeTerminalWorkspaces.length > 1
     ? {
@@ -7764,6 +8059,7 @@ function App() {
             userAbortedTasks={conversation.userAbortedTasks}
             forkDecisions={forkDecisions[conversationId] ?? []}
             inheritedModelId={taskSources.inheritedModelId}
+            multipleWorkspaces={activeTerminalWorkspaces.length > 1}
             plan={activePlan}
             planAwaitingApproval={planAwaitingApproval}
             status={agentStatus}
@@ -7926,6 +8222,7 @@ function App() {
             onRenamePreset={renameConversationPreset}
             onDeletePreset={deleteConversationPreset}
             onSavePreset={saveConversationPreset}
+            onSavePresetCopy={saveConversationPresetCopy}
             onBindPresetTemplate={bindPresetTemplate}
             templates={conversationTemplates}
             onReadTemplate={readTemplateBody}
@@ -7950,7 +8247,7 @@ function App() {
     return (
       <SidePane
         id={pane}
-        title={shellTask.toolName}
+        title={shellTaskTitle(shellTask, activeTerminalWorkspaces.length > 1)}
         onFocus={onFocus}
         expanded={expanded}
         onToggleExpand={onToggleExpand}
@@ -7966,14 +8263,42 @@ function App() {
     );
   };
 
+  const activeProjectName = activeWorkspace
+    ? isTemporaryWorkspace(activeWorkspace) ? t("临时项目", "Temporary project") : activeWorkspace.name
+    : t("未选择项目", "No project selected");
+  // A draft has no conversation to rename yet, and a project being deleted takes no edits.
+  const titleLocked = draftActive || Boolean(activeWorkspaceId && deletingWorkspaceIds.has(activeWorkspaceId));
+  const finishTitleRename = () => {
+    if (!titleDraft) return;
+    const title = titleDraft.value.trim();
+    const conversation = activeConversation?.id === titleDraft.conversationId ? activeConversation : null;
+    if (conversation && activeWorkspace && title && title !== conversation.title) {
+      renameConversation(activeWorkspace.id, conversation.id, title);
+    }
+    setTitleDraft(null);
+  };
+  const shellNav = (
+    <ShellNav
+      sidebarOpen={sidebarOpen}
+      onToggleSidebar={() => setSidebarOpen((open) => !open)}
+      canGoBack={Boolean(historyBack)}
+      canGoForward={Boolean(historyForward)}
+      onBack={() => stepConversationHistory(historyBack)}
+      onForward={() => stepConversationHistory(historyForward)}
+      onSearch={() => setConversationSearchOpen(true)}
+    />
+  );
+
   return (
     <CommonErrorBoundary>
+      <WindowFrame chrome={windowChrome} nav={shellNav}>
       <div
         className={`app-shell ${sidebarOpen ? "" : "app-shell--sidebar-closed"} ${sidebarResizing || paneResizing ? "app-shell--resizing" : ""}`}
         style={{
           "--sidebar-width": `${sidebarWidth}px`
         } as AppShellStyle}
       >
+        {windowChrome !== "windows" && shellNav}
         <Sidebar
             workspaces={document.workspaces}
             sshMachines={document.globalSettings.executionEnvironments.sshMachines}
@@ -7983,22 +8308,15 @@ function App() {
             onNewConversation={openDraftConversation}
             onAddWorkspace={() => { setAssignWorkspaceAfterAdd(false); setWorkspaceDialogOpen(true); }}
             onEditProject={(workspaceId) => setProjectEditor(workspaceId)}
-            onRenameConversation={(workspaceId, conversationId, title) => {
-              updateConversation(workspaceId, conversationId, (conversation) => ({
-                ...conversation,
-                title,
-                updatedAt: new Date().toISOString()
-              }));
-            }}
+            onRenameConversation={renameConversation}
             onDeleteConversation={deleteConversation}
             onDeleteWorkspace={deleteWorkspace}
             isConversationRunning={conversationIsBusy}
-            hasLiveActivity={conversationHasLiveActivity}
+            conversationStatus={conversationStatus}
             conversationPresets={workspacePresetOptions}
             onSetWorkspaceDefaultPreset={setWorkspaceDefaultPreset}
             isWorkspaceDeleting={(workspaceId) => deletingWorkspaceIds.has(workspaceId)}
             onOpenSettings={() => openGlobalSettings("providers")}
-            onClose={() => setSidebarOpen(false)}
             open={sidebarOpen}
             width={sidebarWidth}
             onWidthChange={updateSidebarWidth}
@@ -8018,22 +8336,51 @@ function App() {
         )}
 
         <main className="main-pane">
-          <header className="topbar">
+          {/* On macOS this is the window's top row, so its empty stretches move the window. */}
+          <header className="topbar" {...(windowChrome === "windows" ? {} : { "data-tauri-drag-region": "deep" })}>
             <div className="topbar__leading">
-              {!sidebarOpen && (
-                <IconButton label={t("打开侧栏", "Open sidebar")} onClick={() => setSidebarOpen(true)}>
-                  <PanelLeft size={18} />
-                </IconButton>
-              )}
               {activeConversation ? (
                 <div className="conversation-title">
-                  <div>
-                    <span>
-                      {activeWorkspace?.name ?? t("未选择项目", "No project selected")}
-                    </span>
-                    <ChevronDown size={12} />
-                  </div>
-                  <h1>{activeConversation.title}</h1>
+                  <h1 className="conversation-title__heading">
+                    {titleDraft?.conversationId === activeConversation.id ? (
+                      <span className="conversation-title__field" data-value={titleDraft.value}>
+                        <input
+                          className="conversation-title__input"
+                          aria-label={t("对话标题", "Conversation title")}
+                          size={1}
+                          autoFocus
+                          value={titleDraft.value}
+                          onChange={(event) => setTitleDraft((current) => current ? { ...current, value: event.target.value } : current)}
+                          onFocus={(event) => event.currentTarget.select()}
+                          onBlur={finishTitleRename}
+                          onKeyDown={(event) => {
+                            if (isImeKeyEvent(event.nativeEvent)) return;
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              event.currentTarget.blur();
+                            } else if (event.key === "Escape") {
+                              event.preventDefault();
+                              setTitleDraft(null);
+                            }
+                          }}
+                        />
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="conversation-title__name"
+                        disabled={titleLocked}
+                        aria-label={titleLocked
+                          ? activeConversation.title
+                          : t("对话标题：{title}，点击重命名", "Conversation title: {title}. Click to rename", { title: activeConversation.title })}
+                        title={titleLocked ? undefined : t("点击重命名", "Click to rename")}
+                        onClick={() => setTitleDraft({ conversationId: activeConversation.id, value: activeConversation.title })}
+                      >
+                        {activeConversation.title}
+                      </button>
+                    )}
+                  </h1>
+                  <span className="conversation-title__project">{activeProjectName}</span>
                 </div>
               ) : (
                 <div className="topbar__empty">
@@ -8248,6 +8595,8 @@ function App() {
                 onSaveQuestion={saveQuestionContext}
                 onBranchFrom={(item) => void branchFromUserContext(item)}
                 branchFromDisabledReason={branchFromDisabledReason}
+                onForkAt={draftActive ? undefined : (index) => void forkConversationAt(index)}
+                forkDisabledReason={forkDisabledReason}
                 branchNavigations={activeBranchNavigations}
                 onSelectBranch={(forkContextId, branchId) => void selectConversationBranch(forkContextId, branchId)}
                 branchSwitchDisabledReason={branchSwitchDisabledReason}
@@ -8256,6 +8605,8 @@ function App() {
                 agents={subagents}
                 taskMessages={taskMessages}
                 onOpenWorkflowRun={focusWorkflowRunPanel}
+                runningTaskCount={runningTaskCount}
+                onOpenTasks={openTasksPane}
                 composer={(
                   <>
                     <div className="composer-wrap">
@@ -8393,6 +8744,7 @@ function App() {
                           disabled={branchChipDisabled}
                           menuLabel={t("切换分支", "Switch branch")}
                           menuWidth={260}
+                          placement="above"
                           searchPlaceholder={t("搜索分支…", "Search branches…")}
                           emptyLabel={branchPicker?.status === "loading"
                             ? t("正在读取分支…", "Reading branches…")
@@ -8495,19 +8847,6 @@ function App() {
                         </button>
                       </span>
                     ))}
-                    {/* Opens a shell in the workspace selected to the left, so it sits with the
-                        chips that say where things run. A draft's shells run in the project it is
-                        aimed at, and end if it is aimed somewhere else before it is sent. */}
-                    <TerminalShellButton
-                      workspaceLabel={activeSelectedWorkspace
-                        ? workspaceDirectoryLabel(activeSelectedWorkspace.path)
-                        : t("工作区", "the workspace")}
-                      shells={activeTerminalShells}
-                      paneOpen={terminalPaneOpen}
-                      disabled={activeWorkspaceLifecycleOperationRunning}
-                      onSelect={(shell) => openTerminalIn(activeWorkspaceMember, shell)}
-                      onTogglePane={() => togglePane("terminal")}
-                    />
                     {hasNativeWorkspacePicker() && (
                       <PopoverMenu
                         triggerClassName="composer-chip composer-chip--icon"
@@ -8516,6 +8855,7 @@ function App() {
                         disabled={activeModelRunning}
                         menuLabel={t("在哪台机器上选目录", "Which machine to pick a directory on")}
                         menuWidth={244}
+                        placement="above"
                         emptyLabel={t("没有可选的机器", "No machines to choose from")}
                         onOpen={loadMachineMenu}
                         sections={[{
@@ -9150,7 +9490,15 @@ function App() {
           }}
           onClose={() => setRemoteWorkspacePicker(null)}
         />}
+
+        {conversationSearchOpen && <ConversationSearch
+          workspaces={document.workspaces}
+          activeConversationId={activeConversationId}
+          onSelect={selectConversation}
+          onClose={() => setConversationSearchOpen(false)}
+        />}
       </div>
+      </WindowFrame>
     </CommonErrorBoundary>
   );
 }

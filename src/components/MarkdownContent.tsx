@@ -14,6 +14,8 @@ import { externalHttpUrl } from "../lib/externalLinks";
 import { fenceLanguage } from "../lib/fileViewers";
 import { MARKDOWN_HTML_SCHEMA, mayContainHtml } from "../lib/markdownHtml";
 import remarkPathLinks from "../lib/remarkPathLinks";
+import { rehypeStreamReveal } from "../lib/streamReveal";
+import type { StreamRevealSplit } from "../lib/streamReveal";
 import { MarkdownCodeBlock } from "./CodeBlock";
 import { MathFormula } from "./MathFormula";
 
@@ -311,9 +313,27 @@ export const MarkdownContent = memo(function MarkdownContent({
   // The raw-HTML pass costs a second parse of the whole tree, so it only joins
   // the pipeline once the text has something that could be a tag.
   const withHtml = renderHtml && shouldRender && mayContainHtml(content);
+  // The streaming reveal, last so it sees the tree the page will: the split it
+  // took is kept for the commit that follows, and only a commit moves it on —
+  // a render React throws away, or StrictMode's second one, has to take the
+  // same split as the first.
+  const shownSplit = useRef<StreamRevealSplit | null>(null);
+  const renderedSplit = useRef<StreamRevealSplit | null>(null);
+  const previousSplit = streaming ? shownSplit.current : null;
   const rehypePlugins = useMemo<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>(
-    () => (withHtml ? [rehypeRaw, [rehypeSanitize, MARKDOWN_HTML_SCHEMA]] : []),
-    [withHtml]
+    () => {
+      const plugins: NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]> = withHtml
+        ? [rehypeRaw, [rehypeSanitize, MARKDOWN_HTML_SCHEMA]]
+        : [];
+      if (streaming) {
+        plugins.push([rehypeStreamReveal, {
+          previous: previousSplit,
+          onSplit: (split: StreamRevealSplit) => { renderedSplit.current = split; }
+        }]);
+      }
+      return plugins;
+    },
+    [withHtml, streaming, previousSplit]
   );
 
   // Links and images depend on how this surface resolves them; the rest of the
@@ -402,34 +422,9 @@ export const MarkdownContent = memo(function MarkdownContent({
     };
   }, [content, shouldRender, streaming]);
 
-  // Drives the streaming reveal, writing straight to the DOM rather than
-  // through state: it is paint-only decoration, and a re-render here would
-  // re-run exactly the Markdown parse that makes streaming expensive.
-  //
-  // `tick` alternates 0/1 because a CSS animation only restarts when its name
-  // changes — the two keyframe sets are identical, and alternating is what
-  // makes each commit sweep again. `--stream-reveal-from` is where the previous
-  // commit's text ended, so only the newly arrived tail is revealed instead of
-  // the whole block flashing every 100 ms.
-  const revealedLength = useRef(0);
-  const revealTick = useRef(0);
   useLayoutEffect(() => {
-    const host = hostRef.current;
-    if (!host) return;
-    if (!streaming || !shouldRender) {
-      revealedLength.current = content.length;
-      host.removeAttribute("data-stream-tick");
-      host.style.removeProperty("--stream-reveal-from");
-      return;
-    }
-    const previous = revealedLength.current;
-    if (content.length <= previous) return;
-    revealedLength.current = content.length;
-    revealTick.current = revealTick.current === 0 ? 1 : 0;
-    const from = Math.max(0, Math.min(100, Math.round((previous / content.length) * 100)));
-    host.style.setProperty("--stream-reveal-from", `${from}%`);
-    host.setAttribute("data-stream-tick", String(revealTick.current));
-  }, [content, shouldRender, streaming]);
+    shownSplit.current = streaming ? renderedSplit.current : null;
+  });
 
   return (
     <div

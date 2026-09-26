@@ -3,11 +3,23 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   configureI18n,
   interpolateTranslation,
+  isMainlandChinaLocale,
   resolveApplicationLanguage,
   useI18n
 } from "./i18n";
 
 afterEach(() => configureI18n("zh-CN"));
+
+describe("mainland China locale", () => {
+  it("covers Chinese set for mainland China, or with no region and not Traditional", () => {
+    for (const locale of ["zh-CN", "zh-Hans-CN", "ZH_cn", "zh", "zh-Hans", "cmn-Hans-CN"]) {
+      expect(isMainlandChinaLocale(locale), locale).toBe(true);
+    }
+    for (const locale of ["zh-TW", "zh-HK", "zh-MO", "zh-SG", "zh-Hans-SG", "zh-Hant", "yue-Hant-HK", "en-CN", "en-US", ""]) {
+      expect(isMainlandChinaLocale(locale), locale).toBe(false);
+    }
+  });
+});
 
 describe("application language resolution", () => {
   it("maps every Chinese system locale to zh-CN", () => {

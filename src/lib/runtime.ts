@@ -27,6 +27,9 @@ import type {
   AppUpdateDownloadEvent,
   AppUpdateInstallOutcome,
   AppVersionInfo,
+  LocalModelPromptReport,
+  LocalModelStatus,
+  LocalModelVariantId,
   ProviderFamily,
   ApiKeyStatus,
   AppearancePreferences,
@@ -1265,7 +1268,20 @@ function normalizeAppearance(
     codeBlockCollapsible: input.codeBlockCollapsible === true,
     codeBlockWrappable: input.codeBlockWrappable === true,
     singleDollarMath: input.singleDollarMath !== false,
-    customCss: typeof input.customCss === "string" ? input.customCss : ""
+    customCss: typeof input.customCss === "string" ? input.customCss : "",
+    customBackground: input.customBackground === true,
+    backgroundImage: typeof input.backgroundImage === "string" ? input.backgroundImage : "",
+    localModel: normalizeLocalModelPreferences(input.localModel)
+  };
+}
+
+function normalizeLocalModelPreferences(value: unknown): AppearancePreferences["localModel"] {
+  const input = record(value) ?? {};
+  return {
+    titles: input.titles === true,
+    shellExplanations: input.shellExplanations === true,
+    titlePrompt: typeof input.titlePrompt === "string" ? input.titlePrompt : "",
+    shellPrompt: typeof input.shellPrompt === "string" ? input.shellPrompt : ""
   };
 }
 
@@ -3283,6 +3299,69 @@ export async function appVersionInfo(): Promise<AppVersionInfo> {
 
 /** Ask GitHub Releases for the latest version. The host owns the request; the WebView's CSP
  * has no route to github.com. */
+// ---------------------------------------------------------------- local helper model
+
+/** Install and runtime status of the local helper model. */
+export async function localModelStatus(): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_status");
+}
+
+/** Starts downloading one build of the model; progress arrives as `localModelChanged` events. */
+/** `chinaMirror` downloads from the mirror in mainland China (hf-mirror.com). */
+export async function localModelInstall(variant: LocalModelVariantId, chinaMirror: boolean): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_install", { variant, chinaMirror });
+}
+
+/** Switches to another installed build, which then loads in the background. */
+export async function localModelActivate(variant: LocalModelVariantId): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_activate", { variant });
+}
+
+export async function localModelCancelInstall(): Promise<void> {
+  if (!hasBackendRuntime()) return;
+  await invoke<void>("local_model_cancel_install");
+}
+
+/** Deletes one build: its files and its prompt caches. */
+export async function localModelRemove(variant: LocalModelVariantId): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_remove", { variant });
+}
+
+/**
+ * Caches the prefix state (KV cache) of `prompt`, or of the prompt in effect for `task`,
+ * and reports its token count and size. The first call may load the model, which on a
+ * Mac can take minutes the first time.
+ */
+export async function localModelPromptInfo(
+  task: "title" | "shell",
+  prompt?: string
+): Promise<LocalModelPromptReport> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelPromptReport>("local_model_prompt_info", { task, prompt: prompt ?? null });
+}
+
+/** The built-in prompts in the app language. */
+export async function localModelDefaultPrompts(): Promise<{ title: string; shell: string }> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<{ title: string; shell: string }>("local_model_default_prompts");
+}
+
+/** The user named the conversation: the local helper model must not rename it. */
+export async function settleConversationTitle(conversationId: string): Promise<void> {
+  if (!hasBackendRuntime()) return;
+  await invoke<void>("settle_conversation_title", { conversationId });
+}
+
+/** One-line shell command descriptions by tool card id. */
+export async function getToolExplanations(conversationId: string): Promise<Record<string, string>> {
+  if (!hasBackendRuntime()) return {};
+  return invoke<Record<string, string>>("get_tool_explanations", { conversationId });
+}
+
 export async function checkAppUpdate(): Promise<AppUpdateCheck> {
   if (!hasBackendRuntime()) throw new Error("浏览器预览无法检查更新");
   return invoke<AppUpdateCheck>("check_app_update");

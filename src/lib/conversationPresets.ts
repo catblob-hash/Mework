@@ -5,15 +5,22 @@ import type {
   ConversationSettings,
   ConversationWebSearchSettings,
   GlobalSettings,
-  ResolvedAppLanguage,
-  SandboxSettings,
-  ToolDescriptor
+  SandboxSettings
 } from "../types";
+import { BUILTIN_PRESET_ID } from "../seed";
 import { defaultConversationWebSearchSettings, defaultSandboxSettings } from "./runtime";
 import { isHostDerivedToolName } from "./taskTools";
 import { toolLockOf } from "./toolLock";
 
-export const IMPLICIT_CONVERSATION_PRESET_ID = "__implicit_conversation_preset__";
+/**
+ * Whether `presetId` names the built-in preset. It ships with the build: the
+ * host rewrites it on every start and refuses any save that edits or drops it,
+ * so the UI offers no rename, delete or save for it — only apply, and saving
+ * what the user made of it as a preset of their own.
+ */
+export function isBuiltinConversationPreset(presetId: string): boolean {
+  return presetId === BUILTIN_PRESET_ID;
+}
 
 export function emptyConversationPresetSettings(): ConversationPresetSettings {
   return {
@@ -31,42 +38,6 @@ export function emptyConversationPresetSettings(): ConversationPresetSettings {
     projectMemoryEnabled: false,
     skillToolEnabled: false,
     mcpToolDiscoveryEnabled: false
-  };
-}
-
-/**
- * The shell command tools the implicit preset turns on: every backend's. Which
- * of them a conversation actually offers follows its machines — the host
- * withdraws a shell no machine has — so enabling them all is what lets each
- * machine's shells work without a trip to the settings.
- */
-const IMPLICIT_SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", "powershell"]);
-
-export function implicitConversationPreset(
-  tools: readonly ToolDescriptor[] = [],
-  resolvedLanguage: ResolvedAppLanguage = "zh-CN"
-): ConversationPreset {
-  // Memory tools derive from their two layer switches and remain disabled by
-  // default because they read and write user-disk files. The web tools derive
-  // from `webSearchEnabled` for the same reason, so this list names neither of
-  // them — turning the switch on is what grants them.
-  const enabledTools = tools
-    .filter((tool) => tool.category === "filesystem")
-    .map((tool) => tool.name);
-  enabledTools.push(...tools.filter((tool) => IMPLICIT_SHELL_TOOLS.has(tool.name)).map((tool) => tool.name));
-  return {
-    id: IMPLICIT_CONVERSATION_PRESET_ID,
-    name: resolvedLanguage === "zh-CN"
-      ? "内置工程默认值"
-      : "Built-in engineering defaults",
-    description: "",
-    // It has no row on disk, so there is nowhere to hang a template body either.
-    templateId: "",
-    settings: {
-      ...emptyConversationPresetSettings(),
-      enabledTools,
-      webSearchEnabled: true
-    }
   };
 }
 
@@ -201,30 +172,26 @@ export function sameConversationPresetSettings(
     && equalValues(a.sandbox ?? defaultSandboxSettings(), b.sandbox ?? defaultSandboxSettings());
 }
 
-export function defaultConversationPreset(
-  settings: GlobalSettings,
-  tools: readonly ToolDescriptor[] = [],
-  resolvedLanguage: ResolvedAppLanguage = "zh-CN"
-): ConversationPreset {
+/**
+ * The preset a new conversation starts from. The host keeps the built-in preset
+ * in every document, so `null` — nothing to apply — only answers a document
+ * that never went through it.
+ */
+export function defaultConversationPreset(settings: GlobalSettings): ConversationPreset | null {
   return settings.conversationPresets.find(
     (preset) => preset.id === settings.defaultConversationPresetId
-  ) ?? settings.conversationPresets[0] ?? implicitConversationPreset(tools, resolvedLanguage);
+  ) ?? settings.conversationPresets[0] ?? null;
 }
 
 /**
- * Resolves an applicable preset by ID. The built-in default uses a reserved ID;
- * missing custom IDs return `null` because deleted presets may still be referenced.
+ * Resolves an applicable preset by ID. Missing IDs return `null` because deleted
+ * presets may still be referenced.
  */
 export function conversationPresetById(
   settings: GlobalSettings,
-  presetId: string,
-  tools: readonly ToolDescriptor[] = [],
-  resolvedLanguage: ResolvedAppLanguage = "zh-CN"
+  presetId: string
 ): ConversationPreset | null {
   if (!presetId) return null;
-  if (presetId === IMPLICIT_CONVERSATION_PRESET_ID) {
-    return implicitConversationPreset(tools, resolvedLanguage);
-  }
   return settings.conversationPresets.find((preset) => preset.id === presetId) ?? null;
 }
 
@@ -260,8 +227,6 @@ export function cloneConversationSettings(
     ...sandboxField(snapshot.sandbox)
     // `toolLock` is deliberately absent: the new conversation has run nothing
     // yet, so it has exposed nothing and every setting is still free to move.
-    // `rememberedToolFamilies` is absent too: the rows a conversation kept for
-    // the tool families it switched off belong to that conversation.
   };
 }
 

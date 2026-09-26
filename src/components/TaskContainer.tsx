@@ -69,6 +69,11 @@ export interface TasksPaneProps {
    * own. A role-less child runs on exactly this; its record cannot say so.
    */
   inheritedModelId?: string | null;
+  /**
+   * Whether the conversation has more than one workspace, which is when a shell
+   * row names the workspace its command ran in.
+   */
+  multipleWorkspaces?: boolean;
   /** Todo plan, shown above the list as the run's own summary. */
   status?: AgentStatus;
   /** Agent view currently shown in the main area, so its row reads as selected. */
@@ -480,6 +485,7 @@ export function TasksPane({
   planAwaitingApproval = false,
   planDrafting = false,
   forkDecisions,
+  multipleWorkspaces = false,
   status = { todo: null },
   selectedAgentId,
   selectedRowId = null,
@@ -529,6 +535,7 @@ export function TasksPane({
     planAwaitingApproval,
     planDrafting,
     forkDecisions,
+    multipleWorkspaces,
     now
   }, taskContainerMessages(t)), [
     conversationId,
@@ -540,6 +547,7 @@ export function TasksPane({
     browserSessions,
     forkDecisions,
     modelRequestId,
+    multipleWorkspaces,
     now,
     plan,
     planAwaitingApproval,

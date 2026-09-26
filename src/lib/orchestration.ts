@@ -385,7 +385,8 @@ export interface WaitOutputView {
 }
 
 const WAIT_ENVELOPE_HEADER = /^\[([^\]\r\n]+?)\s*·\s*([^\]\r\n]+?)\]$/;
-/** The status roll-up heading of the two built-in profiles (`task.wait_status_heading`).
+/** The status roll-up heading of the built-in profile (`task.wait_status_heading`),
+ * and the Chinese one older transcripts carry.
  * A custom profile that words it differently folds the roll-up into the last
  * envelope body; the card still renders, only less structured. */
 const WAIT_STATUS_LINE = /^(当前状态：|Current status:)/; // i18n-audit-ignore: parses localized backend output

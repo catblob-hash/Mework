@@ -3,7 +3,6 @@ import type {
   ApiProvider,
   AppDocument,
   ConversationPreset,
-  ConversationWebSearchSettings,
   ModelProfile,
   ShellBackend,
   ToolDescriptor
@@ -630,15 +629,17 @@ function freshToolCatalog(): ToolDescriptor[] {
   }));
 }
 
-export const CODEX_PRESET_ID = "preset_codex";
-export const CLAUDE_CODE_PRESET_ID = "preset_claude_code";
+/** The one conversation preset Mework ships. Keep in sync with
+ * `catalog.rs::BUILTIN_PRESET_ID`. The host rewrites it from its own definition
+ * on every start and holds every save to that, so it can be neither edited nor
+ * deleted; this renderer copy only seeds the browser preview and vitest. */
+export const BUILTIN_PRESET_ID = "preset_mework";
 
-/** The template id a shipped preset opens with. Keep in sync with
- * `catalog.rs::seeded_template_id`. The body lives in the host's SQLite store,
- * written once by `storage::seed_preset_templates`, so in the browser preview
- * and in vitest these ids dangle — which every reader treats as "no template". */
-export const CODEX_TEMPLATE_ID = "template_preset_codex";
-export const CLAUDE_CODE_TEMPLATE_ID = "template_preset_claude_code";
+/** The template the built-in preset opens with. Keep in sync with
+ * `catalog.rs::BUILTIN_PRESET_TEMPLATE_ID`. The body lives in the host's SQLite
+ * store, written by `storage::install_builtin_preset`, so in the browser preview
+ * and in vitest this id dangles — which every reader treats as "no template". */
+export const BUILTIN_PRESET_TEMPLATE_ID = "template_preset_mework";
 
 /** Mirrors `catalog.rs::builtin_claude_agent_provider`: the whole seed table. */
 function claudeAgentSeedModels(): ModelProfile[] {
@@ -691,19 +692,48 @@ function seedProviders(): ApiProvider[] {
   ];
 }
 
-/** One seeded role: everything on, thinking on, nothing said about itself.
- * `tools: null` rather than an allowlist, so the role tracks whatever its preset
- * enables instead of freezing today's catalog into six copies. */
-function seedAgentDefinition(
+/** The built-in preset's roles. Mirrors `catalog.rs::BUILTIN_ROLES`, text
+ * included: the descriptions are what the model reads when it picks a role. */
+const BUILTIN_ROLES: ReadonlyArray<{
+  name: string;
+  family: string;
+  modelId: string;
+  description: string;
+}> = [
+  {
+    name: "Opus",
+    family: CLAUDE_AGENT_PROVIDER_FAMILY,
+    modelId: "claude-opus-5-5",
+    description: "Claude Opus 5.5 (Anthropic). Strongest at long, sprawling engineering work: codebase-wide migrations and audits, hard debugging, and changes that need careful judgement and checking its own work. Pick it for the largest and hardest tasks."
+  },
+  {
+    name: "Sol",
+    family: CODEX_PROVIDER_FAMILY,
+    modelId: "gpt-6-sol",
+    description: "GPT-6 Sol (OpenAI). Built for complex coding and agentic workflows that need strong reasoning: multi-step implementation, refactoring and debugging across several files. Pick it for demanding coding tasks."
+  },
+  {
+    name: "Luna",
+    family: CODEX_PROVIDER_FAMILY,
+    modelId: "gpt-6-luna",
+    description: "GPT-6 Luna (OpenAI). Fast and low-cost, for focused, high-volume work: well-scoped edits, searches and lookups, running tests and summarizing their output. Pick it for repeatable tasks at scale and for many parallel workers."
+  }
+];
+
+/** One role of the built-in preset: everything on and thinking on. `tools: null`
+ * rather than an allowlist, so the role tracks whatever the preset enables
+ * instead of freezing today's catalog into three copies. */
+function builtinRole(
   name: string,
   providerId: string,
-  modelId: string
+  modelId: string,
+  description: string
 ): AgentDefinition {
   return {
     enabled: true,
     deleted: false,
     name,
-    description: "",
+    description,
     source: "user",
     sourceKey: "",
     revision: 1,
@@ -725,10 +755,10 @@ function seedAgentDefinition(
 }
 
 /**
- * The one shell a fresh install's presets turn on: this machine's most
- * preferred. The host probes for it at first launch
- * (`storage::seed_local_shell`); this seed, which has no probe to ask, reads
- * the OS off the platform string and takes that OS's first shell.
+ * The one shell the built-in preset turns on: this machine's most preferred.
+ * The host probes for it on every start (`storage::install_builtin_preset`);
+ * this seed, which has no probe to ask, reads the OS off the platform string
+ * and takes that OS's first shell.
  */
 function seedShellBackend(platform: string): ShellBackend {
   const { os, backends } = knownShells(null, {}, platform);
@@ -737,8 +767,7 @@ function seedShellBackend(platform: string): ShellBackend {
 
 /**
  * Everything in the catalog except the names the host derives for itself and
- * every shell but `shell`. Mirrors `catalog.rs::seed_preset_enabled_tools`
- * narrowed by `storage::seed_local_shell`.
+ * every shell but `shell`. Mirrors `catalog.rs::builtin_preset_enabled_tools`.
  *
  * The memory tools follow the two memory switches, `skill` follows
  * `skillToolEnabled`, the two web tools follow `webSearchEnabled`, and the task
@@ -755,29 +784,31 @@ function seedPresetEnabledTools(tools: readonly ToolDescriptor[], shell: ShellBa
     });
 }
 
-function seedPreset(
-  id: string,
-  name: string,
-  enabledTools: string[],
-  templateId: string,
-  webSearch: ConversationWebSearchSettings,
-  agentDefinitions: AgentDefinition[]
+/** Keep in sync with `src-tauri/src/catalog.rs::builtin_preset`. A role whose
+ * provider row is missing is left out, as the host leaves it out; the Codex
+ * roles are bound to models that do not exist until the user signs in and
+ * fetches the catalog, and the binding waits rather than being discarded. */
+function builtinPreset(
+  providers: readonly ApiProvider[],
+  tools: readonly ToolDescriptor[],
+  platform: string
 ): ConversationPreset {
   return {
-    id,
-    name,
+    id: BUILTIN_PRESET_ID,
+    name: "mework",
     description: "",
-    // The body lives in the host store, written once at first launch; this id
-    // dangles in the browser preview, which reads as "no template".
-    templateId,
+    // The body lives in the host store; this id dangles in the browser preview,
+    // which reads as "no template".
+    templateId: BUILTIN_PRESET_TEMPLATE_ID,
     settings: {
-      // The host has no default prompt of its own; a fresh conversation sends
-      // only its capability sections until the user writes one.
-      enabledTools,
+      enabledTools: seedPresetEnabledTools(tools, seedShellBackend(platform)),
       toolDescriptionFileId: null,
-      agentDefinitions,
-      // Every child is one of the three named roles, so the model cannot route
-      // around them by spawning an anonymous one.
+      agentDefinitions: BUILTIN_ROLES.flatMap((role) => {
+        const provider = providers.find((candidate) => candidate.family === role.family);
+        return provider ? [builtinRole(role.name, provider.id, role.modelId, role.description)] : [];
+      }),
+      // Every child is one of the named roles, so the model cannot route around
+      // them by spawning an anonymous one.
       allowRolelessSubagents: false,
       // The host mints these from the absolute paths of the capability files it
       // writes at first launch, so the renderer seed cannot know them and ships
@@ -786,9 +817,23 @@ function seedPreset(
       hookIds: [],
       skillIds: [],
       mcpIds: [],
-      webSearch,
-      // These presets mirror CLIs that search the web, so web access is on;
-      // which of the two web tools that grants follows the resolved backend.
+      webSearch: {
+        maxSearchesPerCall: 0,
+        provider: { kind: "native" },
+        fetchProvider: { kind: "native" },
+        // The basic versions. A newer one is a choice with its own costs, not a
+        // default to hand every new conversation.
+        nativeSearchTool: NATIVE_SEARCH_TOOLS[0],
+        nativeFetchTool: NATIVE_FETCH_TOOLS[0],
+        maxResults: DEFAULT_SEARCH_MAX_RESULTS,
+        compressionCutoff: DEFAULT_SEARCH_COMPRESSION_CUTOFF,
+        // A shipped domain list would be this application deciding what the web
+        // is allowed to say, so the filter is off and both lists are the user's.
+        domainFilter: "off",
+        includeDomains: [],
+        excludeDomains: []
+      },
+      // Which of the two web tools this grants follows the resolved backend.
       webSearchEnabled: true,
       securityLevel: "request_approval",
       // The memory tools are switched by these two rather than named in the list.
@@ -800,65 +845,6 @@ function seedPreset(
       mcpToolDiscoveryEnabled: true
     }
   };
-}
-
-/** Keep in sync with `src-tauri/src/catalog.rs::product_default_presets`. The
- * Codex roles are bound to models that do not exist until the user signs in and
- * fetches the catalog; the binding waits rather than being discarded, and the
- * role starts working the moment its model shows up.
- *
- * The two web legs differ because the families differ. Search is native for
- * both. Fetch is native only for Codex, whose family folds retrieval into its
- * one `web_search` tool. The Claude Agent family supports neither native leg,
- * so the Claude Code preset ships no fetch backend at all. */
-function seedPresets(
-  providers: readonly ApiProvider[],
-  tools: readonly ToolDescriptor[],
-  platform: string
-): ConversationPreset[] {
-  const enabledTools = () => seedPresetEnabledTools(tools, seedShellBackend(platform));
-  const providerId = (family: string) =>
-    providers.find((provider) => provider.family === family)?.id ?? "";
-  const codex = providerId(CODEX_PROVIDER_FAMILY);
-  const claudeAgent = providerId(CLAUDE_AGENT_PROVIDER_FAMILY);
-  const webSearch = (
-    fetchProvider: ConversationWebSearchSettings["fetchProvider"]
-  ): ConversationWebSearchSettings => ({
-    maxSearchesPerCall: 0,
-    provider: { kind: "native" },
-    fetchProvider,
-    // Factory presets ship the basic versions. A newer one is a choice with its
-    // own costs, not a default to hand every new conversation.
-    nativeSearchTool: NATIVE_SEARCH_TOOLS[0],
-    nativeFetchTool: NATIVE_FETCH_TOOLS[0],
-    maxResults: DEFAULT_SEARCH_MAX_RESULTS,
-    compressionCutoff: DEFAULT_SEARCH_COMPRESSION_CUTOFF,
-    // Factory presets filter nothing and carry no rules to filter with. The
-    // lists are the user's to write, and a shipped one would be this
-    // application deciding what the web is allowed to say.
-    domainFilter: "off",
-    includeDomains: [],
-    excludeDomains: []
-  });
-  return [
-    seedPreset(CODEX_PRESET_ID, "Codex", enabledTools(), CODEX_TEMPLATE_ID, webSearch({ kind: "native" }), [
-      seedAgentDefinition("sol", codex, "gpt-5.6-sol"),
-      seedAgentDefinition("terra", codex, "gpt-5.6-terra"),
-      seedAgentDefinition("luna", codex, "gpt-5.6-luna")
-    ]),
-    seedPreset(
-      CLAUDE_CODE_PRESET_ID,
-      "Claude Code",
-      enabledTools(),
-      CLAUDE_CODE_TEMPLATE_ID,
-      webSearch({ kind: "native" }),
-      [
-        seedAgentDefinition("opus", claudeAgent, "claude-opus-5"),
-        seedAgentDefinition("sonnet", claudeAgent, "claude-sonnet-5"),
-        seedAgentDefinition("haiku", claudeAgent, "claude-haiku-4-5")
-      ]
-    )
-  ];
 }
 
 export const createSeedDocument = (
@@ -877,10 +863,10 @@ export const createSeedDocument = (
       appLanguage: "auto",
       resolvedAppLanguage: "zh-CN",
       theme: "system",
-      conversationPresets: seedPresets(apiProviders, tools, platform),
+      conversationPresets: [builtinPreset(apiProviders, tools, platform)],
       // Storage refuses an empty default once presets exist, so this is written
       // explicitly rather than left to the normalizer's first-preset fallback.
-      defaultConversationPresetId: CLAUDE_CODE_PRESET_ID,
+      defaultConversationPresetId: BUILTIN_PRESET_ID,
       lastReasoningEffort: "disabled",
       apiProviders,
       activeProviderId: activeProvider?.id ?? null,

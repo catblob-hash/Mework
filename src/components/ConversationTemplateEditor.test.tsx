@@ -94,7 +94,7 @@ describe("ConversationTemplateEditor", () => {
     expect(within(page).getByRole("button", { name: /^编辑工具调用/ })).toBeInTheDocument();
     expect(within(page).getByRole("button", { name: /^删除工具调用/ })).toBeInTheDocument();
 
-    await user.pointer({ keys: "[MouseRight]", target: page.querySelector(".context-stream__hint")! });
+    await user.pointer({ keys: "[MouseRight]", target: page.querySelector(".context-stream")! });
     const menu = await screen.findByRole("menu");
     expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
       "系统提示词",
@@ -120,7 +120,7 @@ describe("ConversationTemplateEditor", () => {
     // here would be prose the model can read and never act on.
     const { page } = open({ enabledTools: ["ls"] });
 
-    await user.pointer({ keys: "[MouseRight]", target: page.querySelector(".context-stream__hint")! });
+    await user.pointer({ keys: "[MouseRight]", target: page.querySelector(".context-stream")! });
     await user.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: /工具调用/ }));
 
     const groups = screen.getByRole("menu", { name: "工具调用" });
@@ -209,7 +209,7 @@ describe("ConversationTemplateEditor", () => {
     const user = userEvent.setup();
     const { page, onSave } = open();
 
-    await user.pointer({ keys: "[MouseRight]", target: page.querySelector(".context-stream__hint")! });
+    await user.pointer({ keys: "[MouseRight]", target: page.querySelector(".context-stream")! });
     const menu = await screen.findByRole("menu");
     await user.click(within(menu).getByRole("menuitem", { name: /工具调用/ }));
     await user.click(await screen.findByRole("menuitem", { name: "Shell" }));

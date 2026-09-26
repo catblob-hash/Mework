@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createTestDocument as createSeedDocument } from "../test/fixtures";
 import { TEMPORARY_WORKSPACE_ID } from "../lib/workspaces";
 import type { AttachedWorkspace, SshMachineConfig, Workspace } from "../types";
-import { ProjectSelector, TerminalShellButton, WorkspaceMemberSelector } from "./ProjectChips";
+import { ProjectSelector, WorkspaceMemberSelector } from "./ProjectChips";
 
 const devbox: SshMachineConfig = {
   id: "machine-devbox",
@@ -200,55 +200,5 @@ describe("WorkspaceMemberSelector", () => {
     renderSelector({ workspaces: [{ path: "C:\\platform" }], selected: 1, showIndex: false });
     const trigger = screen.getByRole("button", { name: "工作区：platform" });
     expect(trigger.querySelector(".composer-chip__index")).toBeNull();
-  });
-});
-
-describe("TerminalShellButton", () => {
-  it("offers the shells it is given, then the pane, and reports the one picked", async () => {
-    const onSelect = vi.fn();
-    const onTogglePane = vi.fn();
-    const user = userEvent.setup();
-    render(
-      <TerminalShellButton
-        workspaceLabel="api"
-        shells={["zsh", "bash", "sh"]}
-        paneOpen={false}
-        onSelect={onSelect}
-        onTogglePane={onTogglePane}
-      />
-    );
-
-    await user.click(screen.getByRole("button", { name: "在 api 打开终端" }));
-    const menu = screen.getByRole("menu", { name: "用哪个 shell" });
-    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
-      .toEqual(["zsh", "bash", "sh", "打开终端面板"]);
-    // One level only: nothing in it opens a menu of its own.
-    expect(within(menu).queryAllByRole("menuitem").filter((item) => item.hasAttribute("aria-haspopup")))
-      .toEqual([]);
-    await user.click(within(menu).getByRole("menuitem", { name: "bash" }));
-    expect(onSelect).toHaveBeenCalledWith("bash");
-    expect(onTogglePane).not.toHaveBeenCalled();
-
-    await user.click(screen.getByRole("button", { name: "在 api 打开终端" }));
-    await user.click(within(screen.getByRole("menu", { name: "用哪个 shell" }))
-      .getByRole("menuitem", { name: "打开终端面板" }));
-    expect(onTogglePane).toHaveBeenCalledOnce();
-  });
-
-  it("offers to hide a pane that is open, and says so when no shell was found", async () => {
-    const user = userEvent.setup();
-    render(
-      <TerminalShellButton
-        workspaceLabel="api"
-        shells={[]}
-        paneOpen
-        onSelect={vi.fn()}
-        onTogglePane={vi.fn()}
-      />
-    );
-    await user.click(screen.getByRole("button", { name: "在 api 打开终端" }));
-    const menu = screen.getByRole("menu", { name: "用哪个 shell" });
-    expect(within(menu).getByRole("menuitem", { name: "未探测到可用的 shell" })).toBeDisabled();
-    expect(within(menu).getByRole("menuitem", { name: "收起终端面板" })).toBeEnabled();
   });
 });

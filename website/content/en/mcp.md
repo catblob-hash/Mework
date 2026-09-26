@@ -14,7 +14,7 @@ MCP servers are **not** registered in the app. They are declared in a file, the 
 <workspace>/.mework/mcp.json       workspace scope — that workspace only
 ```
 
-A fresh installation writes four entries into the user file — `builtin_sequential_thinking`, `builtin_context7`, `builtin_fetch` and `builtin_time` — and both presets Mework ships select them. Each launches through `npx` or `uvx` and needs no credential.
+A fresh installation writes four entries into the user file — `builtin_sequential_thinking`, `builtin_context7`, `builtin_fetch` and `builtin_time` — and the built-in **mework** preset selects them. Each launches through `npx` or `uvx` and needs no credential.
 
 The shape is Claude Code's `.mcp.json`: a top-level `mcpServers` object keyed by server name.
 
@@ -84,7 +84,7 @@ The **Tool discovery** switch (under the list, always shown) chooses how the dis
 - **Off, the switch reading *All declared*.** Every discovered tool's full schema goes out with every request, exactly like a built-in tool's.
 - **On, *On demand* — fetched with the [`tool_search` tool](tools/tool_search.html).** No MCP schema is declared. The context carries a `<deferred-tools>` block instead, listing the withheld names grouped by the server that declared them (`tool_search.announcement` and `tool_search.announcement_row` in the [prompt profile](prompt-profiles.html)). `tool_search` takes a `query`: `select:<name>[,<name>…]` returns those exact definitions, anything else is a keyword search over the withheld names, their servers and their descriptions (a `+term` every result must contain, the rest ranking) capped by `max_results`, default 5. A tool whose definition has come back is declared normally from the next step on and callable like any other; calling one whose schema has not been fetched is rejected with the `select:` call that fixes it (`tool_search.not_loaded`).
 
-A new conversation takes the switch from the preset it starts from; both presets Mework ships, **Codex** and **Claude Code**, start it on. Once any server has been dialed the switch is frozen, the same way skill delivery is: the transcript already carries the tools one way. The announcement is fixed for the whole run, so a name stays listed after its schema arrives. A subagent inherits the mode and withholds every inherited tool again, since it starts from an empty history and never read the parent's `tool_search` results.
+A new conversation takes the switch from the preset it starts from; the built-in **mework** preset starts it on. Once any server has been dialed the switch is frozen, the same way skill delivery is: the transcript already carries the tools one way. The announcement is fixed for the whole run, so a name stays listed after its schema arrives. A subagent inherits the mode and withholds every inherited tool again, since it starts from an empty history and never read the parent's `tool_search` results.
 
 `tool_search` is derived, not in the tool picker: it appears exactly when the switch is on and the run withheld at least one tool.
 

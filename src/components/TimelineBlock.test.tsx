@@ -929,6 +929,34 @@ describe("TimelineBlock", () => {
     expect(getRowToggle(settledRow)).toHaveAttribute("aria-label", "think · 思考过程");
   });
 
+  it("sweeps in what each commit adds to a streaming reasoning line, and nothing once it settles", () => {
+    const block = (content: string, streaming = true) => (
+      <TimelineBlock
+        entries={[reasoningEntry(reasoning("sweep-think", { content, streaming }), 0)]}
+        tools={[]}
+        insertionIndex={null}
+      />
+    );
+    const fresh = (row: HTMLElement) => Array.from(row.querySelectorAll(".timeline-row__line .stream-fresh"))
+      .map((span) => span.textContent);
+    const { container, rerender } = render(block("先定位"));
+    const row = getRow(container, "sweep-think");
+    expect(fresh(row)).toEqual(["先定位"]);
+
+    // A continuation: only the continuation moves.
+    rerender(block("先定位失败用例"));
+    expect(rowText(row, "line")).toBe("先定位失败用例");
+    expect(fresh(row)).toEqual(["失败用例"]);
+
+    // A new line is new from its first character.
+    rerender(block("先定位失败用例\n再看调用栈"));
+    expect(fresh(row)).toEqual(["再看调用栈"]);
+
+    rerender(block("先定位失败用例\n再看调用栈", false));
+    expect(rowText(row, "line")).toBe("先定位失败用例");
+    expect(fresh(row)).toEqual([]);
+  });
+
   it("gives an encrypted reasoning row its token count and refuses to edit it", () => {
     // The body never reached the client, so anything typed here would be
     // fabricated history the next round is asked to believe. The token figure

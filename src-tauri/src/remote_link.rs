@@ -2462,6 +2462,9 @@ mod tests {
             let mut text = String::new();
             child.process.take_stdout().unwrap().read_to_string(&mut text).unwrap();
             assert_eq!(text.trim().to_ascii_lowercase(), "/c/windows", "{cwd}");
+            // The machine timed it, so the task row need not use this host's span.
+            let exit = child.process.wait().unwrap();
+            assert!(exit.runtime_ms.is_some(), "{exit:?}");
         }
 
         // A command keeps running, and keeps every line, through a dropped
@@ -2858,6 +2861,7 @@ mod tests {
             signal: None,
             reason: protocol::ExitReason::Exited,
             ends: Default::default(),
+            runtime_ms: None,
         };
         assert_eq!(exit_status(&exited).code(), Some(3));
         let killed = protocol::ExitInfo {
@@ -2865,6 +2869,7 @@ mod tests {
             signal: Some(9),
             reason: protocol::ExitReason::Signalled,
             ends: Default::default(),
+            runtime_ms: None,
         };
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(exit_status(&killed).signal(), Some(9));

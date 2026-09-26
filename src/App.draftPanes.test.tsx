@@ -60,11 +60,12 @@ function documentWithTwoProjects(): AppDocument {
 }
 
 const composer = () => screen.getByLabelText("向 Agent 发送消息");
-/** Opens the terminal pane from the composer's terminal button: the row after its shells. */
+/** Opens the terminal pane from the top bar's terminal button: the row after its shells. */
 async function openTerminalPane(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(screen.getByRole("button", { name: /打开终端$/ }));
-  await user.click(within(await screen.findByRole("menu", { name: "用哪个 shell" }))
-    .getByRole("menuitem", { name: "打开终端面板" }));
+  const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
+  await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+  await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
+    .getByRole("menuitem", { name: "显示终端面板" }));
 }
 /** The first terminal tab's panel, whoever owns it; the owner is part of its DOM id. */
 const firstTerminalPanel = () => window.document.querySelector<HTMLElement>(

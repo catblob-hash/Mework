@@ -2,16 +2,21 @@ import { describe, expect, it } from "vitest";
 // Vite's ?raw import loads Rust source as plain text for cross-language constant alignment.
 // It needs neither Node types nor compilation.
 import storageSource from "../src-tauri/src/storage.rs?raw";
+import catalogSource from "../src-tauri/src/catalog.rs?raw";
 import {
-  CLAUDE_CODE_PRESET_ID,
-  CLAUDE_CODE_TEMPLATE_ID,
-  CODEX_PRESET_ID,
-  CODEX_TEMPLATE_ID,
+  BUILTIN_PRESET_ID,
+  BUILTIN_PRESET_TEMPLATE_ID,
   createSeedDocument
 } from "./seed";
-import { implicitConversationPreset } from "./lib/conversationPresets";
-import { toolCatalog } from "./seed";
 import { defaultConversationWebSearchSettings, normalizeDocument } from "./lib/runtime";
+import type { ConversationPreset } from "./types";
+
+function builtinPresetOf(platform?: string): ConversationPreset {
+  const presets = createSeedDocument(platform).globalSettings.conversationPresets;
+  const preset = presets.find((candidate) => candidate.id === BUILTIN_PRESET_ID);
+  expect(preset).toBeDefined();
+  return preset!;
+}
 
 describe("seed document", () => {
   it("keeps the Rust and TS schema version constants identical", () => {
@@ -29,9 +34,9 @@ describe("seed document", () => {
       resolvedAppLanguage: "zh-CN",
       theme: "system"
     });
-    expect(document.globalSettings.defaultConversationPresetId).toBe(CLAUDE_CODE_PRESET_ID);
+    expect(document.globalSettings.defaultConversationPresetId).toBe(BUILTIN_PRESET_ID);
     expect(document.globalSettings.conversationPresets.map((preset) => preset.id))
-      .toEqual([CODEX_PRESET_ID, CLAUDE_CODE_PRESET_ID]);
+      .toEqual([BUILTIN_PRESET_ID]);
     // Seed conversations always use the most cautious security level.
     expect(document.workspaces.flatMap((workspace) => workspace.conversations)
       .every((conversation) => conversation.settings.securityLevel === "request_approval")).toBe(true);
@@ -70,6 +75,7 @@ describe("seed document", () => {
     expect(settings.apiProviders[0].models).toEqual([]);
     // Claude Agent ships its seed rows installed; fetching asks the CLI later.
     const claudeModelIds = settings.apiProviders[1].models.map((model) => model.id);
+    expect(claudeModelIds).toContain("claude-opus-5-5");
     expect(claudeModelIds).toContain("claude-opus-5");
     expect(claudeModelIds).toContain("claude-sonnet-5");
     expect(claudeModelIds).toContain("claude-haiku-4-5");
@@ -138,81 +144,77 @@ describe("seed document", () => {
     expect(document.capabilities.skills).toEqual([]);
   });
 
-  it("ships the two shipped presets and no other user-managed preset domain", () => {
+  it("ships the one built-in preset and no other user-managed preset domain", () => {
     const document = createSeedDocument("MacIntel");
     const settings = document.globalSettings;
-    const [codex, claudeCode] = settings.conversationPresets;
-    expect([codex.name, claudeCode.name]).toEqual(["Codex", "Claude Code"]);
-    expect(settings.defaultConversationPresetId).toBe(CLAUDE_CODE_PRESET_ID);
+    const [preset] = settings.conversationPresets;
+    expect(preset.name).toBe("mework");
+    expect(settings.defaultConversationPresetId).toBe(BUILTIN_PRESET_ID);
 
-    // Each fleet is exactly three named roles bound to explicit models, thinking
-    // on, tools inherited from the preset, and nothing said about itself.
-    expect(codex.settings.agentDefinitions.map((role) => role.name))
-      .toEqual(["sol", "terra", "luna"]);
-    expect(claudeCode.settings.agentDefinitions.map((role) => role.name))
-      .toEqual(["opus", "sonnet", "haiku"]);
-    for (const preset of settings.conversationPresets) {
-      // No anonymous children: every subagent goes through one of the roles.
-      expect(preset.settings.allowRolelessSubagents).toBe(false);
-      // Everything on except the names the host derives for itself. The two web
-      // tools among them: they follow `webSearchEnabled`, and the plan tools
-      // follow the security level, not a tool toggle. Of the shells, only this
-      // machine's most preferred one.
-      expect(preset.settings.enabledTools).toEqual(
-        document.tools.map((tool) => tool.name).filter((name) => !(
-          document.tools.find((tool) => tool.name === name)!.category === "memory"
-          || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
-          || ["plan", "exit_plan_mode"].includes(name)
-          || ["bash", "sh", "powershell"].includes(name)
-        ))
-      );
-      expect(preset.settings.enabledTools).toEqual(expect.arrayContaining(["zsh", "preview_start", "workflow"]));
-      // The memory tools are switched rather than listed, and both switches are on.
-      expect(preset.settings.globalMemoryEnabled).toBe(true);
-      expect(preset.settings.projectMemoryEnabled).toBe(true);
-      // These presets mirror CLIs that search the web, so web access is on even
-      // though the two web tool names are host-derived from this switch.
-      expect(preset.settings.webSearchEnabled).toBe(true);
-      // Both capability surfaces load on demand rather than inlining every
-      // selected body and every MCP schema into the system prompt.
-      expect(preset.settings.skillToolEnabled).toBe(true);
-      expect(preset.settings.mcpToolDiscoveryEnabled).toBe(true);
-      // Capability ids hash an absolute path, so only the host can mint them;
-      // the renderer seed ships none. Hooks are never selected even there — a
-      // dangling hook id fails every run of the conversation closed.
-      expect(preset.settings.skillIds).toEqual([]);
-      expect(preset.settings.mcpIds).toEqual([]);
-      expect(preset.settings.hookIds).toEqual([]);
-      // Search is native for both; the fetch leg is native for both as well,
-      // each family folding or splitting retrieval in its own way.
-      expect(preset.settings.webSearch.provider).toEqual({ kind: "native" });
-      expect(preset.settings.webSearch.fetchProvider).toEqual({ kind: "native" });
-      // Both presets ship the ordinary result shaping and filter nothing:
-      // these are the defaults a fresh install starts on, not a policy.
-      expect(preset.settings.webSearch.maxResults).toBe(5);
-      expect(preset.settings.webSearch.compressionCutoff).toBe(2000);
-      expect(preset.settings.webSearch.domainFilter).toBe("off");
-      expect(preset.settings.webSearch.includeDomains).toEqual([]);
-      expect(preset.settings.webSearch.excludeDomains).toEqual([]);
-      for (const role of preset.settings.agentDefinitions) {
-        expect(role).toMatchObject({
-          description: "",
-          effort: "medium",
-          tools: null,
-          source: "user",
-          sourceKey: "",
-          revision: 1,
-          memoryEpoch: 1,
-          memory: "none",
-          maxResults: 5,
-          compressionCutoff: 2000
-        });
-        expect(role.modelSelection.kind).toBe("explicit");
-      }
+    // Three named roles bound to explicit models, thinking on, tools inherited
+    // from the preset, and a description saying when to pick each.
+    const provider = (family: string) => settings.apiProviders.find((item) => item.family === family)!.id;
+    expect(preset.settings.agentDefinitions.map((role) => [role.name, role.modelSelection])).toEqual([
+      ["Opus", { kind: "explicit", providerId: provider("claude_agent"), modelId: "claude-opus-5-5" }],
+      ["Sol", { kind: "explicit", providerId: provider("openai_codex"), modelId: "gpt-6-sol" }],
+      ["Luna", { kind: "explicit", providerId: provider("openai_codex"), modelId: "gpt-6-luna" }]
+    ]);
+    for (const role of preset.settings.agentDefinitions) {
+      expect(role).toMatchObject({
+        effort: "medium",
+        tools: null,
+        source: "user",
+        sourceKey: "",
+        revision: 1,
+        memoryEpoch: 1,
+        memory: "none",
+        maxResults: 5,
+        compressionCutoff: 2000
+      });
+      // The host's table is the one that ships; this mirror has to say the same.
+      expect(role.description).not.toBe("");
+      expect(catalogSource).toContain(`"${role.name}"`);
+      expect(catalogSource).toContain(`"${role.description}"`);
     }
-    // Each preset opens with the system prompt the host seeds behind this id.
-    expect(codex.templateId).toBe(CODEX_TEMPLATE_ID);
-    expect(claudeCode.templateId).toBe(CLAUDE_CODE_TEMPLATE_ID);
+    expect(catalogSource).toContain(`const BUILTIN_PRESET_ID: &str = "${BUILTIN_PRESET_ID}";`);
+    expect(catalogSource).toContain(
+      `const BUILTIN_PRESET_TEMPLATE_ID: &str = "${BUILTIN_PRESET_TEMPLATE_ID}";`
+    );
+
+    // No anonymous children: every subagent goes through one of the roles.
+    expect(preset.settings.allowRolelessSubagents).toBe(false);
+    // Everything on except the names the host derives for itself. The two web
+    // tools among them: they follow `webSearchEnabled`, and the plan tools
+    // follow the security level, not a tool toggle. Of the shells, only this
+    // machine's most preferred one.
+    expect(preset.settings.enabledTools).toEqual(
+      document.tools.map((tool) => tool.name).filter((name) => !(
+        document.tools.find((tool) => tool.name === name)!.category === "memory"
+        || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
+        || ["plan", "exit_plan_mode"].includes(name)
+        || ["bash", "sh", "powershell"].includes(name)
+      ))
+    );
+    expect(preset.settings.enabledTools).toEqual(expect.arrayContaining(["zsh", "preview_start", "workflow"]));
+    // The memory tools are switched rather than listed, and both switches are on.
+    expect(preset.settings.globalMemoryEnabled).toBe(true);
+    expect(preset.settings.projectMemoryEnabled).toBe(true);
+    // Web access is on even though the two web tool names are host-derived
+    // from this switch.
+    expect(preset.settings.webSearchEnabled).toBe(true);
+    // Both capability surfaces load on demand rather than inlining every
+    // selected body and every MCP schema into the system prompt.
+    expect(preset.settings.skillToolEnabled).toBe(true);
+    expect(preset.settings.mcpToolDiscoveryEnabled).toBe(true);
+    // Capability ids hash an absolute path, so only the host can mint them;
+    // the renderer seed ships none. Hooks are never selected even there — a
+    // dangling hook id fails every run of the conversation closed.
+    expect(preset.settings.skillIds).toEqual([]);
+    expect(preset.settings.mcpIds).toEqual([]);
+    expect(preset.settings.hookIds).toEqual([]);
+    expect(preset.settings.toolDescriptionFileId).toBeNull();
+    // It opens with the system prompt the host writes behind this id.
+    expect(preset.templateId).toBe(BUILTIN_PRESET_TEMPLATE_ID);
 
     // Retired preset collections must not reappear, even as empty arrays.
     for (const retired of [
@@ -225,12 +227,6 @@ describe("seed document", () => {
     ]) {
       expect(settings).not.toHaveProperty(retired);
     }
-    expect(document.workspaces.flatMap((workspace) => workspace.conversations)).toEqual([]);
-    const implicit = implicitConversationPreset(toolCatalog, "zh-CN").settings;
-    expect(implicit.hookIds).toEqual([]);
-    expect(implicit.skillIds).toEqual([]);
-    expect(implicit.mcpIds).toEqual([]);
-    expect(implicit.toolDescriptionFileId).toBeNull();
     for (const retired of [
       "hookPresetIds",
       "skillPresetIds",
@@ -240,8 +236,9 @@ describe("seed document", () => {
       "modelSelection",
       "securityPolicyId"
     ]) {
-      expect(implicit).not.toHaveProperty(retired);
+      expect(preset.settings).not.toHaveProperty(retired);
     }
+    expect(document.workspaces.flatMap((workspace) => workspace.conversations)).toEqual([]);
     expect(createSeedDocument().capabilities.mcps).toEqual([]);
   });
 
@@ -271,12 +268,15 @@ describe("seed document", () => {
       codeBlockCollapsible: false,
       codeBlockWrappable: false,
       singleDollarMath: true,
-      customCss: ""
+      customCss: "",
+      customBackground: false,
+      backgroundImage: "",
+      localModel: { titles: false, shellExplanations: false, titlePrompt: "", shellPrompt: "" }
     });
   });
 
   it("gives a fresh conversation the default per-conversation search behaviour", () => {
-    expect(implicitConversationPreset(toolCatalog, "zh-CN").settings.webSearch).toEqual({
+    expect(builtinPresetOf().settings.webSearch).toEqual({
       maxSearchesPerCall: 0,
       provider: { kind: "native" },
       fetchProvider: { kind: "native" },
@@ -302,32 +302,26 @@ describe("seed document", () => {
     });
   });
 
-  it("keeps memory tools out of the implicit enabled-tool list", () => {
+  it("keeps memory tools out of the built-in preset's enabled-tool list", () => {
     // Memory tools are derived from the two memory-layer switches rather than the enabled list.
     const document = createSeedDocument();
     const memoryToolNames = new Set(
       document.tools.filter((tool) => tool.category === "memory").map((tool) => tool.name)
     );
     expect(memoryToolNames.size).toBe(6);
-    const implicit = implicitConversationPreset(document.tools, "zh-CN").settings;
-    expect(implicit.globalMemoryEnabled).toBe(false);
-    expect(implicit.projectMemoryEnabled).toBe(false);
-    expect(implicit.enabledTools.some((name) => memoryToolNames.has(name))).toBe(false);
+    const settings = builtinPresetOf().settings;
+    expect(settings.globalMemoryEnabled).toBe(true);
+    expect(settings.projectMemoryEnabled).toBe(true);
+    expect(settings.enabledTools.some((name) => memoryToolNames.has(name))).toBe(false);
   });
 
-  it("turns on the platform's most preferred shell in the shipped presets", () => {
-    const shellsOn = (platform: string) => createSeedDocument(platform).globalSettings.conversationPresets
-      .map((preset) => preset.settings.enabledTools.filter((name) => ["bash", "zsh", "sh", "powershell"].includes(name)));
-    expect(shellsOn("Win32")).toEqual([["powershell"], ["powershell"]]);
-    expect(shellsOn("MacIntel")).toEqual([["zsh"], ["zsh"]]);
-    expect(shellsOn("Linux x86_64")).toEqual([["bash"], ["bash"]]);
+  it("turns on the platform's most preferred shell in the built-in preset", () => {
+    const shellsOn = (platform: string) => builtinPresetOf(platform).settings.enabledTools
+      .filter((name) => ["bash", "zsh", "sh", "powershell"].includes(name));
+    expect(shellsOn("Win32")).toEqual(["powershell"]);
+    expect(shellsOn("MacIntel")).toEqual(["zsh"]);
+    expect(shellsOn("Linux x86_64")).toEqual(["bash"]);
     // A platform the table does not know gets the first shell in tool order.
-    expect(shellsOn("")).toEqual([["bash"], ["bash"]]);
-  });
-
-  it("gives a fresh conversation every backend's shell tool", () => {
-    const implicit = implicitConversationPreset(toolCatalog, "zh-CN").settings;
-    expect(implicit.enabledTools.filter((name) => /^(bash|zsh|sh|powershell)/.test(name)).sort())
-      .toEqual(["bash", "powershell", "sh", "zsh"]);
+    expect(shellsOn("")).toEqual(["bash"]);
   });
 });

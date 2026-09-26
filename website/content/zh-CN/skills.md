@@ -47,7 +47,7 @@ Claude Code 的其余前置元数据键——`allowed-tools`、`disable-model-in
 
 技能的身份是它的**目录名称**：这正是模型传递给 `skill` 工具的值，如同 Claude Code 中的 `/<name>`。前置元数据里的 `name` 和 `description` 只是目录展示的标签与触发文本。
 
-全新安装会在 `~/.mework/skills/` 写入五个技能文件夹——`systematic-debugging`、`verification-before-completion`、`code-review-and-quality`、`git-workflow-and-versioning` 与 `resolving-merge-conflicts`——随附的两个预设都会选中它们。它们是普通文件：可以随意编辑，删掉一个就保持删除。
+全新安装会在 `~/.mework/skills/` 写入五个技能文件夹——`systematic-debugging`、`verification-before-completion`、`code-review-and-quality`、`git-workflow-and-versioning` 与 `resolving-merge-conflicts`——内置的 **mework** 预设会选中它们。它们是普通文件：可以随意编辑，删掉一个就保持删除。
 
 对话抽屉的**技能**页面中，每个扫描发现的行都有一个删除按钮：第二次点击确认后，它会连同 `scripts/` 和 `references/` 一起删除技能的文件夹；本对话已经交给过模型的技能会被锁定——它的复选框被禁用，也没有删除按钮。页面工具条上还有一个**重新扫描**按钮和两个**打开文件夹**按钮——全局的 `~/.mework/skills`，加上本工作区的 `.mework/skills`（对话有工作区时）——目录不存在时它们会先创建它，再在系统文件管理器中打开。启动、打开设置面板、新增工作区以及每次删除之后也会重新扫描；每次运行都会自行重新扫描，因此运行用到的是那一刻磁盘上的内容。
 
@@ -64,7 +64,7 @@ Claude Code 的其余前置元数据键——`allowed-tools`、`disable-model-in
 - **关闭，开关读作*拼进提示词*——粘贴到系统提示词中。**每个选定技能的正文都会追加到系统提示词，以 `---` 行分隔。前置元数据会被剥掉；正文开头自带的标题会保留。模型会在每个回合读取技能，并在每个回合为其支付 token。
 - **开启，*按需加载*——由 [`skill` 工具](tools/skill.html)加载。**系统提示词不包含正文，改为承载目录：一个 `Available skills:` 标题，每个有触发文本的技能各占一行 `- <名称>：<触发条件>`（[提示词档案](prompt-profiles.html)中的 `skill.listing_heading` 与 `skill.listing_row`）。`skill` 工具的 schema 不点名任何技能——它接受目录 `name` 作为字符串，因此在每个对话里都是同一个对象——调用后返回 `Base directory for this skill: <path>`，随后是正文（`skill.result`）。此模式下，两个目录重名的选定技能会被拒绝，因为同一个名字无法区分它们。
 
-新对话从它起始的预设继承这个开关；随附的两个预设 **Codex** 与 **Claude Code** 开局都是开的。
+新对话从它起始的预设继承这个开关；内置的 **mework** 预设开局是开的。
 
 无论哪种方式，对话**开局**带的那批技能就是它系统提示词的内容，此后这份提示词不再变化。之后再选的技能会在时间线的那个位置以**独立的 system 消息**送达——传递关闭时是正文，开启时是触发行（`system.skill_added_body` / `system.skill_added_trigger`）。这也是已经交出去的技能和传递开关都不能再改回来的原因：转录里已经按当时的形态携带着它们，已经回答过的回合无法重问。
 

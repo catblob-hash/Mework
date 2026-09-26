@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "build": {
-    "beforeBundleCommand": "node scripts/stage-macos-cef.mjs"
+    "beforeBundleCommand": "node scripts/stage-macos-cef.mjs && node scripts/stage-macos-mlx.mjs"
   },
   "bundle": {
     "targets": ["app", "dmg"],
@@ -24,7 +24,8 @@
         "Frameworks/Mework Helper (GPU).app": "target/cef-bundle/Mework Helper (GPU).app",
         "Frameworks/Mework Helper (Renderer).app": "target/cef-bundle/Mework Helper (Renderer).app",
         "Frameworks/Mework Helper (Plugin).app": "target/cef-bundle/Mework Helper (Plugin).app",
-        "Frameworks/Mework Helper (Alerts).app": "target/cef-bundle/Mework Helper (Alerts).app"
+        "Frameworks/Mework Helper (Alerts).app": "target/cef-bundle/Mework Helper (Alerts).app",
+        "Frameworks/mework-mlx": "target/mlx-bundle"
       }
     }
   }

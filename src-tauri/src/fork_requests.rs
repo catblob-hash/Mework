@@ -371,6 +371,8 @@ pub fn perform_fork(
             .parent_conversation_id
             .clone()
             .or_else(|| Some(source.id.clone())),
+        // A model's fork is named by its prompt, not after its source.
+        fork_of: None,
         // The child inherits the whole settings body, so it inherits which preset
         // that body came from.
         preset_id: source.preset_id.clone(),

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { DEFAULT_TARGET_DIR, autoPruneCargoTarget } from "./prune-cargo-target.mjs";
 import { windowsNativeBuildEnvironment } from "./windows-native-build-tools.mjs";
 import { withCefBuildEnvironment } from "./cef-environment.mjs";
 import { devChildEnvironment } from "./dev-child-environment.mjs";
@@ -55,6 +56,9 @@ const tauriEntrypoint = join(
   "@tauri-apps",
   "cli",
   "tauri.js",
+);
+autoPruneCargoTarget(
+  environment.CARGO_TARGET_DIR ? resolve(environment.CARGO_TARGET_DIR) : DEFAULT_TARGET_DIR
 );
 const child = spawn(process.execPath, [tauriEntrypoint, ...tauriArguments], {
   env: environment,

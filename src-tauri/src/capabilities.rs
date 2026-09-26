@@ -16,7 +16,7 @@ use crate::{
         ToolDescriptionEntry, Workspace,
     },
     prompt_profile::{self, PromptKey, PromptProfile},
-    prompt_profile_files, skills,
+    skills,
 };
 
 const METADATA_READ_LIMIT: u64 = 64 * 1024;
@@ -209,11 +209,10 @@ pub fn levels_for_conversation(
 
 /// Discovers the current capability catalog: skills, MCP servers and hooks
 /// from `~/.mework` and every workspace's `.mework`, plus the tool-description
-/// files and the two built-in prompt profiles. `app_data` locates the editable
-/// copies of the built-in profiles, which are catalog entries like any other file.
-pub fn discover(document: &AppDocument, app_data: &Path) -> CapabilityCatalog {
+/// files and the built-in prompt profile.
+pub fn discover(document: &AppDocument, _app_data: &Path) -> CapabilityCatalog {
     CapabilityCatalog {
-        tool_description_files: discover_tool_description_files(document, app_data),
+        tool_description_files: discover_tool_description_files(document),
         ..discover_levels(
             &all_levels(document),
             document.global_settings.resolved_app_language,
@@ -269,7 +268,6 @@ pub(crate) fn discover_levels(
             &level.path_for(CapabilityKind::Hooks),
             level.source,
             level.workspace_id.as_deref(),
-            language,
         ) {
             if seen.insert(entry.descriptor.location.clone()) {
                 hook_definitions.insert(entry.descriptor.id.clone(), entry.definition);
@@ -317,13 +315,10 @@ pub(crate) fn discover_levels(
 /// Scans tool-description files separately because [`resolve_prompt_profile`]
 /// needs only these files and must not require a skills root.
 ///
-/// The two built-in profiles come first and are always present: the English
-/// one is the default every conversation renders with until it selects
-/// something else, and neither has a location a user could delete.
-fn discover_tool_description_files(
-    document: &AppDocument,
-    app_data: &Path,
-) -> Vec<ResourceDescriptor> {
+/// The built-in profile comes first and is always present: it is the default
+/// every conversation renders with until it selects something else, and it has
+/// no location a user could delete.
+fn discover_tool_description_files(document: &AppDocument) -> Vec<ResourceDescriptor> {
     let mut files: Vec<ResourceDescriptor> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -338,48 +333,25 @@ fn discover_tool_description_files(
     }
 
     files.sort_by(resource_sort);
-    let mut catalog = builtin_prompt_profile_descriptors(app_data);
+    let mut catalog = vec![builtin_prompt_profile_descriptor()];
     catalog.extend(files);
     catalog
 }
 
-/// The two built-in profiles as catalog entries. `location` stays a `builtin:`
-/// pseudo-location so the renderer can tell them from the files a user added;
-/// the path their texts are edited at goes into the description instead.
-fn builtin_prompt_profile_descriptors(app_data: &Path) -> Vec<ResourceDescriptor> {
-    [
-        PromptProfile::builtin_english(),
-        PromptProfile::builtin_chinese(),
-    ]
-    .into_iter()
-    .map(|profile| ResourceDescriptor {
-        id: profile.id.clone(),
-        name: profile.name.clone(),
-        description: {
-            let path = prompt_profile_files::builtin_profile_path(app_data, profile.language)
-                .to_string_lossy()
-                .into_owned();
-            match profile.language {
-                ResolvedLanguage::EnUs => {
-                    format!("Built-in English prompts and tool descriptions — editable at {path}")
-                }
-                ResolvedLanguage::ZhCn => {
-                    format!("内置中文提示词与工具描述——可在 {path} 编辑")
-                }
-            }
-        },
-        location: format!(
-            "builtin:{}",
-            match profile.language {
-                ResolvedLanguage::EnUs => "en-US",
-                ResolvedLanguage::ZhCn => "zh-CN",
-            }
-        ),
+/// The built-in profile as a catalog entry. `location` is a `builtin:`
+/// pseudo-location so the renderer can tell it from the files a user added.
+fn builtin_prompt_profile_descriptor() -> ResourceDescriptor {
+    let profile = PromptProfile::builtin_english();
+    ResourceDescriptor {
+        id: profile.id,
+        name: profile.name,
+        description: "Built-in prompts and tool descriptions; ships with this version of Mework"
+            .to_owned(),
+        location: "builtin:en-US".to_owned(),
         source: ResourceSource::Builtin,
         available: true,
         workspace_id: None,
-    })
-    .collect()
+    }
 }
 
 /// Runtime context for this turn: the system-prompt addendum, the skills
@@ -912,9 +884,8 @@ fn read_hooks_file(
     path: &Path,
     source: ResourceSource,
     workspace_id: Option<&str>,
-    language: ResolvedLanguage,
 ) -> Vec<HookEntry> {
-    let labels = PromptProfile::builtin_for_language(language);
+    let labels = PromptProfile::builtin_english();
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
@@ -1493,18 +1464,15 @@ fn scan_tool_description_root(
 /// Resolves the conversation's selected tool-description file into the prompt
 /// profile the run renders with.
 ///
-/// No selection, the built-in English id, a dangling id, or an unreadable file
-/// all resolve to the built-in English profile — the one that is always
-/// present. A selected file declares no language of its own, so it follows the
-/// application language, which also picks the built-in that fills in whatever
-/// the file does not override.
-///
-/// Both built-ins render from their editable copy under `app_data`, so a user
-/// who changed a text there sees it in the next run without a rebuild.
+/// No selection, the built-in id, a dangling id, or an unreadable file all
+/// resolve to the built-in profile — the one that is always present, compiled
+/// into this build. A selected file declares no language of its own, so it
+/// carries the application language; the keys it does not override keep the
+/// built-in English wording.
 pub fn resolve_prompt_profile(
     document: &AppDocument,
     conversation: &Conversation,
-    app_data: &Path,
+    _app_data: &Path,
 ) -> PromptProfile {
     let app_language = document.global_settings.resolved_app_language;
     let Some(selected) = conversation
@@ -1512,14 +1480,11 @@ pub fn resolve_prompt_profile(
         .tool_description_file_id
         .as_deref()
         .map(str::trim)
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && *id != prompt_profile::BUILTIN_EN_US_ID)
     else {
-        return prompt_profile_files::load_builtin_profile(app_data, ResolvedLanguage::EnUs);
+        return PromptProfile::builtin_english();
     };
-    if let Some(builtin) = PromptProfile::builtin_for_id(selected) {
-        return prompt_profile_files::load_builtin_profile(app_data, builtin.language);
-    }
-    discover_tool_description_files(document, app_data)
+    discover_tool_description_files(document)
         .iter()
         .find(|descriptor| descriptor.id == selected)
         .and_then(|descriptor| {
@@ -1538,9 +1503,7 @@ pub fn resolve_prompt_profile(
                 )
             })
         })
-        .unwrap_or_else(|| {
-            prompt_profile_files::load_builtin_profile(app_data, ResolvedLanguage::EnUs)
-        })
+        .unwrap_or_else(PromptProfile::builtin_english)
 }
 
 /*
@@ -1675,29 +1638,17 @@ mod tests {
         }
         let app_data = directory.path().join("app-data");
         let catalog = discover(&document, &app_data);
-        assert_eq!(catalog.tool_description_files.len(), 3);
-        assert_eq!(
-            catalog.tool_description_files[0].id,
-            prompt_profile::BUILTIN_EN_US_ID
-        );
-        assert_eq!(
-            catalog.tool_description_files[1].id,
-            prompt_profile::BUILTIN_ZH_CN_ID
-        );
-        // A built-in keeps its `builtin:` location and says where its texts are
-        // edited, because that path is the only way to reach them.
-        for (index, language) in [ResolvedLanguage::EnUs, ResolvedLanguage::ZhCn]
-            .into_iter()
-            .enumerate()
-        {
-            assert!(catalog.tool_description_files[index].description.contains(
-                &prompt_profile_files::builtin_profile_path(&app_data, language)
-                    .to_string_lossy()
-                    .into_owned()
-            ));
-        }
-        assert_eq!(catalog.tool_description_files[2].name, "strict");
-        let found = &catalog.tool_description_files[2];
+        assert_eq!(catalog.tool_description_files.len(), 2);
+        // The built-in comes first, under a `builtin:` pseudo-location, and
+        // names no path: there is nothing on disk to edit.
+        let builtin = &catalog.tool_description_files[0];
+        assert_eq!(builtin.id, prompt_profile::BUILTIN_EN_US_ID);
+        assert_eq!(builtin.name, "Mework built-in");
+        assert_eq!(builtin.source, ResourceSource::Builtin);
+        assert!(builtin.location.starts_with("builtin:"));
+        assert!(!builtin.description.contains(&*app_data.to_string_lossy()));
+        assert_eq!(catalog.tool_description_files[1].name, "strict");
+        let found = &catalog.tool_description_files[1];
         assert_eq!(found.description, "2 个工具描述 · 1 条提示词覆盖");
         assert!(found.available);
 
@@ -1711,7 +1662,7 @@ mod tests {
         );
         assert_eq!(profile.id, found.id);
         // A file declares no language of its own, so it takes the application
-        // language — which is also the built-in that fills the keys it omits.
+        // language; the keys it omits keep the built-in English wording.
         assert_eq!(
             document.global_settings.resolved_app_language,
             ResolvedLanguage::ZhCn
@@ -1728,11 +1679,11 @@ mod tests {
         );
         assert_eq!(
             profile.text(PromptKey::SystemHooksSection),
-            PromptProfile::builtin_chinese().text(PromptKey::SystemHooksSection)
+            PromptKey::SystemHooksSection.builtin_en()
         );
 
-        // Switching the application language switches the fill-in base with it;
-        // the file's own overrides are untouched.
+        // Switching the application language changes the profile's language and
+        // nothing else: the overrides and the English fallback stay as they are.
         document.global_settings.resolved_app_language = ResolvedLanguage::EnUs;
         let profile = resolve_prompt_profile(
             &document,
@@ -1751,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_profile_defaults_to_english_and_resolves_builtins_or_dangling_ids() {
+    fn prompt_profile_defaults_to_the_builtin_and_resolves_dangling_ids_to_it() {
         let directory = tempfile::tempdir().unwrap();
         let app_data = directory.path().join("app-data");
         let mut document = crate::catalog::default_document();
@@ -1763,41 +1714,40 @@ mod tests {
             )
         };
         let profile = resolve(&document);
-        assert_eq!(profile.id, prompt_profile::BUILTIN_EN_US_ID);
-        assert_eq!(profile.language, ResolvedLanguage::EnUs);
+        assert_eq!(profile, PromptProfile::builtin_english());
 
+        // Selecting the built-in by id is the same as selecting nothing.
         document.workspaces[0].conversations[0]
             .settings
-            .tool_description_file_id = Some(prompt_profile::BUILTIN_ZH_CN_ID.to_owned());
-        let profile = resolve(&document);
-        assert_eq!(profile.id, prompt_profile::BUILTIN_ZH_CN_ID);
-        assert_eq!(profile.language, ResolvedLanguage::ZhCn);
+            .tool_description_file_id = Some(prompt_profile::BUILTIN_EN_US_ID.to_owned());
+        assert_eq!(resolve(&document), PromptProfile::builtin_english());
 
-        document.workspaces[0].conversations[0]
-            .settings
-            .tool_description_file_id = Some("missing-profile".to_owned());
-        let profile = resolve(&document);
-        assert_eq!(profile.id, prompt_profile::BUILTIN_EN_US_ID);
-        assert_eq!(profile.language, ResolvedLanguage::EnUs);
+        // A dangling id — a removed file, or the retired Chinese built-in's id
+        // still saved on an older conversation — resolves to the built-in.
+        for dangling in ["missing-profile", "tooldesc_builtin_zh_cn"] {
+            document.workspaces[0].conversations[0]
+                .settings
+                .tool_description_file_id = Some(dangling.to_owned());
+            assert_eq!(resolve(&document), PromptProfile::builtin_english());
+        }
 
-        // A built-in id renders from the editable copy on disk: the id and the
-        // language stay the built-in's, the texts are the file's.
-        let path = prompt_profile_files::builtin_profile_path(&app_data, ResolvedLanguage::ZhCn);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file left under the application data directory is not read: the
+        // built-in renders from the compiled texts.
+        let stale = app_data.join("prompt-profiles").join("en-US.json");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
         fs::write(
-            &path,
+            &stale,
             r#"{"name":"edited","prompts":{"system.capability_row":"ROW {name} {description}"},"tools":[]}"#,
         )
         .unwrap();
         document.workspaces[0].conversations[0]
             .settings
-            .tool_description_file_id = Some(prompt_profile::BUILTIN_ZH_CN_ID.to_owned());
+            .tool_description_file_id = None;
         let profile = resolve(&document);
-        assert_eq!(profile.id, prompt_profile::BUILTIN_ZH_CN_ID);
-        assert_eq!(profile.language, ResolvedLanguage::ZhCn);
+        assert_eq!(profile, PromptProfile::builtin_english());
         assert_eq!(
             profile.text(PromptKey::SystemCapabilityRow),
-            "ROW {name} {description}"
+            PromptKey::SystemCapabilityRow.builtin_en()
         );
     }
 
@@ -1916,13 +1866,37 @@ mod tests {
         assert_eq!(context.mcp_servers.len(), 1);
         assert_eq!(context.mcp_servers[0].server_id, "mcp-probe");
 
-        let chinese = PromptProfile::builtin_chinese();
-        let chinese_addendum = runtime_context_from_discovery(conversation, &scan(), &chinese)
+        // A tool-description file rewords every one of those texts.
+        let file = PromptProfile::from_file(
+            "file".into(),
+            "File".into(),
+            ResolvedLanguage::ZhCn,
+            HashMap::from([
+                (
+                    PromptKey::SystemMcpSection,
+                    "## 已选择的 MCP Server\n\n{servers}".to_owned(),
+                ),
+                (
+                    PromptKey::SystemHooksSection,
+                    "## 生命周期钩子\n\n{hook_names}\n{hooks}".to_owned(),
+                ),
+                (
+                    PromptKey::SystemCapabilityRow,
+                    "- {name}：{description}".to_owned(),
+                ),
+                (
+                    PromptKey::SystemHookEventPreToolUse,
+                    "工具执行前".to_owned(),
+                ),
+            ]),
+            Vec::new(),
+        );
+        let file_addendum = runtime_context_from_discovery(conversation, &scan(), &file)
             .unwrap()
             .addendum;
-        assert!(chinese_addendum.contains("## 已选择的 MCP Server"));
-        assert!(chinese_addendum.contains("## 生命周期钩子"));
-        assert!(chinese_addendum.contains("- Probe Hook：工具执行前"));
+        assert!(file_addendum.contains("## 已选择的 MCP Server"));
+        assert!(file_addendum.contains("## 生命周期钩子"));
+        assert!(file_addendum.contains("- Probe Hook：工具执行前"));
     }
 
     /// Include only the skill body.
@@ -2480,7 +2454,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = read_hooks_file(&path, ResourceSource::User, None, ResolvedLanguage::EnUs);
+        let entries = read_hooks_file(&path, ResourceSource::User, None);
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].descriptor.name, "结束后测试");
@@ -2511,7 +2485,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = read_hooks_file(&path, ResourceSource::User, None, ResolvedLanguage::EnUs);
+        let entries = read_hooks_file(&path, ResourceSource::User, None);
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].definition.event, HookEvent::InstructionsLoaded);
@@ -2773,7 +2747,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_hooks_fixture(&directory);
 
-        let entries = read_hooks_file(&path, ResourceSource::User, None, ResolvedLanguage::EnUs);
+        let entries = read_hooks_file(&path, ResourceSource::User, None);
         assert_eq!(entries.len(), 4, "夹具里四个可执行的处理器");
         let target = entries
             .iter()
@@ -2793,7 +2767,7 @@ mod tests {
 
         remove_hook_from_file(&address).expect("删掉刚发现的钩子应当成功");
 
-        let remaining = read_hooks_file(&path, ResourceSource::User, None, ResolvedLanguage::EnUs);
+        let remaining = read_hooks_file(&path, ResourceSource::User, None);
         assert_eq!(remaining.len(), entries.len() - 1);
         let mut names = remaining
             .iter()

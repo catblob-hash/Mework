@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as browserApi from "../lib/browser";
 import {
   claimFloatingSurfaceId,
@@ -1062,6 +1062,60 @@ describe("BrowserPanel", () => {
     await waitFor(() => expect(document.querySelector(".browser-panel__sketch img"))
       .toHaveAttribute("src", "data:image/png;base64,V0FSTQ"));
     expect(capture).toHaveBeenCalledWith("conversation-annotate-still");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  /**
+   * The renderer CSP's `connect-src` is IPC only, so fetching the composite's own `data:` URL is
+   * refused (WebKit says "Load failed") and the drawing never reached the composer.
+   */
+  it("adds the annotated page to the chat without fetching its data URL", async () => {
+    const user = userEvent.setup();
+    const status = openStatus("http://localhost:5173/");
+    vi.spyOn(browserApi, "getBrowserStatus").mockResolvedValue(status);
+    vi.spyOn(browserApi, "performBrowserAction").mockResolvedValue(status);
+    vi.spyOn(browserApi, "captureBrowserPage").mockResolvedValue({ data: "UE5H", width: 800, height: 600 });
+    const fetch = vi.fn().mockRejectedValue(new TypeError("Load failed"));
+    vi.stubGlobal("fetch", fetch);
+    vi.stubGlobal("Image", class {
+      src = "";
+      naturalWidth = 800;
+      naturalHeight = 600;
+      decode() { return Promise.resolve(); }
+    });
+    // jsdom has no 2D canvas and lays nothing out; a no-op context on a measured surface lets a
+    // stroke land, and every export reads back as the same composite.
+    const context = new Proxy({}, { get: (target, key) => Reflect.get(target, key) ?? (() => undefined) });
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue("data:image/png;base64,Q09NUE9TSVRF");
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(560);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(640);
+    const setPointerCapture = Element.prototype.setPointerCapture;
+    Element.prototype.setPointerCapture = () => undefined;
+    onTestFinished(() => {
+      Element.prototype.setPointerCapture = setPointerCapture;
+    });
+    const onAttachImage = vi.fn();
+
+    render(<BrowserPanel {...pane} native sessionId="conversation-annotate-attach" onAttachImage={onAttachImage} />);
+    const annotate = screen.getByRole("button", { name: "标注" });
+    await waitFor(() => expect(annotate).toBeEnabled());
+    await user.click(annotate);
+    await waitFor(() => expect(document.querySelector(".browser-panel__sketch img"))
+      .toHaveAttribute("src", "data:image/png;base64,UE5H"));
+
+    const canvas = screen.getByRole("application", { name: "绘图画布" });
+    fireEvent.pointerDown(canvas, { pointerId: 1, button: 0, isPrimary: true, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(canvas, { pointerId: 1, clientX: 50, clientY: 60 });
+    fireEvent.pointerUp(canvas, { pointerId: 1 });
+    await user.click(screen.getByRole("button", { name: "添加到对话" }));
+
+    await waitFor(() => expect(onAttachImage).toHaveBeenCalledTimes(1));
+    const file = onAttachImage.mock.calls[0]![0] as File;
+    expect(file.name).toBe("page-annotation.png");
+    expect(file.type).toBe("image/png");
+    expect(await file.text()).toBe("COMPOSITE");
+    expect(fetch).not.toHaveBeenCalled();
     expect(screen.queryByRole("alert")).toBeNull();
   });
 

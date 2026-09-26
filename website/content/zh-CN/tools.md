@@ -2,11 +2,11 @@
 
 Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它替你做什么、什么时候需要审批、模型看到的参数，以及内置提示词档案交给模型的描述。工具名就是模型调用时用的名字，也是[工具描述文件](prompt-profiles.html)里引用的名字。
 
-下面按工具选择器的分组排列。其中有三组工具是同一种能力拆成的许多次调用——文件、shell 和预览——选择器把每一组显示成一行：`files`、`shell` 或 `preview`，点开是它自己的窗口；这三组在本页各有一节，选择器里那一行旁边的书本图标就通向这一节。
+下面按工具选择器的分组排列。每个可开关的工具在选择器里各占一行，行首的书本图标就通向它在这里的页面。
 
 ## 工具怎样变得可用
 
-其中 {{SWITCHABLE_TOOL_COUNT}} 个是对话或预设的「启用的工具」列表里的开关（composer 旁边的滑块图标，或 设置 → 对话预设）。另外 {{DERIVED_TOOL_COUNT}} 个由宿主从别的设置**派生**，从不出现在那个列表里：
+其中 {{SWITCHABLE_TOOL_COUNT}} 个是对话或预设的「启用的工具」列表里的开关（composer 旁边的滑块图标，或 设置 → 对话预设）。另外 {{DERIVED_TOOL_COUNT}} 个从别的设置或工具**派生**，从不出现在那个列表里：
 
 | 派生工具 | 跟随 |
 |---|---|
@@ -17,6 +17,7 @@ Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它
 | `skill` | **技能按需加载**开关，且至少选中了一个技能 |
 | `tool_search` | **工具发现**开关（MCP），且本次运行扣留了 MCP 工具 schema |
 | `plan`、`exit_plan_mode` | **安全层级**处于计划模式 |
+| `preview_start`、`preview_stop`、`preview_list` | 任何其他 `preview_*` 工具被启用 |
 
 一个对话里的工具暴露面只增不减。一次运行把某个工具——或某个 MCP 服务器、某层记忆、技能按需加载、联网——展示给模型之后，它在这个对话余下的时间里一直保持开启，设置面板会把它置灰：已经调用过某个工具的转录，没法重放给一个不再拥有该工具的模型。后面的轮次可以扩大这个面，但不能收窄。
 
@@ -26,11 +27,11 @@ Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它
 
 ## 文件与搜索 {#group-filesystem}
 
-选择器里的**文件与搜索**分组：`files` 这一行，以及单独占一行的 `lsp`。
+选择器里的**文件与搜索**分组：六个文件工具，以及 `lsp`。
 
-### `files` — 文件工具 {#files}
+### 文件工具 {#files}
 
-列出、搜索、读取和修改工作区文件的六个工具，在选择器里是一行：`files`。它的计数表示六个里开了几个；点开是**文件工具**窗口，每个工具各有一个开关，分组标题上的 **+** 会把这六个连同分组里的其他工具一起打开。`write` 和 `edit` 标为**需审查**。六个工具都限定在工作区和授予本对话的根目录之内，[工具与审批](working.html#tools-and-approvals)里的写入保护对它们每一个都适用。
+列出、搜索、读取和修改工作区文件的六个工具。`write` 和 `edit` 标为**需审查**。六个工具都限定在工作区和授予本对话的根目录之内，[工具与审批](working.html#tools-and-approvals)里的写入保护对它们每一个都适用。
 
 {{TOOL_TABLE:ls,find,grep,read,write,edit}}
 
@@ -42,19 +43,19 @@ Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它
 
 ## Shell {#group-shell}
 
-### `shell` — Shell 工具 {#shell}
+### Shell 工具 {#shell}
 
-每个 shell 后端一个工具——`bash`、`zsh`、`sh` 和 `powershell`——在选择器里合成一行：`shell`。它的窗口只列出对话所用机器上找到的 shell：Windows 机器可能提供 `powershell` 和 `bash`，macOS、Linux 或 WSL 机器提供 `zsh`、`bash` 和 `sh`。分组标题上的 **+** 会打开各个 shell。所有 shell 工具都标为**需审查**，而且都会产生任务，所以任务工具会随之出现。
+每个 shell 后端一个工具——`bash`、`zsh`、`sh` 和 `powershell`。选择器只列出对话所用机器上找到的 shell：Windows 机器可能提供 `powershell` 和 `bash`，macOS、Linux 或 WSL 机器提供 `zsh`、`bash` 和 `sh`。所有 shell 工具都标为**需审查**，而且都会产生任务，所以任务工具会随之出现。
 
 {{TOOL_TABLE:bash,zsh,sh,powershell}}
 
-## 操控 {#group-web}
+## 预览 {#group-web}
 
-选择器里的**操控**分组放着 `preview` 这一行。两个联网工具也归在这里，尽管它们从不出现在选择器里。
+选择器里的**预览**分组放着各个预览工具。两个联网工具也归在这里，尽管它们从不出现在选择器里。
 
-### `preview` — 预览工具 {#preview}
+### 预览工具 {#preview}
 
-`preview_*` 工具运行项目的开发服务器，并在内置浏览器里操作它提供的页面；选择器把它们显示成一行：`preview`。它的窗口有三页，下面各对应一张表。`preview_screenshot` 和 `preview_upload_image` 只提供给能看图的模型。服务器按 `.mework/launch.json` 里的配置启动——见[内置浏览器](working.html#the-built-in-browser)。
+`preview_*` 工具运行项目的开发服务器，并在内置浏览器里操作它提供的页面。`preview_start`、`preview_stop` 和 `preview_list` 在选择器里没有自己的行：只要启用了任何其他预览工具，它们就随之启用。`preview_screenshot` 和 `preview_upload_image` 只提供给能看图的模型。服务器按 `.mework/launch.json` 里的配置启动——见[内置浏览器](working.html#the-built-in-browser)。
 
 #### 开发服务器管理 {#preview-servers}
 

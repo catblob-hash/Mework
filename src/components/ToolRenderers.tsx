@@ -43,6 +43,7 @@ import type { LucideIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { t as globalT, useI18n } from "../i18n";
+import { backendOfTool, shellBackendLabel } from "../lib/machineShells";
 import { parseWaitOutput, questionsFromInput } from "../lib/orchestration";
 import { webSourceIcon as siteIcon } from "../lib/runtime";
 import { agentTimelineRunStatus, initialMessage, isChildMainMessageContext } from "../lib/subagents";
@@ -872,10 +873,15 @@ export function toolRowName(item: ToolContext, descriptor?: ToolDescriptor): str
   return item.toolName;
 }
 
+/**
+ * `explanation` is the local helper model's one-line description of a shell
+ * command; when present it replaces the whole title, prefixed with the shell.
+ */
 export function getToolPresentation(
   item: ToolContext,
   descriptor?: ToolDescriptor,
-  t: Translate = globalT
+  t: Translate = globalT,
+  explanation?: string
 ): ToolPresentation {
   const config = registryEntry(item.toolName);
   if (!config) {
@@ -911,7 +917,14 @@ export function getToolPresentation(
     };
   }
   const phase = executionPhase(item);
-  const title = config.resolveTitle?.(item, phase, t)
+  const shell = backendOfTool(item.toolName);
+  const explained = shell && explanation?.trim()
+    ? phase === "failed"
+      ? t("{shell}：{text}（失败）", "{shell}: {text} (failed)", { shell: shellBackendLabel(shell), text: explanation.trim() })
+      : t("{shell}：{text}", "{shell}: {text}", { shell: shellBackendLabel(shell), text: explanation.trim() })
+    : undefined;
+  const title = explained
+    ?? config.resolveTitle?.(item, phase, t)
     ?? (phase === "running" ? config.runningTitle : phase === "failed" ? config.failedTitle : config.doneTitle)?.(t)
     ?? config.doneTitle(t);
   const target = config.target?.(item, t);

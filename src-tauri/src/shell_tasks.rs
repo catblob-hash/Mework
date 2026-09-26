@@ -145,6 +145,23 @@ pub struct ShellTaskSnapshot {
     /// settlement and cancellation; only their own stop button or app exit stops
     /// them. Synchronous commands use their dispatching run/task cancellation signal.
     pub background: bool,
+    /// Root of the workspace the command ran in, on that workspace's machine, as it was when the
+    /// command started. A conversation with more than one workspace names each row's by it.
+    /// Recorded rather than looked up by the workspace's number, because numbers shift when a
+    /// workspace is detached and a finished row has to keep naming the one it actually ran in.
+    /// `None` on a row recorded before this field existed.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    /// How long the process ran, as the machine that ran it measured it, once it has ended.
+    ///
+    /// Only an agent-run command has one: a command on an SSH machine or in a sandbox cell. This
+    /// host's clock keeps counting for such a command while it runs — the row has to tick — but
+    /// its `started_at`..`ended_at` span is not the command's run time: it also holds the link's
+    /// round trips, a first connection made after the row was registered, the output still
+    /// streaming in after the process exited, and any time the link was down before the exit
+    /// reached this host. So when the agent's own figure arrives it supersedes that span.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 struct ShellTaskEntry {
@@ -162,6 +179,10 @@ struct ShellTaskEntry {
     exit_code: Option<i32>,
     /// Background-command marker; see [`ShellTaskSnapshot::background`].
     background: bool,
+    /// See [`ShellTaskSnapshot::workspace_root`].
+    workspace_root: Option<String>,
+    /// See [`ShellTaskSnapshot::duration_ms`]. Set once, with the outcome.
+    duration_ms: Option<u64>,
     /// Mint order, so finished rows evict oldest-first and sort stably alongside running ones.
     sequence: u64,
     /// Live output and its single watcher. Only one page can be looking at a command at a time,
@@ -226,6 +247,8 @@ impl ShellTaskEntry {
             outcome: self.outcome,
             exit_code: self.exit_code,
             background: self.background,
+            workspace_root: self.workspace_root.clone(),
+            duration_ms: self.duration_ms,
         }
     }
 
@@ -332,6 +355,8 @@ pub struct ShellTaskGuard {
     /// reporting one leaves it `None`, and `Drop` then records a stop — an abandoned command did
     /// not succeed, and claiming it did would be the one lie the row must not tell.
     outcome: Option<(ShellTaskOutcome, Option<i32>)>,
+    /// Run time the machine that ran the command reported; see [`ShellTaskSnapshot::duration_ms`].
+    runtime: Option<std::time::Duration>,
 }
 
 impl ShellTaskGuard {
@@ -344,6 +369,12 @@ impl ShellTaskGuard {
     /// actually retires the row; this only supplies the outcome it will record.
     pub fn finish(&mut self, outcome: ShellTaskOutcome, exit_code: Option<i32>) {
         self.outcome = Some((outcome, exit_code));
+    }
+
+    /// Records the run time the machine that ran the command measured, which the row reports in
+    /// place of this host's own span once the command has ended.
+    pub fn measured_runtime(&mut self, runtime: std::time::Duration) {
+        self.runtime = Some(runtime);
     }
 
     /// The registry id this guard's row was minted under — the row's sequence
@@ -400,7 +431,7 @@ impl Drop for ShellTaskGuard {
     fn drop(&mut self) {
         let (outcome, exit_code) = self.outcome.unwrap_or((ShellTaskOutcome::Stopped, None));
         self.registry
-            .finish(&self.shell_task_id, outcome, exit_code);
+            .finish(&self.shell_task_id, outcome, exit_code, self.runtime);
     }
 }
 
@@ -447,6 +478,8 @@ impl ShellTaskRegistry {
                     outcome: snapshot.outcome,
                     exit_code: snapshot.exit_code,
                     background: snapshot.background,
+                    workspace_root: snapshot.workspace_root,
+                    duration_ms: snapshot.duration_ms,
                     sequence: record.sequence,
                     output,
                 },
@@ -512,16 +545,18 @@ impl ShellTaskRegistry {
         command: &str,
         background: bool,
     ) -> ShellTaskGuard {
-        self.try_register(conversation_id, tool_name, command, background)
+        self.try_register(conversation_id, tool_name, command, background, None)
             .unwrap()
     }
 
+    /// `workspace_root` is the root of the workspace the command runs in, on its machine.
     pub fn try_register(
         &self,
         conversation_id: &str,
         tool_name: &str,
         command: &str,
         background: bool,
+        workspace_root: Option<&str>,
     ) -> Result<ShellTaskGuard, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let started_at = Utc::now().to_rfc3339();
@@ -546,6 +581,8 @@ impl ShellTaskRegistry {
                 outcome: None,
                 exit_code: None,
                 background,
+                workspace_root: workspace_root.map(str::to_owned),
+                duration_ms: None,
                 sequence,
                 output: ShellTaskOutput::default(),
             };
@@ -574,6 +611,7 @@ impl ShellTaskRegistry {
             shell_task_id,
             stop,
             outcome: None,
+            runtime: None,
         })
     }
 
@@ -808,7 +846,16 @@ impl ShellTaskRegistry {
     /// Marks a command finished and publishes the terminal snapshot. Idempotent: a second call for
     /// the same id — a `finish` followed by the guard's own `Drop` — leaves the first outcome
     /// standing, because that one described the real exit.
-    fn finish(&self, shell_task_id: &str, outcome: ShellTaskOutcome, exit_code: Option<i32>) {
+    ///
+    /// `runtime` is the run time the machine that ran the command measured, when it did; the end
+    /// is still stamped from this host's clock, because that is when the row learned of it.
+    fn finish(
+        &self,
+        shell_task_id: &str,
+        outcome: ShellTaskOutcome,
+        exit_code: Option<i32>,
+        runtime: Option<std::time::Duration>,
+    ) {
         let (snapshot, output_sink, conversation_id, evicted) = {
             let mut registry = self.lock();
             let Some(entry) = registry.entries.get_mut(shell_task_id) else {
@@ -820,6 +867,8 @@ impl ShellTaskRegistry {
             entry.ended_at = Some(Utc::now().to_rfc3339());
             entry.outcome = Some(outcome);
             entry.exit_code = exit_code;
+            entry.duration_ms =
+                runtime.map(|runtime| runtime.as_millis().min(u128::from(u64::MAX)) as u64);
             // Taken, not cloned: nothing can write to this command again, so the watcher's channel
             // must not be held past the one event that says so.
             let output_sink = entry.output.sink.take();
@@ -1001,7 +1050,7 @@ mod tests {
         .unwrap();
         connection.execute_batch("CREATE TRIGGER refuse_shell_write BEFORE INSERT ON shell_task BEGIN SELECT RAISE(FAIL, 'injected shell write failure'); END;").unwrap();
         assert!(registry
-            .try_register("conv", "bash", "must not start", true)
+            .try_register("conv", "bash", "must not start", true, None)
             .is_err());
         assert_eq!(registry.task_snapshots("conv").len(), 1);
         assert!(!registry.mark_background("conv", &id));
@@ -1131,6 +1180,54 @@ mod tests {
             MAX_FINISHED_PER_CONVERSATION
         );
         assert!(restored.task_snapshot("conv", &first_id).is_none());
+    }
+
+    /// The workspace a command ran in and the run time its machine measured are part of the row,
+    /// and a restart keeps both: a finished row is history, and history does not move.
+    #[test]
+    fn a_rows_workspace_and_measured_run_time_survive_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ShellTaskRegistry::default();
+        registry.install_store(directory.path()).unwrap();
+        let (remote_id, local_id) = {
+            let mut remote = registry
+                .try_register("conv", "bash", "cargo build", false, Some("~/src/app"))
+                .unwrap();
+            let running = registry
+                .task_snapshot("conv", remote.shell_task_id())
+                .unwrap();
+            assert_eq!(running.workspace_root.as_deref(), Some("~/src/app"));
+            // Nothing is known of the run time while the command runs; the row ticks on this
+            // host's clock until the machine that ran it says otherwise.
+            assert_eq!(running.duration_ms, None);
+            remote.finish(ShellTaskOutcome::Succeeded, Some(0));
+            remote.measured_runtime(std::time::Duration::from_millis(1_234));
+
+            let mut local = registry
+                .try_register("conv", "bash", "ls", false, Some("/Users/me/site"))
+                .unwrap();
+            local.finish(ShellTaskOutcome::Succeeded, Some(0));
+            (
+                remote.shell_task_id().to_owned(),
+                local.shell_task_id().to_owned(),
+            )
+        };
+        let check = |registry: &ShellTaskRegistry| {
+            let remote = registry.task_snapshot("conv", &remote_id).unwrap();
+            assert_eq!(remote.duration_ms, Some(1_234));
+            assert!(remote.ended_at.is_some(), "the end is still this host's");
+            let local = registry.task_snapshot("conv", &local_id).unwrap();
+            assert_eq!(local.workspace_root.as_deref(), Some("/Users/me/site"));
+            assert_eq!(
+                local.duration_ms, None,
+                "a local command is timed by its span"
+            );
+        };
+        check(&registry);
+        drop(registry);
+        let restored = ShellTaskRegistry::default();
+        restored.install_store(directory.path()).unwrap();
+        check(&restored);
     }
 
     #[test]

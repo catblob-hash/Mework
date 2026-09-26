@@ -71,10 +71,8 @@ pub fn load_or_initialize(path: &Path) -> Result<AppDocument, String> {
                 }];
             }
         }
-        seed_builtin_capabilities(path, &mut document);
-        seed_local_shell(&mut document);
         seed_conversations(&store, &document)?;
-        seed_preset_templates(&store, &document)?;
+        install_builtin_preset(path, &mut document)?;
         save_unchecked(path, &document)?;
         return read_document(path);
     }
@@ -87,77 +85,155 @@ pub fn load_or_initialize(path: &Path) -> Result<AppDocument, String> {
     })
 }
 
-/// Writes the built-in capability files and points the shipped presets at them.
+/// Brings the built-in preset in `document` to this build's definition, writes
+/// the system prompt it opens with, and removes the presets earlier builds
+/// seeded in its place. Returns whether the document changed, so a start that
+/// finds everything current writes nothing.
 ///
-/// The ids can only be minted here. `stable_id` hashes the absolute path of the
-/// file it names, so neither seed document can carry them as literals — the
-/// renderer seed ships empty lists and this fills them in on the machine that
-/// owns the paths.
-fn seed_builtin_capabilities(path: &Path, document: &mut AppDocument) {
-    let Some(app_data) = path.parent() else {
-        return;
-    };
-    let selection = crate::capability_seed::seed_builtin_capabilities(app_data);
-    apply_builtin_capability_selection(document, &selection);
+/// Runs on every start, not only the first: the preset is part of the build
+/// (see [`crate::catalog::BUILTIN_PRESET_ID`]), so whatever an earlier build
+/// left is replaced rather than merged. The two parts only this machine can
+/// supply are filled in here — the built-in capability ids, which hash absolute
+/// paths ([`crate::capability_seed`]), and the one shell, which takes a probe.
+/// A result that would not validate leaves `document` as it was.
+pub fn install_builtin_preset(path: &Path, document: &mut AppDocument) -> Result<bool, String> {
+    let selection = path
+        .parent()
+        .map(crate::capability_seed::seed_builtin_capabilities)
+        .unwrap_or_default();
+    let local = crate::machine_shells::probe_local();
+    let shell = seeded_shell(local.os, &local.backends());
+    let mut installed = document.clone();
+    let changed = put_builtin_preset(&mut installed, &selection, shell);
+    if changed {
+        validate_shape(&installed)
+            .map_err(|error| format!("内置对话预设无法写入文档：{error}"))?;
+        *document = installed;
+    }
+    let store = crate::conversation_store::store_for(path)?;
+    write_builtin_preset_template(&store)?;
+    let templates = store
+        .templates()?
+        .into_iter()
+        .map(|template| template.id)
+        .collect::<HashSet<_>>();
+    // Nothing else cites these bodies: a template belongs to exactly one
+    // preset, and the preset is gone.
+    for (_, template_id) in crate::catalog::RETIRED_SEEDED_PRESETS {
+        if templates.contains(*template_id) {
+            store.delete_template(template_id)?;
+        }
+    }
+    Ok(changed)
 }
 
-/// Selects the seeded capabilities in every shipped preset.
-///
-/// Hooks are deliberately absent: a hook id is a hash of its position in
-/// `hooks.json`, so any edit to that file renumbers the rest, and a selected
-/// hook id that no longer resolves fails every run of the conversation closed.
-/// The built-in hooks are shipped to be deleted freely, which is incompatible
-/// with being selected. Skills and MCP servers dangle harmlessly by comparison —
-/// discovery skips an id it cannot find and the run continues.
-fn apply_builtin_capability_selection(
+/// The document half of [`install_builtin_preset`]: puts this build's preset
+/// where the old one was (first, when there was none), drops the retired
+/// seeded presets, and points a default that no longer resolves at it.
+fn put_builtin_preset(
     document: &mut AppDocument,
     selection: &crate::capability_seed::BuiltinCapabilitySelection,
-) {
-    if selection.skill_ids.is_empty() && selection.mcp_ids.is_empty() {
-        return;
+    shell: Option<crate::shell_backend::ShellBackend>,
+) -> bool {
+    let before = document.presets.clone();
+    let mut preset = crate::catalog::builtin_preset(
+        &document.assets.api_providers,
+        &document.tools,
+        shell,
+    );
+    // Hooks are deliberately absent: a hook id is a hash of its position in
+    // `hooks.json`, so any edit to that file renumbers the rest, and a selected
+    // hook id that no longer resolves fails every run of the conversation
+    // closed. Skills and MCP servers dangle harmlessly by comparison —
+    // discovery skips an id it cannot find and the run continues.
+    preset.settings.skill_ids = selection.skill_ids.clone();
+    preset.settings.mcp_ids = selection.mcp_ids.clone();
+    let library = &mut document.presets;
+    library.conversation_presets.retain(|preset| {
+        !crate::catalog::RETIRED_SEEDED_PRESETS
+            .iter()
+            .any(|(id, _)| preset.id == *id)
+    });
+    match library
+        .conversation_presets
+        .iter()
+        .position(|candidate| candidate.id == crate::catalog::BUILTIN_PRESET_ID)
+    {
+        Some(index) => library.conversation_presets[index] = preset,
+        None => library.conversation_presets.insert(0, preset),
     }
-    for preset in &mut document.presets.conversation_presets {
-        if crate::catalog::seeded_template_id(&preset.id).is_empty() {
-            continue;
-        }
-        preset.settings.skill_ids = selection.skill_ids.clone();
-        preset.settings.mcp_ids = selection.mcp_ids.clone();
+    if !library
+        .conversation_presets
+        .iter()
+        .any(|preset| preset.id == library.default_conversation_preset_id)
+    {
+        library.default_conversation_preset_id = crate::catalog::BUILTIN_PRESET_ID.into();
     }
+    document.presets != before
 }
 
-/// Gives the shipped presets this machine's most preferred shell and no other.
-///
-/// The seed lists every backend's command tool, because which of them this
-/// machine has is a question only a probe can answer, and the first launch is
-/// the first moment there is a machine to ask. Looking a few names up on
-/// `PATH` is cheap enough to do inline, and it does not wait for
-/// [`crate::machine_shells::install`], which the startup path runs later.
-fn seed_local_shell(document: &mut AppDocument) {
-    let local = crate::machine_shells::probe_local();
-    apply_seeded_shell(document, local.os, &local.backends());
-}
-
-/// Narrows every shipped preset's shell command tools to the first backend in
-/// `os`'s priority order that `available` has. A machine where the probe found
-/// none still gets its OS's first: the tool list hides a shell the machine
-/// lacks, and the user's own install can supply it later.
-fn apply_seeded_shell(
-    document: &mut AppDocument,
+/// The one shell the built-in preset turns on: the first backend in `os`'s
+/// priority order that `available` has. A machine where the probe found none
+/// still gets its OS's first: the tool list hides a shell the machine lacks,
+/// and the user's own install can supply it later.
+fn seeded_shell(
     os: crate::shell_backend::MachineOs,
     available: &[crate::shell_backend::ShellBackend],
-) {
-    let chosen = crate::shell_backend::preferred_backend(os, available)
-        .or_else(|| crate::shell_backend::backends_for(os).first().copied());
-    for preset in &mut document.presets.conversation_presets {
-        if crate::catalog::seeded_template_id(&preset.id).is_empty() {
-            continue;
+) -> Option<crate::shell_backend::ShellBackend> {
+    crate::shell_backend::preferred_backend(os, available)
+        .or_else(|| crate::shell_backend::backends_for(os).first().copied())
+}
+
+/// Holds a save to the built-in preset the host installed: the renderer can
+/// neither edit nor delete it, so whatever the proposal says about that id is
+/// replaced by what `previous` had.
+///
+/// Its tool list is the one part recomputed here. The renderer's save is what
+/// brings a new build's tool catalog into the document, and a preset naming a
+/// tool the catalog no longer lists fails validation; so the list is drawn
+/// again from the proposed catalog, keeping the shell `previous` chose. A
+/// document with no built-in preset (the test library) is left as it is.
+fn keep_builtin_preset(previous: &AppDocument, canonical: &mut AppDocument) {
+    let Some(kept) = previous
+        .presets
+        .conversation_presets
+        .iter()
+        .find(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
+    else {
+        return;
+    };
+    let mut kept = kept.clone();
+    // One shell means the probe chose it; several mean nothing narrowed the
+    // list yet (a document built without a machine to ask), so all stay.
+    let shells = kept
+        .settings
+        .enabled_tools
+        .iter()
+        .filter_map(|name| crate::shell_backend::ShellBackend::of_tool(name))
+        .collect::<HashSet<_>>();
+    let shell = match shells.len() {
+        1 => shells.into_iter().next(),
+        _ => None,
+    };
+    kept.settings.enabled_tools =
+        crate::catalog::builtin_preset_enabled_tools(&canonical.tools, shell);
+    let presets = &mut canonical.presets.conversation_presets;
+    match presets
+        .iter()
+        .position(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
+    {
+        Some(index) => presets[index] = kept,
+        None => {
+            // Put back where it stood, so a delete does not also reorder.
+            let index = previous
+                .presets
+                .conversation_presets
+                .iter()
+                .position(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
+                .unwrap_or(0)
+                .min(presets.len());
+            presets.insert(index, kept);
         }
-        preset.settings.enabled_tools.retain(|name| {
-            match crate::shell_backend::ShellBackend::of_tool(name) {
-                Some(backend) => Some(backend) == chosen,
-                None => true,
-            }
-        });
     }
 }
 
@@ -180,81 +256,40 @@ fn seed_conversations(
     Ok(())
 }
 
-/// The system prompt a shipped preset opens with, keyed by preset id.
+/// Writes the built-in preset's system prompt behind its template id, unless
+/// the row already holds exactly that prompt.
 ///
-/// A conversation template is the only channel a preset has for carrying prompt
-/// text of its own: `ConversationPresetSettings` has no system-prompt field, and
-/// the prompt profile can only override the host's own fixed keys. A
-/// `ContextItem::System` row with `local_only: false` is what
-/// `aisdk::step::system_prompt_parts` lifts into the request's dynamic system
-/// half, so this really does travel as a system prompt rather than as history.
-///
-/// Each text describes how that CLI works rather than what this host already
-/// says for itself; the host's own sections are injected separately and the two
-/// are deduplicated only on a byte-identical match.
-fn seeded_preset_prompt(preset_id: &str) -> Option<&'static str> {
-    match preset_id {
-        crate::catalog::CODEX_PRESET_ID => Some(
-            "你在 Mework 里以 Codex 的工作方式做事。\n\
-             \n\
-             - 先勘察再动手：改一处之前先看清它的调用点与相邻代码，让新代码读起来像它周围的代码。\n\
-             - 说完成之前先验证：跑过的命令和它的输出才算证据；跑不通就直说跑不通，不要用「应该没问题」收尾。\n\
-             - 一次只推进一件事，改动保持可回滚。边界清楚、能独立验证的子任务派给子代理并行做；需要整体判断的留在主线。\n\
-             - 删除、覆盖、推送、对外发布这类难以撤回的动作，先确认再执行；上一次的批准不延续到下一次。\n\
-             - 交回结论时先给结论，再给证据和仍未解决的问题；引用文件给完整路径。",
-        ),
-        crate::catalog::CLAUDE_CODE_PRESET_ID => Some(
-            "你在 Mework 里以 Claude Code 的工作方式做事。\n\
-             \n\
-             - 先读后写：动手前把相关文件、调用点和既有约定读清楚，写出的代码在注释密度、命名和惯用法上与周围一致。\n\
-             - 交付即验收：声称做完、修好或跑通之前，必须真的执行过验证命令并看过输出。测试红了就把输出贴出来，跳过的步骤要讲明。\n\
-             - 按用户实际提出的范围交付，不擅自收窄或放大。真有问题先用一两句说清顾虑，再把活干完。\n\
-             - 边界清楚、可独立验证的子任务派给子代理并行做；需要推理与交叉验证的留在主线。\n\
-             - 删除、覆盖、推送、对外发布这类难以撤回的动作，先确认再执行；上一次的批准不延续到下一次。",
-        ),
-        _ => None,
-    }
-}
-
-/// Writes the body behind each shipped preset's `template_id`, once.
-///
-/// Idempotent by row existence, and that guard is load-bearing:
-/// `put_template` replaces a template's whole body, and this runs again on the
-/// "anchor missing but conversation store alive" recovery path — writing
-/// unconditionally would silently discard a body the user had edited.
-fn seed_preset_templates(
+/// Rewritten whenever it differs rather than written once, because the prompt
+/// ships with the build. Nothing of the user's is lost by it: the preset
+/// cannot be edited, and `update_conversation_template` refuses this id.
+fn write_builtin_preset_template(
     store: &crate::conversation_store::ConversationStore,
-    document: &AppDocument,
 ) -> Result<(), String> {
-    let existing = store
-        .templates()?
-        .into_iter()
-        .map(|template| template.id)
-        .collect::<std::collections::HashSet<_>>();
-    for preset in &document.presets.conversation_presets {
-        if preset.template_id.is_empty() || existing.contains(&preset.template_id) {
-            continue;
-        }
-        let Some(prompt) = seeded_preset_prompt(&preset.id) else {
-            continue;
-        };
-        // The name stays empty like every other template: nothing displays it,
-        // and the preset page addresses this row through `template_id` alone.
-        store.put_template(
-            &preset.template_id,
-            "",
-            &[ContextItem::System {
-                id: format!("ctx_{}", uuid::Uuid::new_v4().simple()),
-                content: prompt.into(),
-                // Never `true`: a local-only system row is a lifecycle
-                // diagnostic and `system_prompt_parts` drops it, so the prompt
-                // would be seeded and then never sent.
-                local_only: false,
-                hook_execution: None,
-                created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            }],
-        )?;
+    let current = store.template_contexts(crate::catalog::BUILTIN_PRESET_TEMPLATE_ID)?;
+    let up_to_date = matches!(
+        current.as_slice(),
+        [ContextItem::System { content, local_only: false, hook_execution: None, .. }]
+            if content == crate::catalog::BUILTIN_PRESET_PROMPT
+    );
+    if up_to_date {
+        return Ok(());
     }
+    // The name stays empty like every other template: nothing displays it,
+    // and the preset page addresses this row through `template_id` alone.
+    store.put_template(
+        crate::catalog::BUILTIN_PRESET_TEMPLATE_ID,
+        "",
+        &[ContextItem::System {
+            id: format!("ctx_{}", uuid::Uuid::new_v4().simple()),
+            content: crate::catalog::BUILTIN_PRESET_PROMPT.into(),
+            // Never `true`: a local-only system row is a lifecycle diagnostic
+            // and `system_prompt_parts` drops it, so the prompt would be
+            // written and then never sent.
+            local_only: false,
+            hook_execution: None,
+            created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }],
+    )?;
     Ok(())
 }
 
@@ -279,6 +314,18 @@ pub fn load_or_recover(path: &Path) -> Result<AppDocument, String> {
                     }
                     Err(error) => eprintln!("孤儿消息标记未能落库：{error}"),
                 }
+            }
+            // Every start, because each build ships its own version of the
+            // preset. A failure here keeps the preset the document already had
+            // rather than failing the start over it.
+            match install_builtin_preset(path, &mut document) {
+                Ok(true) => {
+                    if let Err(error) = save_unchecked(path, &document) {
+                        eprintln!("内置对话预设已更新，但未能落盘，下次保存时写入：{error}");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("内置对话预设未能更新：{error}"),
             }
             return Ok(document);
         }
@@ -325,11 +372,9 @@ pub fn load_or_recover(path: &Path) -> Result<AppDocument, String> {
             workspace.conversations.push(conversation.clone());
         }
     }
-    seed_builtin_capabilities(path, &mut document);
-    seed_local_shell(&mut document);
     let store = crate::conversation_store::store_for(path)?;
     seed_conversations(&store, &document)?;
-    seed_preset_templates(&store, &document)?;
+    install_builtin_preset(path, &mut document)?;
     save_unchecked(path, &document)?;
     read_document(path)
 }
@@ -541,6 +586,9 @@ pub(crate) fn prepare_save_transition(
     canonicalize_context_timestamps(&mut canonical);
     // Conversation bodies are host-authoritative; retain only renderer-owned configuration.
     adopt_authoritative_conversations(previous, &mut canonical);
+    // The built-in preset is the host's, not the renderer's. Before the role
+    // checks below, so its roles meet them exactly as they were installed.
+    keep_builtin_preset(previous, &mut canonical);
     // The role shaping numbers are result shaping, not capability selection, so
     // a proposal past the ceiling is pulled back onto it rather than failed.
     // Runs after `adopt_authoritative_conversations`, which is what decides
@@ -2987,15 +3035,6 @@ fn validate_conversation_settings_shape(
     // Document validation does not bind external selections to assets; runtime execution fails closed.
     validate_conversation_web_search(label, &settings.web_search)?;
     validate_sandbox_settings(label, &settings.sandbox)?;
-    // Renderer state the host never reads, bounded so it cannot grow without limit.
-    if settings.remembered_tool_families.len() > 8
-        || settings
-            .remembered_tool_families
-            .values()
-            .any(|rows| rows.len() > 64 || rows.iter().any(|row| row.chars().count() > 128))
-    {
-        return Err(format!("{label}记住的工具组过多或过长"));
-    }
     Ok(())
 }
 
@@ -5668,210 +5707,342 @@ b"
         assert!(serialized.get("localPreset").is_none());
     }
 
-    /// The first launch keeps one shell in each shipped preset: the first of
-    /// the machine's OS order that its probe found. Any other preset is the
-    /// user's and is left alone.
-    #[test]
-    fn first_launch_keeps_the_machines_most_preferred_shell_in_shipped_presets() {
-        use crate::shell_backend::{MachineOs, ShellBackend};
-        let shells = |document: &AppDocument, preset_id: &str| -> Vec<String> {
-            document
-                .presets
-                .conversation_presets
-                .iter()
-                .find(|preset| preset.id == preset_id)
-                .unwrap()
-                .settings
-                .enabled_tools
-                .iter()
-                .filter(|name| ShellBackend::of_tool(name).is_some())
-                .cloned()
-                .collect()
-        };
-        let product = crate::catalog::product_default_document();
-        let mut custom = product.presets.conversation_presets[0].clone();
-        custom.id = "preset_custom".into();
-
-        let mut mac = product.clone();
-        mac.presets.conversation_presets.push(custom);
-        let before = mac.presets.conversation_presets[0].settings.enabled_tools.len();
-        apply_seeded_shell(&mut mac, MachineOs::Macos, &[ShellBackend::Sh, ShellBackend::Bash]);
-        for preset_id in [
-            crate::catalog::CODEX_PRESET_ID,
-            crate::catalog::CLAUDE_CODE_PRESET_ID,
-        ] {
-            assert_eq!(shells(&mac, preset_id), vec!["bash"]);
-        }
-        let seeded = shells(&product, crate::catalog::CODEX_PRESET_ID);
-        assert_eq!(seeded.len(), 4, "the seed lists every backend's command tool");
-        assert_eq!(shells(&mac, "preset_custom"), seeded);
-        // Only shell tools leave the list.
-        assert_eq!(
-            mac.presets.conversation_presets[0].settings.enabled_tools.len(),
-            before - seeded.len() + 1
-        );
-
-        let mut windows = product.clone();
-        apply_seeded_shell(
-            &mut windows,
-            MachineOs::Windows,
-            &[ShellBackend::Bash, ShellBackend::PowerShell],
-        );
-        assert_eq!(shells(&windows, crate::catalog::CLAUDE_CODE_PRESET_ID), vec!["powershell"]);
-
-        let mut linux = product.clone();
-        apply_seeded_shell(&mut linux, MachineOs::Linux, &[ShellBackend::Zsh, ShellBackend::Sh]);
-        assert_eq!(shells(&linux, crate::catalog::CLAUDE_CODE_PRESET_ID), vec!["zsh"]);
-
-        // A probe that found nothing still leaves the OS's first shell.
-        let mut bare = product;
-        apply_seeded_shell(&mut bare, MachineOs::Macos, &[]);
-        assert_eq!(shells(&bare, crate::catalog::CLAUDE_CODE_PRESET_ID), vec!["zsh"]);
+    fn builtin_preset_of(document: &AppDocument) -> &crate::model::ConversationPreset {
+        document
+            .presets
+            .conversation_presets
+            .iter()
+            .find(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
+            .expect("内置预设必须在")
     }
 
-    /// Each shipped preset opens with a system prompt, and it is seeded as a
-    /// template body in the conversation store rather than carried in the
-    /// document — `ConversationPresetSettings` has no prompt field, and a
-    /// template `System` row is what reaches the request's system half.
-    ///
-    /// Driven through `seed_preset_templates` rather than `load_or_initialize`,
-    /// because `hydrate_test_settings` replaces the shipped presets in test
-    /// builds; the product document is the input the real first launch uses.
+    fn shells_of(preset: &crate::model::ConversationPreset) -> Vec<String> {
+        preset
+            .settings
+            .enabled_tools
+            .iter()
+            .filter(|name| crate::shell_backend::ShellBackend::of_tool(name).is_some())
+            .cloned()
+            .collect()
+    }
+
+    /// The built-in preset keeps one shell: the first of the machine's OS order
+    /// that its probe found, or the OS's first when it found none. Only shell
+    /// tools leave the list.
     #[test]
-    fn seeding_writes_one_system_prompt_behind_each_shipped_preset() {
+    fn the_builtin_preset_keeps_the_machines_most_preferred_shell() {
+        use crate::shell_backend::{MachineOs, ShellBackend};
+        assert_eq!(
+            seeded_shell(MachineOs::Macos, &[ShellBackend::Sh, ShellBackend::Bash]),
+            Some(ShellBackend::Bash)
+        );
+        assert_eq!(
+            seeded_shell(
+                MachineOs::Windows,
+                &[ShellBackend::Bash, ShellBackend::PowerShell]
+            ),
+            Some(ShellBackend::PowerShell)
+        );
+        assert_eq!(
+            seeded_shell(MachineOs::Linux, &[ShellBackend::Zsh, ShellBackend::Sh]),
+            Some(ShellBackend::Zsh)
+        );
+        assert_eq!(seeded_shell(MachineOs::Macos, &[]), Some(ShellBackend::Zsh));
+
+        let product = crate::catalog::product_default_document();
+        let every = builtin_preset_of(&product);
+        assert_eq!(
+            shells_of(every).len(),
+            4,
+            "without a probe the preset lists every backend's command tool"
+        );
+        let mut narrowed = product.clone();
+        put_builtin_preset(
+            &mut narrowed,
+            &Default::default(),
+            Some(ShellBackend::Bash),
+        );
+        let narrowed = builtin_preset_of(&narrowed);
+        assert_eq!(shells_of(narrowed), vec!["bash"]);
+        assert_eq!(
+            narrowed.settings.enabled_tools.len(),
+            every.settings.enabled_tools.len() - 3
+        );
+    }
+
+    /// The built-in preset opens with a system prompt kept in the conversation
+    /// store rather than the document — `ConversationPresetSettings` has no
+    /// prompt field, and a template `System` row is what reaches the request's
+    /// system half. It ships with the build, so a start that finds another
+    /// body there (an older build's) writes this one back, and a start that
+    /// finds it current writes nothing.
+    ///
+    /// Driven with the product document rather than through `load_or_recover`,
+    /// because `hydrate_test_settings` replaces the preset library in test
+    /// builds; the product document is what a real first launch starts from.
+    #[test]
+    fn the_builtin_preset_opens_with_this_builds_prompt() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("document.v1.json");
-        let document = crate::catalog::product_default_document();
+        let mut document = crate::catalog::product_default_document();
+        install_builtin_preset(&path, &mut document).unwrap();
         let store = crate::conversation_store::store_for(&path).unwrap();
-        seed_preset_templates(&store, &document).unwrap();
-
-        for preset_id in [
-            crate::catalog::CODEX_PRESET_ID,
-            crate::catalog::CLAUDE_CODE_PRESET_ID,
-        ] {
-            let template_id = crate::catalog::seeded_template_id(preset_id);
-            assert!(!template_id.is_empty(), "{preset_id} 应当绑定出厂模板");
-            let contexts = store.template_contexts(template_id).unwrap();
-            assert_eq!(contexts.len(), 1, "{preset_id} 的模板应当只有一条系统提示");
+        let body = || {
+            let contexts = store
+                .template_contexts(crate::catalog::BUILTIN_PRESET_TEMPLATE_ID)
+                .unwrap();
+            assert_eq!(contexts.len(), 1, "模板应当只有一条系统提示");
             match &contexts[0] {
                 ContextItem::System {
-                    content, local_only, ..
+                    id,
+                    content,
+                    local_only,
+                    ..
                 } => {
-                    assert!(!content.trim().is_empty());
                     assert!(
                         !local_only,
                         "local_only 的系统行是生命周期诊断，永远不会上线"
                     );
+                    (id.clone(), content.clone())
                 }
-                other => panic!("{preset_id} 的模板正文不是系统行：{other:?}"),
+                other => panic!("模板正文不是系统行：{other:?}"),
             }
-        }
-
-        // The two prompts describe two different CLIs, so they must not be the
-        // same text.
-        let codex = store
-            .template_contexts(crate::catalog::seeded_template_id(
-                crate::catalog::CODEX_PRESET_ID,
-            ))
-            .unwrap();
-        let claude = store
-            .template_contexts(crate::catalog::seeded_template_id(
-                crate::catalog::CLAUDE_CODE_PRESET_ID,
-            ))
-            .unwrap();
-        assert_ne!(
-            serde_json::to_value(&codex[0])
-                .unwrap()
-                .get("content")
-                .cloned(),
-            serde_json::to_value(&claude[0])
-                .unwrap()
-                .get("content")
-                .cloned()
+        };
+        let (first_id, content) = body();
+        assert_eq!(content, crate::catalog::BUILTIN_PRESET_PROMPT);
+        assert_eq!(
+            builtin_preset_of(&document).template_id,
+            crate::catalog::BUILTIN_PRESET_TEMPLATE_ID
         );
-    }
+        // An engineering prompt: where it runs is the host's to say.
+        assert!(!content.to_lowercase().contains("mework"));
 
-    /// Seeding runs again whenever the anchor is missing, including the recovery
-    /// path over a live conversation store. `put_template` replaces a body
-    /// wholesale, so the existence guard is the only thing standing between a
-    /// rebuild and a body the user has since edited.
-    #[test]
-    fn re_seeding_keeps_a_template_body_the_user_edited() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("document.v1.json");
-        let document = crate::catalog::product_default_document();
-        let store = crate::conversation_store::store_for(&path).unwrap();
-        seed_preset_templates(&store, &document).unwrap();
+        // Current: nothing is rewritten.
+        install_builtin_preset(&path, &mut document).unwrap();
+        assert_eq!(body().0, first_id);
 
-        let template_id = crate::catalog::seeded_template_id(crate::catalog::CLAUDE_CODE_PRESET_ID);
+        // An older build's body is replaced by this build's.
         store
             .put_template(
-                template_id,
+                crate::catalog::BUILTIN_PRESET_TEMPLATE_ID,
                 "",
                 &[ContextItem::System {
-                    id: "ctx_edited".into(),
-                    content: "用户改过的提示词".into(),
+                    id: "ctx_older_build".into(),
+                    content: "上一个版本的提示词".into(),
                     local_only: false,
                     hook_execution: None,
                     created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 }],
             )
             .unwrap();
-
-        seed_preset_templates(&store, &document).unwrap();
-
-        let contexts = store.template_contexts(template_id).unwrap();
-        assert_eq!(contexts.len(), 1);
-        match &contexts[0] {
-            ContextItem::System { content, .. } => {
-                assert_eq!(content, "用户改过的提示词", "重新播种不得洗掉用户的正文");
-            }
-            other => panic!("模板正文不是系统行：{other:?}"),
-        }
+        install_builtin_preset(&path, &mut document).unwrap();
+        assert_eq!(body().1, crate::catalog::BUILTIN_PRESET_PROMPT);
     }
 
-    /// The seeded capability ids reach both shipped presets and no other, and
+    /// A start replaces whatever an earlier build left under the built-in id,
+    /// removes the presets earlier builds seeded as user data together with
+    /// their templates, points a default that no longer resolves at the
+    /// built-in, and leaves the user's own presets alone.
+    #[test]
+    fn a_start_installs_this_builds_preset_in_place_of_the_seeded_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.v1.json");
+        let product = crate::catalog::product_default_document();
+        let store = crate::conversation_store::store_for(&path).unwrap();
+
+        // What an earlier build left: its two seeded presets, their templates,
+        // an older built-in, and one of the user's own.
+        let mut document = product.clone();
+        let mut older = builtin_preset_of(&product).clone();
+        older.name = "旧名字".into();
+        older.settings.agent_definitions.truncate(1);
+        older.settings.web_search_enabled = false;
+        let mut own = older.clone();
+        own.id = "preset_own".into();
+        own.template_id = String::new();
+        let mut seeded = Vec::new();
+        for (preset_id, template_id) in crate::catalog::RETIRED_SEEDED_PRESETS {
+            let mut preset = own.clone();
+            preset.id = (*preset_id).into();
+            preset.template_id = (*template_id).into();
+            seeded.push(preset);
+            store
+                .put_template(
+                    template_id,
+                    "",
+                    &[ContextItem::System {
+                        id: format!("ctx_{template_id}"),
+                        content: "出厂提示词".into(),
+                        local_only: false,
+                        hook_execution: None,
+                        created_at: Utc::now()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    }],
+                )
+                .unwrap();
+        }
+        document.presets.conversation_presets = seeded;
+        document.presets.conversation_presets.push(own.clone());
+        document.presets.conversation_presets.push(older);
+        document.presets.default_conversation_preset_id =
+            crate::catalog::RETIRED_SEEDED_PRESETS[1].0.into();
+
+        assert!(install_builtin_preset(&path, &mut document).unwrap());
+        assert_eq!(
+            document
+                .presets
+                .conversation_presets
+                .iter()
+                .map(|preset| preset.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["preset_own", crate::catalog::BUILTIN_PRESET_ID],
+            "旧种子预设要走，用户自己的留下，内置预设原地换新"
+        );
+        assert_eq!(document.presets.conversation_presets[0], own);
+        let installed = builtin_preset_of(&document);
+        assert_eq!(installed.name, "mework");
+        assert_eq!(installed.settings.agent_definitions.len(), 3);
+        assert!(installed.settings.web_search_enabled);
+        assert_eq!(
+            document.presets.default_conversation_preset_id,
+            crate::catalog::BUILTIN_PRESET_ID
+        );
+        let templates = store
+            .templates()
+            .unwrap()
+            .into_iter()
+            .map(|template| template.id)
+            .collect::<Vec<_>>();
+        for (_, template_id) in crate::catalog::RETIRED_SEEDED_PRESETS {
+            assert!(!templates.iter().any(|id| id == template_id));
+        }
+
+        // Nothing left to change.
+        assert!(!install_builtin_preset(&path, &mut document).unwrap());
+
+        // A default the user chose is kept.
+        document.presets.default_conversation_preset_id = "preset_own".into();
+        assert!(!install_builtin_preset(&path, &mut document).unwrap());
+        assert_eq!(document.presets.default_conversation_preset_id, "preset_own");
+    }
+
+    /// The built-in capability ids reach the built-in preset and no other, and
     /// hooks stay unselected — a dangling hook id fails every run closed, and
     /// the built-in hooks exist to be deletable.
     #[test]
-    fn seeded_capability_ids_select_skills_and_servers_but_never_hooks() {
+    fn builtin_capability_ids_select_skills_and_servers_but_never_hooks() {
         let mut document = crate::catalog::product_default_document();
-        apply_builtin_capability_selection(
+        let mut own = builtin_preset_of(&document).clone();
+        own.id = "preset_own".into();
+        document.presets.conversation_presets.push(own);
+        put_builtin_preset(
             &mut document,
             &crate::capability_seed::BuiltinCapabilitySelection {
                 skill_ids: vec!["skill_user_demo_0000000a".into()],
                 mcp_ids: vec!["mcp_user_demo_0000000b".into()],
             },
+            None,
         );
-        for preset in &document.presets.conversation_presets {
-            assert_eq!(preset.settings.skill_ids, vec!["skill_user_demo_0000000a"]);
-            assert_eq!(preset.settings.mcp_ids, vec!["mcp_user_demo_0000000b"]);
-            assert!(preset.settings.hook_ids.is_empty());
-        }
+        let installed = builtin_preset_of(&document);
+        assert_eq!(installed.settings.skill_ids, vec!["skill_user_demo_0000000a"]);
+        assert_eq!(installed.settings.mcp_ids, vec!["mcp_user_demo_0000000b"]);
+        assert!(installed.settings.hook_ids.is_empty());
+        let own = &document.presets.conversation_presets[1];
+        assert_eq!(own.id, "preset_own");
+        assert!(own.settings.skill_ids.is_empty());
+        assert!(own.settings.mcp_ids.is_empty());
+
+        // A platform with no home directory, or a seeding failure, starts with
+        // no built-ins selected rather than with ids nothing can resolve.
+        put_builtin_preset(&mut document, &Default::default(), None);
+        let installed = builtin_preset_of(&document);
+        assert!(installed.settings.skill_ids.is_empty());
+        assert!(installed.settings.mcp_ids.is_empty());
     }
 
-    /// A platform with no home directory, or a seeding failure, leaves the
-    /// selection empty. That must start with no built-ins selected rather than
-    /// with ids nothing can resolve.
+    /// A role whose provider row is missing is left out rather than bound to
+    /// an empty provider id, which validation refuses.
     #[test]
-    fn an_empty_selection_leaves_the_presets_selecting_nothing() {
+    fn a_builtin_role_without_its_provider_row_is_left_out() {
         let mut document = crate::catalog::product_default_document();
-        apply_builtin_capability_selection(
-            &mut document,
-            &crate::capability_seed::BuiltinCapabilitySelection::default(),
-        );
-        for preset in &document.presets.conversation_presets {
-            assert!(preset.settings.skill_ids.is_empty());
-            assert!(preset.settings.mcp_ids.is_empty());
-            assert!(preset.settings.hook_ids.is_empty());
-        }
+        document
+            .assets
+            .api_providers
+            .retain(|provider| provider.family != crate::model::ProviderFamily::OpenaiCodex);
+        put_builtin_preset(&mut document, &Default::default(), None);
+        let roles = builtin_preset_of(&document)
+            .settings
+            .agent_definitions
+            .iter()
+            .map(|role| role.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["Opus"]);
+        validate_shape(&document).unwrap();
     }
 
-    /// The two shipped presets survive the real save boundary with their role
+    /// The renderer can neither edit nor delete the built-in preset: a save
+    /// that tries gets the preset back as the host installed it, where it
+    /// stood. Its tool list follows the saved catalog, so a build that retires
+    /// a tool cannot leave the preset naming it.
+    #[test]
+    fn a_save_cannot_edit_or_delete_the_builtin_preset() {
+        let previous = crate::catalog::product_default_document();
+        let installed = builtin_preset_of(&previous).clone();
+
+        let mut edited = previous.clone();
+        {
+            let preset = edited
+                .presets
+                .conversation_presets
+                .iter_mut()
+                .find(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
+                .unwrap();
+            preset.name = "改名".into();
+            preset.template_id = String::new();
+            preset.settings.agent_definitions.clear();
+            preset.settings.web_search_enabled = false;
+        }
+        let mut own = installed.clone();
+        own.id = "preset_own".into();
+        edited.presets.conversation_presets.push(own);
+        let saved = validate_save_transition(&previous, &edited, &AppState::default()).unwrap();
+        assert_eq!(builtin_preset_of(&saved), &installed);
+        assert_eq!(saved.presets.conversation_presets.len(), 2);
+
+        let mut deleted = previous.clone();
+        deleted.presets.conversation_presets.clear();
+        deleted.presets.default_conversation_preset_id = String::new();
+        let error = validate_save_transition(&previous, &deleted, &AppState::default())
+            .expect_err("默认预设指空时照常拒绝");
+        assert!(error.contains("新对话默认预设不存在"), "{error}");
+        deleted.presets.default_conversation_preset_id = crate::catalog::BUILTIN_PRESET_ID.into();
+        let saved = validate_save_transition(&previous, &deleted, &AppState::default()).unwrap();
+        assert_eq!(saved.presets.conversation_presets, vec![installed.clone()]);
+
+        let retired = "web_fetch";
+        let mut shrunk = previous.clone();
+        shrunk.tools.retain(|tool| tool.name != retired);
+        let saved = validate_save_transition(&previous, &shrunk, &AppState::default()).unwrap();
+        let tools = &builtin_preset_of(&saved).settings.enabled_tools;
+        assert!(!tools.iter().any(|name| name == retired));
+        assert_eq!(tools.len(), installed.settings.enabled_tools.len() - 1);
+
+        // The one shell a probe chose survives the recomputation.
+        let mut narrowed = previous.clone();
+        put_builtin_preset(
+            &mut narrowed,
+            &Default::default(),
+            Some(crate::shell_backend::ShellBackend::Zsh),
+        );
+        let saved = validate_save_transition(&narrowed, &narrowed, &AppState::default()).unwrap();
+        assert_eq!(shells_of(builtin_preset_of(&saved)), vec!["zsh"]);
+    }
+
+    /// The built-in preset survives the real save boundary with its role
     /// bindings intact — including the Codex ones, whose models cannot exist
     /// until the user signs in.
     #[test]
-    fn product_default_document_ships_two_presets_whose_bindings_survive() {
+    fn product_default_document_ships_the_builtin_preset_whose_bindings_survive() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("document.seed-presets.json");
         let document = crate::catalog::product_default_document();
@@ -5882,14 +6053,11 @@ b"
                 .iter()
                 .map(|preset| preset.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                crate::catalog::CODEX_PRESET_ID,
-                crate::catalog::CLAUDE_CODE_PRESET_ID
-            ]
+            vec![crate::catalog::BUILTIN_PRESET_ID]
         );
         assert_eq!(
             document.presets.default_conversation_preset_id,
-            crate::catalog::CLAUDE_CODE_PRESET_ID
+            crate::catalog::BUILTIN_PRESET_ID
         );
 
         validate_and_save(&path, &document, &document, &AppState::default()).unwrap();
@@ -5932,106 +6100,110 @@ b"
                 .map(|model| model.id.as_str())
         );
 
+        let preset = builtin_preset_of(&restored);
+        assert_eq!(preset.name, "mework");
+        assert!(!preset.settings.allow_roleless_subagents);
         // Everything on except the names the host derives for itself. The
         // preview tools and `workflow` are on too.
-        for preset in &restored.presets.conversation_presets {
-            assert!(!preset.settings.allow_roleless_subagents);
-            assert_eq!(preset.settings.agent_definitions.len(), 3);
-            let withheld = |name: &str| {
-                crate::mework_memory::is_memory_tool(name)
-                    || crate::agents::is_task_runtime_tool_name(name)
-                    || crate::plan_mode::is_plan_mode_tool_name(name)
-                    || name == crate::capabilities::SKILL_TOOL
-                    || name == crate::capabilities::TOOL_SEARCH_TOOL
-            };
-            let enabled = &preset.settings.enabled_tools;
-            assert!(enabled.iter().all(|name| !withheld(name)));
-            let withheld_count = restored
-                .tools
-                .iter()
-                .filter(|tool| withheld(&tool.name))
-                .count();
-            assert_eq!(enabled.len(), restored.tools.len() - withheld_count);
-            assert!(enabled.iter().any(|name| name == "preview_start"));
-            assert!(enabled
-                .iter()
-                .any(|name| name == crate::workflow::WORKFLOW_TOOL));
-            // The memory tools come from the two switches, which are on.
-            assert!(preset.settings.global_memory_enabled);
-            assert!(preset.settings.project_memory_enabled);
-            // Every role follows the preset's list rather than keeping its own.
-            assert!(preset
-                .settings
-                .agent_definitions
-                .iter()
-                .all(|role| role.tools.is_none()));
+        let withheld = |name: &str| {
+            crate::mework_memory::is_memory_tool(name)
+                || crate::agents::is_task_runtime_tool_name(name)
+                || crate::plan_mode::is_plan_mode_tool_name(name)
+                || name == crate::capabilities::SKILL_TOOL
+                || name == crate::capabilities::TOOL_SEARCH_TOOL
+        };
+        let enabled = &preset.settings.enabled_tools;
+        assert!(enabled.iter().all(|name| !withheld(name)));
+        let withheld_count = restored
+            .tools
+            .iter()
+            .filter(|tool| withheld(&tool.name))
+            .count();
+        assert_eq!(enabled.len(), restored.tools.len() - withheld_count);
+        assert!(enabled.iter().any(|name| name == "preview_start"));
+        assert!(enabled
+            .iter()
+            .any(|name| name == crate::workflow::WORKFLOW_TOOL));
+        // The memory tools come from the two switches, which are on.
+        assert!(preset.settings.global_memory_enabled);
+        assert!(preset.settings.project_memory_enabled);
+        // Both capability surfaces load on demand rather than inlining every
+        // body and schema into the system prompt.
+        assert!(preset.settings.skill_tool_enabled);
+        assert!(preset.settings.mcp_tool_discovery_enabled);
+        // A dangling hook id fails every run of the conversation closed, and
+        // the built-in hooks are meant to be deletable, so the preset names none.
+        assert!(preset.settings.hook_ids.is_empty());
+        // Both legs are native. Nothing is borrowed from a catalog provider by
+        // default, and nothing resolves to a backend chosen somewhere else.
+        assert_eq!(
+            preset.settings.web_search.provider,
+            crate::model::SearchProviderSelection::Native
+        );
+        assert_eq!(
+            preset.settings.web_search.fetch_provider,
+            crate::model::FetchProviderSelection::Native
+        );
+        // A shipped domain list would be this application deciding what the
+        // web may say, so the filter is off and both lists are empty.
+        assert_eq!(
+            preset.settings.web_search.domain_filter,
+            crate::model::SearchDomainFilterMode::Off
+        );
+        assert!(preset.settings.web_search.include_domains.is_empty());
+        assert!(preset.settings.web_search.exclude_domains.is_empty());
+        // The body lives in the conversation store, not the document; the id
+        // survives the save boundary either way.
+        assert_eq!(preset.template_id, crate::catalog::BUILTIN_PRESET_TEMPLATE_ID);
 
-            // Both capability surfaces load on demand rather than inlining
-            // every body and schema into the system prompt.
-            assert!(preset.settings.skill_tool_enabled);
-            assert!(preset.settings.mcp_tool_discovery_enabled);
-            // A dangling hook id fails every run of the conversation closed,
-            // and the built-in hooks are meant to be deletable, so no shipped
-            // preset may name one.
-            assert!(preset.settings.hook_ids.is_empty());
-            // Both legs are native on both presets. Nothing is borrowed from a
-            // catalog provider by default, and nothing resolves to a backend
-            // chosen somewhere else: on a family that folds retrieval into its
-            // one search tool, native fetch simply grants no second web tool,
-            // which is that family's own shape.
-            assert_eq!(
-                preset.settings.web_search.provider,
-                crate::model::SearchProviderSelection::Native
-            );
-            assert_eq!(
-                preset.settings.web_search.fetch_provider,
-                crate::model::FetchProviderSelection::Native
-            );
-            // A shipped domain list would be this application deciding what the
-            // web may say, so the filter is off and both lists are empty.
-            assert_eq!(
-                preset.settings.web_search.domain_filter,
-                crate::model::SearchDomainFilterMode::Off
-            );
-            assert!(preset.settings.web_search.include_domains.is_empty());
-            assert!(preset.settings.web_search.exclude_domains.is_empty());
-            // The body is seeded into the conversation store, not the document;
-            // the id survives the save boundary either way.
-            assert_eq!(
-                preset.template_id,
-                crate::catalog::seeded_template_id(&preset.id)
-            );
+        let roles = &preset.settings.agent_definitions;
+        assert_eq!(
+            roles
+                .iter()
+                .map(|role| role.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Opus", "Sol", "Luna"]
+        );
+        for role in roles {
+            // Every role follows the preset's list rather than keeping its own,
+            // and says what it is for: the listing is how the model picks one.
+            assert!(role.tools.is_none());
+            assert!(!role.description.trim().is_empty(), "{} 缺少说明", role.name);
         }
-
-        let binding = |preset_id: &str, role: &str| {
-            restored
-                .presets
-                .conversation_presets
+        let binding = |name: &str| {
+            roles
                 .iter()
-                .find(|preset| preset.id == preset_id)
-                .and_then(|preset| {
-                    preset
-                        .settings
-                        .agent_definitions
-                        .iter()
-                        .find(|definition| definition.name == role)
-                })
-                .map(|definition| definition.model_selection.clone())
+                .find(|role| role.name == name)
+                .map(|role| role.model_selection.clone())
                 .expect("角色必须在")
         };
         assert_eq!(
-            binding(crate::catalog::CODEX_PRESET_ID, "sol"),
+            binding("Opus"),
+            AgentModelSelection::Explicit {
+                provider_id: claude_provider.id.clone(),
+                model_id: "claude-opus-5-5".into(),
+            }
+        );
+        assert!(
+            claude_provider
+                .models
+                .iter()
+                .any(|model| model.id == "claude-opus-5-5"),
+            "Opus 绑定的模型要在种子表里，新装即可用"
+        );
+        assert_eq!(
+            binding("Sol"),
             AgentModelSelection::Explicit {
                 provider_id: codex_provider.id.clone(),
-                model_id: "gpt-5.6-sol".into(),
+                model_id: "gpt-6-sol".into(),
             },
             "未登录的 Codex 绑定必须原样活过一次存取"
         );
         assert_eq!(
-            binding(crate::catalog::CLAUDE_CODE_PRESET_ID, "opus"),
+            binding("Luna"),
             AgentModelSelection::Explicit {
-                provider_id: claude_provider.id.clone(),
-                model_id: "claude-opus-5".into(),
+                provider_id: codex_provider.id.clone(),
+                model_id: "gpt-6-luna".into(),
             }
         );
     }

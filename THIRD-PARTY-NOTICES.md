@@ -46,6 +46,60 @@ folded into one file and given a stop switch for shutdown.
 
 ---
 
+## `ggml-org/llama.cpp` — MIT (Windows and Linux builds)
+
+**Linked into:** `mework.exe` / `mework` on Windows and Linux, through the
+[`llama-cpp-sys-2`](https://crates.io/crates/llama-cpp-sys-2) crate, which compiles
+the llama.cpp and ggml sources it bundles. It runs the optional local helper model
+(conversation titles, shell command explanations); macOS builds use Core ML or MLX
+instead and do not contain it.
+
+llama.cpp is MIT: Copyright (c) 2023-2026 The ggml authors. The MIT text is in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).
+
+The model (Qwen3.5-0.8B, Apache-2.0) is not in the app. When the user turns the
+feature on and picks a build, the app downloads that build, converted from the official
+release (the GGUF file on Windows and Linux, the Core ML package or the MLX weights on
+a Mac), from [`catblob-hash/Mework-Qwen3.5-0.8B`](https://huggingface.co/catblob-hash/Mework-Qwen3.5-0.8B)
+on Hugging Face, where it is published with its Apache-2.0 license.
+
+---
+
+## `ml-explore/mlx` — MIT (macOS builds on Apple silicon)
+
+**Bundled:** `Contents/Frameworks/mework-mlx/libmlx.dylib`, Apple's prebuilt MLX
+0.32.2 as published on PyPI (`mlx-metal`), which
+`Contents/Frameworks/mework-mlx/libmework_mlx.dylib` (Mework's model code,
+[`src-tauri/local-model/mlx`](src-tauri/local-model/mlx)) links against. The MLX
+kernel library (`mlx.metallib`, from the same release) is not in the app; it comes with
+the local helper model's GPU build when the user downloads that build.
+
+```
+MIT License
+
+Copyright © 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
 ## `anthropic-experimental/sandbox-runtime` — Apache-2.0
 
 **Adapted file:**

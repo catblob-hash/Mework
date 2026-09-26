@@ -1,5 +1,5 @@
 {
-  "name": "Mework built-in (English)",
+  "name": "Mework built-in",
   "prompts": {
     "fork.request_submitted": "Fork request submitted. Whether the child conversation is created is the user's decision on a non-blocking card; you will not be told the outcome and nothing about it will ever be delivered here. Continue your own work, and do not raise this fork again.",
     "format.list_separator": ", ",

@@ -11,11 +11,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import {
   captureConversationPresetSettings,
-  implicitConversationPreset
+  isBuiltinConversationPreset
 } from "../lib/conversationPresets";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
-import { normalizeRememberedToolFamilies } from "../lib/toolFamilies";
 import type {
   CapabilityCatalog,
   ContextItem,
@@ -32,7 +31,7 @@ import type {
 } from "../types";
 import { Dialog, Switch } from "./Common";
 import { editableUserAgentDefinition } from "../lib/agentDefinitions";
-import { isHostDerivedToolName } from "../lib/taskTools";
+import { isHostDerivedToolName, isPreviewLifecycleToolName } from "../lib/taskTools";
 import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/webSearch";
 import { toolLockOf } from "../lib/toolLock";
 import { ConversationTemplateEditor } from "./ConversationTemplateEditor";
@@ -116,6 +115,8 @@ interface ConversationSettingsProps {
   onDeletePreset?: (presetId: string) => void;
   /** Writes an edited body back onto a saved preset. */
   onSavePreset?: (presetId: string, settings: ConversationPresetSettings) => void;
+  /** Saves an edited body of the built-in preset, which cannot change, as a new preset. */
+  onSavePresetCopy?: (presetId: string, settings: ConversationPresetSettings) => void;
   /**
    * Records the template id a preset opens with, at once rather than on Save.
    * A body is written to the host the moment the user asks for it, so the id it
@@ -191,6 +192,7 @@ export function ConversationSettings({
   onRenamePreset,
   onDeletePreset,
   onSavePreset,
+  onSavePresetCopy,
   onBindPresetTemplate,
   templates,
   onReadTemplate,
@@ -206,7 +208,7 @@ export function ConversationSettings({
   mode = "conversation",
   presetId
 }: ConversationSettingsProps) {
-  const { t, resolvedLanguage } = useI18n();
+  const { t } = useI18n();
   const settings = conversation.settings;
   const [view, setView] = useState<ConversationSettingsView>("features");
   /* The preset currently open in a window of this pane, held as a whole
@@ -239,10 +241,14 @@ export function ConversationSettings({
   }, [onRescanCapabilities]);
 
   // Memory, task-runtime, and skill tools are derived from their respective
-  // settings and are excluded from the enabled-tools list and its count.
+  // settings and are excluded from the enabled-tools list and its count. The
+  // preview lifecycle tools follow the other preview tools, so they are not
+  // counted either.
   const toolNames = useMemo(() => Array.from(new Set(
     tools
-      .filter((tool) => tool.category !== "memory" && !isHostDerivedToolName(tool.name))
+      .filter((tool) => tool.category !== "memory"
+        && !isHostDerivedToolName(tool.name)
+        && !isPreviewLifecycleToolName(tool.name))
       .map((tool) => tool.name)
   )), [tools]);
   const validEnabledToolCount = useMemo(() => {
@@ -308,12 +314,10 @@ export function ConversationSettings({
      cannot be withdrawn behind a tool the earlier rounds did not have, and
      names already announced cannot retroactively have carried their schemas. */
   const mcpDeliveryLocked = lock.mcpIds.length > 0;
-  /* The implicit built-in stands in only while nothing is saved. It has no row
-   * on disk, so the presets page draws it without rename or delete. */
-  const presetsAreSaved = globalSettings.conversationPresets.length > 0;
-  const presetOptions = presetsAreSaved
-    ? globalSettings.conversationPresets
-    : [implicitConversationPreset(tools, resolvedLanguage)];
+  const presetOptions = globalSettings.conversationPresets;
+  /* The built-in preset ships with the build and cannot change, so its window
+   * edits a draft the user can only keep as a preset of their own. */
+  const builtinPreset = editingPreset && Boolean(presetId) && isBuiltinConversationPreset(presetId!);
   /** A deleted preset leaves a dangling ID, which reads as an unnamed draft. */
   const appliedPresetId = presetOptions.some((preset) => preset.id === conversation.presetId)
     ? conversation.presetId
@@ -460,9 +464,11 @@ export function ConversationSettings({
               type="button"
               className="text-button"
               onClick={onSaveAsPreset}
-            >{editingPreset
+            >{editingPreset && !builtinPreset
               ? t("保存预设", "Save preset")
-              : t("另存为预设", "Save as preset")}</button>
+              : builtinPreset
+                ? t("另存为新预设", "Save as new preset")
+                : t("另存为预设", "Save as preset")}</button>
           </div>
         </div>
       </nav>
@@ -470,6 +476,10 @@ export function ConversationSettings({
       <div className="conversation-settings__page">
         <header className="conversation-settings__page-header">
           <p>{pageBlurbs[view]}</p>
+          {builtinPreset && <p className="field__hint">{t(
+            "内置预设随 Mework 版本更新，不能修改或删除。在这里改动的设置可以另存为一份新预设；对话模板只读，不随副本带走。",
+            "The built-in preset updates with Mework and cannot be edited or deleted. Settings changed here can be saved as a new preset; the conversation template is read-only and does not go with the copy."
+          )}</p>}
         </header>
         {/* The template page is a timeline, which brings its own scroller and
             its own edges. Padding and a second scrollbar around one would fight
@@ -487,9 +497,7 @@ export function ConversationSettings({
                   enabledTools: settings.enabledTools,
                   lockedTools: lock.tools,
                   onChange: (enabledTools) => update({ enabledTools }),
-                  expansionKey: conversation.id,
-                  rememberedToolFamilies: normalizeRememberedToolFamilies(settings.rememberedToolFamilies),
-                  onToolSettingsChange: update
+                  expansionKey: conversation.id
                 }}
                 pickerSummary={t(
                   "{enabled} / {total} 个已选",
@@ -676,6 +684,7 @@ export function ConversationSettings({
                 contexts={templateBody}
                 tools={tools}
                 enabledTools={settings.enabledTools}
+                editable={!builtinPreset}
                 imageInputSupported={imageInputSupported}
                 autosave
                 onEnableTools={(names) => update({
@@ -696,7 +705,6 @@ export function ConversationSettings({
                 listId={listId("presets")}
                 presets={presetOptions}
                 appliedId={appliedPresetId}
-                editable={presetsAreSaved}
                 error={presetError}
                 onApply={onApplyPreset}
                 onOpen={openPreset}
@@ -756,7 +764,9 @@ export function ConversationSettings({
             onRevealCapabilityLocation={onRevealCapabilityLocation}
             onProbeMcpServer={onProbeMcpServer}
             onSaveAsPreset={() => {
-              onSavePreset?.(presetDraft.id, captureConversationPresetSettings(presetDraft.settings));
+              const body = captureConversationPresetSettings(presetDraft.settings);
+              if (isBuiltinConversationPreset(presetDraft.id)) onSavePresetCopy?.(presetDraft.id, body);
+              else onSavePreset?.(presetDraft.id, body);
               setPresetDraft(null);
             }}
           />

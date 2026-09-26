@@ -9,6 +9,7 @@ import { deriveWorkflowProgress } from "../lib/workflowProgress";
 import { deriveWorkflowItems } from "../lib/taskContainer";
 import { deriveWorkflowRun } from "../lib/workflowRuns";
 import { subagentViewFixture, taskMessagesFixture } from "../test/fixtures";
+import conversationCss from "../styles/conversation.css?raw";
 import { ContextStream } from "./ContextStream";
 
 describe("ContextStream", () => {
@@ -31,6 +32,16 @@ describe("ContextStream", () => {
       clientHeight: { configurable: true, value: clientHeight },
       scrollHeight: { configurable: true, value: scrollHeight }
     });
+  };
+
+  /** Runs queued animation frames, and the frames they queue, 16 ms apart until none are left. */
+  const runFrames = (frames: FrameRequestCallback[], start = 0) => {
+    let time = start;
+    for (let count = 0; frames.length > 0 && count < 500; count += 1) {
+      time += 16;
+      frames.shift()!(time);
+    }
+    expect(frames).toHaveLength(0);
   };
 
   /**
@@ -114,7 +125,7 @@ describe("ContextStream", () => {
         onSaveTool={vi.fn()}
       />
     );
-    fireEvent.contextMenu(container.querySelector(".context-stream__hint")!, { clientX: 20, clientY: 20 });
+    fireEvent.contextMenu(container.querySelector(".context-stream")!, { clientX: 20, clientY: 20 });
     const menu = screen.getByRole("menu");
     expect(menu).toBeInTheDocument();
     expect(within(menu).getAllByRole("menuitem")).toHaveLength(5);
@@ -143,7 +154,7 @@ describe("ContextStream", () => {
       />
     );
 
-    fireEvent.contextMenu(container.querySelector(".context-stream__hint")!, { clientX: 20, clientY: 20 });
+    fireEvent.contextMenu(container.querySelector(".context-stream")!, { clientX: 20, clientY: 20 });
     await user.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: /工具调用/ }));
 
     // Naming a tool is two steps: the group, then the tool inside it. Each opens
@@ -210,6 +221,37 @@ describe("ContextStream", () => {
     const tool = render1("tool", "write");
     expect(tool.querySelector('.timeline-row[data-row-kind="tool"] .inline-tool-editor[data-tool-name="write"]')).not.toBeNull();
     expect(tool.querySelector(".tool-picker-list")).toBeNull();
+  });
+
+  /**
+   * The insert editor mounts holding focus. WebKit never measures whether a
+   * `content-visibility: auto` box kept relevant only by focus is on screen, so
+   * the press on Save, which blurs the textarea, skipped the editor and the
+   * release missed the button. Its slot, wherever it is drawn, opts out.
+   */
+  it("keeps the insert editor's slot out of content-visibility skipping", () => {
+    const slotRule = conversationCss.match(/\.context-slot--inserting\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(slotRule).toMatch(/content-visibility:\s*visible/);
+
+    const document = createSeedDocument();
+    const conversation = document.workspaces[0].conversations[0];
+    for (const contexts of [[], conversation.contexts]) {
+      for (const index of new Set([0, contexts.length])) {
+        const { container, unmount } = render(
+          <ContextStream
+            contexts={contexts}
+            tools={document.tools}
+            enabledTools={conversation.settings.enabledTools}
+            editor={{ mode: "insert", kind: "user", index }}
+            onCancelEdit={vi.fn()}
+            onSaveText={vi.fn()}
+          />
+        );
+        const editor = container.querySelector(".inline-text-editor");
+        expect(editor?.closest(".context-slot")).toHaveClass("context-slot--inserting");
+        unmount();
+      }
+    }
   });
 
   /// Legacy fold records are user contexts. New folds use host-synthesized
@@ -543,6 +585,67 @@ describe("ContextStream", () => {
     expect(onInsert).toHaveBeenCalledWith(0, "user");
   });
 
+  it("brands the empty conversation and says where content can be inserted", () => {
+    const document = createSeedDocument();
+    const { container, rerender } = render(
+      <ContextStream contexts={[]} tools={document.tools} enabledTools={[]} onInsert={vi.fn()} />
+    );
+    const emptyState = container.querySelector<HTMLElement>(".empty-state")!;
+    expect(within(emptyState).getByText("这段对话还没有消息")).toBeInTheDocument();
+    expect(within(emptyState).getByText("在上下文之间右键，可精确插入新内容")).toBeInTheDocument();
+    // The app's prompt and mark, without the plate that makes it the Dock icon.
+    const icon = emptyState.querySelector(".empty-state__icon svg")!;
+    expect(icon.querySelector("rect")).toBeNull();
+    expect(icon.querySelector(".mework-icon__mark")).not.toBeNull();
+    expect(screen.queryByText("会话内容会显示在这里。")).toBeNull();
+
+    // A transcript that cannot be edited offers no right-click, so it does not advertise one.
+    rerender(<ContextStream contexts={[]} tools={document.tools} enabledTools={[]} readOnly />);
+    expect(screen.getByText("这段对话还没有消息")).toBeInTheDocument();
+    expect(screen.queryByText("在上下文之间右键，可精确插入新内容")).toBeNull();
+  });
+
+  it("forks the conversation at the insertion line from the same menu", () => {
+    const contexts: ContextItem[] = [
+      { id: "fork-u1", kind: "user", content: "第一问", createdAt: "2026-07-20T00:00:01Z" },
+      { id: "fork-a1", kind: "assistant", content: "第一答", createdAt: "2026-07-20T00:00:02Z" }
+    ];
+    const onForkAt = vi.fn();
+    const { container, rerender } = render(
+      <ContextStream contexts={contexts} tools={[]} enabledTools={[]} onInsert={vi.fn()} onForkAt={onForkAt} />
+    );
+    const answer = container.querySelector<HTMLElement>('[data-context-id="fork-a1"]')!;
+    vi.spyOn(answer, "getBoundingClientRect").mockReturnValue(box(100, 100));
+
+    fireEvent.contextMenu(answer, { clientX: 40, clientY: 125 });
+    fireEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: "分叉会话" }));
+    expect(onForkAt).toHaveBeenCalledWith(1);
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    // Nothing above the line, nothing to fork.
+    const question = container.querySelector<HTMLElement>('[data-context-id="fork-u1"]')!;
+    vi.spyOn(question, "getBoundingClientRect").mockReturnValue(box(0, 100));
+    fireEvent.contextMenu(question, { clientX: 40, clientY: 10 });
+    expect(within(screen.getByRole("menu")).getByRole("menuitem", { name: "分叉会话" })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    rerender(
+      <ContextStream
+        contexts={contexts}
+        tools={[]}
+        enabledTools={[]}
+        onInsert={vi.fn()}
+        onForkAt={onForkAt}
+        forkDisabledReason="项目正在删除，无法分叉会话"
+      />
+    );
+    fireEvent.contextMenu(container.querySelector(".context-stream")!, { clientX: 40, clientY: 400 });
+    const disabled = within(screen.getByRole("menu")).getByRole("menuitem", { name: "分叉会话" });
+    expect(disabled).toBeDisabled();
+    expect(disabled).toHaveAttribute("title", "项目正在删除，无法分叉会话");
+    expect(onForkAt).toHaveBeenCalledTimes(1);
+  });
+
   it("regroups tools after deleting a visible boundary and maps insertion UI across hidden anchors", () => {
     const firstTool: ToolContext = {
       id: "edited-group-first",
@@ -704,7 +807,7 @@ describe("ContextStream", () => {
     rerender(<ContextStream contexts={[first]} tools={[]} enabledTools={[]} onInsert={onInsert} />);
     expect(requestFrame).not.toHaveBeenCalled();
 
-    fireEvent.contextMenu(container.querySelector(".context-stream__hint")!, { clientX: 40, clientY: 220 });
+    fireEvent.contextMenu(container.querySelector(".context-stream")!, { clientX: 40, clientY: 220 });
     const menu = screen.getByRole("menu", { name: "添加上下文" });
     expect(menu).toBeInTheDocument();
     fireEvent.click(within(menu).getByRole("menuitem", { name: "模型回复" }));
@@ -805,9 +908,100 @@ describe("ContextStream", () => {
     // Back at the bottom mid-stream: the next chunk is followed again.
     scroller.scrollTop = 560;
     fireEvent.scroll(scroller);
+    setVerticalMetrics(scroller, 80, 720);
     rerender(stream("正在回答这个问题"));
-    frames.splice(0).forEach((callback) => callback(2));
+    runFrames(frames);
     expect(scroller.scrollTop).toBe(640);
+    requestFrame.mockRestore();
+  });
+
+  it("glides down to a streaming tail over several frames instead of jumping", () => {
+    const question = { id: "glide-user", kind: "user" as const, content: "问题", createdAt: "2026-07-21T00:00:00Z" };
+    const reply = (content: string) => ({
+      id: "glide-assistant",
+      kind: "assistant" as const,
+      content,
+      streaming: true,
+      createdAt: "2026-07-21T00:00:01Z"
+    });
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const stream = (content: string) => (
+      <ContextStream contexts={[question, reply(content)]} tools={[]} enabledTools={[]} streaming onInsert={vi.fn()} />
+    );
+    const { container, rerender } = render(stream("第一行"));
+    frames.splice(0).forEach((callback) => callback(0));
+    const scroller = container.querySelector<HTMLElement>(".context-scroll")!;
+    setVerticalMetrics(scroller, 80, 640);
+    scroller.scrollTop = 560;
+    fireEvent.scroll(scroller);
+
+    // One commit's growth: the first frame covers only part of it, and every
+    // frame after moves further down without ever stepping back up.
+    setVerticalMetrics(scroller, 80, 740);
+    rerender(stream("第一行\n第二行"));
+    const positions: number[] = [];
+    let time = 0;
+    while (frames.length > 0 && positions.length < 200) {
+      time += 16;
+      frames.shift()!(time);
+      positions.push(scroller.scrollTop);
+    }
+    // Other components queue frames of their own; only the page's moves count.
+    const moves = positions.filter((position, index) => position !== (positions[index - 1] ?? 560));
+    expect(moves.length).toBeGreaterThan(3);
+    expect(moves[0]).toBeLessThan(620);
+    expect(moves.every((position, index) => position > (moves[index - 1] ?? 560))).toBe(true);
+    expect(moves[moves.length - 1]).toBe(660);
+    requestFrame.mockRestore();
+  });
+
+  it("lets go of a streaming tail the moment the wheel turns up, mid-glide", () => {
+    const question = { id: "wheel-user", kind: "user" as const, content: "问题", createdAt: "2026-07-21T00:00:00Z" };
+    const reply = (content: string) => ({
+      id: "wheel-assistant",
+      kind: "assistant" as const,
+      content,
+      streaming: true,
+      createdAt: "2026-07-21T00:00:01Z"
+    });
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const stream = (content: string) => (
+      <ContextStream contexts={[question, reply(content)]} tools={[]} enabledTools={[]} streaming onInsert={vi.fn()} />
+    );
+    const { container, rerender } = render(stream("第一行"));
+    frames.splice(0).forEach((callback) => callback(0));
+    const scroller = container.querySelector<HTMLElement>(".context-scroll")!;
+    setVerticalMetrics(scroller, 80, 640);
+    scroller.scrollTop = 560;
+    fireEvent.scroll(scroller);
+
+    setVerticalMetrics(scroller, 80, 940);
+    rerender(stream("第一行\n第二行"));
+    let time = 0;
+    while (frames.length > 0 && scroller.scrollTop === 560) {
+      time += 16;
+      frames.shift()!(time);
+    }
+    const reached = scroller.scrollTop;
+    expect(reached).toBeGreaterThan(560);
+    expect(reached).toBeLessThan(860);
+
+    // The frames already queued must not drag the reader back down, and a
+    // later commit must not start a new glide.
+    fireEvent.wheel(scroller, { deltaY: -40 });
+    runFrames(frames);
+    expect(scroller.scrollTop).toBe(reached);
+    rerender(stream("第一行\n第二行\n第三行"));
+    runFrames(frames);
+    expect(scroller.scrollTop).toBe(reached);
     requestFrame.mockRestore();
   });
 
@@ -837,7 +1031,7 @@ describe("ContextStream", () => {
       <ContextStream timelineId="conversation-a" contexts={[first, last]} tools={[]} enabledTools={[]} onInsert={vi.fn()} />
     );
     expect(frames.size).toBe(1);
-    fireEvent.contextMenu(container.querySelector(".context-stream__hint")!, { clientX: 40, clientY: 220 });
+    fireEvent.contextMenu(container.querySelector(".context-stream")!, { clientX: 40, clientY: 220 });
 
     expect(cancelFrame).toHaveBeenCalledTimes(1);
     expect(frames.size).toBe(0);
@@ -1313,7 +1507,9 @@ describe("ContextStream", () => {
     expect(row).toHaveAttribute("data-row-kind", "reasoning");
     // The newest line is the one on the row while the round is still thinking.
     expect(row.querySelector(".timeline-row__line")).toHaveTextContent("先读文件");
-    expect(within(row).getByRole("button", { name: "think · 正在思考" })).toHaveAttribute("aria-expanded", "true");
+    const summary = within(row).getByRole("button", { name: "think · 正在思考" });
+    expect(summary).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(summary);
     expect(row.querySelector(".timeline-row__prose")).toHaveTextContent("先读文件");
   });
 
@@ -1601,13 +1797,14 @@ describe("ContextStream", () => {
     await waitFor(() => expect(
       container.querySelector("[data-context-id='assistant-markdown-stream'] .math-formula--display[data-math-state='ready']")
     ).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "think · 正在思考" }));
     expect(container.querySelector("[data-context-id='reasoning-markdown-stream'] strong")).toHaveTextContent("推导中");
     await waitFor(() => expect(
       container.querySelector("[data-context-id='reasoning-markdown-stream'] .math-formula[data-math-state='ready']")
     ).toBeInTheDocument());
   });
 
-  it("opens streaming reasoning in place and leaves it open once it settles", async () => {
+  it("keeps streaming reasoning closed behind its line, and closed once it settles", async () => {
     const reasoning = {
       id: "reasoning-stream",
       kind: "reasoning" as const,
@@ -1630,15 +1827,44 @@ describe("ContextStream", () => {
     const row = container.querySelector<HTMLElement>('[data-context-id="reasoning-stream"]')!;
     const summary = screen.getByRole("button", { name: "think · 正在思考" });
     expect(row).toHaveAttribute("aria-busy", "true");
-    // Reasoning opens itself while it arrives, so the round narrates in place.
-    expect(summary).toHaveAttribute("aria-expanded", "true");
-    expect(row.querySelector(".timeline-row__prose")).toHaveTextContent(reasoning.content);
-    expect(container.querySelector(".streaming-cursor")).not.toBeInTheDocument();
+    // A body growing under the row would pull the page every commit; the row's
+    // line narrates the round instead.
+    expect(summary).toHaveAttribute("aria-expanded", "false");
+    expect(row.querySelector(".timeline-row__prose")).not.toBeInTheDocument();
+    expect(row.querySelector(".timeline-row__line")).toHaveTextContent(reasoning.content);
+
+    rerender(renderStream(`${reasoning.content}，后续仍在继续增加。`));
+    expect(row.querySelector(".timeline-row__line")).toHaveTextContent("后续仍在继续增加。");
 
     rerender(renderStream(`${reasoning.content}，后续仍在继续增加。`, false));
-    await waitFor(() => expect(screen.getByRole("button", { name: "think · 思考过程" })).toHaveAttribute("aria-expanded", "true"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "think · 思考过程" })).toHaveAttribute("aria-expanded", "false"));
     expect(row).not.toHaveAttribute("aria-busy");
-    expect(row.querySelector(".timeline-row__prose")).toHaveTextContent("后续仍在继续增加。");
+  });
+
+  it("opens streaming reasoning in place when the reader keeps reasoning open", () => {
+    applyAppearance({ ...defaultAppearancePreferences(), collapseReasoning: false });
+    try {
+      const { container } = render(
+        <ContextStream
+          contexts={[{
+            id: "reasoning-stream-open",
+            kind: "reasoning" as const,
+            content: "按偏好展开的思考",
+            streaming: true,
+            createdAt: "2026-07-11T00:00:00Z"
+          }]}
+          tools={[]}
+          enabledTools={[]}
+          onEdit={vi.fn()}
+          onDelete={vi.fn()}
+          onInsert={vi.fn()}
+        />
+      );
+      expect(screen.getByRole("button", { name: "think · 正在思考" })).toHaveAttribute("aria-expanded", "true");
+      expect(container.querySelector(".timeline-row__prose")).toHaveTextContent("按偏好展开的思考");
+    } finally {
+      applyAppearance(defaultAppearancePreferences());
+    }
   });
 
   it("never overrides a user's streaming reasoning view choice", async () => {
@@ -1660,20 +1886,19 @@ describe("ContextStream", () => {
     );
     const { container, rerender } = render(renderStream("尚未超过预览长度"));
     const summary = screen.getByRole("button", { name: "think · 正在思考" });
-    expect(summary).toHaveAttribute("aria-expanded", "true");
+    expect(summary).toHaveAttribute("aria-expanded", "false");
 
     fireEvent.click(summary);
-    expect(summary).toHaveAttribute("aria-expanded", "false");
-    rerender(renderStream("已经超过预览长度的思考内容，继续增加也不应自动打开。"));
-    expect(screen.getByRole("button", { name: "think · 正在思考" })).toHaveAttribute("aria-expanded", "false");
-    // The line keeps moving with the thought even while the body stays shut.
-    expect(container.querySelector(".timeline-row__line"))
-      .toHaveTextContent("已经超过预览长度的思考内容，继续增加也不应自动打开。");
+    expect(summary).toHaveAttribute("aria-expanded", "true");
+    rerender(renderStream("已经超过预览长度的思考内容，继续增加也不应自动收起。"));
+    expect(screen.getByRole("button", { name: "think · 正在思考" })).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector(".timeline-row__prose"))
+      .toHaveTextContent("已经超过预览长度的思考内容，继续增加也不应自动收起。");
 
-    // Settling is not a reason to reopen what the reader closed.
-    rerender(renderStream("思考完成后也保留用户选择的收起视图。", false));
-    await waitFor(() => expect(screen.getByRole("button", { name: "think · 思考过程" })).toHaveAttribute("aria-expanded", "false"));
-    await waitFor(() => expect(container.querySelector(".timeline-row__prose")).not.toBeInTheDocument());
+    // Settling is not a reason to close what the reader opened.
+    rerender(renderStream("思考完成后也保留用户选择的展开视图。", false));
+    await waitFor(() => expect(screen.getByRole("button", { name: "think · 思考过程" })).toHaveAttribute("aria-expanded", "true"));
+    expect(container.querySelector(".timeline-row__prose")).toHaveTextContent("思考完成后也保留用户选择的展开视图。");
   });
 
   it("draws a completed turn's messages flat, with no round of its own", () => {

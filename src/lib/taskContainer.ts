@@ -3,6 +3,7 @@ import type { TerminalSessionState } from "./terminal";
 import type { ShellTaskSnapshot } from "./shellTasks";
 import type { BrowserStatus } from "./browser";
 import { previewServerAddress, previewUrlIsServedAt, type PreviewServerSnapshot } from "./preview";
+import { workspaceDirectoryLabel } from "./workspaces";
 import type { ModelUsage, ConversationPlan, ForkDecisionRecord, UserAbortedTaskKind, UserAbortedTaskRecord } from "../types";
 
 /**
@@ -509,6 +510,32 @@ function browserItem(
 }
 
 /**
+ * What a shell command's row and page are called: the tool, and — once the
+ * conversation has more than one workspace, where "which one did that run in"
+ * becomes a real question — the workspace it ran in, by the same name its chip
+ * carries.
+ */
+export function shellTaskTitle(shell: ShellTaskSnapshot, multipleWorkspaces: boolean): string {
+  return multipleWorkspaces && shell.workspaceRoot
+    ? `${shell.toolName} · ${workspaceDirectoryLabel(shell.workspaceRoot)}`
+    : shell.toolName;
+}
+
+/**
+ * How long a shell command has run. A finished command the machine that ran it
+ * timed reports that figure; everything else is the host's span, which ticks
+ * while the command runs.
+ */
+function shellElapsedMs(shell: ShellTaskSnapshot, now: number): number | null {
+  if (shell.outcome && typeof shell.durationMs === "number") return shell.durationMs;
+  // Passing the real end freezes a finished row at the command's duration
+  // instead of letting it count on forever; with no end on record there is no
+  // duration to freeze at.
+  if (shell.outcome && !shell.endedAt) return null;
+  return elapsedMs(shell.startedAt, shell.endedAt, now);
+}
+
+/**
  * One shell command as a task row, running or finished. A finished command keeps
  * its row on purpose: the question a user has after a build is "did it pass",
  * and a row that vanished at the exact moment it could answer that never got to.
@@ -516,7 +543,8 @@ function browserItem(
 function shellItem(
   shell: ShellTaskSnapshot,
   messages: TaskContainerMessages,
-  now: number
+  now: number,
+  multipleWorkspaces: boolean
 ): TaskItem {
   // The command text is the detail whatever the state, so the row still answers
   // "which command was that" once it is in the collapsed finish list. What
@@ -540,7 +568,7 @@ function shellItem(
     id: shell.shellTaskId,
     // The tool name is the label and the command is the detail, so the row
     // answers "what is running" without the user opening anything.
-    label: shell.toolName,
+    label: shellTaskTitle(shell, multipleWorkspaces),
     detail: status ? `${status} · ${command}` : command,
     // A stopped process is only classified as a user-aborted failure when the
     // taskbar has persisted the corresponding abort record. Other cancellation
@@ -554,15 +582,12 @@ function shellItem(
     // Only the elapsed column can say anything: a shell command spawns no
     // children, spends no tokens and calls no tools. It is also the column that
     // matters most here — the whole reason the row exists is that a command's
-    // runtime is unpredictable. Passing the real end freezes it at the
-    // command's duration instead of letting a finished row count on forever.
+    // runtime is unpredictable.
     metrics: {
       childCount: null,
       tokens: null,
       toolCount: null,
-      elapsedMs: shell.outcome && !shell.endedAt
-        ? null
-        : elapsedMs(shell.startedAt, shell.endedAt, now)
+      elapsedMs: shellElapsedMs(shell, now)
     },
     children: [],
     error: null,
@@ -744,6 +769,11 @@ export interface TaskSources {
    * say so: the host writes a binding only for a named agent or a fork.
    */
   inheritedModelId?: string | null;
+  /**
+   * Whether the conversation has more than one workspace, which is when a shell
+   * row names the workspace its command ran in.
+   */
+  multipleWorkspaces?: boolean;
   /** Clock for the elapsed column, so a render stays a pure function. */
   now?: number;
 }
@@ -782,6 +812,7 @@ export function deriveTaskItems(
     planDrafting = false,
     forkDecisions = [],
     inheritedModelId = null,
+    multipleWorkspaces = false,
     now = Date.now()
   } = sources;
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
@@ -817,7 +848,7 @@ export function deriveTaskItems(
   });
 
   shellTasks.forEach((shell) => {
-    items.push(shellItem(shell, messages, now));
+    items.push(shellItem(shell, messages, now, multipleWorkspaces));
   });
 
   previewServers.forEach((server) => {
@@ -895,6 +926,15 @@ export function finishedTaskItems(items: TaskItem[]): TaskItem[] {
 
 export function runningTaskItems(items: TaskItem[]): TaskItem[] {
   return items.filter((item) => item.state === "running" || item.kind === "plan");
+}
+
+/**
+ * How many rows of the running list are work still going on. The plan is left
+ * out: it sits in that list at every status, and it is a document, not a
+ * process — "drafting" is the model's round, which is already on screen.
+ */
+export function countRunningTasks(items: TaskItem[]): number {
+  return items.filter((item) => item.state === "running" && item.kind !== "plan").length;
 }
 
 /** Every row of the tree, parents before their own children. */

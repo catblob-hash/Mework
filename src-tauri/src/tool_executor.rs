@@ -2239,6 +2239,22 @@ impl ShellChild {
         }
     }
 
+    /// How long an ended process ran, as the machine that ran it measured it: the agent reports
+    /// that with the exit. `None` for a child of this host, whose span the registry measures
+    /// itself, for a process still running, and for a remote kill whose exit never arrived.
+    pub(crate) fn measured_runtime(&self) -> Option<Duration> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote { child, .. } => child
+                .process
+                .try_wait()
+                .ok()
+                .flatten()
+                .and_then(|exit| exit.runtime_ms)
+                .map(Duration::from_millis),
+        }
+    }
+
     pub(crate) fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
         match self {
             Self::Local(child) => ChildExt::wait_timeout(child, timeout),
@@ -2270,6 +2286,7 @@ impl ShellChild {
                             signal: Some(9),
                             reason: remote_agent::protocol::ExitReason::Signalled,
                             ends: Default::default(),
+                            runtime_ms: None,
                         },
                     )),
                 }
@@ -3342,7 +3359,13 @@ fn run_shell(
     let mut guard =
         match state
             .shell_tasks
-            .try_register(conversation_id, kind.tool_name(), &command, false)
+            .try_register(
+                conversation_id,
+                kind.tool_name(),
+                &command,
+                false,
+                Some(&workspace.root),
+            )
         {
             Ok(guard) => guard,
             Err(error) => {
@@ -3567,6 +3590,8 @@ pub(crate) struct ShellProcessResult {
     pub success: bool,
     pub exit_code: Option<i32>,
     pub output: String,
+    /// See [`ShellChild::measured_runtime`].
+    pub runtime: Option<Duration>,
 }
 
 /// What happened when a timed-out run was offered to the task surface.
@@ -3761,6 +3786,10 @@ impl ShellRun {
             },
             status.code(),
         );
+        let runtime = self.child.measured_runtime();
+        if let Some(runtime) = runtime {
+            guard.measured_runtime(runtime);
+        }
         // Joined after the tree is down, never before: these threads end when the last copy of the
         // write handle closes, and a surviving grandchild holds one. That is why the kill has to
         // cover the whole tree — otherwise the command is "stopped" and this still blocks.
@@ -3785,6 +3814,7 @@ impl ShellRun {
             success: status.success() && completion == ShellCompletion::Exited,
             exit_code: status.code(),
             output,
+            runtime,
         }))
     }
 }
@@ -4749,7 +4779,9 @@ mod tests {
             "wrote {bytes} bytes to {path}".to_owned(),
         );
         overrides.insert(PromptKey::ToolEditDone, "edited {path}".to_owned());
-        let profile = PromptProfile::builtin_with_overrides(
+        let profile = PromptProfile::from_file(
+            "test".into(),
+            "Test".into(),
             crate::model::ResolvedLanguage::EnUs,
             overrides,
             Vec::new(),

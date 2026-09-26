@@ -60,6 +60,19 @@ export function resolveApplicationLanguage(
     : "en-US";
 }
 
+/**
+ * The system is set to Chinese for mainland China: `zh-CN`, or Chinese with
+ * no region and not Traditional (`zh`, `zh-Hans`). Taiwan, Hong Kong, Macao
+ * and Singapore settings are not.
+ */
+export function isMainlandChinaLocale(systemLocale: string = browserLanguage()): boolean {
+  const [language, ...subtags] = systemLocale.trim().replaceAll("_", "-").toLowerCase().split("-");
+  if (!language || !chineseLanguageSubtags.has(language)) return false;
+  const region = subtags.find((subtag) => subtag.length === 2 || /^\d{3}$/.test(subtag));
+  if (region) return region === "cn";
+  return !subtags.includes("hant");
+}
+
 function emitIfChanged(next: I18nSnapshot): void {
   if (
     next.preference === snapshot.preference

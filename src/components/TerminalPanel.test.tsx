@@ -149,15 +149,18 @@ describe("TerminalPanel", () => {
     expect(terminalUiColors("day")).toEqual({
       background: "#e8e7e8",
       foreground: "#272227",
-      cursor: "#272227",
+      cursor: "#c98a1b",
+      cursorAccent: "#272227",
       selectionBackground: "#af957388",
     });
-    // The two chrome colours are `--color-e8e7e8`/`--color-272227` and match the
-    // palette's night block; the selection stays amber instead of turning blue.
+    // The chrome colours are `--color-e8e7e8`/`--color-272227` and the cursor is
+    // `--color-c98a1b`, matching the palette's night block; the selection stays amber
+    // instead of turning blue, and the glyph under the cursor stays dark on it.
     expect(terminalUiColors("night")).toEqual({
       background: "#181718",
       foreground: "#ddd8dd",
-      cursor: "#ddd8dd",
+      cursor: "#e4a536",
+      cursorAccent: "#181718",
       selectionBackground: "#8c725088",
     });
   });

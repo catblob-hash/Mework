@@ -99,6 +99,7 @@ key.txt
 # macOS only: the Chromium Embedded Framework distribution cef-dll-sys fetches when
 # the build scripts point CEF_PATH here (see scripts/cef-environment.mjs).
 /.cef/
+/.mlx/
 
 # Runtime databases and machine-local application state.
 /src-tauri/conversations.v1*.sqlite3*

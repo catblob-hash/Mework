@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 use crate::{
-    model::{JsonObject, SecurityLevel, ToolExecutionRequest},
+    model::{JsonObject, ResolvedLanguage, SecurityLevel, ToolExecutionRequest},
     path_guard::{canonical_workspace, resolve_existing_with_scope, resolve_for_write_with_scope},
 };
 
@@ -26,11 +26,40 @@ pub enum RiskLevel {
 }
 
 impl RiskLevel {
-    pub fn label_zh(self) -> &'static str {
-        match self {
-            Self::Low => "低",
-            Self::Medium => "中",
-            Self::High => "高",
+    /// How an approval card names this level.
+    pub fn label(self, language: ResolvedLanguage) -> &'static str {
+        match (language, self) {
+            (ResolvedLanguage::ZhCn, Self::Low) => "低",
+            (ResolvedLanguage::ZhCn, Self::Medium) => "中",
+            (ResolvedLanguage::ZhCn, Self::High) => "高",
+            (ResolvedLanguage::EnUs, Self::Low) => "Low",
+            (ResolvedLanguage::EnUs, Self::Medium) => "Medium",
+            (ResolvedLanguage::EnUs, Self::High) => "High",
+        }
+    }
+}
+
+/// Why a call was classified as it was, in both app languages. It is decided
+/// before anything knows which language the approval card will be drawn in,
+/// and the user can switch languages while a run is live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reason {
+    zh: String,
+    en: String,
+}
+
+impl Reason {
+    pub fn new(zh: impl Into<String>, en: impl Into<String>) -> Self {
+        Self {
+            zh: zh.into(),
+            en: en.into(),
+        }
+    }
+
+    pub fn text(&self, language: ResolvedLanguage) -> &str {
+        match language {
+            ResolvedLanguage::ZhCn => &self.zh,
+            ResolvedLanguage::EnUs => &self.en,
         }
     }
 }
@@ -49,7 +78,7 @@ pub struct SecurityDecision {
     pub mandatory_prompt: bool,
     pub risk_level: RiskLevel,
     pub rule_id: &'static str,
-    pub reason: String,
+    pub reason: Reason,
     pub scope: ExecutionScope,
     pub effect: OperationEffect,
     pub target: Option<PathBuf>,
@@ -580,7 +609,10 @@ pub fn classify_model_call(
             },
             target: None,
             rule_id: "workflow.orchestrated_fan_out",
-            reason: "工作流将并发派生多个子代理执行计划，需要一次明确授权".into(),
+            reason: Reason::new(
+                "工作流将并发派生多个子代理执行计划，需要一次明确授权",
+                "The workflow will spawn several subagents at once to carry out its plan, so it needs one explicit authorization",
+            ),
         }),
         "workflow_step" => {
             return Err("workflow_step is synthetic workflow-internal context and cannot be called as a model tool".into())
@@ -599,7 +631,10 @@ pub fn classify_model_call(
                 mandatory_prompt: false,
                 risk_level: RiskLevel::High,
                 rule_id: "browser.image_upload",
-                reason: "Will send the conversation image attachment to the current web page".into(),
+                reason: Reason::new(
+                    "会把对话中的图片附件发送给当前网页",
+                    "Will send the conversation image attachment to the current web page",
+                ),
                 scope: ExecutionScope::Unrestricted,
                 effect: OperationEffect::Unbounded,
                 target: None,
@@ -622,7 +657,10 @@ pub fn classify_model_call(
         | "exit_plan_mode" => Some(internal_decision(
             RiskLevel::Low,
             "host.read_or_coordinate",
-            "只读取本轮宿主状态、等待结果或在同一对话内协调，不触碰文件、Shell 或外部网络",
+            Reason::new(
+                "只读取本轮宿主状态、等待结果或在同一对话内协调，不触碰文件、Shell 或外部网络",
+                "Only reads this turn's host state, waits for results, or coordinates within this conversation; touches no files, shell, or external network",
+            ),
         )),
         // The plan document lives in the conversation store, not on disk, so
         // writing it is a host state change even while plan mode refuses every
@@ -634,13 +672,19 @@ pub fn classify_model_call(
                 internal_decision(
                     RiskLevel::Low,
                     "host.read_or_coordinate",
-                    "只读取本轮宿主状态，不触碰文件、Shell 或外部网络",
+                    Reason::new(
+                        "只读取本轮宿主状态，不触碰文件、Shell 或外部网络",
+                        "Only reads this turn's host state; touches no files, shell, or external network",
+                    ),
                 )
             } else {
                 internal_decision(
                     RiskLevel::Medium,
                     "host.local_state_change",
-                    "会修改当前对话的宿主状态，但不直接触碰文件、Shell 或外部网络",
+                    Reason::new(
+                        "会修改当前对话的宿主状态，但不直接触碰文件、Shell 或外部网络",
+                        "Changes this conversation's host state, but touches no files, shell, or external network directly",
+                    ),
                 )
             })
         }
@@ -654,7 +698,10 @@ pub fn classify_model_call(
             mandatory_prompt: true,
             risk_level: RiskLevel::High,
             rule_id: "memory.global_persistent_mutation",
-            reason: "会修改所有项目都会自动加载的全局持久记忆，必须由用户直接确认".into(),
+            reason: Reason::new(
+                "会修改所有项目都会自动加载的全局持久记忆，必须由用户直接确认",
+                "Changes the global persistent memory every project loads automatically, so the user must confirm it directly",
+            ),
             scope: ExecutionScope::Unrestricted,
             effect: OperationEffect::Write,
             target: None,
@@ -662,12 +709,18 @@ pub fn classify_model_call(
         "create_project_memory" | "edit_project_memory" => Some(internal_decision(
             RiskLevel::Medium,
             "host.local_state_change",
-            "会修改当前项目的持久记忆，但不直接触碰文件、Shell 或外部网络",
+            Reason::new(
+                "会修改当前项目的持久记忆，但不直接触碰文件、Shell 或外部网络",
+                "Changes this project's persistent memory, but touches no files, shell, or external network directly",
+            ),
         )),
         "followup_task" => Some(internal_decision(
             RiskLevel::Medium,
             "host.local_state_change",
-            "会修改当前对话的宿主状态，但不直接触碰文件、Shell 或外部网络",
+            Reason::new(
+                "会修改当前对话的宿主状态，但不直接触碰文件、Shell 或外部网络",
+                "Changes this conversation's host state, but touches no files, shell, or external network directly",
+            ),
         )),
         // One tool, four actions: `todo` merged its per-operation catalog
         // entries, so the read/write split can no longer be read off the tool
@@ -681,13 +734,19 @@ pub fn classify_model_call(
                 internal_decision(
                     RiskLevel::Low,
                     "host.read_or_coordinate",
-                    "只读取本轮宿主状态，不触碰文件、Shell 或外部网络",
+                    Reason::new(
+                        "只读取本轮宿主状态，不触碰文件、Shell 或外部网络",
+                        "Only reads this turn's host state; touches no files, shell, or external network",
+                    ),
                 )
             } else {
                 internal_decision(
                     RiskLevel::Medium,
                     "host.local_state_change",
-                    "会修改当前对话的宿主状态，但不直接触碰文件、Shell 或外部网络",
+                    Reason::new(
+                        "会修改当前对话的宿主状态，但不直接触碰文件、Shell 或外部网络",
+                        "Changes this conversation's host state, but touches no files, shell, or external network directly",
+                    ),
                 )
             })
         }
@@ -703,7 +762,10 @@ pub fn classify_model_call(
             mandatory_prompt: false,
             risk_level: RiskLevel::Medium,
             rule_id: "agent.delegation",
-            reason: "会派生子代理；子代理的每个后续工具调用仍继承本对话的安全策略".into(),
+            reason: Reason::new(
+                "会派生子代理；子代理的每个后续工具调用仍继承本对话的安全策略",
+                "Spawns a subagent; every tool call it makes still inherits this conversation's security policy",
+            ),
             scope: ExecutionScope::Unrestricted,
             effect: OperationEffect::Write,
             target: None,
@@ -713,7 +775,10 @@ pub fn classify_model_call(
         "subagent_update" => Some(internal_decision(
             RiskLevel::Medium,
             "host.local_state_change",
-            "会向父代理报告子代理状态",
+            Reason::new(
+                "会向父代理报告子代理状态",
+                "Reports the subagent's status to its parent",
+            ),
         )),
         _ => None,
     };
@@ -738,9 +803,10 @@ fn classify_web_network(
                 mandatory_prompt: false,
                 risk_level: RiskLevel::High,
                 rule_id: "web.search",
-                reason:
-                    "联网搜索会把这句查询发给对话选定的搜索后端，并把它返回的不可信网页内容送入上下文"
-                        .into(),
+                reason: Reason::new(
+                    "联网搜索会把这句查询发给对话选定的搜索后端，并把它返回的不可信网页内容送入上下文",
+                    "Web search sends this query to the conversation's search backend and brings the untrusted web content it returns into context",
+                ),
                 scope: ExecutionScope::Unrestricted,
                 effect: OperationEffect::Unbounded,
                 target: None,
@@ -773,7 +839,10 @@ fn classify_web_network(
                 mandatory_prompt: false,
                 risk_level: RiskLevel::High,
                 rule_id: "web.fetch",
-                reason: "网页抓取会由宿主取回这些地址的正文，并把不可信网页内容送入上下文".into(),
+                reason: Reason::new(
+                    "网页抓取会由宿主取回这些地址的正文，并把不可信网页内容送入上下文",
+                    "Web fetch has the host retrieve the content at these URLs and brings that untrusted web content into context",
+                ),
                 scope: ExecutionScope::Unrestricted,
                 effect: OperationEffect::Unbounded,
                 target: None,
@@ -786,14 +855,14 @@ fn classify_web_network(
 fn internal_decision(
     risk_level: RiskLevel,
     rule_id: &'static str,
-    reason: &str,
+    reason: Reason,
 ) -> SecurityDecision {
     SecurityDecision {
         requires_approval: false,
         mandatory_prompt: false,
         risk_level,
         rule_id,
-        reason: reason.into(),
+        reason,
         scope: ExecutionScope::Unrestricted,
         effect: if risk_level == RiskLevel::Low {
             OperationEffect::Read
@@ -818,7 +887,10 @@ fn classify_browser_local(
         mandatory_prompt: false,
         risk_level: RiskLevel::Low,
         rule_id: "browser.local_observation",
-        reason: "只读取或调整本机内置浏览器，不直接产生外部页面操作".into(),
+        reason: Reason::new(
+            "只读取或调整本机内置浏览器，不直接产生外部页面操作",
+            "Only reads or adjusts the local built-in browser; takes no direct action on external pages",
+        ),
         scope: ExecutionScope::restricted(roots).denying([app_data.join("memory")]),
         effect: OperationEffect::Read,
         target: None,
@@ -830,42 +902,42 @@ struct ShellAssessment {
     effect: OperationEffect,
     risk_level: RiskLevel,
     rule_id: &'static str,
-    reason: String,
+    reason: Reason,
     mandatory_prompt: bool,
 }
 
 impl ShellAssessment {
-    fn read(rule_id: &'static str, reason: impl Into<String>) -> Self {
+    fn read(rule_id: &'static str, reason: Reason) -> Self {
         Self {
             effect: OperationEffect::Read,
             risk_level: RiskLevel::Low,
             rule_id,
-            reason: reason.into(),
+            reason,
             mandatory_prompt: false,
         }
     }
 
-    fn workspace_write(rule_id: &'static str, reason: impl Into<String>) -> Self {
+    fn workspace_write(rule_id: &'static str, reason: Reason) -> Self {
         Self {
             effect: OperationEffect::Write,
             risk_level: RiskLevel::Medium,
             rule_id,
-            reason: reason.into(),
+            reason,
             mandatory_prompt: false,
         }
     }
 
-    fn unbounded(rule_id: &'static str, reason: impl Into<String>) -> Self {
+    fn unbounded(rule_id: &'static str, reason: Reason) -> Self {
         Self {
             effect: OperationEffect::Unbounded,
             risk_level: RiskLevel::High,
             rule_id,
-            reason: reason.into(),
+            reason,
             mandatory_prompt: false,
         }
     }
 
-    fn circuit_breaker(rule_id: &'static str, reason: impl Into<String>) -> Self {
+    fn circuit_breaker(rule_id: &'static str, reason: Reason) -> Self {
         Self {
             mandatory_prompt: true,
             ..Self::unbounded(rule_id, reason)
@@ -889,7 +961,7 @@ fn classify_shell(
     let assessment = if command.chars().count() > MAX_SHELL_ANALYSIS_CHARS {
         ShellAssessment::unbounded(
             "shell.analysis_limit",
-            format!("命令超过静态分析上限 {MAX_SHELL_ANALYSIS_CHARS} 字符，无法证明为只读操作"),
+            Reason::new(format!("命令超过静态分析上限 {MAX_SHELL_ANALYSIS_CHARS} 字符，无法证明为只读操作"), format!("The command is longer than the {MAX_SHELL_ANALYSIS_CHARS}-character static analysis limit, so it cannot be proven read-only")),
         )
     } else {
         analyze_shell(kind, command, &workspace, &roots)
@@ -921,51 +993,57 @@ fn analyze_shell(
     if has_network_path(command) {
         return ShellAssessment::unbounded(
             "shell.network_path",
-            "命令包含 UNC 或网络路径，访问时可能向远端主机发送 Windows 凭据",
+            Reason::new("命令包含 UNC 或网络路径，访问时可能向远端主机发送 Windows 凭据", "The command contains a UNC or network path; reaching it may send Windows credentials to a remote host"),
         );
     }
     if has_background_or_call_operator(kind, command) {
         return ShellAssessment::unbounded(
             "shell.background_or_call_operator",
-            "命令包含后台执行或 PowerShell 调用运算符，后续载荷与完成状态无法可靠复核",
+            Reason::new("命令包含后台执行或 PowerShell 调用运算符，后续载荷与完成状态无法可靠复核", "The command contains a background or PowerShell call operator, so what it runs next and whether it finishes cannot be reliably checked"),
         );
     }
     if has_dynamic_shell_expansion(kind, command) {
         if looks_like_recursive_delete(kind, command) {
             return ShellAssessment::circuit_breaker(
                 "shell.unverifiable_recursive_delete",
-                "递归删除目标包含变量、命令替换或动态表达式，静态分类器无法验证最终路径",
+                Reason::new("递归删除目标包含变量、命令替换或动态表达式，静态分类器无法验证最终路径", "The recursive delete target contains a variable, command substitution, or dynamic expression, so the static classifier cannot verify the final path"),
             );
         }
         return ShellAssessment::unbounded(
             "shell.dynamic_expansion",
-            "命令包含命令替换、进程替换、动态调用或表达式执行，静态分类器无法验证实际载荷",
+            Reason::new("命令包含命令替换、进程替换、动态调用或表达式执行，静态分类器无法验证实际载荷", "The command contains command substitution, process substitution, dynamic invocation, or expression evaluation, so the static classifier cannot verify what actually runs"),
         );
     }
     if kind == ShellKind::PowerShell && has_powershell_non_filesystem_provider(command) {
         return ShellAssessment::unbounded(
             "powershell.non_filesystem_provider",
-            "PowerShell 命令引用注册表、证书、环境变量或其他非文件系统 Provider",
+            Reason::new("PowerShell 命令引用注册表、证书、环境变量或其他非文件系统 Provider", "The PowerShell command refers to the registry, certificates, environment variables, or another non-filesystem provider"),
         );
     }
     if looks_like_critical_delete(kind, command) {
         return ShellAssessment::circuit_breaker(
             "shell.critical_delete",
-            "删除操作可能递归作用于文件系统根目录、用户主目录或其他关键系统路径",
+            Reason::new("删除操作可能递归作用于文件系统根目录、用户主目录或其他关键系统路径", "The delete may act recursively on the filesystem root, the home directory, or another critical system path"),
         );
     }
 
     let segments = match split_shell_segments(kind, command) {
         Ok(segments) if !segments.is_empty() => segments,
         Ok(_) => {
-            return ShellAssessment::unbounded("shell.empty_analysis", "命令没有可静态分析的子命令")
+            return ShellAssessment::unbounded(
+                "shell.empty_analysis",
+                Reason::new(
+                    "命令没有可静态分析的子命令",
+                    "The command has no subcommand that can be statically analyzed",
+                ),
+            )
         }
         Err(reason) => return ShellAssessment::unbounded("shell.parse_failed", reason),
     };
 
     let mut combined = ShellAssessment::read(
         "shell.read_only",
-        "所有子命令都属于内置只读集合，且未发现越界路径或写入型参数",
+        Reason::new("所有子命令都属于内置只读集合，且未发现越界路径或写入型参数", "Every subcommand is in the built-in read-only set, with no out-of-bounds paths or write arguments"),
     );
     for segment in segments {
         let next = analyze_shell_segment(kind, &segment, workspace, roots);
@@ -1001,19 +1079,30 @@ fn analyze_shell_segment(
     if contains_unsafe_redirection(kind, segment) {
         return ShellAssessment::unbounded(
             "shell.redirection",
-            "子命令包含输出重定向或无法静态解析的输入重定向",
+            Reason::new("子命令包含输出重定向或无法静态解析的输入重定向", "A subcommand contains output redirection, or input redirection that cannot be statically resolved"),
         );
     }
     let mut tokens = match tokenize_shell_segment(kind, segment) {
         Ok(tokens) if !tokens.is_empty() => tokens,
-        Ok(_) => return ShellAssessment::read("shell.comment", "子命令只包含注释或空白"),
+        Ok(_) => {
+            return ShellAssessment::read(
+                "shell.comment",
+                Reason::new(
+                    "子命令只包含注释或空白",
+                    "The subcommand contains only comments or whitespace",
+                ),
+            )
+        }
         Err(reason) => return ShellAssessment::unbounded("shell.tokenize_failed", reason),
     };
     strip_safe_environment_assignments(&mut tokens);
     if tokens.is_empty() {
         return ShellAssessment::read(
             "shell.environment_assignment",
-            "只设置了当前子进程的环境变量",
+            Reason::new(
+                "只设置了当前子进程的环境变量",
+                "Only sets environment variables for the child process",
+            ),
         );
     }
     if let Err(reason) = strip_process_wrappers(kind, &mut tokens) {
@@ -1022,7 +1111,10 @@ fn analyze_shell_segment(
     if tokens.is_empty() {
         return ShellAssessment::unbounded(
             "shell.wrapper_missing_command",
-            "进程包装器后没有可分析的实际命令",
+            Reason::new(
+                "进程包装器后没有可分析的实际命令",
+                "No command to analyze follows the process wrapper",
+            ),
         );
     }
 
@@ -1036,20 +1128,25 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
     if tokens[0].contains('/') || tokens[0].contains('\\') {
         return ShellAssessment::unbounded(
             "shell.explicit_executable_path",
-            "命令通过显式路径选择可执行文件，不能仅凭文件名白名单证明其实现安全",
+            Reason::new("命令通过显式路径选择可执行文件，不能仅凭文件名白名单证明其实现安全", "The command picks its executable by explicit path, so a file-name allowlist cannot prove it safe"),
         );
     }
     let command = command_basename(&tokens[0]).to_ascii_lowercase();
     if command == "xargs" {
         return ShellAssessment::unbounded(
             "shell.xargs_data_dependent_command",
-            "xargs 会把运行时输入拼接为新的命令或参数，静态分类器无法看到最终载荷",
+            Reason::new("xargs 会把运行时输入拼接为新的命令或参数，静态分类器无法看到最终载荷", "xargs builds new commands or arguments from runtime input, so the static classifier cannot see what finally runs"),
         );
     }
     if matches!(command.as_str(), "watch" | "setsid" | "ionice" | "flock") {
         return ShellAssessment::unbounded(
             "shell.exec_wrapper",
-            format!("{command} 可以反复、异步或带锁执行任意子命令"),
+            Reason::new(
+                format!("{command} 可以反复、异步或带锁执行任意子命令"),
+                format!(
+                    "{command} can run any subcommand repeatedly, asynchronously, or under a lock"
+                ),
+            ),
         );
     }
     if command == "git" {
@@ -1076,7 +1173,10 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
     {
         return ShellAssessment::unbounded(
             "shell.find_side_effect",
-            "find 使用了可执行、删除或写文件的参数",
+            Reason::new(
+                "find 使用了可执行、删除或写文件的参数",
+                "find uses arguments that execute, delete, or write files",
+            ),
         );
     }
     if matches!(command.as_str(), "find" | "wc" | "du")
@@ -1088,7 +1188,7 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
     {
         return ShellAssessment::unbounded(
             "shell.runtime_path_list",
-            format!("{command} 会在运行时从文件或标准输入读取额外路径，静态参数中看不到最终目标"),
+            Reason::new(format!("{command} 会在运行时从文件或标准输入读取额外路径，静态参数中看不到最终目标"), format!("{command} reads more paths from a file or standard input at run time, so its final targets are not in its arguments")),
         );
     }
     if matches!(command.as_str(), "find" | "file")
@@ -1099,7 +1199,7 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
     {
         return ShellAssessment::unbounded(
             "shell.flag_glob",
-            format!("{command} 的未解析 glob 可能在展开后变成写入或执行型参数"),
+            Reason::new(format!("{command} 的未解析 glob 可能在展开后变成写入或执行型参数"), format!("An unexpanded glob in {command} may expand into an argument that writes or executes")),
         );
     }
     if command == "file"
@@ -1116,7 +1216,10 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
     {
         return ShellAssessment::unbounded(
             "shell.file_external_input",
-            "file 使用了会额外打开参数文件的选项",
+            Reason::new(
+                "file 使用了会额外打开参数文件的选项",
+                "file uses an option that opens an extra file named by its value",
+            ),
         );
     }
     if matches!(command.as_str(), "grep" | "egrep" | "fgrep" | "rg")
@@ -1127,7 +1230,7 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
     {
         return ShellAssessment::unbounded(
             "shell.pattern_file_argument",
-            format!("{command} 把额外文件路径藏在选项值中，保守策略要求逐次批准"),
+            Reason::new(format!("{command} 把额外文件路径藏在选项值中，保守策略要求逐次批准"), format!("{command} takes an extra file path inside an option value, so the conservative policy asks every time")),
         );
     }
     if command == "rg"
@@ -1140,14 +1243,17 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
     {
         return ShellAssessment::unbounded(
             "shell.ripgrep_external_command",
-            "ripgrep 参数会启动外部预处理或辅助命令",
+            Reason::new(
+                "ripgrep 参数会启动外部预处理或辅助命令",
+                "The ripgrep arguments start an external preprocessor or helper command",
+            ),
         );
     }
     if is_bash_read_only_command(&command) {
         if !is_bash_builtin_read_command(&command) && shell_search_path_is_suspicious() {
             return ShellAssessment::unbounded(
                 "shell.suspicious_search_path",
-                "进程 PATH 含相对或空目录，白名单命令名可能解析到工作区中的替代程序",
+                Reason::new("进程 PATH 含相对或空目录，白名单命令名可能解析到工作区中的替代程序", "The process PATH has a relative or empty entry, so an allowlisted command name may resolve to a substitute in the workspace"),
             );
         }
         if bash_read_command_follows_paths(&command)
@@ -1158,28 +1264,37 @@ fn analyze_bash_tokens(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -
         {
             return ShellAssessment::unbounded(
                 "shell.dynamic_read_path",
-                format!("{command} 的 glob、brace 或 home 展开可能越过可信目录"),
+                Reason::new(format!("{command} 的 glob、brace 或 home 展开可能越过可信目录"), format!("A glob, brace, or home expansion in {command} may reach beyond the trusted directories")),
             );
         }
         if contains_explicit_outside_path(tokens, workspace, roots) {
             return ShellAssessment::unbounded(
                 "shell.read_outside_trusted_roots",
-                "只读命令显式引用了工作区和应用数据目录之外的路径",
+                Reason::new("只读命令显式引用了工作区和应用数据目录之外的路径", "The read-only command names a path outside the workspace and the app data directory"),
             );
         }
-        return ShellAssessment::read("shell.read_only", format!("{command} 属于内置只读命令集合"));
+        return ShellAssessment::read(
+            "shell.read_only",
+            Reason::new(
+                format!("{command} 属于内置只读命令集合"),
+                format!("{command} is in the built-in read-only command set"),
+            ),
+        );
     }
     if is_bash_workspace_mutation(&command)
         && bash_mutation_is_bounded(&command, tokens, workspace, roots)
     {
         return ShellAssessment::workspace_write(
             "shell.workspace_file_edit",
-            format!("{command} 只修改工作区或应用数据目录内的显式路径"),
+            Reason::new(format!("{command} 只修改工作区或应用数据目录内的显式路径"), format!("{command} only changes explicit paths inside the workspace or the app data directory")),
         );
     }
     ShellAssessment::unbounded(
         "shell.unclassified_command",
-        format!("无法证明 {command} 只读或仅修改可信目录"),
+        Reason::new(
+            format!("无法证明 {command} 只读或仅修改可信目录"),
+            format!("{command} cannot be proven read-only or limited to trusted directories"),
+        ),
     )
 }
 
@@ -1191,7 +1306,7 @@ fn analyze_powershell_tokens(
     if tokens[0].contains('/') || tokens[0].contains('\\') {
         return ShellAssessment::unbounded(
             "powershell.explicit_executable_path",
-            "命令通过路径或模块限定名选择实现，不能仅凭 cmdlet 名称白名单证明其安全",
+            Reason::new("命令通过路径或模块限定名选择实现，不能仅凭 cmdlet 名称白名单证明其安全", "The command picks its implementation by path or module-qualified name, so a cmdlet-name allowlist cannot prove it safe"),
         );
     }
     let command = canonical_powershell_command(&tokens[0]);
@@ -1202,7 +1317,7 @@ fn analyze_powershell_tokens(
         {
             return ShellAssessment::unbounded(
                 "powershell.script_block",
-                "PowerShell 子命令包含脚本块，可能执行任意副作用",
+                Reason::new("PowerShell 子命令包含脚本块，可能执行任意副作用", "The PowerShell subcommand contains a script block, which may have any side effect"),
             );
         }
         if tokens
@@ -1212,18 +1327,21 @@ fn analyze_powershell_tokens(
         {
             return ShellAssessment::unbounded(
                 "powershell.dynamic_read_path",
-                "PowerShell 只读命令包含通配符或 home 展开，可能跟随链接或 Provider 越过可信目录",
+                Reason::new("PowerShell 只读命令包含通配符或 home 展开，可能跟随链接或 Provider 越过可信目录", "The read-only PowerShell command contains a wildcard or home expansion, which may follow links or providers beyond the trusted directories"),
             );
         }
         if contains_explicit_outside_path(tokens, workspace, roots) {
             return ShellAssessment::unbounded(
                 "powershell.read_outside_trusted_roots",
-                "只读 cmdlet 显式引用了工作区和应用数据目录之外的路径",
+                Reason::new("只读 cmdlet 显式引用了工作区和应用数据目录之外的路径", "The read-only cmdlet names a path outside the workspace and the app data directory"),
             );
         }
         return ShellAssessment::read(
             "powershell.read_only",
-            format!("{command} 属于内置只读 cmdlet 集合"),
+            Reason::new(
+                format!("{command} 属于内置只读 cmdlet 集合"),
+                format!("{command} is in the built-in read-only cmdlet set"),
+            ),
         );
     }
     let workspace_write_roots = [workspace.to_path_buf()];
@@ -1232,12 +1350,15 @@ fn analyze_powershell_tokens(
     {
         return ShellAssessment::workspace_write(
             "powershell.workspace_file_edit",
-            format!("{command} 只修改工作区或应用数据目录内的显式路径"),
+            Reason::new(format!("{command} 只修改工作区或应用数据目录内的显式路径"), format!("{command} only changes explicit paths inside the workspace or the app data directory")),
         );
     }
     ShellAssessment::unbounded(
         "powershell.unclassified_command",
-        format!("无法证明 {command} 只读或仅修改可信目录"),
+        Reason::new(
+            format!("无法证明 {command} 只读或仅修改可信目录"),
+            format!("{command} cannot be proven read-only or limited to trusted directories"),
+        ),
     )
 }
 
@@ -1271,7 +1392,7 @@ fn analyze_git(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -> ShellA
     }) {
         return ShellAssessment::unbounded(
             "git.unverifiable_options",
-            "Git 命令包含可改换仓库、执行外部程序、写入输出或在展开后改变参数语义的选项",
+            Reason::new("Git 命令包含可改换仓库、执行外部程序、写入输出或在展开后改变参数语义的选项", "The Git command has options that can switch repositories, run external programs, write output, or change meaning once expanded"),
         );
     }
     let Some((subcommand_index, subcommand)) = tokens
@@ -1281,7 +1402,10 @@ fn analyze_git(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -> ShellA
         .find(|(_, token)| !token.starts_with('-'))
         .map(|(index, token)| (index, token.to_ascii_lowercase()))
     else {
-        return ShellAssessment::unbounded("git.missing_subcommand", "git 缺少可分析的子命令");
+        return ShellAssessment::unbounded(
+            "git.missing_subcommand",
+            Reason::new("git 缺少可分析的子命令", "git has no subcommand to analyze"),
+        );
     };
     let subargs = &tokens[subcommand_index + 1..];
     let read_only = match subcommand.as_str() {
@@ -1394,18 +1518,26 @@ fn analyze_git(tokens: &[String], workspace: &Path, roots: &[PathBuf]) -> ShellA
     if !read_only {
         return ShellAssessment::unbounded(
             "git.state_change",
-            format!("git {subcommand} 可能修改工作树、本地历史或远端状态"),
+            Reason::new(
+                format!("git {subcommand} 可能修改工作树、本地历史或远端状态"),
+                format!(
+                    "git {subcommand} may change the working tree, local history, or remote state"
+                ),
+            ),
         );
     }
     if contains_explicit_outside_path(tokens, workspace, roots) {
         return ShellAssessment::unbounded(
             "git.outside_trusted_roots",
-            "Git 只读命令显式引用了可信目录之外的路径或仓库",
+            Reason::new("Git 只读命令显式引用了可信目录之外的路径或仓库", "The read-only Git command names a path or repository outside the trusted directories"),
         );
     }
     ShellAssessment::read(
         "git.read_only",
-        format!("git {subcommand} 属于只读 Git 操作"),
+        Reason::new(
+            format!("git {subcommand} 属于只读 Git 操作"),
+            format!("git {subcommand} is a read-only Git operation"),
+        ),
     )
 }
 
@@ -1413,17 +1545,20 @@ fn analyze_cd(target: Option<&str>, workspace: &Path, roots: &[PathBuf]) -> Shel
     let Some(target) = target else {
         return ShellAssessment::unbounded(
             "shell.cd_home",
-            "未指定目标的 cd 会进入用户主目录，超出可信工作区",
+            Reason::new(
+                "未指定目标的 cd 会进入用户主目录，超出可信工作区",
+                "cd without a target goes to the home directory, outside the trusted workspace",
+            ),
         );
     };
     let scope = ExecutionScope::restricted(roots.to_vec());
     match resolve_existing_with_scope(workspace, target, &scope) {
         Ok(path) if path.is_dir() => {
-            ShellAssessment::read("shell.cd_trusted", "cd 目标位于可信目录内")
+            ShellAssessment::read("shell.cd_trusted", Reason::new("cd 目标位于可信目录内", "The cd target is inside a trusted directory"))
         }
         _ => ShellAssessment::unbounded(
             "shell.cd_outside_trusted_roots",
-            "cd 目标无法证明位于工作区或应用数据目录内",
+            Reason::new("cd 目标无法证明位于工作区或应用数据目录内", "The cd target cannot be proven to be inside the workspace or the app data directory"),
         ),
     }
 }
@@ -1921,7 +2056,7 @@ fn strip_safe_environment_assignments(tokens: &mut Vec<String>) {
     }
 }
 
-fn strip_process_wrappers(kind: ShellKind, tokens: &mut Vec<String>) -> Result<(), String> {
+fn strip_process_wrappers(kind: ShellKind, tokens: &mut Vec<String>) -> Result<(), Reason> {
     if kind == ShellKind::PowerShell {
         return Ok(());
     }
@@ -1954,7 +2089,10 @@ fn strip_process_wrappers(kind: ShellKind, tokens: &mut Vec<String>) -> Result<(
                     }
                 }
                 if tokens.is_empty() {
-                    return Err("timeout is missing a duration and command".into());
+                    return Err(Reason::new(
+                        "timeout 缺少时长和命令",
+                        "timeout is missing a duration and command",
+                    ));
                 }
                 tokens.remove(0);
             }
@@ -1969,7 +2107,7 @@ fn strip_process_wrappers(kind: ShellKind, tokens: &mut Vec<String>) -> Result<(
     }
 }
 
-fn split_shell_segments(kind: ShellKind, command: &str) -> Result<Vec<String>, String> {
+fn split_shell_segments(kind: ShellKind, command: &str) -> Result<Vec<String>, Reason> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -2024,7 +2162,10 @@ fn split_shell_segments(kind: ShellKind, command: &str) -> Result<Vec<String>, S
             }
             ')' | ']' | '}' => {
                 if depth == 0 {
-                    return Err("Command contains unmatched closing delimiters and cannot be statically parsed".into());
+                    return Err(Reason::new(
+                        "命令包含不配对的右括号或分隔符，无法静态解析",
+                        "Command contains unmatched closing delimiters and cannot be statically parsed",
+                    ));
                 }
                 depth -= 1;
                 current.push(character);
@@ -2044,7 +2185,10 @@ fn split_shell_segments(kind: ShellKind, command: &str) -> Result<Vec<String>, S
         index += 1;
     }
     if quote.is_some() || escaped || depth != 0 {
-        return Err("Command contains an unclosed quote, escape, or parenthesis and cannot be statically parsed".into());
+        return Err(Reason::new(
+            "命令包含未闭合的引号、转义或括号，无法静态解析",
+            "Command contains an unclosed quote, escape, or parenthesis and cannot be statically parsed",
+        ));
     }
     push_shell_segment(&mut segments, &mut current);
     Ok(segments)
@@ -2058,7 +2202,7 @@ fn push_shell_segment(segments: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
-fn tokenize_shell_segment(kind: ShellKind, segment: &str) -> Result<Vec<String>, String> {
+fn tokenize_shell_segment(kind: ShellKind, segment: &str) -> Result<Vec<String>, Reason> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -2104,7 +2248,10 @@ fn tokenize_shell_segment(kind: ShellKind, segment: &str) -> Result<Vec<String>,
         }
     }
     if quote.is_some() || escaped {
-        return Err("Subcommand contains an unclosed quote or escape".into());
+        return Err(Reason::new(
+            "子命令包含未闭合的引号或转义",
+            "Subcommand contains an unclosed quote or escape",
+        ));
     }
     if !current.is_empty() {
         tokens.push(current);
@@ -2270,7 +2417,10 @@ fn classify_unbounded(level: SecurityLevel) -> SecurityDecision {
             mandatory_prompt: false,
             risk_level: RiskLevel::High,
             rule_id: "tool.unbounded",
-            reason: "完全访问允许执行已验证的命令工具".into(),
+            reason: Reason::new(
+                "完全访问允许执行已验证的命令工具",
+                "Full access allows validated command tools",
+            ),
             scope: ExecutionScope::Unrestricted,
             effect: OperationEffect::Unbounded,
             target: None,
@@ -2284,7 +2434,10 @@ fn classify_unbounded(level: SecurityLevel) -> SecurityDecision {
                 mandatory_prompt: false,
                 risk_level: RiskLevel::High,
                 rule_id: "tool.unbounded",
-                reason: "命令执行无法可靠限制为可信目录内的只读或写入操作".into(),
+                reason: Reason::new(
+                    "命令执行无法可靠限制为可信目录内的只读或写入操作",
+                    "Command execution cannot be reliably limited to reads or writes inside trusted directories",
+                ),
                 scope: ExecutionScope::Unrestricted,
                 effect: OperationEffect::Unbounded,
                 target: None,
@@ -2294,20 +2447,30 @@ fn classify_unbounded(level: SecurityLevel) -> SecurityDecision {
 }
 
 fn classify_browser_sensitive(level: SecurityLevel, tool_name: &str) -> SecurityDecision {
-    let subject = match tool_name {
-        "preview_console_logs" => "console logs, which may contain tokens and error context",
-        "preview_network" => {
-            "network logs, which may contain complete URLs, query parameters, and response bodies"
-        }
-        "preview_screenshot" => "the pixels of the current page, whatever it is signed in to",
-        _ => "browser-sensitive data",
+    let (subject_zh, subject) = match tool_name {
+        "preview_console_logs" => (
+            "控制台日志，其中可能有令牌和错误上下文",
+            "console logs, which may contain tokens and error context",
+        ),
+        "preview_network" => (
+            "网络日志，其中可能有完整 URL、查询参数和响应正文",
+            "network logs, which may contain complete URLs, query parameters, and response bodies",
+        ),
+        "preview_screenshot" => (
+            "当前页面的像素，无论它登录了什么",
+            "the pixels of the current page, whatever it is signed in to",
+        ),
+        _ => ("浏览器敏感数据", "browser-sensitive data"),
     };
     SecurityDecision {
         requires_approval: level != SecurityLevel::FullAccess,
         mandatory_prompt: false,
         risk_level: RiskLevel::High,
         rule_id: "browser.sensitive_observation",
-        reason: format!("This tool will read {subject}"),
+        reason: Reason::new(
+            format!("这个工具会读取{subject_zh}"),
+            format!("This tool will read {subject}"),
+        ),
         scope: ExecutionScope::Unrestricted,
         effect: OperationEffect::Unbounded,
         target: None,
@@ -2334,7 +2497,10 @@ fn classify_filesystem(
                 OperationEffect::Unbounded => RiskLevel::High,
             },
             rule_id: "filesystem.full_access",
-            reason: "完全访问允许执行已验证的文件操作".into(),
+            reason: Reason::new(
+                "完全访问允许执行已验证的文件操作",
+                "Full access allows validated file operations",
+            ),
             scope: unrestricted,
             effect,
             target: Some(target),
@@ -2373,9 +2539,15 @@ fn classify_filesystem(
                 "filesystem.outside_trusted_roots"
             },
             reason: if outside_read_allowed {
-                "目标在工作区外；允许编辑模式放行工作区外读取".into()
+                Reason::new(
+                    "目标在工作区外；允许编辑模式放行工作区外读取",
+                    "The target is outside the workspace; Accept edits allows reads outside it",
+                )
             } else {
-                "目标位于工作区和应用数据目录之外".into()
+                Reason::new(
+                    "目标位于工作区和应用数据目录之外",
+                    "The target is outside the workspace and the app data directory",
+                )
             },
             scope,
             effect,
@@ -2388,7 +2560,10 @@ fn classify_filesystem(
             mandatory_prompt: false,
             risk_level: RiskLevel::High,
             rule_id: "filesystem.protected_app_data",
-            reason: "目标是应用控制数据，自动写入可能修改安全策略".into(),
+            reason: Reason::new(
+                "目标是应用控制数据，自动写入可能修改安全策略",
+                "The target is app control data; writing it automatically could change the security policy",
+            ),
             scope,
             effect,
             target: Some(target),
@@ -2404,7 +2579,10 @@ fn classify_filesystem(
                 mandatory_prompt: false,
                 risk_level: RiskLevel::Low,
                 rule_id: "filesystem.trusted_read",
-                reason: "只读目标位于工作区或应用数据目录内".into(),
+                reason: Reason::new(
+                    "只读目标位于工作区或应用数据目录内",
+                    "The read target is inside the workspace or the app data directory",
+                ),
                 scope,
                 effect,
                 target: Some(target),
@@ -2415,7 +2593,10 @@ fn classify_filesystem(
             mandatory_prompt: false,
             risk_level: RiskLevel::Medium,
             rule_id: "filesystem.trusted_write_manual",
-            reason: "请求批准模式要求确认所有写入操作".into(),
+            reason: Reason::new(
+                "请求批准模式要求确认所有写入操作",
+                "Manual mode asks before every write",
+            ),
             scope,
             effect,
             target: Some(target),
@@ -2430,7 +2611,10 @@ fn classify_filesystem(
                     OperationEffect::Unbounded => RiskLevel::High,
                 },
                 rule_id: "filesystem.trusted_allow_edits",
-                reason: "允许编辑模式允许可信目录内的读写操作".into(),
+                reason: Reason::new(
+                    "允许编辑模式允许可信目录内的读写操作",
+                    "Accept edits allows reads and writes inside trusted directories",
+                ),
                 scope,
                 effect,
                 target: Some(target),
@@ -2766,6 +2950,52 @@ mod tests {
         }
     }
 
+    /// The classifier runs before the card's language is known, so every
+    /// reason it gives must be readable in both. A sample across the rule
+    /// families: internal tools, network, browser, filesystem, and the shell
+    /// analyzer's accept, refuse, and parse-failure branches.
+    #[test]
+    fn every_reason_reads_in_both_app_languages() {
+        let fixture = Fixture::new();
+        let han = |text: &str| {
+            text.chars()
+                .any(|character| ('\u{4E00}'..='\u{9FFF}').contains(&character))
+        };
+        let calls = [
+            ("todo", json!({"action": "list"})),
+            ("todo", json!({"action": "create"})),
+            ("create_global_memory", json!({})),
+            ("agent_spawn", json!({})),
+            ("workflow", json!({})),
+            ("web_search", json!({"query": "rust"})),
+            ("web_fetch", json!({"urls": ["https://example.com"]})),
+            ("preview_screenshot", json!({})),
+            ("read", json!({"path": "inside.txt"})),
+            ("write", json!({"path": "inside.txt", "content": "x"})),
+            ("read", json!({"path": fixture.outside.join("outside.txt")})),
+            ("bash", json!({"command": "ls"})),
+            ("bash", json!({"command": "git push"})),
+            ("bash", json!({"command": "echo \"unclosed"})),
+            ("bash", json!({"command": "timeout"})),
+            ("bash", json!({"command": "rm -rf /"})),
+            ("bash", json!({"command": "curl https://example.com"})),
+        ];
+        for (tool, input) in calls {
+            let decision = fixture
+                .classify_model_call(SecurityLevel::RequestApproval, tool, input.clone())
+                .unwrap_or_else(|error| panic!("{tool} {input}: {error}"));
+            let zh = decision.reason.text(ResolvedLanguage::ZhCn);
+            let en = decision.reason.text(ResolvedLanguage::EnUs);
+            assert!(han(zh), "{tool} {input}: Chinese reason {zh:?}");
+            assert!(
+                !en.is_empty() && !han(en),
+                "{tool} {input}: English reason {en:?}"
+            );
+        }
+        assert_eq!(RiskLevel::High.label(ResolvedLanguage::EnUs), "High");
+        assert_eq!(RiskLevel::High.label(ResolvedLanguage::ZhCn), "高");
+    }
+
     #[test]
     fn missing_ls_target_is_classified_without_bypassing_boundaries() {
         let fixture = Fixture::new();
@@ -2861,7 +3091,7 @@ mod tests {
                 json!({"command": "cd ../outside"}),
             )
             .unwrap();
-        assert_eq!(decision.risk_level, RiskLevel::Low, "{}", decision.reason);
+        assert_eq!(decision.risk_level, RiskLevel::Low, "{:?}", decision.reason);
         assert_ne!(decision.rule_id, "shell.cd_outside_trusted_roots");
         let plain = Fixture::new();
         let decision = plain
@@ -2873,7 +3103,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decision.rule_id, "shell.cd_outside_trusted_roots",
-            "{}",
+            "{:?}",
             decision.reason
         );
     }
@@ -3188,7 +3418,10 @@ mod tests {
                 )
                 .unwrap();
             assert!(decision.requires_approval, "{name} must require approval");
-            assert!(decision.reason.contains("应用控制数据"));
+            assert!(decision
+                .reason
+                .text(ResolvedLanguage::ZhCn)
+                .contains("应用控制数据"));
             assert!(is_restricted(&decision));
         }
 
@@ -3722,7 +3955,7 @@ mod tests {
             assert!(guarded.requires_approval, "{tool} must require approval");
             assert_eq!(guarded.effect, OperationEffect::Unbounded);
             assert_eq!(guarded.rule_id, "browser.sensitive_observation");
-            assert!(!guarded.reason.is_empty());
+            assert!(!guarded.reason.text(ResolvedLanguage::EnUs).is_empty());
 
             let full = fixture
                 .classify(SecurityLevel::FullAccess, tool, json!({}))
@@ -3839,7 +4072,10 @@ mod tests {
                     "{level:?} {tool}"
                 );
                 assert_eq!(decision.risk_level, RiskLevel::High);
-                assert!(decision.reason.contains("所有项目"));
+                assert!(decision
+                    .reason
+                    .text(ResolvedLanguage::ZhCn)
+                    .contains("所有项目"));
             }
 
             // The project tier is a local state change, not a mandatory prompt.

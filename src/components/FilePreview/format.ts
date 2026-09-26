@@ -22,7 +22,7 @@ export function formatDuration(seconds: number): string {
 }
 
 /** The bytes a base64 `data:` URL carries. */
-export function dataUrlBytes(source: string): Uint8Array {
+export function dataUrlBytes(source: string): Uint8Array<ArrayBuffer> {
   const comma = source.indexOf(",");
   const binary = atob(comma < 0 ? source : source.slice(comma + 1));
   const bytes = new Uint8Array(binary.length);

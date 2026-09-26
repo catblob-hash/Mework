@@ -17,10 +17,10 @@
 //! change frozen output. Because the variant has no fields, that is enforced by
 //! the type rather than by a comment. V2 is the first shape whose text is
 //! selected: it is `subagent.addendum` of the run's prompt profile
-//! (`prompt_profile::PromptKey::SubagentAddendum`), so the built-in English
-//! profile, the built-in Chinese one and a user-authored file each render
-//! exactly one variant — never two at once, which would double the tokens on
-//! every child turn and double the bytes inside a signed fork snapshot.
+//! (`prompt_profile::PromptKey::SubagentAddendum`), so the built-in profile
+//! and a user-authored file each render exactly one variant — never two at
+//! once, which would double the tokens on every child turn and double the bytes
+//! inside a signed fork snapshot.
 //!
 //! # The version selects only the addendum
 //!
@@ -204,13 +204,6 @@ update the counts here in the same commit; see the module doc and \
         let english = addendum(PromptVersion::V2, &PromptProfile::builtin_english());
         assert_eq!(english.len(), 2038, "{WHY}");
         assert_eq!(english.chars().count(), 2034, "{WHY}");
-
-        // The built-in Chinese addendum opens with V1's exact paragraph:
-        // `api::tests::serve_routed_json` routes child turns by that substring.
-        let chinese = addendum(PromptVersion::V2, &PromptProfile::builtin_chinese());
-        assert_eq!(chinese.len(), 1709, "{WHY}");
-        assert_eq!(chinese.chars().count(), 587, "{WHY}");
-        assert!(chinese.starts_with(ADDENDUM_V1_ZH), "{WHY}");
     }
 
     /// Acceptance (c): `render(V1, x)` is byte-identical to the pre-change
@@ -293,27 +286,6 @@ update the counts here in the same commit; see the module doc and \
     }
 
     #[test]
-    fn v2_chinese_adds_the_boundary_paragraph_and_notes_after_v1s_paragraph() {
-        let v2 = render(PromptVersion::V2, "", &PromptProfile::builtin_chinese());
-        // `api::tests::serve_routed_json` routes a child turn by this exact
-        // substring. Losing it makes that test hang or misroute rather than
-        // report a diff.
-        assert!(v2.starts_with("你是主代理派生的子代理"));
-        assert!(v2.starts_with(V1_GOLDEN));
-        assert_eq!(&v2[V1_GOLDEN.len()..V1_GOLDEN.len() + 2], "\n\n");
-        assert!(v2.contains("指令来源边界："));
-        assert!(v2.contains("\n\n注意事项：\n- "));
-        assert!(v2.contains("你没有向用户提问的工具"));
-        assert!(v2.contains("不能再派生或指挥子代理"));
-        assert!(v2.contains("除非宿主为你单独分配了记忆分区"));
-        assert!(v2.contains("浏览器会话与联网授权由整个对话共享"));
-        assert!(v2.contains("宿主会限制你的轮数"));
-        // No English leaked into the Chinese variant beyond the product name.
-        assert!(!v2.contains("Notes:"));
-        assert!(!v2.contains("Instruction-source boundary"));
-    }
-
-    #[test]
     fn v2_english_is_a_separate_variant_not_a_second_copy() {
         let en = render(PromptVersion::V2, "", &PromptProfile::builtin_english());
         assert!(en.starts_with("You are a child agent spawned by the main agent."));
@@ -324,12 +296,10 @@ update the counts here in the same commit; see the module doc and \
         assert!(en.contains("unless the host assigned you a partition of your own"));
         assert!(en.contains("browser session and web authorization are shared"));
         assert!(en.contains("The host caps your rounds"));
-        // Bilingual means "one of two", not "both at once": emitting both would
-        // double every child turn's prompt tokens.
+        // V2 replaces V1's Chinese paragraph rather than following it: emitting
+        // both would double every child turn's prompt tokens.
         assert!(!en.contains("你是主代理派生的子代理"));
         assert!(!en.contains("注意事项"));
-        let zh = render(PromptVersion::V2, "", &PromptProfile::builtin_chinese());
-        assert_ne!(en, zh);
     }
 
     /// The version selects the addendum and nothing else: `base` reaches the
@@ -344,9 +314,16 @@ update the counts here in the same commit; see the module doc and \
             "指令来源边界：a user is allowed to quote this",
             "<mework-memory-context>\nquoted delimiter\n</mework-memory-context>",
         ];
+        let file = PromptProfile::from_file(
+            "test".into(),
+            "Test".into(),
+            crate::model::ResolvedLanguage::ZhCn,
+            [(PromptKey::SubagentAddendum, "子代理附录".to_owned())].into(),
+            Vec::new(),
+        );
         for (version, profile) in [
             (PromptVersion::V1, PromptProfile::builtin_english()),
-            (PromptVersion::V2, PromptProfile::builtin_chinese()),
+            (PromptVersion::V2, file),
             (PromptVersion::V2, PromptProfile::builtin_english()),
         ] {
             let tail = render(version, "", &profile);

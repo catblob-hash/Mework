@@ -5,12 +5,13 @@
 //! format users hand-write under `.mework/tool-descriptions/*.json`) declares
 //! two things: per-tool description overrides (`tools`) and the wording of
 //! every place where Mework itself injects fixed text into a model request
-//! (`prompts`). Both built-in profiles are JSON files in that same format,
-//! compiled into the binary: they are always present and can never be deleted,
-//! and `prompt_profile_files.rs` materializes an editable copy of each under the
-//! application data directory at startup, so a user can change any host text
-//! without a rebuild. The registry below carries only the key ids, their
-//! placeholders and their documentation — no text.
+//! (`prompts`). There is one built-in profile, "Mework built-in": its English
+//! texts are code in [`english`], so they ship with each build and change with
+//! it. Nothing writes them to disk and nothing edits them in place. A user who
+//! wants other wording writes a tool-description file; it overrides only the
+//! keys it names, and every other key falls back to the built-in. The registry
+//! below carries the key ids, their placeholders and their documentation; the
+//! texts sit in [`english`], one match arm per key.
 //!
 //! What lives here, in one sentence per group: the capability sections appended
 //! to the system prompt; the safety boundaries; the child agent addendum and
@@ -44,21 +45,18 @@ use serde_json::Value;
 
 use crate::model::{ResolvedLanguage, ToolDescriptionEntry};
 
-/// The built-in English profile, in exactly the format a user file uses.
-const EN_US_SOURCE: &str = include_str!("../prompt-profiles/en-US.json");
-/// The built-in Chinese profile, in exactly the format a user file uses.
-const ZH_CN_SOURCE: &str = include_str!("../prompt-profiles/zh-CN.json");
+mod english;
 
-/// Stable resource id of the built-in English profile. Selecting it and
-/// selecting nothing are the same thing.
+/// Stable resource id of the built-in profile. Selecting it and selecting
+/// nothing are the same thing. Saved conversations and presets reference this
+/// exact value, `_en_us` suffix included.
 pub const BUILTIN_EN_US_ID: &str = "tooldesc_builtin_en_us";
-/// Stable resource id of the built-in Chinese profile.
-pub const BUILTIN_ZH_CN_ID: &str = "tooldesc_builtin_zh_cn";
 
 /// Declares the registry. Each entry is one injection point: the enum variant,
 /// its stable id, the placeholders its text may use, and a one-line description
-/// for the documentation. The texts themselves live in the two source JSON
-/// files, not here.
+/// for the documentation. The texts themselves live in [`english`], whose match
+/// is exhaustive over these variants, so a key added here without its text does
+/// not compile.
 macro_rules! prompt_keys {
     ($( $variant:ident => ($id:literal, [$($placeholder:literal),*], $doc:literal) ),* $(,)?) => {
         /// One host injection point. See the module documentation.
@@ -67,13 +65,16 @@ macro_rules! prompt_keys {
             $( $variant, )*
         }
 
-        // `placeholders` and `doc` feed only the golden exports and the registry
-        // tests; production code reaches texts through `PromptProfile::text`.
+        // `ALL`, `id`, `placeholders` and `doc` feed only the golden exports and
+        // the registry tests; production code reaches texts through
+        // `PromptProfile::text` and reads a file's ids through `parse`.
         impl PromptKey {
             /// Every key, in documentation order.
+            #[cfg(test)]
             pub const ALL: &'static [PromptKey] = &[ $( PromptKey::$variant, )* ];
 
             /// The stable id a profile file uses under `prompts`.
+            #[cfg(test)]
             pub fn id(self) -> &'static str {
                 match self { $( PromptKey::$variant => $id, )* }
             }
@@ -373,7 +374,7 @@ prompt_keys! {
     TaskCostUnknownTokens => ("task.cost_unknown_tokens", [],
         "Stands in for `{tokens}` when the provider reported no usage."),
     TaskWaitStatusHeading => ("task.wait_status_heading", [],
-        "Heading of the status roll-up that ends a `task_wait` result. The renderer recognizes the built-in English and Chinese headings."),
+        "Heading of the status roll-up that ends a `task_wait` result. The renderer recognizes the built-in English heading, and the Chinese one in transcripts older builds wrote."),
     TaskStatusCompleted => ("task.status.completed", [], "Status word of a completed task."),
     TaskStatusInterrupted => ("task.status.interrupted", [], "Status word of an interrupted task."),
     TaskStatusFailed => ("task.status.failed", [], "Status word of a failed task."),
@@ -416,7 +417,8 @@ prompt_keys! {
     TaskShellResult => ("task.shell_result", ["shell_ref", "tool_name", "exit", "body"],
         "Result envelope body of a finished background shell command."),
     TaskShellExitCode => ("task.shell_exit_code", ["code"], "Stands in for `{exit}` when the exit code is known."),
-    TaskShellExitUnknown => ("task.shell_exit_unknown", [], "Stands in for `{exit}` when the exit code is unknown."),    TaskShellNoOutput => ("task.shell_no_output", [], "Stands in for `{body}` when the command produced no output."),
+    TaskShellExitUnknown => ("task.shell_exit_unknown", [], "Stands in for `{exit}` when the exit code is unknown."),
+    TaskShellNoOutput => ("task.shell_no_output", [], "Stands in for `{body}` when the command produced no output."),
     TaskShellStoppedByUser => ("task.shell_stopped_by_user", ["shell_ref", "tool_name", "body"],
         "Result envelope body of a background command the user stopped, carrying whatever it printed first."),
     TaskShellFailedToRun => ("task.shell_failed_to_run", ["shell_ref", "error"],
@@ -665,27 +667,20 @@ impl PromptKey {
     }
 }
 
-/// Which built-in profile a profile falls back to for keys it does not override.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BuiltinBase {
-    EnUs,
-    ZhCn,
-}
-
-/// A resolved prompt profile: the base built-in profile plus overrides.
+/// A resolved prompt profile: the built-in texts plus a file's overrides.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PromptProfile {
-    /// Resource id (a built-in id or a discovered file's id).
+    /// Resource id (the built-in id or a discovered file's id).
     pub id: String,
     /// Display name.
     pub name: String,
-    /// The language this profile resolves texts in. For the two built-ins it is
-    /// the language they are written in; for a user file it is the application
-    /// language, since a file declares none of its own. It decides which
-    /// built-in fills the keys the profile omits, tool-label localization, and
-    /// the language recorded on fork bindings.
+    /// The language the run around this profile is presented in. For the
+    /// built-in it is English, the language its texts are written in; for a
+    /// user file it is the application language, since a file declares none of
+    /// its own. It drives tool-label localization, the language servers' labels
+    /// and the language recorded on fork bindings. It does not pick texts: every
+    /// key a profile leaves out falls back to the English built-in.
     pub language: ResolvedLanguage,
-    base: BuiltinBase,
     overrides: HashMap<PromptKey, String>,
     /// Per-tool description overrides.
     pub tools: Vec<ToolDescriptionEntry>,
@@ -697,33 +692,11 @@ impl Default for PromptProfile {
     }
 }
 
-/// The parsed English built-in, built once per process.
-fn english_texts() -> &'static HashMap<PromptKey, String> {
-    static TEXTS: std::sync::OnceLock<HashMap<PromptKey, String>> = std::sync::OnceLock::new();
-    TEXTS.get_or_init(|| {
-        let value: Value =
-            serde_json::from_str(EN_US_SOURCE).expect("the built-in en-US profile is valid JSON");
-        parse_prompt_overrides(&value)
-    })
-}
-
-/// The parsed Chinese built-in, built once per process.
-fn chinese_texts() -> &'static HashMap<PromptKey, String> {
-    static TEXTS: std::sync::OnceLock<HashMap<PromptKey, String>> = std::sync::OnceLock::new();
-    TEXTS.get_or_init(|| {
-        let value: Value =
-            serde_json::from_str(ZH_CN_SOURCE).expect("the built-in zh-CN profile is valid JSON");
-        parse_prompt_overrides(&value)
-    })
-}
-
 impl PromptKey {
-    /// The built-in English text — the last fallback of every profile. A key the
-    /// English source does not carry resolves to nothing rather than to a panic:
-    /// a registry entry added without its text makes the host say nothing at
-    /// that point, which the source-file test catches before a build ships.
+    /// The built-in English text — the fallback of every profile. It is code in
+    /// [`english`], so it ships with the build and changes with it.
     pub fn builtin_en(self) -> &'static str {
-        english_texts().get(&self).map_or("", String::as_str)
+        english::text(self)
     }
 }
 
@@ -761,51 +734,21 @@ pub fn parse_prompt_overrides(value: &Value) -> HashMap<PromptKey, String> {
 }
 
 impl PromptProfile {
-    /// The compiled-in English profile: no overrides, English base.
+    /// The built-in profile: the compiled English texts, no overrides.
     pub fn builtin_english() -> Self {
         Self {
             id: BUILTIN_EN_US_ID.to_owned(),
-            name: "Mework built-in (English)".to_owned(),
+            name: "Mework built-in".to_owned(),
             language: ResolvedLanguage::EnUs,
-            base: BuiltinBase::EnUs,
             overrides: HashMap::new(),
             tools: Vec::new(),
-        }
-    }
-
-    /// The compiled-in Chinese profile.
-    pub fn builtin_chinese() -> Self {
-        Self {
-            id: BUILTIN_ZH_CN_ID.to_owned(),
-            name: "Mework 内置（中文）".to_owned(),
-            language: ResolvedLanguage::ZhCn,
-            base: BuiltinBase::ZhCn,
-            overrides: HashMap::new(),
-            tools: Vec::new(),
-        }
-    }
-
-    /// The built-in profile authored in `language`.
-    pub fn builtin_for_language(language: ResolvedLanguage) -> Self {
-        match language {
-            ResolvedLanguage::EnUs => Self::builtin_english(),
-            ResolvedLanguage::ZhCn => Self::builtin_chinese(),
-        }
-    }
-
-    /// Whether `id` names one of the two built-ins.
-    pub fn builtin_for_id(id: &str) -> Option<Self> {
-        match id {
-            BUILTIN_EN_US_ID => Some(Self::builtin_english()),
-            BUILTIN_ZH_CN_ID => Some(Self::builtin_chinese()),
-            _ => None,
         }
     }
 
     /// A user-authored profile. `language` is the application language: a file
-    /// does not declare one of its own. It selects which built-in fills the keys
-    /// the file leaves out, so a file written against a Chinese app only has to
-    /// override what it changes.
+    /// does not declare one of its own (see [`PromptProfile::language`]). The
+    /// keys the file leaves out keep the built-in English wording, so a file
+    /// only has to spell out what it changes.
     ///
     /// A `tools[]` entry carries the tool-facing half of the same registry: a
     /// non-empty `schemaNotes` is folded onto that tool's description key, which
@@ -825,45 +768,18 @@ impl PromptProfile {
             id,
             name,
             language,
-            base: match language {
-                ResolvedLanguage::EnUs => BuiltinBase::EnUs,
-                ResolvedLanguage::ZhCn => BuiltinBase::ZhCn,
-            },
             overrides,
             tools,
         }
     }
 
-    /// A built-in profile whose texts an editable on-disk copy overrides. The
-    /// identity stays the built-in's — the file under the application data
-    /// directory is that profile's text, not a separate resource — and keys the
-    /// file does not carry keep the compiled wording. `tools` folds exactly as
-    /// in [`PromptProfile::from_file`].
-    pub fn builtin_with_overrides(
-        language: ResolvedLanguage,
-        mut overrides: HashMap<PromptKey, String>,
-        tools: Vec<ToolDescriptionEntry>,
-    ) -> Self {
-        fold_tool_schema_notes(&tools, &mut overrides);
-        Self {
-            overrides,
-            tools,
-            ..Self::builtin_for_language(language)
-        }
-    }
-
-    /// The text for `key`: the profile's override, else its base built-in, else
-    /// the English default.
+    /// The text for `key`: the profile's override, else the built-in English
+    /// text.
     pub fn text(&self, key: PromptKey) -> &str {
-        if let Some(text) = self.overrides.get(&key) {
-            return text;
+        match self.overrides.get(&key) {
+            Some(text) => text,
+            None => key.builtin_en(),
         }
-        if self.base == BuiltinBase::ZhCn {
-            if let Some(text) = chinese_texts().get(&key) {
-                return text;
-            }
-        }
-        key.builtin_en()
     }
 
     /// Renders `key` with `{name}` placeholders substituted from `args`.
@@ -1050,7 +966,7 @@ mod tests {
 
     /// A built-in text may only reference placeholders its key declares, and
     /// must reference all of them unless the key is offered-but-unused.
-    fn assert_placeholders_are_declared(key: PromptKey, text: &str, language: &str) {
+    fn assert_placeholders_are_declared(key: PromptKey, text: &str) {
         let declared = key
             .placeholders()
             .iter()
@@ -1060,14 +976,14 @@ mod tests {
         if PLACEHOLDERS_OFFERED_BUT_UNUSED.contains(&key) {
             assert!(
                 used.is_subset(&declared),
-                "{} {language} uses {used:?} but declares {declared:?}",
+                "{} uses {used:?} but declares {declared:?}",
                 key.id()
             );
         } else {
             assert_eq!(
                 used,
                 declared,
-                "{} {language} uses {used:?} but declares {declared:?}",
+                "{} uses {used:?} but declares {declared:?}",
                 key.id()
             );
         }
@@ -1091,28 +1007,26 @@ mod tests {
         assert_eq!(PromptKey::parse("no.such.key"), None);
     }
 
+    /// `english.rs` lists its texts in registry order, so the two files read
+    /// side by side. Completeness needs no test: the match there is exhaustive,
+    /// so a key without a text does not compile.
     #[test]
-    fn the_english_profile_covers_every_key_with_matching_placeholders() {
-        let value: Value = serde_json::from_str(EN_US_SOURCE).expect("valid JSON");
-        assert!(
-            value.get("baseLanguage").is_none(),
-            "the profile format has no baseLanguage field"
-        );
-        let prompts = value["prompts"].as_object().expect("prompts object");
-        for id in prompts.keys() {
-            assert!(
-                PromptKey::parse(id).is_some(),
-                "en-US profile has unknown key {id}"
-            );
-        }
-        let texts = english_texts();
-        for key in PromptKey::ALL {
-            assert!(
-                texts.contains_key(key),
-                "en-US profile is missing {}",
-                key.id()
-            );
-        }
+    fn english_texts_are_listed_in_registry_order() {
+        let listed = include_str!("prompt_profile/english.rs")
+            .lines()
+            .filter_map(|line| {
+                let (variant, _) = line.strip_prefix("    ")?.split_once(" => \"")?;
+                variant
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric())
+                    .then_some(variant.to_owned())
+            })
+            .collect::<Vec<_>>();
+        let registry = PromptKey::ALL
+            .iter()
+            .map(|key| format!("{key:?}"))
+            .collect::<Vec<_>>();
+        assert_eq!(listed, registry);
     }
 
     #[test]
@@ -1126,97 +1040,36 @@ mod tests {
                 key.id()
             );
             assert!(!has_cjk(text), "{} English default contains CJK", key.id());
-            assert_placeholders_are_declared(*key, text, "en-US");
+            assert_placeholders_are_declared(*key, text);
         }
     }
 
+    /// A file's `language` is the app language and never picks texts: every key
+    /// it leaves out keeps the built-in English wording.
     #[test]
-    fn the_chinese_profile_covers_every_key_with_matching_placeholders() {
-        let value: Value = serde_json::from_str(ZH_CN_SOURCE).expect("valid JSON");
-        assert!(
-            value.get("baseLanguage").is_none(),
-            "the profile format has no baseLanguage field"
-        );
-        let prompts = value["prompts"].as_object().expect("prompts object");
-        for id in prompts.keys() {
-            assert!(
-                PromptKey::parse(id).is_some(),
-                "zh-CN profile has unknown key {id}"
-            );
-        }
-        let texts = chinese_texts();
-        for key in PromptKey::ALL {
-            let text = texts
-                .get(key)
-                .unwrap_or_else(|| panic!("zh-CN profile is missing {}", key.id()));
-            assert_placeholders_are_declared(*key, text, "zh-CN");
-            // Structural tokens the renderer parses stay byte-identical across
-            // languages; only the words around them are translated.
-            if *key == PromptKey::FormatListSeparator {
-                continue;
-            }
-            assert_eq!(
-                text.is_empty(),
-                key.builtin_en().is_empty(),
-                "{} emptiness differs between languages",
-                key.id()
-            );
-        }
-    }
-
-    #[test]
-    fn a_file_profile_falls_back_to_its_language_base_then_english() {
+    fn a_file_profile_falls_back_to_the_english_builtin_in_any_app_language() {
         let mut overrides = HashMap::new();
         overrides.insert(PromptKey::TaskWaitIdle, "custom".to_owned());
-        let chinese = PromptProfile::from_file(
-            "f".into(),
-            "F".into(),
-            ResolvedLanguage::ZhCn,
-            overrides.clone(),
-            Vec::new(),
-        );
-        assert_eq!(chinese.text(PromptKey::TaskWaitIdle), "custom");
-        assert_eq!(
-            chinese.text(PromptKey::TaskListEmpty),
-            PromptProfile::builtin_chinese().text(PromptKey::TaskListEmpty)
-        );
-        let english = PromptProfile::from_file(
-            "f".into(),
-            "F".into(),
-            ResolvedLanguage::EnUs,
-            overrides,
-            Vec::new(),
-        );
-        assert_eq!(english.text(PromptKey::TaskWaitIdle), "custom");
-        assert_eq!(
-            english.text(PromptKey::TaskListEmpty),
-            PromptKey::TaskListEmpty.builtin_en()
-        );
-    }
-
-    #[test]
-    fn an_edited_builtin_keeps_the_builtin_identity_and_its_unedited_texts() {
-        let mut overrides = HashMap::new();
-        overrides.insert(PromptKey::TaskWaitIdle, "edited".to_owned());
-        let profile = PromptProfile::builtin_with_overrides(
-            ResolvedLanguage::ZhCn,
-            overrides,
-            vec![ToolDescriptionEntry {
-                tool_name: "grep".to_owned(),
-                schema_notes: "notes".to_owned(),
-                usage_guidance: String::new(),
-            }],
-        );
-        let builtin = PromptProfile::builtin_chinese();
-        assert_eq!(profile.id, builtin.id);
-        assert_eq!(profile.name, builtin.name);
-        assert_eq!(profile.language, builtin.language);
-        assert_eq!(profile.text(PromptKey::TaskWaitIdle), "edited");
-        assert_eq!(profile.text(PromptKey::ToolGrepDescription), "notes");
-        assert_eq!(
-            profile.text(PromptKey::TaskListEmpty),
-            builtin.text(PromptKey::TaskListEmpty)
-        );
+        for language in [ResolvedLanguage::EnUs, ResolvedLanguage::ZhCn] {
+            let profile = PromptProfile::from_file(
+                "f".into(),
+                "F".into(),
+                language,
+                overrides.clone(),
+                vec![ToolDescriptionEntry {
+                    tool_name: "grep".to_owned(),
+                    schema_notes: "notes".to_owned(),
+                    usage_guidance: String::new(),
+                }],
+            );
+            assert_eq!(profile.language, language);
+            assert_eq!(profile.text(PromptKey::TaskWaitIdle), "custom");
+            assert_eq!(profile.text(PromptKey::ToolGrepDescription), "notes");
+            assert_eq!(
+                profile.text(PromptKey::TaskListEmpty),
+                PromptKey::TaskListEmpty.builtin_en()
+            );
+        }
     }
 
     #[test]
@@ -1258,10 +1111,16 @@ mod tests {
             PromptProfile::builtin_english().join_list(["a", "b", "c"]),
             "a, b, c"
         );
-        assert_eq!(
-            PromptProfile::builtin_chinese().join_list(["a", "b"]),
-            "a、b"
+        let mut overrides = HashMap::new();
+        overrides.insert(PromptKey::FormatListSeparator, "、".to_owned());
+        let file = PromptProfile::from_file(
+            "f".into(),
+            "F".into(),
+            ResolvedLanguage::ZhCn,
+            overrides,
+            Vec::new(),
         );
+        assert_eq!(file.join_list(["a", "b"]), "a、b");
         assert_eq!(
             PromptProfile::builtin_english().join_list(Vec::<&str>::new()),
             ""
@@ -1292,11 +1151,9 @@ mod tests {
     /// untrusted-web-evidence wording without a code change.
     #[test]
     fn the_web_evidence_keys_are_empty_but_still_overridable() {
-        let english = PromptProfile::builtin_english();
-        let chinese = PromptProfile::builtin_chinese();
+        let builtin = PromptProfile::builtin_english();
         for key in INTENTIONALLY_EMPTY {
-            assert_eq!(english.text(*key), "", "{} en-US", key.id());
-            assert_eq!(chinese.text(*key), "", "{} zh-CN", key.id());
+            assert_eq!(builtin.text(*key), "", "{}", key.id());
         }
         let mut overrides = HashMap::new();
         overrides.insert(
@@ -1360,81 +1217,17 @@ Skip steps that aren't relevant — e.g. skip step 5 for non-CSS changes, skip s
         );
     }
 
-    /// The Chinese half is a translation of the instruction, not of the
-    /// vocabulary: the three element names are referred to by name inside the
-    /// prose (`per <when_to_verify>`) and every step names a tool the host
-    /// dispatches on, so both survive translation unchanged while the sentences
-    /// around them become Chinese.
-    #[test]
-    fn the_chinese_preview_tools_section_keeps_the_element_and_tool_names() {
-        let chinese = PromptProfile::builtin_chinese();
-        let text = chinese.text(PromptKey::SystemPreviewTools);
-        assert!(has_cjk(text));
-        for element in [
-            "<preview_tools>",
-            "</preview_tools>",
-            "<when_to_verify>",
-            "</when_to_verify>",
-            "<verification_workflow>",
-            "</verification_workflow>",
-        ] {
-            assert!(text.contains(element), "zh-CN dropped {element}");
-        }
-        for tool in [
-            "preview_start",
-            "preview_eval",
-            "preview_console_logs",
-            "preview_logs",
-            "preview_network",
-            "preview_snapshot",
-            "preview_inspect",
-            "preview_click",
-            "preview_fill",
-            "preview_resize",
-            "preview_screenshot",
-        ] {
-            assert!(text.contains(tool), "zh-CN dropped {tool}");
-        }
-        // Eight numbered steps, in order, in both languages.
-        for step in 1..=8u32 {
-            assert!(
-                text.contains(&format!("\n{step}. ")),
-                "zh-CN dropped step {step}"
-            );
-            assert!(
-                PREVIEW_TOOLS_EN.contains(&format!("\n{step}. ")),
-                "en-US dropped step {step}"
-            );
-        }
-    }
-
-    // ---- Source profiles and golden exports -------------------------------
+    // ---- Golden exports -----------------------------------------------------
     //
-    // Two layers are generated and pinned. The sources under
-    // src-tauri/prompt-profiles/ carry the texts themselves: the regeneration
-    // below rewrites them in registry order, keeping every text a human wrote
-    // and filling a key the registry gained but the file has not (English with
-    // an empty string, so the coverage test above fails until someone writes
-    // it; Chinese with the English text, so the host stays coherent until it is
-    // translated). Three files under docs/context-injections/ are then
-    // generated from the compiled sources, exactly like the schema baseline in
-    // builtin_schemas.rs: the English profile as a complete user-file document,
-    // the Chinese profile re-serialized through the same struct, and the key
-    // manifest (id, placeholders, description) the documentation site renders.
-    // The goldens read the *compiled* sources, so a regeneration that changed a
-    // source file needs a second run (the pin tests say so).
+    // Two files under docs/context-injections/ are generated from the compiled
+    // registry, exactly like the schema baseline in builtin_schemas.rs: the
+    // built-in profile as a complete user-file document, and the key manifest
+    // (id, placeholders, description). The documentation site renders both and
+    // offers them for download, so a user writing a tool-description file
+    // starts from the texts this build ships.
 
     fn baseline_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/context-injections")
-    }
-
-    fn source_path(language: ResolvedLanguage) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("prompt-profiles")
-            .join(match language {
-                ResolvedLanguage::EnUs => "en-US.json",
-                ResolvedLanguage::ZhCn => "zh-CN.json",
-            })
     }
 
     fn pretty(value: &Value) -> String {
@@ -1443,70 +1236,8 @@ Skip steps that aren't relevant — e.g. skip step 5 for non-CSS changes, skip s
         text
     }
 
-    /// The canonical form of one source file: `name` and `tools` as the file has
-    /// them, `prompts` in registry order with every key present.
-    fn canonical_source(language: ResolvedLanguage) -> String {
-        let current: Value = serde_json::from_str(
-            &std::fs::read_to_string(source_path(language)).expect("read the source profile"),
-        )
-        .expect("the source profile is valid JSON");
-        let name = current
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let existing = current
-            .get("prompts")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let tools = current
-            .get("tools")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-
-        let mut text = format!(
-            "{{\n  \"name\": {},\n  \"prompts\": {{\n",
-            Value::from(name)
-        );
-        for (index, key) in PromptKey::ALL.iter().enumerate() {
-            let body = match existing.get(key.id()).and_then(Value::as_str) {
-                Some(body) => body.to_owned(),
-                None => match language {
-                    ResolvedLanguage::EnUs => String::new(),
-                    ResolvedLanguage::ZhCn => key.builtin_en().to_owned(),
-                },
-            };
-            let comma = if index + 1 == PromptKey::ALL.len() {
-                ""
-            } else {
-                ","
-            };
-            text.push_str(&format!(
-                "    {}: {}{comma}\n",
-                Value::from(key.id()),
-                Value::from(body)
-            ));
-        }
-        text.push_str("  },\n");
-        text.push_str(&format!(
-            "  \"tools\": {}\n}}\n",
-            serde_json::to_string_pretty(&tools)
-                .expect("serialize tools")
-                .replace('\n', "\n  ")
-        ));
-        text
-    }
-
-    fn source_files() -> Vec<(std::path::PathBuf, String)> {
-        [ResolvedLanguage::EnUs, ResolvedLanguage::ZhCn]
-            .into_iter()
-            .map(|language| (source_path(language), canonical_source(language)))
-            .collect()
-    }
-
     fn golden_files() -> Vec<(&'static str, String)> {
-        let english = PromptProfile::builtin_english().to_document();
-        let chinese = PromptProfile::builtin_chinese().to_document();
+        let builtin = PromptProfile::builtin_english().to_document();
         let manifest = serde_json::json!({
             "kind": "mework-prompt-profile-keys",
             "note": "Every host injection point a tool-description file may override under `prompts`. Generated by prompt_profile.rs tests; regenerate with: cargo test --lib -- prompt_profile::tests::regenerate_prompt_profile_baselines --ignored",
@@ -1515,22 +1246,9 @@ Skip steps that aren't relevant — e.g. skip step 5 for non-CSS changes, skip s
             "keys": key_manifest(),
         });
         vec![
-            ("prompt-profile.en-US.json", pretty(&english)),
-            ("prompt-profile.zh-CN.json", pretty(&chinese)),
+            ("prompt-profile.en-US.json", pretty(&builtin)),
             ("prompt-profile-keys.json", pretty(&manifest)),
         ]
-    }
-
-    #[test]
-    fn prompt_profile_sources_are_in_registry_order_and_complete() {
-        for (path, expected) in source_files() {
-            let current = std::fs::read_to_string(&path).unwrap_or_default();
-            assert!(
-                current == expected,
-                "{} is not in canonical form (registry order, every key present); run\n  cargo test --lib -- prompt_profile::tests::regenerate_prompt_profile_baselines --ignored\nand commit the result",
-                path.display()
-            );
-        }
     }
 
     #[test]
@@ -1545,11 +1263,8 @@ Skip steps that aren't relevant — e.g. skip step 5 for non-CSS changes, skip s
     }
 
     #[test]
-    #[ignore = "writes the source profiles and the design baselines; run explicitly to regenerate"]
+    #[ignore = "writes the design baselines; run explicitly to regenerate"]
     fn regenerate_prompt_profile_baselines() {
-        for (path, contents) in source_files() {
-            std::fs::write(&path, contents).expect("write source profile");
-        }
         for (name, contents) in golden_files() {
             std::fs::write(baseline_dir().join(name), contents).expect("write baseline");
         }

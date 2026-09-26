@@ -18,8 +18,9 @@
 //! without re-deriving the paths: [`crate::capabilities::stable_id`] hashes the
 //! absolute location, so an id minted here is specific to this machine's home
 //! directory and cannot be written into either seed document as a literal.
-//! Seeding therefore happens where the fresh document is built — see
-//! `storage::load_or_initialize` — and hands the ids straight to the presets.
+//! Every start therefore asks for them where the built-in preset is installed
+//! — see `storage::install_builtin_preset` — and hands them straight to it.
+//! After the first run that is one read of the marker.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -128,7 +129,7 @@ struct BuiltinHook {
 /// The hooks a fresh installation starts with — seeded, listed, and selected by
 /// nothing.
 ///
-/// No shipped preset selects a hook, and that is deliberate. A hook id is a
+/// The built-in preset selects no hook, and that is deliberate. A hook id is a
 /// hash of its *position* in `hooks.json` (`#/hooks/<event>/<group>/<handler>`),
 /// so deleting or reordering any handler renumbers the rest, and a selected id
 /// that no longer resolves fails every run of that conversation closed — by
@@ -175,8 +176,8 @@ const BUILTIN_HOOKS: &[BuiltinHook] = &[
     },
 ];
 
-/// The ids the shipped presets select, handed back so the caller can write them
-/// into a fresh document's preset settings.
+/// The ids the built-in preset selects, handed back so the caller can write them
+/// into its settings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BuiltinCapabilitySelection {
     /// Ids of every seeded skill, in the order of [`BUILTIN_SKILLS`].
@@ -213,8 +214,8 @@ pub fn seed_builtin_capabilities(app_data: &Path) -> BuiltinCapabilitySelection 
 /// `storage::load_or_initialize` test would otherwise write built-ins into the
 /// developer's own `~/.mework`. What it would have done is covered directly:
 /// [`seed_into`] takes both directories and the tests below drive it against
-/// temporary ones, and `storage::apply_builtin_capability_selection` is tested
-/// against a selection built by hand.
+/// temporary ones, and `storage::put_builtin_preset` is tested against a
+/// selection built by hand.
 #[cfg(test)]
 pub fn seed_builtin_capabilities(_app_data: &Path) -> BuiltinCapabilitySelection {
     BuiltinCapabilitySelection::default()
@@ -521,7 +522,7 @@ mod tests {
 
     /// A `${VAR}` without a default makes an entry unavailable, and a selected
     /// unavailable server fails every run of that conversation closed. The
-    /// shipped presets select all of these, so none may carry one.
+    /// built-in preset selects all of these, so none may carry one.
     #[test]
     fn no_seeded_mcp_server_depends_on_an_environment_variable() {
         for (name, command, arguments, _) in BUILTIN_MCP_SERVERS {

@@ -514,7 +514,10 @@ pub(crate) fn session_task_approval(
                 (
                     true,
                     security::RiskLevel::High,
-                    "MCP Server 或本地包会收到这些参数，可能访问网络或产生其他副作用".to_owned(),
+                    security::Reason::new(
+                        "MCP Server 或本地包会收到这些参数，可能访问网络或产生其他副作用",
+                        "The MCP server or local package receives these arguments and may reach the network or have other side effects",
+                    ),
                 )
             } else {
                 // Classify using this call's workspace. Isolated workflow steps rely
@@ -541,6 +544,7 @@ pub(crate) fn session_task_approval(
             let allow_always_offered = !mcp
                 && !mandatory
                 && !crate::tool_prompt::never_blanket_allowed(&tool_request.tool_name);
+            let language = approval_card_language(&approval_state, &app_data_path);
             let card = crate::tool_prompt::PendingToolPrompt {
                 // Minted by the registry; see `ToolPromptRegistry::ask`.
                 prompt_id: String::new(),
@@ -551,8 +555,8 @@ pub(crate) fn session_task_approval(
                     &tool_request.tool_name,
                     &public_tool_input(&tool_request.tool_name, &tool_request.input),
                 ),
-                risk_level: risk.label_zh().to_owned(),
-                reason,
+                risk_level: risk.label(language).to_owned(),
+                reason: reason.text(language).to_owned(),
                 requester: requester.agent.map(crate::tool_prompt::escape_display_text),
                 // Preserve machine-readable coordinates: `requester` is escaped
                 // display text, while these fields are renderer lookup keys.
@@ -604,6 +608,21 @@ fn approval_requested_event(prompt: &crate::tool_prompt::PendingToolPrompt) -> M
         allow_always_offered: prompt.allow_always_offered,
         mandatory: prompt.mandatory,
     }
+}
+
+/// The language approval cards are worded in: the app's, as the renderer last
+/// resolved it. Not the prompt profile's, which is the model's language and can
+/// differ from the UI's. Read as each card is raised, so a switch mid-run
+/// applies to the next card.
+pub(crate) fn approval_card_language(
+    state: &AppState,
+    app_data_path: &str,
+) -> crate::model::ResolvedLanguage {
+    state
+        .document_store
+        .current_snapshot(&Path::new(app_data_path).join("document.v1.json"))
+        .map(|document| document.global_settings.resolved_app_language)
+        .unwrap_or_default()
 }
 
 /// Raises one approval card, blocks until it is answered, and takes it down
@@ -3571,6 +3590,7 @@ fn run_model_inner(
                         round,
                         call_id: call.id.clone(),
                     })?;
+                    crate::helper_model::uses::on_tool_started(state, &request, round, &call.id, &call.name, &call.input);
 
                     let mut authorization = classify_tool_authorization(&request, &call)?;
                     let mut permission_forces_prompt = hook_permission_asks(&pre_tool);
@@ -10937,6 +10957,7 @@ fn run_background_shell(
         kind.tool_name(),
         &command,
         true,
+        Some(&selected.root),
     ) {
         Ok(guard) => guard,
         Err(error) => return Ok(failed_tool_execution(call, error)),
@@ -11207,6 +11228,9 @@ fn drive_background_shell(
     // No deadline on this leg: reaching one is what makes a command *become* a
     // background task, so a command that is already one has none left.
     let result = run.settle_in_background(&mut guard, &cancel_probe, profile);
+    // The machine that ran the command timed it, when it could: this worker started a round
+    // trip after it, and heard of its end only once its last output had arrived.
+    let runtime = result.as_ref().ok().and_then(|result| result.runtime);
     let (status, text) = match result {
         Ok(result) => match result.end {
             tool_executor::ShellProcessEnd::Exited => {
@@ -11253,7 +11277,10 @@ fn drive_background_shell(
             ),
         ),
     };
-    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let duration_ms = runtime
+        .unwrap_or_else(|| started.elapsed())
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
     shared.complete_turn(
         incarnation,
         Vec::new(),
@@ -19698,6 +19725,7 @@ mod tests {
                     run_target: None,
                     additional_directories: Vec::new(),
                     parent_conversation_id: None,
+                    fork_of: None,
                     preset_id: String::new(),
                     template_id: String::new(),
                     attached_workspaces: Vec::new(),
@@ -19882,6 +19910,7 @@ mod tests {
                     run_target: None,
                     additional_directories: Vec::new(),
                     parent_conversation_id: None,
+                    fork_of: None,
                     preset_id: String::new(),
                     template_id: String::new(),
                     attached_workspaces: Vec::new(),
@@ -21705,6 +21734,7 @@ mod tests {
                     run_target: None,
                     additional_directories: Vec::new(),
                     parent_conversation_id: None,
+                    fork_of: None,
                     preset_id: String::new(),
                     template_id: String::new(),
                     attached_workspaces: Vec::new(),
@@ -26867,6 +26897,61 @@ mod tests {
         assert!(!asking.join().unwrap().unwrap());
     }
 
+    /// A card follows the app's UI language; it used to be Chinese whatever
+    /// the UI was in.
+    #[test]
+    fn a_card_is_worded_in_the_app_language() {
+        let state = AppState::default();
+        let workspace = tempfile::tempdir().unwrap();
+        let app_data = tempfile::tempdir().unwrap();
+        let anchor = app_data.path().join("document.v1.json");
+        let mut document = crate::catalog::default_document();
+        document.global_settings.resolved_app_language = crate::model::ResolvedLanguage::EnUs;
+        state
+            .document_store
+            .acquire_process_authority(&anchor)
+            .unwrap();
+        state.document_store.commit(&anchor, document).unwrap();
+        let approve = session_task_approval(
+            &state,
+            "conv-english".into(),
+            Arc::new(crate::model::LiveSecurityLevel::new(
+                SecurityLevel::RequestApproval,
+            )),
+            app_data.path().to_string_lossy().into_owned(),
+            Vec::new(),
+            crate::workspace_set::WorkspaceSet::default(),
+        );
+
+        let target = workspace.path().join("notes.md");
+        let request = write_request("conv-english", workspace.path(), &target.to_string_lossy());
+        let descriptor = write_descriptor();
+        let asking_state = state.clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let asking = thread::spawn(move || {
+            approve(
+                &request,
+                &descriptor,
+                ApprovalRequester::default(),
+                Some(&worker_cancel),
+            )
+        });
+        let card = await_pending_card(&asking_state, "conv-english");
+        assert_eq!(card.risk_level, "Medium");
+        assert_eq!(card.reason, "Manual mode asks before every write");
+
+        asking_state
+            .tool_prompts()
+            .resolve(
+                &card.prompt_id,
+                crate::tool_prompt::ToolPromptDecision::Deny,
+                None,
+            )
+            .unwrap();
+        assert!(!asking.join().unwrap().unwrap());
+    }
+
     /// Approval is consumed in the runner; a rejection must spawn no steps.
     #[test]
     fn a_refused_approval_prevents_any_workflow_step_from_spawning() {
@@ -28953,7 +29038,7 @@ mod tests {
         first.shell_tasks.install_store(directory.path()).unwrap();
         let mut guard = first
             .shell_tasks
-            .try_register(&request.conversation_id, "bash", "historical build", true)
+            .try_register(&request.conversation_id, "bash", "historical build", true, None)
             .unwrap();
         let address = format!("shell:{}", guard.shell_task_id());
         guard.finish(ShellTaskOutcome::Failed, Some(2));
@@ -29910,24 +29995,40 @@ mod tests {
     /// The child addendum follows the parent prompt profile, at both production
     /// call sites. Tool-catalogue language does not control injected text.
     #[test]
-    fn both_child_prompt_call_sites_take_the_language_from_the_parent_profile() {
-        let mut zh_parent = run_request(ProviderFamily::OpenaiResponses);
-        zh_parent.assembled_system_prompt = "Parent prompt.".into();
-        zh_parent.enabled_tools = vec!["read".into()];
-        zh_parent.tools = catalog::tool_catalog_for_language(ResolvedLanguage::EnUs);
-        zh_parent.prompt_profile = Arc::new(PromptProfile::builtin_chinese());
-        let mut en_parent = zh_parent.clone();
+    fn both_child_prompt_call_sites_take_the_addendum_from_the_parent_profile() {
+        let file_profile = || {
+            Arc::new(PromptProfile::from_file(
+                "file".into(),
+                "File".into(),
+                ResolvedLanguage::ZhCn,
+                [(
+                    crate::prompt_profile::PromptKey::SubagentAddendum,
+                    "你是主代理派生的子代理（所选文件）。".to_owned(),
+                )]
+                .into(),
+                Vec::new(),
+            ))
+        };
+        let mut file_parent = run_request(ProviderFamily::OpenaiResponses);
+        file_parent.assembled_system_prompt = "Parent prompt.".into();
+        file_parent.enabled_tools = vec!["read".into()];
+        file_parent.tools = catalog::tool_catalog_for_language(ResolvedLanguage::EnUs);
+        file_parent.prompt_profile = file_profile();
+        let mut en_parent = file_parent.clone();
         en_parent.prompt_profile = Arc::new(PromptProfile::builtin_english());
 
         // Call site 1: `agent_child_template`, the ordinary/fork prompt.
-        let zh_child = agent_child_template(&zh_parent).assembled_system_prompt;
+        let file_child = agent_child_template(&file_parent).assembled_system_prompt;
         let en_child = agent_child_template(&en_parent).assembled_system_prompt;
-        assert!(zh_child.contains("你是主代理派生的子代理"), "{zh_child}");
+        assert!(
+            file_child.contains("你是主代理派生的子代理（所选文件）。"),
+            "{file_child}"
+        );
         assert!(
             en_child.contains("You are a child agent spawned by the main agent"),
             "{en_child}"
         );
-        assert!(zh_child.starts_with("Parent prompt.\n\n---\n\n"));
+        assert!(file_child.starts_with("Parent prompt.\n\n---\n\n"));
         assert!(en_child.starts_with("Parent prompt.\n\n---\n\n"));
 
         // Call site 2: `configure_named_agent_template` uses the same parent
@@ -29954,9 +30055,12 @@ mod tests {
             .unwrap();
             child.assembled_system_prompt
         };
-        let zh_named = named_prompt(Arc::new(PromptProfile::builtin_chinese()));
+        let file_named = named_prompt(file_profile());
         let en_named = named_prompt(Arc::new(PromptProfile::builtin_english()));
-        assert!(zh_named.contains("你是主代理派生的子代理"), "{zh_named}");
+        assert!(
+            file_named.contains("你是主代理派生的子代理（所选文件）。"),
+            "{file_named}"
+        );
         assert!(
             en_named.contains("You are a child agent spawned by the main agent"),
             "{en_named}"

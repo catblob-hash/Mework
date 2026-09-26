@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  countRunningTasks,
   deriveTaskItems,
   finishedTaskItems,
   flattenTaskItems,
@@ -901,6 +902,48 @@ describe("deriveTaskItems", () => {
     expect(later[0]!.metrics.elapsedMs).toBe(155_000);
   });
 
+  it("reports the run time the command's machine measured once it has ended", () => {
+    // An SSH command's host span also holds the link: the round trips, and the
+    // output still streaming in after the process exited. Its own machine's
+    // figure is the command's run time, and replaces the span once it arrives.
+    const remote = shellTask({
+      startedAt: new Date(NOW - 90_000).toISOString(),
+      endedAt: new Date(NOW - 10_000).toISOString(),
+      outcome: "succeeded",
+      exitCode: 0,
+      durationMs: 42_500
+    });
+    const [finished] = deriveTaskItems({ agents: [], terminals: [], shellTasks: [remote], now: NOW }, messages);
+    expect(finished!.metrics.elapsedMs).toBe(42_500);
+    // Without one, a finished row still freezes at the host's span.
+    const [local] = deriveTaskItems({
+      agents: [],
+      terminals: [],
+      shellTasks: [{ ...remote, durationMs: null }],
+      now: NOW
+    }, messages);
+    expect(local!.metrics.elapsedMs).toBe(80_000);
+    // While it runs there is only this host's clock, and it keeps ticking.
+    const [running] = deriveTaskItems({ agents: [], terminals: [], shellTasks: [shellTask()], now: NOW }, messages);
+    expect(running!.metrics.elapsedMs).toBe(90_000);
+  });
+
+  it("names the workspace a shell command ran in once the conversation has more than one", () => {
+    const shellTasks = [
+      shellTask({ workspaceRoot: "/Users/me/web" }),
+      shellTask({ shellTaskId: "shell-2", toolName: "powershell", workspaceRoot: "~/src/api/" }),
+      // A row recorded before the host kept its workspace has nothing to name.
+      shellTask({ shellTaskId: "shell-3", workspaceRoot: null })
+    ];
+    const several = deriveTaskItems({ agents: [], terminals: [], shellTasks, multipleWorkspaces: true, now: NOW }, messages);
+    expect(several.map((item) => item.label)).toEqual(["bash · web", "powershell · api", "bash"]);
+    // The command stays the detail; the workspace belongs with the tool.
+    expect(several[0]!.detail).toBe("npm install");
+    // One workspace needs no telling apart.
+    const one = deriveTaskItems({ agents: [], terminals: [], shellTasks, now: NOW }, messages);
+    expect(one.map((item) => item.label)).toEqual(["bash", "powershell", "bash"]);
+  });
+
   /**
    * The model is never told how a fork ended, so the task bar is the only place
    * the decision is recorded at all. Both outcomes have to land there — a
@@ -1028,5 +1071,28 @@ describe("task item partitions", () => {
     expect(runningTaskItems(items).map((item) => item.id)).toEqual(["live"]);
     expect(finishedTaskItems(items).map((item) => item.id))
       .toEqual(["done", "broken", "terminal-1"]);
+  });
+
+  it("counts running work without the plan, which sits in that list at every status", () => {
+    const items = deriveTaskItems({
+      agents: [
+        agent("live", { status: "running", completedAt: null }),
+        agent("done")
+      ],
+      terminals: [terminal({ phase: "exited" })],
+      shellTasks: [shellTask()],
+      plan: {
+        conversationId: "conversation-1",
+        markdown: "# 计划",
+        status: "draft",
+        createdAt: new Date(NOW).toISOString(),
+        updatedAt: new Date(NOW).toISOString()
+      },
+      planDrafting: true,
+      now: NOW
+    }, messages);
+
+    expect(runningTaskItems(items).map((item) => item.kind)).toContain("plan");
+    expect(countRunningTasks(items)).toBe(2);
   });
 });

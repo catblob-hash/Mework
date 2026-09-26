@@ -18,7 +18,7 @@ Nine operations, one tool:
 
 Every operation takes `filePath`, `line` and `character`. Line and character are **1-based**, the numbers your editor shows. `workspaceSymbol` also takes `query`. The [`lsp` tool page](tools/lsp.html) has the parameters as the model sees them.
 
-`lsp` is one of the switches in a conversation's **Enabled tools** list, under the name **Code navigation**. The shipped presets have it on.
+`lsp` is one of the switches in a conversation's **Enabled tools** list, under the name **Code navigation**. The built-in **mework** preset has it on.
 
 An ordinary call is classified as a **read** of `filePath`: inside the workspace it passes at every [security level](working.html#tools-and-approvals), and outside it asks at Manual and in Plan mode. If the project you are working in ships its own `.mework/lsp.json`, every call is classified as an **unbounded action** instead and asks at every level below Full access — that file gets to name the command Mework launches, and a repository you cloned is not the same thing as a choice you made. Only its existence is checked, never its contents. Nothing else moves the classification: a `~/.mework/lsp.json` of your own and the built-in table leave it where it was, and which server actually answers the call is not consulted either. **Always allow** remembers the answer for `lsp` in that conversation.
 

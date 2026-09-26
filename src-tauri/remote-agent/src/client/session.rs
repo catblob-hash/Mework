@@ -459,6 +459,7 @@ mod tests {
                     signal: None,
                     reason: ExitReason::Exited,
                     ends: StreamEnds { stdout: 14, stderr: 0 },
+                    runtime_ms: None,
                 });
             })
         };

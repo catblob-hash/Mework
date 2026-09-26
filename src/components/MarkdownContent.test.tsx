@@ -98,31 +98,51 @@ $$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$
     expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument();
   });
 
-  it("sweeps only the newly arrived tail, and stops marking settled text", () => {
-    // The reveal must restart each commit (an unchanged animation name would
-    // not replay) and must start where the previous commit ended, so settled
-    // text is not re-faded every 100 ms.
+  it("sweeps only the newly arrived text, and stops marking settled text", () => {
+    const fresh = (container: HTMLElement) => Array.from(container.querySelectorAll<HTMLElement>(".stream-fresh"));
     const { container, rerender } = render(<MarkdownContent content="前半段" streaming />);
-    const host = container.querySelector<HTMLElement>(".markdown-content")!;
-    const firstTick = host.getAttribute("data-stream-tick");
-    expect(firstTick).not.toBeNull();
+    // Nothing was on screen yet, so all of it is new.
+    expect(fresh(container).map((span) => span.textContent)).toEqual(["前半段"]);
+    const firstTick = fresh(container)[0].className;
 
+    // Only the continuation moves, and under the other tick: React keeps the
+    // span, and an unchanged animation name would not replay.
     rerender(<MarkdownContent content="前半段，加上后半段" streaming />);
-    expect(host.getAttribute("data-stream-tick")).not.toBe(firstTick);
-    const from = host.style.getPropertyValue("--stream-reveal-from");
-    expect(Number.parseInt(from, 10)).toBeGreaterThan(0);
-    expect(Number.parseInt(from, 10)).toBeLessThan(100);
+    expect(fresh(container).map((span) => span.textContent)).toEqual(["，加上后半段"]);
+    expect(fresh(container)[0].className).not.toBe(firstTick);
+    expect(container.querySelector("p")).toHaveTextContent("前半段，加上后半段");
 
-    // Same content again: nothing new arrived, so the tick must not advance —
-    // advancing would restart the sweep and re-fade text the reader already
-    // has, which is what makes a fixed-cadence stream look like it is blinking.
-    const settledTick = host.getAttribute("data-stream-tick");
+    // The same text again is not new text: the sweep in flight is left alone
+    // rather than restarted, which would re-fade what the reader already has.
+    const settledTick = fresh(container)[0].className;
     rerender(<MarkdownContent content="前半段，加上后半段" streaming />);
-    expect(host.getAttribute("data-stream-tick")).toBe(settledTick);
+    expect(fresh(container).map((span) => span.textContent)).toEqual(["，加上后半段"]);
+    expect(fresh(container)[0].className).toBe(settledTick);
 
-    // Settled text carries no reveal state at all.
+    // Settled text carries no reveal at all.
     rerender(<MarkdownContent content="前半段，加上后半段" />);
-    expect(host).not.toHaveAttribute("data-stream-tick");
+    expect(fresh(container)).toHaveLength(0);
+  });
+
+  it("sweeps text by what renders, across blocks in reading order, and leaves code alone", () => {
+    const fresh = (container: HTMLElement) => Array.from(container.querySelectorAll<HTMLElement>(".stream-fresh"));
+    const { container, rerender } = render(<MarkdownContent content="先看 **bo" streaming />);
+
+    // `**bo` was literal text; closed, it renders as bold `bo` plus the rest,
+    // and it is the rendered text that is new.
+    rerender(<MarkdownContent content={"先看 **bold** 然后\n\n第二段\n\n```ts\nconst x = 1;\n```"} streaming />);
+    const spans = fresh(container);
+    expect(spans.map((span) => span.textContent)).toEqual(["bold", " 然后", "第二段"]);
+    expect(spans[0].closest("strong")).not.toBeNull();
+    // One stroke in reading order: each span starts where the text before it ends.
+    const delays = spans.map((span) => Number.parseFloat(span.style.animationDelay));
+    expect(delays[0]).toBe(0);
+    expect(delays[1]).toBeGreaterThan(delays[0]);
+    expect(delays[2]).toBeGreaterThan(delays[1]);
+    expect(delays[2] + Number.parseFloat(spans[2].style.animationDuration)).toBeLessThanOrEqual(100);
+    // A code block is drawn from its tree's text, which a span would break.
+    expect(container.querySelector("pre .stream-fresh")).toBeNull();
+    expect(container.querySelector("pre")).toHaveTextContent("const x = 1;");
   });
 
   it("defers historical Markdown outside the viewport and releases it again after scrolling away", () => {

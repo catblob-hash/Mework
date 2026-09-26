@@ -25,15 +25,8 @@
   right: 0;
   width: 288px;
   max-height: min(440px, calc(100vh - var(--topbar-height, 56px) - 72px));
-  opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transform: translateY(10px);
-  transform-origin: bottom right;
-  transition:
-    opacity .2s ease,
-    transform .26s cubic-bezier(.2, .75, .25, 1),
-    visibility 0s linear .26s;
   overflow: auto;
   border: 0;
   border-top: 1px solid var(--border, var(--color-dfdfda));
@@ -44,11 +37,8 @@
   box-shadow: 0 14px 28px var(--color-000000-ap7);
 }
 .git-status-card--expanded .git-status-card__body {
-  opacity: 1;
   visibility: visible;
   pointer-events: auto;
-  transform: none;
-  transition-delay: 0s;
 }
 .git-status-card__heading { padding: 11px 12px 8px; color: var(--faint, var(--color-989892)); font-size: 9.5px; font-weight: 650; letter-spacing: .025em; }
 .git-status-card__row {
@@ -70,7 +60,3 @@
 .git-status-card__diff-stat { display: inline-flex; align-items: center; gap: 5px; font: 10px var(--mono, ui-monospace, monospace); }
 .git-status-card__diff-stat b { color: var(--success, var(--color-218a62)); font-weight: 650; }
 .git-status-card__diff-stat em { color: var(--danger); font-style: normal; font-weight: 650; }
-
-@media (prefers-reduced-motion: reduce) {
-  .git-status-card__body, .git-status-card__toggle { transition-duration: .01ms; }
-}

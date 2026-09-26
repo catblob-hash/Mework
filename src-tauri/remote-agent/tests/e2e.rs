@@ -539,6 +539,35 @@ fn a_request_made_while_the_link_is_down_is_delivered_after_it_returns() {
     link.close(true);
 }
 
+/// A process that ends while the link is down is heard of late, but its exit
+/// still says how long it ran rather than how long the host waited to hear.
+#[cfg(unix)]
+#[test]
+fn an_exit_heard_late_still_reports_how_long_the_process_ran() {
+    let root = scratch_root();
+    let launcher = DirectLauncher::new(root.path(), 3);
+    let (current, _) = launcher.handle();
+    let blocked = launcher.blocker();
+    let link = Link::start(config("host-a", "e1"), launcher);
+    let started = Instant::now();
+    let process = link.spawn(spec("s1", &["sleep", "0.5"]), b"", CALL).unwrap();
+    // Down before the process ends, and kept down well past it.
+    blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+    kill_transport(&current);
+    std::thread::sleep(Duration::from_secs(2));
+    blocked.store(false, std::sync::atomic::Ordering::SeqCst);
+    let exit = process.wait().unwrap();
+    let heard_after = started.elapsed();
+    assert_eq!(exit.code, Some(0));
+    let runtime = Duration::from_millis(exit.runtime_ms.expect("the agent timed the process"));
+    assert!(runtime >= Duration::from_millis(450), "{runtime:?}");
+    assert!(
+        runtime + Duration::from_secs(1) < heard_after,
+        "ran {runtime:?}, heard after {heard_after:?}"
+    );
+    link.close(true);
+}
+
 /// The agent drops a connection that stops sending, even though its socket
 /// never closed; the link notices and replaces it.
 #[test]

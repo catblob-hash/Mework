@@ -1,0 +1,104 @@
+{
+  "source": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+  "variants": {
+    "ane": {
+      "version": "qwen35-ane-1",
+      "files": [
+        {
+          "remote": "ane/qwen35-ane-1/config.json",
+          "local": "config.json",
+          "size": 2907,
+          "sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+        },
+        {
+          "remote": "ane/qwen35-ane-1/embedding.json",
+          "local": "embedding.json",
+          "size": 752,
+          "sha256": "13d57311d9c20e12ea05b754a7755ce4e56fcd262ceb607f9eced1ea3212a2c4"
+        },
+        {
+          "remote": "ane/qwen35-ane-1/model.mlpackage/Data/com.apple.CoreML/model.mlmodel",
+          "local": "model.mlpackage/Data/com.apple.CoreML/model.mlmodel",
+          "size": 1501857,
+          "sha256": "e71c33de92530aaba2ec2bc761c09b495bdad1cab59f3118addde2aee1e63c6c"
+        },
+        {
+          "remote": "ane/qwen35-ane-1/model.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+          "local": "model.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+          "size": 1505702848,
+          "sha256": "ffdfaa25b0ae38c63e48b002163d905029902f3b38ddb0cac9a2cf55f60d2521"
+        },
+        {
+          "remote": "ane/qwen35-ane-1/model.mlpackage/Manifest.json",
+          "local": "model.mlpackage/Manifest.json",
+          "size": 617,
+          "sha256": "695d3b02aa79573c0e0e87ec7f1d596865bed53055904338f89e3f86f1e4c223"
+        },
+        {
+          "remote": "ane/qwen35-ane-1/tokenizer.json",
+          "local": "tokenizer.json",
+          "size": 12807982,
+          "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        }
+      ]
+    },
+    "llama": {
+      "version": "qwen35-gguf-f16-1",
+      "files": [
+        {
+          "remote": "llama/qwen35-gguf-f16-1/config.json",
+          "local": "config.json",
+          "size": 2907,
+          "sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+        },
+        {
+          "remote": "llama/qwen35-gguf-f16-1/qwen3.5-0.8b-f16.gguf",
+          "local": "qwen3.5-0.8b-f16.gguf",
+          "size": 1516744224,
+          "sha256": "e39cf9acaa5d9176157984211502bc7d0cea4a8a8ccac5df0874ee9a15d73daf"
+        },
+        {
+          "remote": "llama/qwen35-gguf-f16-1/tokenizer.json",
+          "local": "tokenizer.json",
+          "size": 12807982,
+          "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        }
+      ]
+    },
+    "mlx": {
+      "version": "qwen35-mlx-1+mlx-0.32.2",
+      "files": [
+        {
+          "remote": "mlx/qwen35-mlx-1/config.json",
+          "local": "config.json",
+          "size": 2907,
+          "sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+        },
+        {
+          "remote": "mlx/qwen35-mlx-1/tokenizer.json",
+          "local": "tokenizer.json",
+          "size": 12807982,
+          "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        {
+          "remote": "mlx/qwen35-mlx-1/weights.bin",
+          "local": "weights.bin",
+          "size": 1507442688,
+          "sha256": "2ea3ff192912914874f99d688c5426efe3ce73ac462e387f9dcfd109a980284e"
+        },
+        {
+          "remote": "mlx/qwen35-mlx-1/weights.json",
+          "local": "weights.json",
+          "size": 38314,
+          "sha256": "964ea5dbf2de966a03e619a3bb0bc49df2a733e37eeac2571df373922ed39c91"
+        },
+        {
+          "remote": "mlx/runtime/0.32.2/mlx.metallib",
+          "local": "mlx.metallib",
+          "size": 135865440,
+          "sha256": "a19618258e2a215d0d0ac3056174a6e066818bb6cdecb50062cc9316076ebe43"
+        }
+      ]
+    }
+  }
+}

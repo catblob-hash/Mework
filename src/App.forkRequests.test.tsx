@@ -63,7 +63,7 @@ function forkedChild(document: AppDocument, prompt: string): Conversation {
 describe("App fork requests", () => {
   beforeEach(resetAppMocks);
 
-  it("draws a pushed fork request in the tray, approves it through the host, and starts the child's run nested under its source", async () => {
+  it("draws a pushed fork request in the tray, approves it through the host, and starts the child's run beside its source", async () => {
     const document = documentWithModel();
     const source = document.workspaces[0].conversations[0];
     source.contexts = [
@@ -124,9 +124,10 @@ describe("App fork requests", () => {
     expect(runtimeMocks.createConversationRemote).not.toHaveBeenCalled();
 
     const sidebar = within(window.document.querySelector(".workspace-list") as HTMLElement);
+    // The child is listed beside its source as an ordinary conversation of the project.
     const parentRow = sidebar.getByText(source.title).closest(".conversation-row") as HTMLElement;
-    expect(within(parentRow).getByRole("button", { name: "收起子会话" })).toBeInTheDocument();
-    expect(sidebar.getByText("把测试也跑一遍").closest(".conversation-row")).toHaveClass("conversation-row--nested");
+    const childRow = sidebar.getByText("把测试也跑一遍").closest(".conversation-row") as HTMLElement;
+    expect(childRow.parentElement).toBe(parentRow.parentElement);
     // The user is not yanked into the child; the source stays active.
     expect(sidebar.getByText(source.title).closest(".conversation-row")).toHaveClass("conversation-row--active");
 
@@ -311,18 +312,15 @@ describe("App fork requests", () => {
     render(<App />);
     const sidebar = within(await screen.findByRole("navigation") as HTMLElement);
     const middleRow = sidebar.getByText("中间层").closest(".conversation-row") as HTMLElement;
-    expect(sidebar.getByText("叶子").closest(".conversation-list--nested")).not.toBeNull();
 
     // Two-click delete: arm, then confirm.
     await user.click(within(middleRow).getByRole("button", { name: "删除 中间层" }));
     await user.click(within(middleRow).getByRole("button", { name: "确认删除 中间层" }));
 
     await waitFor(() => expect(sidebar.queryByText("中间层")).not.toBeInTheDocument());
-    // The leaf now hangs directly under the root instead of vanishing with the
-    // middle layer.
+    // The leaf does not vanish with the middle layer; its link moves to the root.
     const rootRow = sidebar.getByText(root.title).closest(".conversation-row") as HTMLElement;
-    expect(within(rootRow).getByRole("button", { name: "收起子会话" })).toBeInTheDocument();
-    expect(sidebar.getByText("叶子").closest(".conversation-row")).toHaveClass("conversation-row--nested");
+    expect(sidebar.getByText("叶子").closest(".conversation-row")!.parentElement).toBe(rootRow.parentElement);
     await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some(([snapshot]) => (
       (snapshot as AppDocument).workspaces[0].conversations
         .find((candidate) => candidate.id === leaf.id)?.parentConversationId === root.id
