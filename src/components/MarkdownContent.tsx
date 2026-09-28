@@ -109,9 +109,34 @@ function backslashIsEscaped(value: string, index: number) {
 }
 
 /**
+ * Where a single `$` at `open` closes as inline math, or -1 when it is text.
+ * remark-math pairs dollars the way it pairs backticks, so "$4.50 vs $4.75"
+ * became a formula. This takes Pandoc's rule for the pair it would make: the
+ * opener is followed by a non-space, the closer is preceded by a non-space and
+ * not followed by a digit. The search ends at a code span, `$$` or a blank line.
+ */
+function singleDollarClose(content: string, open: number) {
+  if (!/\S/.test(content[open + 1] ?? " ")) return -1;
+  for (let cursor = open + 1; cursor < content.length; cursor += 1) {
+    const character = content[cursor];
+    if (character === "`") return -1;
+    if (character === "\n") {
+      const lineEnd = content.indexOf("\n", cursor + 1);
+      if (content.slice(cursor + 1, lineEnd === -1 ? content.length : lineEnd).trim() === "") return -1;
+      continue;
+    }
+    if (character !== "$" || backslashIsEscaped(content, cursor)) continue;
+    if (content[cursor + 1] === "$" || /\s/.test(content[cursor - 1]) || /\d/.test(content[cursor + 1] ?? "")) return -1;
+    return cursor;
+  }
+  return -1;
+}
+
+/**
  * remark-math understands dollar delimiters. Models also commonly emit the
  * LaTeX-style \(...\) and \[...\] forms, so normalize those while leaving
- * fenced and inline code untouched.
+ * fenced and inline code untouched. A single `$` that does not open or close
+ * inline math (see `singleDollarClose`) is escaped, so prices stay text.
  */
 export function normalizeMathDelimiters(content: string) {
   let result = "";
@@ -120,6 +145,7 @@ export function normalizeMathDelimiters(content: string) {
   let fence: { marker: "`" | "~"; length: number } | null = null;
   let lineStart = true;
   let closeFenceAtLineEnd = false;
+  let mathClose = -1;
 
   while (cursor < content.length) {
     if (lineStart && inlineTicks === 0) {
@@ -168,6 +194,18 @@ export function normalizeMathDelimiters(content: string) {
     if (!fence && inlineTicks === 0 && character === "$" && content[cursor + 1] === "$" && !backslashIsEscaped(content, cursor)) {
       result += "\n$$\n";
       cursor += 2;
+      lineStart = false;
+      continue;
+    }
+
+    if (!fence && inlineTicks === 0 && character === "$" && !backslashIsEscaped(content, cursor)) {
+      if (cursor === mathClose) mathClose = -1;
+      else if (mathClose === -1) {
+        mathClose = singleDollarClose(content, cursor);
+        if (mathClose === -1) result += "\\";
+      }
+      result += character;
+      cursor += 1;
       lineStart = false;
       continue;
     }

@@ -29,7 +29,7 @@ import type {
   ResourceDescriptor,
   ToolDescriptor
 } from "../types";
-import { Dialog, Switch } from "./Common";
+import { Dialog, DialogSidebarTitle, Switch, useInSidebarDialog } from "./Common";
 import { editableUserAgentDefinition } from "../lib/agentDefinitions";
 import { isHostDerivedToolName, isPreviewLifecycleToolName } from "../lib/taskTools";
 import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/webSearch";
@@ -209,6 +209,7 @@ export function ConversationSettings({
   presetId
 }: ConversationSettingsProps) {
   const { t } = useI18n();
+  const inWindow = useInSidebarDialog();
   const settings = conversation.settings;
   const [view, setView] = useState<ConversationSettingsView>("features");
   /* The preset currently open in a window of this pane, held as a whole
@@ -430,6 +431,7 @@ export function ConversationSettings({
         className="conversation-settings__nav settings-nav"
         aria-label={t("对话设置分类", "Conversation settings categories")}
       >
+        <DialogSidebarTitle />
         <div className="conversation-settings__nav-items">
           {pages.map((item) => {
             const Icon = item.icon;
@@ -475,6 +477,9 @@ export function ConversationSettings({
 
       <div className="conversation-settings__page">
         <header className="conversation-settings__page-header">
+          {/* In the side pane the pane's own header names it; a window has no title
+              bar, so the page names itself, beside the window's close button. */}
+          {inWindow && <h3 className="conversation-settings__page-title">{pageTitles[view]}</h3>}
           <p>{pageBlurbs[view]}</p>
           {builtinPreset && <p className="field__hint">{t(
             "内置预设随 Mework 版本更新，不能修改或删除。在这里改动的设置可以另存为一份新预设；对话模板只读，不随副本带走。",
@@ -725,6 +730,7 @@ export function ConversationSettings({
         <Dialog
           title={openedPreset.name || t("未命名预设", "Untitled preset")}
           width="1040px"
+          sidebar
           bodyClassName="dialog__body--flush"
           onClose={() => setPresetDraft(null)}
         >

@@ -115,8 +115,8 @@ button.sortable-surface:active,
 .workspace-group.drop-target--before::before, .conversation-row.drop-target--before::before { top: 0; }
 .workspace-group.drop-target--after::after, .conversation-row.drop-target--after::after { bottom: 0; }
 .sidebar__footer { min-height: 42px; border-top: 1px solid var(--border); padding-top: 7px; display: flex; align-items: center; }
-.sidebar__footer > button { flex: 1; min-width: 0; height: 34px; display: flex; align-items: center; gap: 9px; padding: 0 9px; background: transparent; border-radius: 7px; font-size: 12.5px; text-align: left; }
+/* Settings is a row like the others: the list's full width, its gear in the lead column. */
+.sidebar__footer > button { flex: 1; min-width: 0; height: var(--sidebar-row); display: flex; align-items: center; gap: 7px; padding: 0 7px; background: transparent; border-radius: 7px; font-size: 12.5px; text-align: left; }
 .sidebar__footer > button:hover { background: var(--hover); }
-.version-badge { margin-right: 8px; border: 1px solid var(--border-strong); border-radius: 999px; padding: 2px 6px; font-size: 9px; color: var(--faint); }
-/* Browser-dev uses a separate data domain; isolation from release data is intentional. */
-.version-badge--dev-domain { border-color: var(--color-d97706); color: var(--color-d97706); cursor: help; white-space: nowrap; }
+.sidebar__footer > button svg { flex: 0 0 auto; }
+.sidebar__footer > button span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

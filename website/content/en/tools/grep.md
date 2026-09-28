@@ -6,7 +6,11 @@ Calls are classified as reads. A search that stays inside the workspace, the app
 
 ## Behavior and limits
 
-Patterns use Rust `regex` syntax — character classes, alternation, anchors and repetition, but no backreferences or lookaround — and every line is matched on its own, so `^` and `$` bind to line ends. The walk does not follow symlinks and applies no ignore-file filtering. Files larger than 2 MiB are skipped, and so is any file with a NUL byte among its first 8,192 bytes, which is how binaries are recognised; invalid UTF-8 elsewhere is replaced rather than fatal. Line numbers are 1-based and each reported line is cut at 500 characters. The search stops after 1,000 result lines and says so; an entry that could not be traversed contributes a `[skipped]` line rather than failing the call, and no hits at all answers `No matches found`. Output over 64 KiB is truncated.
+Patterns use Rust `regex` syntax — character classes, alternation, anchors and repetition, but no backreferences or lookaround — and every line is matched on its own, so `^` and `$` bind to line ends.
+
+Inside a Git work tree the search covers what Git would show: tracked files and untracked files that are not ignored, so build output, `node_modules` and whatever else `.gitignore` names produce no hits. Outside a work tree, dependency and build directories are skipped by name, as [ls](ls.html) describes. Version-control directories are never searched. A `path` inside an ignored directory is searched in full, and a single file named as `path` is searched whatever the rules say. Symlinks are not followed. Files larger than 2 MiB are skipped, and so is any file with a NUL byte among its first 8,192 bytes, which is how binaries are recognised; invalid UTF-8 elsewhere is replaced rather than fatal.
+
+Line numbers are 1-based and each reported line is cut at 500 characters. A call returns 250 matching lines unless `limit` asks for another number, up to 1,000; when more follow, a last line gives the `offset` of the next page, and `offset` can reach 100,000. An entry that could not be read adds a `[skipped]` line (the first 20 are named, the rest counted) rather than failing the call, and no hits at all answers `No matches found`. A result longer than 20,000 characters is saved to a file under the app-data directory and replaced by its path and first 2,000 characters; `read` or `grep` that file for the rest.
 
 ## Related
 

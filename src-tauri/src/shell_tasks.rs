@@ -42,12 +42,11 @@ const MAX_DISPLAY_COMMAND: usize = 512;
 
 /// Live output retained per command, in bytes.
 ///
-/// This buffer keeps the **tail**, which is the opposite of what the tool result keeps: the
-/// executor caps its captured bytes at `MAX_TOOL_OUTPUT` from the *start*, because the model is
-/// reading a result and the first thing a command says is usually the thing that explains it. A
-/// person watching a build wants the other end — the error it died on. Both are right for their
-/// own reader, so the two truncations deliberately disagree, and the page says so by reporting
-/// `dropped_head_bytes` rather than quietly presenting a tail as the whole output.
+/// This buffer keeps only the **tail**: a person watching a build wants the error it died on.
+/// The model's copy is a different thing — the executor keeps both the start and the end of each
+/// stream, and hands the model a file and a preview once the output is long — so the two do not
+/// match past this size, and the page says so by reporting `dropped_head_bytes` rather than
+/// quietly presenting a tail as the whole output.
 const MAX_LIVE_OUTPUT: usize = 256 * 1024;
 
 /// Which pipe a chunk came from. The two pipes are drained by independent threads, so their
@@ -1804,9 +1803,9 @@ mod tests {
         assert_eq!(seqs, vec![0, 1, 2]);
     }
 
-    /// The page keeps the tail and says so. The model's copy of the same command keeps the head,
-    /// because `MAX_TOOL_OUTPUT` truncates from the other end — the two deliberately disagree, and
-    /// a page that hid that would be presenting a suffix as the whole output.
+    /// The page keeps the tail and says so. The model's copy of the same command keeps its start
+    /// as well, so the two deliberately disagree, and a page that hid that would be presenting a
+    /// suffix as the whole output.
     #[test]
     fn the_buffer_keeps_the_tail_and_reports_what_it_dropped() {
         let registry = ShellTaskRegistry::default();

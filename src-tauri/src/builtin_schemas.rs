@@ -238,6 +238,20 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "boolean",
                     "default": false,
                     "description": "Match case-sensitively."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 250,
+                    "description": "Most matching lines to return."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100000,
+                    "default": 0,
+                    "description": "Matching lines to skip first, to fetch the next page."
                 }
             },
             "required": ["pattern"],
@@ -283,7 +297,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                 "end_line": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Last line to return, inclusive; must not be smaller than start_line. Text files only."
+                    "description": "Last line to return, inclusive; must not be smaller than start_line. Without it a read returns 2,000 lines. Text files only."
                 }
             },
             "required": ["path"],

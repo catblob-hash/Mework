@@ -1,5 +1,5 @@
 {
-  "keyCount": 254,
+  "keyCount": 262,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -1322,11 +1322,24 @@
       ]
     },
     {
-      "description": "Last line of an `ls` result that hit the entry limit.",
+      "description": "Line of an `ls` result the character budget cut, naming the depth down to which the listing is complete.",
       "id": "tool.ls_limit",
+      "placeholders": [
+        "limit",
+        "depth"
+      ]
+    },
+    {
+      "description": "Line of an `ls` result the character budget cut partway through the first level.",
+      "id": "tool.ls_limit_partial",
       "placeholders": [
         "limit"
       ]
+    },
+    {
+      "description": "Line of an `ls` result that listed ignored directories without expanding them.",
+      "id": "tool.ls_ignored_note",
+      "placeholders": []
     },
     {
       "description": "`ls` result for an empty directory.",
@@ -1334,17 +1347,26 @@
       "placeholders": []
     },
     {
-      "description": "Line in a `grep` result for a file that could not be read.",
+      "description": "An ignored entry in an `ls` or `find` result: a directory `ls` did not expand, a match `find` listed last.",
+      "id": "tool.ignored_entry",
+      "placeholders": [
+        "path"
+      ]
+    },
+    {
+      "description": "Line in a `grep` or `ls` result for an entry that could not be read.",
       "id": "tool.grep_skipped",
       "placeholders": [
         "error"
       ]
     },
     {
-      "description": "Last line of a `grep` result that hit the match limit.",
+      "description": "Last line of a `grep` page when more matches follow, with the offset of the next page.",
       "id": "tool.grep_limit",
       "placeholders": [
-        "limit"
+        "from",
+        "to",
+        "next"
       ]
     },
     {
@@ -1353,8 +1375,31 @@
       "placeholders": []
     },
     {
-      "description": "Last line of a `find` result that hit the entry limit.",
+      "description": "`grep` result when the requested offset is past the last match.",
+      "id": "tool.grep_no_match_at_offset",
+      "placeholders": [
+        "offset",
+        "count"
+      ]
+    },
+    {
+      "description": "Line of a `find` result that returned only some of its matches.",
       "id": "tool.find_limit",
+      "placeholders": [
+        "shown",
+        "total"
+      ]
+    },
+    {
+      "description": "Line of a `find` result some of whose matches are in ignored paths, listed last.",
+      "id": "tool.find_ignored_note",
+      "placeholders": [
+        "count"
+      ]
+    },
+    {
+      "description": "Line of a `find` result that stopped examining entries, so its total is a floor.",
+      "id": "tool.find_scan_limit",
       "placeholders": [
         "limit"
       ]
@@ -1381,10 +1426,21 @@
       "placeholders": []
     },
     {
-      "description": "Last line of a `read` result that hit the line limit.",
+      "description": "Last line of a `read` result that stopped before the end of the file or of the requested range.",
       "id": "tool.read_limit",
       "placeholders": [
-        "limit"
+        "from",
+        "to",
+        "total",
+        "next"
+      ]
+    },
+    {
+      "description": "`read` error when a single line is longer than one read can return.",
+      "id": "tool.read_line_too_long",
+      "placeholders": [
+        "line",
+        "size"
       ]
     },
     {
@@ -1450,9 +1506,11 @@
       ]
     },
     {
-      "description": "Suffix when a command's output was cut to the limit.",
-      "id": "tool.shell_output_truncated",
-      "placeholders": []
+      "description": "Line standing in for the middle of a command's output, past what is kept of its start and end.",
+      "id": "tool.shell_output_omitted",
+      "placeholders": [
+        "size"
+      ]
     },
     {
       "description": "Shell result when the user aborted the command.",
@@ -1489,6 +1547,16 @@
       "description": "Suffix when a tool result was cut to the output limit.",
       "id": "tool.output_truncated",
       "placeholders": []
+    },
+    {
+      "description": "What a shell or `grep` result too long to return whole becomes: where the full output was saved, and its start.",
+      "id": "tool.output_spilled",
+      "placeholders": [
+        "size",
+        "path",
+        "preview_size",
+        "preview"
+      ]
     },
     {
       "description": "Suffix when a write/edit diff was cut to the limit.",

@@ -206,7 +206,7 @@ describe("composer context chips", () => {
     }
   });
 
-  it("hides the project chip once the conversation has started", async () => {
+  it("hides the project, branch and worktree chips once the conversation has started", async () => {
     const document = documentWithModel();
     document.workspaces[0].conversations[0].contexts = [{
       id: "ctx-started",
@@ -218,8 +218,11 @@ describe("composer context chips", () => {
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
 
-    await branchChip("main");
+    // Git has been read — its status card is up — but where the task runs was settled when it began.
+    await screen.findByRole("complementary", { name: "Git 状态" });
     expect(screen.queryByRole("button", { name: /^项目：/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^分支：/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
   });
 
   it("points the Git chip at the workspace picked in a multi-workspace project", async () => {

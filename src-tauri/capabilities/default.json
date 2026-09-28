@@ -102,6 +102,8 @@
     "allow-background-image-put",
     "allow-background-image-commit",
     "allow-background-image-data",
+    "allow-background-image-list",
+    "allow-background-image-delete",
     "allow-file-attachment-upload",
     "allow-file-attachment-data",
     "allow-dropped-paths-probe",

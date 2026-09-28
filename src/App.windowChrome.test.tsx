@@ -88,6 +88,34 @@ describe("App window chrome", () => {
     expect(activeTitle()).toBe(second.title);
   });
 
+  it("sends a solid ground picked from the other theme back to the theme's own when the theme changes", async () => {
+    const { document } = twoConversations();
+    document.globalSettings.theme = "day";
+    document.globalSettings.appearance = { ...document.globalSettings.appearance, background: "solid:night" };
+    const { user } = await renderApp(document);
+    const root = window.document.documentElement;
+    // Applying the saved theme at startup is not a change of theme.
+    expect(root.dataset.theme).toBe("day");
+    expect(root.dataset.backdrop).toBe("custom");
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    const dialog = screen.getByRole("dialog", { name: "全局设置" });
+    await user.click(within(within(dialog).getByRole("navigation", { name: "全局设置分类" })).getByRole("button", { name: "外观" }));
+    await user.click(within(dialog).getByRole("button", { name: "深色" }));
+    expect(root.dataset.theme).toBe("night");
+    await waitFor(() => expect(root.dataset.backdrop).toBe("theme"));
+
+    // A picture stays whatever the theme does.
+    await user.click(within(dialog).getByRole("button", { name: "选择背景…" }));
+    const library = await screen.findByRole("dialog", { name: "背景" });
+    await user.click(within(library).getByRole("button", { name: "书架中" }));
+    await user.click(within(library).getByRole("button", { name: "完成" }));
+    await user.click(within(dialog).getByRole("button", { name: "浅色" }));
+    expect(root.dataset.theme).toBe("day");
+    expect(root.dataset.backdrop).toBe("custom");
+    expect(window.document.querySelector(".app-backdrop__image")).toHaveAttribute("src", expect.stringContaining("shelf"));
+  });
+
   it("toggles the sidebar from the drawer button beside the arrows", async () => {
     const { document } = twoConversations();
     const { user } = await renderApp(document);

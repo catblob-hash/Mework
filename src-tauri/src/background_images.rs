@@ -11,6 +11,10 @@
 //! a `.staging-<upload>` directory (a whole ladder in one message would outgrow
 //! the browser-dev bridge's frame limit) and become an image only when committed
 //! by a rename, so a half-finished upload is never mistaken for one.
+//!
+//! The images are the user's library of backgrounds: an import stays until the
+//! user removes it, whichever background the settings point at. The pictures
+//! that ship with the app are not here; the renderer bundles them.
 
 use std::{
     fs,
@@ -132,9 +136,8 @@ impl BackgroundImageStore {
         Ok(upload_id)
     }
 
-    /// Turns an upload into an image, then drops every other image except `keep`
-    /// (the one the saved settings still point at, which stays until they stop).
-    pub fn commit(&self, upload_id: &str, keep: Option<&str>) -> Result<BackgroundImage, String> {
+    /// Turns an upload into an image of the library.
+    pub fn commit(&self, upload_id: &str) -> Result<BackgroundImage, String> {
         validate_upload_id(upload_id)?;
         let staging = self.root.join(format!("{STAGING_PREFIX}{upload_id}"));
         let tiers = list_tiers(&staging)?;
@@ -170,7 +173,7 @@ impl BackgroundImageStore {
             fs::rename(&staging, &destination)
                 .map_err(|error| format!("无法保存背景图片: {error}"))?;
         }
-        self.prune(&[Some(id.as_str()), keep], STALE_STAGING_AGE);
+        self.prune_staging(STALE_STAGING_AGE);
         Ok(BackgroundImage {
             id,
             width: largest.width,
@@ -208,13 +211,60 @@ impl BackgroundImageStore {
         })
     }
 
-    /// Startup pass: only the image the settings point at survives, and no upload does.
-    pub fn reconcile(&self, referenced: &str) {
-        let keep = (!referenced.is_empty()).then_some(referenced);
-        self.prune(&[keep], Duration::ZERO);
+    /// Every image in the library, the most recently imported first.
+    pub fn list(&self) -> Result<Vec<BackgroundImage>, String> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("无法读取背景图片目录: {error}")),
+        };
+        let mut images = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if validate_image_id(name).is_err() || !entry.path().is_dir() {
+                continue;
+            }
+            // A directory without a tier is not an image; the renderer could not show it.
+            let Some(largest) = list_tiers(&entry.path())?.pop() else {
+                continue;
+            };
+            // Tiers are never written again once staged, and the largest is sent last,
+            // so its file's time is when the picture was imported.
+            let imported = fs::metadata(&largest.path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            images.push((
+                imported,
+                BackgroundImage {
+                    id: name.to_owned(),
+                    width: largest.width,
+                    height: largest.height,
+                },
+            ));
+        }
+        images.sort_by(|(left_time, left), (right_time, right)| {
+            right_time.cmp(left_time).then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(images.into_iter().map(|(_, image)| image).collect())
     }
 
-    fn prune(&self, keep: &[Option<&str>], staging_age: Duration) {
+    /// Removes an image from the library. One that is already gone is not an error.
+    pub fn delete(&self, id: &str) -> Result<(), String> {
+        validate_image_id(id)?;
+        match fs::remove_dir_all(self.root.join(id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("无法删除背景图片: {error}")),
+        }
+    }
+
+    /// Startup pass: an import the app quit in the middle of leaves a staging directory.
+    pub fn reconcile(&self) {
+        self.prune_staging(Duration::ZERO);
+    }
+
+    fn prune_staging(&self, staging_age: Duration) {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return;
         };
@@ -223,23 +273,18 @@ impl BackgroundImageStore {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let path = entry.path();
-            if !path.is_dir() {
+            if !name.starts_with(STAGING_PREFIX) || !path.is_dir() {
                 continue;
             }
-            let remove = if name.starts_with(STAGING_PREFIX) {
-                let age = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .unwrap_or(Duration::MAX);
-                age >= staging_age
-            } else {
-                validate_image_id(name).is_ok() && !keep.iter().any(|kept| *kept == Some(name))
-            };
-            if remove {
+            let age = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or(Duration::MAX);
+            if age >= staging_age {
                 if let Err(error) = fs::remove_dir_all(&path) {
-                    eprintln!("未能删除不再使用的背景图片 {name}：{error}");
+                    eprintln!("未能删除残留的背景图片上传 {name}：{error}");
                 }
             }
         }
@@ -430,7 +475,7 @@ mod tests {
         assert_eq!(store.put(Some(&upload), &jpeg(1920, 1080)).unwrap(), upload);
         store.put(Some(&upload), &jpeg(3840, 2160)).unwrap();
         assert!(store.put(Some(&upload), &jpeg(1920, 1080)).is_err());
-        let image = store.commit(&upload, None).unwrap();
+        let image = store.commit(&upload).unwrap();
         assert_eq!((image.width, image.height), (3840, 2160));
 
         let small = store.data(&image.id, 300, 200).unwrap();
@@ -448,32 +493,48 @@ mod tests {
         let store = BackgroundImageStore::new(temp.path());
         let upload = store.put(None, &jpeg(640, 360)).unwrap();
         store.put(Some(&upload), &jpeg(1000, 1000)).unwrap();
-        assert!(store.commit(&upload, None).is_err());
+        assert!(store.commit(&upload).is_err());
     }
 
     #[test]
-    fn commit_keeps_only_the_new_and_the_referenced_image() {
+    fn imports_stay_in_the_library_until_deleted() {
         let temp = tempfile::tempdir().unwrap();
         let store = BackgroundImageStore::new(temp.path());
-        let import = |width: u16, keep: Option<&str>| {
-            let upload = store.put(None, &png(u32::from(width), 100)).unwrap();
-            store.commit(&upload, keep).unwrap().id
+        assert!(store.list().unwrap().is_empty());
+        let import = |width: u32| {
+            let upload = store.put(None, &png(width, 100)).unwrap();
+            let id = store.commit(&upload).unwrap().id;
+            // Import times any filesystem can tell apart.
+            let time = SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(width));
+            let tier = temp.path().join(DIRECTORY).join(&id).join(format!("{width}x100.png"));
+            fs::OpenOptions::new()
+                .write(true)
+                .open(tier)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+            id
         };
-        let first = import(100, None);
-        let second = import(200, Some(&first));
-        assert!(store.data(&first, 1, 1).is_ok());
-        let third = import(300, Some(&second));
-        assert!(store.data(&first, 1, 1).is_err());
-        assert!(store.data(&second, 1, 1).is_ok());
-        assert!(store.data(&third, 1, 1).is_ok());
+        let first = import(100);
+        let second = import(200);
+        let third = import(300);
+        let listed = store.list().unwrap();
+        assert_eq!(
+            listed.iter().map(|image| image.id.as_str()).collect::<Vec<_>>(),
+            [third.as_str(), second.as_str(), first.as_str()]
+        );
+        assert_eq!((listed[0].width, listed[0].height), (300, 100));
 
         let abandoned = store.put(None, &png(50, 50)).unwrap();
-        store.reconcile(&third);
+        store.reconcile();
+        assert_eq!(store.list().unwrap().len(), 3);
+        assert!(store.commit(&abandoned).is_err());
+
+        store.delete(&second).unwrap();
         assert!(store.data(&second, 1, 1).is_err());
-        assert!(store.data(&third, 1, 1).is_ok());
-        assert!(store.commit(&abandoned, None).is_err());
-        store.reconcile("");
-        assert!(store.data(&third, 1, 1).is_err());
+        assert!(store.data(&first, 1, 1).is_ok());
+        assert_eq!(store.list().unwrap().len(), 2);
+        store.delete(&second).unwrap();
     }
 
     #[test]
@@ -482,8 +543,8 @@ mod tests {
         let store = BackgroundImageStore::new(temp.path());
         let first = store.put(None, &png(64, 64)).unwrap();
         let second = store.put(None, &png(64, 64)).unwrap();
-        let a = store.commit(&first, None).unwrap();
-        let b = store.commit(&second, Some(&a.id)).unwrap();
+        let a = store.commit(&first).unwrap();
+        let b = store.commit(&second).unwrap();
         assert_eq!(a.id, b.id);
         assert!(store.data(&a.id, 1, 1).is_ok());
     }
@@ -494,6 +555,7 @@ mod tests {
         let store = BackgroundImageStore::new(temp.path());
         assert!(store.data("../../etc", 1, 1).is_err());
         assert!(store.put(Some("../x"), &png(1, 1)).is_err());
-        assert!(store.commit("not-an-upload", None).is_err());
+        assert!(store.commit("not-an-upload").is_err());
+        assert!(store.delete("../../etc").is_err());
     }
 }

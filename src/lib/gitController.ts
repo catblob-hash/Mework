@@ -128,20 +128,30 @@ export function gitSnapshotBroadcastIds(
  * A summary snapshot carries no file list, so the host is asked for that one path
  * by name, the way the pane itself asks for its selection. A summary gone stale
  * in the meantime is answered with the current one, which is asked once more.
+ *
+ * `base` is a worktree's fork point: its page opens on the branch's whole change
+ * since then, which lists files already committed there as well, and only the
+ * host knows that listing.
  */
 export async function gitReviewListsPath(
   target: GitTarget,
   snapshot: GitWorkspaceSnapshot,
-  path: string
+  path: string,
+  base: string | null = null
 ): Promise<boolean> {
-  if (snapshot.filesComplete === true || !snapshot.summaryRevision) {
+  if (!snapshot.summaryRevision || (!base && snapshot.filesComplete === true)) {
     return snapshot.files.some((file) => (
       file.path === path && !file.untracked && file.status !== "untracked"
     ));
   }
   let revision = snapshot.summaryRevision;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const result = await getGitChangePage(target, { expectedRevision: revision, selectedPath: path, limit: 1 });
+    const result = await getGitChangePage(target, {
+      expectedRevision: revision,
+      selectedPath: path,
+      limit: 1,
+      ...(base ? { base } : {})
+    });
     if (result.kind === "page") return result.selection?.state === "present";
     revision = result.summary.summaryRevision;
   }

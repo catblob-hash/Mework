@@ -6,7 +6,11 @@ Calls are classified as reads. Inside the workspace, the app-data directory and 
 
 ## Behavior and limits
 
-The walk never follows symlinks or junctions, and every entry is checked against the authorized scope before it is shown or descended into. Entries are sorted, spelled with forward slashes, and directories carry a trailing `/`; the listing stops at 2,000 entries and says that the limit was reached. An empty directory answers `(empty directory)`, and a directory that cannot be traversed fails the whole call. Nothing is filtered by `.gitignore`: `.git`, `node_modules` and build output are walked like anything else, so narrow `path` or reach for `find` instead. Output over 64 KiB is truncated.
+The walk is breadth-first — every entry one level down, then every entry two levels down, and so on to `depth`, each directory in name order — never follows symlinks or junctions, and checks every entry against the authorized scope before it is shown or descended into. Entries are sorted, spelled with forward slashes, and directories carry a trailing `/`.
+
+What stays unexpanded is decided the way Git would decide it. Inside a Git work tree, a directory `git ls-files` reports as ignored is listed with an `(ignored)` mark and not entered; outside one, dependency and build directories are treated the same way by name (`node_modules`, `vendor`, `target`, `build`, `dist`, `.venv`, `__pycache__` and a few more). Version-control directories such as `.git` are never entered. Ignored files are listed like any other file, and so is everything under a `path` that is itself ignored: name `target/debug` and you get `target/debug`. On a remote workspace the machine's own `git` decides.
+
+The answer stops at 40,000 characters. Because the walk is breadth-first, what the limit cuts is the deepest level reached, and the last line says to which depth the listing is complete. An empty directory answers `(empty directory)`; a subdirectory that cannot be read adds a `[skipped]` line, while the listed directory failing to open fails the call.
 
 ## Related
 

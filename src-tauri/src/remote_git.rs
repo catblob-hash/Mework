@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use git_core::service::{GitServiceOp, GitServiceReply, GitServiceRequest};
+use git_core::text;
 use remote_agent::protocol::SELF_PROGRAM;
 use serde::de::DeserializeOwned;
 
@@ -84,9 +85,14 @@ fn call<T: DeserializeOwned>(
         machine: checkout.machine_key.clone(),
         root: checkout.root.clone(),
         op,
+        english: git_core::english(),
     };
-    let body =
-        serde_json::to_vec(&request).map_err(|error| format!("无法编码远端 Git 请求：{error}"))?;
+    let body = serde_json::to_vec(&request).map_err(|error| {
+        text!(
+            "无法编码远端 Git 请求：{error}",
+            "Could not encode the remote Git request: {error}"
+        )
+    })?;
     let output = crate::remote_link::run_script_on(
         &link,
         &checkout.runner,
@@ -97,16 +103,29 @@ fn call<T: DeserializeOwned>(
     )?;
     if output.status != Some(0) {
         return Err(match run_environment::legible_remote_reply(&output.stderr) {
-            Some(reply) => format!("远端 Git 助手失败：{reply}"),
-            None => format!("远端 Git 助手失败（退出码 {:?}）", output.status),
+            Some(reply) => text!(
+                "远端 Git 助手失败：{reply}",
+                "The remote Git helper failed: {reply}"
+            ),
+            None => text!(
+                "远端 Git 助手失败（退出码 {:?}）",
+                "The remote Git helper failed (exit code {:?})",
+                output.status
+            ),
         });
     }
-    match serde_json::from_slice::<GitServiceReply>(&output.stdout)
-        .map_err(|error| format!("远端 Git 助手的回答无法解析：{error}"))?
-    {
-        GitServiceReply::Ok(value) => serde_json::from_value(value)
-            .map(Some)
-            .map_err(|error| format!("远端 Git 助手的回答无法解析：{error}")),
+    match serde_json::from_slice::<GitServiceReply>(&output.stdout).map_err(|error| {
+        text!(
+            "远端 Git 助手的回答无法解析：{error}",
+            "Could not parse the remote Git helper's reply: {error}"
+        )
+    })? {
+        GitServiceReply::Ok(value) => serde_json::from_value(value).map(Some).map_err(|error| {
+            text!(
+                "远端 Git 助手的回答无法解析：{error}",
+                "Could not parse the remote Git helper's reply: {error}"
+            )
+        }),
         GitServiceReply::Err(message) => Err(message),
     }
 }
@@ -118,9 +137,12 @@ fn call_agent<T: DeserializeOwned>(
     timeout: Duration,
 ) -> Result<T, String> {
     call(checkout, op, timeout, LINK_PATIENCE)?.ok_or_else(|| {
-        "这台机器上的 Mework agent 不可用（可能仍在安装，或没有适合它的构建），\
-         只能读取 Git 状态；稍后再试"
-            .to_owned()
+        text!(
+            "这台机器上的 Mework agent 不可用（可能仍在安装，或没有适合它的构建），\
+             只能读取 Git 状态；稍后再试",
+            "The Mework agent is not available on this machine (it may still be installing, \
+             or there is no build for it), so only the Git status can be read; try again later"
+        )
     })
 }
 
@@ -370,7 +392,7 @@ pub(crate) fn workspace_snapshot(
 ) -> Result<Option<GitWorkspaceSnapshot>, String> {
     let root = root.trim();
     if root.is_empty() || root.chars().any(char::is_control) {
-        return Err("工作区路径为空或含有控制字符，无法读取它的 Git 状态".into());
+        return Err(text!("工作区路径为空或含有控制字符，无法读取它的 Git 状态", "The workspace path is empty or contains control characters, so its Git status cannot be read"));
     }
     let script = match shell.dialect() {
         ScriptDialect::PowerShell => crate::remote_powershell::git_status_probe(root),
@@ -379,15 +401,27 @@ pub(crate) fn workspace_snapshot(
     let output = shell.run(&script, None, PROBE_TIMEOUT, &CancelSignal::default())?;
     match output.status {
         Some(0) => {}
-        Some(EXIT_ROOT_MISSING) => {
-            return Err(format!("工作区目录 {root} 在这台机器上不存在或无法进入"))
+        Some(EXIT_ROOT_MISSING) => return Err(text!(
+            "工作区目录 {root} 在这台机器上不存在或无法进入",
+            "The workspace directory {root} does not exist on this machine or cannot be entered"
+        )),
+        Some(EXIT_NO_GIT) => {
+            return Err(text!(
+                "这台机器上没有找到 Git CLI",
+                "Git CLI not found on this machine"
+            ))
         }
-        Some(EXIT_NO_GIT) => return Err("这台机器上没有找到 Git CLI".into()),
         status => {
             return Err(
                 match run_environment::legible_remote_reply(&output.stderr) {
-                    Some(reply) => format!("读取远端 Git 状态失败：{reply}"),
-                    None => format!("读取远端 Git 状态失败（退出码 {status:?}）"),
+                    Some(reply) => text!(
+                        "读取远端 Git 状态失败：{reply}",
+                        "Could not read the remote Git status: {reply}"
+                    ),
+                    None => text!(
+                        "读取远端 Git 状态失败（退出码 {status:?}）",
+                        "Could not read the remote Git status (exit code {status:?})"
+                    ),
                 },
             )
         }
@@ -479,34 +513,60 @@ fn parse_frames(bytes: &[u8]) -> Result<HashMap<String, RemoteGitOutput>, String
             .windows(marker.len())
             .position(|window| window == marker.as_bytes())
             .map(|position| position + 1)
-            .ok_or_else(|| "远端 Git 状态探测没有给出可识别的回答".to_owned())?
+            .ok_or_else(|| {
+                text!(
+                    "远端 Git 状态探测没有给出可识别的回答",
+                    "The remote Git status probe gave no recognizable answer"
+                )
+            })?
     };
     let mut rest = &bytes[start + magic.len()..];
     let mut sections = HashMap::new();
     while !rest.is_empty() {
-        let newline = rest
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .ok_or_else(|| "远端 Git 状态探测的回答被截断".to_owned())?;
-        let header = std::str::from_utf8(&rest[..newline])
-            .map_err(|_| "远端 Git 状态探测的段头不是 UTF-8".to_owned())?;
+        let newline = rest.iter().position(|byte| *byte == b'\n').ok_or_else(|| {
+            text!(
+                "远端 Git 状态探测的回答被截断",
+                "The remote Git status probe's answer was cut off"
+            )
+        })?;
+        let header = std::str::from_utf8(&rest[..newline]).map_err(|_| {
+            text!(
+                "远端 Git 状态探测的段头不是 UTF-8",
+                "A section header of the remote Git status probe is not UTF-8"
+            )
+        })?;
         let fields = header.split_whitespace().collect::<Vec<_>>();
         let [name, status, stdout_len, stderr_len] = fields[..] else {
-            return Err(format!("远端 Git 状态探测的段头无效：{header}"));
+            return Err(text!(
+                "远端 Git 状态探测的段头无效：{header}",
+                "Invalid section header from the remote Git status probe: {header}"
+            ));
         };
         let number = |text: &str| {
-            text.parse::<usize>()
-                .map_err(|_| format!("远端 Git 状态探测的段头无效：{header}"))
+            text.parse::<usize>().map_err(|_| {
+                text!(
+                    "远端 Git 状态探测的段头无效：{header}",
+                    "Invalid section header from the remote Git status probe: {header}"
+                )
+            })
         };
-        let status = status
-            .parse::<i32>()
-            .map_err(|_| format!("远端 Git 状态探测的段头无效：{header}"))?;
+        let status = status.parse::<i32>().map_err(|_| {
+            text!(
+                "远端 Git 状态探测的段头无效：{header}",
+                "Invalid section header from the remote Git status probe: {header}"
+            )
+        })?;
         let (stdout_len, stderr_len) = (number(stdout_len)?, number(stderr_len)?);
         rest = &rest[newline + 1..];
         let body = stdout_len
             .checked_add(stderr_len)
             .filter(|length| *length <= rest.len())
-            .ok_or_else(|| "远端 Git 状态探测的回答被截断".to_owned())?;
+            .ok_or_else(|| {
+                text!(
+                    "远端 Git 状态探测的回答被截断",
+                    "The remote Git status probe's answer was cut off"
+                )
+            })?;
         sections.insert(
             name.to_owned(),
             RemoteGitOutput {

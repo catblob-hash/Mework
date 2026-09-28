@@ -360,7 +360,7 @@ pub struct GlobalSettings {
     #[serde(default)]
     pub active_provider_id: Option<String>,
     /// Renderer-owned appearance preferences must round-trip unchanged.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_appearance")]
     pub appearance: AppearancePreferences,
     /// User-modified shortcuts. The command catalog is renderer-owned.
     #[serde(default)]
@@ -447,14 +447,15 @@ pub struct AppearancePreferences {
     pub single_dollar_math: bool,
     #[serde(default)]
     pub custom_css: String,
-    /// The fourth theme choice: the user's picture behind glass panes. The light or
-    /// dark look of the glass still comes from `GlobalSettings::theme`.
+    /// Panes of glass over the window's background instead of opaque ones. Light or
+    /// dark glass follows `GlobalSettings::theme`.
     #[serde(default)]
-    pub custom_background: bool,
-    /// Id of the imported picture in `background_images`; empty before one is picked.
-    /// Kept when `custom_background` is turned off so turning it back on needs no re-pick.
-    #[serde(default)]
-    pub background_image: String,
+    pub liquid_glass: bool,
+    /// The window's background: `solid` (the theme's own ground, following the theme),
+    /// `solid:day` / `solid:night` (one theme's ground, kept until the theme changes),
+    /// `builtin:<name>` (a picture the renderer bundles), or an image id in `background_images`.
+    #[serde(default = "default_background")]
+    pub background: String,
     /// The local helper model's uses and prompts (Appearance → Local model).
     #[serde(default)]
     pub local_model: LocalModelPreferences,
@@ -513,8 +514,8 @@ impl Default for AppearancePreferences {
             code_block_wrappable: false,
             single_dollar_math: true,
             custom_css: String::new(),
-            custom_background: false,
-            background_image: String::new(),
+            liquid_glass: false,
+            background: default_background(),
             local_model: LocalModelPreferences::default(),
         }
     }
@@ -3735,6 +3736,33 @@ fn default_true() -> bool {
     true
 }
 
+fn default_background() -> String {
+    "solid".into()
+}
+
+/// Appearance, with documents from before the background library carried forward: their
+/// `customBackground` turned the picture and the glass on together, and `backgroundImage`
+/// was remembered even while it was off.
+fn deserialize_appearance<'de, D>(deserializer: D) -> Result<AppearancePreferences, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut value = Value::deserialize(deserializer)?;
+    if let Value::Object(fields) = &mut value {
+        let legacy_on = fields.remove("customBackground").and_then(|value| value.as_bool());
+        let legacy_image = fields.remove("backgroundImage");
+        if !fields.contains_key("background") {
+            if let (Some(true), Some(Value::String(image))) = (legacy_on, legacy_image) {
+                if !image.is_empty() {
+                    fields.insert("background".into(), Value::String(image));
+                    fields.insert("liquidGlass".into(), Value::Bool(true));
+                }
+            }
+        }
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
 fn default_agent_definition_epoch() -> u64 {
     1
 }
@@ -5708,6 +5736,39 @@ mod tests {
         assert_eq!(AppLanguage::default(), AppLanguage::ZhCn);
         assert_eq!(ResolvedLanguage::default(), ResolvedLanguage::ZhCn);
         assert_eq!(ThemePreference::default(), ThemePreference::Day);
+    }
+
+    #[test]
+    fn a_custom_background_from_before_the_library_becomes_glass_over_its_picture() {
+        #[derive(Deserialize)]
+        struct Settings {
+            #[serde(deserialize_with = "super::deserialize_appearance")]
+            appearance: AppearancePreferences,
+        }
+        let read = |appearance: Value| {
+            serde_json::from_value::<Settings>(serde_json::json!({ "appearance": appearance }))
+                .unwrap()
+                .appearance
+        };
+        let picture = "a".repeat(64);
+
+        let on = read(serde_json::json!({ "customBackground": true, "backgroundImage": picture }));
+        assert!(on.liquid_glass);
+        assert_eq!(on.background, picture);
+
+        // Off, the remembered picture was not on screen; the plain theme was.
+        let off = read(serde_json::json!({ "customBackground": false, "backgroundImage": picture }));
+        assert!(!off.liquid_glass);
+        assert_eq!(off.background, "solid");
+
+        let fresh = read(serde_json::json!({}));
+        assert_eq!((fresh.liquid_glass, fresh.background.as_str()), (false, "solid"));
+
+        let current = read(serde_json::json!({ "liquidGlass": true, "background": "builtin:desk" }));
+        assert_eq!((current.liquid_glass, current.background.as_str()), (true, "builtin:desk"));
+        let saved = serde_json::to_value(&current).unwrap();
+        assert!(saved.get("customBackground").is_none());
+        assert!(saved.get("backgroundImage").is_none());
     }
 
     #[test]

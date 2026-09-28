@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 import {
   configureI18n,
   getI18nSnapshot,
@@ -42,6 +43,8 @@ let stopLanguageListener: (() => void) | null = null;
 let stopI18nSubscription: (() => void) | null = null;
 let stopNativeThemeListener: (() => void) | null = null;
 let nativeListenerGeneration = 0;
+let resolvedTheme: ApplicationTheme = "day";
+const resolvedThemeListeners = new Set<() => void>();
 
 function browserPrefersDark(): boolean {
   return typeof window !== "undefined"
@@ -85,12 +88,29 @@ function renderApplicationAppearance(): void {
   if (typeof document === "undefined") return;
   const root = appearanceRoot ?? document.documentElement;
   const { resolvedLanguage } = getI18nSnapshot();
-  applyResolvedApplicationAppearance(
-    resolveApplicationTheme(preferences.theme, systemTheme === "night"),
-    resolvedLanguage,
-    preferences.theme,
-    root
-  );
+  const theme = resolveApplicationTheme(preferences.theme, systemTheme === "night");
+  applyResolvedApplicationAppearance(theme, resolvedLanguage, preferences.theme, root);
+  if (theme !== resolvedTheme) {
+    resolvedTheme = theme;
+    for (const listener of resolvedThemeListeners) listener();
+  }
+}
+
+function subscribeResolvedTheme(listener: () => void): () => void {
+  resolvedThemeListeners.add(listener);
+  return () => {
+    resolvedThemeListeners.delete(listener);
+  };
+}
+
+/** The scheme on screen now, for code that runs after the preferences were applied. */
+export function getResolvedTheme(): ApplicationTheme {
+  return resolvedTheme;
+}
+
+/** The scheme on screen: the theme preference with "follow system" resolved. */
+export function useResolvedTheme(): ApplicationTheme {
+  return useSyncExternalStore(subscribeResolvedTheme, getResolvedTheme, getResolvedTheme);
 }
 
 async function syncNativeWindowPreference(preference: ThemePreference): Promise<void> {

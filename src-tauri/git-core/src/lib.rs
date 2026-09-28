@@ -18,7 +18,10 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,6 +30,20 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
+
+/// `format!` in the language this process words its messages in (see
+/// [`english`]): the Simplified Chinese template, then the English one, then
+/// the arguments both share. Defined ahead of the modules so they can use it.
+#[macro_export]
+macro_rules! text {
+    ($zh:literal, $en:literal $(, $($arg:tt)*)?) => {
+        if $crate::english() {
+            ::std::format!($en $(, $($arg)*)?)
+        } else {
+            ::std::format!($zh $(, $($arg)*)?)
+        }
+    };
+}
 
 pub mod developer_tools;
 pub mod service;
@@ -509,13 +526,16 @@ impl CliOutput {
             if !output.is_empty() && !output.ends_with('\n') {
                 output.push('\n');
             }
-            output.push_str("… 命令输出已截断");
+            output.push_str(phrase("… 命令输出已截断", "… command output truncated"));
         }
         if self.timed_out {
             if !output.is_empty() && !output.ends_with('\n') {
                 output.push('\n');
             }
-            output.push_str("命令执行超时，已终止");
+            output.push_str(phrase(
+                "命令执行超时，已终止",
+                "Command timed out and was stopped",
+            ));
         }
         redact_sensitive_text(output.trim())
     }
@@ -556,7 +576,9 @@ pub fn summary_result(
     let summary = workspace_summary_from_snapshot(snapshot);
     let known_revision = known_revision
         .as_deref()
-        .map(|revision| validate_revision_token("Git 汇总修订", revision))
+        .map(|revision| {
+            validate_revision_token(phrase("Git 汇总修订", "The Git summary revision"), revision)
+        })
         .transpose()?;
     if known_revision.as_deref() == Some(summary.summary_revision.as_str()) {
         Ok(GitWorkspaceSummaryResult::Unchanged {
@@ -574,11 +596,15 @@ pub fn change_page(
     let repository = require_repository(workspace)?;
     let lock = repository_lock(&repository);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let expected_revision = validate_revision_token("Git 变更页修订", &request.expected_revision)?;
+    let expected_revision = validate_revision_token(
+        phrase("Git 变更页修订", "The Git change page revision"),
+        &request.expected_revision,
+    )?;
     let query = normalize_change_query(request.query.as_deref())?;
     if request.limit == 0 || request.limit > MAX_CHANGE_PAGE_LIMIT {
-        return Err(format!(
-            "Git 变更页大小必须在 1 到 {MAX_CHANGE_PAGE_LIMIT} 之间"
+        return Err(text!(
+            "Git 变更页大小必须在 1 到 {MAX_CHANGE_PAGE_LIMIT} 之间",
+            "The Git change page size must be between 1 and {MAX_CHANGE_PAGE_LIMIT}"
         ));
     }
     let selected_path = request
@@ -657,7 +683,10 @@ pub fn change_page(
         matched_total = matched_total.saturating_add(1);
     }
     if offset > matched_total {
-        return Err("Git 变更页游标超出当前匹配结果；请重新加载".into());
+        return Err(text!(
+            "Git 变更页游标超出当前匹配结果；请重新加载",
+            "The Git change page cursor is past the current matches; reload the changes"
+        ));
     }
     let matched_count = u32::try_from(matched_total).unwrap_or(u32::MAX);
     let end = offset.saturating_add(page.len());
@@ -705,9 +734,12 @@ pub fn diff(workspace: &Path, request: GitDiffRequest) -> Result<GitDiffResponse
     ];
     let accepts_difference_exit = requested_untracked;
     if requested_untracked && mode != "staged" {
-        let path = path
-            .as_ref()
-            .ok_or_else(|| "读取未跟踪文件 diff 时必须指定 path".to_owned())?;
+        let path = path.as_ref().ok_or_else(|| {
+            text!(
+                "读取未跟踪文件 diff 时必须指定 path",
+                "Reading the diff of an untracked file needs a path"
+            )
+        })?;
         let absolute = canonical_existing_repo_file(&repository.root, path)?;
         args.push(OsString::from("--no-index"));
         args.push(OsString::from("--"));
@@ -749,7 +781,10 @@ pub fn diff(workspace: &Path, request: GitDiffRequest) -> Result<GitDiffResponse
     let acceptable = output.success()
         || (accepts_difference_exit && !output.timed_out && output.exit_code() == Some(1));
     if !acceptable {
-        return Err(command_error("读取 Git diff", &output));
+        return Err(command_error(
+            phrase("读取 Git diff", "read the Git diff"),
+            &output,
+        ));
     }
     let patch = String::from_utf8_lossy(&output.stdout).into_owned();
     let (additions, deletions) = count_patch_lines(&patch);
@@ -791,9 +826,15 @@ fn diff_files_for_request(
         MAX_STATUS_OUTPUT,
         true,
     )?;
-    require_success("读取 Git diff 文件列表", &output)?;
+    require_success(
+        phrase("读取 Git diff 文件列表", "list the files in the Git diff"),
+        &output,
+    )?;
     if output.stdout_truncated {
-        return Err("Git diff 文件列表超过安全上限，无法保证结果完整".into());
+        return Err(text!(
+            "Git diff 文件列表超过安全上限，无法保证结果完整",
+            "The Git diff file list exceeds the safety limit, so it cannot be shown in full"
+        ));
     }
     let mut files = parse_name_status(&output.stdout)?;
     let line_stats = diff_numstat_for_request(repository, request, path)?;
@@ -875,17 +916,26 @@ fn parse_name_status(bytes: &[u8]) -> Result<Vec<GitFileChange>, String> {
         let code = lossy(records[index]);
         let status = code.chars().next().unwrap_or('?');
         let (path, original_path, consumed) = if matches!(status, 'R' | 'C') {
-            let original = records
-                .get(index + 1)
-                .ok_or_else(|| "Git diff rename 缺少原路径".to_owned())?;
-            let path = records
-                .get(index + 2)
-                .ok_or_else(|| "Git diff rename 缺少目标路径".to_owned())?;
+            let original = records.get(index + 1).ok_or_else(|| {
+                text!(
+                    "Git diff rename 缺少原路径",
+                    "A Git diff rename is missing its original path"
+                )
+            })?;
+            let path = records.get(index + 2).ok_or_else(|| {
+                text!(
+                    "Git diff rename 缺少目标路径",
+                    "A Git diff rename is missing its new path"
+                )
+            })?;
             (lossy(path), Some(lossy(original)), 3)
         } else {
-            let path = records
-                .get(index + 1)
-                .ok_or_else(|| "Git diff 文件状态缺少路径".to_owned())?;
+            let path = records.get(index + 1).ok_or_else(|| {
+                text!(
+                    "Git diff 文件状态缺少路径",
+                    "A Git diff file status is missing its path"
+                )
+            })?;
             (lossy(path), None, 2)
         };
         changes.push(GitFileChange {
@@ -946,9 +996,18 @@ fn diff_numstat_for_request(
         MAX_STATUS_OUTPUT,
         true,
     )?;
-    require_success("统计 Git diff 文件行数", &output)?;
+    require_success(
+        phrase(
+            "统计 Git diff 文件行数",
+            "count the lines changed in the Git diff",
+        ),
+        &output,
+    )?;
     if output.stdout_truncated {
-        return Err("Git diff 行数统计超过安全上限，无法保证结果完整".into());
+        return Err(text!(
+            "Git diff 行数统计超过安全上限，无法保证结果完整",
+            "The Git diff line counts exceed the safety limit, so they cannot be shown in full"
+        ));
     }
     parse_numstat(&output.stdout)
 }
@@ -1015,8 +1074,8 @@ pub fn create_isolated_worktree(
     run_id: &str,
     slot: &str,
 ) -> Result<IsolatedWorktree, String> {
-    let run_id = validate_worktree_component("运行 id", run_id)?;
-    let slot = validate_worktree_component("步骤槽位名", slot)?;
+    let run_id = validate_worktree_component(phrase("运行 id", "The run id"), run_id)?;
+    let slot = validate_worktree_component(phrase("步骤槽位名", "The step slot name"), slot)?;
     let branch = format!("{ISOLATED_WORKTREE_BRANCH_PREFIX}/{run_id}/{slot}");
     create_worktree(workspace, &[&run_id, &slot], &branch, None)
 }
@@ -1056,7 +1115,7 @@ pub fn create_conversation_worktree(
     name: &str,
     from_branch: Option<&str>,
 ) -> Result<CreatedConversationWorktree, String> {
-    let name = validate_worktree_component("工作树名称", name)?;
+    let name = validate_worktree_component(phrase("工作树名称", "The worktree name"), name)?;
     let repository = require_repository(workspace)?;
     let container = repository
         .root
@@ -1078,7 +1137,7 @@ pub fn create_conversation_worktree(
         break;
     }
     let (candidate, branch) = chosen.ok_or_else(|| {
-        format!("工作树名称 {name} 及其后缀都已被占用；请先清理残留的 mework/conv 分支或目录")
+        text!("工作树名称 {name} 及其后缀都已被占用；请先清理残留的 mework/conv 分支或目录", "The worktree name {name} and all its suffixed forms are taken; clean up leftover mework/conv branches or directories first")
     })?;
     let base_branch = match from_branch {
         Some(branch) => Some(branch.to_owned()),
@@ -1175,14 +1234,23 @@ fn create_worktree(
     // prefix. Git accepts it as a cwd but not as a `worktree add` target, so
     // normalize it here before it is also used as the step workspace path.
     let container = PathBuf::from(git_cli_environment_path(&container));
-    fs::create_dir_all(&container)
-        .map_err(|error| format!("无法创建隔离工作树目录 {}: {error}", container.display()))?;
+    fs::create_dir_all(&container).map_err(|error| {
+        text!(
+            "无法创建隔离工作树目录 {}: {error}",
+            "Could not create the isolated worktree directory {}: {error}",
+            container.display()
+        )
+    })?;
     let ignore = container.join(".gitignore");
     // Recreate the self-ignore file every time; deleting it would expose future
     // worktrees as untracked parent-repository content.
     if fs::read(&ignore).ok().as_deref() != Some(ISOLATED_WORKTREE_GITIGNORE.as_bytes()) {
-        fs::write(&ignore, ISOLATED_WORKTREE_GITIGNORE)
-            .map_err(|error| format!("无法写入隔离工作树的 .gitignore: {error}"))?;
+        fs::write(&ignore, ISOLATED_WORKTREE_GITIGNORE).map_err(|error| {
+            text!(
+                "无法写入隔离工作树的 .gitignore: {error}",
+                "Could not write the isolated worktree's .gitignore: {error}"
+            )
+        })?;
     }
 
     let revision = start_point.unwrap_or("HEAD");
@@ -1196,17 +1264,26 @@ fn create_worktree(
     )?;
     if !output.success() {
         // An unborn HEAD has no commit available as a checkout baseline.
-        return Err(
-            "无法读取当前仓库的 HEAD（仓库可能还没有任何提交），隔离工作树需要一个基线提交"
-                .to_owned(),
-        );
+        return Err(text!(
+            "无法读取当前仓库的 HEAD（仓库可能还没有任何提交），隔离工作树需要一个基线提交",
+            "Could not read this repository's HEAD (it may have no commits yet); \
+             an isolated worktree needs a commit to start from"
+        ));
     }
     let base_oid = String::from_utf8(output.stdout.clone())
-        .map_err(|_| "Git 返回的 HEAD 不是有效 UTF-8".to_owned())?
+        .map_err(|_| {
+            text!(
+                "Git 返回的 HEAD 不是有效 UTF-8",
+                "The HEAD Git returned is not valid UTF-8"
+            )
+        })?
         .trim()
         .to_owned();
     if base_oid.is_empty() || !base_oid.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err("Git 返回的 HEAD 不是一个提交 ID".to_owned());
+        return Err(text!(
+            "Git 返回的 HEAD 不是一个提交 ID",
+            "The HEAD Git returned is not a commit id"
+        ));
     }
 
     let mut path = container;
@@ -1228,7 +1305,10 @@ fn create_worktree(
         MAX_ACTION_OUTPUT,
         false,
     )?;
-    require_success("创建隔离工作树", &output)?;
+    require_success(
+        phrase("创建隔离工作树", "create the isolated worktree"),
+        &output,
+    )?;
     Ok(IsolatedWorktree {
         path,
         branch: branch.to_owned(),
@@ -1363,16 +1443,22 @@ fn prune_worktrees(repository: &Repository) {
 /// names. Reject `..`, `/`, and leading `-` to prevent path escape or option injection.
 fn validate_worktree_component(label: &str, value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 128 {
-        return Err(format!("{label}长度不合法"));
+        return Err(text!("{label}长度不合法", "{label} has an invalid length"));
     }
     if !value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
     {
-        return Err(format!("{label}只能包含字母、数字、下划线与连字符"));
+        return Err(text!(
+            "{label}只能包含字母、数字、下划线与连字符",
+            "{label} may only contain letters, digits, underscores and hyphens"
+        ));
     }
     if value.starts_with('-') || value.starts_with('.') {
-        return Err(format!("{label}不能以连字符或点开头"));
+        return Err(text!(
+            "{label}不能以连字符或点开头",
+            "{label} cannot start with a hyphen or a dot"
+        ));
     }
     Ok(value.to_owned())
 }
@@ -1403,7 +1489,7 @@ pub fn execute_action(workspace: &Path, action: GitAction) -> Result<GitActionRe
             run_git(&repository, args, input, timeout, MAX_ACTION_OUTPUT, false)?
         }
     };
-    require_success("执行 Git 操作", &output)?;
+    require_success(phrase("执行 Git 操作", "run the Git operation"), &output)?;
     let message = output.display_output();
     let snapshot = bounded_workspace_snapshot(snapshot_for_repository(&repository)?);
     Ok(GitActionResult {
@@ -1437,14 +1523,19 @@ fn validate_bulk_action(repository: &Repository, action: &GitAction) -> Result<(
     else {
         return Ok(());
     };
-    let expected_content_revision =
-        validate_revision_token("Git 内容修订", expected_content_revision)?;
+    let expected_content_revision = validate_revision_token(
+        phrase("Git 内容修订", "The Git content revision"),
+        expected_content_revision,
+    )?;
     let snapshot = snapshot_for_repository(repository)?;
     if snapshot.content_revision != expected_content_revision {
-        return Err("Git 工作区已在操作前发生变化；请刷新后重试".into());
+        return Err(text!(
+            "Git 工作区已在操作前发生变化；请刷新后重试",
+            "The Git workspace changed before the operation ran; refresh and try again"
+        ));
     }
     if !snapshot.is_clean {
-        return Err("Git bisect 前进操作要求工作树干净；请先提交或储藏当前变更".into());
+        return Err(text!("Git bisect 前进操作要求工作树干净；请先提交或储藏当前变更", "Moving a Git bisect forward needs a clean worktree; commit or stash your changes first"));
     }
     Ok(())
 }
@@ -1499,8 +1590,9 @@ fn validate_submodule_action(repository: &Repository, action: &GitAction) -> Res
         .filter(|change| normalized.contains(&change.path) && change.submodule)
     {
         if !change.submodule_commit_changed {
-            return Err(format!(
+            return Err(text!(
                 "子模块 {} 只有内部未提交变更，父仓库没有可暂存的 gitlink；请将该子模块作为独立工作区处理",
+                "Submodule {} only has uncommitted changes inside it, so the parent repository has no gitlink to stage; open the submodule as a workspace of its own",
                 change.path
             ));
         }
@@ -1509,17 +1601,35 @@ fn validate_submodule_action(repository: &Repository, action: &GitAction) -> Res
 }
 
 fn require_repository(workspace: &Path) -> Result<Repository, String> {
-    discover_repository(workspace)?
-        .ok_or_else(|| "当前工作目录不是独立的 Git 仓库根目录".to_owned())
+    discover_repository(workspace)?.ok_or_else(|| {
+        text!(
+            "当前工作目录不是独立的 Git 仓库根目录",
+            "The working directory is not the root of a Git repository of its own"
+        )
+    })
 }
 
 fn discover_repository(workspace: &Path) -> Result<Option<Repository>, String> {
-    let workspace = fs::canonicalize(workspace)
-        .map_err(|error| format!("无法访问 Git 工作目录 {}: {error}", workspace.display()))?;
+    let workspace = fs::canonicalize(workspace).map_err(|error| {
+        text!(
+            "无法访问 Git 工作目录 {}: {error}",
+            "Could not access the Git working directory {}: {error}",
+            workspace.display()
+        )
+    })?;
     if !workspace.is_dir() {
-        return Err(format!("Git 工作目录不是文件夹: {}", workspace.display()));
+        return Err(text!(
+            "Git 工作目录不是文件夹: {}",
+            "The Git working directory is not a folder: {}",
+            workspace.display()
+        ));
     }
-    let git = find_program("git").ok_or_else(|| "未找到 Git CLI，请先安装 Git".to_owned())?;
+    let git = find_program("git").ok_or_else(|| {
+        text!(
+            "未找到 Git CLI，请先安装 Git",
+            "Git CLI not found; install Git first"
+        )
+    })?;
     let output = run_program(
         &git,
         &workspace,
@@ -1555,10 +1665,17 @@ fn discover_repository(workspace: &Path) -> Result<Option<Repository>, String> {
         if text.to_ascii_lowercase().contains("not a git repository") {
             return Ok(None);
         }
-        return Err(command_error("检测 Git 仓库", &output));
+        return Err(command_error(
+            phrase("检测 Git 仓库", "detect the Git repository"),
+            &output,
+        ));
     }
     let paths = parse_rev_parse_paths(&output.stdout, 4)?;
-    let root = canonical_git_directory("仓库根目录", Path::new(&paths[0]), &workspace)?;
+    let root = canonical_git_directory(
+        phrase("仓库根目录", "repository root"),
+        Path::new(&paths[0]),
+        &workspace,
+    )?;
     if !same_path(&root, &workspace) {
         // A selected subdirectory must not silently elevate Git access to its parent repository.
         return Ok(None);
@@ -1569,16 +1686,21 @@ fn discover_repository(workspace: &Path) -> Result<Option<Repository>, String> {
     } else {
         root.join(git_dir)
     };
-    let git_dir = canonical_git_directory("元数据目录", &git_dir, &root)?;
+    let git_dir =
+        canonical_git_directory(phrase("元数据目录", "metadata directory"), &git_dir, &root)?;
     let git_common_dir = PathBuf::from(&paths[2]);
     let git_common_dir = if git_common_dir.is_absolute() {
         git_common_dir
     } else {
         root.join(git_common_dir)
     };
-    let git_common_dir = canonical_git_directory("共享元数据目录", &git_common_dir, &root)?;
+    let git_common_dir = canonical_git_directory(
+        phrase("共享元数据目录", "common metadata directory"),
+        &git_common_dir,
+        &root,
+    )?;
     if !path_is_within(&git_dir, &git_common_dir) {
-        return Err("Git 返回的 worktree 元数据目录不属于共享元数据目录".into());
+        return Err(text!("Git 返回的 worktree 元数据目录不属于共享元数据目录", "The worktree metadata directory Git returned is not inside the common metadata directory"));
     }
     let index_path = PathBuf::from(&paths[3]);
     let index_path = if index_path.is_absolute() {
@@ -1586,12 +1708,16 @@ fn discover_repository(workspace: &Path) -> Result<Option<Repository>, String> {
     } else {
         root.join(index_path)
     };
-    let index_parent = index_path
-        .parent()
-        .ok_or_else(|| "Git worktree index 路径缺少父目录".to_owned())?;
+    let index_parent = index_path.parent().ok_or_else(|| {
+        text!(
+            "Git worktree index 路径缺少父目录",
+            "The Git worktree index path has no parent directory"
+        )
+    })?;
     let index_parent = fs::canonicalize(index_parent).map_err(|error| {
-        format!(
+        text!(
             "无法验证 Git worktree index 父目录 {}: {error}",
+            "Could not verify the Git worktree index's parent directory {}: {error}",
             index_parent.display()
         )
     })?;
@@ -1600,7 +1726,10 @@ fn discover_repository(workspace: &Path) -> Result<Option<Repository>, String> {
             .file_name()
             .is_none_or(|name| !name.to_string_lossy().eq_ignore_ascii_case("index"))
     {
-        return Err("Git 返回的 index 不属于当前 worktree 元数据目录".into());
+        return Err(text!(
+            "Git 返回的 index 不属于当前 worktree 元数据目录",
+            "The index Git returned is not inside this worktree's metadata directory"
+        ));
     }
     let version_output = run_program(
         &git,
@@ -1611,7 +1740,10 @@ fn discover_repository(workspace: &Path) -> Result<Option<Repository>, String> {
         4096,
         CliKind::GitPassive,
     )?;
-    require_success("读取 Git 版本", &version_output)?;
+    require_success(
+        phrase("读取 Git 版本", "read the Git version"),
+        &version_output,
+    )?;
     let version_text = String::from_utf8_lossy(&version_output.stdout);
     let version_text = version_text.trim();
     let git_version = version_text
@@ -1659,9 +1791,9 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
         MAX_STATUS_OUTPUT,
         true,
     )?;
-    require_success("读取 Git 状态", &status)?;
+    require_success(phrase("读取 Git 状态", "read the Git status"), &status)?;
     if status.stdout_truncated {
-        return Err("Git 状态超过安全上限，无法可靠显示完整变更".into());
+        return Err(text!("Git 状态超过安全上限，无法可靠显示完整变更", "The Git status exceeds the safety limit, so the changes cannot be shown reliably in full"));
     }
     let mut parsed = parse_porcelain_v2(&status.stdout)?;
     let mut warnings = nested_submodule_warnings(&parsed.changes);
@@ -1685,7 +1817,7 @@ fn snapshot_for_repository(repository: &Repository) -> Result<GitWorkspaceSnapsh
                 if parsed.branch.oid.as_deref() != Some(local_oid.as_str())
                     || parsed.branch.upstream != upstream
                 {
-                    return Err("Git 分支或 upstream 在状态读取期间发生变化；请重试".into());
+                    return Err(text!("Git 分支或 upstream 在状态读取期间发生变化；请重试", "The Git branch or upstream changed while the status was being read; try again"));
                 }
                 (upstream, target)
             }
@@ -1738,8 +1870,9 @@ fn nested_submodule_warnings(changes: &[GitFileChange]) -> Vec<String> {
         })
         .count();
     if nested_submodule_changes > 0 {
-        vec![format!(
-            "{nested_submodule_changes} 个子模块包含内部未提交变更；请将子模块目录作为独立工作区处理"
+        vec![text!(
+            "{nested_submodule_changes} 个子模块包含内部未提交变更；请将子模块目录作为独立工作区处理",
+            "Submodules with uncommitted changes inside them: {nested_submodule_changes}; open each submodule directory as a workspace of its own"
         )]
     } else {
         Vec::new()
@@ -1870,9 +2003,13 @@ impl RemoteGitOutput {
         let detail = String::from_utf8_lossy(&self.stderr);
         let detail = detail.trim();
         Err(if detail.is_empty() {
-            format!("{label}失败（退出码 {}）", self.status)
+            text!(
+                "{label}失败（退出码 {}）",
+                "Could not {label} (exit code {})",
+                self.status
+            )
         } else {
-            format!("{label}失败：{detail}")
+            text!("{label}失败：{detail}", "Could not {label}: {detail}")
         })
     }
 }
@@ -1890,9 +2027,12 @@ pub struct RemoteGitProbe {
 
 impl RemoteGitProbe {
     fn section(&self, name: &str) -> Result<&RemoteGitOutput, String> {
-        self.sections
-            .get(name)
-            .ok_or_else(|| format!("远端 Git 状态探测缺少 {name} 段"))
+        self.sections.get(name).ok_or_else(|| {
+            text!(
+                "远端 Git 状态探测缺少 {name} 段",
+                "The remote Git status probe is missing its {name} section"
+            )
+        })
     }
 }
 
@@ -1918,7 +2058,7 @@ pub fn remote_workspace_snapshot(
     {
         return Ok(None);
     }
-    let output = rev_parse.success("检测 Git 仓库")?;
+    let output = rev_parse.success(phrase("检测 Git 仓库", "detect the Git repository"))?;
     // `--show-prefix` comes first and is empty exactly when the workspace is
     // the repository root: the answer `same_path(root, workspace)` gives here,
     // without comparing two spellings of a path on a machine whose rules the
@@ -1926,7 +2066,12 @@ pub fn remote_workspace_snapshot(
     let newline = output
         .iter()
         .position(|byte| *byte == b'\n')
-        .ok_or_else(|| "Git 返回的仓库路径数量不正确".to_owned())?;
+        .ok_or_else(|| {
+            text!(
+                "Git 返回的仓库路径数量不正确",
+                "Git returned the wrong number of repository paths"
+            )
+        })?;
     if !output[..newline].iter().all(|byte| *byte == b'\r') {
         // A selected subdirectory must not silently elevate Git access to its parent repository.
         return Ok(None);
@@ -1938,17 +2083,25 @@ pub fn remote_workspace_snapshot(
     let (repository_id, worktree_id) =
         machine_scoped_identities(&probe.machine_key, &root, &git_dir, &git_common_dir);
 
-    let version = lossy(probe.section("version")?.success("读取 Git 版本")?);
+    let version = lossy(
+        probe
+            .section("version")?
+            .success(phrase("读取 Git 版本", "read the Git version"))?,
+    );
     let version = version.trim();
     let git_version = version
         .strip_prefix("git version ")
         .unwrap_or(version)
         .to_owned();
-    let mut parsed = parse_porcelain_v2(probe.section("status")?.success("读取 Git 状态")?)?;
+    let mut parsed = parse_porcelain_v2(
+        probe
+            .section("status")?
+            .success(phrase("读取 Git 状态", "read the Git status"))?,
+    )?;
     let mut warnings = nested_submodule_warnings(&parsed.changes);
     let per_file = probe
         .section("numstat")
-        .and_then(|output| output.success("统计 Git 变更行数"))
+        .and_then(|output| output.success(phrase("统计 Git 变更行数", "count the changed lines")))
         .and_then(parse_numstat);
     let line_stats = match per_file {
         Ok(per_file) => apply_line_stats(&mut parsed.changes, per_file),
@@ -1961,17 +2114,19 @@ pub fn remote_workspace_snapshot(
             }
         }
     };
-    let staged = probe
-        .section("staged-digest")?
-        .success("计算 Git 暂存内容修订")?;
-    let unstaged = probe
-        .section("unstaged-digest")?
-        .success("计算 Git 工作树内容修订")?;
+    let staged = probe.section("staged-digest")?.success(phrase(
+        "计算 Git 暂存内容修订",
+        "compute the revision of the staged content",
+    ))?;
+    let unstaged = probe.section("unstaged-digest")?.success(phrase(
+        "计算 Git 工作树内容修订",
+        "compute the revision of the worktree content",
+    ))?;
     let content_revision =
         content_revision(&parsed.changes, staged.trim_ascii(), unstaged.trim_ascii());
     let remote_proofs = match probe
         .section("remotes")
-        .and_then(|output| output.success("读取 Git remotes"))
+        .and_then(|output| output.success(phrase("读取 Git remotes", "read the Git remotes")))
     {
         Ok(listing) => remote_proofs_from_listing(listing, &mut warnings),
         Err(error) => {
@@ -1985,7 +2140,7 @@ pub fn remote_workspace_snapshot(
                 if parsed.branch.oid.as_deref() != Some(local_oid.as_str())
                     || parsed.branch.upstream != upstream
                 {
-                    return Err("Git 分支或 upstream 在状态读取期间发生变化；请重试".into());
+                    return Err(text!("Git 分支或 upstream 在状态读取期间发生变化；请重试", "The Git branch or upstream changed while the status was being read; try again"));
                 }
                 (upstream, target)
             }
@@ -2027,6 +2182,36 @@ static IDENTITY_NAMESPACE: OnceLock<String> = OnceLock::new();
 /// (the host's `run_environment::env_key`). Only the first call takes effect.
 pub fn set_identity_namespace(machine: &str) {
     let _ = IDENTITY_NAMESPACE.set(machine.to_owned());
+}
+
+/// Whether the messages this process words for people — errors, warnings and
+/// the labels they are built from — are in English (the host's resolved UI
+/// language) rather than Simplified Chinese.
+///
+/// The host sets it when the document's language resolves; the remote agent's
+/// `git` helper, a process of its own per request, from each request
+/// ([`service::GitServiceRequest::english`]).
+static ENGLISH: AtomicBool = AtomicBool::new(false);
+
+/// Words this process's messages in English when `english`, in Simplified
+/// Chinese otherwise. The latest call wins.
+pub fn set_english(english: bool) {
+    ENGLISH.store(english, Ordering::Relaxed);
+}
+
+/// Whether this process words its messages in English (see [`set_english`]).
+pub fn english() -> bool {
+    ENGLISH.load(Ordering::Relaxed)
+}
+
+/// `zh` or `en`, in the language [`english`] picks, for a message with nothing
+/// to format.
+fn phrase(zh: &'static str, en: &'static str) -> &'static str {
+    if english() {
+        en
+    } else {
+        zh
+    }
 }
 
 /// Repository and worktree ids of a checkout on the machine `machine` names,
@@ -2097,8 +2282,9 @@ fn remote_proofs_from_listing(listing: &[u8], warnings: &mut Vec<String>) -> Vec
             continue;
         };
         if let Err(error) = validate_remote_name_syntax(name, false) {
-            warnings.push(format!(
-                "Git remote {name} 的 transport proof 不可用：{error}"
+            warnings.push(text!(
+                "Git remote {name} 的 transport proof 不可用：{error}",
+                "The transport proof of Git remote {name} is unavailable: {error}"
             ));
             continue;
         }
@@ -2146,24 +2332,36 @@ fn remote_upstream_target(
 ) -> Result<(Option<String>, Option<GitUpstream>, String), String> {
     let listing = probe
         .section("branches")?
-        .success("读取 Git upstream atoms")?;
+        .success(phrase("读取 Git upstream atoms", "read the Git upstream"))?;
     let full_ref = format!("refs/heads/{branch}");
     let record = listing
         .split(|byte| *byte == b'\n')
         .find_map(|record| record.strip_prefix(b"*\0"))
-        .ok_or_else(|| "当前本地 Git 分支已在读取 upstream 时消失".to_owned())?;
+        .ok_or_else(|| {
+            text!(
+                "当前本地 Git 分支已在读取 upstream 时消失",
+                "The current local Git branch disappeared while its upstream was being read"
+            )
+        })?;
     let local_oid = record
         .split(|byte| *byte == 0)
         .nth(1)
         .map(lossy)
         .unwrap_or_default();
     let Some(atoms) = parse_upstream_atoms(record, &full_ref)? else {
-        let local_oid = validate_object_id("本地分支提交", local_oid)?;
+        let local_oid =
+            validate_object_id(phrase("本地分支提交", "The local branch commit"), local_oid)?;
         return Ok((None, None, local_oid));
     };
     let tracking = probe.section("upstream-oid")?;
     let tracking_oid = (tracking.status == 0)
-        .then(|| validate_object_id("upstream 提交", lossy(tracking.stdout.trim_ascii())).ok())
+        .then(|| {
+            validate_object_id(
+                phrase("upstream 提交", "The upstream commit"),
+                lossy(tracking.stdout.trim_ascii()),
+            )
+            .ok()
+        })
         .flatten();
     let is_local = atoms.remote_name == ".";
     let remote = if is_local {
@@ -2173,12 +2371,22 @@ fn remote_upstream_target(
             .iter()
             .find(|remote| remote.name == atoms.remote_name)
             .cloned()
-            .ok_or_else(|| "Git upstream 指向不存在的 remote".to_owned())?
+            .ok_or_else(|| {
+                text!(
+                    "Git upstream 指向不存在的 remote",
+                    "The Git upstream points to a remote that does not exist"
+                )
+            })?
     };
     let remote_branch = atoms
         .merge_ref
         .strip_prefix("refs/heads/")
-        .ok_or_else(|| "Git upstream merge ref 无效".to_owned())?
+        .ok_or_else(|| {
+            text!(
+                "Git upstream merge ref 无效",
+                "The Git upstream merge ref is invalid"
+            )
+        })?
         .to_owned();
     let target = GitUpstream {
         remote_name: atoms.remote_name,
@@ -2198,7 +2406,10 @@ fn remote_upstream_target(
 fn remote_operation_state(
     output: &RemoteGitOutput,
 ) -> Result<Option<RepositoryOperationState>, String> {
-    let bytes = output.success("检查 Git 操作标志")?;
+    let bytes = output.success(phrase(
+        "检查 Git 操作标志",
+        "check the Git operation markers",
+    ))?;
     let label_end = bytes
         .iter()
         .position(|byte| *byte == b'\n')
@@ -2217,7 +2428,12 @@ fn remote_operation_state(
     ]
     .into_iter()
     .find(|operation| repository_operation_label(*operation) == label)
-    .ok_or_else(|| format!("远端 Git 报告了未知的进行中操作 {label}"))?;
+    .ok_or_else(|| {
+        text!(
+            "远端 Git 报告了未知的进行中操作 {label}",
+            "The remote Git reported an unknown operation in progress: {label}"
+        )
+    })?;
     let mut digest = Sha256::new();
     digest.update(b"mework.git.remote-operation-revision.v1\0");
     update_revision_component(&mut digest, b"state", bytes);
@@ -2424,8 +2640,9 @@ fn bounded_workspace_snapshot(mut snapshot: GitWorkspaceSnapshot) -> GitWorkspac
 fn normalize_change_query(query: Option<&str>) -> Result<String, String> {
     let query = query.unwrap_or_default().trim();
     if query.contains('\0') || query.as_bytes().len() > MAX_CHANGE_QUERY_BYTES {
-        return Err(format!(
-            "Git 变更筛选不能包含 NUL，且不能超过 {MAX_CHANGE_QUERY_BYTES} 字节"
+        return Err(text!(
+            "Git 变更筛选不能包含 NUL，且不能超过 {MAX_CHANGE_QUERY_BYTES} 字节",
+            "A Git change filter cannot contain NUL or exceed {MAX_CHANGE_QUERY_BYTES} bytes"
         ));
     }
     Ok(query.to_lowercase())
@@ -2455,18 +2672,31 @@ fn encode_change_cursor(offset: usize, revision: &str, query: &str) -> String {
 
 fn parse_change_cursor(cursor: &str, revision: &str, query: &str) -> Result<usize, String> {
     if cursor.len() > MAX_CHANGE_CURSOR_BYTES || cursor.contains('\0') {
-        return Err("Git 变更页游标无效；请重新加载".into());
+        return Err(text!(
+            "Git 变更页游标无效；请重新加载",
+            "The Git change page cursor is invalid; reload the changes"
+        ));
     }
-    let (offset, _) = cursor
-        .split_once('.')
-        .ok_or_else(|| "Git 变更页游标无效；请重新加载".to_owned())?;
+    let (offset, _) = cursor.split_once('.').ok_or_else(|| {
+        text!(
+            "Git 变更页游标无效；请重新加载",
+            "The Git change page cursor is invalid; reload the changes"
+        )
+    })?;
     if offset.is_empty() || !offset.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("Git 变更页游标无效；请重新加载".into());
+        return Err(text!(
+            "Git 变更页游标无效；请重新加载",
+            "The Git change page cursor is invalid; reload the changes"
+        ));
     }
-    let offset = usize::from_str_radix(offset, 16)
-        .map_err(|_| "Git 变更页游标无效；请重新加载".to_owned())?;
+    let offset = usize::from_str_radix(offset, 16).map_err(|_| {
+        text!(
+            "Git 变更页游标无效；请重新加载",
+            "The Git change page cursor is invalid; reload the changes"
+        )
+    })?;
     if encode_change_cursor(offset, revision, query) != cursor {
-        return Err("Git 变更页游标与当前仓库或筛选条件不匹配；请重新加载".into());
+        return Err(text!("Git 变更页游标与当前仓库或筛选条件不匹配；请重新加载", "The Git change page cursor does not match the current repository or filter; reload the changes"));
     }
     Ok(offset)
 }
@@ -2575,9 +2805,15 @@ fn tracked_diff_digest(repository: &Repository, staged: bool) -> Result<[u8; 32]
     let output = run_git(repository, args, None, LOCAL_COMMAND_TIMEOUT, 0, true)?;
     require_success(
         if staged {
-            "计算 Git 暂存内容修订"
+            phrase(
+                "计算 Git 暂存内容修订",
+                "compute the revision of the staged content",
+            )
         } else {
-            "计算 Git 工作树内容修订"
+            phrase(
+                "计算 Git 工作树内容修订",
+                "compute the revision of the worktree content",
+            )
         },
         &output,
     )?;
@@ -2642,9 +2878,12 @@ fn parse_porcelain_v2(bytes: &[u8]) -> Result<ParsedStatus, String> {
         } else if record.starts_with(b"1 ") {
             changes.push(parse_ordinary_change(record)?);
         } else if record.starts_with(b"2 ") {
-            let original = records
-                .get(index + 1)
-                .ok_or_else(|| "Git rename 状态缺少原路径".to_owned())?;
+            let original = records.get(index + 1).ok_or_else(|| {
+                text!(
+                    "Git rename 状态缺少原路径",
+                    "A Git rename status is missing its original path"
+                )
+            })?;
             changes.push(parse_renamed_change(record, original)?);
             index += 1;
         } else if record.starts_with(b"u ") {
@@ -2689,7 +2928,11 @@ fn parse_porcelain_v2(bytes: &[u8]) -> Result<ParsedStatus, String> {
                 submodule_untracked: false,
             });
         } else {
-            return Err(format!("无法解析 Git status 记录: {}", lossy(record)));
+            return Err(text!(
+                "无法解析 Git status 记录: {}",
+                "Could not parse a Git status record: {}",
+                lossy(record)
+            ));
         }
         index += 1;
     }
@@ -2724,11 +2967,19 @@ fn parse_submodule_state(value: &[u8]) -> Result<SubmoduleState, String> {
         return Ok(SubmoduleState::default());
     }
     if value.len() != 4 || value[0] != b'S' {
-        return Err(format!("Git submodule 状态无效: {}", lossy(value)));
+        return Err(text!(
+            "Git submodule 状态无效: {}",
+            "Invalid Git submodule status: {}",
+            lossy(value)
+        ));
     }
     let valid = |actual: u8, marker: u8| actual == b'.' || actual == marker;
     if !valid(value[1], b'C') || !valid(value[2], b'M') || !valid(value[3], b'U') {
-        return Err(format!("Git submodule 状态无效: {}", lossy(value)));
+        return Err(text!(
+            "Git submodule 状态无效: {}",
+            "Invalid Git submodule status: {}",
+            lossy(value)
+        ));
     }
     Ok(SubmoduleState {
         submodule: true,
@@ -2741,7 +2992,10 @@ fn parse_submodule_state(value: &[u8]) -> Result<SubmoduleState, String> {
 fn parse_ordinary_change(record: &[u8]) -> Result<GitFileChange, String> {
     let fields = splitn_ascii(record, b' ', 9);
     if fields.len() != 9 {
-        return Err("Git ordinary status 字段数量无效".into());
+        return Err(text!(
+            "Git ordinary status 字段数量无效",
+            "A Git ordinary status record has the wrong number of fields"
+        ));
     }
     let (index_status, worktree_status) = parse_xy(fields[1])?;
     let submodule = parse_submodule_state(fields[2])?;
@@ -2769,7 +3023,10 @@ fn parse_ordinary_change(record: &[u8]) -> Result<GitFileChange, String> {
 fn parse_renamed_change(record: &[u8], original: &[u8]) -> Result<GitFileChange, String> {
     let fields = splitn_ascii(record, b' ', 10);
     if fields.len() != 10 {
-        return Err("Git rename status 字段数量无效".into());
+        return Err(text!(
+            "Git rename status 字段数量无效",
+            "A Git rename status record has the wrong number of fields"
+        ));
     }
     let (index_status, worktree_status) = parse_xy(fields[1])?;
     let submodule = parse_submodule_state(fields[2])?;
@@ -2801,7 +3058,10 @@ fn parse_renamed_change(record: &[u8], original: &[u8]) -> Result<GitFileChange,
 fn parse_unmerged_change(record: &[u8]) -> Result<GitFileChange, String> {
     let fields = splitn_ascii(record, b' ', 11);
     if fields.len() != 11 {
-        return Err("Git conflict status 字段数量无效".into());
+        return Err(text!(
+            "Git conflict status 字段数量无效",
+            "A Git conflict status record has the wrong number of fields"
+        ));
     }
     let (index_status, worktree_status) = parse_xy(fields[1])?;
     let submodule = parse_submodule_state(fields[2])?;
@@ -2827,7 +3087,10 @@ fn parse_unmerged_change(record: &[u8]) -> Result<GitFileChange, String> {
 
 fn parse_xy(value: &[u8]) -> Result<(String, String), String> {
     if value.len() != 2 || !value.is_ascii() {
-        return Err("Git status XY 字段无效".into());
+        return Err(text!(
+            "Git status XY 字段无效",
+            "A Git status XY field is invalid"
+        ));
     }
     Ok((
         char::from(value[0]).to_string(),
@@ -2930,9 +3193,15 @@ fn diff_numstat(
         MAX_STATUS_OUTPUT,
         true,
     )?;
-    require_success("统计 Git 变更行数", &output)?;
+    require_success(
+        phrase("统计 Git 变更行数", "count the changed lines"),
+        &output,
+    )?;
     if output.stdout_truncated {
-        return Err("Git 变更行数统计超过安全上限，无法保证结果完整".into());
+        return Err(text!(
+            "Git 变更行数统计超过安全上限，无法保证结果完整",
+            "The Git changed-line counts exceed the safety limit, so they cannot be shown in full"
+        ));
     }
     parse_numstat(&output.stdout)
 }
@@ -2946,21 +3215,33 @@ fn parse_numstat(bytes: &[u8]) -> Result<HashMap<String, FileLineStats>, String>
     let mut index = 0;
     while index < records.len() {
         let mut fields = records[index].splitn(3, |byte| *byte == b'\t');
-        let additions = fields
-            .next()
-            .ok_or_else(|| "Git numstat 缺少新增行数字段".to_owned())?;
-        let deletions = fields
-            .next()
-            .ok_or_else(|| "Git numstat 缺少删除行数字段".to_owned())?;
-        let inline_path = fields
-            .next()
-            .ok_or_else(|| "Git numstat 缺少路径字段".to_owned())?;
+        let additions = fields.next().ok_or_else(|| {
+            text!(
+                "Git numstat 缺少新增行数字段",
+                "A Git numstat record is missing its added-lines field"
+            )
+        })?;
+        let deletions = fields.next().ok_or_else(|| {
+            text!(
+                "Git numstat 缺少删除行数字段",
+                "A Git numstat record is missing its deleted-lines field"
+            )
+        })?;
+        let inline_path = fields.next().ok_or_else(|| {
+            text!(
+                "Git numstat 缺少路径字段",
+                "A Git numstat record is missing its path field"
+            )
+        })?;
         let path = if inline_path.is_empty() {
             // With -z, rename/copy entries encode an empty inline path followed
             // by the source and destination as two additional NUL records.
-            let destination = records
-                .get(index + 2)
-                .ok_or_else(|| "Git numstat rename 缺少目标路径".to_owned())?;
+            let destination = records.get(index + 2).ok_or_else(|| {
+                text!(
+                    "Git numstat rename 缺少目标路径",
+                    "A Git numstat rename is missing its new path"
+                )
+            })?;
             index += 2;
             lossy(destination)
         } else {
@@ -2987,17 +3268,22 @@ fn parse_numstat(bytes: &[u8]) -> Result<HashMap<String, FileLineStats>, String>
 }
 
 fn parse_numstat_count(value: &[u8]) -> Result<u64, String> {
-    lossy(value)
-        .parse::<u64>()
-        .map_err(|_| "Git numstat 行数无效".to_owned())
+    lossy(value).parse::<u64>().map_err(|_| {
+        text!(
+            "Git numstat 行数无效",
+            "A Git numstat line count is invalid"
+        )
+    })
 }
 
 fn repository_operation_state(git_dir: &Path) -> Result<Option<RepositoryOperationState>, String> {
     let path_exists = |relative: &str| {
-        git_dir
-            .join(relative)
-            .try_exists()
-            .map_err(|error| format!("无法检查 Git 操作标志 {relative}: {error}"))
+        git_dir.join(relative).try_exists().map_err(|error| {
+            text!(
+                "无法检查 Git 操作标志 {relative}: {error}",
+                "Could not check the Git operation marker {relative}: {error}"
+            )
+        })
     };
     let operation = if path_exists("MERGE_HEAD")? {
         GitRepositoryOperation::Merge
@@ -3054,12 +3340,18 @@ fn repository_operation_revision(
         ],
         GitRepositoryOperation::Bisect => {
             let mut roots = vec![PathBuf::from("refs/bisect")];
-            let entries = fs::read_dir(git_dir)
-                .map_err(|error| format!("无法读取 Git 操作目录 {}: {error}", git_dir.display()))?;
+            let entries = fs::read_dir(git_dir).map_err(|error| {
+                text!(
+                    "无法读取 Git 操作目录 {}: {error}",
+                    "Could not read the Git operation directory {}: {error}",
+                    git_dir.display()
+                )
+            })?;
             for entry in entries {
                 let entry = entry.map_err(|error| {
-                    format!(
+                    text!(
                         "无法枚举 Git bisect 操作标志 {}: {error}",
+                        "Could not list the Git bisect markers in {}: {error}",
                         git_dir.display()
                     )
                 })?;
@@ -3097,8 +3389,9 @@ fn hash_operation_artifact(
 ) -> Result<(), String> {
     budget.artifacts = budget.artifacts.saturating_add(1);
     if budget.artifacts > MAX_OPERATION_REVISION_ARTIFACTS {
-        return Err(format!(
-            "Git 操作元数据超过 {MAX_OPERATION_REVISION_ARTIFACTS} 个条目，无法生成安全修订"
+        return Err(text!(
+            "Git 操作元数据超过 {MAX_OPERATION_REVISION_ARTIFACTS} 个条目，无法生成安全修订",
+            "The Git operation metadata has more than {MAX_OPERATION_REVISION_ARTIFACTS} entries, too many to compute a safe revision"
         ));
     }
     update_revision_component(
@@ -3114,16 +3407,18 @@ fn hash_operation_artifact(
             return Ok(());
         }
         Err(error) => {
-            return Err(format!(
+            return Err(text!(
                 "无法读取 Git 操作元数据 {}: {error}",
+                "Could not read the Git operation metadata {}: {error}",
                 relative.display()
             ))
         }
     };
     let created = before.created().ok();
     let modified = before.modified().map_err(|error| {
-        format!(
+        text!(
             "无法读取 Git 操作元数据 {} 的修改时间: {error}",
+            "Could not read the modification time of the Git operation metadata {}: {error}",
             relative.display()
         )
     })?;
@@ -3135,7 +3430,11 @@ fn hash_operation_artifact(
     if before.file_type().is_symlink() {
         update_revision_component(digest, b"artifact-type", b"symlink");
         let target = fs::read_link(&path).map_err(|error| {
-            format!("无法读取 Git 操作符号链接 {}: {error}", relative.display())
+            text!(
+                "无法读取 Git 操作符号链接 {}: {error}",
+                "Could not read the Git operation symlink {}: {error}",
+                relative.display()
+            )
         })?;
         update_revision_component(
             digest,
@@ -3145,8 +3444,9 @@ fn hash_operation_artifact(
     } else if before.is_dir() {
         update_revision_component(digest, b"artifact-type", b"directory");
         let entries = fs::read_dir(&path).map_err(|error| {
-            format!(
+            text!(
                 "无法读取 Git 操作元数据目录 {}: {error}",
+                "Could not read the Git operation metadata directory {}: {error}",
                 relative.display()
             )
         })?;
@@ -3155,8 +3455,9 @@ fn hash_operation_artifact(
                 entry
                     .map(|entry| relative.join(entry.file_name()))
                     .map_err(|error| {
-                        format!(
+                        text!(
                             "无法枚举 Git 操作元数据目录 {}: {error}",
+                            "Could not list the Git operation metadata directory {}: {error}",
                             relative.display()
                         )
                     })
@@ -3173,13 +3474,24 @@ fn hash_operation_artifact(
             .unwrap_or(usize::MAX)
             .min(MAX_OPERATION_REVISION_FILE_BYTES)
             .min(remaining);
-        let mut file = fs::File::open(&path)
-            .map_err(|error| format!("无法打开 Git 操作元数据 {}: {error}", relative.display()))?;
+        let mut file = fs::File::open(&path).map_err(|error| {
+            text!(
+                "无法打开 Git 操作元数据 {}: {error}",
+                "Could not open the Git operation metadata {}: {error}",
+                relative.display()
+            )
+        })?;
         let mut content = Vec::with_capacity(content_limit);
         Read::by_ref(&mut file)
             .take(content_limit as u64)
             .read_to_end(&mut content)
-            .map_err(|error| format!("无法读取 Git 操作元数据 {}: {error}", relative.display()))?;
+            .map_err(|error| {
+                text!(
+                    "无法读取 Git 操作元数据 {}: {error}",
+                    "Could not read the Git operation metadata {}: {error}",
+                    relative.display()
+                )
+            })?;
         budget.content_bytes = budget.content_bytes.saturating_add(content.len());
         update_revision_component(digest, b"artifact-content-prefix", &content);
         update_revision_component(
@@ -3192,24 +3504,32 @@ fn hash_operation_artifact(
             },
         );
         if before.len() <= content_limit as u64 && content.len() as u64 != before.len() {
-            return Err(format!(
+            return Err(text!(
                 "Git 操作元数据在读取时缩短，请刷新后重试: {}",
+                "The Git operation metadata shrank while it was being read; refresh and try again: {}",
                 relative.display()
             ));
         }
     } else {
-        return Err(format!(
+        return Err(text!(
             "Git 操作元数据类型不受支持: {}",
+            "Unsupported Git operation metadata type: {}",
             relative.display()
         ));
     }
 
-    let after = fs::symlink_metadata(&path)
-        .map_err(|error| format!("无法复核 Git 操作元数据 {}: {error}", relative.display()))?;
+    let after = fs::symlink_metadata(&path).map_err(|error| {
+        text!(
+            "无法复核 Git 操作元数据 {}: {error}",
+            "Could not recheck the Git operation metadata {}: {error}",
+            relative.display()
+        )
+    })?;
     let after_created = after.created().ok();
     let after_modified = after.modified().map_err(|error| {
-        format!(
+        text!(
             "无法复核 Git 操作元数据 {} 的修改时间: {error}",
+            "Could not recheck the modification time of the Git operation metadata {}: {error}",
             relative.display()
         )
     })?;
@@ -3218,8 +3538,9 @@ fn hash_operation_artifact(
         || created != after_created
         || modified != after_modified
     {
-        return Err(format!(
+        return Err(text!(
             "Git 操作元数据在生成修订时发生变化，请刷新后重试: {}",
+            "The Git operation metadata changed while its revision was being computed; refresh and try again: {}",
             relative.display()
         ));
     }
@@ -3324,24 +3645,26 @@ fn validate_action_during_repository_operation(
     let current = repository_operation_state(&repository.git_dir)?;
     let expected = expected_operation_for_action(action);
     match (current.as_ref(), expected) {
-        (None, Some((expected, _, _))) => Err(format!(
+        (None, Some((expected, _, _))) => Err(text!(
             "Git {} 操作已经结束；请刷新仓库状态后重试",
+            "The Git {} has already ended; refresh the repository status and try again",
             repository_operation_label(expected)
         )),
-        (Some(current), Some((expected, _, _))) if current.operation != expected => Err(format!(
+        (Some(current), Some((expected, _, _))) if current.operation != expected => Err(text!(
             "仓库当前正在执行 Git {}，不是请求中的 {}；请刷新后重试",
+            "The repository is in the middle of a Git {}, not the {} the request expects; refresh and try again",
             repository_operation_label(current.operation),
             repository_operation_label(expected)
         )),
         (Some(current), Some((_, expected_head, expected_revision))) => {
-            let expected_head = validate_object_id("Git 操作起始提交", expected_head.to_owned())?;
+            let expected_head = validate_object_id(phrase("Git 操作起始提交", "The Git operation's starting commit"), expected_head.to_owned())?;
             let actual_head = resolve_commit(repository, "HEAD")?;
             if actual_head != expected_head {
-                return Err("仓库 HEAD 已在确认后发生变化；请刷新并重新确认当前 Git 操作".into());
+                return Err(text!("仓库 HEAD 已在确认后发生变化；请刷新并重新确认当前 Git 操作", "The repository's HEAD changed after you confirmed; refresh and confirm the current Git operation again"));
             }
-            let expected_revision = validate_revision_token("Git 操作修订", expected_revision)?;
+            let expected_revision = validate_revision_token(phrase("Git 操作修订", "The Git operation revision"), expected_revision)?;
             if current.revision != expected_revision {
-                return Err("当前 Git 操作已在确认后变化或重新开始；请刷新并重新确认操作".into());
+                return Err(text!("当前 Git 操作已在确认后变化或重新开始；请刷新并重新确认操作", "The current Git operation changed or restarted after you confirmed; refresh and confirm the operation again"));
             }
             Ok(())
         }
@@ -3353,8 +3676,9 @@ fn validate_action_during_repository_operation(
         {
             Ok(())
         }
-        (Some(current), None) => Err(format!(
+        (Some(current), None) => Err(text!(
             "仓库正在执行 Git {}；请先解决冲突并继续，或中止当前操作",
+            "The repository is in the middle of a Git {}; resolve the conflicts and continue, or abort the operation first",
             repository_operation_label(current.operation)
         )),
         (None, None) => Ok(()),
@@ -3363,7 +3687,10 @@ fn validate_action_during_repository_operation(
 
 fn validate_revision_token(label: &str, value: &str) -> Result<String, String> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("{label}无效；请刷新仓库状态后重试"));
+        return Err(text!(
+            "{label}无效；请刷新仓库状态后重试",
+            "{label} is invalid; refresh the repository status and try again"
+        ));
     }
     Ok(value.to_ascii_lowercase())
 }
@@ -3397,13 +3724,14 @@ fn prepare_repository_operation_action(
         }
         (GitRepositoryOperation::Bisect, RepositoryOperationControl::Continue) => {
             return Err(
-                "Git bisect 需要先标记当前提交为 good 或 bad；当前界面只支持结束二分查找".into(),
+                text!("Git bisect 需要先标记当前提交为 good 或 bad；当前界面只支持结束二分查找", "Git bisect needs the current commit marked good or bad first; here you can only end the bisect"),
             );
         }
         (GitRepositoryOperation::Merge, RepositoryOperationControl::Skip)
         | (GitRepositoryOperation::Bisect, RepositoryOperationControl::Skip) => {
-            return Err(format!(
+            return Err(text!(
                 "Git {} 不支持跳过当前提交",
+                "Git {} does not support skipping the current commit",
                 repository_operation_label(operation)
             ));
         }
@@ -3437,15 +3765,25 @@ fn prepare_repository_operation_action(
 
 fn parse_bisect_term_output(bytes: &[u8]) -> Result<String, String> {
     if bytes.len() > MAX_GIT_BISECT_TERM_BYTES {
-        return Err("Git bisect 自定义术语超过安全上限".into());
+        return Err(text!(
+            "Git bisect 自定义术语超过安全上限",
+            "The custom Git bisect terms exceed the safety limit"
+        ));
     }
-    let text =
-        std::str::from_utf8(bytes).map_err(|_| "Git bisect 自定义术语不是有效 UTF-8".to_owned())?;
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        text!(
+            "Git bisect 自定义术语不是有效 UTF-8",
+            "The custom Git bisect terms are not valid UTF-8"
+        )
+    })?;
     let text = text.strip_suffix('\n').unwrap_or(text);
     let term = text.strip_suffix('\r').unwrap_or(text);
     if term.is_empty() || term.as_bytes().contains(&0) || term.contains('\r') || term.contains('\n')
     {
-        return Err("Git bisect 自定义术语格式无效".into());
+        return Err(text!(
+            "Git bisect 自定义术语格式无效",
+            "The custom Git bisect terms are malformed"
+        ));
     }
     Ok(term.to_owned())
 }
@@ -3474,9 +3812,18 @@ fn resolve_bisect_step_command(
         MAX_GIT_BISECT_TERM_BYTES,
         true,
     )?;
-    require_success("读取 Git bisect 自定义术语", &output)?;
+    require_success(
+        phrase(
+            "读取 Git bisect 自定义术语",
+            "read the custom Git bisect terms",
+        ),
+        &output,
+    )?;
     if output.stdout_truncated {
-        return Err("Git bisect 自定义术语超过安全上限".into());
+        return Err(text!(
+            "Git bisect 自定义术语超过安全上限",
+            "The custom Git bisect terms exceed the safety limit"
+        ));
     }
     Ok(vec![
         OsString::from("bisect"),
@@ -3499,13 +3846,16 @@ fn branches_for_repository(repository: &Repository) -> Result<Vec<GitBranch>, St
         MAX_JSON_OUTPUT,
         true,
     )?;
-    require_success("读取 Git 分支", &output)?;
+    require_success(phrase("读取 Git 分支", "read the Git branches"), &output)?;
     let text = String::from_utf8_lossy(&output.stdout);
     let mut branches = Vec::new();
     for line in text.lines() {
         let fields = line.split('\0').collect::<Vec<_>>();
         if fields.len() != 6 {
-            return Err("Git 分支输出字段数量无效".into());
+            return Err(text!(
+                "Git 分支输出字段数量无效",
+                "A Git branch record has the wrong number of fields"
+            ));
         }
         if fields[0].ends_with("/HEAD") {
             continue;
@@ -3669,10 +4019,16 @@ fn discard_selection(
             .files
             .iter()
             .find(|change| change.path == path)
-            .ok_or_else(|| format!("只能丢弃当前 Git 变更列表中的路径: {path}"))?;
+            .ok_or_else(|| {
+                text!(
+                    "只能丢弃当前 Git 变更列表中的路径: {path}",
+                    "Only paths in the current Git change list can be discarded: {path}"
+                )
+            })?;
         if change.submodule {
-            return Err(format!(
+            return Err(text!(
                 "Mework 不会从父仓库递归丢弃子模块 {} 的内部变更；请将该子模块作为独立工作区处理",
+                "Mework does not discard the changes inside submodule {} from its parent repository; open the submodule as a workspace of its own",
                 change.path
             ));
         }
@@ -3699,8 +4055,9 @@ fn git_file_status_label(status: GitFileStatus) -> &'static [u8] {
 fn target_proof_remaining(deadline: Instant, action_label: &str) -> Result<Duration, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        Err(format!(
-            "计算 Git {action_label}目标修订超时；未执行任何更改"
+        Err(text!(
+            "计算 Git {action_label}目标修订超时；未执行任何更改",
+            "Computing the revision of the Git {action_label} targets timed out; nothing was changed"
         ))
     } else {
         Ok(remaining)
@@ -3754,7 +4111,7 @@ fn discard_target_revision(
         include_untracked,
         DISCARD_TARGET_REVISION_TIMEOUT,
         b"mework.git.discard-target-revision.v1\0",
-        "丢弃",
+        phrase("丢弃", "discard"),
     )
 }
 
@@ -3785,8 +4142,9 @@ fn selected_target_revision(
     for change in selection {
         target_proof_remaining(deadline, action_label)?;
         if change.untracked && !include_untracked {
-            return Err(format!(
+            return Err(text!(
                 "未跟踪文件 {} 只有在明确允许删除未跟踪文件时才能丢弃",
+                "The untracked file {} can only be discarded when deleting untracked files is explicitly allowed",
                 change.path
             ));
         }
@@ -3824,8 +4182,9 @@ fn selected_target_revision(
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 let target = fs::read_link(&path).map_err(|error| {
-                    format!(
+                    text!(
                         "无法读取 Git {action_label}目标符号链接 {}: {error}",
+                        "Could not read the Git {action_label} target symlink {}: {error}",
                         change.path
                     )
                 })?;
@@ -3838,24 +4197,34 @@ fn selected_target_revision(
             }
             Ok(metadata) if metadata.is_file() => {
                 let canonical = fs::canonicalize(&path).map_err(|error| {
-                    format!("无法访问 Git {action_label}目标 {}: {error}", change.path)
+                    text!(
+                        "无法访问 Git {action_label}目标 {}: {error}",
+                        "Could not access the Git {action_label} target {}: {error}",
+                        change.path
+                    )
                 })?;
                 if !canonical.starts_with(&repository.root) {
-                    return Err(format!("Git {action_label}目标越出仓库: {}", change.path));
+                    return Err(text!(
+                        "Git {action_label}目标越出仓库: {}",
+                        "The Git {action_label} target is outside the repository: {}",
+                        change.path
+                    ));
                 }
                 update_revision_component(&mut digest, b"worktree-kind", b"regular");
                 hash_target_regular_file_mode(&mut digest, &metadata);
                 regular_files.push((change.path.clone(), PathBuf::from(&change.path)));
             }
             Ok(metadata) if metadata.is_dir() => {
-                return Err(format!(
+                return Err(text!(
                     "Git {action_label}目标不是普通文件: {}",
+                    "The Git {action_label} target is not a regular file: {}",
                     change.path
                 ));
             }
             Ok(_) => {
-                return Err(format!(
+                return Err(text!(
                     "Git {action_label}目标类型不受支持: {}",
+                    "The Git {action_label} target has an unsupported type: {}",
                     change.path
                 ));
             }
@@ -3863,8 +4232,9 @@ fn selected_target_revision(
                 update_revision_component(&mut digest, b"worktree-kind", b"missing");
             }
             Err(error) => {
-                return Err(format!(
+                return Err(text!(
                     "无法检查 Git {action_label}目标 {}: {error}",
+                    "Could not check the Git {action_label} target {}: {error}",
                     change.path
                 ));
             }
@@ -3899,11 +4269,18 @@ fn selected_target_revision(
             true,
         )?;
         if output.timed_out {
-            return Err(format!(
-                "计算 Git {action_label}目标索引修订超时；未执行任何更改"
+            return Err(text!(
+                "计算 Git {action_label}目标索引修订超时；未执行任何更改",
+                "Computing the index revision of the Git {action_label} targets timed out; nothing was changed"
             ));
         }
-        require_success(&format!("读取 Git {action_label}目标索引来源"), &output)?;
+        require_success(
+            &text!(
+                "读取 Git {action_label}目标索引来源",
+                "read the index entries of the Git {action_label} targets"
+            ),
+            &output,
+        )?;
         update_revision_component(&mut digest, b"index-source-digest", &output.stdout_sha256);
     }
 
@@ -3933,13 +4310,20 @@ fn selected_target_revision(
             true,
         )?;
         if output.timed_out {
-            return Err(format!(
-                "计算 Git {action_label}目标内容修订超时；未执行任何更改"
+            return Err(text!(
+                "计算 Git {action_label}目标内容修订超时；未执行任何更改",
+                "Computing the content revision of the Git {action_label} targets timed out; nothing was changed"
             ));
         }
-        require_success(&format!("计算 Git {action_label}目标内容修订"), &output)?;
+        require_success(
+            &text!(
+                "计算 Git {action_label}目标内容修订",
+                "compute the content revision of the Git {action_label} targets"
+            ),
+            &output,
+        )?;
         if output.stdout_truncated {
-            return Err(format!("Git {action_label}目标内容修订输出超过安全上限"));
+            return Err(text!("Git {action_label}目标内容修订输出超过安全上限", "The content revision output of the Git {action_label} targets exceeds the safety limit"));
         }
         let object_id_output = String::from_utf8_lossy(&output.stdout);
         let object_ids = object_id_output
@@ -3948,15 +4332,19 @@ fn selected_target_revision(
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>();
         if object_ids.len() != batch.len() {
-            return Err(format!(
-                "Git {action_label}目标内容修订数量与请求路径不一致"
+            return Err(text!(
+                "Git {action_label}目标内容修订数量与请求路径不一致",
+                "The number of content revisions of the Git {action_label} targets does not match the requested paths"
             ));
         }
         for (index, object_id) in object_ids.into_iter().enumerate() {
             if !matches!(object_id.len(), 40 | 64)
                 || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
-                return Err(format!("Git {action_label}目标内容修订无效"));
+                return Err(text!(
+                    "Git {action_label}目标内容修订无效",
+                    "A content revision of the Git {action_label} targets is invalid"
+                ));
             }
             let (relative, _) = &regular_files[regular_offset + index];
             update_revision_component(&mut digest, b"content-path", relative.as_bytes());
@@ -3994,19 +4382,23 @@ fn execute_discard(
     expected_content_revision: &str,
     expected_target_revision: &str,
 ) -> Result<CliOutput, String> {
-    let expected_content_revision =
-        validate_revision_token("Git 内容修订", expected_content_revision)?;
-    let expected_target_revision =
-        validate_revision_token("Git 丢弃目标修订", expected_target_revision)?;
+    let expected_content_revision = validate_revision_token(
+        phrase("Git 内容修订", "The Git content revision"),
+        expected_content_revision,
+    )?;
+    let expected_target_revision = validate_revision_token(
+        phrase("Git 丢弃目标修订", "The Git discard target revision"),
+        expected_target_revision,
+    )?;
     let snapshot = snapshot_for_repository(repository)?;
     if snapshot.content_revision != expected_content_revision {
-        return Err("文件内容已在确认后发生变化；请刷新差异并重新确认丢弃".into());
+        return Err(text!("文件内容已在确认后发生变化；请刷新差异并重新确认丢弃", "The file contents changed after you confirmed; refresh the diff and confirm the discard again"));
     }
     let selection = discard_selection(&snapshot, paths)?;
     let actual_target_revision =
         discard_target_revision(repository, &selection, include_untracked)?;
     if actual_target_revision != expected_target_revision {
-        return Err("待丢弃文件已在确认后发生变化；请刷新差异并重新确认丢弃".into());
+        return Err(text!("待丢弃文件已在确认后发生变化；请刷新差异并重新确认丢弃", "The files to discard changed after you confirmed; refresh the diff and confirm the discard again"));
     }
     let mut tracked = Vec::new();
     let mut untracked = Vec::new();
@@ -4058,11 +4450,22 @@ fn execute_discard(
             removed = removed.saturating_add(1);
         }
     }
-    let mut message = format!("已丢弃 {} 个未暂存变更", tracked.len());
+    let mut message = text!(
+        "已丢弃 {} 个未暂存变更",
+        "Unstaged changes discarded: {}",
+        tracked.len()
+    );
     if include_untracked {
-        message.push_str(&format!("，删除 {removed} 个未跟踪文件"));
+        message.push_str(&text!(
+            "，删除 {removed} 个未跟踪文件",
+            ", untracked files deleted: {removed}"
+        ));
     } else if !untracked.is_empty() {
-        message.push_str(&format!("；保留 {} 个未跟踪文件", untracked.len()));
+        message.push_str(&text!(
+            "；保留 {} 个未跟踪文件",
+            "; untracked files kept: {}",
+            untracked.len()
+        ));
     }
     output.stdout = message.into_bytes();
     output.stdout_sha256 = Sha256::digest(&output.stdout).into();
@@ -4160,22 +4563,44 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
             .to_ascii_lowercase()
     }
 
-    let root_handle = open_handle(root, FILE_READ_ATTRIBUTES, false)
-        .map_err(|error| format!("无法锁定 Git 仓库根目录 {}: {error}", root.display()))?;
+    let root_handle = open_handle(root, FILE_READ_ATTRIBUTES, false).map_err(|error| {
+        text!(
+            "无法锁定 Git 仓库根目录 {}: {error}",
+            "Could not lock the Git repository root {}: {error}",
+            root.display()
+        )
+    })?;
     let target_path = root.join(relative);
-    let target_handle = open_handle(&target_path, DELETE | FILE_READ_ATTRIBUTES, true)
-        .map_err(|error| format!("无法打开未跟踪文件 {}: {error}", relative.to_string_lossy()))?;
+    let target_handle =
+        open_handle(&target_path, DELETE | FILE_READ_ATTRIBUTES, true).map_err(|error| {
+            text!(
+                "无法打开未跟踪文件 {}: {error}",
+                "Could not open the untracked file {}: {error}",
+                relative.to_string_lossy()
+            )
+        })?;
 
-    let root_final = final_handle_path(root_handle.as_raw_handle().cast())
-        .map_err(|error| format!("无法验证 Git 仓库根目录句柄: {error}"))?;
-    let target_final = final_handle_path(target_handle.as_raw_handle().cast())
-        .map_err(|error| format!("无法验证未跟踪文件 {}: {error}", relative.to_string_lossy()))?;
+    let root_final = final_handle_path(root_handle.as_raw_handle().cast()).map_err(|error| {
+        text!(
+            "无法验证 Git 仓库根目录句柄: {error}",
+            "Could not verify the Git repository root handle: {error}"
+        )
+    })?;
+    let target_final =
+        final_handle_path(target_handle.as_raw_handle().cast()).map_err(|error| {
+            text!(
+                "无法验证未跟踪文件 {}: {error}",
+                "Could not verify the untracked file {}: {error}",
+                relative.to_string_lossy()
+            )
+        })?;
     let root_final = normalized_handle_path(&root_final);
     let target_final = normalized_handle_path(&target_final);
     let descendant_prefix = format!("{root_final}\\");
     if !target_final.starts_with(&descendant_prefix) {
-        return Err(format!(
+        return Err(text!(
             "拒绝删除越出 Git 仓库的未跟踪文件: {}",
+            "Refusing to delete an untracked file outside the Git repository: {}",
             relative.to_string_lossy()
         ));
     }
@@ -4188,15 +4613,17 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
         )
     } == 0
     {
-        return Err(format!(
+        return Err(text!(
             "无法检查未跟踪文件 {}: {}",
+            "Could not check the untracked file {}: {}",
             relative.to_string_lossy(),
             std::io::Error::last_os_error()
         ));
     }
     if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-        return Err(format!(
+        return Err(text!(
             "拒绝递归删除未跟踪目录: {}",
+            "Refusing to delete an untracked directory recursively: {}",
             relative.to_string_lossy()
         ));
     }
@@ -4225,8 +4652,9 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
             )
         } == 0
         {
-            return Err(format!(
+            return Err(text!(
                 "无法删除未跟踪文件 {}: {}",
+                "Could not delete the untracked file {}: {}",
                 relative.to_string_lossy(),
                 std::io::Error::last_os_error()
             ));
@@ -4247,7 +4675,8 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
     };
 
     fn c_path(value: &std::ffi::OsStr) -> Result<CString, String> {
-        CString::new(value.as_bytes()).map_err(|_| "Git 路径包含 NUL 字节".to_owned())
+        CString::new(value.as_bytes())
+            .map_err(|_| text!("Git 路径包含 NUL 字节", "A Git path contains a NUL byte"))
     }
 
     let root_path = c_path(root.as_os_str())?;
@@ -4258,8 +4687,9 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
         )
     };
     if root_fd < 0 {
-        return Err(format!(
+        return Err(text!(
             "无法锁定 Git 仓库根目录 {}: {}",
+            "Could not lock the Git repository root {}: {}",
             root.display(),
             std::io::Error::last_os_error()
         ));
@@ -4267,7 +4697,10 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
     let mut directory = unsafe { OwnedFd::from_raw_fd(root_fd) };
     let mut components = relative.components().peekable();
     let Some(Component::Normal(first)) = components.next() else {
-        return Err("未跟踪文件路径无效".into());
+        return Err(text!(
+            "未跟踪文件路径无效",
+            "The untracked file path is invalid"
+        ));
     };
     let mut current = first;
     while components.peek().is_some() {
@@ -4280,15 +4713,19 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
             )
         };
         if next_fd < 0 {
-            return Err(format!(
+            return Err(text!(
                 "拒绝沿符号链接访问未跟踪文件 {}: {}",
+                "Refusing to follow a symlink to the untracked file {}: {}",
                 relative.display(),
                 std::io::Error::last_os_error()
             ));
         }
         directory = unsafe { OwnedFd::from_raw_fd(next_fd) };
         let Some(Component::Normal(next)) = components.next() else {
-            return Err("未跟踪文件路径无效".into());
+            return Err(text!(
+                "未跟踪文件路径无效",
+                "The untracked file path is invalid"
+            ));
         };
         current = next;
     }
@@ -4304,18 +4741,24 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
         )
     } != 0
     {
-        return Err(format!(
+        return Err(text!(
             "无法检查未跟踪文件 {}: {}",
+            "Could not check the untracked file {}: {}",
             relative.display(),
             std::io::Error::last_os_error()
         ));
     }
     if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
-        return Err(format!("拒绝递归删除未跟踪目录: {}", relative.display()));
+        return Err(text!(
+            "拒绝递归删除未跟踪目录: {}",
+            "Refusing to delete an untracked directory recursively: {}",
+            relative.display()
+        ));
     }
     if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        return Err(format!(
+        return Err(text!(
             "无法删除未跟踪文件 {}: {}",
+            "Could not delete the untracked file {}: {}",
             relative.display(),
             std::io::Error::last_os_error()
         ));
@@ -4325,23 +4768,33 @@ fn remove_file_beneath_root(root: &Path, relative: &Path) -> Result<(), String> 
 
 fn encode_pathspecs(paths: &[String]) -> Result<Vec<u8>, String> {
     if paths.is_empty() {
-        return Err("Git 文件操作至少需要一个路径".into());
+        return Err(text!(
+            "Git 文件操作至少需要一个路径",
+            "A Git file action needs at least one path"
+        ));
     }
     if paths.len() > MAX_PATHS_PER_ACTION {
-        return Err(format!(
-            "Git 文件操作一次最多接受 {MAX_PATHS_PER_ACTION} 个路径"
+        return Err(text!(
+            "Git 文件操作一次最多接受 {MAX_PATHS_PER_ACTION} 个路径",
+            "A Git file action accepts at most {MAX_PATHS_PER_ACTION} paths at once"
         ));
     }
     let mut input = Vec::new();
     for path in paths {
         let path = validate_relative_path(path)?;
         if path == "." {
-            return Err("批量路径操作不接受工作区根目录；请使用 stageAll".into());
+            return Err(text!(
+                "批量路径操作不接受工作区根目录；请使用 stageAll",
+                "A path action does not accept the workspace root; use stageAll"
+            ));
         }
         input.extend_from_slice(path.as_bytes());
         input.push(0);
         if input.len() > MAX_PATH_BYTES_PER_ACTION {
-            return Err("Git 文件操作路径总长度超过 1 MiB".into());
+            return Err(text!(
+                "Git 文件操作路径总长度超过 1 MiB",
+                "The paths of a Git file action exceed 1 MiB in total"
+            ));
         }
     }
     Ok(input)
@@ -4349,14 +4802,23 @@ fn encode_pathspecs(paths: &[String]) -> Result<Vec<u8>, String> {
 
 fn validate_relative_path(path: &str) -> Result<String, String> {
     if path.is_empty() || path.contains('\0') {
-        return Err("Git 路径不能为空或包含 NUL".into());
+        return Err(text!(
+            "Git 路径不能为空或包含 NUL",
+            "A Git path cannot be empty or contain NUL"
+        ));
     }
     if path.contains('\\') {
-        return Err("Git 路径必须使用 / 分隔".into());
+        return Err(text!(
+            "Git 路径必须使用 / 分隔",
+            "A Git path must use / as its separator"
+        ));
     }
     let candidate = Path::new(path);
     if candidate.is_absolute() {
-        return Err("Git 路径必须相对于仓库根目录".into());
+        return Err(text!(
+            "Git 路径必须相对于仓库根目录",
+            "A Git path must be relative to the repository root"
+        ));
     }
     let mut components = Vec::new();
     for component in candidate.components() {
@@ -4364,7 +4826,10 @@ fn validate_relative_path(path: &str) -> Result<String, String> {
             Component::CurDir => {}
             Component::Normal(part) => components.push(part.to_string_lossy().into_owned()),
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err("Git 路径不得越出仓库根目录".into())
+                return Err(text!(
+                    "Git 路径不得越出仓库根目录",
+                    "A Git path cannot leave the repository root"
+                ))
             }
         }
     }
@@ -4376,17 +4841,24 @@ fn validate_relative_path(path: &str) -> Result<String, String> {
 
 fn canonical_existing_repo_file(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let candidate = root.join(relative);
-    let canonical = fs::canonicalize(&candidate)
-        .map_err(|error| format!("无法访问 Git 文件 {relative}: {error}"))?;
+    let canonical = fs::canonicalize(&candidate).map_err(|error| {
+        text!(
+            "无法访问 Git 文件 {relative}: {error}",
+            "Could not access the Git file {relative}: {error}"
+        )
+    })?;
     if !canonical.starts_with(root) || !canonical.is_file() {
-        return Err(format!("Git 文件越出仓库或不是普通文件: {relative}"));
+        return Err(text!(
+            "Git 文件越出仓库或不是普通文件: {relative}",
+            "The Git file is outside the repository or not a regular file: {relative}"
+        ));
     }
     Ok(canonical)
 }
 
 fn validate_branch_name(repository: &Repository, name: &str) -> Result<(), String> {
     if name.trim() != name || name.is_empty() || name.contains('\0') {
-        return Err("Git 分支名称无效".into());
+        return Err(text!("Git 分支名称无效", "Invalid Git branch name"));
     }
     let output = run_git(
         repository,
@@ -4400,7 +4872,10 @@ fn validate_branch_name(repository: &Repository, name: &str) -> Result<(), Strin
         16 * 1024,
         true,
     )?;
-    require_success("验证 Git 分支名称", &output)
+    require_success(
+        phrase("验证 Git 分支名称", "validate the Git branch name"),
+        &output,
+    )
 }
 
 fn validate_local_branch(repository: &Repository, name: &str) -> Result<(), String> {
@@ -4411,7 +4886,10 @@ fn validate_local_branch(repository: &Repository, name: &str) -> Result<(), Stri
     {
         Ok(())
     } else {
-        Err(format!("本地 Git 分支不存在: {name}"))
+        Err(text!(
+            "本地 Git 分支不存在: {name}",
+            "The local Git branch does not exist: {name}"
+        ))
     }
 }
 
@@ -4439,7 +4917,7 @@ fn resolve_commit(repository: &Repository, revision: &str) -> Result<String, Str
         || revision.starts_with('-')
         || revision.len() > 1024
     {
-        return Err("Git revision 无效".into());
+        return Err(text!("Git revision 无效", "Invalid Git revision"));
     }
     let output = run_git(
         repository,
@@ -4454,7 +4932,10 @@ fn resolve_commit(repository: &Repository, revision: &str) -> Result<String, Str
         4096,
         true,
     )?;
-    require_success("解析 Git revision", &output)?;
+    require_success(
+        phrase("解析 Git revision", "resolve the Git revision"),
+        &output,
+    )?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
@@ -4490,12 +4971,19 @@ fn configured_remote_names(repository: &Repository) -> Result<Vec<String>, Strin
         64 * 1024,
         true,
     )?;
-    require_success("读取 Git remotes", &remotes)?;
+    require_success(phrase("读取 Git remotes", "read the Git remotes"), &remotes)?;
     if remotes.stdout_truncated {
-        return Err("Git remote 列表超过安全上限".into());
+        return Err(text!(
+            "Git remote 列表超过安全上限",
+            "The Git remote list exceeds the safety limit"
+        ));
     }
-    let text = std::str::from_utf8(&remotes.stdout)
-        .map_err(|_| "Git remote 列表不是有效 UTF-8".to_owned())?;
+    let text = std::str::from_utf8(&remotes.stdout).map_err(|_| {
+        text!(
+            "Git remote 列表不是有效 UTF-8",
+            "The Git remote list is not valid UTF-8"
+        )
+    })?;
     let mut names = text
         .lines()
         .map(|name| name.strip_suffix('\r').unwrap_or(name))
@@ -4503,7 +4991,10 @@ fn configured_remote_names(repository: &Repository) -> Result<Vec<String>, Strin
         .map(str::to_owned)
         .collect::<Vec<_>>();
     if names.len() > MAX_GIT_REMOTES {
-        return Err(format!("Git remote 数量超过 {MAX_GIT_REMOTES} 个安全上限"));
+        return Err(text!(
+            "Git remote 数量超过 {MAX_GIT_REMOTES} 个安全上限",
+            "The Git remotes exceed the safety limit of {MAX_GIT_REMOTES}"
+        ));
     }
     for name in &names {
         validate_remote_name_syntax(name, false)?;
@@ -4526,7 +5017,7 @@ fn validate_remote_name_syntax(name: &str, allow_local: bool) -> Result<(), Stri
             .chars()
             .any(|character| character == '\0' || character.is_control())
     {
-        return Err("Git remote 名称无效".into());
+        return Err(text!("Git remote 名称无效", "Invalid Git remote name"));
     }
     Ok(())
 }
@@ -4553,28 +5044,44 @@ fn remote_config_values(
         if !output.timed_out && output.exit_code() == Some(1) {
             return Ok(Vec::new());
         }
-        return Err("无法读取 Git transport 配置".into());
+        return Err(text!(
+            "无法读取 Git transport 配置",
+            "Could not read the Git transport configuration"
+        ));
     }
     if output.stdout_truncated {
-        return Err("Git transport 配置超过安全上限".into());
+        return Err(text!(
+            "Git transport 配置超过安全上限",
+            "The Git transport configuration exceeds the safety limit"
+        ));
     }
     let mut values = Vec::new();
     for raw in output.stdout.split(|byte| *byte == 0) {
         if raw.is_empty() {
             continue;
         }
-        let value =
-            std::str::from_utf8(raw).map_err(|_| "Git transport 配置不是有效 UTF-8".to_owned())?;
+        let value = std::str::from_utf8(raw).map_err(|_| {
+            text!(
+                "Git transport 配置不是有效 UTF-8",
+                "The Git transport configuration is not valid UTF-8"
+            )
+        })?;
         if value.as_bytes().len() > MAX_GIT_REMOTE_VALUE_BYTES
             || value
                 .chars()
                 .any(|character| character == '\0' || character == '\r' || character == '\n')
         {
-            return Err("Git transport 配置值无效或超过安全上限".into());
+            return Err(text!(
+                "Git transport 配置值无效或超过安全上限",
+                "A Git transport configuration value is invalid or exceeds the safety limit"
+            ));
         }
         values.push(value.to_owned());
         if values.len() > max_values {
-            return Err("Git transport 配置项数量超过安全上限".into());
+            return Err(text!(
+                "Git transport 配置项数量超过安全上限",
+                "The Git transport configuration has more entries than the safety limit"
+            ));
         }
     }
     Ok(values)
@@ -4603,13 +5110,23 @@ fn remote_effective_urls(
         true,
     )?;
     if !output.success() {
-        return Err("无法读取 Git remote transport locator".into());
+        return Err(text!(
+            "无法读取 Git remote transport locator",
+            "Could not read the Git remote transport locator"
+        ));
     }
     if output.stdout_truncated {
-        return Err("Git remote transport locator 超过安全上限".into());
+        return Err(text!(
+            "Git remote transport locator 超过安全上限",
+            "The Git remote transport locator exceeds the safety limit"
+        ));
     }
-    let text = std::str::from_utf8(&output.stdout)
-        .map_err(|_| "Git remote transport locator 不是有效 UTF-8".to_owned())?;
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| {
+        text!(
+            "Git remote transport locator 不是有效 UTF-8",
+            "The Git remote transport locator is not valid UTF-8"
+        )
+    })?;
     let mut values = Vec::new();
     for value in text.lines() {
         let value = value.strip_suffix('\r').unwrap_or(value);
@@ -4619,17 +5136,24 @@ fn remote_effective_urls(
                 .chars()
                 .any(|character| character == '\0' || character.is_control())
         {
-            return Err("Git remote transport locator 无效或超过安全上限".into());
+            return Err(text!(
+                "Git remote transport locator 无效或超过安全上限",
+                "A Git remote transport locator is invalid or exceeds the safety limit"
+            ));
         }
         values.push(value.to_owned());
         if values.len() > MAX_GIT_REMOTE_URLS {
-            return Err(format!(
-                "Git remote transport locator 超过 {MAX_GIT_REMOTE_URLS} 个安全上限"
+            return Err(text!(
+                "Git remote transport locator 超过 {MAX_GIT_REMOTE_URLS} 个安全上限",
+                "The Git remote transport locators exceed the safety limit of {MAX_GIT_REMOTE_URLS}"
             ));
         }
     }
     if values.is_empty() {
-        return Err("Git remote 没有可用的 transport locator".into());
+        return Err(text!(
+            "Git remote 没有可用的 transport locator",
+            "The Git remote has no usable transport locator"
+        ));
     }
     Ok(values)
 }
@@ -4690,7 +5214,10 @@ fn remote_transport_for_existing(
         MAX_GIT_REMOTE_URLS,
     )?;
     if configured_urls.is_empty() {
-        return Err("Git remote 没有有效的 url 配置".into());
+        return Err(text!(
+            "Git remote 没有有效的 url 配置",
+            "The Git remote has no valid url configured"
+        ));
     }
     let _configured_push_urls = remote_config_values(
         repository,
@@ -4734,8 +5261,9 @@ fn snapshot_remote_transports(repository: &Repository) -> (Vec<RemoteTransport>,
     for name in names {
         match remote_transport_for_existing(repository, &name) {
             Ok(transport) => transports.push(transport),
-            Err(error) => warnings.push(format!(
-                "Git remote {name} 的 transport proof 不可用：{error}"
+            Err(error) => warnings.push(text!(
+                "Git remote {name} 的 transport proof 不可用：{error}",
+                "The transport proof of Git remote {name} is unavailable: {error}"
             )),
         }
     }
@@ -4762,9 +5290,15 @@ fn read_upstream_atoms(
         64 * 1024,
         true,
     )?;
-    require_success("读取 Git upstream atoms", &output)?;
+    require_success(
+        phrase("读取 Git upstream atoms", "read the Git upstream"),
+        &output,
+    )?;
     if output.stdout_truncated {
-        return Err("Git upstream atoms 超过安全上限".into());
+        return Err(text!(
+            "Git upstream atoms 超过安全上限",
+            "The Git upstream atoms exceed the safety limit"
+        ));
     }
     parse_upstream_atoms(&output.stdout, &full_ref)
 }
@@ -4780,36 +5314,60 @@ fn parse_upstream_atoms(bytes: &[u8], full_ref: &str) -> Result<Option<UpstreamA
         bytes = &bytes[..bytes.len() - 1];
     }
     if bytes.is_empty() {
-        return Err("当前本地 Git 分支已在读取 upstream 时消失".into());
+        return Err(text!(
+            "当前本地 Git 分支已在读取 upstream 时消失",
+            "The current local Git branch disappeared while its upstream was being read"
+        ));
     }
     let fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
     if fields.len() != 6 {
-        return Err("Git upstream atoms 字段数量无效".into());
+        return Err(text!(
+            "Git upstream atoms 字段数量无效",
+            "The Git upstream atoms have the wrong number of fields"
+        ));
     }
     let fields = fields
         .iter()
         .map(|field| {
-            std::str::from_utf8(field)
-                .map(str::to_owned)
-                .map_err(|_| "Git upstream atoms 不是有效 UTF-8".to_owned())
+            std::str::from_utf8(field).map(str::to_owned).map_err(|_| {
+                text!(
+                    "Git upstream atoms 不是有效 UTF-8",
+                    "The Git upstream atoms are not valid UTF-8"
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     if fields[0] != full_ref {
-        return Err("Git upstream atoms 返回了错误的本地分支".into());
+        return Err(text!(
+            "Git upstream atoms 返回了错误的本地分支",
+            "The Git upstream atoms name the wrong local branch"
+        ));
     }
-    let local_oid = validate_object_id("本地分支提交", fields[1].clone())?;
+    let local_oid = validate_object_id(
+        phrase("本地分支提交", "The local branch commit"),
+        fields[1].clone(),
+    )?;
     if fields[2].is_empty() {
         if fields[3..].iter().any(|field| !field.is_empty()) {
-            return Err("Git upstream atoms 不完整".into());
+            return Err(text!(
+                "Git upstream atoms 不完整",
+                "The Git upstream atoms are incomplete"
+            ));
         }
         return Ok(None);
     }
     if fields[3].is_empty() || fields[4].is_empty() || fields[5].is_empty() {
-        return Err("Git upstream atoms 不完整".into());
+        return Err(text!(
+            "Git upstream atoms 不完整",
+            "The Git upstream atoms are incomplete"
+        ));
     }
     validate_remote_name_syntax(&fields[4], true)?;
     if !fields[5].starts_with("refs/heads/") {
-        return Err("Git upstream merge ref 不是远端分支".into());
+        return Err(text!(
+            "Git upstream merge ref 不是远端分支",
+            "The Git upstream merge ref is not a remote branch"
+        ));
     }
     Ok(Some(UpstreamAtoms {
         local_ref: fields[0].clone(),
@@ -4836,17 +5394,27 @@ fn upstream_target_for_branch(
         });
     if first.is_none() {
         if local_oid.is_empty() {
-            return Err("无法解析当前本地 Git 分支".into());
+            return Err(text!(
+                "无法解析当前本地 Git 分支",
+                "Could not resolve the current local Git branch"
+            ));
         }
         return Ok((None, None, local_oid));
     }
     let first = first.expect("checked above");
     let first_tracking_oid = resolve_commit(repository, &first.tracking_ref).ok();
-    let second = read_upstream_atoms(repository, branch)?
-        .ok_or_else(|| "Git upstream 在读取时被移除；请重试".to_owned())?;
+    let second = read_upstream_atoms(repository, branch)?.ok_or_else(|| {
+        text!(
+            "Git upstream 在读取时被移除；请重试",
+            "The Git upstream was removed while it was being read; try again"
+        )
+    })?;
     let second_tracking_oid = resolve_commit(repository, &second.tracking_ref).ok();
     if first != second || first_tracking_oid != second_tracking_oid {
-        return Err("Git upstream 在读取时发生变化；请重试".into());
+        return Err(text!(
+            "Git upstream 在读取时发生变化；请重试",
+            "The Git upstream changed while it was being read; try again"
+        ));
     }
     let is_local = second.remote_name == ".";
     let remote = if is_local {
@@ -4856,12 +5424,22 @@ fn upstream_target_for_branch(
             .iter()
             .find(|transport| transport.proof.name == second.remote_name)
             .map(|transport| transport.proof.clone())
-            .ok_or_else(|| "Git upstream 指向不存在的 remote".to_owned())?
+            .ok_or_else(|| {
+                text!(
+                    "Git upstream 指向不存在的 remote",
+                    "The Git upstream points to a remote that does not exist"
+                )
+            })?
     };
     let remote_branch = second
         .merge_ref
         .strip_prefix("refs/heads/")
-        .ok_or_else(|| "Git upstream merge ref 无效".to_owned())?
+        .ok_or_else(|| {
+            text!(
+                "Git upstream merge ref 无效",
+                "The Git upstream merge ref is invalid"
+            )
+        })?
         .to_owned();
     let target = GitUpstream {
         remote_name: second.remote_name.clone(),
@@ -4892,7 +5470,7 @@ fn preferred_git_remote(
 
 fn validate_object_id(label: &str, value: String) -> Result<String, String> {
     if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("{label} 无效"));
+        return Err(text!("{label} 无效", "{label} is invalid"));
     }
     Ok(value.to_ascii_lowercase())
 }
@@ -5079,38 +5657,55 @@ fn run_program(
     }
 
     let containment = ProcessContainment::create()?;
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("无法启动 {}: {error}", program.display()))?;
+    let mut child = command.spawn().map_err(|error| {
+        text!(
+            "无法启动 {}: {error}",
+            "Could not start {}: {error}",
+            program.display()
+        )
+    })?;
     if let Err(error) = containment.assign(&child) {
         terminate_uncontained(&mut child);
         return Err(error);
     }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "无法捕获命令标准输出".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "无法捕获命令错误输出".to_owned())?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        text!(
+            "无法捕获命令标准输出",
+            "Could not capture the command's standard output"
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        text!(
+            "无法捕获命令错误输出",
+            "Could not capture the command's error output"
+        )
+    })?;
     let stdout_reader = capture_pipe(stdout, max_output);
     let stderr_reader = capture_pipe(stderr, max_output);
     let input_writer = input.map(|input| {
         let mut stdin = child.stdin.take().expect("piped stdin");
         thread::spawn(move || -> Result<(), String> {
-            stdin
-                .write_all(&input)
-                .map_err(|error| format!("无法写入命令标准输入: {error}"))?;
-            stdin
-                .flush()
-                .map_err(|error| format!("无法刷新命令标准输入: {error}"))
+            stdin.write_all(&input).map_err(|error| {
+                text!(
+                    "无法写入命令标准输入: {error}",
+                    "Could not write the command's standard input: {error}"
+                )
+            })?;
+            stdin.flush().map_err(|error| {
+                text!(
+                    "无法刷新命令标准输入: {error}",
+                    "Could not flush the command's standard input: {error}"
+                )
+            })
         })
     });
 
-    let waited = child
-        .wait_timeout(timeout)
-        .map_err(|error| format!("等待命令退出失败: {error}"))?;
+    let waited = child.wait_timeout(timeout).map_err(|error| {
+        text!(
+            "等待命令退出失败: {error}",
+            "Waiting for the command to exit failed: {error}"
+        )
+    })?;
     let timed_out = waited.is_none();
     let status = if let Some(status) = waited {
         Some(status)
@@ -5119,18 +5714,41 @@ fn run_program(
         child.wait_timeout(PROCESS_TERMINATION_GRACE).ok().flatten()
     };
     if let Some(writer) = input_writer {
-        writer
-            .join()
-            .map_err(|_| "命令标准输入线程异常终止".to_owned())??;
+        writer.join().map_err(|_| {
+            text!(
+                "命令标准输入线程异常终止",
+                "The command's standard input thread ended abnormally"
+            )
+        })??;
     }
     let stdout_capture = stdout_reader
         .join()
-        .map_err(|_| "命令标准输出线程异常终止".to_owned())?
-        .map_err(|error| format!("读取命令标准输出失败: {error}"))?;
+        .map_err(|_| {
+            text!(
+                "命令标准输出线程异常终止",
+                "The command's standard output thread ended abnormally"
+            )
+        })?
+        .map_err(|error| {
+            text!(
+                "读取命令标准输出失败: {error}",
+                "Reading the command's standard output failed: {error}"
+            )
+        })?;
     let stderr_capture = stderr_reader
         .join()
-        .map_err(|_| "命令错误输出线程异常终止".to_owned())?
-        .map_err(|error| format!("读取命令错误输出失败: {error}"))?;
+        .map_err(|_| {
+            text!(
+                "命令错误输出线程异常终止",
+                "The command's error output thread ended abnormally"
+            )
+        })?
+        .map_err(|error| {
+            text!(
+                "读取命令错误输出失败: {error}",
+                "Reading the command's error output failed: {error}"
+            )
+        })?;
     Ok(CliOutput {
         status,
         stdout: stdout_capture.output,
@@ -5204,11 +5822,14 @@ fn command_error(label: &str, output: &CliOutput) -> String {
     let detail = output.display_output();
     if detail.is_empty() {
         match output.exit_code() {
-            Some(code) => format!("{label}失败（退出码 {code}）"),
-            None => format!("{label}失败"),
+            Some(code) => text!(
+                "{label}失败（退出码 {code}）",
+                "Could not {label} (exit code {code})"
+            ),
+            None => text!("{label}失败", "Could not {label}"),
         }
     } else {
-        format!("{label}失败：{detail}")
+        text!("{label}失败：{detail}", "Could not {label}: {detail}")
     }
 }
 
@@ -5283,11 +5904,18 @@ fn repository_lock(repository: &Repository) -> Arc<Mutex<()>> {
 }
 
 fn parse_rev_parse_paths(output: &[u8], expected_count: usize) -> Result<Vec<String>, String> {
-    let output = std::str::from_utf8(output)
-        .map_err(|_| "Git 返回的仓库路径不是有效 UTF-8，无法安全使用".to_owned())?;
+    let output = std::str::from_utf8(output).map_err(|_| {
+        text!(
+            "Git 返回的仓库路径不是有效 UTF-8，无法安全使用",
+            "The repository paths Git returned are not valid UTF-8 and cannot be used safely"
+        )
+    })?;
     let output = output.strip_suffix('\n').unwrap_or(output);
     if output.is_empty() || output.ends_with('\n') {
-        return Err("Git 返回的仓库路径数量不正确".into());
+        return Err(text!(
+            "Git 返回的仓库路径数量不正确",
+            "Git returned the wrong number of repository paths"
+        ));
     }
     let paths = output
         .split('\n')
@@ -5299,7 +5927,10 @@ fn parse_rev_parse_paths(output: &[u8], expected_count: usize) -> Result<Vec<Str
             .iter()
             .any(|path| path.is_empty() || path.contains('\0'))
     {
-        return Err("Git 返回的仓库路径数量或格式不正确".into());
+        return Err(text!(
+            "Git 返回的仓库路径数量或格式不正确",
+            "Git returned repository paths of the wrong number or format"
+        ));
     }
     Ok(paths)
 }
@@ -5314,10 +5945,19 @@ fn canonical_git_directory(
     } else {
         relative_to.join(path)
     };
-    let canonical = fs::canonicalize(&path)
-        .map_err(|error| format!("无法验证 Git {label} {}: {error}", path.display()))?;
+    let canonical = fs::canonicalize(&path).map_err(|error| {
+        text!(
+            "无法验证 Git {label} {}: {error}",
+            "Could not verify the Git {label} {}: {error}",
+            path.display()
+        )
+    })?;
     if !canonical.is_dir() {
-        return Err(format!("Git {label} 不是目录: {}", canonical.display()));
+        return Err(text!(
+            "Git {label} 不是目录: {}",
+            "The Git {label} is not a directory: {}",
+            canonical.display()
+        ));
     }
     Ok(canonical)
 }
@@ -5335,8 +5975,13 @@ fn path_is_within(path: &Path, ancestor: &Path) -> bool {
 }
 
 fn git_path_id(domain: &[u8], path: &Path) -> Result<String, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("无法读取 Git 身份目录元数据 {}: {error}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        text!(
+            "无法读取 Git 身份目录元数据 {}: {error}",
+            "Could not read the metadata of the Git identity directory {}: {error}",
+            path.display()
+        )
+    })?;
     let mut digest = Sha256::new();
     digest.update(domain);
     digest.update(b"\0");
@@ -5351,14 +5996,16 @@ fn git_path_id(domain: &[u8], path: &Path) -> Result<String, String> {
 
 fn git_worktree_id(repository_id: &str, root: &Path, git_dir: &Path) -> Result<String, String> {
     let root_metadata = fs::metadata(root).map_err(|error| {
-        format!(
+        text!(
             "无法读取 Git worktree 根目录元数据 {}: {error}",
+            "Could not read the metadata of the Git worktree root {}: {error}",
             root.display()
         )
     })?;
     let git_dir_metadata = fs::metadata(git_dir).map_err(|error| {
-        format!(
+        text!(
             "无法读取 Git worktree 元数据目录元数据 {}: {error}",
+            "Could not read the metadata of the Git worktree metadata directory {}: {error}",
             git_dir.display()
         )
     })?;
@@ -5510,8 +6157,9 @@ impl ProcessContainment {
         };
         let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
         if handle.is_null() {
-            return Err(format!(
+            return Err(text!(
                 "无法创建命令进程作业对象: {}",
+                "Could not create the job object for the command process: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -5527,8 +6175,9 @@ impl ProcessContainment {
             )
         };
         if configured == 0 {
-            return Err(format!(
+            return Err(text!(
                 "无法配置命令进程作业对象: {}",
+                "Could not configure the job object for the command process: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -5540,8 +6189,9 @@ impl ProcessContainment {
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         let assigned = unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle() as _) };
         if assigned == 0 {
-            return Err(format!(
+            return Err(text!(
                 "无法将命令进程加入受控作业对象: {}",
+                "Could not add the command process to its job object: {}",
                 std::io::Error::last_os_error()
             ));
         }

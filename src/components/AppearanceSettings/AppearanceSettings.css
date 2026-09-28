@@ -90,12 +90,12 @@
 .appearance-settings-page__theme-grid {
   width: 100%;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 9px;
 }
 
-@container appearance-themes (max-width: 520px) {
-  .appearance-settings-page__theme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@container appearance-themes (max-width: 400px) {
+  .appearance-settings-page__theme-grid { grid-template-columns: 1fr; }
 }
 
 .appearance-settings-page__theme-preview {
@@ -123,8 +123,6 @@
   color: var(--accent);
 }
 
-.appearance-settings-page__theme-preview:disabled { cursor: progress; }
-
 .appearance-settings-page__theme-preview-surface {
   position: relative;
   display: block;
@@ -143,13 +141,6 @@
   transform: translateX(-50%); background: var(--border-strong);
 }
 
-.appearance-settings-page__theme-badge {
-  position: absolute; left: 50%; top: 50%; width: 28px; height: 28px;
-  display: grid; place-items: center; transform: translate(-50%, -50%);
-  border-radius: 50%; background: var(--panel); color: var(--text);
-  box-shadow: 0 2px 8px var(--color-000000-ap16);
-}
-
 .appearance-settings-page__theme-preview strong {
   font-size: 10.5px;
   font-weight: 600;
@@ -162,10 +153,110 @@
   line-height: 1.5;
 }
 
-.appearance-settings-page__background-actions {
+.appearance-settings-page__background-control {
   display: flex;
   align-items: center;
+  gap: 10px;
+}
+
+/* A background in miniature (BackgroundLibrary.tsx). A solid one is a `.background-swatch`,
+   coloured in `styles/backdrop.css` alongside the window's own layer. */
+.background-surface {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--border);
+}
+.background-surface > img { position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: cover; }
+.background-surface__badge {
+  position: absolute; left: 50%; top: 50%; width: 26px; height: 26px;
+  display: grid; place-items: center; transform: translate(-50%, -50%);
+  border-radius: 50%; background: var(--panel); color: var(--muted);
+  box-shadow: 0 2px 8px var(--color-000000-ap16);
+}
+
+.background-preview { width: 64px; flex: 0 0 auto; display: block; }
+
+.background-library__section + .background-library__section { margin-top: 18px; }
+.background-library__heading {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.background-library__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+  gap: 10px;
+}
+.background-library__tile { position: relative; min-width: 0; }
+.background-library__choice {
+  width: 100%;
+  padding: 5px 5px 6px;
+  display: flex;
+  flex-direction: column;
   gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  text-align: left;
+  transition: border-color .14s, box-shadow .14s, color .14s, background .14s;
+}
+.background-library__choice:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--hover);
+  color: var(--text);
+}
+.background-library__choice[aria-pressed="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+  color: var(--accent);
+}
+.background-library__choice:disabled { cursor: progress; opacity: 1; }
+.background-library__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.background-library__add-surface {
+  display: grid;
+  place-items: center;
+  box-shadow: none;
+  border: 1px dashed var(--border-strong);
+  background: var(--subtle);
+  color: var(--muted);
+}
+.background-library__choice--add:hover:not(:disabled) .background-library__add-surface { color: var(--text); }
+/* Over the picture's corner, shown while the tile is pointed at or holds focus; an armed
+   button stays, so the second press can land. */
+.background-library__remove.icon-button {
+  position: absolute; top: 9px; right: 9px;
+  box-shadow: 0 1px 4px var(--color-000000-ap16);
+  opacity: 0;
+}
+/* `:where` keeps this at the button's own weight, so its hover and armed colours win. */
+.background-library__remove.icon-button:where(:not(.confirm-delete--armed)) { background: var(--panel); }
+.background-library__remove.icon-button.confirm-delete--armed { width: auto; padding: 0 6px; }
+.background-library__tile:is(:hover, :focus-within) .background-library__remove,
+.background-library__remove.confirm-delete--armed { opacity: 1; }
+.background-library__hint {
+  margin: 10px 0 0;
+  color: var(--faint);
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+.background-library__error {
+  margin: 6px 0 0;
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 /*
@@ -248,34 +339,52 @@
 .theme-sample__task--2 { top: 36%; }
 .theme-sample__task--3 { top: 51%; }
 
-/* Custom background: the picture behind the same window, its surfaces turned to glass
-   with the tints and edge `styles/backdrop.css` gives the real one. The blur is the
-   window's scaled down with it. */
+/* The window's background: `picture` wherever the window's ground shows, and with
+   `glass`, the sidebar and tiles turned to glass over it with the tints and edge
+   `styles/backdrop.css` gives the real ones. Those are per scheme here, because a sample
+   of the other theme is drawn beside this one. The blur is the window's scaled down. */
+.theme-sample {
+  --s-light: var(--color-ffffff);
+  --s-glass-alpha: 78%;
+  --s-glass-pane-alpha: 80%;
+  --s-glass-edge-alpha: 45%;
+}
+:root[data-theme="night"] .theme-sample { --s-light: var(--color-000000); }
+/* Night glass is denser, and its rim dimmer. */
+:root:not([data-theme="night"]) .theme-sample:is([data-scheme="opposite"], [data-scheme="night"]),
+:root[data-theme="night"] .theme-sample:is([data-scheme="current"], [data-scheme="night"]) {
+  --s-glass-alpha: 84%;
+  --s-glass-pane-alpha: 86%;
+  --s-glass-edge-alpha: 13%;
+}
 .theme-sample[data-glass] {
-  --s-glass-tile: var(--color-f7f7f5-ap78);
-  --s-glass-pane: var(--color-efefeb-ap80);
-  --s-glass-frame: var(--color-efefeb-ap66);
-  --s-glass-edge: var(--color-ffffff-ap45);
+  --s-glass-tile: color-mix(in srgb, var(--s-app) var(--s-glass-alpha), transparent);
+  --s-glass-pane: color-mix(in srgb, var(--s-pane) var(--s-glass-pane-alpha), transparent);
+  --s-glass-edge: color-mix(in srgb, var(--s-light) var(--s-glass-edge-alpha), transparent);
   background: var(--s-gutter);
 }
-:root[data-theme="night"] .theme-sample[data-glass] {
-  --s-glass-tile: var(--color-f7f7f5-ap84);
-  --s-glass-pane: var(--color-efefeb-ap86);
-  --s-glass-frame: var(--color-efefeb-ap74);
-  --s-glass-edge: var(--color-000000-ap13);
-}
 .theme-sample .theme-sample__picture { position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: cover; }
-.theme-sample__picture--placeholder { background: linear-gradient(135deg, var(--color-315eae), var(--color-6254aa) 55%, var(--color-279070)); }
-.theme-sample[data-glass] .theme-sample__sidebar,
-.theme-sample[data-glass] span.theme-sample__chat,
-.theme-sample[data-glass] span.theme-sample__pane {
-  -webkit-backdrop-filter: blur(3px) saturate(130%);
-  backdrop-filter: blur(3px) saturate(130%);
+.theme-sample:is([data-glass], [data-picture]) span.theme-sample__tiles { background: transparent; }
+/* The glass's blur is the picture's own, drawn once more under the sidebar and the tiles,
+   rather than a backdrop filter on each pane: the samples sit on the settings window's
+   glass, and glass on glass is what left blocks of stale colour on screen. Everywhere but
+   the top bar is under glass (the gutters between tiles are a pixel or two), so the copy
+   is cut to that L. */
+.theme-sample .theme-sample__picture--frosted {
+  filter: blur(3px) saturate(130%);
+  clip-path: polygon(0 0, 24% 0, 24% 12%, 100% 12%, 100% 100%, 0 100%);
 }
-.theme-sample[data-glass] .theme-sample__sidebar { background: var(--s-glass-frame); box-shadow: 1px 0 0 var(--s-glass-edge); }
-.theme-sample[data-glass] span.theme-sample__tiles { background: transparent; }
+/* The sidebar is the conversation's glass, against the window's edges, rimmed on its inner side. */
+.theme-sample[data-glass] .theme-sample__sidebar { background: var(--s-glass-tile); box-shadow: inset -1px 0 0 var(--s-glass-edge); }
 .theme-sample[data-glass] span.theme-sample__chat { background: var(--s-glass-tile); box-shadow: inset 0 0 0 1px var(--s-glass-edge); }
 .theme-sample[data-glass] span.theme-sample__pane { background: var(--s-glass-pane); box-shadow: inset 0 0 0 1px var(--s-glass-edge); }
+/* Inside the glass, regions differ by what they let through, as the window's do: the
+   composer is the panel white thinned, the bubble and the rows are the text colour thinned. */
+.theme-sample[data-glass] .theme-sample__composer {
+  background: color-mix(in srgb, var(--s-panel) 46%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--s-text) 17%, transparent);
+}
+.theme-sample[data-glass] :is(.theme-sample__bubble, .theme-sample__task) { background: color-mix(in srgb, var(--s-text) 8%, transparent); }
 
 .appearance-settings-page__color-controls {
   width: 100%;

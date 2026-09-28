@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Ban, ShieldCheck } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { SearchDomainFilterMode } from "../types";
-import { Dialog } from "./Common";
+import { Dialog, DialogSidebarTitle } from "./Common";
 
 /** Which of the two lists a page of this window edits. */
 type DomainList = Exclude<SearchDomainFilterMode, "off">;
@@ -75,11 +75,13 @@ export function SearchDomainRulesWindow({
     <Dialog
       title={t("域名名单", "Domain lists")}
       width="860px"
+      sidebar
       bodyClassName="dialog__body--flush"
       onClose={onClose}
     >
       <div className="domain-rules">
         <div className="domain-rules__aside">
+          <DialogSidebarTitle />
           <nav className="settings-nav domain-rules__nav" aria-label={t("域名名单", "Domain lists")}>
             {railEntry(
               "exclude",
@@ -94,6 +96,9 @@ export function SearchDomainRulesWindow({
           </nav>
         </div>
         <div className="domain-rules__page">
+          <h3 className="domain-rules__title">
+            {page === "exclude" ? t("黑名单", "Blocklist") : t("白名单", "Allowlist")}
+          </h3>
           <p className="domain-rules__help">{page === "exclude"
             ? t(
               "命中其中任意一条的结果会被丢掉。一行一条：支持 <all_urls>、scheme://host/path 匹配模式（* 通配，*. 匹配子域），以及前后加斜杠的正则。写错的规则会被忽略，而不是让整次检索失败。",

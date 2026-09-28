@@ -118,6 +118,24 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     None,
                     None,
                 ),
+                parameter(
+                    "limit",
+                    "条数上限",
+                    Number,
+                    false,
+                    Some(json!(250)),
+                    None,
+                    Some("最多返回的匹配行，默认 250，至多 1000"),
+                ),
+                parameter(
+                    "offset",
+                    "跳过",
+                    Number,
+                    false,
+                    Some(json!(0)),
+                    None,
+                    Some("先跳过这么多匹配行，用于翻到下一页"),
+                ),
             ],
         ),
         descriptor(
@@ -1710,6 +1728,7 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "image_id" => "Image number",
         "label" => "Display name",
         "level" => "Level",
+        "limit" => "Limit",
         "line" => "Line",
         "lines" => "Line limit",
         "operation" => "Operation",
@@ -1718,6 +1737,7 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "metadata" => "Metadata",
         "name" => "Name",
         "new_text" => "New text",
+        "offset" => "Offset",
         "old_text" => "Original text",
         "owner" => "Owner",
         "path" => "Path",
@@ -1757,6 +1777,8 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
 fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
     Some(match (tool, parameter) {
         ("ls", "depth") => "0 lists only the current directory.",
+        ("grep", "limit") => "Most matching lines to return: 250 by default, at most 1,000.",
+        ("grep", "offset") => "Matching lines to skip first, to fetch the next page.",
         ("skill", "name") => {
             "Name of a skill this conversation selected; the schema lists them as an enum."
         }

@@ -1290,13 +1290,14 @@ export interface AppearancePreferences {
   singleDollarMath: boolean;
   /** User-defined CSS applied through a constructable stylesheet, not a `<style>` element. */
   customCss: string;
+  /** Panes of glass over {@link background}; light or dark glass follows {@link GlobalSettings.theme}. */
+  liquidGlass: boolean;
   /**
-   * The fourth theme choice: {@link backgroundImage} behind glass panes. Light or dark
-   * glass still follows {@link GlobalSettings.theme}.
+   * The window's background (`lib/background.ts`): `solid`, the theme's own ground, which
+   * follows the theme; `solid:day` / `solid:night`, one theme's ground picked while the other
+   * was on screen, until the theme changes; `builtin:<name>`; or an imported picture's host id.
    */
-  customBackground: boolean;
-  /** Host id of the imported background picture; empty before one is picked. */
-  backgroundImage: string;
+  background: string;
   /** The local helper model's uses and prompts (Appearance → Local model). */
   localModel: LocalModelPreferences;
 }

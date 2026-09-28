@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import { hasBackendRuntime, invoke } from "./backend";
 import type { ConversationWorktree } from "../types";
 
@@ -299,7 +300,7 @@ export interface GitDiscardPreparation {
 }
 
 function requireGitRuntime(): void {
-  if (!hasBackendRuntime()) throw new Error("Git 功能仅可在连接 Rust 后端时使用");
+  if (!hasBackendRuntime()) throw new Error(t("Git 功能仅可在连接 Rust 后端时使用", "Git is available only with the Rust backend connected"));
 }
 
 function normalizeDiffResult(value: GitDiffResult | string): GitDiffResult {

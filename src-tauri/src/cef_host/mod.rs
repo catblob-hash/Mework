@@ -364,6 +364,7 @@ fn start_engine(root: &Path) -> Result<pump::ExternalPump, String> {
     let pump = pump::ExternalPump::new();
     let mut app = MeworkCefApp::new(pump.clone(), framework_text);
     let args = args::Args::new();
+    let _sigchld = SignalDisposition::save(libc::SIGCHLD);
     if initialize(
         Some(args.as_main_args()),
         Some(&settings),
@@ -375,6 +376,34 @@ fn start_engine(root: &Path) -> Result<pump::ExternalPump, String> {
     }
     pump.do_work();
     Ok(pump)
+}
+
+/// Puts a signal's disposition back when dropped.
+///
+/// Chromium's startup resets SIGCHLD, among other signals, to the default disposition
+/// (`SetupSignalHandlers` in content). `wait-timeout`, which every bounded child wait in this
+/// process goes through, learns that a child exited only from the SIGCHLD handler it installs
+/// once per process; without it every such wait runs to its deadline and reports a timeout, so
+/// once the browser had started, Git calls that git answered at once failed after 30 s.
+struct SignalDisposition {
+    signal: libc::c_int,
+    saved: libc::sigaction,
+}
+
+impl SignalDisposition {
+    fn save(signal: libc::c_int) -> Self {
+        // SAFETY: a null new action only reads the current one into `saved`.
+        let mut saved = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        unsafe { libc::sigaction(signal, std::ptr::null(), &mut saved) };
+        Self { signal, saved }
+    }
+}
+
+impl Drop for SignalDisposition {
+    fn drop(&mut self) {
+        // SAFETY: `saved` is the complete action this process had installed for the signal.
+        unsafe { libc::sigaction(self.signal, &self.saved, std::ptr::null_mut()) };
+    }
 }
 
 fn wait_for_context() -> Result<(), String> {
@@ -421,5 +450,35 @@ pub(crate) fn shutdown() {
     // than tripping that check.
     if page::live_count() == 0 {
         cef::shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn ignore(_: libc::c_int) {}
+
+    fn current(signal: libc::c_int) -> libc::sigaction {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) };
+        action
+    }
+
+    #[test]
+    fn signal_disposition_puts_back_the_handler_it_saved() {
+        // SIGUSR2 stands in for SIGCHLD, which other tests' child waits depend on meanwhile.
+        let mut handler = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        handler.sa_sigaction = ignore as *const () as usize;
+        handler.sa_flags = libc::SA_RESTART;
+        unsafe { libc::sigaction(libc::SIGUSR2, &handler, std::ptr::null_mut()) };
+        {
+            let _saved = SignalDisposition::save(libc::SIGUSR2);
+            unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
+            assert_eq!(current(libc::SIGUSR2).sa_sigaction, libc::SIG_DFL);
+        }
+        let restored = current(libc::SIGUSR2);
+        assert_eq!(restored.sa_sigaction, ignore as *const () as usize);
+        assert_ne!(restored.sa_flags & libc::SA_RESTART, 0);
     }
 }

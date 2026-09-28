@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use git_core::text;
+
 use crate::git::{GitWorkspaceSummary, GitWorkspaceSummaryResult};
 
 /// How long a finished read keeps answering. Far below the pane's poll
@@ -53,7 +55,10 @@ impl Drop for Settle<'_> {
         let mut outcome = lock(&self.flight.outcome);
         if outcome.is_none() {
             *outcome = Some((
-                Err("读取 Git 状态的任务意外中断；请重试".into()),
+                Err(text!(
+                    "读取 Git 状态的任务意外中断；请重试",
+                    "Reading the Git status stopped unexpectedly; try again"
+                )),
                 Instant::now(),
             ));
             self.flight.ready.notify_all();
@@ -134,9 +139,10 @@ pub(crate) fn outcome(result: Result<GitWorkspaceSummaryResult, String>) -> Outc
     match result? {
         GitWorkspaceSummaryResult::NotRepository => Ok(None),
         GitWorkspaceSummaryResult::Snapshot { summary } => Ok(Some(summary)),
-        GitWorkspaceSummaryResult::Unchanged { .. } => {
-            Err("Git 摘要读取意外地只返回了修订号；请重试".into())
-        }
+        GitWorkspaceSummaryResult::Unchanged { .. } => Err(text!(
+            "Git 摘要读取意外地只返回了修订号；请重试",
+            "The Git summary read unexpectedly returned only a revision; try again"
+        )),
     }
 }
 

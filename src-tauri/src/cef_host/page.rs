@@ -595,7 +595,9 @@ impl CefWebview {
             let mut value = cef::value_create().ok_or_else(|| "CEF 未能创建代理设置".to_owned())?;
             let mut settings = settings;
             value.set_dictionary(Some(&mut settings));
-            let mut error = CefString::default();
+            // Not `CefString::default()`: that has no storage behind it and reaches CEF as a null
+            // `error`, which CEF refuses outright — the preference is never even looked at.
+            let mut error = CefString::from("");
             let applied = context.set_preference(
                 Some(&CefString::from("proxy")),
                 Some(&mut value),

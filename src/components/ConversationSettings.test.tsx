@@ -425,6 +425,8 @@ describe("ConversationSettings", () => {
     // no modal of its own and nothing closes it from the inside.
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.queryByRole("button", { name: "关闭" })).toBeNull();
+    // Nor does it name itself or its page, as a window does.
+    expect(document.querySelector(".dialog__sidebar-title, .conversation-settings__page-title")).toBeNull();
     // A preset is not conversation state, so no preset-managed or conversation-only sections appear.
     expect(screen.queryByText("由预设管理")).toBeNull();
     expect(screen.queryByText("仅此对话")).toBeNull();
@@ -1604,6 +1606,9 @@ describe("ConversationSettings", () => {
 
     const dialog = screen.getByRole("dialog", { name: "默认" });
     const nestedNav = within(dialog).getByRole("navigation", { name: "对话设置分类" });
+    // A window has no title bar: its name heads the page list, and the page names itself.
+    expect(within(nestedNav).getByRole("heading", { level: 2, name: "默认" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("heading", { level: 3, name: "功能" })).toBeInTheDocument();
     // A preset body describes a reusable copy, so the one page about a live
     // conversation — its own presets — is withheld, the page only a preset has
     // appears, and the footer saves in place rather than saving a copy.

@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { Fragment } from "react";
 import { useI18n } from "../i18n";
+import { DialogSidebarTitle } from "./Common";
 import type { SettingsView } from "../types";
 
 /**
@@ -79,6 +80,7 @@ export function GlobalSettingsNavigation({
   };
   return (
     <nav className="settings-nav" aria-label={t("全局设置分类", "Global settings categories")}>
+      <DialogSidebarTitle />
       {globalSettingsNavigationGroups.map((group) => (
         <Fragment key={group.id}>
           {groupTitles[group.id] && (

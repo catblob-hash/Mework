@@ -135,6 +135,69 @@
 /* One line tall, like the header: a dialog's own buttons are its last row, not a
    toolbar, so they take the metrics of the row rather than of a page's call to action. */
 .dialog__footer .button { min-height: 28px; padding: 0 12px; font-size: 12px; }
+/* A sidebar window (`Dialog` with `sidebar`) has no title bar: its name heads the
+   sidebar, the selected page's own title heads the right-hand side, and the close
+   button takes the top corner beside that. The three share the centre line of a top
+   band, whatever padding each page brings; every page's top row keeps clear of the
+   button, which floats over it. */
+.dialog--sidebar {
+  --dialog-band: 48px;
+  /* The button's 32px, its inset, and a gap, measured from the window's right edge. */
+  --dialog-close-reach: 52px;
+  position: relative;
+}
+.dialog__sidebar-title {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: calc((var(--dialog-band) - 20px) / 2) 9px;
+  font-size: 13px; line-height: 20px; font-weight: 650;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Right of the scrollbar's reach, so the top of a page's scrollbar stays grabbable. */
+.dialog__close { position: absolute; z-index: 1; top: calc((var(--dialog-band) - 32px) / 2); right: 12px; }
+
+.settings-nav:has(> .dialog__sidebar-title) { padding-top: 0; }
+.conversation-settings__nav > .dialog__sidebar-title { padding-inline: 7px; }
+.domain-rules__aside > .dialog__sidebar-title { padding-inline: 18px; }
+.domain-rules__aside:has(> .dialog__sidebar-title) > .domain-rules__nav { padding-top: 0; }
+
+/* Page titles on the band's centre line. */
+.dialog--sidebar :is(.settings-page-heading h3, .conversation-settings__page-title, .domain-rules__title) { line-height: 20px; }
+.dialog--sidebar .settings-page { padding-top: calc((var(--dialog-band) - 20px) / 2); }
+.dialog--sidebar .settings-page-heading { padding-right: calc(var(--dialog-close-reach) - 22px); }
+.dialog--sidebar .provider-pane__header { min-height: var(--dialog-band); padding-right: var(--dialog-close-reach); }
+.dialog--sidebar .usage-stats { padding-top: calc((var(--dialog-band) - 32px) / 2); }
+.dialog--sidebar .usage-stats__toolbar { padding-right: calc(var(--dialog-close-reach) - 24px); }
+.dialog--sidebar .conversation-settings__page-header { padding-top: calc((var(--dialog-band) - 20px) / 2); }
+/* Narrowed on both sides rather than padded on one, so the header still centres
+   over the same column as the body beneath it. */
+.dialog--sidebar .conversation-settings__page-header > * {
+  max-width: min(var(--conversation-settings-measure), calc(100% - 2 * (var(--dialog-close-reach) - 24px)));
+}
+.conversation-settings__page-title { margin: 0 auto 3px; font-size: 13px; font-weight: 650; }
+.dialog--sidebar .domain-rules__page { padding-top: calc((var(--dialog-band) - 20px) / 2); }
+.domain-rules__title { margin: 0; padding-right: calc(var(--dialog-close-reach) - 14px); font-size: 13px; font-weight: 650; }
+/* On a narrow window the global settings' sidebar is a strip across the top
+   (feedback.css). The name leads the strip, the strip is the band, and the page below
+   starts under it as before. The strip scrolls sideways, so it ends short of the close
+   button rather than padding its far end, and the rule under it moves to the page so it
+   still runs the window's full width. */
+@media (max-width: 720px) {
+  .dialog--sidebar .global-settings-layout > .settings-nav {
+    min-height: var(--dialog-band);
+    margin-right: calc(var(--dialog-close-reach) - 4px);
+    padding: 6px 9px;
+    align-items: center;
+    border-bottom: 0;
+  }
+  .dialog--sidebar .global-settings-layout > .global-settings-content { border-top: 1px solid var(--border); }
+  .global-settings-layout > .settings-nav > .dialog__sidebar-title { padding-block: 0; }
+  .dialog--sidebar .global-settings-layout .settings-page { padding-top: 21px; }
+  .dialog--sidebar .global-settings-layout .settings-page-heading { padding-right: 0; }
+  .dialog--sidebar .global-settings-layout .provider-pane__header { padding-right: calc(18px + var(--scrollbar-size)); }
+  .dialog--sidebar .global-settings-layout .usage-stats { padding-top: 22px; }
+  .dialog--sidebar .global-settings-layout .usage-stats__toolbar { padding-right: 0; }
+}
 /* The template editor's body IS a timeline, so a failed save has nowhere to
    report inside it and takes the free space in the footer instead. */
 .template-editor__error { flex: 1; min-width: 0; margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--danger); }

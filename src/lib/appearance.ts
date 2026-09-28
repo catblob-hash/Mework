@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { AppearancePreferences, KeyToken } from "../types";
+import { replacesThemeGround } from "./background";
 
 /**
  * Apply appearance preferences to the DOM.
@@ -73,8 +74,8 @@ export function defaultAppearancePreferences(): AppearancePreferences {
     codeBlockWrappable: false,
     singleDollarMath: true,
     customCss: "",
-    customBackground: false,
-    backgroundImage: "",
+    liquidGlass: false,
+    background: "solid",
     localModel: { titles: false, shellExplanations: false, titlePrompt: "", shellPrompt: "" }
   };
 }
@@ -102,11 +103,6 @@ export function normalizeHexColor(input: string): string | null {
     : body;
   if (expanded.length !== 6) return null;
   return `#${expanded.toUpperCase()}`;
-}
-
-/** Whether the window shows the user's picture behind glass instead of a plain theme. */
-export function hasCustomBackground(appearance: AppearancePreferences): boolean {
-  return appearance.customBackground && appearance.backgroundImage !== "";
 }
 
 export function clampZoom(value: number): number {
@@ -233,10 +229,12 @@ export function applyAppearance(appearance: AppearancePreferences): void {
   root.dataset.wideMessages = appearance.wideMessages ? "true" : "false";
   root.dataset.codeWrap = appearance.codeBlockWrappable ? "true" : "false";
   root.dataset.codeCollapse = appearance.codeBlockCollapsible ? "true" : "false";
-  // `AppBackdrop` paints the picture; this switches the panes to glass over it. It is set
-  // as soon as the choice is made, not when the picture arrives, so the layout does
-  // not restyle a second time under the reader.
-  root.dataset.backdrop = hasCustomBackground(appearance) ? "image" : "none";
+  // `AppBackdrop` paints the background; these let it through the window's ground and
+  // turn the panes to glass over it (`styles/backdrop.css`). They are set as soon as the
+  // choice is made, not when a picture arrives, so the layout does not restyle a second
+  // time under the reader.
+  root.dataset.backdrop = replacesThemeGround(appearance.background) ? "custom" : "theme";
+  root.dataset.glass = appearance.liquidGlass ? "true" : "false";
 
   applyCustomCss(appearance.customCss);
 }

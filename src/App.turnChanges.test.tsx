@@ -61,10 +61,8 @@ const trackedFile: GitFileChange = {
   deletions: 1
 };
 
-describe("App — a turn's changed files", () => {
-  beforeEach(resetAppMocks);
-
-  it("opens a tracked change on its diff in the review pane and anything else in the file pane", async () => {
+/** A conversation whose one turn edited a tracked file and wrote a new one; Git answers for it. */
+function stageTurnChanges() {
     const appDocument = documentWithModel();
     const conversation = appDocument.workspaces[0].conversations[0];
     conversation.contexts = [
@@ -94,7 +92,7 @@ describe("App — a turn's changed files", () => {
     }));
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     const root = appDocument.workspaces[0].path;
-    gitMocks.getGitWorkspaceSummary.mockResolvedValue({
+    const summary = {
       kind: "snapshot",
       summary: {
         repositoryId: "repository-id",
@@ -130,7 +128,8 @@ describe("App — a turn's changed files", () => {
         binaryFiles: 0,
         warnings: []
       }
-    });
+    };
+    gitMocks.getGitWorkspaceSummary.mockResolvedValue(summary);
     gitMocks.getGitChangePage.mockImplementation((
       _target: GitTarget,
       request: { expectedRevision: string; selectedPath?: string }
@@ -153,7 +152,22 @@ describe("App — a turn's changed files", () => {
       truncated: false,
       files: []
     });
+    return { summary };
+}
 
+async function expectDiffOpenInReview() {
+    const review = await screen.findByRole("region", { name: "审阅" });
+    await waitFor(() => expect(
+      review.querySelector('[data-diff-file="src/App.tsx"] .diff-viewer__file-toggle')
+    ).toHaveAttribute("aria-expanded", "true"));
+    return review;
+}
+
+describe("App — a turn's changed files", () => {
+  beforeEach(resetAppMocks);
+
+  it("opens a tracked change on its diff in the review pane and anything else in the file pane", async () => {
+    stageTurnChanges();
     const user = userEvent.setup();
     render(<App />);
     const card = await screen.findByRole("region", { name: "编辑了 2 个文件" });
@@ -161,10 +175,7 @@ describe("App — a turn's changed files", () => {
 
     await waitFor(() => expect(gitMocks.getGitWorkspaceSummary).toHaveBeenCalled());
     await user.click(within(card).getByRole("button", { name: /App\.tsx/ }));
-    const review = await screen.findByRole("region", { name: "审阅" });
-    await waitFor(() => expect(
-      review.querySelector('[data-diff-file="src/App.tsx"] .diff-viewer__file-toggle')
-    ).toHaveAttribute("aria-expanded", "true"));
+    const review = await expectDiffOpenInReview();
     // Opened just for this file, so its file column starts folded.
     expect(within(review).getByRole("button", { name: "显示文件" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByRole("region", { name: "文件" })).toBeNull();
@@ -177,5 +188,24 @@ describe("App — a turn's changed files", () => {
       selectedPath: "notes/new.md",
       limit: 1
     });
+  });
+
+  it("asks Git itself when the conversation has no review page yet", async () => {
+    const { summary } = stageTurnChanges();
+    // The poll's read failed, so no page exists when the row is clicked.
+    gitMocks.getGitWorkspaceSummary.mockReset();
+    gitMocks.getGitWorkspaceSummary
+      .mockRejectedValueOnce(new Error("Git timed out"))
+      .mockResolvedValue(summary);
+    const user = userEvent.setup();
+    render(<App />);
+    const card = await screen.findByRole("region", { name: "编辑了 2 个文件" });
+    await waitFor(() => expect(gitMocks.getGitWorkspaceSummary).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "审阅" })).toBeDisabled();
+
+    await user.click(within(card).getByRole("button", { name: /App\.tsx/ }));
+    await expectDiffOpenInReview();
+    expect(screen.queryByRole("region", { name: "文件" })).toBeNull();
+    expect(gitMocks.getGitWorkspaceSummary).toHaveBeenCalledTimes(2);
   });
 });

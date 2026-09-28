@@ -1098,9 +1098,9 @@ describe("App model run flow — images", () => {
     expect(visionSwitch).toHaveAttribute("aria-checked", "true");
     await user.click(visionSwitch);
     await user.click(within(modelDialog).getByRole("button", { name: "保存" }));
-    // The settings dialog's own close control, not one of the page's: the header owns it.
+    // The settings dialog's own close control, not one of the page's: the corner owns it.
     await user.click(within(
-      settingsDialog.querySelector<HTMLElement>(".dialog__header")!
+      settingsDialog.querySelector<HTMLElement>(".dialog__close")!
     ).getByRole("button", { name: "关闭" }));
 
     const currentComposer = await screen.findByLabelText("向 Agent 发送消息");

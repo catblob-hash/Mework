@@ -112,6 +112,7 @@ mod remote_terminal;
 mod reveal_path;
 mod run_environment;
 mod run_stream;
+mod search_scope;
 mod security;
 mod shell_backend;
 mod shell_snapshot;
@@ -128,6 +129,7 @@ mod token_ledger;
 mod token_statistics;
 mod tool_attestation;
 mod tool_executor;
+mod tool_output;
 mod tool_prompt;
 mod web_search;
 mod wire_history;
@@ -211,6 +213,7 @@ fn load_document(
     // fetch after a rejected save) would otherwise be handed a conversation
     // whose last answer is missing, and would go on running from that body.
     storage::refresh_conversation_bodies(&path, &mut document);
+    apply_git_language(&document);
     let document = std::sync::Arc::new(document);
     let app_data = path
         .parent()
@@ -225,6 +228,15 @@ fn load_document(
         eprintln!("加载文档时同步临时工作区失败，将在下次保存或加载时重试：{error}");
     }
     Ok(document)
+}
+
+/// Git's messages reach the renderer as they are (the review pane shows them verbatim), so
+/// they follow the language the renderer mirrored into the document; the agent's `git` helper
+/// takes it from each request.
+fn apply_git_language(document: &crate::model::AppDocument) {
+    git_core::set_english(
+        document.global_settings.resolved_app_language == crate::model::ResolvedLanguage::EnUs,
+    );
 }
 
 /// Copies a conversation's history through `throughContextId` into a branch.
@@ -853,6 +865,7 @@ fn save_document_blocking(
         None
     };
     drop(definition_authority);
+    apply_git_language(&canonical);
     // The tray menu is host-rendered chrome, so it follows the language the
     // renderer just mirrored into the document.
     if previous.global_settings.resolved_app_language
@@ -1096,6 +1109,7 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
         .document_store
         .flush(std::time::Duration::from_secs(30))?;
     state.clear_receipts();
+    apply_git_language(&document);
     app_tray::apply_language(&app, document.global_settings.resolved_app_language);
     #[cfg(target_os = "macos")]
     app_menu::apply_language(&app, document.global_settings.resolved_app_language);
@@ -3578,10 +3592,8 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
                     }
                 }
             }
-            // Only the background the settings point at is kept; an import the
-            // app quit in the middle of leaves a staging directory behind.
-            background_images::BackgroundImageStore::new(app_data)
-                .reconcile(&document.global_settings.appearance.background_image);
+            // An import the app quit in the middle of leaves a staging directory behind.
+            background_images::BackgroundImageStore::new(app_data).reconcile();
             // Normal deletion occurs in the save transaction; remove only
             // orphaned workflow directories left by an interrupted deletion.
             let reaped = workflow_store::reap_conversation_orphans(app_data, document);
@@ -3663,24 +3675,36 @@ async fn background_image_put(
     .map_err(|error| format!("背景图片上传任务失败: {error}"))?
 }
 
-/// Finishes an import. The image the saved settings point at is kept alongside the
-/// new one until the settings stop pointing at it; every other image is removed.
+/// Finishes an import, adding the picture to the library of backgrounds.
 #[cfg(not(test))]
 #[tauri::command]
 async fn background_image_commit(
     app: AppHandle,
     upload_id: String,
 ) -> Result<background_images::BackgroundImage, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let referenced = document_path(&app)
-            .and_then(|path| app.state::<AppState>().document_store.current_snapshot(&path))
-            .map(|document| document.global_settings.appearance.background_image.clone())
-            .ok()
-            .filter(|id| !id.is_empty());
-        background_image_store(&app)?.commit(&upload_id, referenced.as_deref())
-    })
-    .await
-    .map_err(|error| format!("背景图片保存任务失败: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || background_image_store(&app)?.commit(&upload_id))
+        .await
+        .map_err(|error| format!("背景图片保存任务失败: {error}"))?
+}
+
+/// The imported backgrounds, the most recent first.
+#[cfg(not(test))]
+#[tauri::command]
+async fn background_image_list(
+    app: AppHandle,
+) -> Result<Vec<background_images::BackgroundImage>, String> {
+    tauri::async_runtime::spawn_blocking(move || background_image_store(&app)?.list())
+        .await
+        .map_err(|error| format!("背景图片列表任务失败: {error}"))?
+}
+
+/// Removes an imported background from the library.
+#[cfg(not(test))]
+#[tauri::command]
+async fn background_image_delete(app: AppHandle, image_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || background_image_store(&app)?.delete(&image_id))
+        .await
+        .map_err(|error| format!("背景图片删除任务失败: {error}"))?
 }
 
 /// The tier of a background image that covers a window of this many device pixels.

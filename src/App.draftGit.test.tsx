@@ -224,7 +224,10 @@ describe("draft conversation Git surface", () => {
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
-    expect(screen.getByRole("button", { name: "分支：main" })).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Git 状态" })).toBeInTheDocument();
+    // Branch and worktree were the draft's choices; the started conversation no longer offers them.
+    expect(screen.queryByRole("button", { name: "分支：main" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /工作树/ })).not.toBeInTheDocument();
   });
 
   it("creates the draft's requested worktree at its first send, before the model runs", async () => {

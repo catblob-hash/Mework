@@ -39,12 +39,13 @@ use crate::{
     model::{ImageAttachment, JsonObject},
     prompt_profile::{PromptKey, PromptProfile},
     run_environment::{self, RemoteCommandOutput, ShellRunner},
+    search_scope::{self, IgnoreRules},
     shell_backend::ScriptDialect,
     tool_executor::{
         apply_edit, optional_bool, optional_string, optional_u64, parse_read_range,
         required_string, slice_text_lines, truncate_chars, unified_diff, write_receipt_note,
         FileGuardContext, FileGuardTouch, FILE_MODIFIED_SINCE_READ, FILE_NOT_READ,
-        MAX_LIST_ENTRIES, MAX_PATH_CHARS, MAX_SEARCH_MATCHES, MAX_TEXT_FILE, MAX_WRITE_BYTES,
+        MAX_PATH_CHARS, MAX_TEXT_FILE, MAX_WRITE_BYTES,
     },
     workspace_set::ResolvedWorkspace,
 };
@@ -154,7 +155,7 @@ const EXIT_BAD_PATTERN: i32 = 2;
 /// Lines of a remote `find` listing the host will pull over for `find`'s own
 /// matching. Past it the listing is cut and the result says so: a silently
 /// shortened listing reads as "no such file".
-const MAX_SCANNED_ENTRIES: usize = 200_000;
+const MAX_SCANNED_ENTRIES: usize = search_scope::FIND_SCAN_LIMIT;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -566,15 +567,20 @@ fn ls_script(target: &RemoteWorkspace<'_>, path: &str, depth: u64) -> Result<Str
             &ps,
             path,
             depth + 1,
-            MAX_LIST_ENTRIES + 1,
+            search_scope::LS_REMOTE_LINES,
         ));
     }
     let mut script = prologue(target, path, TargetMode::Existing)?;
     script.push_str(&format!("[ -d \"$C\" ] || exit {EXIT_WRONG_KIND}\n"));
+    script.push_str(IGNORE_PROBE);
+    script.push_str(IGNORE_SECTION);
+    script.push_str(&collapse_condition(true));
+    // Sorted by depth before the cut, so what the line cap drops is the
+    // deepest level reached — the host leg's breadth-first order.
     script.push_str(&format!(
-        "{{ find \"$C\" -mindepth 1 -maxdepth {} {MARK_ENTRIES} ; }} 2>/dev/null | head -n {}\n",
+        "{{ find \"$C\" -mindepth 1 -maxdepth {} \\( \\( \"$@\" \\) -prune {MARK_ENTRIES} \\) -o {MARK_ENTRIES} ; }} 2>/dev/null | {BY_DEPTH} | head -n {}\n",
         depth + 1,
-        MAX_LIST_ENTRIES + 1
+        search_scope::LS_REMOTE_LINES
     ));
     Ok(script)
 }
@@ -600,47 +606,123 @@ fn ls_with(
         &wording,
     )?;
     let (header, rest) = take_header(&output.stdout)?;
+    let (rules, rest) = search_scope::take_remote_rules(rest)?;
     Ok(render_listing(
         target.profile,
         &header,
+        &rules,
         &String::from_utf8_lossy(rest),
-        PromptKey::ToolLsLimit,
-        PromptKey::ToolLsEmpty,
     ))
 }
 
-/// Shared rendering for `ls`: entries relative to the root, capped in the order
-/// the remote walked them and then sorted, exactly as the host leg does it.
+/// Shared rendering for `ls`: the remote's entries in breadth-first order,
+/// through the same budget and marks as the host leg.
 fn render_listing(
     profile: &PromptProfile,
     header: &Header,
+    rules: &IgnoreRules,
     payload: &str,
-    limit_key: PromptKey,
-    empty_key: PromptKey,
 ) -> String {
-    let mut entries = Vec::new();
-    let mut overflowed = false;
-    for line in payload.lines().filter(|line| !line.is_empty()) {
-        if entries.len() >= MAX_LIST_ENTRIES {
-            overflowed = true;
+    let mut lines = payload
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let is_dir = line.ends_with('/');
+            let absolute = line.trim_end_matches('/');
+            let relative = search_scope::relative_below(&header.canonical, absolute);
+            let level = relative.split('/').count();
+            (level, absolute.to_owned(), relative, is_dir)
+        })
+        .collect::<Vec<_>>();
+    // The machine sorted by depth already; within a level, name order is the
+    // host leg's.
+    lines.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    let source_cut = lines.len() >= search_scope::LS_REMOTE_LINES;
+    let last_level = lines.last().map_or(0, |line| line.0);
+    let mut listing = search_scope::Listing::new();
+    let mut complete = true;
+    for (level, absolute, relative, is_dir) in lines {
+        let collapsed = is_dir && rules.collapses(&relative);
+        let display = display_relative(&header.root, &absolute);
+        if !listing.push(level, &display, is_dir, collapsed, profile) {
+            complete = false;
             break;
         }
-        let directory = line.ends_with('/');
-        let mut display = display_relative(&header.root, line.trim_end_matches('/'));
-        if directory {
-            display.push('/');
+    }
+    if complete && source_cut {
+        listing.cut_by_source(last_level);
+    }
+    listing.render(profile)
+}
+
+/// Decides, in the script, what Git says about the target: `IGN` becomes
+/// `git` (inside a work tree, not ignored), `root` (itself ignored, so
+/// nothing below it is hidden) or `names` (no Git answer). The variables
+/// that would point Git at some other repository are cleared first.
+///
+/// The subshell's own exit 3 — the target could not be entered — must not
+/// read as Git's 1.
+const IGNORE_PROBE: &str = r#"unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT 2>/dev/null
+IGN=names
+if [ -d "$C" ] && command -v git >/dev/null 2>&1; then
+( cd -- "$C" 2>/dev/null || exit 3; GIT_OPTIONAL_LOCKS=0 exec git -c core.fsmonitor=false check-ignore -q . ) >/dev/null 2>&1
+case $? in 0) IGN=root ;; 1) IGN=git ;; esac
+fi
+"#;
+
+/// The ignore section of an `ls` or `find` answer
+/// ([`search_scope::take_remote_rules`]): the mode, then — under Git — what
+/// `git ls-files` lists as ignored below the target, then an empty line.
+/// `IGNORED` stays set for [`collapse_condition`].
+const IGNORE_SECTION: &str = r#"IGNORED=
+if [ "$IGN" = git ]; then
+IGNORED=$(cd -- "$C" && GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false -c core.quotepath=false ls-files --others --ignored --exclude-standard --directory -- . 2>/dev/null) || { IGN=names; IGNORED=; }
+fi
+printf '%s\n' "$IGN"
+if [ -n "$IGNORED" ]; then printf '%s\n' "$IGNORED"; fi
+printf '\n'
+"#;
+
+/// Sorts `find` output by depth, deepest last. The count of `/` stands in
+/// for the depth: every line starts with the same target.
+const BY_DEPTH: &str = r#"awk '{ n = gsub(/\//, "/"); if (substr($0, length($0), 1) == "/") n--; print n "\t" $0 }' | sort -n -k1,1 | cut -f2-"#;
+
+/// Sets the positional parameters to a `find` condition that is true for
+/// what the walk must not enter: version-control metadata always; with
+/// `ignored`, also the dependency directories when there is no Git answer,
+/// and the directories Git listed in `IGNORED` when there is. The Git
+/// entries become `-path` patterns, so their glob characters are escaped; a
+/// name Git had to quote (a control character in it) is left to the host.
+fn collapse_condition(ignored: bool) -> String {
+    let mut condition = String::from("set --");
+    for (index, name) in search_scope::VCS_DIRECTORIES.iter().enumerate() {
+        if index > 0 {
+            condition.push_str(" -o");
         }
-        entries.push(display);
+        condition.push_str(&format!(" -name {name}"));
     }
-    entries.sort_unstable();
-    if overflowed {
-        entries.push(profile.render(limit_key, &[("limit", &MAX_LIST_ENTRIES.to_string())]));
+    condition.push('\n');
+    if !ignored {
+        return condition;
     }
-    if entries.is_empty() {
-        profile.text(empty_key).to_owned()
-    } else {
-        entries.join("\n")
+    condition.push_str("if [ \"$IGN\" = names ]; then set -- \"$@\"");
+    for name in search_scope::DEPENDENCY_DIRECTORIES {
+        condition.push_str(&format!(" -o -name {name}"));
     }
+    condition.push_str("; fi\n");
+    condition.push_str(
+        r#"if [ -n "$IGNORED" ]; then
+CE=$(printf '%s\n' "${C%/}" | sed 's/[][*?\\]/\\&/g')
+PRUNED=$(printf '%s\n' "$IGNORED" | sed -n '/^"/d; s|/$||p' | sed 's/[][*?\\]/\\&/g')
+while IFS= read -r E; do
+if [ -n "$E" ]; then set -- "$@" -o -path "$CE/$E"; fi
+done <<MEWORK_PRUNED
+$PRUNED
+MEWORK_PRUNED
+fi
+"#,
+    );
+    condition
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +734,7 @@ fn grep_script(
     path: &str,
     pattern: &str,
     case_sensitive: bool,
+    wanted: usize,
 ) -> Result<String, String> {
     if let Some(ps) = powershell(target)? {
         check_operand(path, "path")?;
@@ -661,7 +744,7 @@ fn grep_script(
             path,
             pattern,
             case_sensitive,
-            MAX_SEARCH_MATCHES + 1,
+            wanted,
         ));
     }
     let pattern = quote_search_operand(pattern, "pattern")?;
@@ -674,12 +757,31 @@ fn grep_script(
     script.push_str(&format!(
         "VERR=$(grep $GP{case} -q -e {pattern} /dev/null 2>&1)\nif [ $? -eq {EXIT_BAD_PATTERN} ]; then printf '%s\\n' \"$VERR\" >&2; exit {EXIT_BAD_PATTERN}; fi\n"
     ));
-    // 2049 one-kilobyte blocks is "at most 2 MiB" once `find` has rounded the
-    // size up, which is the host leg's own cutoff.
+    // The files Git lists reach `grep` through `xargs`, whose child shell
+    // prefixes each with the target — dropping any whose directory has become
+    // a link since Git indexed it, which the host leg's walk would not have
+    // followed either — and lets `find` pick the regular files a host-leg
+    // walk would read: no links, nothing a submodule's directory hides,
+    // nothing past 2 MiB (2049 one-kilobyte blocks once `find` has rounded
+    // up). The pattern travels in the environment, never through a second
+    // round of quoting.
     script.push_str(&format!(
-        "if [ -d \"$C\" ]; then\nfind \"$C\" -type f -size -2049k -exec grep $GP{case} -I -n -e {pattern} /dev/null {{}} +\nelse\ngrep $GP{case} -I -n -e {pattern} /dev/null \"$C\"\nfi | head -n {}\n",
-        MAX_SEARCH_MATCHES + 1
+        "MEWORK_RX={pattern}\nMEWORK_GF=\"$GP{case} -I -n\"\nexport MEWORK_RX MEWORK_GF\n"
     ));
+    script.push_str("IGNORED=\nif [ -d \"$C\" ]; then\n");
+    script.push_str(IGNORE_PROBE);
+    script.push_str(&collapse_condition(true));
+    script.push_str(
+        r#"if [ "$IGN" = git ]; then
+( cd -- "$C" && GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false -c core.quotepath=false ls-files --cached --others --exclude-standard -- . 2>/dev/null ) | sed '/^"/d' | uniq | tr '\n' '\000' | xargs -0 sh -c 'd=${1%/}; shift; for f do shift; p=$f; ok=1; while :; do case $p in */*) p=${p%/*} ;; *) break ;; esac; if [ -L "$d/$p" ]; then ok=; break; fi; done; if [ -n "$ok" ]; then set -- "$@" "$d/$f"; fi; done; [ $# -gt 0 ] || exit 0; exec find "$@" -prune -type f -size -2049k -exec grep $MEWORK_GF -e "$MEWORK_RX" /dev/null {} +' sh "$C"
+else
+find "$C" -mindepth 1 \( -type d \( "$@" \) -prune \) -o -type f -size -2049k -exec grep $MEWORK_GF -e "$MEWORK_RX" /dev/null {} +
+fi
+else
+grep $MEWORK_GF -e "$MEWORK_RX" /dev/null "$C"
+"#,
+    );
+    script.push_str(&format!("fi | head -n {wanted}\n"));
     Ok(script)
 }
 
@@ -691,11 +793,12 @@ fn grep_with(
     let pattern = required_string(input, "pattern", 4096, false)?;
     let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
     let case_sensitive = optional_bool(input, "case_sensitive", false)?;
+    let page = search_scope::GrepPage::from_input(input)?;
     let wording = ExitWording::new(&path).grep();
     let output = run_script(
         shell,
         target,
-        &grep_script(target, &path, &pattern, case_sensitive)?,
+        &grep_script(target, &path, &pattern, case_sensitive, page.wanted())?,
         None,
         SEARCH_TIMEOUT,
         &wording,
@@ -704,6 +807,7 @@ fn grep_with(
     Ok(render_matches(
         target.profile,
         &header,
+        &page,
         &String::from_utf8_lossy(rest),
         &output.stderr,
     ))
@@ -728,34 +832,25 @@ fn format_match(root: &str, line: &str) -> String {
 fn render_matches(
     profile: &PromptProfile,
     header: &Header,
+    page: &search_scope::GrepPage,
     payload: &str,
     stderr: &str,
 ) -> String {
-    let mut matches = Vec::new();
-    let mut overflowed = false;
-    for line in payload.lines().filter(|line| !line.is_empty()) {
-        if matches.len() >= MAX_SEARCH_MATCHES {
-            overflowed = true;
-            break;
-        }
-        matches.push(format_match(&header.root, line));
-    }
-    if overflowed {
-        matches.push(profile.render(
-            PromptKey::ToolGrepLimit,
-            &[("limit", &MAX_SEARCH_MATCHES.to_string())],
-        ));
-    }
+    let matches = payload
+        .lines()
+        .filter(|line| !line.is_empty())
+        .take(page.wanted())
+        .map(|line| format_match(&header.root, line))
+        .collect::<Vec<_>>();
     // Whatever the remote `find`/`grep` could not open is reported the way the
     // host leg reports an unreadable entry, rather than being silently dropped.
-    for line in stderr.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        matches.push(profile.render(PromptKey::ToolGrepSkipped, &[("error", line)]));
-    }
-    if matches.is_empty() {
-        profile.text(PromptKey::ToolGrepNoMatch).to_owned()
-    } else {
-        matches.join("\n")
-    }
+    let skipped = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    page.render(matches, skipped, profile)
 }
 
 // ---------------------------------------------------------------------------
@@ -782,13 +877,18 @@ fn find_script(target: &RemoteWorkspace<'_>, path: &str, query: &str) -> Result<
         ));
     }
     let filter = if name_only_query(query) {
-        format!(" -name {}", quote_search_operand(query, "query")?)
+        format!("-name {} ", quote_search_operand(query, "query")?)
     } else {
         String::new()
     };
     let mut script = prologue(target, path, TargetMode::Existing)?;
+    // `find` hides nothing Git ignores; the section only ranks the matches.
+    script.push_str(IGNORE_PROBE);
+    script.push_str(IGNORE_SECTION);
+    // Version-control metadata can be found by name, never walked.
+    script.push_str(&collapse_condition(false));
     script.push_str(&format!(
-        "{{ find \"$C\" -mindepth 1{filter} {MARK_ENTRIES} ; }} 2>/dev/null | head -n {}\n",
+        "{{ find \"$C\" -mindepth 1 \\( \\( \"$@\" \\) -prune {filter}{MARK_ENTRIES} \\) -o {filter}{MARK_ENTRIES} ; }} 2>/dev/null | head -n {}\n",
         MAX_SCANNED_ENTRIES + 1
     ));
     Ok(script)
@@ -814,12 +914,14 @@ fn find_with(
         &wording,
     )?;
     let (header, rest) = take_header(&output.stdout)?;
+    let (rules, rest) = search_scope::take_remote_rules(rest)?;
     let payload = String::from_utf8_lossy(rest);
 
     let lines: Vec<&str> = payload.lines().filter(|line| !line.is_empty()).collect();
-    let scanned_all = lines.len() <= MAX_SCANNED_ENTRIES;
-    let mut found = Vec::new();
-    let mut overflowed = false;
+    let mut found = search_scope::FindMatches::default();
+    if lines.len() > MAX_SCANNED_ENTRIES {
+        found.scan_cut();
+    }
     for line in lines.iter().take(MAX_SCANNED_ENTRIES) {
         let directory = line.ends_with('/');
         let absolute = line.trim_end_matches('/');
@@ -832,34 +934,17 @@ fn find_with(
         if !matched {
             continue;
         }
-        if found.len() >= MAX_LIST_ENTRIES {
-            overflowed = true;
-            break;
-        }
         let mut display = display_relative(&header.root, absolute);
         if directory {
             display.push('/');
         }
-        found.push(display);
+        let ignored = rules.ignores(
+            &search_scope::relative_below(&header.canonical, absolute),
+            directory,
+        );
+        found.push(display, ignored);
     }
-    found.sort_unstable();
-    if overflowed {
-        found.push(target.profile.render(
-            PromptKey::ToolFindLimit,
-            &[("limit", &MAX_LIST_ENTRIES.to_string())],
-        ));
-    }
-    let mut rendered = if found.is_empty() {
-        target.profile.text(PromptKey::ToolFindNoMatch).to_owned()
-    } else {
-        found.join("\n")
-    };
-    if !scanned_all {
-        rendered.push_str(&format!(
-            "\n(only the first {MAX_SCANNED_ENTRIES} entries under this path were examined; narrow the path)"
-        ));
-    }
-    Ok(rendered)
+    Ok(found.render(target.profile))
 }
 
 // ---------------------------------------------------------------------------
@@ -950,7 +1035,7 @@ fn read_with(
     }
     let content = String::from_utf8(body.to_vec())
         .map_err(|error| format!("Failed to read text file as UTF-8: {error}"))?;
-    let slice = slice_text_lines(&content, start_line, end_line, target.profile);
+    let slice = slice_text_lines(&content, start_line, end_line, target.profile)?;
     let record = if slice.whole_file {
         FileReadRecord::full_read(modified_ms, file_read_state::normalize_text(&content))
     } else {
@@ -1378,6 +1463,81 @@ pub(crate) mod tests {
         }
     }
 
+    /// What Git ignores, on a real Linux machine over SSH through the agent,
+    /// with bash and with the machine's own `sh` (dash on Debian and Ubuntu)
+    /// as the agent shell: GNU `find`, `xargs` and `sort`, the machine's own
+    /// `git`. Set `MEWORK_E2E_SSH_HOST` (and `MEWORK_E2E_SSH_PORT`,
+    /// `MEWORK_E2E_SSH_KEY` as needed) and run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn over_real_ssh_the_file_tools_leave_out_what_git_ignores() {
+        let host = std::env::var("MEWORK_E2E_SSH_HOST").expect("MEWORK_E2E_SSH_HOST");
+        let port = std::env::var("MEWORK_E2E_SSH_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(0);
+        let identity_file = std::env::var("MEWORK_E2E_SSH_KEY").unwrap_or_default();
+        let app_data = tempfile::tempdir().unwrap();
+        crate::remote_link::install(app_data.path(), Vec::new(), None);
+        let cancel = CancelSignal::default();
+        let profile = PromptProfile::default();
+        for backend in [
+            crate::shell_backend::ShellBackend::Bash,
+            crate::shell_backend::ShellBackend::Sh,
+        ] {
+            let runner = ShellRunner::Ssh {
+                agent_shell: crate::shell_backend::AgentShell::new(backend, backend.id()),
+                host: host.clone(),
+                port,
+                identity_file: identity_file.clone(),
+                env: Default::default(),
+            };
+            let root = "/tmp/mework-e2e-ignore";
+            let setup = runner
+                .run(
+                    &format!(
+                        "rm -rf {root} && mkdir -p {root}/src {root}/target/debug {root}/node_modules/pkg && cd {root} && git init -q && \\
+                         printf 'target/\\nnode_modules/\\n*.log\\n.env\\n' > .gitignore && \\
+                         printf 'NEEDLE=1\\n' > .env && printf 'fn needle() {{}}\\n' > src/main.rs && \\
+                         printf 'needle\\n' > src/run.log && printf 'needle\\n' > target/debug/out.rs && \\
+                         printf 'needle\\n' > node_modules/pkg/index.js"
+                    ),
+                    None,
+                    FILE_TIMEOUT,
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(setup.status, Some(0), "{}", setup.stderr);
+            let set = WorkspaceSet::single(root.to_owned(), runner.clone());
+            let target = RemoteWorkspace {
+                workspace: set.primary().expect("one workspace"),
+                machine_key: "ssh:e2e".to_owned(),
+                confinement: Confinement::Workspace,
+                profile: &profile,
+                cancel: &cancel,
+            };
+            let listed = run_ls(&target, &input(json!({"depth": 3}))).unwrap();
+            assert!(listed.contains("target/ (ignored)"), "{backend:?}: {listed}");
+            assert!(listed.contains("node_modules/ (ignored)"), "{backend:?}: {listed}");
+            assert!(!listed.contains("target/debug"), "{backend:?}: {listed}");
+            assert!(listed.contains("src/main.rs"), "{backend:?}: {listed}");
+            assert!(listed.contains(".env"), "{backend:?}: {listed}");
+            let inside = run_ls(&target, &input(json!({"path": "target", "depth": 3}))).unwrap();
+            assert!(inside.contains("target/debug/out.rs"), "{backend:?}: {inside}");
+
+            let grepped = run_grep(&target, &input(json!({"pattern": "needle"}))).unwrap();
+            assert_eq!(grepped, "src/main.rs:1:fn needle() {}", "{backend:?}");
+            let grepped = run_grep(&target, &input(json!({"pattern": "needle", "path": "node_modules"}))).unwrap();
+            assert_eq!(grepped, "node_modules/pkg/index.js:1:needle", "{backend:?}");
+
+            let found = run_find(&target, &input(json!({"query": "*.rs"}))).unwrap();
+            let lines = found.lines().collect::<Vec<_>>();
+            assert_eq!(&lines[..2], &["src/main.rs", "target/debug/out.rs (ignored)"], "{backend:?}: {found}");
+            let cleaned = runner.run(&format!("rm -rf {root}"), None, FILE_TIMEOUT, &cancel).unwrap();
+            assert_eq!(cleaned.status, Some(0));
+        }
+    }
+
     /// The file tools against a real Windows machine over SSH, through the
     /// agent: Git Bash runs the same scripts a Unix machine does, in a
     /// workspace rooted at a Windows path the way the directory picker
@@ -1546,6 +1706,41 @@ pub(crate) mod tests {
         let read = run_read(&target, &input(json!({"path": posix})), None, None).unwrap();
         assert!(read.output.contains("third"), "{}", read.output);
 
+        // Made a Git work tree, the workspace hides what `.gitignore` names:
+        // the directory is listed unexpanded, `grep` passes over it, and
+        // `find` ranks it last — Git for Windows deciding, as on the host.
+        let ignoring = runner
+            .run(
+                &format!(
+                    "$ErrorActionPreference = 'Continue'
+                     Set-Location -LiteralPath {root}
+                     & git init -q 2>$null
+                     New-Item -ItemType Directory -Path 'build/out' | Out-Null
+                     Set-Content -LiteralPath '.gitignore' -Value 'build/'
+                     Set-Content -LiteralPath 'build/out/gen.txt' -Value 'third'
+                     exit $LASTEXITCODE
+",
+                    root = crate::remote_shell::ps_single_quote(&root),
+                ),
+                None,
+                FILE_TIMEOUT,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(ignoring.status, Some(0), "{}", ignoring.stderr);
+        let listing = run_ls(&target, &input(json!({"depth": 3}))).unwrap();
+        assert!(listing.contains("build/ (ignored)"), "{listing}");
+        assert!(!listing.contains("build/out"), "{listing}");
+        assert!(listing.contains(".git/ (ignored)"), "{listing}");
+        let grep = run_grep(&target, &input(json!({"pattern": "third"}))).unwrap();
+        assert_eq!(grep, "notes/it's.txt:1:third", "{grep}");
+        let grep = run_grep(&target, &input(json!({"pattern": "third", "path": "build"}))).unwrap();
+        assert!(grep.contains("build/out/gen.txt:1:third"), "{grep}");
+        let found = run_find(&target, &input(json!({"query": "*.txt"}))).unwrap();
+        let lines = found.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "notes/it's.txt", "{found}");
+        assert!(found.contains("build/out/gen.txt (ignored)"), "{found}");
+
         let cleaned = runner
             .run(
                 &format!(
@@ -1626,26 +1821,34 @@ pub(crate) mod tests {
             root: "/srv/app".into(),
             canonical: "/srv/app".into(),
         };
+        let rules = IgnoreRules::DependencyNames;
         let rendered = render_listing(
             &profile,
             &header,
+            &rules,
             "/srv/app/src/\n/srv/app/src/main.rs\n/etc/passwd\n",
-            PromptKey::ToolLsLimit,
-            PromptKey::ToolLsEmpty,
         );
         // Sorted, root-relative, and a path outside the root keeps its absolute
         // spelling — which only an unconfined call can produce.
         assert_eq!(rendered, "/etc/passwd\nsrc/\nsrc/main.rs");
         assert_eq!(
-            render_listing(
-                &profile,
-                &header,
-                "",
-                PromptKey::ToolLsLimit,
-                PromptKey::ToolLsEmpty
-            ),
+            render_listing(&profile, &header, &rules, ""),
             profile.text(PromptKey::ToolLsEmpty)
         );
+        // What the rules ignore is marked, and explained once.
+        let rendered = render_listing(
+            &profile,
+            &header,
+            &rules,
+            "/srv/app/node_modules/\n/srv/app/.git/\n/srv/app/src/\n",
+        );
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(
+            &lines[..3],
+            &[".git/ (ignored)", "node_modules/ (ignored)", "src/"],
+            "{rendered}"
+        );
+        assert_eq!(lines[3], profile.text(PromptKey::ToolLsIgnoredNote));
     }
 
     #[test]
@@ -1655,25 +1858,33 @@ pub(crate) mod tests {
             root: "/r".into(),
             canonical: "/r".into(),
         };
-        let payload: String = (0..MAX_LIST_ENTRIES + 5)
+        // Eight characters an entry with its newline: the budget holds 5,000.
+        let payload: String = (0..6_000)
             .map(|index| format!("/r/f{index:06}\n"))
             .collect();
-        let rendered = render_listing(
-            &profile,
-            &header,
-            &payload,
-            PromptKey::ToolLsLimit,
-            PromptKey::ToolLsEmpty,
-        );
+        let rendered = render_listing(&profile, &header, &IgnoreRules::NamedRoot, &payload);
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), MAX_LIST_ENTRIES + 1);
+        let fitted = search_scope::LS_BUDGET_CHARS / 8;
+        assert_eq!(lines.len(), fitted + 1);
+        assert_eq!(lines[fitted - 1], format!("f{:06}", fitted - 1));
         assert_eq!(
-            lines[MAX_LIST_ENTRIES],
+            lines[fitted],
             profile.render(
-                PromptKey::ToolLsLimit,
-                &[("limit", &MAX_LIST_ENTRIES.to_string())]
+                PromptKey::ToolLsLimitPartial,
+                &[("limit", &search_scope::LS_BUDGET_CHARS.to_string())]
             )
         );
+        // A deeper level is what the budget cuts first, and the answer says
+        // how deep it is complete.
+        let mut payload = String::from("/r/a/\n/r/b/\n");
+        payload.extend((0..6_000).map(|index| format!("/r/a/f{index:06}\n")));
+        let rendered = render_listing(&profile, &header, &IgnoreRules::NamedRoot, &payload);
+        assert!(rendered.starts_with("a/\na/f000000\n"), "{}", &rendered[..40]);
+        assert!(rendered.contains("\nb/\n"));
+        assert!(rendered.ends_with(&profile.render(
+            PromptKey::ToolLsLimit,
+            &[("limit", &search_scope::LS_BUDGET_CHARS.to_string()), ("depth", "0")]
+        )));
     }
 
     #[test]
@@ -1692,16 +1903,27 @@ pub(crate) mod tests {
             root: "/r".into(),
             canonical: "/r".into(),
         };
-        let rendered = render_matches(&profile, &header, "", "find: '/r/x': Permission denied\n");
+        let page = search_scope::GrepPage::from_input(&JsonObject::new()).unwrap();
+        let rendered = render_matches(
+            &profile,
+            &header,
+            &page,
+            "",
+            "find: '/r/x': Permission denied\n",
+        );
         assert_eq!(
             rendered,
-            profile.render(
-                PromptKey::ToolGrepSkipped,
-                &[("error", "find: '/r/x': Permission denied")]
+            format!(
+                "{}\n{}",
+                profile.text(PromptKey::ToolGrepNoMatch),
+                profile.render(
+                    PromptKey::ToolGrepSkipped,
+                    &[("error", "find: '/r/x': Permission denied")]
+                )
             )
         );
         assert_eq!(
-            render_matches(&profile, &header, "", ""),
+            render_matches(&profile, &header, &page, "", ""),
             profile.text(PromptKey::ToolGrepNoMatch)
         );
     }
@@ -1959,6 +2181,96 @@ pub(crate) mod tests {
                 profile: &self.profile,
                 cancel: &self.cancel,
             }
+        }
+    }
+
+    /// The two legs must agree on what Git leaves out: one repository listed,
+    /// searched and found through the host leg and through the scripts.
+    #[test]
+    fn both_legs_leave_out_what_git_ignores_alike() {
+        let Some(fixture) = fixture() else { return };
+        if crate::environment_tools::resolve_on_path("git").is_none() {
+            return;
+        }
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&fixture.workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        write_fixture_file(&fixture, ".gitignore", b"target/\n*.log\n.env\n");
+        write_fixture_file(&fixture, ".env", b"NEEDLE=1\n");
+        write_fixture_file(&fixture, "src/main.rs", b"fn needle() {}\n");
+        write_fixture_file(&fixture, "src/debug.log", b"needle in a log\n");
+        write_fixture_file(&fixture, "target/debug/build.rs", b"fn needle() {}\n");
+        write_fixture_file(&fixture, "target/debug/deep/x.rs", b"needle\n");
+        write_fixture_file(&fixture, "docs/guide.md", b"nothing here\n");
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let state = crate::state::AppState::default();
+        let host = |tool: &str, arguments: Value| {
+            let response = crate::tool_executor::execute(
+                crate::model::ToolExecutionRequest {
+                    conversation_id: "conversation-test".into(),
+                    workspace_path: fixture.workspace.clone(),
+                    tool_name: tool.into(),
+                    input: input(arguments),
+                },
+                &state,
+            );
+            assert!(response.success, "{tool}: {}", response.output);
+            response.output
+        };
+
+        let listed = ls_with(&fixture.shell, &target, &input(json!({"depth": 3}))).unwrap();
+        assert_eq!(listed, host("ls", json!({"depth": 3})));
+        // The ignored directory is named, not entered; an ignored file is
+        // listed as it is, because nothing has to be walked to show it.
+        assert!(listed.contains("target/ (ignored)"), "{listed}");
+        assert!(!listed.contains("target/debug"), "{listed}");
+        assert!(listed.contains(".env"), "{listed}");
+        assert!(listed.contains(".git/ (ignored)"), "{listed}");
+        assert!(!listed.contains(".git/HEAD"), "{listed}");
+        // Named outright, an ignored directory is listed like any other.
+        let inside = ls_with(&fixture.shell, &target, &input(json!({"path": "target", "depth": 3}))).unwrap();
+        assert_eq!(inside, host("ls", json!({"path": "target", "depth": 3})));
+        assert!(inside.contains("target/debug/deep/x.rs"), "{inside}");
+
+        let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle"}))).unwrap();
+        assert_eq!(grepped, host("grep", json!({"pattern": "needle"})));
+        assert_eq!(grepped, "src/main.rs:1:fn needle() {}", "{grepped}");
+        let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle", "path": "target"}))).unwrap();
+        assert_eq!(grepped, host("grep", json!({"pattern": "needle", "path": "target"})));
+        assert!(grepped.contains("target/debug/deep/x.rs:1:needle"), "{grepped}");
+
+        let found = find_with(&fixture.shell, &target, &input(json!({"query": "*.rs"}))).unwrap();
+        assert_eq!(found, host("find", json!({"query": "*.rs"})));
+        let lines = found.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "src/main.rs", "{found}");
+        assert_eq!(lines[1], "target/debug/build.rs (ignored)", "{found}");
+        let found = find_with(&fixture.shell, &target, &input(json!({"query": ".env"}))).unwrap();
+        assert_eq!(found, host("find", json!({"query": ".env"})));
+        assert!(found.starts_with(".env (ignored)"), "{found}");
+
+        // A directory Git indexed and that has since become a link out of the
+        // workspace is not searched through, on either leg.
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("a.txt"), "needle outside\n").unwrap();
+            write_fixture_file(&fixture, "docs/a.txt", b"inside\n");
+            let added = Command::new("git")
+                .args(["add", "docs/a.txt"])
+                .current_dir(&fixture.workspace)
+                .status()
+                .unwrap();
+            assert!(added.success());
+            let docs = std::path::Path::new(&fixture.workspace).join("docs");
+            std::fs::remove_dir_all(&docs).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &docs).unwrap();
+            let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle"}))).unwrap();
+            assert_eq!(grepped, host("grep", json!({"pattern": "needle"})));
+            assert!(!grepped.contains("outside"), "{grepped}");
         }
     }
 

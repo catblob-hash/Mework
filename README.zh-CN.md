@@ -6,9 +6,9 @@
 
 📖 **文档站：** [catblob-hash.github.io/Mework](https://catblob-hash.github.io/Mework/zh-CN/index.html)
 
-![Mework 使用 DeepSeek-V4.1-Flash：Agent 给一个小网站加上深色模式开关，启动开发服务器，再在内置浏览器里点击开关验收](.github/assets/demo.zh-CN.gif)
+![Mework 功能导览：一个项目同时包含 Mac 本地目录和 SSH 连接的 Linux 电脑；子代理和脚本工作流跑在不同厂商的模型上；计划模式与审批；两台机器上的改动审阅、终端和内置浏览器；文件预览；编辑模型看到的内容；预设、设置和中文界面](.github/assets/demo.gif)
 
-<sub>DeepSeek-V4.1-Flash 给页头加上深色模式开关，再到 Mework 的内置浏览器里点一下验收。macOS 上录制，Agent 执行部分已加速。</sub>
+<sub>两分钟功能导览：主 Agent 用 DeepSeek，子代理用 Claude 和 GPT 模型，一个项目同时包含 Mac 本地目录和 SSH 连接的 Linux 电脑。macOS 上录制，等待部分已剪掉，较长的步骤已加速。</sub>
 
 Mework 是一个 Windows 桌面端的编程 Agent。Claude Code 能做的事它基本都能做——读写项目、跑命令、搜网页、开子代理、在浏览器里验收自己的改动——区别在于它是本地应用，模型由你选，而且模型看到的每一句话你都能看见、都能改。
 

@@ -45,7 +45,9 @@ export const toolCatalog: ToolDescriptor[] = [
     parameters: [
       { name: "pattern", label: "搜索内容", type: "string", required: true, placeholder: "TODO|FIXME" },
       { name: "path", label: "范围", type: "string", required: false, defaultValue: "." },
-      { name: "case_sensitive", label: "区分大小写", type: "boolean", required: false, defaultValue: false }
+      { name: "case_sensitive", label: "区分大小写", type: "boolean", required: false, defaultValue: false },
+      { name: "limit", label: "条数上限", type: "number", required: false, defaultValue: 250, help: "最多返回的匹配行，默认 250，至多 1000" },
+      { name: "offset", label: "跳过", type: "number", required: false, defaultValue: 0, help: "先跳过这么多匹配行，用于翻到下一页" }
     ]
   },
   {

@@ -154,16 +154,86 @@ pub(crate) fn prologue(target: &Target<'_>, path: &str, mode: Mode) -> String {
     script
 }
 
+/// What Git says about the target, the PowerShell form of the POSIX
+/// `IGNORE_PROBE`: `$Ign` becomes `git`, `root` or `names`
+/// ([`crate::search_scope::take_remote_rules`]). With `list`, `$Ignored`
+/// holds what `git ls-files` lists as ignored below the target.
+///
+/// Windows PowerShell turns a native command's redirected stderr into error
+/// records, which `$ErrorActionPreference = 'Stop'` would make fatal, so the
+/// preference is relaxed around the calls. Every argument is a fixed token:
+/// the target is the current location, never an argument, because 5.1
+/// re-splits what it hands a native program on spaces and quotes.
+fn ignore_probe(list: bool) -> String {
+    let listing = if list {
+        "\n      $MeworkLines = & git -c core.fsmonitor=false -c core.quotepath=false ls-files --others --ignored --exclude-standard --directory -- . 2>$null\n      if ($LASTEXITCODE -eq 0) { $Ignored = @($MeworkLines | Where-Object { $_ }) } else { $Ign = 'names'; $Ignored = @() }"
+    } else {
+        ""
+    };
+    format!(
+        r#"$Ign = 'names'
+$Ignored = @()
+if ([System.IO.Directory]::Exists($C) -and (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {{
+  $MeworkEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  foreach ($MeworkVar in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT')) {{ Remove-Item -LiteralPath ('Env:' + $MeworkVar) -ErrorAction SilentlyContinue }}
+  $env:GIT_OPTIONAL_LOCKS = '0'
+  Push-Location -LiteralPath $C
+  try {{
+    & git -c core.fsmonitor=false check-ignore -q . 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {{ $Ign = 'root' }}
+    elseif ($LASTEXITCODE -eq 1) {{
+      $Ign = 'git'{listing}
+    }}
+  }} catch {{ $Ign = 'names'; $Ignored = @() }} finally {{ Pop-Location; $ErrorActionPreference = $MeworkEap }}
+}}
+"#
+    )
+}
+
+/// The ignore section of an `ls` or `find` answer: the mode, the ignored
+/// entries, an empty line.
+const IGNORE_SECTION: &str = "Out-Line $Ign\nforeach ($MeworkEntry in $Ignored) { Out-Line $MeworkEntry }\nOut-Line ''\n";
+
+/// `Collapsed $Shown $Name`: whether the walk leaves a directory unexpanded —
+/// version-control metadata always, and what the ignore mode says. The
+/// shown path is the one the walk prints, `$C` plus `/`-joined names.
+fn collapsed_function() -> String {
+    let quoted = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| ps_single_quote(name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        r#"$MeworkVcs = @({vcs})
+$MeworkDeps = @({deps})
+$MeworkPrune = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($MeworkEntry in $Ignored) {{
+  if ($MeworkEntry.EndsWith('/') -and -not $MeworkEntry.StartsWith('"')) {{ [void]$MeworkPrune.Add($C.TrimEnd('/') + '/' + $MeworkEntry.TrimEnd('/')) }}
+}}
+function Collapsed([string]$Shown, [string]$Name) {{
+  if ($MeworkVcs -contains $Name) {{ return $true }}
+  if ($Ign -eq 'names' -and $MeworkDeps -contains $Name) {{ return $true }}
+  return $MeworkPrune.Contains($Shown)
+}}
+"#,
+        vcs = quoted(&crate::search_scope::VCS_DIRECTORIES),
+        deps = quoted(crate::search_scope::DEPENDENCY_DIRECTORIES),
+    )
+}
+
 /// Walks a directory the way the POSIX leg's `find` does: pre-order, one entry
 /// per line, directories marked with a trailing `/`, links to directories
-/// neither marked nor descended into, at most `limit` lines.
+/// neither marked nor descended into, version-control metadata listed but not
+/// entered, at most `limit` lines.
 ///
-/// `max_depth` 0 is unbounded. `name_filter`, when given, is a `-like`
-/// pattern the printed entries' names must match; every directory is still
-/// walked, as `find -name` walks them. It is a pre-filter for the host's own
-/// glob matcher, and PowerShell's `-like` ignores case, so it only ever lets
-/// more through, never less.
-fn walk(max_depth: u64, limit: usize, name_filter: Option<&str>) -> String {
+/// `name_filter`, when given, is a `-like` pattern the printed entries' names
+/// must match; every directory is still walked, as `find -name` walks them.
+/// It is a pre-filter for the host's own glob matcher, and PowerShell's
+/// `-like` ignores case, so it only ever lets more through, never less.
+fn walk(limit: usize, name_filter: Option<&str>) -> String {
     let filter = match name_filter {
         Some(pattern) => format!(
             "($it.Name -like {})",
@@ -173,7 +243,7 @@ fn walk(max_depth: u64, limit: usize, name_filter: Option<&str>) -> String {
     };
     format!(
         r#"$global:MeworkLeft = {limit}
-function Walk([string]$Dir, [string]$Shown, [int]$Depth) {{
+function Walk([string]$Dir, [string]$Shown) {{
   try {{ $items = ([System.IO.DirectoryInfo]::new($Dir)).GetFileSystemInfos() }} catch {{ return }}
   foreach ($it in $items) {{
     if ($global:MeworkLeft -le 0) {{ return }}
@@ -183,34 +253,74 @@ function Walk([string]$Dir, [string]$Shown, [int]$Depth) {{
       if ($isDir) {{ Out-Line ($path + '/') }} else {{ Out-Line $path }}
       $global:MeworkLeft--
     }}
-    if ($isDir -and ({max_depth} -eq 0 -or $Depth -lt {max_depth})) {{ Walk $it.FullName $path ($Depth + 1) }}
+    if ($isDir -and -not ($MeworkVcs -contains $it.Name)) {{ Walk $it.FullName $path }}
   }}
 }}
-Walk $C $C.TrimEnd('/') 1
+Walk $C $C.TrimEnd('/')
 Quit 0
 "#
     )
 }
 
-/// `ls`: the entries under the target, `max_depth` levels deep.
+/// `ls`: the entries under the target, `max_depth` levels deep, breadth-first
+/// and each directory in name order, at most `limit` lines — so the cut falls
+/// on the deepest level reached, as on the host. Ignored directories are
+/// printed but not entered.
 pub(crate) fn listing(target: &Target<'_>, path: &str, max_depth: u64, limit: usize) -> String {
     let mut script = prologue(target, path, Mode::Existing);
     script.push_str("if (-not [System.IO.Directory]::Exists($C)) { Quit 67 }\n");
-    script.push_str(&walk(max_depth, limit, None));
+    script.push_str(&ignore_probe(true));
+    script.push_str(IGNORE_SECTION);
+    script.push_str(&collapsed_function());
+    script.push_str(&format!(
+        r#"$global:MeworkLeft = {limit}
+$MeworkLevel = [System.Collections.Generic.List[object]]::new()
+$MeworkLevel.Add(@($C, $C.TrimEnd('/')))
+for ($MeworkDepth = 1; $MeworkDepth -le {max_depth} -and $MeworkLevel.Count -gt 0; $MeworkDepth++) {{
+  $MeworkNext = [System.Collections.Generic.List[object]]::new()
+  foreach ($MeworkDir in $MeworkLevel) {{
+    try {{ $items = @(([System.IO.DirectoryInfo]::new($MeworkDir[0])).GetFileSystemInfos() | Sort-Object -Property Name) }} catch {{ continue }}
+    foreach ($it in $items) {{
+      if ($global:MeworkLeft -le 0) {{ Quit 0 }}
+      $path = $MeworkDir[1] + '/' + $it.Name
+      $isDir = ($it -is [System.IO.DirectoryInfo]) -and -not ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+      if ($isDir) {{ Out-Line ($path + '/') }} else {{ Out-Line $path }}
+      $global:MeworkLeft--
+      if ($isDir -and -not (Collapsed $path $it.Name)) {{ $MeworkNext.Add(@($it.FullName, $path)) }}
+    }}
+  }}
+  $MeworkLevel = $MeworkNext
+}}
+Quit 0
+"#
+    ));
     script
 }
 
-/// `find`: every entry under the target, optionally pre-filtered by name.
+/// `find`: every entry under the target, optionally pre-filtered by name,
+/// after the ignore section the host ranks the matches by.
 pub(crate) fn find(target: &Target<'_>, path: &str, name_filter: Option<&str>, limit: usize) -> String {
     let mut script = prologue(target, path, Mode::Existing);
-    script.push_str(&walk(0, limit, name_filter));
+    script.push_str(&ignore_probe(true));
+    script.push_str(IGNORE_SECTION);
+    script.push_str(&format!(
+        "$MeworkVcs = @({})\n",
+        crate::search_scope::VCS_DIRECTORIES
+            .iter()
+            .map(|name| ps_single_quote(name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    script.push_str(&walk(limit, name_filter));
     script
 }
 
 /// `grep`: `path:line:text` for every matching line, files over 2 MiB and
 /// binary files (a NUL in the first 8000 bytes, as `grep -I` decides) skipped
-/// under a directory, at most `limit` lines. A bad pattern exits 2 with .NET's
-/// complaint on stderr; an unreadable file is reported on stderr and skipped.
+/// under a directory, at most `limit` lines. Inside a Git work tree the files
+/// are the ones `git ls-files` shows; otherwise the walk skips what
+/// `Collapsed` names. A bad pattern exits 2 with .NET's complaint on stderr;
+/// an unreadable file is reported on stderr and skipped.
 pub(crate) fn grep(
     target: &Target<'_>,
     path: &str,
@@ -258,15 +368,50 @@ function Tree([string]$Dir, [string]$Shown) {{
   foreach ($it in $items) {{
     if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {{ continue }}
     $path = $Shown + '/' + $it.Name
-    if ($it -is [System.IO.DirectoryInfo]) {{ Tree $it.FullName $path }}
+    if ($it -is [System.IO.DirectoryInfo]) {{ if (-not (Collapsed $path $it.Name)) {{ Tree $it.FullName $path }} }}
     elseif ($it.Length -le 2097152) {{ Scan $it.FullName $path $true }}
   }}
 }}
-if ([System.IO.Directory]::Exists($C)) {{ Tree $C $C.TrimEnd('/') }} else {{ Scan $C $C $true }}
-Quit 0
 "#,
         pattern = ps_single_quote(pattern),
     ));
+    script.push_str(&ignore_probe(false));
+    script.push_str(&collapsed_function());
+    script.push_str(
+        r#"if (-not [System.IO.Directory]::Exists($C)) { Scan $C $C $true; Quit 0 }
+if ($Ign -eq 'git') {
+  $MeworkEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  Push-Location -LiteralPath $C
+  try { $MeworkFiles = @(& git -c core.fsmonitor=false -c core.quotepath=false ls-files --cached --others --exclude-standard -- . 2>$null) } finally { Pop-Location; $ErrorActionPreference = $MeworkEap }
+  if ($LASTEXITCODE -ne 0) { $Ign = 'names' }
+}
+if ($Ign -ne 'git') { Tree $C $C.TrimEnd('/'); Quit 0 }
+# A path whose directory has become a junction since Git indexed it is not
+# followed, as the walk would not have followed it.
+$MeworkLinked = @{}
+function Linked([string]$Relative) {
+  $cut = $Relative.LastIndexOf('/')
+  if ($cut -lt 0) { return $false }
+  $dir = $Relative.Substring(0, $cut)
+  if ($MeworkLinked.ContainsKey($dir)) { return $MeworkLinked[$dir] }
+  $info = [System.IO.DirectoryInfo]::new([System.IO.Path]::Combine($C, $dir))
+  $answer = (Linked $dir) -or -not $info.Exists -or [bool]($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+  $MeworkLinked[$dir] = $answer
+  return $answer
+}
+$MeworkPrev = $null
+foreach ($MeworkFile in $MeworkFiles) {
+  if (-not $MeworkFile -or $MeworkFile.StartsWith('"') -or $MeworkFile -eq $MeworkPrev) { continue }
+  $MeworkPrev = $MeworkFile
+  if (Linked $MeworkFile) { continue }
+  try { $MeworkInfo = [System.IO.FileInfo]::new([System.IO.Path]::Combine($C, $MeworkFile)) } catch { continue }
+  if (-not $MeworkInfo.Exists -or ($MeworkInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $MeworkInfo.Length -gt 2097152) { continue }
+  Scan $MeworkInfo.FullName ($C.TrimEnd('/') + '/' + $MeworkFile) $true
+}
+Quit 0
+"#,
+    );
     script
 }
 

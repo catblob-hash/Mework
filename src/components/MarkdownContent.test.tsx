@@ -75,6 +75,22 @@ $$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$
     await waitFor(() => expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument());
   });
 
+  it("keeps prices as text while dollars around a formula still make math", async () => {
+    const { container } = render(<MarkdownContent content={"The mug is $4.50 vs $4.75 in town, $5-$10 online, and $x^2$ stays math."} />);
+    await waitFor(() => expect(container.querySelector(".math-formula[data-math-state='ready']")).toBeInTheDocument());
+    expect(container.querySelectorAll(".math-formula")).toHaveLength(1);
+    expect(screen.getByRole("math", { name: "x^2" })).toBeInTheDocument();
+    expect(container.querySelector("p")).toHaveTextContent("The mug is $4.50 vs $4.75 in town, $5-$10 online, and");
+  });
+
+  it("escapes only the single dollars that do not delimit math", () => {
+    expect(normalizeMathDelimiters("$4.50 vs $4.75")).toBe("\\$4.50 vs \\$4.75");
+    expect(normalizeMathDelimiters("from $5 to $x$")).toBe("from \\$5 to $x$");
+    expect(normalizeMathDelimiters("$a$ and \\$b `$c$`")).toBe("$a$ and \\$b `$c$`");
+    // A formula does not run on past a blank line.
+    expect(normalizeMathDelimiters("$a\n\nb$")).toBe("\\$a\n\nb\\$");
+  });
+
   it("does not rewrite math-like delimiters inside code", () => {
     const source = "文本 \\(x\\) `\\(inline\\)`\n\n```txt\n\\[block\\]\n```\n之后 \\[y\\]";
     expect(normalizeMathDelimiters(source)).toBe("文本 $x$ `\\(inline\\)`\n\n```txt\n\\[block\\]\n```\n之后 \n$$\ny\n$$\n");

@@ -239,6 +239,9 @@ describe("App model run flow — layout", () => {
 
     const dialog = screen.getByRole("dialog", { name: "全局设置" });
     const settingsNavigation = within(dialog).getByRole("navigation", { name: "全局设置分类" });
+    // No title bar: the window's name heads its sidebar, and the page names itself.
+    expect(dialog.querySelector(".dialog__header")).toBeNull();
+    expect(within(settingsNavigation).getByRole("heading", { level: 2, name: "全局设置" })).toBeInTheDocument();
     expect(within(settingsNavigation).getByRole("button", { name: "模型提供商" }))
       .toHaveClass("settings-nav__item--active");
     expect(within(settingsNavigation).queryByRole("button", { name: "对话预设" })).not.toBeInTheDocument();

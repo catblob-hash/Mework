@@ -19,23 +19,30 @@ const englishParameterLabels: Record<string, string> = {
   content: "File content",
   context: "Initial context",
   depth: "Recursion depth",
-  description: "",
+  description: "Description",
   doubleClick: "Double-click",
-  end_line: "End line",  effort: "Effort level",
+  effort: "Effort level",
+  end_line: "End line",
   expression: "Expression",
   schema: "Output schema",
+  filename: "File name",
   filter: "Filter",
   filePath: "File path",
   find: "Find text",
   height: "Height",
+  image_id: "Image number",
   label: "Display name",
   level: "Level",
+  limit: "Limit",
   line: "Line",
   lines: "Line limit",
   max_results: "Maximum results",
   message: "Message",
   metadata: "Metadata",
   name: "Name",
+  new_text: "New text",
+  offset: "Offset",
+  old_text: "Original text",
   owner: "Owner",
   operation: "Operation",
   path: "Path",
@@ -49,6 +56,7 @@ const englishParameterLabels: Record<string, string> = {
   replace: "Replacement",
   requestId: "Request ID",
   resume_run_id: "Resume run ID",
+  run_in_background: "Run in background",
   script: "JavaScript",
   scale: "Scale",
   search: "Text filter",
@@ -61,13 +69,45 @@ const englishParameterLabels: Record<string, string> = {
   taskId: "Task ID",
   tasks: "Tasks",
   target: "Child agent",
+  timeout: "Timeout (ms)",
   timeout_seconds: "Timeout (seconds)",
+  token_budget: "Token budget",
+  urls: "URLs",
   value: "Value",
   width: "Width"
 };
 
 const englishParameterHelp: Record<string, string> = {
+  "一句自足的查询；不要用代词指代上文，长问题拆成多次检索":
+    "One self-contained query; no pronouns pointing back at the conversation. Break a long question into several searches.",
+  "一批绝对 http(s) 地址；不知道地址时先用联网搜索":
+    "Absolute http(s) page URLs. Search first when you do not know the URL.",
+  "任务地址数组：子代理与工作流直接写名称（工作流也可写 workflow:<runId>），后台命令写 shell:<id>，终端写 terminal:<id>，开发服务器写 preview:<serverId>（对话有多个工作区时写 preview:<serverId>@<工作区编号>）；等待到点名的任务全部给出结果为止，省略时等待本对话全部子代理、工作流与后台命令（不含终端与开发服务器）":
+    "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a dev server as preview:<serverId> (preview:<serverId>@<workspace> when the conversation has several workspaces). The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and dev servers excluded).",
+  "以 `export const meta = {…}` 开头的 JS 编排脚本：用 agent()/parallel()/pipeline()/phase()/log() 派生并组织步骤子代理，正文的 return 值就是运行结果。给某一步加 { isolation: \"worktree\" } 会为它单开一棵从 HEAD 检出的 git 工作树（看不到未提交改动；留下改动就保留，没改动就自动拆除）":
+    "JavaScript orchestration starting with `export const meta = {…}`: spawn steps with agent()/parallel()/pipeline(), narrate with phase()/log(); the body's return value is the run result. Adding { isolation: \"worktree\" } to a step gives it its own git worktree checked out from HEAD (uncommitted changes are not in it; a step that leaves changes keeps its worktree, one that changes nothing has it removed).",
+  "原样暴露给脚本的 JSON 值（全局 args）；数组与对象直接传，不要编码成字符串":
+    "JSON value exposed to the script as the global `args`, verbatim; pass arrays and objects directly, not as encoded strings.",
+  "本次运行允许消耗的 token 硬顶，脚本经 budget 读到；耗尽后新的 agent() 调用抛错":
+    "Hard token ceiling for this run, readable as budget in the script; once exhausted, further agent() calls throw.",
+  "上一次同脚本运行报出的运行 ID；已入日志的步骤即时重放，其余步骤重跑。脚本正文必须与获批时逐字一致":
+    "Run id from a previous run of this same script; journaled steps replay, the first unjournaled one and everything after it re-runs.",
+  "记忆索引里列出的文档名，.md 后缀可写可不写":
+    "A document name listed in the memory index. The .md suffix is optional.",
+  "memory 目录下的单个文档名，不能包含路径分隔符；.md 后缀可写可不写":
+    "A single document name inside the memory directory. Path separators are forbidden; the .md suffix is optional.",
+  "要修改的记忆文档名，.md 后缀可写可不写": "The memory document to modify. The .md suffix is optional.",
+  "这份记忆的完整 Markdown 正文": "The document's complete Markdown body.",
+  "文档中要被替换的原文，必须唯一匹配；不唯一时请提供更长的片段":
+    "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique.",
+  "替换后的文本；留空表示删除这段内容": "The replacement text. Leave it empty to delete the passage.",
+  "一句话说明这份记忆记录了什么，会写进 MEMORY.md 索引供以后判断要不要读取":
+    "One sentence describing what this memory records. It is written into the MEMORY.md index so a later run can decide whether to read the document.",
+  "修改后这份记忆的一句话说明，会刷新 MEMORY.md 索引里的对应条目":
+    "One sentence describing this memory after the change. It refreshes the document's entry in the MEMORY.md index.",
   "0 仅列出当前目录": "0 lists only the current directory.",
+  "最多返回的匹配行，默认 250，至多 1000": "Most matching lines to return: 250 by default, at most 1,000.",
+  "先跳过这么多匹配行，用于翻到下一页": "Matching lines to skip first, to fetch the next page.",
   "本对话已选技能的名字，取自 schema 的 enum":
     "Name of a skill this conversation selected; the schema lists them as an enum.",
   "`select:<名字>[,<名字>…]` 按名取，或者用关键词搜索":
@@ -149,6 +189,13 @@ const englishParameterHelp: Record<string, string> = {
 };
 
 const englishParameterPlaceholders: Record<string, string> = {
+  "查看工作树状态": "Show working tree status",
+  "列出当前目录的文件": "List files in the current directory",
+  "Anthropic Claude 4.5 发布日期": "Anthropic Claude 4.5 release date",
+  "用户偏好": "user-preferences",
+  "构建环境": "build-environment",
+  "用户长期偏好的语言与代码风格": "The user's long-standing language and code-style preferences",
+  "测试必须用项目自带环境运行": "Tests must run in the project's own environment",
   "调查 src/ 下的路由结构并总结关键文件": "Inspect routing under src/ and summarize the key files",
   "调查路由": "Inspect routing",
   "在分叉出的会话里要完成的任务": "The task to complete in the forked conversation",
@@ -175,6 +222,7 @@ const englishToolLabels: Record<string, string> = {
   read: "Read file",
   lsp: "Code navigation",
   web_search: "Web search",
+  web_fetch: "Fetch web pages",
   workflow: "Workflow",
   preview_start: "Start preview",
   preview_stop: "Stop preview",
@@ -197,6 +245,12 @@ const englishToolLabels: Record<string, string> = {
   task_wait: "Wait for tasks",
   task_list: "List tasks",
   box: "Background result",
+  read_global_memory: "Read global memory",
+  read_project_memory: "Read project memory",
+  create_global_memory: "Create global memory",
+  create_project_memory: "Create project memory",
+  edit_global_memory: "Edit global memory",
+  edit_project_memory: "Edit project memory",
   ask_user: "Ask user",
   fork: "Fork conversation",
   todo: "Todo",

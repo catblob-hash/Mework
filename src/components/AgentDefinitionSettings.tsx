@@ -34,7 +34,7 @@ import type {
   WebSearchAssets
 } from "../types";
 import { CatalogRow, useCatalogSort } from "./CatalogRow";
-import { ConfirmDeleteButton, Dialog, Field, IconButton, Switch } from "./Common";
+import { ConfirmDeleteButton, Dialog, DialogSidebarTitle, Field, IconButton, Switch } from "./Common";
 import { ConversationTemplateEditor } from "./ConversationTemplateEditor";
 import { FeaturesPage } from "./FeaturesPage";
 import { reorderItems } from "./usePointerDrag";
@@ -875,6 +875,7 @@ export function AgentDefinitionSettings({
             ? t("新建角色", "New role")
             : editor.originalName ?? t("角色设置", "Role settings")}
           width="1040px"
+          sidebar
           bodyClassName="dialog__body--flush"
           // Deliberately not dismissible: a stray click on the backdrop would
           // discard an in-progress role without asking. The header's own close
@@ -888,6 +889,7 @@ export function AgentDefinitionSettings({
               className="conversation-settings__nav settings-nav agent-definition-editor__nav"
               aria-label={t("角色设置分类", "Role settings categories")}
             >
+              <DialogSidebarTitle />
               <div className="conversation-settings__nav-items">
                 {ROLE_EDITOR_PAGES.map((item) => {
                   const Icon = item.icon;
@@ -979,6 +981,7 @@ export function AgentDefinitionSettings({
 
             <div className="conversation-settings__page">
               <header className="conversation-settings__page-header">
+                <h3 className="conversation-settings__page-title">{pageTitles[page]}</h3>
                 <p>{pageBlurbs[page]}</p>
               </header>
               {/* The template page is a timeline, which brings its own scroller

@@ -3,8 +3,8 @@ import type { BackgroundImage, BackgroundImageData } from "../types";
 import { hasBackendRuntime, invoke } from "./backend";
 
 /**
- * The custom window background: a picked picture cut into a ladder of sizes, kept by
- * the host, and painted at the size the window needs.
+ * Imported window backgrounds: a picked picture cut into a ladder of sizes, kept by
+ * the host in a library the user manages, and painted at the size the window needs.
  *
  * The browser engine decodes the file because it knows every format the platform
  * does — HEIC on macOS, AVIF on Windows — and the host's decoders know four. Resizing
@@ -346,22 +346,27 @@ async function commitUpload(uploadId: string): Promise<BackgroundImage> {
 /*
  * Ids are content hashes, so importing the same picture again — after its files went
  * missing, say — gives back the id the settings already hold and changes nothing a
- * reader would notice. Every import therefore also bumps this count, and whatever
- * shows the picture reads again when it moves.
+ * reader would notice. Every import and removal therefore also bumps this count, and
+ * whatever lists or shows the pictures reads again when it moves.
  */
-let importGeneration = 0;
-const importListeners = new Set<() => void>();
+let libraryGeneration = 0;
+const libraryListeners = new Set<() => void>();
 
-function subscribeImports(listener: () => void): () => void {
-  importListeners.add(listener);
+function subscribeLibrary(listener: () => void): () => void {
+  libraryListeners.add(listener);
   return () => {
-    importListeners.delete(listener);
+    libraryListeners.delete(listener);
   };
 }
 
-/** Changes after every completed import; a dependency for anything that shows the picture. */
-export function useBackgroundImportGeneration(): number {
-  return useSyncExternalStore(subscribeImports, () => importGeneration, () => importGeneration);
+function libraryChanged(): void {
+  libraryGeneration += 1;
+  for (const listener of libraryListeners) listener();
+}
+
+/** Changes after every import or removal; a dependency for anything that lists or shows pictures. */
+export function useBackgroundLibraryGeneration(): number {
+  return useSyncExternalStore(subscribeLibrary, () => libraryGeneration, () => libraryGeneration);
 }
 
 /** Decodes, resizes and stores a picked picture; the result's id goes into the appearance settings. */
@@ -373,9 +378,27 @@ export async function importBackgroundImage(file: Blob): Promise<BackgroundImage
   }
   if (!uploadId) throw new Error("empty upload");
   const image = await commitUpload(uploadId);
-  importGeneration += 1;
-  for (const listener of importListeners) listener();
+  libraryChanged();
   return image;
+}
+
+/** The imported pictures, the most recent first. */
+export async function listBackgroundImages(): Promise<BackgroundImage[]> {
+  if (hasBackendRuntime()) return invoke<BackgroundImage[]>("background_image_list");
+  return [...previewImages].reverse().map(([id, tiers]) => {
+    const largest = tiers[tiers.length - 1];
+    return { id, width: largest.width, height: largest.height };
+  });
+}
+
+/** Removes an imported picture from the library; the settings must stop pointing at it. */
+export async function deleteBackgroundImage(imageId: string): Promise<void> {
+  if (hasBackendRuntime()) {
+    await invoke("background_image_delete", { imageId });
+  } else {
+    previewImages.delete(imageId);
+  }
+  libraryChanged();
 }
 
 /** The tier of a stored picture that covers `width`×`height` device pixels, or its largest. */

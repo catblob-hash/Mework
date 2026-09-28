@@ -308,7 +308,9 @@ import {
   type SidePanesAction
 } from "./lib/sidePanes";
 import { resolveApplicationLanguage, translate, useI18n } from "./i18n";
-import { configureApplicationAppearance } from "./theme";
+import { configureApplicationAppearance, getResolvedTheme, useResolvedTheme } from "./theme";
+import type { ApplicationTheme } from "./theme";
+import { backgroundAfterThemeChange } from "./lib/background";
 import { ZOOM_STEP, clampZoom, defaultAppearancePreferences } from "./lib/appearance";
 import {
   SHORTCUT_COMMANDS,
@@ -1273,6 +1275,30 @@ function App() {
     document?.globalSettings.theme,
     document?.globalSettings.appearance
   ]);
+
+  // A solid background is a theme's own ground: when the theme on screen changes, one picked
+  // from the other theme goes back to following it (`lib/background.ts`). The scheme is read
+  // after the effect above has applied the loaded preferences, so startup is not a change.
+  const resolvedTheme = useResolvedTheme();
+  const followedThemeRef = useRef<ApplicationTheme | null>(null);
+  const documentLoaded = Boolean(document);
+  useEffect(() => {
+    if (!documentLoaded) return;
+    const theme = getResolvedTheme();
+    const previous = followedThemeRef.current;
+    followedThemeRef.current = theme;
+    if (previous === null || previous === theme) return;
+    documentStore.update((current) => {
+      if (!current) return current;
+      const appearance = current.globalSettings.appearance;
+      const background = backgroundAfterThemeChange(appearance.background);
+      if (background === appearance.background) return current;
+      return {
+        ...current,
+        globalSettings: { ...current.globalSettings, appearance: { ...appearance, background } }
+      };
+    });
+  }, [documentLoaded, resolvedTheme]);
 
   // The host cannot resolve `auto` without an OS language library, so mirror the renderer-resolved
   // application language into the document for built-in tool descriptions.
@@ -3029,7 +3055,7 @@ function App() {
     // Each project workspace that is a repository has a review page, on whichever machine it is;
     // Git reads it at its root, which is the conversation's checkout of that workspace.
     const reviewPages = activeReviewPages;
-    if (filesRoot === null && reviewPages.length === 0) return;
+    if (filesRoot === null && activeGitMembers.length === 0) return;
     // A pane opened only to show this file opens on the file, its file column folded; one
     // already open keeps its column the way the reader left it.
     const paneWasOpen = (pane: SidePaneId) => (
@@ -3069,14 +3095,16 @@ function App() {
       const remote = Boolean(named?.machine);
       // The file pane and the file manager only reach this computer's disk.
       const filesRelative = remote || filesRoot === null ? null : workspaceRelativePath(path, base, filesRoot);
-      const page = review ? reviewPages.find((entry) => entry.member === number) : undefined;
-      const reviewRelative = page && named ? workspaceRelativePath(path, base, named.path) : null;
+      // A workspace has a review page once Git has answered for it, which a conversation just
+      // opened (or one whose reads failed) is still waiting on; the click asks Git itself.
+      const member = review ? activeGitMembers.find((entry) => entry.member === number) : undefined;
+      const reviewRelative = member && named ? workspaceRelativePath(path, base, named.path) : null;
       const revealElsewhere = () => {
         void revealPath(path, base).catch((error: unknown) => {
           console.error("Failed to reveal the file", error);
         });
       };
-      if (!page || reviewRelative === null) {
+      if (!member || reviewRelative === null) {
         if (filesRelative !== null) showInFiles(filesRelative, line);
         // Nothing here can show a file on another machine outside its review page.
         else if (remote) return true;
@@ -3085,11 +3113,17 @@ function App() {
         return true;
       }
       // Only Git knows whether it tracks the file, so the pane is picked once it has answered.
-      void gitReviewListsPath(page.target, page.snapshot, reviewRelative)
+      const page = reviewPages.find((entry) => entry.member === number);
+      void (page
+        ? Promise.resolve(page.snapshot)
+        : refreshGitSnapshot(member.key, member.surfaceKey, member.target))
+        .then((snapshot) => snapshot
+          ? gitReviewListsPath(member.target, snapshot, reviewRelative, member.worktree?.baseOid ?? null)
+          : false)
         .catch(() => false)
         .then((listed) => {
           if (activeConversationIdRef.current !== conversationId) return;
-          if (listed) showInReview(page.member, reviewRelative);
+          if (listed) showInReview(member.member, reviewRelative);
           else if (filesRelative !== null) showInFiles(filesRelative, line);
           else if (!remote) revealElsewhere();
         });
@@ -3098,10 +3132,12 @@ function App() {
   }, [
     activeConversation?.id,
     activeConversationWorkspaces,
+    activeGitMembers,
     activeReviewPages,
     filesPaneAvailable,
     filesPaneRoot,
     openPane,
+    refreshGitSnapshot,
     timelinePathBaseDir
   ]);
   /**
@@ -5152,8 +5188,10 @@ function App() {
         ...current,
         workspaces: current.workspaces.map((workspace) => workspace.id === targetId ? {
           ...workspace,
-          // The newly created conversation becomes the workspace's remembered settings snapshot.
-          lastConversationSettings: resolvedSettings,
+          // A new task becomes the workspace's remembered settings snapshot. A
+          // branch or fork only copies an existing conversation's, which may be
+          // older than what the user last chose for a new task.
+          ...(parentConversationId ? {} : { lastConversationSettings: resolvedSettings }),
           conversations: [conversation, ...workspace.conversations]
         } : workspace)
       };
@@ -7247,8 +7285,17 @@ function App() {
     // Create the branch before any await: `createConversation` reads the
     // render-time document, which a suspended continuation would leave stale.
     // The branch nests under its source in the sidebar; it is otherwise an
-    // independent conversation.
-    const created = createConversation(workspaceId, "global", undefined, undefined, conversationId);
+    // independent conversation, which retries the source's work under the
+    // source's settings — a Full access conversation does not branch into Manual.
+    const created = createConversation(
+      workspaceId,
+      "global",
+      source.settings,
+      undefined,
+      conversationId,
+      [],
+      source.presetId
+    );
     if (!created) return;
     composerController.updateDrafts((current) => ({ ...current, [created]: item.content ?? "" }));
     window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
@@ -8720,7 +8767,9 @@ function App() {
                         }}
                       />
                     )}
-                    {activeGitSnapshot && (
+                    {/* Branch and worktree are chosen before the task starts, like the project:
+                        once the conversation has content it runs where it began, and the group goes. */}
+                    {activeGitSnapshot && !activeConversationStarted && (
                       <div className="composer-chip-group">
                         <PopoverMenu
                           triggerClassName="composer-chip composer-chip--flush"
@@ -9214,6 +9263,7 @@ function App() {
           <Dialog
             title={t("全局设置", "Global settings")}
             width="1040px"
+            sidebar
             bodyClassName="dialog__body--flush"
             onClose={() => setGlobalSettingsView(null)}
           >

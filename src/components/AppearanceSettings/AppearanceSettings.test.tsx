@@ -11,7 +11,9 @@ const pictureId = "a".repeat(64);
 const backgroundMocks = vi.hoisted(() => ({
   importBackgroundImage: vi.fn(),
   backgroundImageData: vi.fn(),
-  useBackgroundImportGeneration: () => 0
+  listBackgroundImages: vi.fn(),
+  deleteBackgroundImage: vi.fn(),
+  useBackgroundLibraryGeneration: () => 0
 }));
 vi.mock("../../lib/backgroundImage", () => backgroundMocks);
 
@@ -132,6 +134,10 @@ describe("AppearanceSettings", () => {
       height: 360,
       largest: false
     });
+    backgroundMocks.listBackgroundImages.mockReset();
+    backgroundMocks.listBackgroundImages.mockResolvedValue([]);
+    backgroundMocks.deleteBackgroundImage.mockReset();
+    backgroundMocks.deleteBackgroundImage.mockResolvedValue(undefined);
   });
   afterEach(() => configureI18n("zh-CN"));
 
@@ -209,71 +215,103 @@ describe("AppearanceSettings", () => {
     expect(within(card).getAllByText("Theme")).toHaveLength(1);
   });
 
-  it("imports a picked picture and switches to the custom background", async () => {
-    backgroundMocks.importBackgroundImage.mockResolvedValue({ id: pictureId, width: 3840, height: 2160 });
-    const { container, getSettings } = renderSettings();
-    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
-    const click = vi.spyOn(input, "click");
+  it("turns the panes to glass without touching the theme or the background", async () => {
+    const user = userEvent.setup();
+    const { getSettings } = renderSettings();
 
-    fireEvent.click(screen.getByRole("button", { name: "Custom background" }));
+    await user.click(screen.getByRole("switch", { name: "Liquid glass" }));
+    expect(getSettings().appearance).toMatchObject({ liquidGlass: true, background: "solid" });
+    expect(getSettings().theme).toBe("system");
+
+    await user.click(screen.getByRole("switch", { name: "Liquid glass" }));
+    expect(getSettings().appearance.liquidGlass).toBe(false);
+  });
+
+  it("picks a built-in picture from the library, which applies at once", async () => {
+    const user = userEvent.setup();
+    const { getSettings } = renderSettings();
+
+    await user.click(screen.getByRole("button", { name: "Choose background…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Background" });
+    await user.click(within(dialog).getByRole("button", { name: "Under the desk" }));
+    expect(getSettings().appearance.background).toBe("builtin:desk");
+    expect(within(dialog).getByRole("button", { name: "Under the desk" })).toHaveAttribute("aria-pressed", "true");
+    expect(within(dialog).getByRole("button", { name: "Light solid" })).toHaveAttribute("aria-pressed", "false");
+
+    await user.click(within(dialog).getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog", { name: "Background" })).not.toBeInTheDocument();
+    expect(getSettings().appearance.background).toBe("builtin:desk");
+  });
+
+  it("saves the theme's own solid ground as following it, and the other theme's as kept", async () => {
+    const user = userEvent.setup();
+    const initial = globalSettings();
+    initial.appearance = { ...initial.appearance, background: "builtin:curtain" };
+    const { getSettings } = renderSettings(initial);
+
+    await user.click(screen.getByRole("button", { name: "Choose background…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Background" });
+    // Nothing has resolved a theme in this test, so the light one is on screen.
+    await user.click(within(dialog).getByRole("button", { name: "Dark solid" }));
+    expect(getSettings().appearance.background).toBe("solid:night");
+    expect(within(dialog).getByRole("button", { name: "Dark solid" })).toHaveAttribute("aria-pressed", "true");
+
+    await user.click(within(dialog).getByRole("button", { name: "Light solid" }));
+    expect(getSettings().appearance.background).toBe("solid");
+    expect(within(dialog).getByRole("button", { name: "Light solid" })).toHaveAttribute("aria-pressed", "true");
+    expect(within(dialog).getByRole("button", { name: "Dark solid" })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("imports a picture into the library and chooses it", async () => {
+    backgroundMocks.importBackgroundImage.mockResolvedValue({ id: pictureId, width: 3840, height: 2160 });
+    const user = userEvent.setup();
+    const { getSettings } = renderSettings();
+
+    await user.click(screen.getByRole("button", { name: "Choose background…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Background" });
+    const input = dialog.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const click = vi.spyOn(input, "click");
+    await user.click(within(dialog).getByRole("button", { name: "Add picture…" }));
     expect(click).toHaveBeenCalled();
 
     const file = new File(["x"], "sea.heic", { type: "image/heic" });
     fireEvent.change(input, { target: { files: [file] } });
-    await waitFor(() => expect(getSettings().appearance.backgroundImage).toBe(pictureId));
+    await waitFor(() => expect(getSettings().appearance.background).toBe(pictureId));
     expect(backgroundMocks.importBackgroundImage).toHaveBeenCalledWith(file);
-    expect(getSettings().appearance.customBackground).toBe(true);
-    expect(screen.getByRole("button", { name: "Custom background" })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "Follow system" })).toHaveAttribute("aria-pressed", "false");
+    expect(getSettings().appearance.liquidGlass).toBe(false);
   });
 
-  it("keeps the picture when a plain theme is chosen and returns to it without re-picking", async () => {
+  it("removes an imported picture on a second press, and the window returns to the theme's ground", async () => {
+    backgroundMocks.listBackgroundImages.mockResolvedValue([{ id: pictureId, width: 3840, height: 2160 }]);
     const user = userEvent.setup();
     const initial = globalSettings();
-    initial.appearance = { ...initial.appearance, customBackground: true, backgroundImage: pictureId };
-    const { container, getSettings } = renderSettings(initial);
-    const click = vi.spyOn(container.querySelector<HTMLInputElement>('input[type="file"]')!, "click");
+    initial.appearance = { ...initial.appearance, liquidGlass: true, background: pictureId };
+    const { getSettings } = renderSettings(initial);
 
-    await user.selectOptions(screen.getByLabelText("Glass tone"), "night");
-    expect(getSettings().theme).toBe("night");
-    expect(getSettings().appearance.customBackground).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Choose background…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Background" });
+    const picture = await within(dialog).findByRole("button", { name: "Imported picture 3840 × 2160" });
+    expect(picture).toHaveAttribute("aria-pressed", "true");
 
-    await user.click(screen.getByRole("button", { name: "Light" }));
-    expect(getSettings().theme).toBe("day");
-    expect(getSettings().appearance).toMatchObject({ customBackground: false, backgroundImage: pictureId });
-    expect(screen.queryByLabelText("Glass tone")).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "Custom background" }));
-    expect(click).not.toHaveBeenCalled();
-    expect(getSettings().appearance.customBackground).toBe(true);
-
-    await user.click(screen.getByRole("button", { name: "Remove" }));
-    expect(getSettings().appearance).toMatchObject({ customBackground: false, backgroundImage: "" });
-  });
-
-  it("asks for a picture again when the saved one can no longer be read", async () => {
-    backgroundMocks.backgroundImageData.mockRejectedValue(new Error("背景图片不存在"));
-    const initial = globalSettings();
-    initial.appearance = { ...initial.appearance, backgroundImage: pictureId };
-    const { container, getSettings } = renderSettings(initial);
-    const click = vi.spyOn(container.querySelector<HTMLInputElement>('input[type="file"]')!, "click");
-
-    await waitFor(() => expect(backgroundMocks.backgroundImageData).toHaveBeenCalled());
-    await waitFor(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Custom background" }));
-      expect(click).toHaveBeenCalled();
-    });
-    expect(getSettings().appearance.customBackground).toBe(false);
+    await user.click(within(dialog).getByRole("button", { name: "Remove this picture" }));
+    expect(backgroundMocks.deleteBackgroundImage).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Confirm removing this picture" }));
+    await waitFor(() => expect(getSettings().appearance.background).toBe("solid"));
+    expect(backgroundMocks.deleteBackgroundImage).toHaveBeenCalledWith(pictureId);
+    expect(getSettings().appearance.liquidGlass).toBe(true);
   });
 
   it("explains a picture the engine cannot decode", async () => {
     backgroundMocks.importBackgroundImage.mockRejectedValue(new Error("unreadable"));
-    const { container, getSettings } = renderSettings();
-    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const user = userEvent.setup();
+    const { getSettings } = renderSettings();
 
+    await user.click(screen.getByRole("button", { name: "Choose background…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Background" });
+    const input = dialog.querySelector<HTMLInputElement>('input[type="file"]')!;
     fireEvent.change(input, { target: { files: [new File(["x"], "broken.png")] } });
-    expect(await screen.findByRole("alert")).toHaveTextContent("This picture can't be read");
-    expect(getSettings().appearance.customBackground).toBe(false);
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("This picture can't be read");
+    expect(getSettings().appearance.background).toBe("solid");
   });
 
   describe("local model", () => {

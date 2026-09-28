@@ -382,6 +382,8 @@ describe("App model run flow — timeline", () => {
   it("branches a user message into an independent conversation carrying its own copy of the history", async () => {
     const document = documentWithModel();
     const conversation = document.workspaces[0].conversations[0];
+    conversation.settings.securityLevel = "full_access";
+    const remembered = document.workspaces[0].lastConversationSettings;
     conversation.contexts = [
       { id: "branch-sys", kind: "system", content: "系统", createdAt: "2026-07-20T00:00:00Z" },
       { id: "branch-u1", kind: "user", content: "第一问", createdAt: "2026-07-20T00:00:01Z" },
@@ -429,6 +431,10 @@ describe("App model run flow — timeline", () => {
     const branch = conversations.find((candidate) => candidate.id !== conversation.id)!;
     expect(branch.contexts.map((context) => context.id))
       .toEqual(["copied-sys", "copied-u1", "copied-a1"]);
+    // ...retries the source's work under the source's settings, without making them what the
+    // project's next new task starts from...
+    expect(branch.settings.securityLevel).toBe("full_access");
+    expect(saved.workspaces[0].lastConversationSettings).toEqual(remembered);
     // ...remembers where it came from, yet the sidebar lists it as an ordinary conversation...
     expect(branch.parentConversationId).toBe(conversation.id);
     const parentRow = window.document.querySelector(`[data-conversation-id="${conversation.id}"]`) as HTMLElement;

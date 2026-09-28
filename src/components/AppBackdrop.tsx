@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { hasCustomBackground, useAppearance } from "../lib/appearance";
-import { backgroundImageData, tierCovers, useBackgroundImportGeneration } from "../lib/backgroundImage";
+import { useAppearance } from "../lib/appearance";
+import { parseBackground, replacesThemeGround } from "../lib/background";
+import { backgroundImageData, tierCovers, useBackgroundLibraryGeneration } from "../lib/backgroundImage";
 import type { BackgroundImageData } from "../types";
 
 function devicePixels(): { width: number; height: number } {
@@ -12,26 +13,37 @@ function devicePixels(): { width: number; height: number } {
 }
 
 /**
- * The user's picture behind the whole window (Appearance → Custom background).
+ * The window's background (Appearance → Custom background), behind the whole window
+ * whenever the panes are glass or the ground is not the theme's own.
  *
- * `object-fit: cover` crops it to the window's shape and never stretches it. It asks
- * the host for the smallest tier that covers the window in device pixels, and asks
- * again only when the window — or the screen it moved to — outgrows that tier. It never
- * trades down: the tier it has is already sharp at a smaller size.
+ * The layer itself paints a solid ground; a picture lies over it. `object-fit: cover`
+ * crops a picture to the window's shape and never stretches it. The bundled pictures
+ * come in one size, and are cropped around their cat. For an imported one it asks the host for the smallest tier that
+ * covers the window in device pixels, and asks again only when the window — or the
+ * screen it moved to — outgrows that tier. It never trades down: the tier it has is
+ * already sharp at a smaller size.
  */
 export function AppBackdrop() {
   const appearance = useAppearance();
-  const imageId = hasCustomBackground(appearance) ? appearance.backgroundImage : "";
-  const importGeneration = useBackgroundImportGeneration();
-  const [shown, setShown] = useState<{ id: string; tier: BackgroundImageData } | null>(null);
+  const libraryGeneration = useBackgroundLibraryGeneration();
+  const background = parseBackground(appearance.background);
+  const layered = appearance.liquidGlass || replacesThemeGround(appearance.background);
+  const bundled = layered && background.kind === "builtin" ? background.picture.picture : "";
+  const focus = background.kind === "builtin" ? background.picture.focus : "";
+  const imported = layered && background.kind === "imported" ? background.id : "";
+  const [picture, setPicture] = useState<{ key: string; src: string; focus?: string } | null>(null);
 
   useEffect(() => {
-    if (!imageId) {
-      setShown(null);
+    if (bundled) {
+      setPicture({ key: bundled, src: bundled, focus });
+      return;
+    }
+    if (!imported) {
+      setPicture(null);
       return;
     }
     // Re-read after any import, which may have restored this very id's files.
-    void importGeneration;
+    void libraryGeneration;
     let disposed = false;
     let loaded: BackgroundImageData | null = null;
     let loading = false;
@@ -41,21 +53,22 @@ export function AppBackdrop() {
       const { width, height } = devicePixels();
       if (loaded && (loaded.largest || tierCovers(loaded, width, height))) return;
       loading = true;
-      backgroundImageData(imageId, width, height)
+      backgroundImageData(imported, width, height)
         .then((tier) => {
           if (disposed) return;
           if (!loaded || tier.width > loaded.width) {
             loaded = tier;
-            setShown({ id: imageId, tier });
+            setPicture({ key: imported, src: tier.dataUrl });
           }
           loading = false;
           // The window may have grown while this tier was on its way.
           load();
         })
         .catch(() => {
-          // A picture that cannot be read leaves the glass over the plain theme colour,
-          // which is still a usable window; the settings page is where it can be re-picked.
+          // A picture that cannot be read leaves the solid ground, which is still a
+          // usable window; the settings page is where another can be picked.
           loading = false;
+          if (!disposed && !loaded) setPicture(null);
         });
     };
 
@@ -88,20 +101,28 @@ export function AppBackdrop() {
       window.removeEventListener("resize", schedule);
       density?.removeEventListener("change", onDensityChange);
     };
-  }, [imageId, importGeneration]);
+  }, [bundled, focus, imported, libraryGeneration]);
 
-  // The previous picture stays up until the next one has arrived, rather than blinking out.
-  if (!imageId || !shown) return null;
+  if (!layered) return null;
+  // Between two pictures the previous one stays up until the next has arrived, rather
+  // than blinking out to the ground.
   return (
-    <div className="app-backdrop" aria-hidden="true">
-      <img
-        key={shown.id}
-        className="app-backdrop__image"
-        src={shown.tier.dataUrl}
-        alt=""
-        draggable={false}
-        decoding="async"
-      />
+    <div
+      className="app-backdrop"
+      data-solid={background.kind === "solid" ? background.scheme ?? "theme" : "theme"}
+      aria-hidden="true"
+    >
+      {picture && background.kind !== "solid" && (
+        <img
+          key={picture.key}
+          className="app-backdrop__image"
+          src={picture.src}
+          style={picture.focus ? { objectPosition: picture.focus } : undefined}
+          alt=""
+          draggable={false}
+          decoding="async"
+        />
+      )}
     </div>
   );
 }

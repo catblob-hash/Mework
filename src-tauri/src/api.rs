@@ -11225,6 +11225,18 @@ fn drive_background_shell(
             .load(std::sync::atomic::Ordering::Acquire)
     };
     let profile = &shared.template.prompt_profile;
+    // An output too long to deliver is saved beside the conversation's other
+    // spilled output and delivered as its path and start, as in the
+    // foreground.
+    let spill_stem = format!("{tool_name}-{}", guard.shell_task_id());
+    let spill = crate::tool_output::Spill::new(
+        Some(Path::new(&shared.template.app_data_path)),
+        &shared.template.conversation_id,
+        &spill_stem,
+    );
+    let fit = |output: String| {
+        crate::tool_output::fit(output, crate::tool_output::SHELL_INLINE_CHARS, spill, profile)
+    };
     // No deadline on this leg: reaching one is what makes a command *become* a
     // background task, so a command that is already one has none left.
     let result = run.settle_in_background(&mut guard, &cancel_probe, profile);
@@ -11238,7 +11250,7 @@ fn drive_background_shell(
                     tool_name,
                     &shell_ref,
                     result.exit_code,
-                    &tool_executor::truncate_output(&result.output, profile),
+                    &fit(result.output),
                     profile,
                 );
                 if result.success {
@@ -11264,7 +11276,7 @@ fn drive_background_shell(
                 orchestration::shell_background_stopped_text(
                     tool_name,
                     &shell_ref,
-                    &tool_executor::truncate_output(&result.output, profile),
+                    &fit(result.output),
                     profile,
                 ),
             ),

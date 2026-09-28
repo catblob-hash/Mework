@@ -342,8 +342,10 @@ pub fn classify_in_workspaces(
     additional_directories: &[String],
     request: &ToolExecutionRequest,
 ) -> Result<SecurityDecision, String> {
-    if let Some(decision) = classify_remote_filesystem_call(level, workspaces, request)? {
-        return Ok(decision);
+    if !crate::tool_output::names_host_file(app_data, request) {
+        if let Some(decision) = classify_remote_filesystem_call(level, workspaces, request)? {
+            return Ok(decision);
+        }
     }
     let workspace = selected_local_lsp_root(workspaces, request)?.unwrap_or(workspace);
     classify(level, workspace, app_data, additional_directories, request)
@@ -359,8 +361,13 @@ pub fn classify_model_call_in_workspaces(
     additional_directories: &[String],
     request: &ToolExecutionRequest,
 ) -> Result<SecurityDecision, String> {
-    if let Some(decision) = classify_remote_filesystem_call(level, workspaces, request)? {
-        return Ok(decision);
+    // A conversation's own saved tool output is on the host whatever machine
+    // its workspace is on; it is judged as the host path it is — inside the
+    // application data directory — and the executor serves it here.
+    if !crate::tool_output::names_host_file(app_data, request) {
+        if let Some(decision) = classify_remote_filesystem_call(level, workspaces, request)? {
+            return Ok(decision);
+        }
     }
     let workspace = selected_local_lsp_root(workspaces, request)?.unwrap_or(workspace);
     classify_model_call(level, workspace, app_data, additional_directories, request)
@@ -4339,6 +4346,48 @@ mod tests {
             &fixture.additional,
             &request(&fixture.workspace, tool_name, input),
         )
+    }
+
+    /// Output a tool saved for this conversation is a file in the app data
+    /// directory on this host, whichever workspace the call that reads it
+    /// back names — the executor serves it here, so it is judged here.
+    #[test]
+    fn saved_tool_output_is_judged_as_the_host_file_it_is() {
+        let fixture = Fixture::new();
+        let profile = crate::prompt_profile::PromptProfile::builtin_english();
+        let spill = |conversation: &'static str| {
+            let notice = crate::tool_output::fit(
+                "output\n".repeat(100),
+                10,
+                crate::tool_output::Spill::new(Some(&fixture.app_data), conversation, "bash-1"),
+                &profile,
+            );
+            crate::tool_output::saved_path(&notice).expect("saved")
+        };
+        let own = spill("conversation-test");
+        for tool in ["read", "grep"] {
+            let input = if tool == "read" {
+                json!({"path": own, "workspace": 2})
+            } else {
+                json!({"path": own, "pattern": "output", "workspace": 2})
+            };
+            let decision =
+                classify_remote(&fixture, SecurityLevel::RequestApproval, tool, input).unwrap();
+            assert!(!decision.requires_approval, "{tool}");
+            assert_eq!(decision.rule_id, "filesystem.trusted_read", "{tool}");
+        }
+        // Another conversation's file is nothing of this one's: the call is
+        // judged as a path on the remote machine, outside its root.
+        let other = spill("another-conversation");
+        let decision = classify_remote(
+            &fixture,
+            SecurityLevel::RequestApproval,
+            "read",
+            json!({"path": other, "workspace": 2}),
+        )
+        .unwrap();
+        assert!(decision.requires_approval);
+        assert_eq!(decision.rule_id, "filesystem.outside_trusted_roots");
     }
 
     #[test]

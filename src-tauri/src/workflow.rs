@@ -1754,7 +1754,9 @@ fn timeout_message(profile: &PromptProfile, slots: &[StepSlot]) -> String {
 /// Converts a completed step's pool state into a result consumable by the plan source.
 ///
 /// Schema-bound steps accept only `structured_output`; ordinary steps use the final assistant
-/// text. Every non-completed state becomes a null result with an error.
+/// text. Every non-completed state becomes a null result with an error, which carries the reason
+/// the step gave — a failed request, a missing structured result — after its status: the status
+/// alone told the reader nothing about why all three steps of a run failed at once.
 fn harvest_outcome(
     index: usize,
     request: &WorkflowStepRequest,
@@ -1776,13 +1778,20 @@ fn harvest_outcome(
                 (Some(Value::String(final_assistant_text(&record))), None)
             }
         }
-        other => (
-            None,
-            Some(profile.render(
+        other => {
+            let ended = profile.render(
                 PromptKey::WorkflowStepEndedWith,
                 &[("status", status_wire(other))],
-            )),
-        ),
+            );
+            let reason = shared.result();
+            let reason = reason.trim();
+            let error = if reason.is_empty() {
+                ended
+            } else {
+                format!("{ended}\n{reason}")
+            };
+            (None, Some(error))
+        }
     };
     // Account provider-reported totals when available, otherwise sum input and output. Failed
     // steps count because the budget constrains actual cost, not successful output.
@@ -2402,6 +2411,45 @@ mod tests {
         assert!(!numbered.contains("--"), "{numbered}");
         assert!(numbered.ends_with("b-2"), "{numbered}");
         crate::agents::validate_agent_name(&numbered).unwrap();
+    }
+
+    #[test]
+    fn a_failed_step_says_why_after_its_status() {
+        let profile = PromptProfile::builtin_english();
+        let request: WorkflowStepRequest =
+            serde_json::from_value(json!({ "prompt": "task", "schema": { "type": "object" } }))
+                .unwrap();
+        let pool = AgentPool::unbounded();
+        let step = pool
+            .register(
+                "ws1".into(),
+                "ws1".into(),
+                "task".into(),
+                crate::agents::tests::template(),
+                SubagentRunKind::General,
+                &AppState::default(),
+                Vec::new(),
+                Vec::new(),
+                AgentLiveStatus::Running,
+                "call-ws1".into(),
+                None,
+            )
+            .unwrap();
+        step.complete_turn(
+            step.identity(),
+            Vec::new(),
+            "(Subagent run failed: the AI SDK sidecar exited)".into(),
+            AgentLiveStatus::Failed,
+            &ModelUsage::default(),
+            1,
+            None,
+        );
+        let outcome = harvest_outcome(0, &request, &step, &profile);
+        assert_eq!(outcome.value, None);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("The step ended with status failed\n(Subagent run failed: the AI SDK sidecar exited)")
+        );
     }
 
     #[test]

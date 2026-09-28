@@ -1055,6 +1055,10 @@ async fn dispatch(
             )
             .await,
         ),
+        "background_image_list" => result_value(super::background_image_list(app.clone()).await),
+        "background_image_delete" => result_value(
+            super::background_image_delete(app.clone(), arg(args, "imageId")?).await,
+        ),
         "file_attachment_upload" => result_value(
             super::file_attachment_upload(
                 app.clone(),

@@ -40,6 +40,10 @@ pub struct GitServiceRequest {
     /// with `~`, which is the helper's home directory.
     pub root: String,
     pub op: GitServiceOp,
+    /// The host's UI language — English when set, Simplified Chinese otherwise
+    /// — so the helper words failures as the host would.
+    #[serde(default)]
+    pub english: bool,
 }
 
 /// What to do. Each arm is the crate function of the same name, with the
@@ -94,6 +98,7 @@ pub enum GitServiceReply {
 /// Runs one request in this process.
 pub fn handle(request: GitServiceRequest) -> GitServiceReply {
     crate::set_identity_namespace(&request.machine);
+    crate::set_english(request.english);
     match run(request) {
         Ok(value) => GitServiceReply::Ok(value),
         Err(message) => GitServiceReply::Err(message),
@@ -134,7 +139,12 @@ fn run(request: GitServiceRequest) -> Result<serde_json::Value, String> {
 
 fn json<T: Serialize>(value: Result<T, String>) -> Result<serde_json::Value, String> {
     value.and_then(|value| {
-        serde_json::to_value(value).map_err(|error| format!("无法编码 Git 结果：{error}"))
+        serde_json::to_value(value).map_err(|error| {
+            text!(
+                "无法编码 Git 结果：{error}",
+                "Could not encode the Git result: {error}"
+            )
+        })
     })
 }
 
@@ -144,12 +154,22 @@ fn expand_home(path: &str) -> Result<PathBuf, String> {
         None => return Ok(PathBuf::from(path)),
         Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => rest,
         // `~user` names someone else's home, which this helper has no reason to reach.
-        Some(_) => return Err(format!("不支持的路径写法：{path}")),
+        Some(_) => {
+            return Err(text!(
+                "不支持的路径写法：{path}",
+                "Unsupported path form: {path}"
+            ))
+        }
     };
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
-        .ok_or_else(|| format!("无法展开 {path}：这台机器没有主目录"))?;
+        .ok_or_else(|| {
+            text!(
+                "无法展开 {path}：这台机器没有主目录",
+                "Could not expand {path}: this machine has no home directory"
+            )
+        })?;
     let rest = rest.trim_start_matches(['/', '\\']);
     Ok(if rest.is_empty() {
         PathBuf::from(home)
@@ -166,22 +186,51 @@ pub fn run_stdio() -> Result<(), String> {
     std::io::stdin()
         .take(MAX_REQUEST_BYTES + 1)
         .read_to_end(&mut input)
-        .map_err(|error| format!("无法读取 Git 请求：{error}"))?;
+        .map_err(|error| {
+            text!(
+                "无法读取 Git 请求：{error}",
+                "Could not read the Git request: {error}"
+            )
+        })?;
     let reply = if input.len() as u64 > MAX_REQUEST_BYTES {
-        GitServiceReply::Err("Git 请求超过大小上限".into())
+        GitServiceReply::Err(text!(
+            "Git 请求超过大小上限",
+            "The Git request exceeds the size limit"
+        ))
     } else {
         match serde_json::from_slice::<GitServiceRequest>(&input) {
             Ok(request) => handle(request),
-            Err(error) => GitServiceReply::Err(format!("无法解析 Git 请求：{error}")),
+            Err(error) => {
+                // Answered in the request's language when it names one.
+                crate::set_english(
+                    serde_json::from_slice::<serde_json::Value>(&input)
+                        .ok()
+                        .and_then(|request| request.get("english")?.as_bool())
+                        .unwrap_or(false),
+                );
+                GitServiceReply::Err(text!(
+                    "无法解析 Git 请求：{error}",
+                    "Could not parse the Git request: {error}"
+                ))
+            }
         }
     };
-    let bytes =
-        serde_json::to_vec(&reply).map_err(|error| format!("无法编码 Git 回答：{error}"))?;
+    let bytes = serde_json::to_vec(&reply).map_err(|error| {
+        text!(
+            "无法编码 Git 回答：{error}",
+            "Could not encode the Git reply: {error}"
+        )
+    })?;
     let mut stdout = std::io::stdout().lock();
     stdout
         .write_all(&bytes)
         .and_then(|()| stdout.flush())
-        .map_err(|error| format!("无法写出 Git 回答：{error}"))
+        .map_err(|error| {
+            text!(
+                "无法写出 Git 回答：{error}",
+                "Could not write the Git reply: {error}"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -210,6 +259,7 @@ mod tests {
                 paths: vec!["a.txt".into()],
                 include_untracked: true,
             },
+            english: false,
         };
         let text = serde_json::to_string(&request).unwrap();
         assert!(text.contains(r#""kind":"prepareDiscard""#), "{text}");
@@ -257,6 +307,7 @@ mod tests {
             op: GitServiceOp::Summary {
                 known_revision: None,
             },
+            english: false,
         })
         .unwrap();
         assert_eq!(reply["kind"], "snapshot");

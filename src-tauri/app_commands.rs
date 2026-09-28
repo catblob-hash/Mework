@@ -88,6 +88,8 @@ macro_rules! mework_app_commands {
             background_image_put,
             background_image_commit,
             background_image_data,
+            background_image_list,
+            background_image_delete,
             file_attachment_upload,
             file_attachment_data,
             dropped_paths_probe,

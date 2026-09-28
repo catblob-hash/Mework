@@ -1,6 +1,6 @@
 import { Trash2, X } from "lucide-react";
 import type { PropsWithChildren, ReactNode } from "react";
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { useFloatingSurface } from "../lib/floatingSurfaces";
@@ -144,6 +144,24 @@ export function Switch({ checked, onChange, label, disabled = false }: { checked
   );
 }
 
+/** The name of the sidebar window around it, for `DialogSidebarTitle`; null anywhere else. */
+const SidebarDialogContext = createContext<{ id: string; title: string } | null>(null);
+
+/**
+ * A sidebar window's name, drawn at the head of its sidebar where the title bar used
+ * to put it. Outside such a window it draws nothing, so a sidebar that is also used
+ * in a side pane (the conversation settings) can carry it unconditionally.
+ */
+export function DialogSidebarTitle() {
+  const dialog = useContext(SidebarDialogContext);
+  return dialog && <h2 className="dialog__sidebar-title" id={dialog.id}>{dialog.title}</h2>;
+}
+
+/** Whether this is drawn inside a sidebar window, whose selected page names itself at the top. */
+export function useInSidebarDialog(): boolean {
+  return useContext(SidebarDialogContext) !== null;
+}
+
 export function Dialog({
   title,
   description,
@@ -152,6 +170,7 @@ export function Dialog({
   onClose,
   width = "560px",
   dismissible = true,
+  sidebar = false,
   bodyClassName,
   className
 }: PropsWithChildren<{
@@ -170,6 +189,13 @@ export function Dialog({
   onClose: () => void;
   width?: string;
   dismissible?: boolean;
+  /**
+   * A window laid out as a sidebar of pages beside the selected page, with a flush
+   * body. It has no title bar: the name heads the sidebar (the content draws
+   * `DialogSidebarTitle` there), the selected page's own title heads the right-hand
+   * side, and the close button sits in the top corner beside it.
+   */
+  sidebar?: boolean;
   /** Added to the scrolling body, for content that brings its own padding and dividers. */
   bodyClassName?: string;
   /** Added to the panel, for a window that needs a size of its own rather than its content's. */
@@ -228,6 +254,16 @@ export function Dialog({
     };
   }, []);
 
+  /* Drawn even where `dismissible` is false. That flag is about closing by
+   * ACCIDENT — a stray backdrop click, a reflexive Escape — and says nothing about
+   * closing on purpose. A window with no way out in its own corner is one the user
+   * has to guess their way out of. */
+  const closeButton = (
+    <IconButton label={t("关闭", "Close")} onClick={onClose}>
+      <X size={16} />
+    </IconButton>
+  );
+
   /* A fixed element is viewport-relative only until an ancestor with transform,
    * filter, perspective, or contain establishes a containing block. Sidebar
    * ancestors use transforms and overflow for collapse and entrance animations,
@@ -245,7 +281,7 @@ export function Dialog({
     >
       <div
         ref={panelRef}
-        className={`dialog${className ? ` ${className}` : ""}`}
+        className={`dialog${sidebar ? " dialog--sidebar" : ""}${className ? ` ${className}` : ""}`}
         style={{ maxWidth: width }}
         role="dialog"
         aria-modal="true"
@@ -253,21 +289,22 @@ export function Dialog({
         aria-describedby={description ? descriptionId : undefined}
         tabIndex={-1}
       >
-        <div className="dialog__header">
-          <h2 id={titleId}>{title}</h2>
-          {/* Drawn even where `dismissible` is false. That flag is about closing
-              by ACCIDENT — a stray backdrop click, a reflexive Escape — and says
-              nothing about closing on purpose. A window with no way out in its
-              own corner is one the user has to guess their way out of. */}
-          <IconButton label={t("关闭", "Close")} onClick={onClose}>
-            <X size={16} />
-          </IconButton>
-        </div>
-        <div className={`dialog__body${bodyClassName ? ` ${bodyClassName}` : ""}`}>
-          {description && <p className="dialog__lede" id={descriptionId}>{description}</p>}
-          {children}
-        </div>
+        {!sidebar && (
+          <div className="dialog__header">
+            <h2 id={titleId}>{title}</h2>
+            {closeButton}
+          </div>
+        )}
+        <SidebarDialogContext.Provider value={sidebar ? { id: titleId, title } : null}>
+          <div className={`dialog__body${bodyClassName ? ` ${bodyClassName}` : ""}`}>
+            {description && <p className="dialog__lede" id={descriptionId}>{description}</p>}
+            {children}
+          </div>
+        </SidebarDialogContext.Provider>
         {footer && <div className="dialog__footer">{footer}</div>}
+        {/* Last, so it is also the last stop of the Tab cycle: the corner it sits
+            in is read after the page's own title. */}
+        {sidebar && <div className="dialog__close">{closeButton}</div>}
       </div>
     </div>,
     document.body

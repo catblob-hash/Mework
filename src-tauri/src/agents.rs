@@ -485,6 +485,11 @@ struct AgentCore {
     /// ended without a structured result cannot leave the previous turn's value
     /// standing as if it described the current one.
     structured_output: Option<Value>,
+    /// Text of the latest terminal envelope, replaced the same way: what the
+    /// child answered, or why it failed. `task_wait` reads it from the envelope;
+    /// the workflow driver, which takes only the record, reads it here to say
+    /// why a step failed.
+    result: String,
 }
 
 /// Called when `complete_turn` records a terminal envelope with the task name
@@ -643,6 +648,7 @@ impl AgentShared {
             }
             core.status = status;
             core.structured_output = structured_output.clone();
+            core.result = final_text.clone();
             let persisted = status.persisted();
             core.outbox.push(AgentEnvelope {
                 agent: self.name.clone(),
@@ -732,6 +738,11 @@ impl AgentShared {
         self.lock_core().status
     }
 
+    /// What the latest settled turn answered, or why it failed (see `AgentCore::result`).
+    pub fn result(&self) -> String {
+        self.lock_core().result.clone()
+    }
+
     /// Forces an agent that ignored its cancel flag to a terminal state,
     /// preserving its transcript and emitting a result envelope so the parent
     /// learns why it stopped. Never drops the record — a settled agent must
@@ -760,6 +771,7 @@ impl AgentShared {
                 .template
                 .prompt_profile
                 .render(PromptKey::SubagentForcedStop, &[("name", &self.name)]);
+            core.result = reason.clone();
             core.outbox.push(AgentEnvelope {
                 agent: self.name.clone(),
                 identity,
@@ -1108,16 +1120,18 @@ impl Drop for RunningTurnGuard {
                 if core.status == AgentLiveStatus::Running && core.identity == self.incarnation {
                     core.status = AgentLiveStatus::Failed;
                     let persisted = AgentLiveStatus::Failed.persisted();
+                    let content = self
+                        .shared
+                        .template
+                        .prompt_profile
+                        .text(PromptKey::SubagentWorkerPanic)
+                        .to_owned();
+                    core.result = content.clone();
                     core.outbox.push(AgentEnvelope {
                         agent: self.shared.name.clone(),
                         identity: self.incarnation,
                         kind: EnvelopeKind::Result(persisted),
-                        content: self
-                            .shared
-                            .template
-                            .prompt_profile
-                            .text(PromptKey::SubagentWorkerPanic)
-                            .to_owned(),
+                        content,
                         metrics: None,
                         structured_output: None,
                     });
@@ -1347,6 +1361,7 @@ impl AgentPool {
                 usage: ModelUsage::default(),
                 lifetime_usage: ModelUsage::default(),
                 structured_output: initial_structured_output,
+                result: String::new(),
             }),
             signal: Arc::clone(&self.signal),
             settle_observer: self.settle_observer.clone(),
@@ -1852,7 +1867,7 @@ fn merge_shared_usage(total: &mut ModelUsage, delta: &ModelUsage) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{
         AgentDefinitionBinding, AgentDefinitionMemory, AgentDefinitionSource, ApiProvider,
@@ -1925,7 +1940,7 @@ mod tests {
         );
     }
 
-    fn template() -> RunModelRequest {
+    pub(crate) fn template() -> RunModelRequest {
         RunModelRequest {
             provider: ApiProvider {
                 id: "p".into(),

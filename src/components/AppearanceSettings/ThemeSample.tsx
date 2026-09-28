@@ -11,8 +11,9 @@ export type ThemeSampleScheme = "current" | "opposite" | "day" | "night";
 
 /**
  * A miniature of the window — sidebar, top bar, the conversation tile with its
- * composer, and a side pane — drawn in one scheme's colours. With `glass`, it is the
- * custom-background look instead: `picture` (or a stand-in gradient) behind glass tiles.
+ * composer, and a side pane — drawn in one scheme's colours. `picture` lies behind the
+ * window where its ground shows, in place of the scheme's solid one; with `glass`, the
+ * sidebar and tiles are glass over whichever ground it is.
  */
 export function ThemeSample({
   scheme,
@@ -30,11 +31,18 @@ export function ThemeSample({
       className={`theme-sample${className ? ` ${className}` : ""}`}
       data-scheme={scheme}
       data-glass={glass || undefined}
+      data-picture={picture ? true : undefined}
       aria-hidden="true"
     >
-      {glass && (picture
-        ? <img className="theme-sample__picture" src={picture} alt="" draggable={false} />
-        : <span className="theme-sample__picture theme-sample__picture--placeholder" />)}
+      {picture && <img className="theme-sample__picture" src={picture} alt="" draggable={false} />}
+      {picture && glass && (
+        <img
+          className="theme-sample__picture theme-sample__picture--frosted"
+          src={picture}
+          alt=""
+          draggable={false}
+        />
+      )}
       <span className="theme-sample__sidebar">
         <span className="theme-sample__bar theme-sample__new" />
         <span className="theme-sample__selection" />

@@ -7,6 +7,7 @@ import {
   workspaceEnvKey
 } from "./workspaces";
 import { createSeedDocument } from "../seed";
+import { normalizeBackground } from "./background";
 import { isRegistered, isShellBackend } from "./machineShells";
 import {
   emptyConversationPresetSettings
@@ -1249,6 +1250,14 @@ function normalizeAppearance(
   const themeColor = normalizeHexColor(
     typeof input.themeColor === "string" ? input.themeColor : ""
   );
+  // Before the background library, `customBackground` turned the picture and the glass on
+  // together (the host carries this forward too; see `model::deserialize_appearance`).
+  const legacyPicture = input.background === undefined
+    && input.customBackground === true
+    && typeof input.backgroundImage === "string"
+    && input.backgroundImage !== ""
+    ? input.backgroundImage
+    : null;
   return {
     themeColor: themeColor ?? "",
     zoom: clampZoom(optionalFiniteNumber(input.zoom) ?? fallback.zoom),
@@ -1269,8 +1278,8 @@ function normalizeAppearance(
     codeBlockWrappable: input.codeBlockWrappable === true,
     singleDollarMath: input.singleDollarMath !== false,
     customCss: typeof input.customCss === "string" ? input.customCss : "",
-    customBackground: input.customBackground === true,
-    backgroundImage: typeof input.backgroundImage === "string" ? input.backgroundImage : "",
+    liquidGlass: input.liquidGlass === true || legacyPicture !== null,
+    background: normalizeBackground(legacyPicture ?? input.background),
     localModel: normalizeLocalModelPreferences(input.localModel)
   };
 }

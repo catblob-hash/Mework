@@ -79,6 +79,23 @@ describe("gitReviewListsPath", () => {
     });
     await expect(gitReviewListsPath(conversationTarget, snapshot({ files: [] }), "new.md")).resolves.toBe(false);
   });
+
+  it("asks against a worktree's fork point, which also lists what the branch committed", async () => {
+    gitMocks.getGitChangePage.mockResolvedValueOnce({
+      kind: "page",
+      revision: "revision-1",
+      files: [],
+      matchedCount: 1,
+      nextCursor: null,
+      selection: { state: "present", file: { path: "src/committed.ts", status: "modified" } }
+    });
+    // The inline list holds only uncommitted changes, so it cannot answer for the branch.
+    const complete = snapshot({ filesComplete: true, files: [] });
+    await expect(gitReviewListsPath(conversationTarget, complete, "src/committed.ts", "base-oid")).resolves.toBe(true);
+    expect(gitMocks.getGitChangePage.mock.calls.map(([, request]) => request)).toEqual([
+      { expectedRevision: "revision-1", selectedPath: "src/committed.ts", limit: 1, base: "base-oid" }
+    ]);
+  });
 });
 
 describe("pure snapshot helpers", () => {

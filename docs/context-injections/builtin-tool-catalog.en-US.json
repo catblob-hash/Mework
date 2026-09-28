@@ -57,6 +57,22 @@
           "type": "boolean",
           "required": false,
           "defaultValue": false
+        },
+        {
+          "name": "limit",
+          "label": "Limit",
+          "type": "number",
+          "required": false,
+          "defaultValue": 250,
+          "help": "Most matching lines to return: 250 by default, at most 1,000."
+        },
+        {
+          "name": "offset",
+          "label": "Offset",
+          "type": "number",
+          "required": false,
+          "defaultValue": 0,
+          "help": "Matching lines to skip first, to fetch the next page."
         }
       ]
     },

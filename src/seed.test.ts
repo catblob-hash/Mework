@@ -269,10 +269,33 @@ describe("seed document", () => {
       codeBlockWrappable: false,
       singleDollarMath: true,
       customCss: "",
-      customBackground: false,
-      backgroundImage: "",
+      liquidGlass: false,
+      background: "solid",
       localModel: { titles: false, shellExplanations: false, titlePrompt: "", shellPrompt: "" }
     });
+  });
+
+  it("carries a custom background from before the library forward as glass over its picture", () => {
+    const picture = "a".repeat(64);
+    const read = (appearance: Record<string, unknown>) => {
+      const document = createSeedDocument();
+      return normalizeDocument({
+        ...document,
+        globalSettings: { ...document.globalSettings, appearance: { ...document.globalSettings.appearance, ...appearance } }
+      }).globalSettings.appearance;
+    };
+    // The seed's own values stand in for a current document; drop them to read an old one.
+    const legacy = (fields: Record<string, unknown>) => ({ background: undefined, liquidGlass: undefined, ...fields });
+
+    expect(read(legacy({ customBackground: true, backgroundImage: picture })))
+      .toMatchObject({ liquidGlass: true, background: picture });
+    // Off, the remembered picture was not on screen; the plain theme was.
+    expect(read(legacy({ customBackground: false, backgroundImage: picture })))
+      .toMatchObject({ liquidGlass: false, background: "solid" });
+    expect(read({ background: "builtin:nowhere" }).background).toBe("solid");
+    expect(read({ background: "solid:night" }).background).toBe("solid:night");
+    expect(read({ background: "builtin:shelf", liquidGlass: true }))
+      .toMatchObject({ liquidGlass: true, background: "builtin:shelf" });
   });
 
   it("gives a fresh conversation the default per-conversation search behaviour", () => {

@@ -28,7 +28,6 @@ import {
 } from "../lib/workspaces";
 import type { NewConversationSource } from "../lib/workspaces";
 import { isImeKeyEvent } from "../lib/shortcuts";
-import { isBrowserDevRuntime } from "../lib/backend";
 import { usePointerDrag } from "./usePointerDrag";
 import type { DragPoint } from "./usePointerDrag";
 import { MeworkMark } from "./MeworkIcon";
@@ -578,20 +577,9 @@ export function Sidebar({
 
       <div className="sidebar__footer">
         <button type="button" onClick={onOpenSettings}>
-          <Settings size={17} />
+          <Settings size={14} />
           <span>{t("设置", "Settings")}</span>
         </button>
-        {isBrowserDevRuntime() ? (
-          <span
-            className="version-badge version-badge--dev-domain"
-            title={t(
-              "browser-dev 使用独立的开发数据域（com.mework.app.e2e.interactive-dev）；这里的对话、设置与正式版互不可见，不是数据丢失。",
-              "browser-dev uses an isolated development data domain (com.mework.app.e2e.interactive-dev); conversations and settings here are invisible to the production app by design — nothing is lost."
-            )}
-          >{t("开发数据域", "Dev data domain")}</span>
-        ) : (
-          <span className="version-badge">{t("本地", "Local")}</span>
-        )}
       </div>
       <div
         className="sidebar-resize-handle"

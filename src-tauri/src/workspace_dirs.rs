@@ -14,6 +14,9 @@ const TEMPORARY_WORKSPACE_ROOT: &str = "temporary-workspaces";
 /// cwd file, image staging — need a real local directory whatever machine the
 /// model is addressing, and a remote root is not one.
 const REMOTE_ANCHOR_ROOT: &str = "remote-workspace-anchors";
+/// Tool output too long to hand the model inline ([`crate::tool_output`]),
+/// one directory per conversation, whatever machine its workspace is on.
+const TOOL_OUTPUT_ROOT: &str = "tool-output";
 
 pub(crate) fn ensure_temporary_workspace(
     app_data: &Path,
@@ -33,6 +36,23 @@ pub(crate) fn ensure_remote_workspace_anchor(
     conversation_id: &str,
 ) -> Result<PathBuf, String> {
     ensure_conversation_workspace(app_data, REMOTE_ANCHOR_ROOT, conversation_id, "远端工作区锚点")
+}
+
+/// The directory a conversation's spilled tool output is written to, created
+/// on first use.
+pub(crate) fn ensure_tool_output_dir(
+    app_data: &Path,
+    conversation_id: &str,
+) -> Result<PathBuf, String> {
+    ensure_conversation_workspace(app_data, TOOL_OUTPUT_ROOT, conversation_id, "工具输出")
+}
+
+/// Where [`ensure_tool_output_dir`] puts a conversation's directory, without
+/// creating anything: the lookup a `read` of a spilled file makes.
+pub(crate) fn tool_output_dir(app_data: &Path, conversation_id: &str) -> Result<PathBuf, String> {
+    Ok(app_data
+        .join(TOOL_OUTPUT_ROOT)
+        .join(workspace_directory_name(conversation_id)?))
 }
 
 /// Makes the App-Data-backed temporary workspace tree match the persisted
@@ -64,7 +84,24 @@ pub(crate) fn reconcile_temporary_workspaces(
     }
 
     remove_orphan_workspace_entries(&root, &expected, "临时工作区")?;
-    reconcile_remote_workspace_anchors(app_data, document, drafts)
+    reconcile_remote_workspace_anchors(app_data, document, drafts)?;
+    reconcile_tool_output(app_data, document, drafts)
+}
+
+/// Drops the spilled output of conversations that no longer exist. Every
+/// conversation may have some, whatever its workspace, so nothing is filtered
+/// by kind; nothing is created either.
+fn reconcile_tool_output(
+    app_data: &Path,
+    document: &AppDocument,
+    drafts: &HashMap<String, String>,
+) -> Result<(), String> {
+    let expected = owner_ids(document, drafts, |_| true)
+        .into_iter()
+        .map(workspace_directory_name)
+        .collect::<Result<HashSet<_>, _>>()?;
+    let root = ensure_workspace_root(app_data, TOOL_OUTPUT_ROOT, "工具输出")?;
+    remove_orphan_workspace_entries(&root, &expected, "工具输出")
 }
 
 /// The conversations in the workspaces `select` picks, and the drafts aimed at
@@ -276,6 +313,25 @@ mod tests {
         let drafts = HashMap::from([("conv_draft".to_owned(), document.workspaces[0].id.clone())]);
         reconcile_temporary_workspaces(app_data.path(), &document, &drafts).unwrap();
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn saved_tool_output_goes_with_its_conversation() {
+        let app_data = tempfile::tempdir().unwrap();
+        let document = crate::catalog::default_document();
+        let kept = document.workspaces[0].conversations[0].id.clone();
+        let kept_dir = ensure_tool_output_dir(app_data.path(), &kept).unwrap();
+        let gone_dir = ensure_tool_output_dir(app_data.path(), "conv_deleted").unwrap();
+        fs::write(kept_dir.join("bash-1.txt"), "kept").unwrap();
+        fs::write(gone_dir.join("bash-2.txt"), "gone").unwrap();
+        assert_eq!(
+            fs::canonicalize(tool_output_dir(app_data.path(), &kept).unwrap()).unwrap(),
+            kept_dir
+        );
+
+        reconcile_temporary_workspaces(app_data.path(), &document, &HashMap::new()).unwrap();
+        assert!(kept_dir.join("bash-1.txt").is_file());
+        assert!(!gone_dir.exists());
     }
 
     #[test]

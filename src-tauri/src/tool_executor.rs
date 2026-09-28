@@ -31,6 +31,7 @@ use crate::{
         secure_open_existing_file_with_scope, ExecutionScope,
     },
     prompt_profile::{PromptKey, PromptProfile},
+    search_scope,
     shell_tasks::{ShellOutputSink, ShellOutputStream, ShellTaskOutcome},
     state::AppState,
     storage::atomic_write,
@@ -42,8 +43,6 @@ pub(crate) const MAX_TEXT_FILE: u64 = 2 * 1024 * 1024;
 pub(crate) const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_PATH_CHARS: usize = 4096;
 const MAX_COMMAND_CHARS: usize = 64 * 1024;
-pub(crate) const MAX_LIST_ENTRIES: usize = 2_000;
-pub(crate) const MAX_SEARCH_MATCHES: usize = 1_000;
 /// How often a running command checks whether someone asked it to stop. This is what bounds the
 /// delay between pressing the stop button and the process tree dying, and — since a command has no
 /// deadline of its own — it is the only thing standing between a runaway build and the user.
@@ -289,7 +288,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
         opened_file: None,
         file_touch: None,
     });
-    finish_verified_execution(&request, state, started, result, profile)
+    finish_verified_execution(&request, state, started, result, app_data, profile)
 }
 
 fn finish_execution(
@@ -299,7 +298,7 @@ fn finish_execution(
     result: Outcome,
     profile: &PromptProfile,
 ) -> ToolExecutionResponse {
-    finish_verified_execution(request, state, started, result, profile).result
+    finish_verified_execution(request, state, started, result, None, profile).result
 }
 
 fn finish_verified_execution(
@@ -307,13 +306,14 @@ fn finish_verified_execution(
     state: &AppState,
     started: Instant,
     result: Outcome,
+    app_data: Option<&Path>,
     profile: &PromptProfile,
 ) -> VerifiedToolExecutionResponse {
     let opened_file = result.opened_file;
     let file_touch = result.file_touch;
     let response = ToolExecutionResponse {
         success: result.success,
-        output: truncate_output(&result.output, profile),
+        output: fit_output(request, result.output, app_data, profile),
         images: result.images,
         diff: result.diff.map(|diff| truncate_diff(&diff, profile)),
         executed_at: Utc::now().to_rfc3339(),
@@ -324,6 +324,30 @@ fn finish_verified_execution(
         result: response,
         opened_file: opened_file.map(VerifiedOpenedFile),
         file_touch,
+    }
+}
+
+/// A result's text as the model receives it. The file tools and the shells
+/// bound their own output — a character budget for `ls`, a match count for
+/// `find`, a byte budget for `read`, the spill for a command — so the generic
+/// cap is for everything else. `grep` bounds its matches and then, like a
+/// command, spills what is still too long, Claude Code's 20,000 characters.
+fn fit_output(
+    request: &ToolExecutionRequest,
+    output: String,
+    app_data: Option<&Path>,
+    profile: &PromptProfile,
+) -> String {
+    match request.tool_name.as_str() {
+        "grep" => crate::tool_output::fit(
+            output,
+            crate::tool_output::GREP_INLINE_CHARS,
+            crate::tool_output::Spill::new(app_data, &request.conversation_id, "grep"),
+            profile,
+        ),
+        "ls" | "find" | "read" => output,
+        name if ShellKind::of_tool(name).is_some() => output,
+        _ => truncate_output(&output, profile),
     }
 }
 
@@ -438,7 +462,13 @@ fn run_tool(
     // path never touches this filesystem, and a language server for such a
     // workspace is started there too. Everything after this match is a
     // host-side tool, or one whose workspace is here.
-    if !selected.is_local() {
+    //
+    // One exception: output this conversation's own tools saved on the host
+    // ([`crate::tool_output`]). The model was handed that path to read back,
+    // and it exists nowhere but here.
+    let names_host_output = app_data
+        .is_some_and(|app_data| crate::tool_output::names_host_file(app_data, request));
+    if !selected.is_local() && !names_host_output {
         let remote = remote_workspace(selected, scope, profile, cancel);
         match request.tool_name.as_str() {
             "ls" => return crate::remote_files::run_ls(&remote, &request.input).map(Outcome::success),
@@ -1393,47 +1423,66 @@ fn run_ls(
     if !root.is_dir() {
         return Err(format!("ls target is not a directory: {path}"));
     }
+    let rules = search_scope::local_rules(&root);
 
-    let mut entries = Vec::new();
-    let mut overflowed = false;
-    for entry in WalkDir::new(&root)
-        .follow_links(false)
-        .min_depth(1)
-        .max_depth(depth as usize + 1)
-        .into_iter()
-        .filter_entry(|entry| existing_path_is_allowed(scope, entry.path()))
-    {
-        let entry = entry.map_err(|error| {
-            let reason = error
-                .io_error()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "directory traversal failed".into());
-            format!("Failed to list directory {path}: {reason}")
-        })?;
-        if entries.len() >= MAX_LIST_ENTRIES {
-            overflowed = true;
+    // Breadth-first, a level at a time and each directory in name order, so
+    // the budget cuts the deepest level reached and a big subtree cannot push
+    // its siblings out of the answer.
+    let mut listing = search_scope::Listing::new();
+    let mut frontier = vec![root.clone()];
+    'levels: for level in 1..=(depth as usize + 1) {
+        let mut next = Vec::new();
+        for directory in &frontier {
+            let mut children = match fs::read_dir(directory) {
+                Ok(children) => children.filter_map(Result::ok).collect::<Vec<_>>(),
+                Err(error) if directory == &root => {
+                    return Err(format!("Failed to list directory {path}: {error}"))
+                }
+                Err(error) => {
+                    listing.skipped(format!("{}: {error}", display_path(&workspace, directory)));
+                    continue;
+                }
+            };
+            children.sort_by_key(|child| child.file_name());
+            for child in children {
+                let child_path = child.path();
+                if !existing_path_is_allowed(scope, &child_path) {
+                    continue;
+                }
+                // A link to a directory is listed, not followed, and so not
+                // marked as one.
+                let is_dir = child.file_type().is_ok_and(|kind| kind.is_dir());
+                let relative = search_relative(&root, &child_path);
+                let collapsed = is_dir && rules.collapses(&relative);
+                if !listing.push(
+                    level,
+                    &display_path(&workspace, &child_path),
+                    is_dir,
+                    collapsed,
+                    profile,
+                ) {
+                    break 'levels;
+                }
+                if is_dir && !collapsed {
+                    next.push(child_path);
+                }
+            }
+        }
+        if next.is_empty() {
             break;
         }
-        let mut display = relative_display(&workspace, entry.path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        if entry.file_type().is_dir() {
-            display.push('/');
-        }
-        entries.push(display);
+        frontier = next;
     }
-    entries.sort_unstable();
-    if overflowed {
-        entries.push(profile.render(
-            PromptKey::ToolLsLimit,
-            &[("limit", &MAX_LIST_ENTRIES.to_string())],
-        ));
-    }
-    Ok(if entries.is_empty() {
-        profile.text(PromptKey::ToolLsEmpty).to_owned()
-    } else {
-        entries.join("\n")
-    })
+    Ok(listing.render(profile))
+}
+
+/// A walked path relative to the directory a search started from,
+/// `/`-separated: the spelling the ignore rules are written in.
+fn search_relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn run_grep(
@@ -1445,6 +1494,7 @@ fn run_grep(
     let pattern = required_string(input, "pattern", 4096, false)?;
     let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
     let case_sensitive = optional_bool(input, "case_sensitive", false)?;
+    let page = search_scope::GrepPage::from_input(input)?;
     let regex = RegexBuilder::new(&pattern)
         .case_insensitive(!case_sensitive)
         .build()
@@ -1452,68 +1502,121 @@ fn run_grep(
     let workspace = canonical_workspace(workspace)?;
     let root = resolve_existing_with_scope(&workspace, &path, scope)?;
 
-    let mut matches = Vec::new();
-    let mut overflowed = false;
-    for entry in WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| existing_path_is_allowed(scope, entry.path()))
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
+    let mut search = GrepSearch {
+        workspace: &workspace,
+        regex: &regex,
+        wanted: page.wanted(),
+        matches: Vec::new(),
+        skipped: Vec::new(),
+    };
+    if !root.is_dir() {
+        // A file named outright is searched whatever the ignore rules say.
+        search.file(&root);
+    } else {
+        match search_scope::local_search_files(&root) {
+            search_scope::SearchFiles::Listed(files) => {
+                // Git never lists what is behind a link, but its index can
+                // still name a path whose directory has since become one;
+                // the walk this replaces followed no links, and neither does
+                // this.
+                let mut linked = std::collections::HashMap::new();
+                for file in files {
+                    if search_scope::has_linked_parent(&root, &file, &mut linked) {
+                        continue;
+                    }
+                    let file = root.join(file);
+                    if existing_path_is_allowed(scope, &file) && !search.file(&file) {
+                        break;
+                    }
+                }
+            }
+            search_scope::SearchFiles::Walk(rules) => {
+                let mut walk = WalkDir::new(&root)
+                    .follow_links(false)
+                    .sort_by_file_name()
+                    .into_iter();
+                while let Some(entry) = walk.next() {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            search.skipped.push(error.to_string());
+                            continue;
+                        }
+                    };
+                    if entry.depth() == 0 {
+                        continue;
+                    }
+                    let is_dir = entry.file_type().is_dir();
+                    if !existing_path_is_allowed(scope, entry.path())
+                        || (is_dir && rules.collapses(&search_relative(&root, entry.path())))
+                    {
+                        if is_dir {
+                            walk.skip_current_dir();
+                        }
+                        continue;
+                    }
+                    if entry.file_type().is_file() && !search.file(entry.path()) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let GrepSearch {
+        matches, skipped, ..
+    } = search;
+    Ok(page.render(matches, skipped, profile))
+}
+
+/// One `grep` call's search: the matches found so far, up to what the page
+/// needs.
+struct GrepSearch<'a> {
+    workspace: &'a Path,
+    regex: &'a regex::Regex,
+    wanted: usize,
+    matches: Vec<String>,
+    skipped: Vec<String>,
+}
+
+impl GrepSearch<'_> {
+    /// Searches one file; `false` once the page has all it needs. A link, a
+    /// file over 2 MiB and a binary file (a NUL in its first 8 KiB) are
+    /// passed over.
+    fn file(&mut self, path: &Path) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return true;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_TEXT_FILE {
+            return true;
+        }
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
             Err(error) => {
-                matches.push(
-                    profile.render(PromptKey::ToolGrepSkipped, &[("error", &error.to_string())]),
-                );
-                continue;
+                self.skipped
+                    .push(format!("{}: {error}", display_path(self.workspace, path)));
+                return true;
             }
         };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let metadata = match entry.metadata() {
-            Ok(metadata) if metadata.len() <= MAX_TEXT_FILE => metadata,
-            _ => continue,
-        };
-        let _ = metadata;
-        let bytes = match fs::read(entry.path()) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
         if bytes.iter().take(8192).any(|byte| *byte == 0) {
-            continue;
+            return true;
         }
         let content = String::from_utf8_lossy(&bytes);
+        let relative = display_path(self.workspace, path);
         for (line_index, line) in content.lines().enumerate() {
-            if regex.is_match(line) {
-                let relative = display_path(&workspace, entry.path());
-                matches.push(format!(
+            if self.regex.is_match(line) {
+                self.matches.push(format!(
                     "{}:{}:{}",
                     relative,
                     line_index + 1,
                     truncate_chars(line, 500)
                 ));
-                if matches.len() >= MAX_SEARCH_MATCHES {
-                    overflowed = true;
-                    break;
+                if self.matches.len() >= self.wanted {
+                    return false;
                 }
             }
         }
-        if overflowed {
-            break;
-        }
+        true
     }
-    if overflowed {
-        matches.push(profile.render(
-            PromptKey::ToolGrepLimit,
-            &[("limit", &MAX_SEARCH_MATCHES.to_string())],
-        ));
-    }
-    Ok(if matches.is_empty() {
-        profile.text(PromptKey::ToolGrepNoMatch).to_owned()
-    } else {
-        matches.join("\n")
-    })
 }
 
 fn run_find(
@@ -1529,17 +1632,42 @@ fn run_find(
         .compile_matcher();
     let workspace = canonical_workspace(workspace)?;
     let root = resolve_existing_with_scope(&workspace, &path, scope)?;
+    // Only for ranking: `find` hides nothing Git ignores.
+    let rules = search_scope::local_rules(&root);
 
-    let mut found = Vec::new();
-    let mut overflowed = false;
-    for entry in WalkDir::new(&root)
+    let mut found = search_scope::FindMatches::default();
+    let mut scanned = 0_usize;
+    let mut walk = WalkDir::new(&root)
         .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| existing_path_is_allowed(scope, entry.path()))
-    {
-        let entry = entry.map_err(|error| format!("Failed to find files: {error}"))?;
+        .sort_by_file_name()
+        .into_iter();
+    while let Some(entry) = walk.next() {
+        let Ok(entry) = entry else {
+            continue;
+        };
         if entry.depth() == 0 {
             continue;
+        }
+        let is_dir = entry.file_type().is_dir();
+        if !existing_path_is_allowed(scope, entry.path()) {
+            if is_dir {
+                walk.skip_current_dir();
+            }
+            continue;
+        }
+        scanned += 1;
+        if scanned > search_scope::FIND_SCAN_LIMIT {
+            found.scan_cut();
+            break;
+        }
+        // Version-control data can be found by name but is not walked.
+        if is_dir
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(search_scope::is_vcs_directory)
+        {
+            walk.skip_current_dir();
         }
         let relative_to_root = entry.path().strip_prefix(&root).unwrap_or(entry.path());
         let matches = matcher.is_match(relative_to_root)
@@ -1550,28 +1678,14 @@ fn run_find(
         if !matches {
             continue;
         }
-        if found.len() >= MAX_LIST_ENTRIES {
-            overflowed = true;
-            break;
-        }
         let mut display = display_path(&workspace, entry.path());
-        if entry.file_type().is_dir() {
+        if is_dir {
             display.push('/');
         }
-        found.push(display);
+        let ignored = rules.ignores(&search_relative(&root, entry.path()), is_dir);
+        found.push(display, ignored);
     }
-    found.sort_unstable();
-    if overflowed {
-        found.push(profile.render(
-            PromptKey::ToolFindLimit,
-            &[("limit", &MAX_LIST_ENTRIES.to_string())],
-        ));
-    }
-    Ok(if found.is_empty() {
-        profile.text(PromptKey::ToolFindNoMatch).to_owned()
-    } else {
-        found.join("\n")
-    })
+    Ok(found.render(profile))
 }
 
 pub(crate) fn display_path(workspace: &Path, path: &Path) -> String {
@@ -1675,38 +1789,79 @@ pub(crate) struct TextSlice {
     pub whole_file: bool,
 }
 
-/// Slices `content` to the validated range, applying the 5001-line cap and
-/// the out-of-range wording. Shared by the host and remote legs so a file
-/// reads the same whichever machine it is on.
+/// Lines a `read` without `end_line` returns: Claude Code's default.
+pub(crate) const READ_DEFAULT_LINES: usize = 2_000;
+/// Bytes of text one `read` returns, whatever its range; a range past it is
+/// cut at a line boundary and says where to continue.
+pub(crate) const READ_MAX_BYTES: usize = 60 * 1024;
+
+/// Slices `content` to the validated range: [`READ_DEFAULT_LINES`] when no
+/// end was given, and never more than [`READ_MAX_BYTES`] of whole lines.
+/// Shared by the host and remote legs so a file reads the same whichever
+/// machine it is on.
 pub(crate) fn slice_text_lines(
     content: &str,
     start_line: u64,
     end_line: u64,
     profile: &PromptProfile,
-) -> TextSlice {
+) -> Result<TextSlice, String> {
     let lines = content.lines().collect::<Vec<_>>();
     let start_index = (start_line - 1).min(usize::MAX as u64) as usize;
     if start_index >= lines.len() {
         // Only an empty file reaches here from line 1, and that is a full read
         // of it; any other start is a slice that saw nothing.
-        return TextSlice {
+        return Ok(TextSlice {
             output: profile.text(PromptKey::ToolReadRangeOutOfBounds).to_owned(),
             whole_file: start_line == 1 && end_line == u64::MAX,
-        };
+        });
     }
-    let end_index = if end_line == u64::MAX {
-        lines.len().min(start_index.saturating_add(5_001))
+    let wanted_end = if end_line == u64::MAX {
+        lines.len().min(start_index.saturating_add(READ_DEFAULT_LINES))
     } else {
         (end_line.min(lines.len() as u64)) as usize
     };
-    let mut output = lines[start_index..end_index].join("\n");
-    if end_line == u64::MAX && end_index < lines.len() {
-        output.push_str(&profile.render(PromptKey::ToolReadLimit, &[("limit", "5001")]));
+    let mut end_index = start_index;
+    let mut bytes = 0_usize;
+    while end_index < wanted_end {
+        let cost = lines[end_index].len() + 1;
+        if bytes + cost > READ_MAX_BYTES {
+            if end_index == start_index {
+                return Err(profile.render(
+                    PromptKey::ToolReadLineTooLong,
+                    &[
+                        ("line", &(end_index + 1).to_string()),
+                        (
+                            "size",
+                            &crate::tool_output::human_size(lines[end_index].len() as u64),
+                        ),
+                    ],
+                ));
+            }
+            break;
+        }
+        bytes += cost;
+        end_index += 1;
     }
-    TextSlice {
+    let mut output = lines[start_index..end_index].join("\n");
+    // Short of what was asked for — the byte budget — or, with no end given,
+    // short of the file's end.
+    let stopped_early =
+        end_index < wanted_end || (end_line == u64::MAX && end_index < lines.len());
+    if stopped_early {
+        output.push_str(&profile.render(
+            PromptKey::ToolReadLimit,
+            &[
+                ("from", &start_line.to_string()),
+                ("to", &end_index.to_string()),
+                ("total", &lines.len().to_string()),
+                ("next", &(end_index + 1).to_string()),
+            ],
+        ));
+    }
+    Ok(TextSlice {
         output,
         whole_file: start_line == 1 && end_line == u64::MAX && end_index >= lines.len(),
-    }
+    })
 }
 
 fn run_read(
@@ -1783,7 +1938,7 @@ fn run_read(
     // bytes were read. If the file changes between the two, the record is
     // older than the disk and the next edit reads as stale — the safe side.
     let modified_ms = file_read_state::modified_ms_of(&metadata);
-    let slice = slice_text_lines(&content, start_line, end_line, profile);
+    let slice = slice_text_lines(&content, start_line, end_line, profile)?;
     // A full record needs the whole file in front of the model. Anything less
     // is remembered, but vouches for nothing about the parts it did not show.
     let record = if slice.whole_file {
@@ -3380,6 +3535,9 @@ fn run_shell(
     // controlled only by its registered task row.
     let cancelled = || cancel.cancelled();
     let timeout = parse_shell_timeout(input);
+    // What an output too long to return is saved as, should it come to that.
+    let spill_stem = format!("{}-{}", kind.tool_name(), guard.shell_task_id());
+    let spill = crate::tool_output::Spill::new(app_data, conversation_id, &spill_stem);
     let run = ShellRun::start(spawned, &guard, Some(timeout))?;
     match run.wait(
         &mut guard,
@@ -3395,7 +3553,14 @@ fn run_shell(
             if let Some(cwd) = adopt_reported_cwd(context.cwd_file(), local_anchor) {
                 state.set_shell_cwd(conversation_id, cwd);
             }
-            let mut output = result.output;
+            // The hint goes after the fitting, so it is never what gets cut
+            // or saved away.
+            let mut output = crate::tool_output::fit(
+                result.output,
+                crate::tool_output::SHELL_INLINE_CHARS,
+                spill,
+                profile,
+            );
             if let Some(hint) = stale_read_hint(
                 file_guard,
                 local_anchor,
@@ -3450,7 +3615,12 @@ fn run_shell(
             drop(context);
             Ok(Outcome {
                 success: false,
-                output: result.output,
+                output: crate::tool_output::fit(
+                    result.output,
+                    crate::tool_output::SHELL_INLINE_CHARS,
+                    spill,
+                    profile,
+                ),
                 images: Vec::new(),
                 diff: None,
                 opened_file: None,
@@ -3630,8 +3800,8 @@ pub(crate) struct ShellRun {
     job: ShellJob,
     /// Carried only so a timed-out result can name the deadline it missed.
     timeout: Option<Duration>,
-    stdout_thread: thread::JoinHandle<(Vec<u8>, bool)>,
-    stderr_thread: thread::JoinHandle<(Vec<u8>, bool)>,
+    stdout_thread: thread::JoinHandle<CapturedStream>,
+    stderr_thread: thread::JoinHandle<CapturedStream>,
 }
 
 /// Why [`ShellRun::wait`] returned.
@@ -3793,10 +3963,10 @@ impl ShellRun {
         // Joined after the tree is down, never before: these threads end when the last copy of the
         // write handle closes, and a surviving grandchild holds one. That is why the kill has to
         // cover the whole tree — otherwise the command is "stopped" and this still blocks.
-        let (stdout, stdout_truncated) = self.stdout_thread.join().map_err(|_| {
+        let stdout = self.stdout_thread.join().map_err(|_| {
             "The command standard-output reader thread terminated unexpectedly".to_owned()
         })?;
-        let (stderr, stderr_truncated) = self.stderr_thread.join().map_err(|_| {
+        let stderr = self.stderr_thread.join().map_err(|_| {
             "The command standard-error reader thread terminated unexpectedly".to_owned()
         })?;
         let output = format_process_output(
@@ -3804,8 +3974,6 @@ impl ShellRun {
             completion,
             &stdout,
             &stderr,
-            stdout_truncated,
-            stderr_truncated,
             self.timeout,
             profile,
         );
@@ -3992,12 +4160,82 @@ impl Drop for ShellJob {
     }
 }
 
+/// Bytes of a command's stream kept from its start, and from its end. What
+/// the model gets is cut to [`tool_output::SHELL_INLINE_CHARS`] and the rest
+/// saved to a file; these bound that file. A build that prints for an hour
+/// keeps both what it said first and the error it died on, and says how much
+/// fell between.
+const CAPTURE_HEAD_BYTES: usize = 4 * 1024 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 4 * 1024 * 1024;
+
+/// One stream of a command as captured for the model.
+#[derive(Default)]
+pub(crate) struct CapturedStream {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    /// Bytes that fell between the head and the tail.
+    omitted: u64,
+}
+
+impl CapturedStream {
+    #[cfg(test)]
+    pub(crate) fn whole(bytes: &[u8]) -> Self {
+        let mut captured = Self::default();
+        captured.push(bytes);
+        captured
+    }
+
+    fn push(&mut self, mut bytes: &[u8]) {
+        let room = CAPTURE_HEAD_BYTES.saturating_sub(self.head.len());
+        if room > 0 {
+            let taken = bytes.len().min(room);
+            self.head.extend_from_slice(&bytes[..taken]);
+            bytes = &bytes[taken..];
+        }
+        self.tail.extend(bytes);
+        let excess = self.tail.len().saturating_sub(CAPTURE_TAIL_BYTES);
+        if excess > 0 {
+            self.tail.drain(..excess);
+            self.omitted += excess as u64;
+        }
+    }
+
+    /// The stream as text, with the omission marked where it happened.
+    fn text(&self, profile: &PromptProfile) -> String {
+        if self.omitted == 0 {
+            let mut bytes = self.head.clone();
+            bytes.extend(self.tail.iter());
+            return crate::console_text::decode_console_text(&bytes);
+        }
+        // Both cuts can land inside a character: the head's end loses its
+        // partial character, the tail's start its continuation bytes.
+        let mut head = self.head.clone();
+        let head_len = head.len();
+        trim_incomplete_utf8_tail(&mut head);
+        let tail = self.tail.iter().copied().collect::<Vec<_>>();
+        let skip = tail
+            .iter()
+            .take(3)
+            .take_while(|byte| **byte & 0b1100_0000 == 0b1000_0000)
+            .count();
+        let omitted = self.omitted + (head_len - head.len()) as u64 + skip as u64;
+        format!(
+            "{}\n{}\n{}",
+            crate::console_text::decode_console_text(&head),
+            profile.render(
+                PromptKey::ToolShellOutputOmitted,
+                &[("size", &crate::tool_output::human_size(omitted))],
+            ),
+            crate::console_text::decode_console_text(&tail[skip..])
+        )
+    }
+}
+
 /// Drains one pipe to end-of-stream.
 ///
 /// Two readers, one per pipe, because a command that fills its stderr buffer while nobody reads it
-/// deadlocks. The captured vector is what the *model* gets and stops growing at `MAX_TOOL_OUTPUT`;
-/// the sink is what a *person* watching the task page gets and keeps receiving past that cap, so a
-/// long build stays watchable after its result has been truncated.
+/// deadlocks. The captured stream is what the *model* gets — its start and its end, see
+/// [`CAPTURE_HEAD_BYTES`]; the sink is what a *person* watching the task page gets, live.
 ///
 /// Captured bytes pass through untouched; the watcher sink decodes its copy incrementally. Trailing
 /// whitespace used to be stripped here, which only earned its keep while the PowerShell console was
@@ -4006,10 +4244,9 @@ impl Drop for ShellJob {
 fn collect_pipe<R: Read + Send + 'static>(
     mut pipe: R,
     mut sink: ShellOutputSink,
-) -> thread::JoinHandle<(Vec<u8>, bool)> {
+) -> thread::JoinHandle<CapturedStream> {
     thread::spawn(move || {
-        let mut captured = Vec::new();
-        let mut truncated = false;
+        let mut captured = CapturedStream::default();
         let mut chunk = [0_u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
@@ -4017,19 +4254,12 @@ fn collect_pipe<R: Read + Send + 'static>(
                 Ok(read) => {
                     let text = &chunk[..read];
                     sink.append(text);
-                    let remaining = MAX_TOOL_OUTPUT.saturating_sub(captured.len());
-                    captured.extend_from_slice(&text[..text.len().min(remaining)]);
-                    if text.len() > remaining {
-                        truncated = true;
-                    }
+                    captured.push(text);
                 }
             }
         }
         sink.finish();
-        if truncated {
-            trim_incomplete_utf8_tail(&mut captured);
-        }
-        (captured, truncated)
+        captured
     })
 }
 
@@ -4078,13 +4308,14 @@ fn strip_leading_blank_lines(text: &str) -> &str {
 /// task page dim stderr and stream live output, a surface Claude Code has no
 /// equivalent of. It does not change what the model sees, because Claude Code's
 /// own model-facing text groups stderr after stdout too.
+///
+/// Length is not decided here: the caller fits the whole text to the shell's
+/// inline share with [`crate::tool_output::fit`], saving the rest to a file.
 fn format_process_output(
     status: ExitStatus,
     completion: ShellCompletion,
-    stdout: &[u8],
-    stderr: &[u8],
-    stdout_truncated: bool,
-    stderr_truncated: bool,
+    stdout: &CapturedStream,
+    stderr: &CapturedStream,
     timeout: Option<Duration>,
     profile: &PromptProfile,
 ) -> String {
@@ -4092,12 +4323,9 @@ fn format_process_output(
     // stdout loses only its leading blank lines and its trailing whitespace, so
     // a command's own indentation and interior padding survive, while stderr is
     // trimmed at both ends because it is a diagnostic, not data.
-    let stdout =
-        normalize_line_endings(&crate::console_text::decode_console_text(stdout)).into_owned();
+    let stdout = normalize_line_endings(&stdout.text(profile)).into_owned();
     let stdout = strip_leading_blank_lines(&stdout).trim_end().to_owned();
-    let stderr = normalize_line_endings(&crate::console_text::decode_console_text(stderr))
-        .trim()
-        .to_owned();
+    let stderr = normalize_line_endings(&stderr.text(profile)).trim().to_owned();
     let mut parts: Vec<String> = Vec::new();
 
     match completion {
@@ -4130,9 +4358,6 @@ fn format_process_output(
         parts.extend([stderr, stdout].into_iter().filter(|part| !part.is_empty()));
     } else {
         parts.extend([stdout, stderr].into_iter().filter(|part| !part.is_empty()));
-    }
-    if stdout_truncated || stderr_truncated {
-        parts.push(profile.text(PromptKey::ToolShellOutputTruncated).to_owned());
     }
     if parts.is_empty() {
         // A silent success still has to say something, or the round reads as if
@@ -5669,15 +5894,218 @@ mod tests {
     /// was widened to thousands of columns and padded every formatted row out to
     /// that width. Claude Code widens nothing and strips nothing per line.
     #[test]
+    fn a_read_without_an_end_returns_two_thousand_lines_and_says_where_to_go_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = (1..=2_500).map(|n| format!("line {n}\n")).collect::<String>();
+        fs::write(directory.path().join("long.txt"), &text).unwrap();
+        let state = AppState::default();
+
+        let first = execute(request(directory.path(), "read", json!({"path":"long.txt"})), &state);
+        assert!(first.success, "{}", first.output);
+        assert!(first.output.starts_with("line 1\nline 2\n"));
+        assert!(first.output.contains("\nline 2000\n"), "{}", &first.output[first.output.len() - 200..]);
+        assert!(!first.output.contains("line 2001"));
+        assert!(
+            first.output.ends_with("… showing lines 1–2000 of 2500. Continue with start_line=2001."),
+            "{}",
+            &first.output[first.output.len() - 200..]
+        );
+
+        // A range that is all there comes back whole, with nothing appended.
+        let rest = execute(
+            request(directory.path(), "read", json!({"path":"long.txt","start_line":2001,"end_line":2500})),
+            &state,
+        );
+        assert!(rest.success, "{}", rest.output);
+        assert!(rest.output.starts_with("line 2001\n"));
+        assert!(rest.output.ends_with("line 2500"), "{}", &rest.output[rest.output.len() - 100..]);
+    }
+
+    #[test]
+    fn a_read_stops_at_its_byte_budget_on_a_line_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        // A thousand bytes a line with its newline: 61 fit in 60 KiB.
+        let row = "x".repeat(999);
+        let text = (0..100).map(|_| format!("{row}\n")).collect::<String>();
+        fs::write(directory.path().join("wide.txt"), &text).unwrap();
+        fs::write(directory.path().join("one-line.min.js"), "y".repeat(70_000)).unwrap();
+        let state = AppState::default();
+
+        let read = execute(
+            request(directory.path(), "read", json!({"path":"wide.txt","start_line":1,"end_line":100})),
+            &state,
+        );
+        assert!(read.success, "{}", read.output);
+        assert_eq!(read.output.lines().filter(|line| *line == row).count(), 61);
+        assert!(
+            read.output.ends_with("… showing lines 1–61 of 100. Continue with start_line=62."),
+            "{}",
+            &read.output[read.output.len() - 100..]
+        );
+
+        let refused = execute(
+            request(directory.path(), "read", json!({"path":"one-line.min.js"})),
+            &state,
+        );
+        assert!(!refused.success);
+        assert_eq!(
+            refused.output,
+            "Line 1 alone is 70 KB, more than one read can return. Use grep to find the part you need."
+        );
+    }
+
+    #[test]
+    fn a_stream_past_its_capture_keeps_its_start_and_its_end() {
+        let profile = PromptProfile::builtin_english();
+        let mut captured = CapturedStream::default();
+        // The head ends inside a three-byte character and the tail starts
+        // inside another; neither half is left with a broken one.
+        let wide = "中".repeat(CAPTURE_HEAD_BYTES / 3 + 1);
+        captured.push(wide.as_bytes());
+        captured.push(&vec![b'-'; 998]);
+        captured.push("终".repeat(CAPTURE_TAIL_BYTES / 3 + 1).as_bytes());
+        let text = captured.text(&profile);
+        let (head, rest) = text.split_once('\n').unwrap();
+        let (marker, tail) = rest.split_once('\n').unwrap();
+        assert!(head.chars().all(|character| character == '中'));
+        assert_eq!(head.len(), CAPTURE_HEAD_BYTES / 3 * 3);
+        assert!(tail.chars().all(|character| character == '终'));
+        assert_eq!(tail.len(), CAPTURE_TAIL_BYTES / 3 * 3);
+        assert_eq!(marker, "[… 1 KB of output omitted …]");
+
+        let short = CapturedStream::whole(b"all of it");
+        assert_eq!(short.text(&profile), "all of it");
+    }
+
+    #[test]
+    fn a_command_whose_output_is_too_long_hands_back_a_file_and_a_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let app_data = tempfile::tempdir().unwrap();
+        let state = AppState::default();
+        let run = |tool: &str, input: Value| {
+            execute_with_scope_and_attachments(
+                request(directory.path(), tool, input),
+                &state,
+                ExecutionScope::restricted([
+                    fs::canonicalize(directory.path()).unwrap(),
+                    fs::canonicalize(app_data.path()).unwrap(),
+                ]),
+                Some(app_data.path()),
+                &crate::workspace_set::WorkspaceSet::default(),
+                &PromptProfile::builtin_english(),
+            )
+        };
+        let result = run(
+            "bash",
+            json!({"command": "i=0; while [ $i -lt 5000 ]; do echo \"row $i of the output\"; i=$((i+1)); done"}),
+        );
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.starts_with("<persisted-output>\nOutput too large ("), "{}", result.output);
+        assert!(result.output.contains("row 0 of the output"));
+        assert!(!result.output.contains("row 4999"));
+        let path = crate::tool_output::saved_path(&result.output).expect("a saved file");
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("row 0 of the output\n"));
+        assert!(saved.ends_with("row 4999 of the output"));
+
+        // The rest is a `read` away.
+        let tail = run("read", json!({"path": path, "start_line": 4999}));
+        assert!(tail.success, "{}", tail.output);
+        assert_eq!(tail.output, "row 4998 of the output\nrow 4999 of the output");
+
+        // `grep` spills past its own, smaller share.
+        fs::write(
+            directory.path().join("many.txt"),
+            (0..300).map(|n| format!("needle {n} {}\n", "z".repeat(200))).collect::<String>(),
+        )
+        .unwrap();
+        let grepped = run("grep", json!({"pattern": "needle"}));
+        assert!(grepped.success, "{}", grepped.output);
+        assert!(grepped.output.starts_with("<persisted-output>"), "{}", &grepped.output[..200]);
+        let saved = fs::read_to_string(crate::tool_output::saved_path(&grepped.output).unwrap()).unwrap();
+        assert_eq!(saved.lines().filter(|line| line.contains(":needle ")).count(), 250);
+        assert!(saved.ends_with("pass offset=250 for the next page, or narrow the pattern or path."));
+    }
+
+    /// A conversation whose workspace is on another machine still has its
+    /// spilled output here, and a `read` of it is served here rather than
+    /// sent to a machine that has never seen the file.
+    #[test]
+    fn saved_output_is_read_on_the_host_whatever_workspace_the_call_names() {
+        let anchor = tempfile::tempdir().unwrap();
+        let app_data = tempfile::tempdir().unwrap();
+        let notice = crate::tool_output::fit(
+            "saved line\n".repeat(10),
+            5,
+            crate::tool_output::Spill::new(Some(app_data.path()), "conversation-test", "bash-1"),
+            &PromptProfile::builtin_english(),
+        );
+        let path = crate::tool_output::saved_path(&notice).unwrap();
+        let unreachable = crate::run_environment::ShellRunner::Ssh {
+            agent_shell: Default::default(),
+            host: "mework-test-host.invalid".into(),
+            port: 0,
+            identity_file: String::new(),
+            env: Default::default(),
+        };
+        let state = AppState::default();
+        let read = execute_with_scope_and_attachments(
+            request(anchor.path(), "read", json!({"path": path, "end_line": 2})),
+            &state,
+            ExecutionScope::restricted([
+                fs::canonicalize(anchor.path()).unwrap(),
+                fs::canonicalize(app_data.path()).unwrap(),
+            ]),
+            Some(app_data.path()),
+            &crate::workspace_set::WorkspaceSet::single("/home/dev/app", unreachable),
+            &PromptProfile::builtin_english(),
+        );
+        assert!(read.success, "{}", read.output);
+        assert_eq!(read.output, "saved line\nsaved line");
+    }
+
+    #[test]
+    fn ls_walks_breadth_first_and_leaves_ignored_directories_unexpanded() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // No Git here (unless the temporary directory sits in a work tree),
+        // so the dependency names stand in.
+        // Thirteen characters an entry: 4,000 of them are past the budget.
+        for index in 0..4_000 {
+            let path = root.join(format!("big/sub{index:04}"));
+            fs::create_dir_all(&path).unwrap();
+        }
+        fs::create_dir_all(root.join("node_modules/react")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "\n").unwrap();
+        fs::write(root.join("z-last.txt"), "\n").unwrap();
+        let state = AppState::default();
+        let listed = execute(request(root, "ls", json!({"depth": 2})), &state);
+        assert!(listed.success, "{}", listed.output);
+        // Every top-level entry made it, although `big/` alone could fill the
+        // budget: the cut falls on the deepest level reached.
+        for entry in ["big/", "src/", "z-last.txt"] {
+            assert!(listed.output.lines().any(|line| line == entry), "{entry}");
+        }
+        if !listed.output.contains("node_modules/ (ignored)") {
+            // A work tree around the temporary directory decides otherwise.
+            return;
+        }
+        assert!(!listed.output.contains("node_modules/react"));
+        // The second level is the one cut, and the answer says so.
+        assert!(listed.output.contains("big/sub0000/"));
+        assert!(listed.output.contains("listing cut at the 40000-character limit; it is complete to depth 0."));
+        assert!(listed.output.chars().count() < search_scope::LS_BUDGET_CHARS + 1_000);
+    }
+
+    #[test]
     fn command_output_is_not_reshaped_on_its_way_to_the_model() {
         let profile = PromptProfile::default();
         let padded = format_process_output(
             exit_status(0),
             ShellCompletion::Exited,
-            b"\n  \r\nName       \r\nvalue  \n",
-            b"",
-            false,
-            false,
+            &CapturedStream::whole(b"\n  \r\nName       \r\nvalue  \n"),
+            &CapturedStream::whole(b""),
             None,
             &profile,
         );
@@ -5698,10 +6126,8 @@ mod tests {
         let output = format_process_output(
             exit_status(0),
             ShellCompletion::Exited,
-            &[0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, b'\n'],
-            b"",
-            false,
-            false,
+            &CapturedStream::whole(&[0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, b'\n']),
+            &CapturedStream::whole(b""),
             None,
             &profile,
         );
@@ -5734,10 +6160,8 @@ mod tests {
         let output = format_process_output(
             ExitStatus::from_raw(0),
             ShellCompletion::Exited,
-            b"PS\r\nNODE\nprogress 10%\rprogress 20%\r\n",
-            b"warn\r\n",
-            false,
-            false,
+            &CapturedStream::whole(b"PS\r\nNODE\nprogress 10%\rprogress 20%\r\n"),
+            &CapturedStream::whole(b"warn\r\n"),
             None,
             &profile,
         );
@@ -5754,10 +6178,8 @@ mod tests {
         let output = format_process_output(
             exit_status(2),
             ShellCompletion::Exited,
-            b"partial progress\n",
-            b"fatal: not a git repository\n",
-            false,
-            false,
+            &CapturedStream::whole(b"partial progress\n"),
+            &CapturedStream::whole(b"fatal: not a git repository\n"),
             None,
             &profile,
         );
@@ -5771,10 +6193,8 @@ mod tests {
         let ok = format_process_output(
             exit_status(0),
             ShellCompletion::Exited,
-            b"on main\n",
-            b"note\n",
-            false,
-            false,
+            &CapturedStream::whole(b"on main\n"),
+            &CapturedStream::whole(b"note\n"),
             None,
             &profile,
         );
@@ -5785,10 +6205,8 @@ mod tests {
         let silent = format_process_output(
             exit_status(0),
             ShellCompletion::Exited,
-            b"",
-            b"",
-            false,
-            false,
+            &CapturedStream::whole(b""),
+            &CapturedStream::whole(b""),
             None,
             &profile,
         );
@@ -5804,10 +6222,8 @@ mod tests {
         let output = format_process_output(
             exit_status(1),
             ShellCompletion::TimedOut,
-            b"building...\n",
-            b"",
-            false,
-            false,
+            &CapturedStream::whole(b"building...\n"),
+            &CapturedStream::whole(b""),
             Some(Duration::from_millis(120_000)),
             &profile,
         );
