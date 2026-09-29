@@ -46,11 +46,11 @@ const LANGUAGES = [
   { code: "en", label: "English", htmlLang: "en", dir: "en", catalog: "en-US" },
   { code: "zh-CN", label: "简体中文", htmlLang: "zh-CN", dir: "zh-CN", catalog: "zh-CN" },
 ];
-const PAGES = ["index", "working", "tools", "prompt-profiles", "skills", "mcp", "lsp", "hooks"];
+const PAGES = ["index", "working", "tools", "prompt-profiles", "skills", "mcp", "lsp", "hooks", "privacy"];
 // Short navigation labels; page titles (first heading) stay descriptive.
 const NAV_LABELS = {
-  en: { index: "Overview", working: "Working with Mework", tools: "Tools", "prompt-profiles": "Prompt profiles", skills: "Skills", mcp: "MCP", lsp: "Code navigation", hooks: "Hooks" },
-  "zh-CN": { index: "概览", working: "使用方法", tools: "工具", "prompt-profiles": "提示词档案", skills: "技能", mcp: "MCP", lsp: "代码语义导航", hooks: "钩子" },
+  en: { index: "Overview", working: "Working with Mework", tools: "Tools", "prompt-profiles": "Prompt profiles", skills: "Skills", mcp: "MCP", lsp: "Code navigation", hooks: "Hooks", privacy: "Privacy" },
+  "zh-CN": { index: "概览", working: "使用方法", tools: "工具", "prompt-profiles": "提示词档案", skills: "技能", mcp: "MCP", lsp: "代码语义导航", hooks: "钩子", privacy: "隐私" },
 };
 const UI = {
   en: {
