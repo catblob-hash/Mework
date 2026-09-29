@@ -9,9 +9,10 @@
 
 import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
-import { copyFile, mkdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripAuthenticode } from "./strip-authenticode.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dist = resolve(here, "dist");
@@ -105,6 +106,10 @@ if (!sea) {
   // signature, which injection would invalidate, and an arm64 Mac refuses to
   // run a binary whose signature does not verify.
   if (macos) execFileSync("codesign", ["--remove-signature", exe], { stdio: "inherit" });
+  // And for Windows (`signtool remove /s`): injected around, Node's Authenticode
+  // signature leaves a certificate table nothing can sign over, which fails
+  // signing the sidecar and any MSIX that contains it (strip-authenticode.mjs).
+  if (process.platform === "win32") await writeFile(exe, stripAuthenticode(await readFile(exe)));
   // Run postject's CLI directly instead of `npx postject`: on Windows, npx needs
   // `shell: true` and may fetch packages during the build. The dev dependency has a stable path.
   execFileSync(
@@ -129,8 +134,8 @@ if (!sea) {
   const { size } = await stat(exe);
   process.stderr.write(`[build] ${exe} — ${(size / 1024 / 1024).toFixed(1)} MiB\n`);
   if (process.platform === "win32") {
-    // postject invalidates Node's Authenticode signature. Sign the sidecar
-    // executable separately; signing NSIS does not sign the embedded sidecar.
-    process.stderr.write("[build] 提醒：postject 已使 node.exe 的签名失效，发布前必须对该 exe 单独 Authenticode 签名。\n");
+    // The sidecar is unsigned (Node's signature was removed above); signing the
+    // NSIS installer does not sign the executables inside it.
+    process.stderr.write("[build] 提醒：侧车 exe 未签名（已去掉 node.exe 原有的签名），需要签名时要对它单独 Authenticode 签名。\n");
   }
 }
