@@ -174,6 +174,9 @@ describe("UpdateSettings", () => {
     expect(screen.getByText("MSIX")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "检查更新" })).not.toBeInTheDocument();
     expect(screen.queryByText("正在检查更新…")).not.toBeInTheDocument();
+    expect(screen.getByText("这个版本的更新由 Microsoft Store 提供。")).toBeInTheDocument();
+    expect(screen.queryByText(/GitHub Releases/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "全部发布" })).not.toBeInTheDocument();
     expect(backend.checkAppUpdate).not.toHaveBeenCalled();
   });
 

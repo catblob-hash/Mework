@@ -151,10 +151,13 @@ function VersionCard({
             <ExternalLink size={11} />
             {t("源代码", "Source")}
           </a>
-          <a href={info.releasesUrl} target="_blank" rel="noreferrer noopener">
-            <ExternalLink size={11} />
-            {t("全部发布", "All releases")}
-          </a>
+          {/* The MSIX edition comes from the Store; it does not point at other downloads. */}
+          {updatesInApp(info) && (
+            <a href={info.releasesUrl} target="_blank" rel="noreferrer noopener">
+              <ExternalLink size={11} />
+              {t("全部发布", "All releases")}
+            </a>
+          )}
         </div>
       )}
     </article>
@@ -439,10 +442,12 @@ export function UpdateSettings({
     <section className="settings-page update-settings">
       <SettingsPageHeading
         title={t("版本更新", "Updates")}
-        description={t(
-          "从 GitHub Releases 检查新版本。安装版可以在应用内下载并安装；便携版下载压缩包后由你手动替换。",
-          "Check GitHub Releases for a newer version. The installer flavor downloads and installs in place; the portable flavor downloads the archive for you to unpack."
-        )}
+        description={inApp
+          ? t(
+            "从 GitHub Releases 检查新版本。安装版可以在应用内下载并安装；便携版下载压缩包后由你手动替换。",
+            "Check GitHub Releases for a newer version. The installer flavor downloads and installs in place; the portable flavor downloads the archive for you to unpack."
+          )
+          : t("这个版本的更新由 Microsoft Store 提供。", "This edition is updated by the Microsoft Store.")}
         action={connected && inApp ? (
           <div className="settings-page-heading__actions">
             <button
