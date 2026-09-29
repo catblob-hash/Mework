@@ -5,6 +5,7 @@ import App from "./App";
 import { configureI18n } from "./i18n";
 import type {
   AppDocument,
+  ContextItem,
   ModelRunRequest,
   ToolContext
 } from "./types";
@@ -502,7 +503,10 @@ describe("App model run flow — timeline", () => {
       { id: "fork-u2", kind: "user", content: "第二问", createdAt: "2026-07-20T00:00:03Z" }
     ];
     runtimeMocks.loadDocument.mockResolvedValue(document);
-    runtimeMocks.forkConversationContexts.mockImplementation(async ({ sourceContexts, throughContextId }) => {
+    runtimeMocks.forkConversationContexts.mockImplementation(async ({ sourceContexts, throughContextId }: {
+      sourceContexts: ContextItem[];
+      throughContextId: string;
+    }) => {
       const cut = sourceContexts.findIndex((context) => context.id === throughContextId);
       const copy = runtimeMocks.forkConversationContexts.mock.calls.length;
       return sourceContexts.slice(0, cut + 1).map((context) => ({ ...context, id: `${context.id}-copy${copy}` }));

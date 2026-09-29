@@ -3,6 +3,11 @@
 //! `mlx/mework_mlx.cpp` against it into `libmework_mlx.dylib`, beside
 //! `libmlx.dylib`.
 //!
+//! The wheel comes from PyPI's file host or, when that fails or crawls, from
+//! its mirrors in mainland China, which serve every file at the same path;
+//! `$MEWORK_MLX_MIRROR` (such a host, e.g. `https://pypi.tuna.tsinghua.edu.cn`)
+//! is tried before them all. The SHA-256 is checked whatever the host.
+//!
 //! Prebuilt, because building MLX from source needs the Metal shader compiler,
 //! which only ships with the full Xcode. A dylib the app `dlopen`s, because
 //! MLX needs macOS 14 and the app starts on macOS 13; nothing links against
@@ -20,8 +25,19 @@ use std::process::Command;
 
 /// Also read by `scripts/stage-macos-mlx.mjs`.
 const MLX_VERSION: &str = "0.32.2";
-const WHEEL_URL: &str = "https://files.pythonhosted.org/packages/f7/ab/ba1952908c5d2a5070cf1cfbfea0161c4751ea62299e2776819810917483/mlx_metal-0.32.2-py3-none-macosx_14_0_arm64.whl";
+/// The wheel's path on a PyPI file host.
+const WHEEL_PATH: &str = "packages/f7/ab/ba1952908c5d2a5070cf1cfbfea0161c4751ea62299e2776819810917483/mlx_metal-0.32.2-py3-none-macosx_14_0_arm64.whl";
 const WHEEL_SHA256: &str = "3825fff379dbc107dd3413e564a06caeaa24819910ec49c0439e454c06a1b9b8";
+/// Tried in turn, after `$MEWORK_MLX_MIRROR`: PyPI's own, then Tsinghua
+/// (TUNA), Aliyun, USTC and Tencent Cloud.
+const WHEEL_HOSTS: &[&str] = &[
+    "https://files.pythonhosted.org",
+    "https://pypi.tuna.tsinghua.edu.cn",
+    "https://mirrors.aliyun.com/pypi",
+    "https://mirrors.ustc.edu.cn/pypi",
+    "https://mirrors.cloud.tencent.com/pypi",
+];
+const MIRROR_ENV: &str = "MEWORK_MLX_MIRROR";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -55,15 +71,31 @@ fn fetch(root: &Path) {
     let parent = root.parent().expect("mlx dir has a parent");
     fs::create_dir_all(parent).expect("create .mlx");
     let wheel = parent.join(format!("mlx_metal-{MLX_VERSION}.whl.part"));
-    let status = Command::new("curl")
-        .args(["--fail", "--location", "--silent", "--show-error", "--retry", "3", "-o"])
-        .arg(&wheel)
-        .arg(WHEEL_URL)
-        .status()
-        .expect("run curl");
-    assert!(status.success(), "下载 MLX（{WHEEL_URL}）失败");
-    let digest = sha256_hex(&fs::read(&wheel).expect("read wheel"));
-    assert_eq!(digest, WHEEL_SHA256, "MLX 安装包校验失败");
+    let mirror = env::var(MIRROR_ENV).ok().filter(|base| !base.trim().is_empty());
+    let hosts: Vec<&str> = mirror.iter().map(|base| base.trim()).chain(WHEEL_HOSTS.iter().copied()).collect();
+    let mut failures = Vec::new();
+    let fetched = hosts.iter().enumerate().find_map(|(index, host)| {
+        let url = format!("{}/{WHEEL_PATH}", host.trim_end_matches('/'));
+        match download(&url, &wheel, index + 1 == hosts.len()) {
+            Ok(()) => Some(url),
+            Err(error) => {
+                failures.push(format!("{url}: {error}"));
+                None
+            }
+        }
+    });
+    let Some(url) = fetched else {
+        let _ = fs::remove_file(&wheel);
+        panic!(
+            "下载 MLX 运行库失败，每个源都试过了：\n  {}\n\
+             可用 {MIRROR_ENV} 指定一个 PyPI 镜像（按 packages/ 路径提供文件），\
+             或把解开的 mlx-metal {MLX_VERSION} wheel 放进 MEWORK_MLX_DIR。",
+            failures.join("\n  ")
+        );
+    };
+    if !failures.is_empty() {
+        println!("cargo:warning=MLX 运行库改从 {url} 下载；先前失败：{}", failures.join("；"));
+    }
     let staging = parent.join(format!("{MLX_VERSION}.unpacking"));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging).expect("create staging");
@@ -79,6 +111,29 @@ fn fetch(root: &Path) {
     let _ = fs::remove_dir_all(root);
     fs::rename(&staging, root).expect("place mlx");
     let _ = fs::remove_file(&wheel);
+}
+
+/// Fetches `url` into `wheel` and checks it against `WHEEL_SHA256`. Unless
+/// it is the `last` host, one that stays under 64 KiB/s for 30 s (over ten
+/// minutes for the 42 MB wheel) gives way to the next.
+fn download(url: &str, wheel: &Path, last: bool) -> Result<(), String> {
+    let _ = fs::remove_file(wheel);
+    let mut curl = Command::new("curl");
+    curl.args(["--fail", "--location", "--silent", "--show-error", "--retry", "1", "--connect-timeout", "15"]);
+    if !last {
+        curl.args(["--speed-limit", "65536", "--speed-time", "30"]);
+    }
+    let output = curl.arg("-o").arg(wheel).arg(url).output().expect("run curl");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr.lines().rev().map(str::trim).find(|line| !line.is_empty());
+        return Err(reason.map_or_else(|| output.status.to_string(), str::to_owned));
+    }
+    let digest = sha256_hex(&fs::read(wheel).map_err(|error| format!("读不到下载的文件: {error}"))?);
+    if digest != WHEEL_SHA256 {
+        return Err(format!("sha256 不符（{digest}）"));
+    }
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

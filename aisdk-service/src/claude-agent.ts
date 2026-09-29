@@ -12,7 +12,7 @@
 //! handlers with the results and streams the following model reply.
 //!
 //! Version. The executable is the CLI inside the Agent SDK's own platform
-//! package, pinned exactly (SDK `0.3.282`, Claude Code `2.1.282`) and shipped
+//! package, pinned exactly (SDK `0.3.284`, Claude Code `2.1.284`) and shipped
 //! beside the application; the host resolves it and sends the path in
 //! `agent.executable`. The user's own install is never consulted. That is what
 //! makes this module's knowledge of CLI behaviour — which switches exist, what the
@@ -117,7 +117,7 @@ const EVICTION_SWEEP_MS = 60 * 60 * 1000;
  * seen. Mework ships one Claude Code build, so this is that build rather than a
  * guess; a live session still prefers the version its own `init` reported.
  */
-const FALLBACK_CLI_VERSION = "2.1.282";
+const FALLBACK_CLI_VERSION = "2.1.284";
 /**
  * Prompt used when a tool round must continue in a fresh CLI session (the parked
  * session is gone). The transcript then already ends with the tool results, and

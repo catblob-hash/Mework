@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useAppearance } from "../lib/appearance";
 import { parseBackground, replacesThemeGround } from "../lib/background";
 import { backgroundImageData, tierCovers, useBackgroundLibraryGeneration } from "../lib/backgroundImage";
+import { setBackdropPicture } from "../lib/glassGround";
 import type { BackgroundImageData } from "../types";
 
 function devicePixels(): { width: number; height: number } {
@@ -103,16 +104,26 @@ export function AppBackdrop() {
     };
   }, [bundled, focus, imported, libraryGeneration]);
 
+  // Boxes painted like the glass read the ground's colour off the picture once it has
+  // loaded (the `<img>`'s `onLoad`), and off this layer while none is shown.
+  const showsPicture = layered && picture !== null && background.kind !== "solid";
+  const solid = background.kind === "solid" ? background.scheme ?? "theme" : "theme";
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new solid ground is a new colour to read, though nothing here reads it.
+  useEffect(() => {
+    if (!showsPicture) setBackdropPicture(null);
+  }, [showsPicture, solid]);
+
   if (!layered) return null;
   // Between two pictures the previous one stays up until the next has arrived, rather
   // than blinking out to the ground.
   return (
     <div
       className="app-backdrop"
-      data-solid={background.kind === "solid" ? background.scheme ?? "theme" : "theme"}
+      data-solid={solid}
       aria-hidden="true"
     >
       {picture && background.kind !== "solid" && (
+        // biome-ignore lint/a11y/noNoninteractiveElementInteractions: `onLoad` is the picture arriving, not the user interacting.
         <img
           key={picture.key}
           className="app-backdrop__image"
@@ -121,6 +132,7 @@ export function AppBackdrop() {
           alt=""
           draggable={false}
           decoding="async"
+          onLoad={(event) => setBackdropPicture(event.currentTarget)}
         />
       )}
     </div>

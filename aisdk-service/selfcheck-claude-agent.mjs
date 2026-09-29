@@ -251,17 +251,28 @@ function textOf(message) {
  * `<system-reminder>` block of its own as a trailing `system`-role message (the
  * context plugin leaves out the environment, model and date ones it would
  * otherwise carry); that is CLI-authored context, not a turn the host projected,
- * so the checks on "what ends the conversation" look past it. Only a reminder is
- * skipped — anything else trailing the conversation must fail.
+ * so the checks on "what ends the conversation" look past it. Since 2.1.284 the
+ * CLI may also append an effort marker: a `system` message with no content that
+ * carries only `output_config` (the same effort as the request's top level). It
+ * adds nothing the model reads and is skipped too. Only these two are skipped —
+ * anything else trailing the conversation must fail.
  */
 function lastTurnMessage(messages) {
   const list = Array.isArray(messages) ? messages : [];
   for (let index = list.length - 1; index >= 0; index -= 1) {
     const message = list[index];
     if (message?.role === "system" && textOf(message).includes("<system-reminder>")) continue;
+    if (isEffortMarker(message)) continue;
     return message;
   }
   return undefined;
+}
+
+/** `{ role: "system", content: [], output_config }` and nothing more. */
+function isEffortMarker(message) {
+  if (message?.role !== "system" || !Array.isArray(message.content) || message.content.length !== 0) return false;
+  const extra = Object.keys(message).filter((key) => key !== "role" && key !== "content");
+  return extra.length === 1 && extra[0] === "output_config";
 }
 
 function describe(frame) {
@@ -381,7 +392,7 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
   ];
   const requestText = [systemText, ...(call1?.messages ?? []).map(textOf)].join("\n");
   const leaked = CLI_CONTEXT.filter(([, pattern]) => pattern.test(requestText)).map(([name]) => name);
-  const firstPrompt = (call1?.messages ?? []).at(-1);
+  const firstPrompt = lastTurnMessage(call1?.messages);
   check(
     "30 claude-agent：CLI 自带的环境块、模型身份句、日期都被插件略去，上游请求里一处都没有",
     leaked.length === 0,

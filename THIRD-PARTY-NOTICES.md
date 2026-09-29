@@ -280,15 +280,15 @@ SOFTWARE.
 ## `@anthropic-ai/claude-agent-sdk` — Anthropic Commercial Terms of Service
 
 **Bundled file:** the SDK's JavaScript (`sdk.mjs` of
-`@anthropic-ai/claude-agent-sdk` 0.3.282, declared in
+`@anthropic-ai/claude-agent-sdk` 0.3.284, declared in
 [`aisdk-service/package.json`](aisdk-service/package.json)) is compiled into the
 sidecar executable `mework-aisdk.exe` by esbuild. It is the runtime behind the
 "Claude Agent (Claude Code)" provider family (`aisdk-service/src/claude-agent.ts`).
 
 **Distributed file:** Mework also distributes the Claude Code executable from the
-platform package `@anthropic-ai/claude-agent-sdk-win32-x64` 0.3.282 as
+platform package `@anthropic-ai/claude-agent-sdk-win32-x64` 0.3.284 as
 `claude.exe` beside the main application executable — a file of its own, not
-bundled into either Mework binary. That executable is Claude Code 2.1.282 and is
+bundled into either Mework binary. That executable is Claude Code 2.1.284 and is
 staged by `src-tauri/build.rs` from the pinned platform package.
 
 The package is not open source: it is © Anthropic, PBC and licensed under

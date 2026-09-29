@@ -212,7 +212,7 @@ fn stage_aisdk_sidecar() {
 /// pin and this constant together, then running the sidecar selfcheck, which
 /// drives the new CLI and asserts what it sends upstream
 /// (`aisdk-service/selfcheck-claude-agent.mjs`).
-const CLAUDE_CODE_VERSION: &str = "2.1.282";
+const CLAUDE_CODE_VERSION: &str = "2.1.284";
 
 /// The Agent SDK's npm platform package for the build target, in the SDK's own
 /// naming: `process.platform`-`process.arch`, plus `-musl` where the C library
@@ -304,7 +304,7 @@ fn stage_claude_code() {
     println!("cargo:rerun-if-changed={}", staged.display());
 
     // The SDK ships the CLI's version in its own manifest. Checking it before the
-    // copy is what makes "Mework runs Claude Code 2.1.282" a fact about the build
+    // copy is what makes "Mework runs Claude Code 2.1.284" a fact about the build
     // rather than a hope about node_modules.
     if let Ok(text) = fs::read_to_string(&sdk_manifest) {
         let declared = json_string_field(&text, "claudeCodeVersion");

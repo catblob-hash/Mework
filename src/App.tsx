@@ -56,6 +56,7 @@ import type { ConversationStatus } from "./components/Sidebar";
 import { ShellNav, useWindowFullscreen, WindowFrame } from "./components/WindowChrome";
 import { ConversationSearch } from "./components/ConversationSearch";
 import { windowChromeKind } from "./lib/windowChrome";
+import { glassGroundRef } from "./lib/glassGround";
 import {
   conversationHistoryTarget,
   EMPTY_CONVERSATION_HISTORY,
@@ -631,6 +632,9 @@ function ErrorView({ message, onReset }: { message: string; onReset: () => void 
     </div>
   );
 }
+
+/** Over glass the chips above the composer are solid, painted like the glass under each. */
+const composerChipsGround = glassGroundRef(".composer-chip-group, .composer-chip:not(.composer-chip--flush)");
 
 function App() {
   const { resolvedLanguage, t } = useI18n();
@@ -8719,7 +8723,7 @@ function App() {
                   )}
                 />
                 {/* Project, workspace, and branch describe where the conversation runs, so they sit above the composer rather than inside it. */}
-                <div className="composer-context">
+                <div ref={composerChipsGround} className="composer-context">
                     {/* The project is chosen before the task starts; once the conversation has
                         content it belongs to that project for good, and the chip goes away. */}
                     {!activeConversationStarted && (

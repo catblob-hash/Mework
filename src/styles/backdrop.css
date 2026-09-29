@@ -27,6 +27,9 @@
   --glass-edge: var(--color-ffffff-ap45);
   --glass-sheen: var(--color-ffffff-ap28);
   --glass-shadow: var(--color-000000-ap13);
+  /* A draft's clearer glass (below). It is kept on the root rather than on the draft's tile
+     so that the chip row's sampler (lib/glassGround.ts) can read it whatever the pane shows. */
+  --glass-draft-filter: blur(7px) saturate(200%) brightness(1.06);
 }
 /* Mirroring would turn the edge and sheen dark and the shadow light; night glass
    still catches light on its rim and still casts a shadow, so it takes the tokens
@@ -39,6 +42,7 @@
   --glass-edge: var(--color-000000-ap13);
   --glass-sheen: var(--color-000000-ap6);
   --glass-shadow: var(--color-ffffff-ap34);
+  --glass-draft-filter: blur(7px) saturate(180%) brightness(.92);
 }
 /* The top bar's strip: frosted, and denser than the panes it fades over. It reaches
    `--strip-reach` below the bar, and the tiles rise `--tile-rise` into the bar's foot. */
@@ -521,6 +525,30 @@
 :root[data-glass="true"] .context-usage-meter__trigger:not(.context-usage-meter__trigger--warning, .context-usage-meter__trigger--danger) { color: var(--text); }
 :root[data-glass="true"] .context-usage-meter__track { stroke: color-mix(in srgb, var(--text) 24%, transparent); }
 
+/* The chips above the composer are solid. They float over the timeline's foot, where the
+   glass lies under them and text scrolls out beneath, and a draft's were glass over its
+   glass: a filter over a filter, or a box repainting over one, is what leaves the stray
+   blocks macOS draws on screen. Each is painted instead with what the glass shows there,
+   its tint over the ground its filter makes of the background under the chip, which
+   `lib/glassGround.ts` sets on each. A hover or an open menu is a veil over that. A chip
+   in the branch group is solid through the group. These rules outrank the chips' own
+   hover and open states, which are restated after them. */
+:root[data-glass="true"] .composer-context :is(.composer-chip-group, .composer-chip:not(.composer-chip--flush)) {
+  --glass-chip: linear-gradient(var(--glass-tile), var(--glass-tile)) var(--glass-ground, var(--app));
+  background: var(--glass-chip);
+}
+/* A draft's chips are the dense controls its clear glass needs, over that glass. */
+:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer-context :is(.composer-chip-group, .composer-chip:not(.composer-chip--flush)) {
+  --glass-chip:
+    linear-gradient(var(--glass-control), var(--glass-control)),
+    linear-gradient(var(--glass-draft), var(--glass-draft)) var(--glass-ground-draft, var(--app));
+  box-shadow: 0 2px 8px var(--glass-shadow);
+}
+:root[data-glass="true"] .composer-context .composer-chip:not(.composer-chip--flush):is(:hover:not(:disabled), .popover-menu__trigger--open, .git-status-card__toggle:focus-visible),
+:root[data-glass="true"] .composer-context .git-status-card--expanded .git-status-card__toggle {
+  background: linear-gradient(var(--subtle), var(--subtle)), var(--glass-chip);
+}
+
 /*
  * An empty timeline — a draft — holds nothing but a line of text in the middle and
  * the composer at its foot, so its glass is the clearest in the window, top to bottom:
@@ -534,13 +562,12 @@
  *
  * The empty-state line and the cat on the composer's rim have no glass of their own
  * under them, so they carry a soft halo in the ground's colour. The composer and the
- * controls above and below it are dense glass of their own: over glass this clear,
- * a halo was not enough to read them by.
+ * controls below it are dense glass of their own, and the chips above it are as dense
+ * but solid: over glass this clear, a halo was not enough to read them by.
  */
 :root[data-glass="true"] .pane-tiles > .pane-tiles__chat:has(.context-stream > .empty-state) {
   --glass-light: var(--color-ffffff);
   --glass-draft: color-mix(in srgb, var(--app) 12%, transparent);
-  --glass-draft-filter: blur(7px) saturate(200%) brightness(1.06);
   --glass-glint: color-mix(in srgb, var(--glass-light) 78%, transparent);
   --glass-glint-soft: color-mix(in srgb, var(--glass-light) 30%, transparent);
   --glass-glow: color-mix(in srgb, var(--glass-light) 24%, transparent);
@@ -553,7 +580,6 @@
 :root[data-glass="true"][data-theme="night"] .pane-tiles > .pane-tiles__chat:has(.context-stream > .empty-state) {
   --glass-light: var(--color-000000);
   --glass-draft: color-mix(in srgb, var(--app) 30%, transparent);
-  --glass-draft-filter: blur(7px) saturate(180%) brightness(.92);
   --glass-glint: color-mix(in srgb, var(--glass-light) 50%, transparent);
   --glass-glint-soft: color-mix(in srgb, var(--glass-light) 16%, transparent);
   --glass-glow: color-mix(in srgb, var(--glass-light) 12%, transparent);
@@ -605,11 +631,9 @@
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
 }
-/* The chips above the composer and the controls below it are small glass of their own.
-   `:where` keeps these rules at the controls' own weight, so their hover and open states
-   still paint over the glass. A chip in the branch group is glass through the group. */
-:where(:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer-context)
-  :is(.composer-chip-group, .composer-chip:where(:not(.composer-chip--flush))),
+/* The controls below the composer are small glass of their own. `:where` keeps this rule
+   at the controls' own weight, so their hover and open states still paint over the glass.
+   The chips above it are solid (above). */
 :where(:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer__footer)
   :is(.composer-option, .composer-add-menu__trigger, .context-usage-meter__trigger) {
   background: var(--glass-control);
