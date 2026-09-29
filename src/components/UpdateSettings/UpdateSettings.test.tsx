@@ -161,6 +161,22 @@ describe("UpdateSettings", () => {
     expect(backend.checkAppUpdate).toHaveBeenCalledTimes(1);
   });
 
+  it("leaves an MSIX install to the Microsoft Store and never checks GitHub", async () => {
+    updateMocks.appVersionInfo.mockResolvedValue({
+      ...versionInfo,
+      flavor: "msix",
+      executableDir: "C:\\Program Files\\WindowsApps\\Mework_1.0.0.0_x64__abc"
+    });
+    const backend = createBackend();
+    render(<UpdateSettings controller={createAppUpdateController(backend)} />);
+
+    expect(await screen.findByText("由 Microsoft Store 更新")).toBeInTheDocument();
+    expect(screen.getByText("MSIX")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "检查更新" })).not.toBeInTheDocument();
+    expect(screen.queryByText("正在检查更新…")).not.toBeInTheDocument();
+    expect(backend.checkAppUpdate).not.toHaveBeenCalled();
+  });
+
   it("renders an available release, its asset, and markdown notes", async () => {
     const backend = createBackend();
     backend.checkAppUpdate.mockResolvedValue(availableCheck);

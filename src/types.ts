@@ -1417,7 +1417,7 @@ export interface EnvironmentToolSnapshot {
 }
 
 /** How this copy of Mework was installed. Mirrors Rust `app_update::InstallFlavor`. */
-export type AppInstallFlavor = "installer" | "portable";
+export type AppInstallFlavor = "installer" | "portable" | "msix";
 
 /** Running version and install shape. Mirrors Rust `app_update::AppVersionInfo`. */
 export interface AppVersionInfo {

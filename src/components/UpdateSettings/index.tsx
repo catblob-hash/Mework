@@ -52,7 +52,41 @@ function formatDateTime(iso: string, locale: string): string {
 }
 
 function flavorLabel(info: AppVersionInfo, t: TranslationFunction): string {
-  return info.flavor === "installer" ? t("安装版", "Installer") : t("便携版", "Portable");
+  switch (info.flavor) {
+    case "installer":
+      return t("安装版", "Installer");
+    case "portable":
+      return t("便携版", "Portable");
+    case "msix":
+      return "MSIX";
+  }
+}
+
+/** An MSIX install is Windows' to update (the Microsoft Store's), so the page never checks. */
+function updatesInApp(info: AppVersionInfo | null): boolean {
+  return info?.flavor !== "msix";
+}
+
+function StoreUpdatesCard() {
+  const { t } = useI18n();
+  return (
+    <article className="update-settings__card update-settings__update update-settings__update--neutral">
+      <div className="update-settings__status">
+        <span className="update-settings__status-icon" aria-hidden="true">
+          <ShieldCheck size={18} />
+        </span>
+        <div className="update-settings__status-copy">
+          <strong>{t("由 Microsoft Store 更新", "Updated by the Microsoft Store")}</strong>
+          <span>
+            {t(
+              "这是 MSIX 版，Windows 管理它的安装与更新：从 Microsoft Store 安装的会由 Store 自动更新，应用内不检查也不下载新版本。",
+              "This is the MSIX edition, which Windows installs and updates: installed from the Microsoft Store, it is kept up to date by the Store, and the app neither checks for nor downloads new versions itself."
+            )}
+          </span>
+        </div>
+      </div>
+    </article>
+  );
 }
 
 function VersionCard({
@@ -385,16 +419,21 @@ export function UpdateSettings({
     let cancelled = false;
     appVersionInfo()
       .then((next) => {
-        if (!cancelled) setInfo(next);
+        if (cancelled) return;
+        setInfo(next);
+        if (updatesInApp(next)) void controller.check();
       })
       .catch((error: unknown) => {
-        if (!cancelled) setInfoError(errorMessage(error));
+        if (cancelled) return;
+        setInfoError(errorMessage(error));
+        // Without the flavor the check still runs; the host refuses it for an MSIX install.
+        void controller.check();
       });
-    void controller.check();
     return () => {
       cancelled = true;
     };
   }, [connected, controller]);
+  const inApp = updatesInApp(info);
 
   return (
     <section className="settings-page update-settings">
@@ -404,7 +443,7 @@ export function UpdateSettings({
           "从 GitHub Releases 检查新版本。安装版可以在应用内下载并安装；便携版下载压缩包后由你手动替换。",
           "Check GitHub Releases for a newer version. The installer flavor downloads and installs in place; the portable flavor downloads the archive for you to unpack."
         )}
-        action={connected ? (
+        action={connected && inApp ? (
           <div className="settings-page-heading__actions">
             <button
               type="button"
@@ -421,7 +460,9 @@ export function UpdateSettings({
       />
 
       <VersionCard info={info} infoError={infoError} connected={connected} />
-      {connected && <UpdateCard state={state} info={info} controller={controller} />}
+      {connected && (inApp
+        ? <UpdateCard state={state} info={info} controller={controller} />
+        : <StoreUpdatesCard />)}
     </section>
   );
 }

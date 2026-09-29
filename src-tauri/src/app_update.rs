@@ -19,6 +19,9 @@
 //! hosts still run the check and learn the latest version and its release page, but the check
 //! selects no asset for them (see [`supports_in_app_install`]) and a download request is refused
 //! before any directory is touched.
+//!
+//! An MSIX install ([`InstallFlavor::Msix`]) never checks here at all: Windows owns the package,
+//! and the Microsoft Store is what updates it (its policy forbids a Store app updating itself).
 
 use std::{
     fmt, fs,
@@ -72,15 +75,40 @@ pub enum InstallFlavor {
     Installer,
     /// Unzipped anywhere; the user replaces the files themselves.
     Portable,
+    /// An MSIX package (the Microsoft Store's, or the release's sideloaded `.msix`). Windows
+    /// installed it and Windows updates it; nothing in the app checks, downloads or installs.
+    Msix,
 }
 
-/// The NSIS installer always writes its uninstaller beside the main binary, and nothing else
-/// puts an `uninstall.exe` there, so its presence is the flavor.
+impl InstallFlavor {
+    /// Whether the app itself may look for, download and hand off a newer version.
+    pub fn updates_in_app(self) -> bool {
+        match self {
+            InstallFlavor::Installer | InstallFlavor::Portable => true,
+            InstallFlavor::Msix => false,
+        }
+    }
+}
+
+/// An MSIX package root holds its `AppxManifest.xml` beside the main binary, and the NSIS
+/// installer always writes its uninstaller there; nothing else puts either file in that
+/// directory, so their presence is the flavor.
 pub fn detect_flavor(executable_dir: &Path) -> InstallFlavor {
-    if executable_dir.join("uninstall.exe").is_file() {
+    if executable_dir.join("AppxManifest.xml").is_file() {
+        InstallFlavor::Msix
+    } else if executable_dir.join("uninstall.exe").is_file() {
         InstallFlavor::Installer
     } else {
         InstallFlavor::Portable
+    }
+}
+
+/// Refuses every update step for a flavor the app does not update itself.
+fn require_updates_in_app(flavor: InstallFlavor) -> Result<(), String> {
+    if flavor.updates_in_app() {
+        Ok(())
+    } else {
+        Err("MSIX 版由 Microsoft Store 更新，不在应用内检查或下载".to_owned())
     }
 }
 
@@ -402,6 +430,7 @@ pub fn select_asset(
                     lower.ends_with("-setup.exe") || lower.ends_with("_setup.exe")
                 }
                 InstallFlavor::Portable => lower.ends_with(".zip") && lower.contains("portable"),
+                InstallFlavor::Msix => false,
             }
         })
         .collect::<Vec<_>>();
@@ -589,6 +618,7 @@ pub fn check_for_update(
     current_version: &str,
     flavor: InstallFlavor,
 ) -> Result<UpdateCheck, String> {
+    require_updates_in_app(flavor)?;
     let (owner, repo) = repository_slug(REPOSITORY_URL)?;
     let platform = crate::host_platform::host_platform();
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
@@ -723,13 +753,17 @@ fn check_via_release_redirects(
             conventional_asset_names(&latest.to_plain_string(), arch_token());
         let download_base = format!("https://github.com/{owner}/{repo}/releases/download/{tag}");
         let wanted = match flavor {
-            InstallFlavor::Installer => installer,
-            InstallFlavor::Portable => portable,
+            InstallFlavor::Installer => Some(installer),
+            InstallFlavor::Portable => Some(portable),
+            InstallFlavor::Msix => None,
         };
-        (
-            probe_asset(client, &format!("{download_base}/{wanted}"), &wanted),
-            probe_asset(client, &format!("{download_base}/{checksums}"), checksums),
-        )
+        match wanted {
+            Some(wanted) => (
+                probe_asset(client, &format!("{download_base}/{wanted}"), &wanted),
+                probe_asset(client, &format!("{download_base}/{checksums}"), checksums),
+            ),
+            None => (None, None),
+        }
     } else {
         (None, None)
     };
@@ -877,11 +911,13 @@ pub fn validate_release_download_url(url: &Url, expected_name: &str) -> Result<S
 }
 
 pub fn validate_asset(asset: &ReleaseAsset, flavor: InstallFlavor) -> Result<Url, String> {
+    require_updates_in_app(flavor)?;
     validate_asset_file_name(&asset.name)?;
     let lower = asset.name.to_ascii_lowercase();
     let expected = match flavor {
         InstallFlavor::Installer => ".exe",
         InstallFlavor::Portable => ".zip",
+        InstallFlavor::Msix => unreachable!("refused above"),
     };
     if !lower.ends_with(expected) {
         return Err(format!(
@@ -1583,6 +1619,35 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         fs::create_dir(other.path().join("uninstall.exe")).unwrap();
         assert_eq!(detect_flavor(other.path()), InstallFlavor::Portable);
+    }
+
+    #[test]
+    fn an_msix_package_root_is_the_msix_flavor_and_never_updates_in_app() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("AppxManifest.xml"), b"<Package/>").unwrap();
+        assert_eq!(detect_flavor(directory.path()), InstallFlavor::Msix);
+        // The manifest wins over a stray uninstaller: Windows owns the package either way.
+        fs::write(directory.path().join("uninstall.exe"), b"stub").unwrap();
+        assert_eq!(detect_flavor(directory.path()), InstallFlavor::Msix);
+
+        assert!(InstallFlavor::Installer.updates_in_app());
+        assert!(InstallFlavor::Portable.updates_in_app());
+        assert!(!InstallFlavor::Msix.updates_in_app());
+        let assets = vec![
+            asset("Mework_1.1.0_x64-setup.exe"),
+            asset("Mework_1.1.0_x64_portable.zip"),
+            asset("Mework_1.1.0_x64.msix"),
+            asset("Mework-setup.exe"),
+        ];
+        for arch in ["x64", "arm64", "unknown"] {
+            assert_eq!(select_on_windows(&assets, InstallFlavor::Msix, arch), None, "{arch}");
+        }
+        let refused = validate_asset(&asset("Mework_1.1.0_x64-setup.exe"), InstallFlavor::Msix)
+            .unwrap_err();
+        assert!(refused.contains("Microsoft Store"), "{refused}");
+        let refused = check_for_update("1.0.0", InstallFlavor::Msix).unwrap_err();
+        assert!(refused.contains("Microsoft Store"), "{refused}");
+        assert_eq!(serde_json::to_value(InstallFlavor::Msix).unwrap(), "msix");
     }
 
     #[test]

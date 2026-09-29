@@ -14,6 +14,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { msixFileNames } from "./package-msix-plan.mjs";
 import { formatSha256Sums, releaseAssetNames } from "./release-assets-plan.mjs";
 
 const label = "[release:assets]";
@@ -69,6 +70,22 @@ if (missing.length > 0) {
       + "Run npm run tauri:build and npm run package:portable first."
   );
 }
+// The sideloadable MSIX and the certificate that signed it, when `npm run package:msix --
+// --sign <thumbprint>` made them. The unsigned Store package is uploaded to Partner Center,
+// not to the release.
+const msixNames = msixFileNames(packageVersion);
+const msixAssets = [
+  { name: msixNames.signed, from: path.join(releaseDirectory, "msix", msixNames.signed) },
+  { name: msixNames.certificate, from: path.join(releaseDirectory, "msix", msixNames.certificate) }
+];
+const msixPresent = msixAssets.filter((asset) => fs.existsSync(asset.from));
+if (msixPresent.length === msixAssets.length) {
+  assets.push(...msixAssets);
+} else if (msixPresent.length > 0) {
+  fail(`Only part of the signed MSIX is built: ${msixPresent.map((asset) => asset.name).join(", ")}`);
+} else {
+  console.log(`${label} No signed MSIX (npm run package:msix -- --sign <thumbprint>); releasing without it.`);
+}
 
 const outputDirectory = path.resolve(
   out ?? path.join(releaseDirectory, "release-assets")
@@ -79,7 +96,7 @@ const checksummedAssets = await Promise.all(assets.map(async (asset) => ({
   sha256: await sha256File(asset.from)
 })));
 
-// Only the three staged files are replaced. The output directory itself is never removed:
+// Only the staged files are replaced. The output directory itself is never removed:
 // `--out` may point at a directory the user also keeps other things in.
 fs.mkdirSync(outputDirectory, { recursive: true });
 for (const asset of checksummedAssets) {
@@ -98,12 +115,11 @@ for (const asset of checksummedAssets) {
   );
 }
 
-const installer = path.join(outputDirectory, assetNames.installer);
-const portable = path.join(outputDirectory, assetNames.portable);
-const checksums = path.join(outputDirectory, assetNames.checksums);
+const uploads = [...checksummedAssets.map((asset) => asset.name), assetNames.checksums]
+  .map((name) => path.join(outputDirectory, name));
 console.log(`${label} Upload these exact assets to the v${packageVersion} tag:`);
 console.log(
-  `gh release create v${packageVersion} ${installer} ${portable} ${checksums}`
+  `gh release create v${packageVersion} ${uploads.join(" ")}`
     + ` --title "Mework ${packageVersion}" --notes-file <release-notes.md>`
 );
 console.log(`${label} The in-app updater matches these exact asset name patterns; the tag must be v${packageVersion}.`);

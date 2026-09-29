@@ -1725,7 +1725,8 @@ async fn download_app_update(
         .map_err(|error| format!("无法解析应用本地数据目录: {error}"))?
         .join("updates");
     let destination_dir = match flavor {
-        app_update::InstallFlavor::Installer => updates_dir,
+        // An MSIX install is refused by `download_update` before this directory is touched.
+        app_update::InstallFlavor::Installer | app_update::InstallFlavor::Msix => updates_dir,
         app_update::InstallFlavor::Portable => dirs::download_dir().unwrap_or(updates_dir),
     };
     let request = app_update::DownloadRequest {
@@ -1794,6 +1795,10 @@ async fn install_app_update(
             Ok(app_update::InstallOutcome {
                 action: app_update::InstallAction::Revealed,
             })
+        }
+        // Never downloaded: `download_update` refuses an MSIX install.
+        app_update::InstallFlavor::Msix => {
+            Err("MSIX 版由 Microsoft Store 更新，不在应用内安装".to_owned())
         }
     }
 }
