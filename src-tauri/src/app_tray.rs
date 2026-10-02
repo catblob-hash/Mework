@@ -177,8 +177,9 @@ fn tray_icon(_app: &AppHandle) -> Result<Image<'static>, String> {
 
 #[cfg(not(target_os = "macos"))]
 fn tray_icon(app: &AppHandle) -> Result<Image<'static>, String> {
+    // The window icon is borrowed from the app; the tray keeps its own copy.
     app.default_window_icon()
-        .cloned()
+        .map(|icon| icon.clone().to_owned())
         .ok_or_else(|| "应用没有可用于托盘的默认图标".to_owned())
 }
 

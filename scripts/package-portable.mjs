@@ -6,7 +6,8 @@
 //
 // The archive is an allowlist, never a copy of `target/release`: that directory
 // also holds PDBs, dependency intermediates, and staging left over from earlier
-// resource configurations. Three executables and the license files are the whole payload.
+// resource configurations. Three executables, the remote agents and the license files are
+// the whole payload.
 //
 // The adjacent binary names are hard runtime contracts. A release build resolves
 // the AI SDK sidecar as `<dir of mework.exe>/mework-aisdk.exe` and the bundled
@@ -62,11 +63,18 @@ const payload = [
   { from: path.join(root, "THIRD-PARTY-NOTICES.md"), as: "THIRD-PARTY-NOTICES.md" },
   { from: path.join(root, "THIRD-PARTY-LICENSES.md"), as: "THIRD-PARTY-LICENSES.md" }
 ];
+// The agent builds go in as the `remote-agents/` directory beside mework.exe, where the
+// app looks for them when it has no resource directory (install_machine_links in
+// src-tauri/src/lib.rs), the same layout the installer and the MSIX get. Without it a
+// portable install can give neither an SSH machine nor a WSL distribution its agent,
+// and has no Windows sandbox helper (srt-win.exe) for local commands.
+const remoteAgents = path.join(root, "src-tauri", "remote-agents");
 
-const missing = payload.filter((entry) => !fs.existsSync(entry.from));
+const missing = payload.filter((entry) => !fs.existsSync(entry.from)).map((entry) => entry.from);
+if (!fs.existsSync(remoteAgents)) missing.push(remoteAgents);
 if (missing.length > 0) {
   fail(
-    `缺少构建产物：\n${missing.map((entry) => `  ${entry.from}`).join("\n")}\n`
+    `缺少构建产物：\n${missing.map((file) => `  ${file}`).join("\n")}\n`
       + "Please run npm run tauri:build first."
   );
 }
@@ -83,6 +91,8 @@ fs.mkdirSync(staging, { recursive: true });
 for (const entry of payload) {
   fs.copyFileSync(entry.from, path.join(staging, entry.as));
 }
+fs.cpSync(remoteAgents, path.join(staging, "remote-agents"), { recursive: true });
+const archived = [...payload.map((entry) => entry.as), "remote-agents"];
 
 fs.mkdirSync(path.dirname(archive), { recursive: true });
 fs.rmSync(archive, { force: true });
@@ -98,7 +108,7 @@ try {
       "-NonInteractive",
       "-Command",
       "Compress-Archive -LiteralPath "
-        + payload.map((entry) => `'${path.join(staging, entry.as)}'`).join(",")
+        + archived.map((name) => `'${path.join(staging, name)}'`).join(",")
         + ` -DestinationPath '${archive}' -CompressionLevel Optimal -Force`
     ],
     { stdio: "inherit", windowsHide: true }
@@ -112,4 +122,4 @@ fs.rmSync(staging, { recursive: true, force: true, maxRetries: 3, retryDelay: 12
 
 const size = fs.statSync(archive).size;
 console.log(`${label} 已生成 ${archive}（${(size / 1024 / 1024).toFixed(1)} MiB）`);
-for (const entry of payload) console.log(`${label}   ${entry.as}`);
+for (const name of archived) console.log(`${label}   ${name}`);
