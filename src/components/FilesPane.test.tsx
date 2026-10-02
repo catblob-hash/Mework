@@ -25,7 +25,7 @@ const ROOT = "/w/mework";
 const ubuntu: SshMachineConfig = {
   id: "ubuntu-id",
   name: "ubuntu",
-  host: "holycat@100.126.178.91",
+  host: "dev@100.88.12.34",
   port: 0,
   identityFile: "",
   createdAt: "",
@@ -198,7 +198,7 @@ beforeEach(() => {
   window.localStorage.clear();
   backend.hasBackendRuntime.mockReturnValue(true);
   backend.invoke.mockReset();
-  homes = { local: "/home/me", "ssh:ubuntu-id": "/home/holycat" };
+  homes = { local: "/home/me", "ssh:ubuntu-id": "/home/dev" };
   directories = {
     local: {
       [ROOT]: [entry(ROOT, "Docs", "directory"), entry(ROOT, "src", "directory"), entry(ROOT, "readme.txt")],
@@ -209,7 +209,7 @@ beforeEach(() => {
       "/": [entry("/", "w", "directory")]
     },
     "ssh:ubuntu-id": {
-      "/home/holycat": [entry("/home/holycat", "notes.txt")],
+      "/home/dev": [entry("/home/dev", "notes.txt")],
       "/srv": [entry("/srv", "app", "directory")]
     }
   };
@@ -220,7 +220,7 @@ beforeEach(() => {
       [`${ROOT}/Docs/guide.md`]: textFile(`${ROOT}/Docs/guide.md`, "指南\n")
     },
     "ssh:ubuntu-id": {
-      "/home/holycat/notes.txt": textFile("/home/holycat/notes.txt", "远端笔记\n")
+      "/home/dev/notes.txt": textFile("/home/dev/notes.txt", "远端笔记\n")
     }
   };
   pictures = { local: {}, "ssh:ubuntu-id": {} };
@@ -697,12 +697,12 @@ describe("FilesPane", () => {
 
   /** A workspace recorded as `~/…` on its machine is shown at the path that machine gives it. */
   it("opens a workspace recorded under ~ where its machine says it is", async () => {
-    directories["ssh:ubuntu-id"]!["/home/holycat/app"] = [entry("/home/holycat/app", "main.py")];
+    directories["ssh:ubuntu-id"]!["/home/dev/app"] = [entry("/home/dev/app", "main.py")];
     renderPane({ workspaces: [{ number: 1, machine: ubuntuMachine, path: "~/app", label: "app" }] });
 
     expect(await screen.findByRole("treeitem", { name: rowName("main.py") })).toBeInTheDocument();
     expect(calls("browse_list_directory")[0]).toEqual({ machine: ubuntuMachine, path: "~/app" });
-    expect(await screen.findByRole("button", { name: "位置：holycat@100.126.178.91:/home/holycat/app，点按编辑" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "位置：dev@100.88.12.34:/home/dev/app，点按编辑" })).toBeInTheDocument();
   });
 });
 
@@ -723,7 +723,7 @@ describe("FilesPane address bar", () => {
     await user.click(screen.getByRole("button", { name: "上一级" }));
 
     expect(await screen.findByRole("tree", { name: "机器" })).toBeInTheDocument();
-    expect(screen.getAllByRole("treeitem").map((row) => row.textContent)).toEqual(["本机", "ubuntuholycat@100.126.178.91"]);
+    expect(screen.getAllByRole("treeitem").map((row) => row.textContent)).toEqual(["本机", "ubuntudev@100.88.12.34"]);
     expect(screen.getByRole("button", { name: "上一级" })).toBeDisabled();
   });
 
@@ -738,7 +738,7 @@ describe("FilesPane address bar", () => {
     await user.click(await screen.findByRole("treeitem", { name: /^ubuntu/ }));
 
     expect(await screen.findByRole("treeitem", { name: rowName("notes.txt") })).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "位置：holycat@100.126.178.91:/home/holycat，点按编辑" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "位置：dev@100.88.12.34:/home/dev，点按编辑" })).toBeInTheDocument();
   });
 
   it("takes a typed SSH address to that machine's directory", async () => {
@@ -765,9 +765,9 @@ describe("FilesPane address bar", () => {
     await user.click(screen.getByRole("button", { name: `位置：${ROOT}，点按编辑` }));
     const field = screen.getByRole("textbox", { name: "位置" });
     await user.clear(field);
-    await user.type(field, "holycat@100.126.178.91:~/notes.txt{Enter}");
+    await user.type(field, "dev@100.88.12.34:~/notes.txt{Enter}");
 
-    expect(await screen.findByLabelText("home/holycat/notes.txt")).toHaveTextContent("远端笔记");
+    expect(await screen.findByLabelText("home/dev/notes.txt")).toHaveTextContent("远端笔记");
     expect(await screen.findByRole("treeitem", { name: rowName("notes.txt") })).toHaveAttribute("aria-current", "true");
   });
 
@@ -850,7 +850,7 @@ describe("FilesPane menus", () => {
   });
 
   it("keeps this computer's desktop out of reach for another machine's files", async () => {
-    renderPane({ workspaces: [{ number: 1, machine: ubuntuMachine, path: "/home/holycat", label: "holycat" }] });
+    renderPane({ workspaces: [{ number: 1, machine: ubuntuMachine, path: "/home/dev", label: "dev" }] });
 
     const menu = await rowMenu("notes.txt");
     expect(within(menu).getByRole("menuitem", { name: "在文件管理器中打开" })).toBeDisabled();
@@ -887,7 +887,7 @@ describe("FilesPane menus", () => {
 
   it("warns that a delete on another machine is for good", async () => {
     const user = userEvent.setup();
-    renderPane({ workspaces: [{ number: 1, machine: ubuntuMachine, path: "/home/holycat", label: "holycat" }] });
+    renderPane({ workspaces: [{ number: 1, machine: ubuntuMachine, path: "/home/dev", label: "dev" }] });
 
     await user.click(within(await rowMenu("notes.txt")).getByRole("menuitem", { name: "删除…" }));
 
@@ -1212,10 +1212,10 @@ describe("FilesPane open requests", () => {
   });
 
   it("opens a file on another machine", async () => {
-    renderPane({ openRequest: { machine: ubuntuMachine, path: "/home/holycat/notes.txt", line: null, nonce: 1 } });
+    renderPane({ openRequest: { machine: ubuntuMachine, path: "/home/dev/notes.txt", line: null, nonce: 1 } });
 
-    expect(await screen.findByLabelText("home/holycat/notes.txt")).toHaveTextContent("远端笔记");
-    expect(calls("browse_read_file")).toEqual([{ machine: ubuntuMachine, path: "/home/holycat/notes.txt" }]);
+    expect(await screen.findByLabelText("home/dev/notes.txt")).toHaveTextContent("远端笔记");
+    expect(calls("browse_read_file")).toEqual([{ machine: ubuntuMachine, path: "/home/dev/notes.txt" }]);
   });
 
   /** A request that arrives while the pane is closed is honoured on the mount that follows. */

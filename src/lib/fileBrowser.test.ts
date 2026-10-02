@@ -18,7 +18,7 @@ function sshMachine(id: string, name: string, host: string, port = 0): SshMachin
 }
 
 const machines = [
-  sshMachine("ubuntu-id", "ubuntu", "holycat@100.126.178.91"),
+  sshMachine("ubuntu-id", "ubuntu", "dev@100.88.12.34"),
   sshMachine("win-id", "office-pc", "win"),
   sshMachine("lab-id", "lab", "lab.internal", 2222)
 ];
@@ -81,8 +81,8 @@ describe("addresses", () => {
   it("prints this computer's paths bare and other machines' with their identity", () => {
     expect(formatAddress(null, "/home/dev", posixHost)).toBe("/home/dev");
     expect(formatAddress(null, "C:/Users/dev", windowsHost)).toBe("C:\\Users\\dev");
-    expect(formatAddress({ kind: "ssh", machineId: "ubuntu-id" }, "/home/holycat", posixHost))
-      .toBe("holycat@100.126.178.91:/home/holycat");
+    expect(formatAddress({ kind: "ssh", machineId: "ubuntu-id" }, "/home/dev", posixHost))
+      .toBe("dev@100.88.12.34:/home/dev");
     expect(formatAddress({ kind: "ssh", machineId: "lab-id" }, "/srv", posixHost)).toBe("ssh://lab.internal:2222/srv");
     expect(formatAddress({ kind: "wsl", distro: "Ubuntu" }, "/home/dev", windowsHost))
       .toBe("\\\\wsl.localhost\\Ubuntu\\home\\dev");
@@ -91,9 +91,9 @@ describe("addresses", () => {
   it("reads back every address it prints", () => {
     const cases = [
       { machine: null, path: "/home/dev", context: posixHost },
-      { machine: { kind: "ssh" as const, machineId: "ubuntu-id" }, path: "/home/holycat", context: posixHost },
+      { machine: { kind: "ssh" as const, machineId: "ubuntu-id" }, path: "/home/dev", context: posixHost },
       { machine: { kind: "ssh" as const, machineId: "lab-id" }, path: "/srv", context: posixHost },
-      { machine: { kind: "ssh" as const, machineId: "win-id" }, path: "C:/Users/holycat", context: posixHost },
+      { machine: { kind: "ssh" as const, machineId: "win-id" }, path: "C:/Users/dev", context: posixHost },
       { machine: { kind: "wsl" as const, distro: "Ubuntu" }, path: "/home/dev", context: windowsHost }
     ];
     for (const { machine, path, context } of cases) {
@@ -105,10 +105,10 @@ describe("addresses", () => {
 
   it("knows an SSH machine by its address, its host or its name", () => {
     const ubuntu = { kind: "location", machine: { kind: "ssh", machineId: "ubuntu-id" }, path: "/srv" };
-    expect(parseAddress("holycat@100.126.178.91:/srv", posixHost, null)).toEqual(ubuntu);
-    expect(parseAddress("100.126.178.91:/srv", posixHost, null)).toEqual(ubuntu);
+    expect(parseAddress("dev@100.88.12.34:/srv", posixHost, null)).toEqual(ubuntu);
+    expect(parseAddress("100.88.12.34:/srv", posixHost, null)).toEqual(ubuntu);
     expect(parseAddress("ubuntu:/srv", posixHost, null)).toEqual(ubuntu);
-    expect(parseAddress("ssh://holycat@100.126.178.91/srv", posixHost, null)).toEqual(ubuntu);
+    expect(parseAddress("ssh://dev@100.88.12.34/srv", posixHost, null)).toEqual(ubuntu);
     expect(parseAddress("ubuntu:", posixHost, null)).toEqual({ ...ubuntu, path: "~" });
     expect(parseAddress("ssh://ubuntu/~/notes", posixHost, null)).toEqual({ ...ubuntu, path: "~/notes" });
     expect(parseAddress("nowhere:/srv", posixHost, null)).toEqual({ kind: "error", reason: "unknown-machine", name: "nowhere" });

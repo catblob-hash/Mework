@@ -47,7 +47,7 @@ function twoMachineDocument() {
   document.globalSettings.executionEnvironments.sshMachines = [{
     id: "ubuntu-id",
     name: "ubuntu",
-    host: "holycat@100.126.178.91",
+    host: "dev@100.88.12.34",
     port: 0,
     identityFile: "",
     createdAt: "",
@@ -116,7 +116,7 @@ describe("App — a path the transcript names", () => {
     const choices = within(menu).getAllByRole("menuitem");
     expect(choices.map((choice) => choice.textContent)).toEqual([
       `Mework${LOCAL_ROOT}/src/main.rs1`,
-      "appholycat@100.126.178.91:/srv/app/src/main.rs2"
+      "appdev@100.88.12.34:/srv/app/src/main.rs2"
     ]);
     expect(browse.probe).toHaveBeenCalledWith([
       { machine: null, path: `${LOCAL_ROOT}/src/main.rs` },
