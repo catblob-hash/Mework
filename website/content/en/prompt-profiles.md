@@ -109,7 +109,7 @@ They ship empty because the search backend is one *you* configured, and Mework t
 
 ## What changes when you switch profile
 
-- The **environment block**, the **skill, MCP and hook sections**, the app-data line and (if you filled it in) the web safety boundary are rendered fresh every turn, so switching takes effect on the next message.
+- The **environment block**, the **skill, MCP and hook sections** and the app-data line are rendered fresh every turn, so switching takes effect on the next message.
 - The **child addendum** of subagents and workflow steps follows the parent conversation's profile at spawn time. A conversation the `fork` tool creates snapshots the rendered prompt and renders from that snapshot for the rest of its life.
 - **Receipts** and appended system messages (the plan-mode instructions) already in the history keep the wording they were written with; the model reads mixed wording if you switch mid-conversation, which is harmless.
 - **Background-task deliveries** replay identically on every later turn: the delivery card holds exactly the exchange the model reads — the `box` call's one empty argument (`none: []`) and the whole `<task-notification>` as its result — and one shared builder derives the fabricated call id from the card, so the turn that produced the delivery and every replay of it cannot drift apart. Editing the card's result edits what the model reads next.
@@ -121,7 +121,7 @@ They ship empty because the search backend is one *you* configured, and Mework t
 2. Delete every key you do not intend to change; keeping a full copy only makes future diffs against the built-in harder.
 3. Keep the declared placeholders of the keys you edit (the reference below lists them).
 4. Save it under `~/.mework/tool-descriptions/<anything>.json`, open the conversation settings pane, and select it.
-5. Send a message and inspect the result: tool receipts are visible in the timeline cards, and the **Outgoing requests** pane shows each request as it was sent — its `system` part is the host half byte for byte, and `systemDynamic` carries the sections that come and go (your system cards, the web safety boundary).
+5. Send a message and inspect the result: tool receipts are visible in the timeline cards, and the **History** tab (More options → History) shows the system prompt each turn opened with, read from the payload as it was sent, whenever it is new or changed — its `system` part is the host half byte for byte, and `systemDynamic` carries the conversation's own system prompt (its first card) and, in a continuation, the handoff notes' index.
 
 Tips that follow from how the texts are used:
 

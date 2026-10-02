@@ -97,6 +97,6 @@ Both follow the conversation's single **Enable web search** switch; which of the
 
 ## Handoff {#group-handoff}
 
-None of these is a setting. With **Auto-compact** on (in the context meter's menu), a conversation whose context crosses the threshold is told so by the host, in the same form a background task's result takes, and gains these four tools. The model writes handoff notes, then calls `handoff`, which opens a new conversation and stops this one. The new conversation starts with this conversation's system prompt, the same tools and those notes, and nothing of its history. A conversation that inherited notes can read them from its first request.
+None of these is a setting. With **Auto-compact** on (in the context meter's menu), a conversation whose context crosses the threshold is asked by the host to hand off — as a mid-conversation system message where the model and endpoint take one, else in the same `box` delivery a background task's result takes — and gains these four tools. The model writes handoff notes, then calls `handoff`, which opens a continuation (a new conversation, not a fork) and stops this one. The new conversation starts with this conversation's system prompt, the same tools and those notes, and nothing of its history. A conversation that inherited notes can read them from its first request.
 
 {{TOOL_TABLE:read_handoff_note,create_handoff_note,edit_handoff_note,handoff}}

@@ -76,7 +76,7 @@ The `skill` tool is derived, not in the tool picker: it appears exactly when the
 
 ## Verifying that a skill is active
 
-- With delivery **off**, the next model reply will follow the skill's instructions; the **Outgoing requests** pane (More options → Outgoing requests) shows the body inside the system prompt, after the `---` separator.
+- With delivery **off**, the next model reply will follow the skill's instructions; the **History** tab (More options → History) shows the body inside the system prompt, after the `---` separator.
 - With delivery **on**, the timeline shows a `skill` tool call card whose result begins with the base directory line when the model loads it.
 
 ## Troubleshooting
