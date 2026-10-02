@@ -28,10 +28,10 @@ API Key 或订阅由你自己提供，其余一切都在你的机器上运行和
 
 ## 该有的也都有
 
-- **能把活干完的 Agent。** 带语言服务器代码导航的文件工具；每台机器上可用的 shell——PowerShell、Bash、zsh、sh（本机、WSL 或 SSH 远程），一个项目可以横跨几台机器；网页搜索与抓取、长期记忆、待办清单，以及先出方案再动手的计划模式。日常编程场景下功能与 Claude Code 基本相当，尚有的差距见下文。
+- **能把活干完的 Agent。** 带语言服务器代码导航的文件工具；每台机器上可用的 shell——PowerShell、Bash、zsh、sh（本机、WSL 或 SSH 远程），一个项目可以横跨几台机器；网页搜索与抓取、长期记忆，以及先出方案再动手的计划模式。日常编程场景下功能与 Claude Code 基本相当，尚有的差距见下文。
 - **后台子代理与脚本化工作流。** 最多 8 个子代理并行，回合结束后继续跑，应用重启也不丢。更大的任务可以写一段 JavaScript 工作流脚本编排多个代理，带检查点和崩溃恢复。
 - **会验收的浏览器。** Mework 拉起项目的开发服务器，打开它渲染的页面，让模型读控制台和网络请求、检查元素、点击、输入、截图——然后把结果拿给你看，而不是让你自己去检查。同一个面板也是一个你可以自己操作的普通浏览器。
-- **看得懂的审批卡。** 每个有风险的调用都会显示完整命令或路径，以及为什么被这样归类；四档安全级别，从逐条批准到完全放行。
+- **看得懂的审批卡。** 每个有风险的调用都会显示完整命令或路径，以及为什么被这样归类；三档安全级别，从逐条批准到完全放行。
 - **沿用你已有的格式。** 技能是 `SKILL.md` 目录，与 Claude Code、Codex 和公开技能库同一格式，可开局加载，也可按需加载。MCP 服务器支持 stdio 与 Streamable HTTP，写在与 Claude Code 同形状的 `mcp.json` 里，工具 schema 可以开局声明，也可以按需发现。钩子在七个生命周期节点执行 shell 命令，从 Claude Code 复制过来的 `hooks` 块可直接使用。
 - **模型你选，Key 你管。** 支持 OpenAI、Anthropic、Google、Azure OpenAI、Amazon Bedrock、Google Vertex、xAI 以及任何 OpenAI 兼容端点。另有两家登录即用：**OpenAI Codex** 用你的 ChatGPT 订阅，**Claude Agent** 用 Mework 自带的那份 Claude Code，配你本机已有的 Claude Code 登录——不必再单独装一份、也不用操心版本对不上（受 [Claude Code 使用条款](https://code.claude.com/docs/en/legal-and-compliance)约束）。Key 保存在 Windows 凭据管理器；在 Mac 上存进一个由登录钥匙串条目加密的保险库——绝不写进配置文件。
 - **不打扰。** 关窗即缩到托盘，子代理、工作流和 shell 任务照常运行。Windows 上应用从 GitHub Releases 自动更新（Mac 上会提示你去下载新版本）；可选的本地小模型在你自己的电脑上给对话起标题、给 shell 命令写一行说明、说清失败的调用为什么失败。
