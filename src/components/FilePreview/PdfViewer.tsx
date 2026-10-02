@@ -6,6 +6,7 @@ import { useI18n } from "../../i18n";
 import { IconButton } from "../Common";
 import { loadPdfJs, openPdfDocument, type PdfJs } from "../../lib/pdfDocument";
 import { dataUrlBytes, formatBytes } from "./format";
+import { attachTextLayerSelection } from "./pdfTextSelection";
 
 /** Past this many device pixels a page is drawn at a lower resolution rather than not at all. */
 const MAX_CANVAS_PIXELS = 16_777_216;
@@ -123,7 +124,8 @@ export function PdfViewer({ source, bytes }: { source: string; bytes: number | n
         {!pdf || !library
           ? <p className="files-pane__notice">{t("正在读取…", "Loading…")}</p>
           : (
-            <div className="file-preview__pdf-pages">
+            // One selection region across every page; the space between pages still starts none.
+            <div className="file-preview__pdf-pages" data-selection-region>
               {sizes.map((size, index) => (
                 <PdfPage
                   key={index}
@@ -212,7 +214,11 @@ const PdfPage = memo(function PdfPage({
     const text = textRef.current;
     if (!canvas || !text) return;
     let cancelled = false;
-    const running: { render: RenderTask | null; layer: PdfTextLayer | null } = { render: null, layer: null };
+    const running: { render: RenderTask | null; layer: PdfTextLayer | null; detach: (() => void) | null } = {
+      render: null,
+      layer: null,
+      detach: null
+    };
     const timer = window.setTimeout(() => {
       void pdf.getPage(pageNumber).then(async (page) => {
         if (cancelled) return;
@@ -240,6 +246,8 @@ const PdfPage = memo(function PdfPage({
         text.replaceChildren();
         running.layer = new library.TextLayer({ textContentSource: page.streamTextContent(), container: text, viewport });
         await running.layer.render();
+        if (cancelled) return;
+        running.detach = attachTextLayerSelection(text);
       }).catch(() => undefined);
     }, drawnScale.current === null ? 0 : 120);
     return () => {
@@ -247,6 +255,7 @@ const PdfPage = memo(function PdfPage({
       window.clearTimeout(timer);
       running.render?.cancel();
       running.layer?.cancel();
+      running.detach?.();
     };
   }, [pdf, library, near, pageNumber, scale]);
 
@@ -261,7 +270,7 @@ const PdfPage = memo(function PdfPage({
   return (
     <div className="file-preview__pdf-page" ref={boxRef} style={style} data-page-number={pageNumber}>
       <canvas ref={canvasRef} className="file-preview__pdf-canvas" />
-      <div ref={textRef} className="textLayer" />
+      <div ref={textRef} className="textLayer" data-native-selection />
     </div>
   );
 });

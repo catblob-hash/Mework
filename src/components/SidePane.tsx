@@ -1,10 +1,11 @@
 import { Maximize2, Minimize2, MoreVertical, X } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useContext, useLayoutEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
 import { paneKind, sidePaneDomId } from "../lib/sidePanes";
 import type { SidePaneId } from "../lib/sidePanes";
 import { IconButton } from "./Common";
+import { PaneTileGeometryContext } from "./paneTileGeometry";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuSection } from "./PopoverMenu";
 import "./SidePane.css";
@@ -14,6 +15,12 @@ export interface SidePaneBounds {
   y: number;
   width: number;
   height: number;
+  /**
+   * The radius the pane rounds the body's bottom corners to: the pane's own corner radius less its
+   * border, which is where its `overflow: hidden` clips. A native page placed in the body has to
+   * round the same corners itself, since nothing in the renderer can clip it.
+   */
+  bottomCornerRadius: number;
 }
 
 export interface SidePaneProps {
@@ -54,6 +61,20 @@ export interface SidePaneProps {
   children: ReactNode;
 }
 
+/**
+ * The radius `section` clips its bottom corners to on the inside: the outer radius less the
+ * border, the curve its padding box — and so the body — is cut to.
+ */
+export function innerBottomRadius(section: HTMLElement): number {
+  const style = getComputedStyle(section);
+  const radius = Math.min(
+    Number.parseFloat(style.borderBottomLeftRadius) || 0,
+    Number.parseFloat(style.borderBottomRightRadius) || 0
+  );
+  const border = Number.parseFloat(style.borderBottomWidth) || 0;
+  return Math.max(0, radius - border);
+}
+
 /** One pseudo-window on the right: a 32px title bar, a close ×, and a measurable body. */
 export function SidePane({
   id,
@@ -72,8 +93,14 @@ export function SidePane({
   const { t } = useI18n();
   const sectionRef = useRef<HTMLElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
+  // A tile can change place without changing size; the observer below would miss that move.
+  const tileGeometry = useContext(PaneTileGeometryContext);
 
-  useEffect(() => {
+  // A layout effect, and the observer's callback runs before paint too: the native page follows
+  // this rectangle, and a move reported after the frame that made it is a frame in which the page
+  // is still where the pane used to be, over whatever took its place.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new `tileGeometry` is a move to measure, though nothing here reads it.
+  useLayoutEffect(() => {
     if (!onContentBoundsChange) return;
     const body = bodyRef.current;
     const section = sectionRef.current;
@@ -81,7 +108,13 @@ export function SidePane({
     let motionFrame = 0;
     const report = () => {
       const rect = body.getBoundingClientRect();
-      onContentBoundsChange({ x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+      onContentBoundsChange({
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        bottomCornerRadius: section ? innerBottomRadius(section) : 0
+      });
     };
     // A transition moves the box without resizing it, so the observer alone would publish the
     // rectangle the pane had before the animation rather than the one it settles at.
@@ -103,7 +136,7 @@ export function SidePane({
       section?.removeEventListener("transitionend", reportAfterMotion);
       section?.removeEventListener("animationend", reportAfterMotion);
     };
-  }, [onContentBoundsChange]);
+  }, [onContentBoundsChange, tileGeometry]);
 
   return (
     <section

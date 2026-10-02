@@ -3,13 +3,22 @@
   overflow: hidden; border: 1px solid var(--border, var(--color-dfdfda)); border-radius: 8px;
   color: var(--text, var(--color-1b1b1a)); background: var(--panel, var(--color-ffffff));
 }
-.tool-renderer__body { max-height: var(--tool-renderer-max-height); overflow: auto; }
+.tool-renderer__body { max-height: var(--tool-renderer-max-height); overflow: auto scroll; }
 .tool-renderer__images { padding: 10px; }
 .tool-renderer__raw { border-top: 1px solid var(--border, var(--color-dfdfda)); background: var(--subtle, var(--color-f3f3f0)); }
-.tool-renderer__raw summary { padding: 6px 10px; color: var(--muted, var(--color-6b6b67)); font-size: 10px; cursor: pointer; user-select: none; }
+.tool-renderer__raw summary { padding: 6px 10px; color: var(--muted, var(--color-6b6b67)); font-size: 10px; cursor: pointer; -webkit-user-select: none; user-select: none; }
 .tool-renderer__raw summary:hover { color: var(--text, var(--color-1b1b1a)); }
+/* Each part of a result is a selection region of its own: a command apart from its output,
+   every value in a card apart from its label and from the other values. */
+.tool-renderer__file-list, .tool-renderer__grep-list, .tool-renderer__command pre,
+.tool-renderer__terminal-output, .tool-renderer__info-grid dd, .tool-renderer__fallback pre,
+.tool-renderer__snapshot-tree, .tool-renderer__log-list, .tool-renderer__network-list,
+.tool-renderer__plain-output, .tool-kv__value, .tool-renderer__findings,
+.tool-renderer__result-list, .tool-renderer__error pre, .tool-renderer__raw pre {
+  -webkit-user-select: text; user-select: text;
+}
 .tool-renderer__raw pre, .tool-renderer__plain-output {
-  max-height: 220px; margin: 0; padding: 8px 10px 11px; overflow: auto;
+  max-height: 220px; margin: 0; padding: 8px 10px 11px; overflow: auto scroll;
   white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.55 var(--mono, monospace);
 }
 .tool-renderer__empty { padding: 19px 12px; color: var(--faint, var(--color-989892)); font-size: 11px; text-align: center; }
@@ -27,8 +36,8 @@
 .tool-renderer__grep-list li { padding: 6px 10px; display: grid; grid-template-columns: minmax(125px, 34%) minmax(0, 1fr); gap: 10px; }
 .tool-renderer__grep-list li + li { border-top: 1px solid color-mix(in srgb, var(--border, var(--color-dfdfda)) 68%, transparent); }
 .tool-renderer__grep-location { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
-.tool-renderer__grep-location code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted, var(--color-6b6b67)); font: 10px var(--mono, monospace); }
-.tool-renderer__grep-location span { flex: 0 0 auto; color: var(--faint, var(--color-989892)); font: 9px var(--mono, monospace); }
+.tool-renderer__grep-path { color: var(--muted, var(--color-6b6b67)); font: 10px var(--mono, monospace); }
+.tool-renderer__grep-line { flex: 0 0 auto; color: var(--faint, var(--color-989892)); font: 9px var(--mono, monospace); }
 .tool-renderer__grep-content { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; font: 10.5px/1.45 var(--mono, monospace); }
 .tool-renderer__grep-meta { display: block !important; color: var(--faint, var(--color-989892)); }
 
@@ -113,7 +122,7 @@
 .tool-renderer__fallback > svg { color: var(--warning, var(--color-a56312)); }
 .tool-renderer__fallback > div, .tool-renderer__error > div { min-width: 0; flex: 1; }
 .tool-renderer__fallback strong, .tool-renderer__error strong { display: block; margin-bottom: 4px; font-size: 11px; }
-.tool-renderer__fallback pre, .tool-renderer__error pre { max-height: 180px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.5 var(--mono, monospace); }
+.tool-renderer__fallback pre, .tool-renderer__error pre { max-height: 180px; margin: 0; overflow: auto scroll; white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.5 var(--mono, monospace); }
 .tool-renderer--failed { border-color: color-mix(in srgb, var(--danger, var(--color-c43d3d)) 35%, var(--border, var(--color-dfdfda))); }
 .tool-renderer__error { color: var(--color-923838); background: var(--danger-soft, var(--color-fff0f0)); }
 .tool-renderer__error > svg { color: var(--danger, var(--color-c43d3d)); }

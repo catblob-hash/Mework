@@ -2,7 +2,7 @@ The `powershell` tool runs one command through PowerShell, launched `-NoProfile 
 
 ## Approval
 
-Every shell call raises a card at Manual approval, Accept edits and Plan mode; only Full access — or a `PreToolUse` hook answering `allow` — clears it. Static analysis only sets the card's risk level and rule: file access it can see (`Get-Content`, `Remove-Item` and their aliases) is judged against the file tools' path policy; anything touching a non-filesystem provider, a UNC path or the call operator is unbounded, and a command over 10,000 characters is not analysed at all. A recursive delete that could reach the filesystem root, your home directory or a system path is a confirmation no security level and no hook turns off. `powershell` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox: approval means the command may run, not that it is confined.
+Every shell call raises a card at Manual approval and Accept edits; only Full access — or a `PreToolUse` hook answering `allow` — clears it. Static analysis only sets the card's risk level and rule: file access it can see (`Get-Content`, `Remove-Item` and their aliases) is judged against the file tools' path policy; anything touching a non-filesystem provider, a UNC path or the call operator is unbounded, and a command over 10,000 characters is not analysed at all. A recursive delete that could reach the filesystem root, your home directory or a system path is a confirmation no security level and no hook turns off. `powershell` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox: approval means the command may run, not that it is confined.
 
 ## Behavior and limits
 

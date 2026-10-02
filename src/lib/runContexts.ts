@@ -2,7 +2,7 @@ import { getI18nSnapshot, translate } from "../i18n";
 import type { ContextItem, Conversation } from "../types";
 import { canonicalJson } from "./contextTokens";
 import { isEncryptedReasoning } from "./modelCapabilities";
-import type { ModelRunState, StreamingHookState, StreamingToolState } from "./modelStream";
+import type { HostContextState, ModelRunState, StreamingHookState, StreamingToolState } from "./modelStream";
 import { isPreviewPageToolName } from "./taskTools";
 
 /**
@@ -148,6 +148,23 @@ export function liveReasoningFromModelRun(run: ModelRunState | undefined): LiveR
   return { startedAt: live.startedAt, ...(tokens ? { tokens } : {}) };
 }
 
+/**
+ * What joined the transcript ahead of a round, in the host's order: the user's
+ * steering and the host's own additions, each host context placed after the
+ * steered inputs that had arrived before it.
+ */
+function joinedAheadOfRound(steeredInputs: ContextItem[], hostContexts: HostContextState[]): ContextItem[] {
+  if (!hostContexts.length) return steeredInputs;
+  const joined: ContextItem[] = [];
+  let steered = 0;
+  for (const { context, afterSteered } of hostContexts) {
+    while (steered < Math.min(afterSteered, steeredInputs.length)) joined.push(steeredInputs[steered++]);
+    joined.push(context);
+  }
+  joined.push(...steeredInputs.slice(steered));
+  return joined;
+}
+
 export function contextsFromModelRun(
   run: ModelRunState,
   streaming: boolean
@@ -168,7 +185,8 @@ export function contextsFromModelRun(
     ...Object.keys(run.streamedTextByRound),
     ...Object.keys(run.streamedToolsByRound),
     ...Object.keys(run.streamedHooksByRound),
-    ...Object.keys(run.steeredInputsByRound)
+    ...Object.keys(run.steeredInputsByRound),
+    ...Object.keys(run.hostContextsByRound ?? {})
   ].map(Number))].sort((left, right) => left - right);
 
   return rounds.flatMap<ContextItem>((round) => {
@@ -180,7 +198,7 @@ export function contextsFromModelRun(
     const tools = run.streamedToolsByRound[round] ?? [];
     const hooks = run.streamedHooksByRound[round] ?? [];
     const steeredInputs = run.steeredInputsByRound[round] ?? [];
-    contexts.push(...steeredInputs);
+    contexts.push(...joinedAheadOfRound(steeredInputs, run.hostContextsByRound?.[round] ?? []));
     const preflightHooks = hooks.filter((hook) => ["SessionStart", "UserPromptSubmit"].includes(hook.event));
     const preToolHooks = hooks.filter((hook) => ["PreToolUse", "PermissionRequest"].includes(hook.event));
     const postToolHooks = hooks.filter((hook) => hook.event === "PostToolUse");

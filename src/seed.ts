@@ -14,6 +14,8 @@ import {
   SEARCH_PROVIDERS
 } from "./lib/searchProviders";
 import { defaultAppearancePreferences } from "./lib/appearance";
+import { defaultAutoCompactSettings } from "./lib/autoCompact";
+import { knownAppendCapabilities, normalizeCapabilities } from "./lib/modelCapabilities";
 import {
   CLAUDE_AGENT_PROVIDER_FAMILY,
   CLAUDE_AGENT_PROVIDER_NAME,
@@ -363,32 +365,10 @@ export const toolCatalog: ToolDescriptor[] = [
     parameters: [
       { name: "prompt", label: "任务", type: "multiline", required: true, placeholder: "调查 src/ 下的路由结构并总结关键文件", help: "默认子代理看不到当前对话，任务描述必须自包含全部背景" },
       { name: "agent_type", label: "命名类型", type: "string", required: false, placeholder: "code-reviewer", help: "可选的可信命名定义短名称；可用的名称与用途列在本轮的可用 Agent 清单里。由宿主解析，不能与 context=conversation 同时使用" },
-      { name: "name", label: "名称", type: "string", required: true, placeholder: "review-api", help: "必填。用于 send_message / followup_task / task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名" },
+      { name: "name", label: "名称", type: "string", required: true, placeholder: "review-api", help: "必填。用于 task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名" },
       { name: "label", label: "显示名", type: "string", required: false, placeholder: "调查路由", help: "显示在时间线上的短名称" },
       { name: "context", label: "初始上下文", type: "string", required: false, defaultValue: "none", help: "none（默认）：只看到任务；conversation：携带当前对话历史副本" },
       { name: "schema", label: "输出模式", type: "json", required: false, placeholder: "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\"}},\"required\":[\"verdict\"]}", help: "可选的 JSON Schema 子集；给出后子代理必须调用 structured_output 交回符合该模式的结果，返回值会随 task_wait 一起回来。顶层必须是 type 为 object 的对象模式；支持 type、properties、required、items、enum、const、additionalProperties、minItems/maxItems、minLength/maxLength、minimum/maximum，其余关键字会被当场拒绝" }
-    ]
-  },
-  {
-    name: "send_message",
-    label: "发送消息",
-    description: "",
-    category: "orchestration",
-    dangerous: false,
-    parameters: [
-      { name: "target", label: "子代理", type: "string", required: true, placeholder: "a1", help: "agent_spawn 返回的名称" },
-      { name: "message", label: "消息", type: "multiline", required: true }
-    ]
-  },
-  {
-    name: "followup_task",
-    label: "追加任务",
-    description: "",
-    category: "orchestration",
-    dangerous: false,
-    parameters: [
-      { name: "target", label: "子代理", type: "string", required: true, placeholder: "a1", help: "agent_spawn 返回的名称" },
-      { name: "message", label: "消息", type: "multiline", required: true }
     ]
   },
   {
@@ -416,7 +396,9 @@ export const toolCatalog: ToolDescriptor[] = [
     description: "",
     category: "orchestration",
     dangerous: false,
-    parameters: []
+    parameters: [
+      { name: "none", label: "空参数", type: "json", required: true, placeholder: "[]", help: "始终为空数组" }
+    ]
   },
   {
     name: "skill",
@@ -542,26 +524,7 @@ export const toolCatalog: ToolDescriptor[] = [
       { name: "name", label: "名称", type: "string", required: true, placeholder: "review-sweep", help: "必填。这次运行在会话代理命名空间里的地址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名，续跑也要换新名字" },
       { name: "args", label: "输入参数", type: "json", required: false, help: "原样暴露给脚本的 JSON 值（全局 args）；数组与对象直接传，不要编码成字符串" },
       { name: "token_budget", label: "token 预算", type: "number", required: false, help: "本次运行允许消耗的 token 硬顶，脚本经 budget 读到；耗尽后新的 agent() 调用抛错" },
-      { name: "resume_run_id", label: "续跑运行 ID", type: "string", required: false, placeholder: "run0a1b2c3d", help: "上一次同脚本运行报出的运行 ID；已入日志的步骤即时重放，其余步骤重跑。脚本正文必须与获批时逐字一致" }
-    ]
-  },
-  {
-    name: "todo",
-    label: "待办事项",
-    description: "",
-    category: "orchestration",
-    dangerous: false,
-    parameters: [
-      { name: "action", label: "动作", type: "string", required: true, placeholder: "create", help: "选择操作：create、update、get、list" },
-      { name: "taskId", label: "任务 ID", type: "string", required: false, placeholder: "task-1", help: "用于 update、get；create 返回的不透明 ID" },
-      { name: "subject", label: "任务标题", type: "string", required: false, placeholder: "补全用户认证", help: "create 必填；update 可选" },
-      { name: "description", label: "任务说明", type: "multiline", required: false, placeholder: "实现登录与注册接口，并补齐测试。", help: "create 必填；update 可选" },
-      { name: "activeForm", label: "进行中文案", type: "string", required: false, placeholder: "正在补全用户认证", help: "create、update；任务处于 in_progress 时显示的简短进行时文案" },
-      { name: "status", label: "状态", type: "string", required: false, placeholder: "in_progress", help: "用于 update；pending | in_progress | completed | deleted" },
-      { name: "owner", label: "负责人", type: "string", required: false, help: "仅用于 update" },
-      { name: "addBlocks", label: "新增被阻塞任务", type: "json", required: false, help: "用于 update；由本任务阻塞的 task ID 数组" },
-      { name: "addBlockedBy", label: "新增前置任务", type: "json", required: false, help: "用于 update；阻塞本任务的 task ID 数组" },
-      { name: "metadata", label: "元数据", type: "json", required: false, help: "create 整体写入；update 按 key 合并，值为 null 时删除该 key" }
+      { name: "resume_run_id", label: "续跑运行 ID", type: "string", required: false, placeholder: "run0a1b2c3d", help: "上一次运行报出的运行 ID；提示词与选项没变的步骤即时重放，上次停下时还在跑的步骤单独重跑，从第一个改动或失败的步骤起其余全部重跑。可省略脚本与 args 沿用上次的；传入改过的脚本会重新审批" }
     ]
   },
   {
@@ -617,6 +580,51 @@ export const toolCatalog: ToolDescriptor[] = [
     dangerous: false,
     parameters: []
   },
+  // The handoff tools: derived by the host once the conversation's context
+  // crosses the auto-compact threshold, never offered by a picker.
+  {
+    name: "read_handoff_note",
+    label: "读取交接文档",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: [
+      { name: "name", label: "文档名", type: "string", required: true, placeholder: "当前进度", help: "交接索引里列出的文档名，.md 后缀可写可不写" }
+    ]
+  },
+  {
+    name: "create_handoff_note",
+    label: "写交接文档",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: [
+      { name: "name", label: "文档名", type: "string", required: true, placeholder: "当前进度", help: "交接文档名，不能包含路径分隔符；.md 后缀可写可不写" },
+      { name: "content", label: "文档内容", type: "multiline", required: true, help: "交接文档的完整 Markdown 正文" },
+      { name: "description", label: "索引描述", type: "string", required: true, placeholder: "任务目标、已完成的工作与下一步", help: "一句话说明这份交接文档写了什么，会写进交接索引" }
+    ]
+  },
+  {
+    name: "edit_handoff_note",
+    label: "修改交接文档",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: [
+      { name: "name", label: "文档名", type: "string", required: true, placeholder: "当前进度", help: "要修改的交接文档名，.md 后缀可写可不写" },
+      { name: "old_text", label: "原文", type: "multiline", required: true, help: "文档中要被替换的原文，必须唯一匹配；不唯一时请提供更长的片段" },
+      { name: "new_text", label: "新文本", type: "multiline", required: true, help: "替换后的文本；留空表示删除这段内容" },
+      { name: "description", label: "索引描述", type: "string", required: true, placeholder: "任务目标、已完成的工作与下一步", help: "修改后这份交接文档的一句话说明，会刷新交接索引里的对应条目" }
+    ]
+  },
+  {
+    name: "handoff",
+    label: "交接",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: []
+  },
 ];
 
 function freshToolCatalog(): ToolDescriptor[] {
@@ -652,7 +660,10 @@ function claudeAgentSeedModels(): ModelProfile[] {
       group: "claude",
       contextWindow,
       maxOutputTokens,
-      capabilities: ["image_recognition"],
+      capabilities: normalizeCapabilities([
+        "image_recognition",
+        ...knownAppendCapabilities({ family: "claude_agent", baseUrl: "" }, id)
+      ]),
       reasoningContent: "plaintext",
       promptCache: true
     }));
@@ -706,25 +717,31 @@ const BUILTIN_ROLES: ReadonlyArray<{
     name: "Opus",
     family: CLAUDE_AGENT_PROVIDER_FAMILY,
     modelId: "claude-opus-5-5",
-    description: "Claude Opus 5.5 (Anthropic). Strongest at long, sprawling engineering work: codebase-wide migrations and audits, hard debugging, and changes that need careful judgement and checking its own work. Pick it for the largest and hardest tasks."
+    description: "Claude Opus 5.5 (Anthropic). Excellent judgement and taste. Takes on ambiguous, open-ended and hard problems, including ones where it is not yet clear what the problem is, and its conclusions can be relied on. Pick it for the hardest work and for anything that needs sound judgement across a wide area: design, diagnosis, review and deciding what to do."
+  },
+  {
+    name: "Sonnet",
+    family: CLAUDE_AGENT_PROVIDER_FAMILY,
+    modelId: "claude-sonnet-5-5",
+    description: "Claude Sonnet 5.5 (Anthropic). Has the strengths of Opus in a lighter form: good judgement and able to work through ambiguous problems, though less reliably on the hardest ones, and at a lower cost. Pick it for work that needs judgement but not Opus's full depth."
   },
   {
     name: "Sol",
     family: CODEX_PROVIDER_FAMILY,
-    modelId: "gpt-6-sol",
-    description: "GPT-6 Sol (OpenAI). Built for complex coding and agentic workflows that need strong reasoning: multi-step implementation, refactoring and debugging across several files. Pick it for demanding coding tasks."
+    modelId: "gpt-6.1-sol",
+    description: "GPT-6.1 Sol (OpenAI). Rigorous, precise reasoning that very rarely makes a mistake, but weak judgement: it does poorly on vague tasks and on ones that call for weighing many things across a wide area, and is at its best on a focused, local problem. Pick it for clearly specified, verifiable work where correctness matters most; give it the exact goal and how to check the result, and keep open-ended decisions away from it."
   },
   {
     name: "Luna",
     family: CODEX_PROVIDER_FAMILY,
     modelId: "gpt-6-luna",
-    description: "GPT-6 Luna (OpenAI). Fast and low-cost, for focused, high-volume work: well-scoped edits, searches and lookups, running tests and summarizing their output. Pick it for repeatable tasks at scale and for many parallel workers."
+    description: "GPT-6 Luna (OpenAI). Very cheap, with limited reasoning: don't ask it to make judgement calls or to verify anything that is hard to check. Pick it for simple, mechanical, easily checked chores in bulk, such as repetitive edits, searches and lookups, and collecting or summarizing output, and for many parallel workers."
   }
 ];
 
 /** One role of the built-in preset: everything on and thinking on. `tools: null`
  * rather than an allowlist, so the role tracks whatever the preset enables
- * instead of freezing today's catalog into three copies. */
+ * instead of freezing today's catalog into a copy per role. */
 function builtinRole(
   name: string,
   providerId: string,
@@ -860,7 +877,7 @@ export const createSeedDocument = (
   const activeProvider = apiProviders.find((provider) => provider.enabled) ?? null;
 
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     globalSettings: {
       appLanguage: "auto",
       resolvedAppLanguage: "zh-CN",
@@ -869,7 +886,7 @@ export const createSeedDocument = (
       // Storage refuses an empty default once presets exist, so this is written
       // explicitly rather than left to the normalizer's first-preset fallback.
       defaultConversationPresetId: BUILTIN_PRESET_ID,
-      lastReasoningEffort: "disabled",
+      lastReasoningEffort: "medium",
       apiProviders,
       activeProviderId: activeProvider?.id ?? null,
       webSearch: {
@@ -890,7 +907,8 @@ export const createSeedDocument = (
       executionEnvironments: { sshMachines: [], envVars: {} },
       // An empty object uses the default bindings in `src/lib/shortcuts.ts`.
       shortcuts: {},
-      environmentTools: []
+      environmentTools: [],
+      autoCompact: defaultAutoCompactSettings()
     },
     tools,
     capabilities: {

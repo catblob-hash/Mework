@@ -15,7 +15,18 @@ import type { TerminalLaunchChoice } from "./terminal";
  *
  * A conversation has no terminal until one is asked for: the first is made when the pane opens
  * with nothing in it, in whatever shell the caller chose for it.
+ *
+ * Beside the shells the strip can hold one read-only page: the output of a command the model ran,
+ * opened from its task row. There is never more than one — opening another command's output
+ * points that page at it — and it sits at the strip's start, ahead of every shell, whatever order
+ * they are dragged into. It has no process of its own, so closing it ends nothing.
  */
+
+/**
+ * The read-only page's tab id. There is one page at most, so it needs no number, and no shell's
+ * `terminal-{ordinal}` id can take this shape.
+ */
+export const READ_ONLY_TERMINAL_TAB_ID = "read-only";
 
 export interface TerminalTab {
   /** The host's terminal id, unique within the conversation and never reused. */
@@ -42,7 +53,11 @@ export interface TerminalTab {
 }
 
 export interface TerminalTabsLayout {
+  /** The shells, in strip order after the read-only page. */
   tabs: TerminalTab[];
+  /** The shell task the read-only page shows, or null when the strip has no read-only page. */
+  readOnly: string | null;
+  /** A shell's id, `READ_ONLY_TERMINAL_TAB_ID`, or null with nothing in the strip. */
   activeId: string | null;
   /** Monotonic: an ordinal is spent when its tab is created and never minted again. */
   nextOrdinal: number;
@@ -61,6 +76,10 @@ export type TerminalTabsAction =
    */
   | { type: "ensure"; conversationId: string; launch?: TerminalLaunchChoice | null }
   | { type: "add"; conversationId: string; launch?: TerminalLaunchChoice | null }
+  /** Points the read-only page at a shell task, opening the page if there is none, and selects it. */
+  | { type: "show_read_only"; conversationId: string; shellTaskId: string }
+  /** Closes the read-only page if it shows this shell task: the host let go of its output. */
+  | { type: "forget_read_only"; conversationId: string; shellTaskId: string }
   | { type: "close"; conversationId: string; terminalId: string }
   | { type: "activate"; conversationId: string; terminalId: string }
   | { type: "rename"; conversationId: string; terminalId: string; name: string }
@@ -83,6 +102,7 @@ export function terminalTabId(ordinal: number): string {
 /** What a conversation starts with: no terminal until one is asked for. */
 const EMPTY_LAYOUT: TerminalTabsLayout = {
   tabs: [],
+  readOnly: null,
   activeId: null,
   nextOrdinal: 1,
   nextNumbers: {}
@@ -98,6 +118,12 @@ export function terminalTabsFor(
   if (!conversationId) return EMPTY_LAYOUT;
   return Object.prototype.hasOwnProperty.call(state.byConversation, conversationId)
     ? state.byConversation[conversationId] : EMPTY_LAYOUT;
+}
+
+/** Every tab id the strip draws, in strip order: the read-only page first, then the shells. */
+export function terminalStripIds(layout: TerminalTabsLayout): string[] {
+  const shells = layout.tabs.map((tab) => tab.id);
+  return layout.readOnly === null ? shells : [READ_ONLY_TERMINAL_TAB_ID, ...shells];
 }
 
 /**
@@ -126,6 +152,7 @@ function added(
   const key = terminalShellKey(launch);
   const number = layout.nextNumbers[key] ?? 1;
   return {
+    ...layout,
     tabs: [...layout.tabs, { id, ordinal, number, name: null, launch }],
     activeId: id,
     nextOrdinal: ordinal + 1,
@@ -141,23 +168,43 @@ export function terminalTabsReducer(
   const layout = terminalTabsFor(state, conversationId);
   switch (action.type) {
     case "ensure":
-      return layout.tabs.length > 0
+      // The read-only page counts: a pane showing it already has something to show.
+      return terminalStripIds(layout).length > 0
         ? state
         : withLayout(state, conversationId, added(layout, action.launch ?? null));
     case "add":
       return withLayout(state, conversationId, added(layout, action.launch ?? null));
+    case "show_read_only":
+      return layout.readOnly === action.shellTaskId && layout.activeId === READ_ONLY_TERMINAL_TAB_ID
+        ? state
+        : withLayout(state, conversationId, {
+          ...layout,
+          readOnly: action.shellTaskId,
+          activeId: READ_ONLY_TERMINAL_TAB_ID
+        });
+    case "forget_read_only":
+      return layout.readOnly !== action.shellTaskId
+        ? state
+        : terminalTabsReducer(state, {
+          type: "close",
+          conversationId,
+          terminalId: READ_ONLY_TERMINAL_TAB_ID
+        });
     case "close": {
-      const index = layout.tabs.findIndex((tab) => tab.id === action.terminalId);
+      const strip = terminalStripIds(layout);
+      const index = strip.indexOf(action.terminalId);
       if (index < 0) return state;
-      const tabs = layout.tabs.filter((tab) => tab.id !== action.terminalId);
+      const rest = strip.filter((id) => id !== action.terminalId);
       // Focus falls to the right, as a browser's does, and to the left off the end.
       const activeId = layout.activeId !== action.terminalId ? layout.activeId
-        : tabs.length === 0 ? null : tabs[Math.min(index, tabs.length - 1)].id;
-      return withLayout(state, conversationId, { ...layout, tabs, activeId });
+        : rest.length === 0 ? null : rest[Math.min(index, rest.length - 1)];
+      return withLayout(state, conversationId, action.terminalId === READ_ONLY_TERMINAL_TAB_ID
+        ? { ...layout, readOnly: null, activeId }
+        : { ...layout, tabs: layout.tabs.filter((tab) => tab.id !== action.terminalId), activeId });
     }
     case "activate":
       return layout.activeId === action.terminalId
-        || !layout.tabs.some((tab) => tab.id === action.terminalId) ? state
+        || !terminalStripIds(layout).includes(action.terminalId) ? state
         : withLayout(state, conversationId, { ...layout, activeId: action.terminalId });
     case "rename": {
       const name = action.name.trim() || null;
@@ -171,6 +218,8 @@ export function terminalTabsReducer(
       });
     }
     case "reorder": {
+      // Only the shells move: the read-only page is not among them, so its id is ignored and it
+      // keeps the strip's start.
       const tabs = arrangeByIds(layout.tabs, action.terminalIds, (tab) => tab.id);
       return tabs === null ? state : withLayout(state, conversationId, { ...layout, tabs });
     }

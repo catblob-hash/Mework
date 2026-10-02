@@ -1,178 +1,239 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { PendingQuestion, QuestionItemView } from "../lib/orchestration";
-import type { ToolContext } from "../types";
+import type { QuestionItemView } from "../lib/orchestration";
+import type { JsonValue, PendingToolPrompt } from "../types";
 import { QuestionDock } from "./QuestionDock";
 
-function question(id: string, questions: QuestionItemView[]): PendingQuestion {
-  const input = { questions };
-  const context: ToolContext = {
-    id,
-    kind: "tool",
+function card(questions: QuestionItemView[], promptId = "prompt-1"): PendingToolPrompt {
+  return {
+    promptId,
     toolName: "ask_user",
-    round: 1,
-    input: input as unknown as ToolContext["input"],
-    result: {
-      success: true,
-      output: "等待用户回答",
-      executedAt: "2026-07-14T01:00:00Z",
-      durationMs: 0
-    },
-    createdAt: "2026-07-14T01:00:00Z"
+    kind: "question",
+    label: "回答问题？",
+    summary: questions[0]?.question ?? "",
+    riskLevel: "低",
+    reason: "模型在等你回答问题",
+    allowAlwaysOffered: false,
+    mandatory: true,
+    questions: questions as unknown as JsonValue
   };
-  const first = questions[0];
-  return { context, questions, question: first.question, options: first.options };
 }
 
-const single = (prompt: string): QuestionItemView => ({
+const choice = (prompt: string, header = "方案", multiSelect = false): QuestionItemView => ({
   question: prompt,
-  header: "方案",
+  header,
   options: [
     { label: "方案 A", description: "保持改动最小" },
     { label: "方案 B", description: "完整重构" }
   ],
-  multiSelect: false
+  multiSelect
 });
 
 describe("QuestionDock", () => {
-  it("renders nothing without a pending question", () => {
-    const { container } = render(<QuestionDock pending={null} onAnswer={vi.fn()} />);
+  it("draws nothing without a question card", () => {
+    const { container } = render(<QuestionDock prompt={null} onRespond={vi.fn()} />);
     expect(container).toBeEmptyDOMElement();
+    const approval = { ...card([choice("Q?")]), kind: "tool" as const };
+    const { container: other } = render(<QuestionDock prompt={approval} onRespond={vi.fn()} />);
+    expect(other).toBeEmptyDOMElement();
   });
 
-  it("renders a single question page, focuses the first choice, and completes once", async () => {
-    const onAnswer = vi.fn();
-    const user = userEvent.setup();
-    const { container } = render(
-      <QuestionDock pending={question("ask-plan", [single("采用哪个实现方案？")])} onAnswer={onAnswer} />
-    );
+  it("submits a lone single-select question as soon as an option is picked", async () => {
+    const onRespond = vi.fn();
+    render(<QuestionDock prompt={card([choice("采用哪个方案？")])} onRespond={onRespond} />);
 
-    const dialog = screen.getByRole("dialog", { name: "需要你的回答" });
-    expect(dialog).toHaveAttribute("aria-modal", "false");
-    expect(dialog).toHaveAttribute("data-pending-question", "true");
-    expect(container.querySelectorAll("fieldset")).toHaveLength(1);
-    expect(screen.getByRole("button", { name: "上一项" })).toBeDisabled();
-    const done = screen.getByRole("button", { name: "完成" });
-    expect(done).toBeDisabled();
-    const first = screen.getByRole("button", { name: /方案 A.*保持改动最小/ });
-    await waitFor(() => expect(first).toHaveFocus());
+    // One single-select question: no Submit tab and no arrows.
+    expect(screen.queryByRole("tab", { name: /提交/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "切换到下一个问题" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("option", { name: /方案 A/ }));
 
-    await user.click(first);
-    expect(first).toHaveAttribute("aria-pressed", "true");
-    expect(done).toBeEnabled();
-    await user.dblClick(done);
-
-    expect(onAnswer).toHaveBeenCalledTimes(1);
-    expect(onAnswer).toHaveBeenCalledWith(
-      'User has answered your questions: "采用哪个实现方案？"="方案 A"'
-    );
-    expect(screen.getByRole("status")).toHaveTextContent("回答已提交");
-    expect(first).toBeDisabled();
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond).toHaveBeenCalledWith({
+      action: "submit",
+      answers: ["方案 A"],
+      previews: [null],
+      notes: [null]
+    });
   });
 
-  it("pages through questions and preserves option and custom-answer drafts when going back", async () => {
-    const onAnswer = vi.fn();
-    const user = userEvent.setup();
-    const featureQuestion: QuestionItemView = {
-      question: "需要启用哪些能力？",
-      header: "能力",
-      options: [
-        { label: "搜索", description: "启用全文搜索" },
-        { label: "导出", description: "启用文件导出" }
-      ],
-      multiSelect: true
-    };
-    const detailQuestion = single("还有其他要求吗？");
-    const { container } = render(
-      <QuestionDock pending={question("ask-multi", [featureQuestion, detailQuestion])} onAnswer={onAnswer} />
-    );
-
-    expect(container.querySelectorAll("fieldset")).toHaveLength(1);
-    expect(screen.getByText("需要启用哪些能力？")).toBeInTheDocument();
-    expect(screen.queryByText("还有其他要求吗？")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "上一项" })).toBeDisabled();
-    const next = screen.getByRole("button", { name: "下一项" });
-    expect(next).toBeDisabled();
-    await user.click(screen.getByRole("button", { name: /搜索.*启用全文搜索/ }));
-    await user.click(screen.getByRole("button", { name: /导出.*启用文件导出/ }));
-    expect(next).toBeEnabled();
-    expect(onAnswer).not.toHaveBeenCalled();
-    await user.click(next);
-
-    expect(container.querySelectorAll("fieldset")).toHaveLength(1);
-    expect(screen.queryByText("需要启用哪些能力？")).not.toBeInTheDocument();
-    const secondQuestion = screen.getByText("还有其他要求吗？").closest("fieldset")!;
-    expect(screen.getByRole("button", { name: "上一项" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "完成" })).toBeDisabled();
-    await user.click(within(secondQuestion).getByRole("button", { name: /其他.*输入自定义回答/ }));
-    const custom = within(secondQuestion).getByPlaceholderText("输入你的回答…");
-    await user.type(custom, "  需要离线模式  ");
-    expect(screen.getByRole("button", { name: "完成" })).toBeEnabled();
-
-    await user.click(screen.getByRole("button", { name: "上一项" }));
-    expect(screen.getByText("需要启用哪些能力？")).toBeInTheDocument();
-    expect(screen.queryByText("还有其他要求吗？")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /搜索.*启用全文搜索/ })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: /导出.*启用文件导出/ })).toHaveAttribute("aria-pressed", "true");
-
-    await user.click(screen.getByRole("button", { name: "下一项" }));
-    expect(screen.getByText("还有其他要求吗？")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("输入你的回答…")).toHaveValue("  需要离线模式  ");
-    await user.click(screen.getByRole("button", { name: "完成" }));
-
-    expect(onAnswer).toHaveBeenCalledTimes(1);
-    expect(onAnswer).toHaveBeenCalledWith(
-      'User has answered your questions: "需要启用哪些能力？"="搜索, 导出", "还有其他要求吗？"="需要离线模式"'
-    );
-  });
-
-  it("closes an unfinished question through the supplied callback", async () => {
-    const pending = question("ask-dismiss", [single("还要继续吗？")]);
-    const onAnswer = vi.fn();
-    const onDismissQuestion = vi.fn();
-    const user = userEvent.setup();
+  it("advances on each pick and submits what was answered from the review screen", async () => {
+    const onRespond = vi.fn();
     render(
       <QuestionDock
-        pending={pending}
-        onAnswer={onAnswer}
-        onDismissQuestion={onDismissQuestion}
+        prompt={card([choice("先做哪个？", "顺序"), choice("用什么库？", "库")])}
+        onRespond={onRespond}
       />
     );
 
-    await user.click(screen.getByRole("button", { name: "关闭并删除提问" }));
+    await userEvent.click(screen.getByRole("option", { name: /方案 B/ }));
+    // Picked, so the first tab is ticked and the second question is up.
+    expect(screen.getByRole("tab", { name: "顺序（已回答）" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "用什么库？" })).toBeInTheDocument();
 
-    expect(onDismissQuestion).toHaveBeenCalledTimes(1);
-    expect(onDismissQuestion).toHaveBeenCalledWith(pending.context);
-    expect(onAnswer).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("tab", { name: /提交/ }));
+    expect(screen.getByRole("heading", { name: "检查你的回答" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("你还有问题没有回答");
+    expect(screen.getByText("→ 方案 B")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "提交回答" }));
+    expect(onRespond).toHaveBeenCalledWith(expect.objectContaining({
+      action: "submit",
+      answers: ["方案 B", null]
+    }));
   });
 
-  it("honors the disabled branch without reporting a submission", () => {
-    const onAnswer = vi.fn();
-    const { container } = render(
-      <QuestionDock pending={question("ask-disabled", [single("现在继续吗？")])} disabled onAnswer={onAnswer} />
+  it("joins multi-select answers, typed Other included, and moves on with Next", async () => {
+    const onRespond = vi.fn();
+    render(
+      <QuestionDock
+        prompt={card([choice("要哪些功能？", "功能", true), choice("用什么库？", "库")])}
+        onRespond={onRespond}
+      />
     );
 
-    expect(screen.getByRole("dialog", { name: "需要你的回答" })).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByRole("button", { name: /方案 A/ })).toBeDisabled();
-    expect(screen.getByText("暂时无法提交回答")).toBeInTheDocument();
-    fireEvent.submit(container.querySelector("form")!);
-    expect(onAnswer).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("checkbox", { name: /方案 A/ }));
+    await userEvent.type(screen.getByRole("textbox", { name: "其他" }), "my, custom");
+    await userEvent.click(screen.getByRole("button", { name: "下一题" }));
+    await userEvent.click(screen.getByRole("button", { name: /先聊聊这个/ }));
+
+    expect(onRespond).toHaveBeenCalledWith(expect.objectContaining({
+      action: "chat",
+      answers: ['方案 A, "my, custom"', null]
+    }));
   });
 
-  it("resets selection when the question payload changes", async () => {
-    const onAnswer = vi.fn();
-    const user = userEvent.setup();
-    const first = question("ask-first", [single("先选一个？")]);
-    const { rerender } = render(<QuestionDock pending={first} onAnswer={onAnswer} />);
+  it("answers a single-select question with the typed Other text, and closes on a blank one", async () => {
+    const onRespond = vi.fn();
+    const { unmount } = render(
+      <QuestionDock prompt={card([choice("采用哪个方案？")])} onRespond={onRespond} />
+    );
+    const other = screen.getByRole("textbox", { name: "其他" });
+    await userEvent.type(other, "  都不要  {Enter}");
+    expect(onRespond).toHaveBeenLastCalledWith(expect.objectContaining({
+      action: "submit",
+      answers: ["  都不要  "]
+    }));
+    unmount();
 
-    await user.click(screen.getByRole("button", { name: /方案 A/ }));
-    expect(screen.getByRole("button", { name: /方案 A/ })).toHaveAttribute("aria-pressed", "true");
+    const onClose = vi.fn();
+    render(<QuestionDock prompt={card([choice("采用哪个方案？")], "prompt-2")} onRespond={onClose} />);
+    await userEvent.type(screen.getByRole("textbox", { name: "其他" }), "{Enter}");
+    expect(onClose).toHaveBeenCalledWith({ action: "close", answers: [] });
+  });
 
-    const changed = question("ask-first", [single("改成另一个问题？")]);
-    rerender(<QuestionDock pending={changed} onAnswer={onAnswer} />);
+  it("checks the single-select Other circle when its box is clicked, and clears it when an option is picked", async () => {
+    const onDraftChange = vi.fn();
+    render(
+      <QuestionDock
+        prompt={card([choice("先做哪个？", "顺序"), choice("用什么库？", "库")])}
+        onRespond={vi.fn()}
+        onDraftChange={onDraftChange}
+      />
+    );
+    const otherCircle = screen.getByRole("radio", { name: "选择其他" });
+    expect(otherCircle).toHaveAttribute("aria-checked", "false");
 
-    expect(screen.getByRole("button", { name: /方案 A/ })).toHaveAttribute("aria-pressed", "false");
-    await waitFor(() => expect(screen.getByRole("button", { name: /方案 A/ })).toHaveFocus());
+    await userEvent.click(screen.getByRole("textbox", { name: "其他" }));
+    expect(otherCircle).toHaveAttribute("aria-checked", "true");
+    // Checked but empty is not an answer yet.
+    expect(onDraftChange).toHaveBeenLastCalledWith("prompt-1", { action: "close", answers: [] });
+
+    await userEvent.type(screen.getByRole("textbox", { name: "其他" }), "自己写");
+    expect(onDraftChange).toHaveBeenLastCalledWith("prompt-1", expect.objectContaining({
+      action: "submit",
+      answers: ["自己写", null]
+    }));
+
+    // Picking an option moves the check off Other; the typed text stays but no longer answers.
+    fireEvent.click(screen.getByRole("option", { name: /方案 A/ }));
+    await userEvent.click(screen.getByRole("tab", { name: "顺序（已回答）" }));
+    expect(screen.getByRole("radio", { name: "选择其他" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("textbox", { name: "其他" })).toHaveValue("自己写");
+    expect(onDraftChange).toHaveBeenLastCalledWith("prompt-1", expect.objectContaining({
+      answers: ["方案 A", null]
+    }));
+
+    await userEvent.click(screen.getByRole("radio", { name: "选择其他" }));
+    expect(screen.getByRole("radio", { name: "选择其他" })).toHaveAttribute("aria-checked", "true");
+    expect(onDraftChange).toHaveBeenLastCalledWith("prompt-1", expect.objectContaining({
+      answers: ["自己写", null]
+    }));
+  });
+
+  it("closes with Esc and with the close button", async () => {
+    const onEsc = vi.fn();
+    const { unmount } = render(<QuestionDock prompt={card([choice("Q?")])} onRespond={onEsc} />);
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(onEsc).toHaveBeenCalledWith({ action: "close", answers: [] });
+    unmount();
+
+    const onButton = vi.fn();
+    render(<QuestionDock prompt={card([choice("Q?")], "prompt-2")} onRespond={onButton} />);
+    await userEvent.click(screen.getByRole("button", { name: "关闭提问" }));
+    expect(onButton).toHaveBeenCalledWith({ action: "close", answers: [] });
+  });
+
+  it("keeps the page told what a composer message would hand back", async () => {
+    const onDraftChange = vi.fn();
+    render(
+      <QuestionDock
+        prompt={card([choice("先做哪个？", "顺序"), choice("用什么库？", "库")])}
+        onRespond={vi.fn()}
+        onDraftChange={onDraftChange}
+      />
+    );
+    expect(onDraftChange).toHaveBeenLastCalledWith("prompt-1", { action: "close", answers: [] });
+
+    await userEvent.click(screen.getByRole("option", { name: /方案 A/ }));
+    expect(onDraftChange).toHaveBeenLastCalledWith("prompt-1", expect.objectContaining({
+      action: "submit",
+      answers: ["方案 A", null]
+    }));
+  });
+
+  it("shows the focused option's preview beside the list and takes notes with n", async () => {
+    const onRespond = vi.fn();
+    const withPreview: QuestionItemView = {
+      question: "哪种布局？",
+      header: "布局",
+      multiSelect: false,
+      options: [
+        { label: "网格", description: "两列", preview: "GRID-PREVIEW" },
+        { label: "列表", description: "一列", preview: "LIST-PREVIEW" }
+      ]
+    };
+    render(<QuestionDock prompt={card([withPreview, choice("用什么库？", "库")])} onRespond={onRespond} />);
+
+    expect(screen.getByText("GRID-PREVIEW")).toBeInTheDocument();
+    // The preview layout has no Other row.
+    expect(screen.queryByRole("textbox", { name: "其他" })).not.toBeInTheDocument();
+    fireEvent.mouseEnter(screen.getByRole("option", { name: /列表/ }));
+    expect(screen.getByText("LIST-PREVIEW")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "n" });
+    const notes = await screen.findByPlaceholderText("为这个方案添加备注…");
+    await userEvent.type(notes, "再宽一点");
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    await userEvent.click(screen.getByRole("option", { name: /网格/ }));
+    await userEvent.click(screen.getByRole("tab", { name: /提交/ }));
+    await userEvent.click(screen.getByRole("button", { name: "提交回答" }));
+
+    expect(onRespond).toHaveBeenCalledWith({
+      action: "submit",
+      answers: ["网格", null],
+      previews: ["GRID-PREVIEW", null],
+      notes: ["再宽一点", null]
+    });
+  });
+
+  it("unlocks for a retry when the host did not take the answer", async () => {
+    const onRespond = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    render(<QuestionDock prompt={card([choice("先做哪个？"), choice("用什么库？", "库")])} onRespond={onRespond} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "关闭提问" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "关闭提问" })).toBeEnabled());
+    await userEvent.click(screen.getByRole("button", { name: "关闭提问" }));
+    expect(onRespond).toHaveBeenCalledTimes(2);
   });
 });

@@ -9,7 +9,7 @@
   min-height: 0;
   flex: 1;
   padding: 16px 22px 20px;
-  overflow: auto;
+  overflow: auto scroll;
 }
 
 .plan-page__empty {

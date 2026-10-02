@@ -1,4 +1,13 @@
-import { ArrowRight, Bot, FileText, Plus, Settings2, Wrench } from "lucide-react";
+import {
+  Bot,
+  ChevronDown,
+  CopyPlus,
+  FileText,
+  Plus,
+  Settings2,
+  SlidersHorizontal,
+  Wrench
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import {
@@ -14,6 +23,7 @@ import {
 } from "../lib/agentDefinitions";
 import type { UserAgentDefinitionDraft } from "../lib/agentDefinitions";
 import { supportsVision } from "../lib/modelCapabilities";
+import { REASONING_EFFORTS } from "../lib/reasoningEffort";
 import { isPreviewLifecycleToolName } from "../lib/taskTools";
 import {
   DEFAULT_SEARCH_COMPRESSION_CUTOFF,
@@ -34,9 +44,15 @@ import type {
   WebSearchAssets
 } from "../types";
 import { CatalogRow, useCatalogSort } from "./CatalogRow";
-import { ConfirmDeleteButton, Dialog, DialogSidebarTitle, Field, IconButton, Switch } from "./Common";
+import { ConfirmDeleteButton, Dialog, Field, IconButton, Switch } from "./Common";
 import { ConversationTemplateEditor } from "./ConversationTemplateEditor";
-import { FeaturesPage } from "./FeaturesPage";
+import { AdvancedToolsPage } from "./AdvancedToolsPage";
+import { DocsLink } from "./DocsLink";
+import { PopoverMenu } from "./PopoverMenu";
+import { SettingsLayout, SettingsNavigation } from "./SettingsLayout";
+import { SettingsPageHeading } from "./SettingsPageHeading";
+import { ToolSelectionGroups } from "./ToolSelectionGroups";
+import { HostedWindow } from "./WindowLayer";
 import { reorderItems } from "./usePointerDrag";
 import "./AgentDefinitionSettings.css";
 
@@ -154,23 +170,17 @@ function rememberDraft(key: string, state: EditorState): void {
  * Laid out the way a preset's window is — a rail of pages on the left, the page
  * on the right, the save under the rail — because it is the same kind of thing:
  * one reusable body, opened to be edited. `role` is what the role is called and
- * what it runs on; `tools` is the conversation's own features page with the
- * sections a role cannot answer left out; `template` is the opening history.
+ * what it runs on; `tools` and `advanced` are the conversation's own two tool
+ * pages with the sections a role cannot answer left out; `template` is the
+ * opening history.
  */
-type RoleEditorPage = "role" | "tools" | "template";
+type RoleEditorPage = "role" | "tools" | "advanced" | "template";
 
 const ROLE_EDITOR_PAGES: ReadonlyArray<{ id: RoleEditorPage; icon: typeof Bot }> = [
   { id: "role", icon: Bot },
   { id: "tools", icon: Wrench },
+  { id: "advanced", icon: SlidersHorizontal },
   { id: "template", icon: FileText }
-];
-
-const AGENT_EFFORTS: readonly ReasoningEffort[] = [
-  "disabled",
-  "low",
-  "medium",
-  "high",
-  "xhigh"
 ];
 
 interface ExplicitModelOption {
@@ -250,12 +260,12 @@ export function AgentDefinitionSettings({
   /* Two whole categories are withheld here, for two unrelated reasons.
    *
    * `orchestration` — a child may hold NONE of it. The host strips
-   * `agent_spawn` / `send_message` / `followup_task` / `task_wait` /
-   * `task_list` / `workflow` / `todo` / `ask_user` from every child
-   * template (`SUBAGENT_DISABLED_TOOL_NAMES` in `src-tauri/src/api.rs`), and
-   * that list is re-applied to the catalogue a role's allowlist selects out
-   * of — so ticking one of them here could never grant it. It could only make
-   * the role worse: a role whose allowlist named nothing else resolves to the
+   * `agent_spawn` / `task_wait` / `task_list` / `workflow` / `ask_user` from
+   * every child template (`SUBAGENT_DISABLED_TOOL_NAMES` in
+   * `src-tauri/src/api.rs`), and that list is re-applied to the catalogue a
+   * role's allowlist selects out of — so ticking one of them here could
+   * never grant it. It could only make the role worse: a role whose
+   * allowlist named nothing else resolves to the
    * empty set and its first spawn fails outright ("no usable tools resolved" —
    * the one degenerate case the host lets through is a conversation that
    * enabled no tools at all). Drawing a switch for a capability this screen
@@ -604,6 +614,7 @@ export function AgentDefinitionSettings({
   const pageTitles: Record<RoleEditorPage, string> = {
     role: t("角色设置", "Role settings"),
     tools: t("工具", "Tools"),
+    advanced: t("高级工具", "Advanced tools"),
     template: t("对话模板", "Conversation template")
   };
   const pageBlurbs: Record<RoleEditorPage, string> = {
@@ -611,13 +622,22 @@ export function AgentDefinitionSettings({
       "这个角色叫什么、主代理从描述里读到它是干什么的，以及它跑在哪个模型上。关掉窗口会保留草稿，点「保存角色」才会写入。",
       "What this role is called, what the main agent reads about what it is for, and which model it runs on. Closing the window keeps the draft; nothing is written until Save role."
     ),
-    tools: t(
-      "这个角色拿到的工具面与联网后端，和对话自己的功能页是同一页；联网开关、记忆与工具描述由调用它的对话决定，这里不出现。",
-      "The tool surface and web backends this role gets — the same page as the conversation's own features page. Web access, memory and tool descriptions are decided by the conversation that calls it, so they do not appear here."
+    /* A role with no list of its own follows the conversation's, and the line
+       that says what the page is for is where that is said: the list it draws is
+       the conversation's, and would otherwise read as the role's own. */
+    tools: editor?.draft.tools === null
+      ? t(
+          "这个角色能调用的工具。现在跟随对话设置：本对话启用哪些，这个角色就有哪些；改动任何一项，这个角色就有了自己的一份。",
+          "The tools this role may call. It follows the conversation for now: this role gets whatever the conversation enables, and changing any row gives it a list of its own."
+        )
+      : t("这个角色能调用的工具。", "The tools this role may call."),
+    advanced: t(
+      "这个角色的联网后端。联网开关、计划模式、记忆与工具描述由调用它的对话决定，这里不出现。",
+      "This role's web backends. Web access, plan mode, memory and tool descriptions are decided by the conversation that calls it, so they do not appear here."
     ),
     template: t(
-      "这个角色的开局历史。模板里的用户消息若恰好含一个 {input}，主代理给的输入会替换到那里；没有或有两个以上时，输入作为最后一条用户消息追加。左下方点一份预设，可以用它的对话模板覆盖这里。",
-      "This role's opening history. If the template's user messages contain exactly one {input}, the caller's input replaces it; with none or with two or more, the input is appended as a final user message. Pick a preset at the bottom left to copy its template over this one."
+      "这个角色的开局历史。模板里的用户消息若恰好含一个 {input}，主代理给的输入会替换到那里；没有或有两个以上时，输入作为最后一条用户消息追加。右上角的「从预设覆盖」可以用一份预设的对话模板换掉这里。",
+      "This role's opening history. If the template's user messages contain exactly one {input}, the caller's input replaces it; with none or with two or more, the input is appended as a final user message. Copy from a preset, at the top right, replaces this one with a preset's template."
     )
   };
 
@@ -866,130 +886,115 @@ export function AgentDefinitionSettings({
       </div>
 
       {editor && (
-        <Dialog
-          /* Named after the role, the way a preset's window is named after the
-             preset. The name as it was OPENED, not as it is being typed: the
-             title is how the user knows which role this window is, and it
-             should not change under them mid-rename. */
-          title={editor.mode === "create"
-            ? t("新建角色", "New role")
-            : editor.originalName ?? t("角色设置", "Role settings")}
-          width="1040px"
-          sidebar
-          bodyClassName="dialog__body--flush"
-          // Deliberately not dismissible: a stray click on the backdrop would
-          // discard an in-progress role without asking. The header's own close
-          // button is unaffected — that one is a decision, not a slip, and it
-          // keeps the draft rather than throwing it away.
-          dismissible={false}
-          onClose={closeEditor}
-        >
-          <div className="conversation-settings agent-definition-editor">
-            <nav
-              className="conversation-settings__nav settings-nav agent-definition-editor__nav"
-              aria-label={t("角色设置分类", "Role settings categories")}
-            >
-              <DialogSidebarTitle />
-              <div className="conversation-settings__nav-items">
-                {ROLE_EDITOR_PAGES.map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <button
-                      type="button"
-                      key={item.id}
-                      aria-current={page === item.id || undefined}
-                      className={page === item.id
-                        ? "settings-nav__item settings-nav__item--active"
-                        : "settings-nav__item"}
-                      onClick={() => setPage(item.id)}
-                    >
-                      <Icon size={14} aria-hidden="true" />
-                      <span>{pageTitles[item.id]}</span>
-                      {item.id === "template" && (
-                        <small className="conversation-settings__nav-count">{templateMessageCount}</small>
+        <HostedWindow>
+          <Dialog
+            /* Named after the role, the way a preset's window is named after the
+               preset. The name as it was OPENED, not as it is being typed: the
+               title is how the user knows which role this window is, and it
+               should not change under them mid-rename. */
+            title={editor.mode === "create"
+              ? t("新建角色", "New role")
+              : editor.originalName ?? t("角色设置", "Role settings")}
+            width="1040px"
+            sidebar
+            bodyClassName="dialog__body--flush"
+            // Deliberately not dismissible: a stray click on the backdrop would
+            // discard an in-progress role without asking. The header's own close
+            // button is unaffected — that one is a decision, not a slip, and it
+            // keeps the draft rather than throwing it away.
+            dismissible={false}
+            onClose={closeEditor}
+          >
+            <SettingsLayout
+              label={t("角色设置", "Role settings")}
+              navigation={(
+                <SettingsNavigation
+                  label={t("角色设置分类", "Role settings categories")}
+                  groups={[{
+                    id: "pages",
+                    items: ROLE_EDITOR_PAGES.map((item) => ({
+                      id: item.id,
+                      icon: item.icon,
+                      label: pageTitles[item.id],
+                      count: item.id === "template"
+                        ? templateMessageCount
+                        : item.id === "tools"
+                          ? visibleSelectedCount(editor.draft.tools ?? inheritedToolNames)
+                          : null
+                    }))
+                  }]}
+                  view={page}
+                  onSelect={setPage}
+                  footer={(
+                    <>
+                      <button
+                        type="button"
+                        className="settings-nav__action"
+                        // Not disabled on a blank name. A save greyed out with no
+                        // explanation is a puzzle; pressing it and being told what
+                        // is missing is an answer.
+                        onClick={saveEditor}
+                      >{t("保存角色", "Save role")}</button>
+                      {editorError && (
+                        <p className="settings-nav__error" role="alert">{editorError}</p>
                       )}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Only while the template is on screen: copying a preset's body
-                  over the role's is an act on that page, and it is read against
-                  the body it would replace. One line per preset, the whole line
-                  the target, and the arrow pointing at where the body goes. */}
-              {page === "template" && (
-                <div className="agent-definition-editor__presets">
-                  <span className="agent-definition-editor__presets-label">
-                    {t("从预设覆盖", "Copy from a preset")}
-                  </span>
-                  <div className="agent-definition-editor__presets-list">
-                    {presets.map((preset) => {
-                      const name = preset.name || t("未命名预设", "Untitled preset");
-                      const empty = presetTemplateCount(preset) === 0;
-                      return (
-                        <button
-                          type="button"
-                          key={preset.id}
-                          className="agent-definition-editor__preset"
-                          aria-label={t(
-                            "用预设 {name} 的对话模板覆盖",
-                            "Copy preset {name}'s template over this one",
-                            { name }
-                          )}
-                          title={empty
-                            ? t("这份预设没有对话模板。", "This preset has no conversation template.")
-                            : name}
-                          disabled={empty || overwriting}
-                          onClick={() => requestOverwrite(preset)}
-                        >
-                          <span>{name}</span>
-                          <ArrowRight size={12} aria-hidden="true" />
-                        </button>
-                      );
-                    })}
-                    {presets.length === 0 && (
-                      <p className="agent-definition-editor__presets-empty">
-                        {t("还没有对话预设。", "No conversation presets yet.")}
-                      </p>
-                    )}
-                  </div>
-                  {overwriteError && (
-                    <p className="agent-definition-editor__error" role="alert">{overwriteError}</p>
+                    </>
                   )}
-                </div>
+                />
               )}
-
-              {/* Saving belongs to the whole window rather than to any one page,
-                  so it is the one thing under the list — the corner a preset's
-                  window keeps its own save in. */}
-              <div className="conversation-settings__nav-footer">
-                <div className="conversation-settings__preset-actions">
-                  <button
-                    type="button"
-                    className="text-button"
-                    // Not disabled on a blank name. A save greyed out with no
-                    // explanation is a puzzle; pressing it and being told what
-                    // is missing is an answer.
-                    onClick={saveEditor}
-                  >{t("保存角色", "Save role")}</button>
-                </div>
-                {editorError && (
-                  <p className="agent-definition-editor__error" role="alert">{editorError}</p>
+            >
+              <section className={page === "template" ? "settings-page settings-editor-page" : "settings-page"}>
+                {/* The rail names the page, so the page says only what it is for,
+                    as a preset's window does. */}
+                <SettingsPageHeading
+                  description={pageBlurbs[page]}
+                  /* On the template page, copying a preset's body over the role's:
+                     an act on that page, read against the body it would replace. A
+                     preset with no template has nothing to copy, so its row is
+                     there but cannot be chosen. The two tool pages end the line
+                     with their documentation instead, as the conversation's do. */
+                  action={page === "tools" || page === "advanced" ? (
+                    <DocsLink page="features" />
+                  ) : page === "template" ? (
+                    <div className="settings-page-heading__actions">
+                      <PopoverMenu
+                        trigger={<>
+                          <CopyPlus size={14} aria-hidden="true" />
+                          {t("从预设覆盖", "Copy from a preset")}
+                          <ChevronDown size={12} aria-hidden="true" />
+                        </>}
+                        triggerLabel={t("从预设覆盖", "Copy from a preset")}
+                        triggerClassName="button button--secondary button--small"
+                        disabled={overwriting}
+                        menuLabel={t("从预设覆盖", "Copy from a preset")}
+                        align="end"
+                        emptyLabel={t("还没有对话预设。", "No conversation presets yet.")}
+                        sections={[{
+                          id: "presets",
+                          items: presets.map((preset) => {
+                            const name = preset.name || t("未命名预设", "Untitled preset");
+                            const count = presetTemplateCount(preset);
+                            return {
+                              id: preset.id,
+                              label: name,
+                              description: count === 0
+                                ? t("这份预设没有对话模板。", "This preset has no conversation template.")
+                                : t("{count} 条消息", "{count} messages", { count }),
+                              disabled: count === 0,
+                              onSelect: () => requestOverwrite(preset)
+                            };
+                          })
+                        }]}
+                      />
+                    </div>
+                  ) : undefined}
+                />
+                {page === "template" && overwriteError && (
+                  <p className="settings-page__note settings-page__note--error" role="alert">{overwriteError}</p>
                 )}
-              </div>
-            </nav>
-
-            <div className="conversation-settings__page">
-              <header className="conversation-settings__page-header">
-                <h3 className="conversation-settings__page-title">{pageTitles[page]}</h3>
-                <p>{pageBlurbs[page]}</p>
-              </header>
-              {/* The template page is a timeline, which brings its own scroller
-                  and its own edges, so it gets the body flush — as it does on a
-                  preset's page. */}
-              <div className={page === "template"
-                ? "conversation-settings__page-body conversation-settings__page-body--flush"
-                : "conversation-settings__page-body"}>
+                {/* The template page is a timeline, which brings its own scroller
+                    and its own edges, so it gets the body flush — as it does on a
+                    preset's page. */}
                 <div className={page === "template"
                   ? "conversation-settings__page-stack conversation-settings__page-stack--flush"
                   : "conversation-settings__page-stack"}>
@@ -1147,7 +1152,7 @@ export function AgentDefinitionSettings({
                               })}
                             >
                               <option value="inherit">{t("跟随对话", "Follow the conversation")}</option>
-                              {AGENT_EFFORTS.map((effort) => (
+                              {REASONING_EFFORTS.map((effort) => (
                                 <option key={effort} value={effort}>{effort}</option>
                               ))}
                             </select>
@@ -1157,40 +1162,31 @@ export function AgentDefinitionSettings({
                     </>
                   )}
 
-                  {/* The conversation's own features page, not a copy of it: a
+                  {/* The conversation's own two tool pages, not copies of them: a
                       row added or reworded there lands here too. What a role
                       leaves out is exactly what it has no field for — the web
                       access switch (whether to reach the web at all is the
-                      caller's decision), the memory tiers (derived from the
-                      caller's switches and the role's memory binding, never from
-                      a tool list), the app-data path, and the tool-description
-                      profile. What it adds is a "follow the conversation" answer
-                      on every row that has a caller to follow. */}
+                      caller's decision), plan mode, the memory tiers (derived
+                      from the caller's switches and the role's memory binding,
+                      never from a tool list), the app-data path, and the
+                      tool-description profile. What it adds is a "follow the
+                      conversation" answer on every row that has a caller to
+                      follow. */}
                   {page === "tools" && (
-                    <FeaturesPage
-                      picker={{
-                        tools: selectableTools as ToolDescriptor[],
-                        // While inheriting, the picker shows the conversation's
-                        // own set rather than an empty list: that IS what this
-                        // role will get, and drawing it as "nothing selected"
-                        // would misread as broken.
-                        enabledTools: editor.draft.tools ?? inheritedToolNames,
-                        onChange: (tools) => replaceEditorDraft({ tools }),
-                        expansionKey: editor.originalName ?? "new-role"
-                      }}
-                      pickerSummary={editor.draft.tools === null
-                        ? t(
-                            "跟随对话设置：本对话启用哪些，这个角色就有哪些",
-                            "Following the conversation: this role gets whatever the conversation enables"
-                          )
-                        : t(
-                            "{enabled} / {total} 个已选",
-                            "{enabled} / {total} selected",
-                            {
-                              enabled: visibleSelectedCount(editor.draft.tools),
-                              total: selectableToolNames.filter((name) => !isPreviewLifecycleToolName(name)).length
-                            }
-                          )}
+                    <ToolSelectionGroups
+                      tools={selectableTools as ToolDescriptor[]}
+                      // While inheriting, the picker shows the conversation's
+                      // own set rather than an empty list: that IS what this
+                      // role will get, and drawing it as "nothing selected"
+                      // would misread as broken.
+                      enabledTools={editor.draft.tools ?? inheritedToolNames}
+                      onChange={(tools) => replaceEditorDraft({ tools })}
+                      expansionKey={editor.originalName ?? "new-role"}
+                    />
+                  )}
+
+                  {page === "advanced" && (
+                    <AdvancedToolsPage
                       web={{
                         inheritOption: true,
                         value: {
@@ -1234,10 +1230,10 @@ export function AgentDefinitionSettings({
                     />
                   )}
                 </div>
-              </div>
-            </div>
-          </div>
-        </Dialog>
+              </section>
+            </SettingsLayout>
+          </Dialog>
+        </HostedWindow>
       )}
 
       {pendingOverwrite && (

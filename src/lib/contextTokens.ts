@@ -1,4 +1,4 @@
-import type { ContextItem, JsonObject, JsonValue } from "../types";
+import type { ContextItem, ImageAttachment, JsonObject, JsonValue } from "../types";
 import type { ModelRunState } from "./modelStream";
 
 /** Stable structural JSON form used for open-set supersession comparisons. */
@@ -36,17 +36,22 @@ function projectedContextText(item: ContextItem): string {
   return item.kind === "system" && item.localOnly ? "" : item.content;
 }
 
-function estimateContextImageTokens(item: ContextItem): number {
-  const images = item.kind === "user"
-    ? item.images
-    : item.kind === "tool"
-      ? item.result.images
-      : undefined;
+function estimateImagesTokens(images: ImageAttachment[] | undefined): number {
   return images?.reduce((total, image) => {
     if (!image.width || !image.height) return total + 1024;
     const tiled = 85 + Math.ceil(image.width / 512) * Math.ceil(image.height / 512) * 170;
     return total + Math.max(1024, tiled);
   }, 0) ?? 0;
+}
+
+function estimateContextImageTokens(item: ContextItem): number {
+  return estimateImagesTokens(
+    item.kind === "user"
+      ? item.images
+      : item.kind === "tool"
+        ? item.result.images
+        : undefined
+  );
 }
 
 /**
@@ -95,12 +100,40 @@ function streamedRoundTokens(run: ModelRunState, round: number): number {
     // Same projection the settled tool context uses, so a round's estimate does
     // not change shape the moment it stops being live.
     + tools.reduce(
-      (total, tool) => total + estimateTokens(
-        `${tool.toolName}\n${canonicalJson(tool.input)}\n${tool.result.output}`
-      ),
+      (total, tool) => total
+        + estimateTokens(`${tool.toolName}\n${canonicalJson(tool.input)}\n${tool.result.output}`)
+        + estimateImagesTokens(tool.result.images),
       0
     )
   );
+}
+
+/**
+ * What a reported round's calls have returned. The calls are in the round's
+ * output, but their results reach the provider only with the next request, so
+ * no snapshot has counted them yet.
+ */
+function roundResultTokens(run: ModelRunState, round: number): number {
+  return (run.streamedToolsByRound[round] ?? []).reduce(
+    (total, tool) => total
+      + estimateTokens(tool.result.output)
+      + estimateImagesTokens(tool.result.images),
+    0
+  );
+}
+
+/** Messages the user steered, and the host delivered, into rounds after
+ * `round`, which its snapshot predates. */
+function steeredInputTokens(run: ModelRunState, round: number): number {
+  const steered = Object.entries(run.steeredInputsByRound)
+    .filter(([steeredRound]) => Number(steeredRound) > round)
+    .reduce((total, [, inputs]) => total + estimateContextsTokens(inputs), 0);
+  return Object.entries(run.hostContextsByRound ?? {})
+    .filter(([hostRound]) => Number(hostRound) > round)
+    .reduce(
+      (total, [, entries]) => total + estimateContextsTokens(entries.map((entry) => entry.context)),
+      steered
+    );
 }
 
 /**
@@ -111,8 +144,10 @@ function streamedRoundTokens(run: ModelRunState, round: number): number {
  * Responses at `response.completed` — so a gauge that waits for the turn's
  * final response sits frozen for the entire turn and then jumps. This anchors
  * on the newest snapshot the provider has actually given and adds an estimate
- * of everything streamed since, which is the only part that can move between
- * snapshots.
+ * of everything that has joined since — what the round's calls returned, what
+ * later rounds streamed, what the user steered in — which is the only part
+ * that can move between snapshots. The host measures the auto-compact
+ * threshold the same way (`api.rs::ContextMeasure`).
  *
  * `fallbackTokens` is the caller's estimate of the conversation as persisted,
  * used before this run's first snapshot arrives. Nothing is added on top of it:
@@ -146,7 +181,9 @@ export function liveContextTokens(
   const growthFrom = settled === undefined ? anchorRound : anchorRound + 1;
   const growth = streamedRounds(run)
     .filter((round) => round >= growthFrom)
-    .reduce((total, round) => total + streamedRoundTokens(run, round), 0);
+    .reduce((total, round) => total + streamedRoundTokens(run, round), 0)
+    + (settled === undefined ? 0 : roundResultTokens(run, anchorRound))
+    + steeredInputTokens(run, anchorRound);
   return {
     tokens: Math.max(0, anchorInput + (settled ?? 0) + growth),
     estimated: growth > 0

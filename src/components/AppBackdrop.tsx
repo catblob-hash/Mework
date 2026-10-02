@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useAppearance } from "../lib/appearance";
 import { parseBackground, replacesThemeGround } from "../lib/background";
 import { backgroundImageData, tierCovers, useBackgroundLibraryGeneration } from "../lib/backgroundImage";
-import { setBackdropPicture } from "../lib/glassGround";
+import { setBackdropPicture, watchGlassPlates } from "../lib/glassPlate";
 import type { BackgroundImageData } from "../types";
 
 function devicePixels(): { width: number; height: number } {
@@ -104,10 +104,11 @@ export function AppBackdrop() {
     };
   }, [bundled, focus, imported, libraryGeneration]);
 
-  // Boxes painted like the glass read the ground's colour off the picture once it has
-  // loaded (the `<img>`'s `onLoad`), and off this layer while none is shown.
+  // The glass is baked from the picture once it has loaded (the `<img>`'s `onLoad`), and from
+  // this layer's colour while none is shown (`lib/glassPlate.ts`).
   const showsPicture = layered && picture !== null && background.kind !== "solid";
   const solid = background.kind === "solid" ? background.scheme ?? "theme" : "theme";
+  useEffect(() => (layered ? watchGlassPlates() : undefined), [layered]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: a new solid ground is a new colour to read, though nothing here reads it.
   useEffect(() => {
     if (!showsPicture) setBackdropPicture(null);

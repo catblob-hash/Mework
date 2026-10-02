@@ -2,7 +2,7 @@
 
 ## Approval
 
-A fetch is classified as an unbounded action with no path (rule `web.fetch`, high risk), the same boundary `web_search` uses. `request_approval`, `allow_edits` and Plan mode ask; `full_access` does not. One card authorizes the whole list, so read the URLs before answering. The prompt is not mandatory, so **Always allow** can remember it for that conversation. The list is validated before any card is shown: one to twenty absolute `http(s)` URLs, each non-blank and under 2,048 characters; anything else is refused outright.
+A fetch is classified as an unbounded action with no path (rule `web.fetch`, high risk), the same boundary `web_search` uses. `request_approval` and `allow_edits` ask; `full_access` does not. One card authorizes the whole list, so read the URLs before answering. The prompt is not mandatory, so **Always allow** can remember it for that conversation. The list is validated before any card is shown: one to twenty absolute `http(s)` URLs, each non-blank and under 2,048 characters; anything else is refused outright.
 
 ## Behavior and limits
 

@@ -187,8 +187,10 @@ describe("streaming workflow projection", () => {
       { agents: views, terminals: [], inheritedModelId: "会话模型" },
       taskMessages
     );
+    // Titled role:name and subtitled with the step's task; a role-less step is
+    // titled by its name alone.
     expect(Object.fromEntries((item?.children ?? []).map((child) => [child.label, child.detail])))
-      .toEqual({ 审查一: "reviewer", 无角色: "会话模型" });
+      .toEqual({ "reviewer:审查一": "审查代理内核", 无角色: "沿用对话的模型" });
   });
 });
 
@@ -433,7 +435,7 @@ describe("a workflow that finishes while its turn is still streaming", () => {
 
     expect(item?.kind).toBe("workflow");
     expect(Object.fromEntries((item?.children ?? []).map((child) => [child.label, child.detail])))
-      .toEqual({ alpha: "auditor", beta: "会话模型" });
+      .toEqual({ "auditor:alpha": "step-alpha", beta: "step-beta" });
 
     // The run panel draws the same steps from the same projection, so the two
     // surfaces cannot disagree about which role is answering. Keyed by label

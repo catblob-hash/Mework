@@ -369,6 +369,23 @@ describe("background agent views", () => {
     ...overrides
   });
 
+  // The spawn receipt succeeding only means the host accepted the call. A
+  // settled card with no record anywhere never heard how the child ended.
+  it("does not read a record-less spawn's accepted call as a completed child", () => {
+    const [lost] = deriveSubagentViews([spawnContext()]);
+    expect(lost.status).toBe("interrupted");
+
+    const [outlivingItsTurn] = deriveSubagentViews([
+      spawnContext({ live: { status: "running", contexts: [], updates: [] } })
+    ]);
+    expect(outlivingItsTurn.status).toBe("running");
+
+    const [refused] = deriveSubagentViews([
+      spawnContext({ result: { ...result("name taken"), success: false } })
+    ]);
+    expect(refused.status).toBe("interrupted");
+  });
+
   it("merges agent_spawn and agent_send continuations into one view keyed by name", () => {
     const spawn = spawnContext({
       subagent: {
@@ -459,7 +476,7 @@ describe("background agent views", () => {
     expect(settledView.modelId).toBe("sonnet-5");
   });
 
-  it("does not mint a subagent view for a child's message to the main agent", () => {
+  it("does not mint a subagent view for a saved child message to the main agent", () => {
     const spawn = spawnContext({
       subagent: {
         name: "helper",
@@ -471,8 +488,8 @@ describe("background agent views", () => {
         updates: []
       }
     });
-    // The child form the host mints: same wire name, no `target`, because its
-    // only recipient is the main agent.
+    // The retired child form as saved conversations hold it: same wire name, no
+    // `target`, because its only recipient was the main agent.
     const upward: ToolContext = {
       id: "tool-message-up",
       kind: "tool",
@@ -491,7 +508,7 @@ describe("background agent views", () => {
     expect(deriveSubagentViews([spawn, downward])[0].callIds).toEqual(["tool-spawn", "tool-message-down"]);
   });
 
-  it("keeps queue-only send_message out of the child transcript until it is drained", () => {
+  it("keeps a saved queue-only send_message out of the child transcript until it was drained", () => {
     const spawn = spawnContext({
       subagent: {
         name: "helper",
@@ -518,8 +535,7 @@ describe("background agent views", () => {
           { id: "queue-task", kind: "user", content: "审查 API", createdAt: "2026-07-14T01:00:01Z" },
           { id: "queue-answer", kind: "assistant", content: "初版结论", createdAt: "2026-07-14T01:01:00Z" }
         ],
-        updates: [],
-        queuedMessages: [{ content: "暂存这条要求", triggerTurn: false }]
+        updates: []
       },
       createdAt: "2026-07-14T02:00:00Z"
     };
@@ -1308,7 +1324,7 @@ describe("background agent views", () => {
     expect(view.contexts.map((context) => context.id)).toEqual(["step-task", "step-answer"]);
   });
 
-  it("still shows a follow-up the child has not drained yet", () => {
+  it("still shows a saved follow-up the child never drained", () => {
     // The other half of the same rule: consuming a persisted turn is what
     // suppresses the synthesized one, so a message the record has not captured
     // must still appear — otherwise dropping the clock comparison would hide
@@ -1344,7 +1360,7 @@ describe("background agent views", () => {
       .toEqual(["审查 API", "补充并发风险"]);
   });
 
-  it("still shows a follow-up whose text a forked parent turn happens to repeat", () => {
+  it("still shows a saved follow-up whose text a forked parent turn happens to repeat", () => {
     // `context: "conversation"` copies the parent's own user turns into the head
     // of the child's record, so the record holds user turns no call produced.
     // Matching on content alone let this undrained follow-up claim the
@@ -1580,7 +1596,8 @@ describe("agent timeline row status", () => {
       streaming: true,
       streamStatus: "completed"
     }))).toBe("running");
-    // A queued message is not a run: it never owns a child of its own.
+    // A queued message (retired `send_message`) is not a run: it never owned a
+    // child of its own.
     expect(agentTimelineRunStatus(agentTool("queue", "send_message", { target: "beta" }, {
       streaming: true,
       streamStatus: "completed"

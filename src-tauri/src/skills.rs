@@ -6,6 +6,8 @@
 //! is copied or registered: the folder on disk is the skill, its directory name
 //! is the name the model addresses it by, and a conversation picks the ones it
 //! wants by the id discovery mints from the folder's location.
+//!
+//! The one exception is [`MEWORK_SDK_ID`], the skill compiled into the app.
 
 use std::{
     fs,
@@ -18,8 +20,57 @@ use crate::{
         SKILL_READ_LIMIT,
     },
     memory_archive_file,
-    model::{ResourceDescriptor, ResourceSource},
+    model::{ResolvedLanguage, ResourceDescriptor, ResourceSource},
 };
+
+/// The id of the built-in **Mework SDK** skill, which teaches the model how to
+/// configure Mework itself.
+///
+/// It is a catalog entry like any folder under `skills/`, except for what
+/// follows from having no folder: its text is this build's, so every update
+/// replaces it; nothing can edit or delete it; and its id is a constant rather
+/// than a hash of a location, so a conversation that selected it keeps it
+/// across versions. Nothing selects it by default — no built-in preset does.
+/// The host writes nothing for it: `~/.mework` holds only the user's files.
+pub const MEWORK_SDK_ID: &str = "skill_builtin_mework_sdk";
+
+/// A `builtin:` pseudo-location, like the built-in language servers' and the
+/// built-in prompt profile's, shaped as a manifest path so the directory name
+/// the model addresses it by reads back out of it the way it does for a folder.
+const MEWORK_SDK_LOCATION: &str = "builtin:skills/mework-sdk/SKILL.md";
+
+/// The manifest as written. `{{MEWORK_VERSION}}` names the build it ships in.
+const MEWORK_SDK_SOURCE: &str = include_str!("../builtin-skills/mework-sdk/SKILL.md");
+
+/// The skills compiled into the app, as catalog entries. Their catalog text is
+/// in the application language, like the built-in language servers'; what the
+/// model reads is the manifest, which is English.
+pub fn builtin_skills(language: ResolvedLanguage) -> Vec<ResourceDescriptor> {
+    let metadata = skill_metadata_from_source(MEWORK_SDK_SOURCE, "mework-sdk");
+    let description = match language {
+        ResolvedLanguage::EnUs => "Built in and updated with Mework: teaches the model to configure Mework itself — skills, MCP servers, hooks, language servers, prompt profiles, launch configs, instructions and memory",
+        ResolvedLanguage::ZhCn => "内置，随 Mework 版本更新：指导模型配置 Mework 自身——技能、MCP、钩子、语言服务器、提示词档案、启动配置、项目指令与记忆",
+    };
+    vec![ResourceDescriptor {
+        id: MEWORK_SDK_ID.to_owned(),
+        name: metadata.name,
+        description: description.to_owned(),
+        location: MEWORK_SDK_LOCATION.to_owned(),
+        source: ResourceSource::Builtin,
+        available: true,
+        workspace_id: None,
+    }]
+}
+
+/// The manifest text of a built-in skill, or `None` for a skill on disk.
+///
+/// Keyed on the source as well as the location: a folder's location is an
+/// absolute path, so no file can answer for a built-in, and a built-in is never
+/// read from disk.
+pub fn builtin_manifest(descriptor: &ResourceDescriptor) -> Option<String> {
+    (descriptor.source == ResourceSource::Builtin && descriptor.location == MEWORK_SDK_LOCATION)
+        .then(|| MEWORK_SDK_SOURCE.replace("{{MEWORK_VERSION}}", env!("CARGO_PKG_VERSION")))
+}
 
 /// Directory names Claude Code refuses for a skill: they cannot be typed as a
 /// slash command there, and here they would make one enum value ambiguous.
@@ -146,6 +197,9 @@ pub fn directory_name_of(descriptor: &ResourceDescriptor) -> String {
 /// a skill's scripts and references live in the same folder and go with it,
 /// which is what removing the skill means when the folder is the skill.
 pub fn delete_directory(roots: &[PathBuf], descriptor: &ResourceDescriptor) -> Result<(), String> {
+    if descriptor.source == ResourceSource::Builtin {
+        return Err("A built-in skill ships with Mework and cannot be deleted".into());
+    }
     let directory = Path::new(&descriptor.location)
         .parent()
         .ok_or_else(|| "The skill has no directory to delete".to_owned())?;
@@ -252,6 +306,27 @@ mod tests {
         assert!(!directory_name_is_valid("a,b"));
         assert!(!directory_name_is_valid("call(me)"));
         assert!(!directory_name_is_valid("tab\there"));
+    }
+
+    /// Only the built-in entry itself reads the compiled text: a skill on disk
+    /// carrying the same location answers nothing, and the built-in is never
+    /// handed to the folder deleter's filesystem checks.
+    #[test]
+    fn the_builtin_manifest_answers_only_for_the_builtin_entry() {
+        let builtin = builtin_skills(ResolvedLanguage::EnUs).remove(0);
+        assert_eq!(builtin.id, MEWORK_SDK_ID);
+        assert_eq!(directory_name_of(&builtin), "mework-sdk");
+        let text = builtin_manifest(&builtin).unwrap();
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+
+        let forged = ResourceDescriptor {
+            source: ResourceSource::User,
+            ..builtin.clone()
+        };
+        assert!(builtin_manifest(&forged).is_none());
+
+        let error = delete_directory(&[PathBuf::from("builtin:skills")], &builtin).unwrap_err();
+        assert!(error.contains("built-in"), "{error}");
     }
 
     #[test]

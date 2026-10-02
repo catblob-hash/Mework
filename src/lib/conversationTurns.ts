@@ -3,7 +3,7 @@ import type { ContextItem, ModelUsage } from "../types";
 
 export const CONVERSATION_TURNS_STORAGE_KEY = "mework.conversation-turns.v1";
 
-export type ConversationTurnStatus = "running" | "awaiting_user" | "completed" | "interrupted";
+export type ConversationTurnStatus = "running" | "completed" | "interrupted";
 
 /**
  * Why a turn stopped producing. Carried on the turn so the failure is readable
@@ -86,11 +86,16 @@ function normalizeTurnError(value: unknown): ConversationTurnError | undefined {
   };
 }
 
-/** The status as written to disk, before load converts a stale `running` one. */
-function storedTurnStatus(value: Partial<ConversationTurn>): ConversationTurnStatus {
-  return value.status === "awaiting_user"
-    || value.status === "completed"
-    || value.status === "interrupted"
+/**
+ * The status as written to disk, before load converts a stale `running` one.
+ * `awaiting_user` is what a turn paused on an `ask_user` question used to be
+ * stored as, back when the answer arrived as a user message that resumed it.
+ * Questions now block inside the turn, so nothing resumes those any more; they
+ * read as the unfinished turns they are.
+ */
+function storedTurnStatus(value: { status?: unknown }): ConversationTurnStatus {
+  if (value.status === "awaiting_user") return "interrupted";
+  return value.status === "completed" || value.status === "interrupted"
     ? value.status
     : "running";
 }
@@ -150,14 +155,12 @@ function normalizeTurn(value: unknown, now: number): ConversationTurn | null {
  * newest unfinished round, so the header would come back carrying the dead
  * round's elapsed time and token counters over output it never produced.
  *
- * A live turn is exempt — `running` still has its stream ahead of it, and
- * `awaiting_user` is a question whose answer has to come back to it. So is one
+ * A live turn is exempt — `running` still has its stream ahead of it. So is one
  * carrying a failure notice, which is the one thing an empty round still has
  * to say.
  */
 export function turnLeavesNoRecord(turn: ConversationTurn): boolean {
   return turn.status !== "running"
-    && turn.status !== "awaiting_user"
     && !turn.contextIds.length
     && !turn.error;
 }
@@ -316,12 +319,12 @@ export function repairTurnAnchor(turn: ConversationTurn, contexts: ContextItem[]
 
 /**
  * A round ends on a new user message or on a normal final reply. Anything else
- * — a stop, a dropped connection, a pause for `ask_user` — leaves it unfinished,
+ * — a stop, a dropped connection — leaves it unfinished,
  * and a later run that carries no user message continues it rather than opening
  * a round of its own.
  */
 function isUnfinishedTurn(turn: ConversationTurn): boolean {
-  return turn.status === "interrupted" || turn.status === "awaiting_user";
+  return turn.status === "interrupted";
 }
 
 /**
@@ -342,11 +345,7 @@ function turnBoundaryIndex(
 /**
  * The turn a run carrying no new user message continues.
  *
- * `"awaiting"` is the `ask_user` answer path: it resumes the paused turn
- * wherever it sits, because the answer belongs to the question that paused it
- * and not to whatever ran afterwards.
- *
- * `"continue"` is the bare Send and the task wake. It only ever continues the
+ * That is the bare Send and the task wake. It only ever continues the
  * newest round, and only while that round is genuinely unfinished — a user
  * message sitting after everything the turn owns already closed it, so the run
  * belongs to the round that message started instead. A round that produced
@@ -356,12 +355,8 @@ function turnBoundaryIndex(
  */
 export function findResumableTurn(
   turns: ConversationTurn[],
-  contexts: ContextItem[],
-  mode: "continue" | "awaiting"
+  contexts: ContextItem[]
 ): ConversationTurn | undefined {
-  if (mode === "awaiting") {
-    return [...turns].reverse().find((turn) => turn.status === "awaiting_user");
-  }
   const last = turns[turns.length - 1];
   if (!last || !isUnfinishedTurn(last) || !last.contextIds.length) return undefined;
   const boundary = turnBoundaryIndex(last, contexts);

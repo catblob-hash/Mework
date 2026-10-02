@@ -8,8 +8,9 @@ import { isTauriRuntime } from "./backend";
  *
  * - `mac`: the title bar is transparent and the content runs under it. The traffic lights
  *   stay native and sit over the sidebar's first row, which leaves room for them.
- * - `windows`: there is no frame at all. The renderer draws a title bar row across the
- *   top with its own minimize, maximize and close buttons.
+ * - `windows`: there is no frame at all. The content runs to the top edge as on macOS, and
+ *   the renderer draws minimize, maximize and close over the top row's right end, where
+ *   the chat's top bar leaves room for them.
  * - `none`: the system frame is intact (Linux, and browser-dev in an ordinary tab), so the
  *   renderer draws no window controls and reserves no room for any.
  */

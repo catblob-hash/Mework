@@ -16,7 +16,7 @@ describe("canRerunTool", () => {
   });
 
   it("refuses tools the host classifier will not execute outside the model run loop", () => {
-    for (const name of ["web_search", "web_fetch", "ask_user", "todo", "workflow", "agent_spawn", "task_wait", "box", "read_project_memory", "edit_global_memory", "mcp__example__do_thing"]) {
+    for (const name of ["web_search", "web_fetch", "ask_user", "plan", "workflow", "agent_spawn", "task_wait", "box", "read_project_memory", "edit_global_memory", "mcp__example__do_thing"]) {
       expect(canRerunTool(name), name).toBe(false);
     }
   });

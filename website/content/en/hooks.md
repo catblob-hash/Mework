@@ -11,7 +11,7 @@ Hooks are written in files, not in the app. Mework reads two files and lists wha
 <workspace>/.mework/hooks.json       workspace scope — that workspace only
 ```
 
-(`~/.naiword/hooks.json` is read instead when the `.mework` file does not exist.) Skills, MCP servers and language servers follow the same two-location model, each with its own file: `SKILL.md` folders under `skills/`, an `mcp.json` and an `lsp.json`. A fresh installation writes three example handlers into `~/.mework/hooks.json` — a `SessionStart` that reports the git branch, a `PreToolUse` that refuses to `write` or `edit` a `.env` file, a `PostToolUse` that appends shell calls to `.mework/shell-hook.log` — and selects none of them.
+(`~/.naiword/hooks.json` is read instead when the `.mework` file does not exist.) Skills, MCP servers and language servers follow the same two-location model, each with its own file: `SKILL.md` folders under `skills/`, an `mcp.json` and an `lsp.json`. Mework writes none of these files itself: every hook is one you wrote.
 
 The conversation drawer's **Hooks** page lists every handler with its event, and its matcher when it has one, as the description; the toolbar has a **Rescan** button and buttons that open the global `~/.mework` and, when the conversation has a workspace, that workspace's `.mework`. Nothing watches the files, so press **Rescan** after editing one (a restart re-reads them too). Each handler is one selectable entry; a conversation selects the handlers it wants under `hookIds`, from the global file plus its own workspace's (a preset is offered the whole catalog, but a run only ever resolves those two levels). Nothing runs until it is selected, and a row's delete button removes that handler from its `hooks.json`. A handler's id is derived from its position in the file (`#/hooks/<event>/<group>/hooks/<handler>`), so deleting or reordering handlers renumbers the rest and selections of the ones that moved stop resolving. A selected id that is no longer in the catalog **fails the run** until you fix the file or uncheck it — unlike a dangling skill or MCP server, which is silently skipped.
 
@@ -69,12 +69,12 @@ The command's working directory is the workspace. Stdin is a UTF-8 JSON object; 
   "cwd": "<workspace path>",
   "hook_event_name": "PreToolUse",
   "model": "<model id>",
-  "permission_mode": "default | acceptEdits | plan | bypassPermissions",
+  "permission_mode": "default | acceptEdits | bypassPermissions",
   "turn_id": "<uuid>"
 }
 ```
 
-`permission_mode` maps the conversation's security level: `request_approval` → `default`, `allow_edits` → `acceptEdits`, `plan` → `plan`, `full_access` → `bypassPermissions`. Event-specific fields:
+`permission_mode` maps the conversation's security level: `request_approval` → `default`, `allow_edits` → `acceptEdits`, `full_access` → `bypassPermissions`. Plan mode is a tool switch, not a level, so it never appears here. Event-specific fields:
 
 | Event | Extra fields |
 |---|---|
@@ -82,7 +82,7 @@ The command's working directory is the workspace. Stdin is a UTF-8 JSON object; 
 | `UserPromptSubmit` | `prompt` — the last real user message. |
 | `PreToolUse` | `tool_name`, `tool_use_id`, `tool_input` |
 | `PermissionRequest` | `tool_name`, `tool_input`, `permission_suggestions: []` — fires only for a call that would otherwise show an approval card, or that a `PreToolUse` hook forced to ask. |
-| `PostToolUse` | `tool_name`, `tool_use_id`, `tool_input`, `tool_response` (the public projection of the result) |
+| `PostToolUse` | `tool_name`, `tool_use_id`, `tool_input`, `tool_response` (the result as the model receives it) |
 | `Stop` | `stop_hook_active` (true when the model is continuing because of an earlier Stop hook), `last_assistant_message` |
 | `InstructionsLoaded` | `file_path`, `memory_type` (`User` / `Project` / `Local` / `Managed`), `load_reason` (`session_start` / `nested_traversal` / `path_glob_match` / `include`), and when relevant `globs`, `trigger_file_path`, `parent_file_path`. No instruction body. |
 
@@ -128,7 +128,7 @@ Then **stdout**. For `SessionStart` and `UserPromptSubmit`, plain text is accept
 
 Stop hooks must answer with JSON if they print anything at all. Hook output is capped at 64 KiB; all synchronous hook work in one turn shares a 5-minute budget on top of the per-handler timeout. Every handler matching one event runs in parallel, and their decisions are combined.
 
-Two guarantees that follow from "classify what will actually run": an `allow` never overrides another hook's `ask` or `deny`, and a call denied before execution never triggers `PostToolUse`. `PostToolUse` cannot undo a tool that already ran (a file write is on disk); its rejection only changes what the model is told, and the receipt says so (`hook.post_tool_not_rolled_back`). [`todo`](tools/todo.html) and [`tool_search`](tools/tool_search.html) are different: their whole effect is host-side turn state, so a block takes them back. The mandatory confirmations listed under [approvals](working.html#tools-and-approvals) cannot be pre-approved by a hook.
+Two guarantees that follow from "classify what will actually run": an `allow` never overrides another hook's `ask` or `deny`, and a call denied before execution never triggers `PostToolUse`. `PostToolUse` cannot undo a tool that already ran (a file write is on disk); its rejection only changes what the model is told, and the receipt says so (`hook.post_tool_not_rolled_back`). [`tool_search`](tools/tool_search.html) is different: its whole effect is host-side turn state, so a block takes it back. The mandatory confirmations listed under [approvals](working.html#tools-and-approvals) cannot be pre-approved by a hook.
 
 `InstructionsLoaded` is observation only, and runs off the turn: its exit code, stdout and JSON are discarded, and reach neither the model nor the timeline.
 

@@ -2,7 +2,7 @@ Puts an image that is already in the conversation into a file input on the previ
 
 ## Approval
 
-The call sends local data to the page (`browser.image_upload`, high risk), so it asks at `request_approval`, `allow_edits` and `plan`; only `full_access` clears that line. No page tool is remembered by **Always allow**, and on a page you signed into yourself the takeover confirmation comes first, which no security level or hook can answer for you. There is no manual route: the image number only means something inside a live run, so executing or approving the tool outside one is refused outright.
+The call sends local data to the page (`browser.image_upload`, high risk), so it asks at `request_approval` and `allow_edits`; only `full_access` clears that line. No page tool is remembered by **Always allow**, and on a page you signed into yourself the takeover confirmation comes first, which no security level or hook can answer for you. There is no manual route: the image number only means something inside a live run, so executing or approving the tool outside one is refused outright.
 
 ## Behavior and limits
 

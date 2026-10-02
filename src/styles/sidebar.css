@@ -10,7 +10,7 @@
 .sidebar-resize-handle::after { content: ""; position: absolute; top: 0; right: 0; width: 2px; height: 100%; background: var(--focus); opacity: 0; transition: opacity .14s ease; }
 .sidebar-resize-handle:hover::after, .sidebar-resize-handle:focus-visible::after, .sidebar-resize-active .sidebar-resize-handle::after { opacity: .72; }
 .sidebar-resize-handle:focus-visible { outline-offset: -3px; }
-.sidebar-resize-active, .sidebar-resize-active * { cursor: col-resize !important; user-select: none !important; }
+.sidebar-resize-active, .sidebar-resize-active * { cursor: col-resize !important; -webkit-user-select: none !important; user-select: none !important; }
 /*
  * Every row in the sidebar is one line of text tall, and every row shares one grid: a 14px
  * lead column (the new-task plus, a project's folder, a conversation's status mark) at the
@@ -19,8 +19,6 @@
 .sidebar { --sidebar-row: 28px; --sidebar-row-button: 22px; }
 /* The window's top row: room for the traffic lights and `ShellNav`, which float over it. */
 .sidebar__chrome-row { flex: 0 0 var(--topbar-height); height: var(--topbar-height); margin: 0 -9px; }
-/* On Windows the window's title bar row is its own strip above the sidebar and the chat. */
-:root[data-window-chrome="windows"] .sidebar__chrome-row { flex-basis: 8px; height: 8px; }
 .new-task-button {
   width: 100%; height: var(--sidebar-row); display: flex; align-items: center; gap: 7px; padding: 0 7px; background: transparent;
   border: 0; border-radius: 7px; font-size: 12.5px; font-weight: 600;
@@ -32,7 +30,7 @@ kbd { font-family: inherit; font-size: 10px; color: var(--faint); font-weight: 5
 .sidebar__section-heading { height: var(--sidebar-row); margin-top: 14px; padding: 0 3px 0 7px; display: flex; align-items: center; }
 .sidebar__section-heading > span { flex: 1; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; font-weight: 700; color: var(--faint); }
 .sidebar__section-heading .icon-button { width: var(--sidebar-row-button); height: var(--sidebar-row-button); flex-basis: var(--sidebar-row-button); border-radius: 6px; }
-.workspace-list { flex: 1; overflow: auto; min-height: 0; padding-bottom: 12px; }
+.workspace-list { flex: 1; overflow: auto scroll; min-height: 0; padding-bottom: 12px; }
 .workspace-group { position: relative; border-radius: 8px; transition: opacity .14s, transform .14s, background .14s, box-shadow .14s; }
 .workspace-group + .workspace-group { margin-top: 6px; }
 .workspace-heading { height: var(--sidebar-row); display: flex; align-items: center; gap: 1px; border-radius: 7px; }
@@ -95,7 +93,7 @@ kbd { font-family: inherit; font-size: 10px; color: var(--faint); font-weight: 5
 .conversation-row--editing .conversation-row__actions { opacity: 1; }
 .conversation-row__rename-input { flex: 1; min-width: 0; height: 22px; padding: 0 2px; border: 1px solid var(--color-aeb9d2); border-radius: 6px; outline: 0; background: var(--color-ffffff); font: 12.5px var(--sans); box-shadow: 0 0 0 2px var(--color-5f5f5a-ap10); }
 .conversation-list__empty { margin: 0; height: var(--sidebar-row); padding-left: 28px; display: flex; align-items: center; font-size: 11px; color: var(--faint); }
-.sortable-surface { position: relative; cursor: grab; user-select: none; }
+.sortable-surface { position: relative; cursor: grab; -webkit-user-select: none; user-select: none; }
 .sortable-surface:active { cursor: grabbing; }
 button.sortable-surface:not(:disabled),
 .workspace-heading.sortable-surface > .workspace-heading__toggle,
@@ -109,7 +107,7 @@ button.sortable-surface:active,
 .provider-rail__row.sortable-surface,
 .provider-rail__row.sortable-surface:active { cursor: default; }
 .sortable-surface--dragging { opacity: .38 !important; transform: scale(.985); }
-.pointer-sort-active, .pointer-sort-active * { cursor: grabbing !important; user-select: none !important; }
+.pointer-sort-active, .pointer-sort-active * { cursor: grabbing !important; -webkit-user-select: none !important; user-select: none !important; }
 .conversation-row--dragging, .workspace-group--dragging { opacity: .38; transform: scale(.985); }
 .drop-target--before::before, .drop-target--after::after { content: ""; position: absolute; z-index: 4; left: 4px; right: 4px; height: 2px; border-radius: 99px; background: var(--accent); pointer-events: none; }
 .workspace-group.drop-target--before::before, .conversation-row.drop-target--before::before { top: 0; }

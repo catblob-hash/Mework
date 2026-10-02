@@ -12,8 +12,7 @@ import type {
   LocalModelStatus,
   MachineShells,
   PendingForkRequest,
-  PendingToolPrompt,
-  SecurityLevel
+  PendingToolPrompt
 } from "../types";
 import type { ShellTaskSnapshot } from "./shellTasks";
 
@@ -92,18 +91,28 @@ export type AppPushEvent =
        */
       decision?: ForkDecisionRecord | null;
     }
-  // The host changed a conversation's security level on its own — entering plan
-  // mode, or leaving it once the plan was approved. The renderer mirrors it into
-  // the conversation without writing back: the host already committed it.
-  | { type: "conversationSecurityLevelChanged"; conversationId: string; securityLevel: SecurityLevel }
+  // The model called `handoff`: the conversation continues in
+  // `childConversationId`, a fork armed on the host's opening message. The
+  // renderer starts it like any host-made fork and follows it when the source
+  // is on screen.
+  | {
+      type: "conversationHandedOff";
+      workspaceId: string;
+      sourceConversationId: string;
+      childConversationId: string;
+    }
   // The conversation's plan document was written, approved, sent back, or cleared.
   | { type: "conversationPlanUpdated"; conversationId: string; plan: ConversationPlan | null }
+  // The host moved the conversation's plan-mode switch (an approved plan turns
+  // it off). Already persisted; the composer mirrors it.
+  | { type: "conversationPlanModeChanged"; conversationId: string; enabled: boolean }
   // The host wrote a conversation's title: the chosen message as a placeholder,
   // then the local helper model's title (`settled`). Mirrored without writing back.
   | { type: "conversationTitleChanged"; conversationId: string; title: string; settled: boolean }
-  // The local helper model described a shell command. `contextId` is the tool
+  // The local helper model described a shell command (or titled a subagent),
+  // or with `error` said why a failed call failed. `contextId` is the tool
   // card's id (the card may not be saved yet); `callId` the provider's call id.
-  | { type: "toolExplained"; conversationId: string; contextId: string; callId: string; text: string }
+  | { type: "toolExplained"; conversationId: string; contextId: string; callId: string; text: string; error: boolean }
   // The local helper model's install or runtime status changed.
   | { type: "localModelChanged"; status: LocalModelStatus };
 

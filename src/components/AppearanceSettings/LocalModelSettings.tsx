@@ -6,9 +6,11 @@ import { localModelController } from "../../lib/localModel";
 import type {
   LocalModelMachine,
   LocalModelPhase,
+  LocalModelDefaultPrompts,
   LocalModelPreferences,
   LocalModelPromptReport,
   LocalModelStatus,
+  LocalModelTask,
   LocalModelUnavailable,
   LocalModelVariantId,
   LocalModelVariantStatus
@@ -18,7 +20,7 @@ import { formatBytes } from "../FilePreview/format";
 import { SettingRow, SettingsCard } from "./rows";
 
 type Translate = ReturnType<typeof useI18n>["t"];
-type Use = "titles" | "shellExplanations";
+type Use = "titles" | "shellExplanations" | "errorExplanations";
 
 /** Quiet time after typing before a prompt's KV cache is recomputed. */
 const PROMPT_SETTLE_MS = 800;
@@ -32,7 +34,7 @@ function percentOf(done: number, total: number): number {
   return total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
 }
 
-export function variantName(id: LocalModelVariantId, t: Translate): string {
+function variantName(id: LocalModelVariantId, t: Translate): string {
   switch (id) {
     case "ane":
       return t("神经网络引擎版（Core ML）", "Neural Engine build (Core ML)");
@@ -47,8 +49,8 @@ function variantDescription(id: LocalModelVariantId, t: Translate): string {
   switch (id) {
     case "ane":
       return t(
-        "在神经网络引擎上运行：省电，不占用显卡。第一次加载要为这台 Mac 编译，约两分钟，之后一秒内加载。",
-        "Runs on the Neural Engine: low power, leaves the GPU alone. The first load compiles it for this Mac, about two minutes; after that it loads in a second."
+        "在神经网络引擎上运行：省电，不占用显卡。第一次加载要为这台 Mac 编译，约两分钟，之后一秒内加载；应用更新后，或磁盘空间不足、系统清掉了编译缓存时，会再编译一次。",
+        "Runs on the Neural Engine: low power, leaves the GPU alone. The first load compiles it for this Mac, about two minutes; after that it loads in a second. It compiles again after an app update, or when the disk runs low and the system clears its compiled copy."
       );
     case "mlx":
       return t(
@@ -79,7 +81,7 @@ export function unavailableReason(reason: LocalModelUnavailable, t: Translate): 
 }
 
 /** "Apple M4 Pro (Mac16,7) · 16-core Neural Engine · macOS 15.4", or null off a Mac. */
-export function machineSummary(machine: LocalModelMachine, t: Translate): string | null {
+function machineSummary(machine: LocalModelMachine, t: Translate): string | null {
   if (!machine.chip && !machine.osVersion) return null;
   const parts: string[] = [];
   if (machine.chip) {
@@ -102,11 +104,13 @@ function downloadSource(source: Extract<LocalModelPhase, { phase: "downloading" 
       return "hf-mirror.com";
     case "mirror":
       return t("镜像", "mirror");
+    case "release":
+      return t("官方发布页", "the official release");
   }
 }
 
 /** One build's state in a line. */
-export function variantSummary(variant: LocalModelVariantStatus, status: LocalModelStatus, t: Translate): string {
+function variantSummary(variant: LocalModelVariantStatus, status: LocalModelStatus, t: Translate): string {
   switch (variant.phase) {
     case "missing":
       return t("未下载 · 约 {size}", "Not downloaded · about {size}", { size: formatBytes(variant.downloadBytes) });
@@ -123,6 +127,8 @@ export function variantSummary(variant: LocalModelVariantStatus, status: LocalMo
           return t("正在编译模型…", "Compiling the model…");
         case "verify":
           return t("正在校验编译结果…", "Checking the compiled model…");
+        case "unpack":
+          return t("正在解压 llama.cpp 运行库…", "Unpacking llama.cpp…");
       }
       return t("正在准备模型…", "Preparing the model…");
     case "ready": {
@@ -132,10 +138,18 @@ export function variantSummary(variant: LocalModelVariantStatus, status: LocalMo
       if (status.warming) {
         return variant.id === "ane"
           ? t(
-            "正在加载并缓存提示词（第一次在这台 Mac 上加载要编译，约两分钟）…",
-            "Loading and caching the prompts (the first load on this Mac compiles it, about two minutes)…"
+            "正在加载并缓存提示词（系统里没有为这台 Mac 编译好的副本时要先编译，约两分钟）…",
+            "Loading and caching the prompts (compiled for this Mac first when the system has no compiled copy, about two minutes)…"
           )
           : t("正在加载并缓存提示词…", "Loading and caching the prompts…");
+      }
+      if (status.loading) {
+        return variant.id === "ane"
+          ? t(
+            "正在加载（系统里没有为这台 Mac 编译好的副本时要先编译，约两分钟）…",
+            "Loading (compiled for this Mac first when the system has no compiled copy, about two minutes)…"
+          )
+          : t("正在加载…", "Loading…");
       }
       const parts = [t("使用中", "In use")];
       if (status.device) parts.push(status.device);
@@ -148,7 +162,7 @@ export function variantSummary(variant: LocalModelVariantStatus, status: LocalMo
 }
 
 /** The card's summary: the build in use, or what is happening instead. */
-export function statusSummary(status: LocalModelStatus | null, t: Translate): string {
+function statusSummary(status: LocalModelStatus | null, t: Translate): string {
   if (!status) return t("正在读取状态…", "Reading status…");
   const busy = status.variants.find((variant) => variant.phase === "downloading" || variant.phase === "preparing");
   if (busy) return `${variantName(busy.id, t)} · ${variantSummary(busy, status, t)}`;
@@ -168,8 +182,8 @@ export function statusSummary(status: LocalModelStatus | null, t: Translate): st
 }
 
 /**
- * Appearance → Local model: the two uses of the local helper model, the
- * build it runs (picked by what this machine can run), and its prompts.
+ * Appearance → Local model: the uses of the local helper model, the build it
+ * runs (picked by what this machine can run), and its prompts.
  */
 export function LocalModelSettings({ preferences, onChange }: LocalModelSettingsProps): JSX.Element {
   const { t } = useI18n();
@@ -211,8 +225,8 @@ export function LocalModelSettings({ preferences, onChange }: LocalModelSettings
       <SettingRow
         title={t("自动生成会话标题", "Name conversations automatically")}
         description={t(
-          "会话第一次发出请求时，用本机运行的 Qwen3.5-0.8B 起一个标题。",
-          "When a conversation sends its first request, Qwen3.5-0.8B running on this computer names it."
+          "会话第一次发出请求时，用本机运行的 Qwen3.5-0.8B 起一个标题。它和主模型一样读整条消息：文字、附带的文件和图片，合计超过 4096 个 token 的部分截掉。启动子代理时，也用模型交给它的任务起一个标题，作为任务面板里那一行的副标题。",
+          "When a conversation sends its first request, Qwen3.5-0.8B running on this computer names it. Like the main model, it reads the whole message: its text, attached files and images, cut beyond 4,096 tokens in all. A subagent's task, as the model gave it, is named the same way and becomes the subtitle of its row in the task panel."
         )}
       >
         <Switch
@@ -234,6 +248,35 @@ export function LocalModelSettings({ preferences, onChange }: LocalModelSettings
           checked={preferences.shellExplanations}
           disabled={unsupported}
           onChange={(checked) => setUse("shellExplanations", checked)}
+        />
+      </SettingRow>
+      <SettingRow
+        title={t("解释错误", "Explain errors")}
+        description={t(
+          "工具调用或 shell 命令失败时，把错误消息交给本地模型，用一句话说明原因，显示在工具卡片的标题上（超过 15 个 token 的部分截掉）。说明出来之前标题先显示错误原文；关闭时一直显示原文。",
+          "When a tool call or shell command fails, the local model reads its error message and says why in a few words, shown as the tool card's title (cut at 15 tokens). Until it answers the title shows the error itself; with this off it always does."
+        )}
+      >
+        <Switch
+          label={t("解释错误", "Explain errors")}
+          checked={preferences.errorExplanations}
+          disabled={unsupported}
+          onChange={(checked) => setUse("errorExplanations", checked)}
+        />
+      </SettingRow>
+      <SettingRow
+        title={t("也用于子代理", "Also for subagents")}
+        description={t(
+          "上面几项也用在子代理和工作流步骤上：它们的 shell 命令和失败也会得到说明，工作流的每一步也会起标题，作为任务面板里那一行的副标题。这些请求排在主对话之后：模型同时跑的请求数有上限、一起合批生成，等待的请求太多时先让出子代理的。",
+          "The uses above reach subagents and workflow steps too: their shell commands and failures are explained as well, and each workflow step is named, as the subtitle of its row in the task panel. These requests wait behind the conversation's own: the model runs a bounded number of requests at once, batched together, and when too many are waiting a subagent's give way first."
+        )}
+      >
+        <Switch
+          label={t("也用于子代理", "Also for subagents")}
+          checked={preferences.subagents}
+          disabled={unsupported}
+          // Changes where the uses above reach, not whether any runs: nothing to download for it.
+          onChange={(checked) => onChange((current) => ({ ...current, subagents: checked }))}
         />
       </SettingRow>
       <SettingRow
@@ -411,7 +454,7 @@ function LocalModelDialog({
   onClose: () => void;
 }): JSX.Element {
   const { t } = useI18n();
-  const [defaults, setDefaults] = useState<{ title: string; shell: string } | null>(null);
+  const [defaults, setDefaults] = useState<LocalModelDefaultPrompts | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -495,6 +538,14 @@ function LocalModelDialog({
         fallback={defaults?.shell ?? null}
         backend={active?.id ?? null}
         onChange={(text) => onChange((current) => ({ ...current, shellPrompt: text }))}
+      />
+      <PromptEditor
+        task="error"
+        title={t("错误解释的前置提示词", "Prompt for error explanations")}
+        value={preferences.errorPrompt}
+        fallback={defaults?.error ?? null}
+        backend={active?.id ?? null}
+        onChange={(text) => onChange((current) => ({ ...current, errorPrompt: text }))}
       />
       {download.question}
     </Dialog>
@@ -617,9 +668,10 @@ function VariantRow({
 }
 
 /**
- * One system prompt. Whatever text is in effect is cached as the model's KV
- * cache once typing settles; the line under it reports that cache for the
- * build in use (each backend keeps its own form of it).
+ * One system prompt. The line under it reports the prompt's KV cache for the
+ * build in use (each backend keeps its own form of it). Opening the dialog
+ * only reads a cache already on disk; once the user edits the text, whatever
+ * is in effect is cached when typing settles, loading the model if needed.
  */
 function PromptEditor({
   task,
@@ -629,7 +681,7 @@ function PromptEditor({
   backend,
   onChange
 }: {
-  task: "title" | "shell";
+  task: LocalModelTask;
   title: string;
   /** The stored prompt; empty means the built-in one. */
   value: string;
@@ -644,14 +696,18 @@ function PromptEditor({
   const [computing, setComputing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const request = useRef(0);
+  // Until the user edits the prompt, only a cache already on disk is read:
+  // opening the dialog must not load the model.
+  const edited = useRef(false);
 
   useEffect(() => {
     if (!backend || !text.trim()) return;
     const id = ++request.current;
+    const build = edited.current;
     setComputing(true);
     const timer = window.setTimeout(() => {
       localModelController
-        .promptInfo(task, text)
+        .promptInfo(task, text, build)
         .then((next) => {
           if (request.current !== id) return;
           setReport(next);
@@ -674,12 +730,18 @@ function PromptEditor({
     info = t("安装模型后显示这段提示词的 token 数与 KV 缓存大小。", "Install the model to see this prompt's token count and KV cache size.");
   } else if (computing) {
     info = t("正在计算 KV 缓存…", "Computing the KV cache…");
-  } else if (report) {
+  } else if (report && report.cacheBytes !== null) {
     info = t("相当于 {tokens} 个 token · KV 缓存 {size}（上限 {max} 个 token）", "{tokens} tokens · KV cache {size} (limit {max} tokens)", {
       tokens: report.tokens,
       size: formatBytes(report.cacheBytes),
       max: report.maxTokens
     });
+  } else if (report) {
+    info = t(
+      "相当于 {tokens} 个 token（上限 {max} 个 token）· KV 缓存在模型下次用到这段提示词时生成",
+      "{tokens} tokens (limit {max} tokens) · the KV cache is built the next time the model uses this prompt",
+      { tokens: report.tokens, max: report.maxTokens }
+    );
   } else {
     info = "";
   }
@@ -692,7 +754,10 @@ function PromptEditor({
           type="button"
           className="button button--ghost button--small"
           disabled={!value.trim()}
-          onClick={() => onChange("")}
+          onClick={() => {
+            edited.current = true;
+            onChange("");
+          }}
         >
           {t("恢复默认", "Reset to default")}
         </button>
@@ -705,6 +770,7 @@ function PromptEditor({
         placeholder={fallback === null ? t("正在读取默认提示词…", "Reading the default prompt…") : undefined}
         onChange={(event) => {
           const next = event.target.value;
+          edited.current = true;
           onChange(fallback !== null && next === fallback ? "" : next);
         }}
       />

@@ -56,8 +56,6 @@ function fail(message) {
 
 const mockMode = process.argv.includes("--mock");
 const filter = argumentValue("filter");
-// Use `deepseek_live::` rather than `deepseek_live`: substring matching would include
-// the long-running `deepseek_live_storm::` stress test.
 const testFilter = {
   "": "deepseek_live::",
   chat: "deepseek_live_chat_completions_tool_loop",
@@ -65,16 +63,13 @@ const testFilter = {
   anthropic: "deepseek_live_anthropic_messages_tool_loop",
   native: "deepseek_live_native_search",
   bgworkflow: "deepseek_live_background_workflow_write",
-  storm: "deepseek_live_storm::",
 }[filter];
 if (testFilter === undefined) {
-  fail(`--filter 只接受 chat | responses | anthropic | native | bgworkflow | storm，收到：${filter}`);
+  fail(`--filter 只接受 chat | responses | anthropic | native | bgworkflow，收到：${filter}`);
 }
 // Mock mode excludes background-workflow tests because they require a real model to
 // choose `write`; the mock server replays a fixed `ls` tool loop.
 const mockSkips = ["deepseek_live_background_workflow_write"];
-// The stress test targets this model; other tests use the discovered flash model.
-const STORM_MODEL = "deepseek-v4-flash-vision-exp";
 
 function runCargo(extraEnv) {
   const cargo = spawn(
@@ -447,13 +442,6 @@ function resolveModel(ids) {
       console.warn(`[deepseek-live-e2e] 警告：/models 未列出 ${explicit}，仍按指定使用。可用：${ids.join(", ")}`);
     }
     return explicit;
-  }
-  // The stress test uses its fixed target instead of flash-model discovery.
-  if (filter === "storm") {
-    if (!ids.includes(STORM_MODEL)) {
-      console.warn(`[deepseek-live-e2e] 警告：/models 未列出 ${STORM_MODEL}，仍按压力腿约定使用。可用：${ids.join(", ")}`);
-    }
-    return STORM_MODEL;
   }
   // Prefer an ID containing `flash`, then prefer v4 among multiple matches.
   const flash = ids.filter((id) => /flash/iu.test(id));

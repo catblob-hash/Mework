@@ -1,0 +1,8 @@
+/* A context menu wears the popover menu's panel (menus.css); these are its own touches. */
+.context-menu { min-width: 180px; }
+.popover-menu__item.context-menu__item--danger:not(:disabled) { color: var(--danger); }
+.popover-menu__item.context-menu__item--danger:not(:disabled) .popover-menu__icon { color: var(--danger); }
+.context-menu__loading { display: flex; align-items: center; gap: 6px; }
+.context-menu__placeholder { padding: 7px 8px; color: var(--faint); font-size: 11px; display: flex; align-items: center; gap: 6px; }
+/* A program's own icon, drawn at the size of the menu's line icons. */
+.context-menu__app-icon { width: 16px; height: 16px; flex: 0 0 16px; }

@@ -9,7 +9,7 @@ use std::{
     io::{Cursor, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use base64::Engine as _;
@@ -17,23 +17,68 @@ use serde_json::{json, Value};
 
 pub use crate::content_store::ReconcileReport;
 use crate::content_store::{hex_digest, read_regular_file, ContentDirectory, Label};
+use crate::memory_pool::{MemoryPool, PoolKey, PoolKind};
 use crate::model::{AppDocument, ContextItem, ImageAttachment};
 
+mod prompt;
+
+/// A stored sidecar, whichever path made it. Tool images are stored whole
+/// (lossless) up to these bounds, and documents written before the prompt
+/// pipeline may hold user images this large.
 pub const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_IMAGE_ATTACHMENT_NAME_BYTES: usize = 256;
 pub const MAX_IMAGE_ATTACHMENT_DIMENSION: u32 = 8_000;
 pub const MAX_IMAGE_ATTACHMENT_PIXELS: u64 = 16 * 1024 * 1024;
-pub const MAX_REQUEST_IMAGES: usize = 20;
-pub const MAX_REQUEST_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
-pub const MAX_REQUEST_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
-const MAX_DECODED_IMAGE_BYTES: usize = (MAX_IMAGE_ATTACHMENT_PIXELS as usize) * 4;
-const MAX_DECODER_WORKING_BYTES: usize = MAX_DECODED_IMAGE_BYTES + 32 * 1024 * 1024;
+/// A picture the user attaches, before [`prompt`] shrinks it to Claude Code's
+/// 2000 px / 500 KB. Claude Code sets no bound here; these only keep one decode
+/// within memory (64 MiP is 256 MiB of RGBA) and one upload within the bridge.
+pub const MAX_IMAGE_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_IMAGE_UPLOAD_DIMENSION: u32 = 16_384;
+pub const MAX_IMAGE_UPLOAD_PIXELS: u64 = 64 * 1024 * 1024;
 const PLACEHOLDER_KEY: &str = "$meworkImageAttachment";
 const LABEL: Label = Label {
     noun: "image attachment",
     title: "Image attachment",
 };
+/// The timeline chip draws an image at 112 × 88 CSS px with `object-fit:
+/// cover` (`ImageStrip.css`); a thumbnail covering that at 3× device pixels
+/// stays sharp on every display.
+const THUMBNAIL_COVER: (u32, u32) = (336, 264);
+/// The chip's thumbnail, stored beside the image: a JPEG, or a PNG for a
+/// picture with transparency, told apart by content.
+const THUMBNAIL_SUFFIX: &str = ".thumb";
+const MAX_THUMBNAIL_BYTES: usize = 1024 * 1024;
 static IMAGE_ATTACHMENT_FS_LOCK: Mutex<()> = Mutex::new(());
+/// Uploads are processed one at a time: each may decode to 256 MiB of pixels.
+static PROMPT_PIPELINE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Pixel bounds a decoder enforces before it allocates.
+#[derive(Clone, Copy, Debug)]
+struct DecodeLimits {
+    max_dimension: u32,
+    max_pixels: u64,
+}
+
+impl DecodeLimits {
+    fn rgba_bytes(self) -> usize {
+        (self.max_pixels as usize).saturating_mul(4)
+    }
+
+    fn working_bytes(self) -> usize {
+        self.rgba_bytes().saturating_add(32 * 1024 * 1024)
+    }
+}
+
+/// Stored sidecars and tool images.
+const STORED_LIMITS: DecodeLimits = DecodeLimits {
+    max_dimension: MAX_IMAGE_ATTACHMENT_DIMENSION,
+    max_pixels: MAX_IMAGE_ATTACHMENT_PIXELS,
+};
+/// A user's picture on its way into [`prompt`].
+const UPLOAD_LIMITS: DecodeLimits = DecodeLimits {
+    max_dimension: MAX_IMAGE_UPLOAD_DIMENSION,
+    max_pixels: MAX_IMAGE_UPLOAD_PIXELS,
+};
 
 /// Encoding stored in an image placeholder.
 ///
@@ -65,24 +110,59 @@ impl ImageAttachmentStore {
                 app_data.join("image-attachments"),
                 LABEL,
                 &IMAGE_ATTACHMENT_FS_LOCK,
-                &[],
+                &[THUMBNAIL_SUFFIX],
             ),
         }
     }
 
-    pub fn import(&self, name: &str, bytes: &[u8]) -> Result<ImageAttachment, String> {
+    /// Stores an image the model is about to see, shrunk the way Claude Code
+    /// shrinks a prompt image ([`prompt`]): at most 2000 px a side, then at
+    /// most 500 KB where a JPEG can get it there. Pictures the user attaches
+    /// and pictures tools hand back (screenshots, images `read` opens) both go
+    /// through here. EXIF orientation is applied and metadata stripped on
+    /// every path.
+    pub fn import_compressed(&self, name: &str, bytes: &[u8]) -> Result<ImageAttachment, String> {
         let name = validate_name(name)?;
-        if bytes.is_empty() {
-            return Err("Image content is empty".into());
-        }
-        if bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
+        if bytes.len() > MAX_IMAGE_UPLOAD_BYTES {
             return Err(format!(
-                "Image exceeds the {} MiB limit ({} bytes)",
-                MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024,
+                "Image exceeds the {} MiB upload limit ({} bytes)",
+                MAX_IMAGE_UPLOAD_BYTES / 1024 / 1024,
                 bytes.len()
             ));
         }
-        let canonical = canonicalize_image(bytes)?;
+        let processed = {
+            let _guard = PROMPT_PIPELINE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            prompt::process(bytes, prompt::Limits::CLAUDE_CODE)?
+        };
+        // What is stored must pass the check every later read makes.
+        let validated = validate_canonical_sidecar(&processed.bytes)?;
+        if (validated.width, validated.height) != (processed.width, processed.height) {
+            return Err("Processed image dimensions do not match its pixels".into());
+        }
+        self.store_canonical(
+            name,
+            CanonicalImage {
+                bytes: processed.bytes,
+                mime: validated.mime,
+                width: validated.width,
+                height: validated.height,
+            },
+        )
+    }
+
+    fn store_canonical(
+        &self,
+        name: String,
+        canonical: CanonicalImage,
+    ) -> Result<ImageAttachment, String> {
+        if canonical.bytes.is_empty() || canonical.bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
+            return Err(format!(
+                "Image exceeds the {} MiB attachment limit after processing",
+                MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
+            ));
+        }
         let id = hex_digest(&canonical.bytes);
         let _guard = self.directory.lock();
         self.directory.ensure_root(true)?;
@@ -116,7 +196,28 @@ impl ImageAttachmentStore {
         })
     }
 
+    /// `image` at `width`×`height` as opaque RGB, transparency composited
+    /// over white as transformers' `convert_to_rgb` does: what the local
+    /// helper model reads.
+    pub(crate) fn rgb(&self, image: &ImageAttachment, width: u32, height: u32) -> Result<Vec<u8>, String> {
+        let (_, decoded) = self.read_validated(image)?;
+        let resized = prompt::resize(&decoded.rgba, decoded.width, decoded.height, width, height);
+        Ok(resized
+            .chunks_exact(4)
+            .flat_map(|pixel| {
+                let over = |channel| prompt::over_white(channel, pixel[3]);
+                [over(pixel[0]), over(pixel[1]), over(pixel[2])]
+            })
+            .collect())
+    }
+
     pub fn read_bytes(&self, image: &ImageAttachment) -> Result<Vec<u8>, String> {
+        self.read_validated(image).map(|(bytes, _)| bytes)
+    }
+
+    /// `image`'s stored bytes, checked against its metadata, and the pixels
+    /// the check decoded.
+    fn read_validated(&self, image: &ImageAttachment) -> Result<(Vec<u8>, ValidatedCanonicalImage), String> {
         validate_metadata(image)?;
         let _guard = self.directory.lock();
         self.directory.restore_quarantined_locked(&image.id)?;
@@ -152,7 +253,7 @@ impl ImageAttachmentStore {
                 image.id
             ));
         }
-        Ok(bytes)
+        Ok((bytes, decoded))
     }
 
     pub fn data_url(&self, image: &ImageAttachment) -> Result<String, String> {
@@ -199,6 +300,19 @@ impl ImageAttachmentStore {
     /// This is intentionally safe while a model/tool request is still using an
     /// in-memory snapshot, and it also preserves crash recovery while the
     /// document writer is still flushing the new snapshot.
+    /// [`Self::reconcile_transition`] for callers that hold the referenced ids
+    /// rather than two documents carrying every body: the document snapshot
+    /// keeps no bodies, and `attachment_refs` answers for them. `next` must
+    /// already include every pinned id.
+    pub fn reconcile_referenced(
+        &self,
+        previous: &HashSet<String>,
+        next: &HashSet<String>,
+    ) -> Result<ReconcileReport, String> {
+        self.directory.reconcile_transition(previous, next)
+    }
+
+    #[cfg(test)]
     pub fn reconcile_transition(
         &self,
         previous: &AppDocument,
@@ -221,6 +335,17 @@ impl ImageAttachmentStore {
     /// `pinned` carries the ids no document names — conversation template
     /// bodies — and this is the pass that would otherwise delete them, so a
     /// caller that cannot read them must not call this rather than pass none.
+    /// [`Self::reconcile_startup`] for a caller that holds the referenced ids:
+    /// the startup load drops each body once it has noted what it references
+    /// (`attachment_refs`). `referenced` must already include every pinned id.
+    pub fn reconcile_startup_referenced(
+        &self,
+        referenced: &HashSet<String>,
+    ) -> Result<ReconcileReport, String> {
+        self.directory.reconcile_startup(referenced)
+    }
+
+    #[cfg(test)]
     pub fn reconcile_startup(
         &self,
         document: &AppDocument,
@@ -234,7 +359,82 @@ impl ImageAttachmentStore {
     /// Used only by the explicit full-document reset after its durability
     /// barrier and dependency fence have succeeded.
     pub fn purge_all(&self) -> Result<(), String> {
+        let scope = self.pool_scope();
+        MemoryPool::global().retain(|key| {
+            !matches!(key.kind, PoolKind::ImageData | PoolKind::ImageThumbnail)
+                || !key.id.starts_with(&scope)
+        });
         self.directory.purge_all()
+    }
+
+    /// Keys of this directory's entries in the shared memory pool. An id names
+    /// the same bytes forever, so a pooled copy never goes stale; only a reset
+    /// (`purge_all`) takes the bytes away.
+    fn pool_scope(&self) -> String {
+        format!("{}\u{0}", self.directory.root().display())
+    }
+
+    fn pool_key(&self, kind: PoolKind, id: &str) -> PoolKey {
+        PoolKey::new(kind, format!("{}{id}", self.pool_scope()))
+    }
+
+    /// [`Self::data_url_by_id`] through the shared memory pool, as low-priority
+    /// data: only the full-size viewer reads it.
+    pub fn pooled_data_url_by_id(&self, id: &str) -> Result<Arc<String>, String> {
+        pooled(self.pool_key(PoolKind::ImageData, id), || self.data_url_by_id(id))
+    }
+
+    /// [`Self::thumbnail_data_url_by_id`] through the shared memory pool, as
+    /// high-priority data: the timeline draws it.
+    pub fn pooled_thumbnail_data_url_by_id(&self, id: &str) -> Result<Arc<String>, String> {
+        pooled(self.pool_key(PoolKind::ImageThumbnail, id), || {
+            self.thumbnail_data_url_by_id(id)
+        })
+    }
+
+    /// The small picture the timeline chip shows, as a data URL: the stored
+    /// thumbnail, made on first request from the image, or the image itself
+    /// when it is no larger than the chip needs.
+    pub fn thumbnail_data_url_by_id(&self, id: &str) -> Result<String, String> {
+        validate_id(id)?;
+        let _guard = self.directory.lock();
+        self.directory.restore_quarantined_locked(id)?;
+        let thumbnail_path = self.directory.companion_path(id, THUMBNAIL_SUFFIX)?;
+        // A companion carries no digest to check, so one that no longer decodes
+        // as a thumbnail is made again rather than served.
+        if let Ok(bytes) = read_regular_file(&thumbnail_path, MAX_THUMBNAIL_BYTES, LABEL.title) {
+            if let Some(mime) = thumbnail_mime(&bytes) {
+                return Ok(data_url(mime, &bytes));
+            }
+        }
+        let bytes = read_image_file(&self.path_for_id(id)?)
+            .map_err(|error| format!("Could not read image attachment {id}: {error}"))?;
+        if bytes.is_empty() || bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES || hex_digest(&bytes) != id
+        {
+            return Err(format!(
+                "Image attachment {id} failed its content integrity check"
+            ));
+        }
+        let validated = validate_canonical_sidecar(&bytes).map_err(|error| {
+            format!("Image attachment {id} failed its canonical-content integrity check: {error}")
+        })?;
+        let decoded = decode_supported_image(&bytes)?;
+        let (cover_width, cover_height) = THUMBNAIL_COVER;
+        match prompt::thumbnail(
+            decoded.width,
+            decoded.height,
+            &decoded.rgba,
+            cover_width,
+            cover_height,
+        )? {
+            None => Ok(data_url(validated.mime, &bytes)),
+            Some(thumbnail) => {
+                let mime = thumbnail_mime(&thumbnail.bytes)
+                    .ok_or_else(|| format!("Image attachment {id} made an unreadable thumbnail"))?;
+                crate::storage::atomic_write(&thumbnail_path, &thumbnail.bytes)?;
+                Ok(data_url(mime, &thumbnail.bytes))
+            }
+        }
     }
 
     fn path_for_id(&self, id: &str) -> Result<PathBuf, String> {
@@ -245,6 +445,35 @@ impl ImageAttachmentStore {
     fn quarantine_path_for_id(&self, id: &str) -> Result<PathBuf, String> {
         self.directory.quarantine_path_for_id(id)
     }
+}
+
+/// Reads through the shared pool: the cached value, or `load`'s, which is then
+/// kept.
+fn pooled(key: PoolKey, load: impl FnOnce() -> Result<String, String>) -> Result<Arc<String>, String> {
+    let pool = MemoryPool::global();
+    if let Some(cached) = pool.get::<String>(&key) {
+        return Ok(cached);
+    }
+    let value = Arc::new(load()?);
+    pool.insert(key, Arc::clone(&value), value.len() as u64);
+    Ok(value)
+}
+
+fn data_url(mime: &str, bytes: &[u8]) -> String {
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+/// The MIME type of a stored thumbnail that decodes, `None` for anything else.
+fn thumbnail_mime(bytes: &[u8]) -> Option<&'static str> {
+    let mime = sniff_mime(bytes)?;
+    if !matches!(mime, "image/png" | "image/jpeg") {
+        return None;
+    }
+    decode_supported_image(bytes).ok()?;
+    Some(mime)
 }
 
 fn read_image_file(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -379,8 +608,8 @@ fn ai_sdk_slot_value<'a>(messages: &'a [Value], slot: (usize, usize)) -> Option<
         .get("image")
 }
 
-/// Returns the three values required by the request guards. `DataUrl` is the
-/// only MIME-carrying `DataContent` representation accepted by `ImagePart`.
+/// What the image placeholders in `messages` come to. `DataUrl` is the only
+/// MIME-carrying `DataContent` representation accepted by `ImagePart`.
 pub fn ai_sdk_placeholder_stats(messages: &[Value]) -> Result<ImagePlaceholderStats, String> {
     let mut stats = ImagePlaceholderStats::default();
     for slot in ai_sdk_image_slots(messages) {
@@ -461,42 +690,12 @@ pub fn validate_metadata(image: &ImageAttachment) -> Result<(), String> {
 }
 
 /// Validates one canonical image-bearing message/result before it is persisted
-/// or admitted to a live steer. Request-wide history budgets remain a separate
-/// provider-hydration concern.
+/// or admitted to a live steer: each image on its own. How many a message
+/// carries, and what they come to together, is not budgeted.
 pub fn validate_image_list(images: &[ImageAttachment], owner: &str) -> Result<(), String> {
-    if images.len() > MAX_REQUEST_IMAGES {
-        return Err(format!(
-            "{owner} has more than {MAX_REQUEST_IMAGES} image attachments"
-        ));
-    }
-
-    let mut total_bytes = 0_u64;
-    let mut total_pixels = 0_u64;
     for image in images {
         validate_metadata(image)
             .map_err(|error| format!("{owner} has an invalid image attachment: {error}"))?;
-        total_bytes = total_bytes
-            .checked_add(image.bytes)
-            .ok_or_else(|| format!("{owner} image attachment total byte count overflowed"))?;
-        let pixels = u64::from(image.width)
-            .checked_mul(u64::from(image.height))
-            .ok_or_else(|| format!("{owner} image attachment total pixel count overflowed"))?;
-        total_pixels = total_pixels
-            .checked_add(pixels)
-            .ok_or_else(|| format!("{owner} image attachment total pixel count overflowed"))?;
-    }
-
-    if total_bytes > MAX_REQUEST_IMAGE_BYTES {
-        return Err(format!(
-            "{owner} image attachment total size exceeds the {} MiB limit",
-            MAX_REQUEST_IMAGE_BYTES / 1024 / 1024
-        ));
-    }
-    if total_pixels > MAX_REQUEST_IMAGE_PIXELS {
-        return Err(format!(
-            "{owner} image attachment total pixels exceed the {} MP limit",
-            MAX_REQUEST_IMAGE_PIXELS / 1024 / 1024
-        ));
     }
     Ok(())
 }
@@ -526,20 +725,21 @@ fn validate_name(name: &str) -> Result<String, String> {
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
-    if width == 0
-        || height == 0
-        || width > MAX_IMAGE_ATTACHMENT_DIMENSION
-        || height > MAX_IMAGE_ATTACHMENT_DIMENSION
-    {
+    validate_dimensions_within(width, height, STORED_LIMITS)
+}
+
+fn validate_dimensions_within(width: u32, height: u32, limits: DecodeLimits) -> Result<(), String> {
+    if width == 0 || height == 0 || width > limits.max_dimension || height > limits.max_dimension {
         return Err(format!(
-            "Image dimensions must be within 1–{MAX_IMAGE_ATTACHMENT_DIMENSION} pixels"
+            "Image dimensions must be within 1–{} pixels",
+            limits.max_dimension
         ));
     }
     let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_IMAGE_ATTACHMENT_PIXELS {
+    if pixels > limits.max_pixels {
         return Err(format!(
             "Total image pixels exceed the {} MP limit",
-            MAX_IMAGE_ATTACHMENT_PIXELS / 1024 / 1024
+            limits.max_pixels / 1024 / 1024
         ));
     }
     Ok(())
@@ -583,6 +783,8 @@ struct ValidatedCanonicalImage {
     mime: &'static str,
     width: u32,
     height: u32,
+    /// The pixels the check decoded, for a caller that wants them.
+    rgba: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -657,10 +859,6 @@ struct LimitedImageWriter {
 }
 
 impl LimitedImageWriter {
-    fn new() -> Self {
-        Self::with_limit(MAX_IMAGE_ATTACHMENT_BYTES)
-    }
-
     fn with_limit(limit: usize) -> Self {
         Self {
             bytes: Vec::new(),
@@ -693,35 +891,6 @@ impl Write for LimitedImageWriter {
     }
 }
 
-fn canonicalize_image(bytes: &[u8]) -> Result<CanonicalImage, String> {
-    let decoded = decode_supported_image(bytes)?;
-    let width = decoded.width;
-    let height = decoded.height;
-    let pixels = CanonicalPixels::from_rgba(decoded.rgba);
-
-    if let Some(bytes) = encode_canonical_png(width, height, &pixels)? {
-        return Ok(CanonicalImage {
-            bytes,
-            mime: "image/png",
-            width,
-            height,
-        });
-    }
-    if let Some(bytes) = encode_canonical_webp(width, height, &pixels)? {
-        return Ok(CanonicalImage {
-            bytes,
-            mime: "image/webp",
-            width,
-            height,
-        });
-    }
-
-    Err(format!(
-        "Image decoded successfully, but its metadata-free lossless canonical form exceeds {} MiB; reduce the image dimensions or complexity",
-        MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
-    ))
-}
-
 // Re-decode every sidecar at the provider boundary. Structural checks enforce
 // the metadata-free containers emitted above without re-encoding persisted
 // pixels, so an encoder upgrade cannot silently invalidate existing hashes.
@@ -731,48 +900,59 @@ fn validate_canonical_sidecar(bytes: &[u8]) -> Result<ValidatedCanonicalImage, S
     match mime {
         "image/png" => validate_canonical_png_container(bytes)?,
         "image/webp" => validate_canonical_webp_container(bytes)?,
-        _ => return Err("Canonical image must be metadata-free PNG or lossless WebP".into()),
+        // Only the prompt pipeline stores JPEG: its quality ladder, or a
+        // photo's own scan data with every metadata segment removed.
+        "image/jpeg" => prompt::validate_canonical_jpeg(bytes)?,
+        _ => return Err("Canonical image must be metadata-free PNG, JPEG or lossless WebP".into()),
     }
     let decoded = decode_supported_image(bytes)?;
     Ok(ValidatedCanonicalImage {
         mime,
         width: decoded.width,
         height: decoded.height,
+        rgba: decoded.rgba,
     })
 }
 
 fn decode_supported_image(bytes: &[u8]) -> Result<DecodedImage, String> {
+    decode_supported_image_within(bytes, STORED_LIMITS)
+}
+
+fn decode_supported_image_within(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<DecodedImage, String> {
     match sniff_mime(bytes) {
-        Some("image/png") => decode_png(bytes),
+        Some("image/png") => decode_png(bytes, limits),
         Some("image/jpeg") => {
             let orientation = jpeg_exif_orientation(bytes)?;
-            let mut decoded = decode_jpeg(bytes)?;
+            let mut decoded = decode_jpeg(bytes, limits)?;
             apply_exif_orientation(&mut decoded, orientation)?;
             Ok(decoded)
         }
-        Some("image/gif") => decode_gif(bytes),
-        Some("image/webp") => decode_webp(bytes),
+        Some("image/gif") => decode_gif(bytes, limits),
+        Some("image/webp") => decode_webp(bytes, limits),
         _ => Err(
             "Unsupported image format; only PNG, JPEG, WebP, and static GIF are supported".into(),
         ),
     }
 }
 
-fn decoded_rgba_len(width: u32, height: u32) -> Result<usize, String> {
-    validate_dimensions(width, height)?;
+fn decoded_rgba_len(width: u32, height: u32, limits: DecodeLimits) -> Result<usize, String> {
+    validate_dimensions_within(width, height, limits)?;
     u64::from(width)
         .checked_mul(u64::from(height))
         .and_then(|pixels| pixels.checked_mul(4))
         .and_then(|bytes| usize::try_from(bytes).ok())
-        .filter(|bytes| *bytes <= MAX_DECODED_IMAGE_BYTES)
+        .filter(|bytes| *bytes <= limits.rgba_bytes())
         .ok_or_else(|| "Decoded image pixel buffer exceeds the limit".to_owned())
 }
 
-fn decode_png(bytes: &[u8]) -> Result<DecodedImage, String> {
+fn decode_png(bytes: &[u8], limits: DecodeLimits) -> Result<DecodedImage, String> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
-    let mut limits = png::Limits::default();
-    limits.bytes = MAX_DECODER_WORKING_BYTES;
-    decoder.set_limits(limits);
+    let mut png_limits = png::Limits::default();
+    png_limits.bytes = limits.working_bytes();
+    decoder.set_limits(png_limits);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder
         .read_info()
@@ -781,7 +961,7 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, String> {
         return Err("APNG animation is not supported; provide a static PNG".into());
     }
     let (width, height) = reader.info().size();
-    let expected_rgba = decoded_rgba_len(width, height)?;
+    let expected_rgba = decoded_rgba_len(width, height, limits)?;
     let output_size = reader.output_buffer_size();
     if output_size > expected_rgba {
         return Err("PNG decode buffer exceeds the pixel limit".into());
@@ -825,12 +1005,12 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, String> {
     })
 }
 
-fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, String> {
+fn decode_jpeg(bytes: &[u8], limits: DecodeLimits) -> Result<DecodedImage, String> {
     use zune_jpeg::zune_core::{colorspace::ColorSpace, options::DecoderOptions};
 
     let options = DecoderOptions::default()
-        .set_max_width(MAX_IMAGE_ATTACHMENT_DIMENSION as usize)
-        .set_max_height(MAX_IMAGE_ATTACHMENT_DIMENSION as usize)
+        .set_max_width(limits.max_dimension as usize)
+        .set_max_height(limits.max_dimension as usize)
         .set_strict_mode(true)
         .jpeg_set_out_colorspace(ColorSpace::RGBA);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(bytes, options);
@@ -844,7 +1024,7 @@ fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, String> {
         u32::try_from(width).map_err(|_| "JPEG width exceeds the supported range".to_owned())?;
     let height =
         u32::try_from(height).map_err(|_| "JPEG height exceeds the supported range".to_owned())?;
-    let expected_rgba = decoded_rgba_len(width, height)?;
+    let expected_rgba = decoded_rgba_len(width, height, limits)?;
     // A single-component frame makes the decoder override the requested RGBA output
     // back to Luma, so the native buffer is one byte per pixel and is expanded below.
     let colorspace = decoder
@@ -1057,11 +1237,11 @@ fn apply_exif_orientation(image: &mut DecodedImage, orientation: u8) -> Result<(
     Ok(())
 }
 
-fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, String> {
+fn decode_gif(bytes: &[u8], limits: DecodeLimits) -> Result<DecodedImage, String> {
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
     options.set_memory_limit(gif::MemoryLimit::Bytes(
-        NonZeroU64::new(MAX_DECODED_IMAGE_BYTES as u64)
+        NonZeroU64::new(limits.rgba_bytes() as u64)
             .ok_or_else(|| "Invalid GIF decode memory limit".to_owned())?,
     ));
     options.check_frame_consistency(true);
@@ -1071,7 +1251,7 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, String> {
         .map_err(|error| format!("Invalid GIF header: {error}"))?;
     let width = u32::from(decoder.width());
     let height = u32::from(decoder.height());
-    let expected_rgba = decoded_rgba_len(width, height)?;
+    let expected_rgba = decoded_rgba_len(width, height, limits)?;
     let mut rgba = vec![0; expected_rgba];
     let frame = decoder
         .read_next_frame()
@@ -1114,18 +1294,18 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, String> {
     })
 }
 
-fn decode_webp(bytes: &[u8]) -> Result<DecodedImage, String> {
+fn decode_webp(bytes: &[u8], limits: DecodeLimits) -> Result<DecodedImage, String> {
     if bytes.get(12..16) == Some(b"VP8X") && bytes.get(20).map_or(false, |flags| *flags & 2 != 0) {
         return Err("Animated WebP is not supported; provide a static WebP".into());
     }
     let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|error| format!("Invalid WebP header: {error}"))?;
-    decoder.set_memory_limit(MAX_DECODER_WORKING_BYTES);
+    decoder.set_memory_limit(limits.working_bytes());
     if decoder.is_animated() {
         return Err("Animated WebP is not supported; provide a static WebP".into());
     }
     let (width, height) = decoder.dimensions();
-    let expected_rgba = decoded_rgba_len(width, height)?;
+    let expected_rgba = decoded_rgba_len(width, height, limits)?;
     let output_size = decoder
         .output_buffer_size()
         .filter(|size| *size <= expected_rgba)
@@ -1152,26 +1332,35 @@ fn decode_webp(bytes: &[u8]) -> Result<DecodedImage, String> {
     })
 }
 
-fn encode_canonical_png(
-    width: u32,
-    height: u32,
-    pixels: &CanonicalPixels,
-) -> Result<Option<Vec<u8>>, String> {
-    encode_canonical_png_with_limit(width, height, pixels, MAX_IMAGE_ATTACHMENT_BYTES)
-}
-
 fn encode_canonical_png_with_limit(
     width: u32,
     height: u32,
     pixels: &CanonicalPixels,
     max_output_bytes: usize,
 ) -> Result<Option<Vec<u8>>, String> {
+    encode_png_with(
+        width,
+        height,
+        pixels,
+        max_output_bytes,
+        png::Compression::Best,
+    )
+}
+
+/// `None` when the PNG would exceed `max_output_bytes`; the encoder stops there.
+fn encode_png_with(
+    width: u32,
+    height: u32,
+    pixels: &CanonicalPixels,
+    max_output_bytes: usize,
+    compression: png::Compression,
+) -> Result<Option<Vec<u8>>, String> {
     let mut output = LimitedImageWriter::with_limit(max_output_bytes);
     let result = (|| -> Result<(), png::EncodingError> {
         let mut encoder = png::Encoder::new(&mut output, width, height);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_color(pixels.png_color_type());
-        encoder.set_compression(png::Compression::Best);
+        encoder.set_compression(compression);
         encoder.set_filter(png::FilterType::Paeth);
         let mut writer = encoder.write_header()?;
         writer.write_image_data(pixels.bytes())?;
@@ -1184,12 +1373,13 @@ fn encode_canonical_png_with_limit(
     }
 }
 
-fn encode_canonical_webp(
+fn encode_canonical_webp_with_limit(
     width: u32,
     height: u32,
     pixels: &CanonicalPixels,
+    max_output_bytes: usize,
 ) -> Result<Option<Vec<u8>>, String> {
-    let mut output = LimitedImageWriter::new();
+    let mut output = LimitedImageWriter::with_limit(max_output_bytes);
     let result = image_webp::WebPEncoder::new(&mut output).encode(
         pixels.bytes(),
         width,
@@ -1209,6 +1399,8 @@ fn validate_canonical_png_container(bytes: &[u8]) -> Result<(), String> {
     }
     let mut cursor = 8_usize;
     let mut saw_header = false;
+    let mut saw_palette = false;
+    let mut saw_transparency = false;
     let mut saw_data = false;
     loop {
         let header_end = cursor
@@ -1228,6 +1420,11 @@ fn validate_canonical_png_container(bytes: &[u8]) -> Result<(), String> {
             .ok_or_else(|| "Canonical PNG chunk data is truncated".to_owned())?;
         match chunk_type {
             b"IHDR" if !saw_header && !saw_data && length == 13 => saw_header = true,
+            // The prompt pipeline's palette PNG: its colours, then their alphas.
+            b"PLTE" if saw_header && !saw_palette && !saw_transparency && !saw_data => {
+                saw_palette = true
+            }
+            b"tRNS" if saw_header && !saw_transparency && !saw_data => saw_transparency = true,
             b"IDAT" if saw_header => saw_data = true,
             b"IEND" if saw_header && saw_data && length == 0 => {
                 if chunk_end != bytes.len() {
@@ -1235,7 +1432,7 @@ fn validate_canonical_png_container(bytes: &[u8]) -> Result<(), String> {
                 }
                 return Ok(());
             }
-            b"IHDR" | b"IDAT" | b"IEND" => {
+            b"IHDR" | b"PLTE" | b"tRNS" | b"IDAT" | b"IEND" => {
                 return Err("Canonical PNG chunk order is invalid".into())
             }
             _ => return Err("Canonical PNG must not contain metadata or private chunks".into()),
@@ -1311,15 +1508,6 @@ mod tests {
         output
     }
 
-    fn test_jpeg_2x1() -> Vec<u8> {
-        let mut jpeg = base64::engine::general_purpose::STANDARD
-            .decode("/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAABAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD4H8Q/8h/Uv+vmX/0M0UUV/ptkP/Ipwn/XuH/pKPAzr/kZ4r/r5P8A9KZ//9k=")
-            .unwrap();
-        // Complete the fixture's second 8-bit quantization table.
-        jpeg.splice(155..155, [0x14, 0x14, 0x14]);
-        jpeg
-    }
-
     fn test_static_webp(pixel: [u8; 4]) -> Vec<u8> {
         let mut output = Vec::new();
         image_webp::WebPEncoder::new(&mut output)
@@ -1388,8 +1576,8 @@ mod tests {
     fn import_is_content_addressed_and_hydration_keeps_base64_external() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let first = store.import("pixel.png", PNG).unwrap();
-        let second = store.import("renamed.png", PNG).unwrap();
+        let first = store.import_compressed("pixel.png", PNG).unwrap();
+        let second = store.import_compressed("renamed.png", PNG).unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(first.id.len(), 64);
 
@@ -1421,7 +1609,7 @@ mod tests {
     fn hydrates_only_the_hosts_own_image_slots() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
 
         let projected = vec![
             json!({
@@ -1495,7 +1683,7 @@ mod tests {
     fn arbitrary_json_and_tool_input_cannot_impersonate_image_slots() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let forged = placeholder(&image, WireEncoding::DataUrl);
 
         let tool_input = vec![json!({
@@ -1561,8 +1749,8 @@ mod tests {
     fn rejects_non_images_and_forged_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        assert!(store.import("note.txt", b"not an image").is_err());
-        let mut image = store.import("pixel.png", PNG).unwrap();
+        assert!(store.import_compressed("note.txt", b"not an image").is_err());
+        let mut image = store.import_compressed("pixel.png", PNG).unwrap();
         image.width = 2;
         assert!(store.read_bytes(&image).is_err());
         assert!(store.data_url_by_id("../escape").is_err());
@@ -1582,7 +1770,7 @@ mod tests {
         let truncated = [
             137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
         ];
-        let truncated_error = store.import("truncated.png", &truncated).unwrap_err();
+        let truncated_error = store.import_compressed("truncated.png", &truncated).unwrap_err();
         assert!(
             truncated_error.contains("PNG"),
             "unexpected error: {truncated_error}"
@@ -1590,7 +1778,7 @@ mod tests {
 
         let mut corrupt = PNG.to_vec();
         corrupt[48] ^= 0x80;
-        let corrupt_error = store.import("corrupt.png", &corrupt).unwrap_err();
+        let corrupt_error = store.import_compressed("corrupt.png", &corrupt).unwrap_err();
         assert!(
             corrupt_error.contains("PNG"),
             "unexpected error: {corrupt_error}"
@@ -1607,9 +1795,9 @@ mod tests {
         private.extend_from_slice(b"PRIVATE_TRAILER");
         let webp = test_static_webp(pixel);
 
-        let plain_image = store.import("plain.png", &plain).unwrap();
-        let private_image = store.import("private.png", &private).unwrap();
-        let webp_image = store.import("same-pixels.webp", &webp).unwrap();
+        let plain_image = store.import_compressed("plain.png", &plain).unwrap();
+        let private_image = store.import_compressed("private.png", &private).unwrap();
+        let webp_image = store.import_compressed("same-pixels.webp", &webp).unwrap();
         assert_eq!(plain_image.id, private_image.id);
         assert_eq!(plain_image.id, webp_image.id);
         assert_eq!(plain_image.mime, "image/png");
@@ -1623,11 +1811,11 @@ mod tests {
     #[test]
     fn canonical_webp_roundtrips_and_rejects_extra_chunks_or_trailing_data() {
         let pixels = CanonicalPixels::Rgb8(vec![255, 0, 0, 0, 0, 255]);
-        let webp = encode_canonical_webp(2, 1, &pixels)
+        let webp = encode_canonical_webp_with_limit(2, 1, &pixels, MAX_IMAGE_ATTACHMENT_BYTES)
             .unwrap()
             .expect("two pixels must fit the attachment limit");
         validate_canonical_webp_container(&webp).unwrap();
-        let decoded = decode_webp(&webp).unwrap();
+        let decoded = decode_webp(&webp, STORED_LIMITS).unwrap();
         assert_eq!((decoded.width, decoded.height), (2, 1));
         assert_eq!(decoded.rgba, vec![255, 0, 0, 255, 0, 0, 255, 255]);
 
@@ -1643,34 +1831,18 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_is_fully_decoded_and_reencoded_without_trailing_data() {
-        let jpeg = test_jpeg_2x1();
-        let mut with_trailer = jpeg.clone();
-        with_trailer.extend_from_slice(b"PRIVATE_JPEG_TRAILER");
-        let temp = tempfile::tempdir().unwrap();
-        let store = ImageAttachmentStore::new(temp.path());
-        let clean = store.import("photo.jpg", &jpeg).unwrap();
-        let tailed = store.import("tailed.jpg", &with_trailer).unwrap();
-        assert_eq!(clean.id, tailed.id);
-        assert_eq!(clean.mime, "image/png");
-        let canonical = store.read_bytes(&clean).unwrap();
-        assert!(!canonical.windows(7).any(|window| window == b"PRIVATE"));
-        assert!(!canonical.starts_with(b"\xff\xd8\xff"));
-    }
-
-    #[test]
     fn jpeg_exif_orientation_six_rotates_pixels_before_metadata_is_removed() {
         let jpeg = base64::engine::general_purpose::STANDARD
             .decode("/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAABAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD4H8Q/8h/Uv+vmX/0M0UUV/ptkP/Ipwn/XuH/pKPAzr/kZ4r/r5P8A9KZ//9k=")
             .unwrap();
-        let raw = decode_jpeg(&jpeg).unwrap();
+        let raw = decode_jpeg(&jpeg, STORED_LIMITS).unwrap();
         assert_eq!((raw.width, raw.height), (2, 1));
         let oriented = jpeg_with_orientation(&jpeg, 6);
         assert_eq!(jpeg_exif_orientation(&oriented).unwrap(), 6);
 
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("oriented.jpg", &oriented).unwrap();
+        let image = store.import_compressed("oriented.jpg", &oriented).unwrap();
         assert_eq!((image.width, image.height), (1, 2));
         let canonical = store.read_bytes(&image).unwrap();
         let decoded = decode_supported_image(&canonical).unwrap();
@@ -1694,19 +1866,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
         assert!(store
-            .import("animated.gif", &animated_gif)
+            .import_compressed("animated.gif", &animated_gif)
             .unwrap_err()
             .contains("animated GIF"));
         assert!(store
-            .import("animated.png", &test_apng())
+            .import_compressed("animated.png", &test_apng())
             .unwrap_err()
             .contains("APNG"));
         assert!(store
-            .import("animated.webp", &test_animated_webp())
+            .import_compressed("animated.webp", &test_animated_webp())
             .unwrap_err()
             .contains("Animated WebP"));
         let outside_canvas =
-            std::panic::catch_unwind(|| store.import("outside-canvas.gif", &outside_canvas_gif))
+            std::panic::catch_unwind(|| store.import_compressed("outside-canvas.gif", &outside_canvas_gif))
                 .expect("out-of-canvas GIF must return an error instead of panicking");
         assert!(outside_canvas.is_err());
     }
@@ -1715,7 +1887,7 @@ mod tests {
     fn hydration_rejects_hash_valid_but_malformed_sidecar() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        store.import("seed.png", PNG).unwrap();
+        store.import_compressed("seed.png", PNG).unwrap();
         let malformed = vec![
             137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
         ];
@@ -1776,7 +1948,7 @@ mod tests {
     fn oversized_tampered_sidecars_are_rejected_before_every_read_entrypoint() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let path = store.path_for_id(&image.id).unwrap();
         fs::OpenOptions::new()
             .write(true)
@@ -1792,12 +1964,269 @@ mod tests {
         let data_url_error = store.data_url_by_id(&image.id).unwrap_err();
         assert!(data_url_error.contains("read limit"), "{data_url_error}");
 
-        let import_error = store.import("same-content.png", PNG).unwrap_err();
+        let import_error = store.import_compressed("same-content.png", PNG).unwrap_err();
         assert!(import_error.contains("read limit"), "{import_error}");
         assert_eq!(
             fs::metadata(path).unwrap().len(),
             MAX_IMAGE_ATTACHMENT_BYTES as u64 + 1
         );
+    }
+
+    #[test]
+    fn hands_the_helper_model_opaque_rgb_at_any_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+        // Fully transparent: whatever its colour, it reads as white.
+        let image = store.import_compressed("clear.png", &rgba_png(64, 40, 0)).unwrap();
+        let rgb = store.rgb(&image, 64, 40).unwrap();
+        assert_eq!(rgb.len(), 64 * 40 * 3);
+        assert!(rgb.iter().all(|channel| *channel == 255));
+        // Resized either way.
+        assert_eq!(store.rgb(&image, 32, 32).unwrap().len(), 32 * 32 * 3);
+        assert_eq!(store.rgb(&image, 256, 160).unwrap().len(), 256 * 160 * 3);
+        let opaque = store.import_compressed("opaque.png", &rgba_png(64, 40, 255)).unwrap();
+        let rgb = store.rgb(&opaque, 64, 40).unwrap();
+        assert!(rgb.chunks_exact(3).any(|pixel| pixel != [255, 255, 255]));
+    }
+
+    fn rgba_png(width: u32, height: u32, alpha: u8) -> Vec<u8> {
+        let pixels = (0..width * height)
+            .flat_map(|index| [(index % 251) as u8, (index / width % 199) as u8, 90, alpha])
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut output, width, height);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_color(png::ColorType::Rgba);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&pixels).unwrap();
+            writer.finish().unwrap();
+        }
+        output
+    }
+
+    fn decode_data_url(url: &str) -> (String, DecodedImage) {
+        let (head, body) = url.split_once(";base64,").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
+        (
+            head.trim_start_matches("data:").to_owned(),
+            decode_supported_image(&bytes).unwrap(),
+        )
+    }
+
+    /// A photo's chip gets a small JPEG that just covers the chip, stored
+    /// beside the image and served from there afterwards.
+    #[test]
+    fn a_large_image_gets_a_stored_thumbnail_that_covers_the_chip() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+        let image = store.import_compressed("big.png", &rgba_png(1200, 900, 255)).unwrap();
+        let url = store.thumbnail_data_url_by_id(&image.id).unwrap();
+        let (mime, decoded) = decode_data_url(&url);
+        assert_eq!(mime, "image/jpeg");
+        // Cover 336 × 264: the scale is max(336/1200, 264/900) = 0.293.
+        assert_eq!((decoded.width, decoded.height), (352, 264));
+        let companion = store
+            .directory
+            .companion_path(&image.id, THUMBNAIL_SUFFIX)
+            .unwrap();
+        assert!(companion.is_file());
+        assert_eq!(store.thumbnail_data_url_by_id(&image.id).unwrap(), url);
+        // The full picture is untouched.
+        assert_eq!(
+            decode_data_url(&store.data_url_by_id(&image.id).unwrap()).1.width,
+            1200
+        );
+    }
+
+    /// Transparency keeps a thumbnail a PNG, as it keeps a prompt image one.
+    #[test]
+    fn a_transparent_image_gets_a_png_thumbnail() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+        let image = store.import_compressed("clear.png", &rgba_png(1000, 1000, 128)).unwrap();
+        let (mime, decoded) = decode_data_url(&store.thumbnail_data_url_by_id(&image.id).unwrap());
+        assert_eq!(mime, "image/png");
+        assert_eq!((decoded.width, decoded.height), (336, 336));
+    }
+
+    /// An image no larger than the chip needs is its own thumbnail: nothing is
+    /// stored beside it.
+    #[test]
+    fn a_small_image_is_its_own_thumbnail() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+        let image = store.import_compressed("small.png", &rgba_png(200, 100, 255)).unwrap();
+        assert_eq!(
+            store.thumbnail_data_url_by_id(&image.id).unwrap(),
+            store.data_url_by_id(&image.id).unwrap()
+        );
+        assert!(!store
+            .directory
+            .companion_path(&image.id, THUMBNAIL_SUFFIX)
+            .unwrap()
+            .exists());
+    }
+
+    /// A damaged thumbnail is made again, never served.
+    #[test]
+    fn a_damaged_thumbnail_is_remade() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+        let image = store.import_compressed("big.png", &rgba_png(1200, 900, 255)).unwrap();
+        let url = store.thumbnail_data_url_by_id(&image.id).unwrap();
+        let companion = store
+            .directory
+            .companion_path(&image.id, THUMBNAIL_SUFFIX)
+            .unwrap();
+        fs::write(&companion, b"not an image").unwrap();
+        assert_eq!(store.thumbnail_data_url_by_id(&image.id).unwrap(), url);
+    }
+
+    /// Chips and full pictures go through the shared pool at their own
+    /// priorities, and a reset takes them out of it.
+    #[test]
+    fn pooled_reads_are_kept_at_their_priority_until_a_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+        let image = store.import_compressed("big.png", &rgba_png(1200, 900, 255)).unwrap();
+        let chip = store.pooled_thumbnail_data_url_by_id(&image.id).unwrap();
+        let full = store.pooled_data_url_by_id(&image.id).unwrap();
+        assert!(Arc::ptr_eq(&chip, &store.pooled_thumbnail_data_url_by_id(&image.id).unwrap()));
+        assert!(Arc::ptr_eq(&full, &store.pooled_data_url_by_id(&image.id).unwrap()));
+        let pool = MemoryPool::global();
+        assert!(pool.contains(&store.pool_key(PoolKind::ImageThumbnail, &image.id)));
+        assert!(pool.contains(&store.pool_key(PoolKind::ImageData, &image.id)));
+        store.purge_all().unwrap();
+        assert!(!pool.contains(&store.pool_key(PoolKind::ImageThumbnail, &image.id)));
+        assert!(!pool.contains(&store.pool_key(PoolKind::ImageData, &image.id)));
+    }
+
+    /// A thumbnail goes where its image goes: quarantined, restored and swept
+    /// together.
+    #[test]
+    fn a_thumbnail_is_quarantined_with_its_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+        let image = store.import_compressed("big.png", &rgba_png(1200, 900, 255)).unwrap();
+        store.thumbnail_data_url_by_id(&image.id).unwrap();
+        let companion = store
+            .directory
+            .companion_path(&image.id, THUMBNAIL_SUFFIX)
+            .unwrap();
+        store
+            .reconcile_referenced(&HashSet::from([image.id.clone()]), &HashSet::new())
+            .unwrap();
+        assert!(!companion.exists());
+        assert!(store
+            .directory
+            .quarantine_companion_path(&image.id, THUMBNAIL_SUFFIX)
+            .unwrap()
+            .exists());
+        // Reading the thumbnail restores both.
+        store.thumbnail_data_url_by_id(&image.id).unwrap();
+        assert!(companion.exists());
+        assert!(store.path_for_id(&image.id).unwrap().exists());
+    }
+
+    #[test]
+    fn uploads_are_shrunk_like_claude_code_and_stored_as_readable_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(temp.path());
+
+        // Wider than 2000 px and than the 8000 px a stored image may be.
+        let wide_pixels = (0..9_000_u32 * 20)
+            .flat_map(|index| [(index % 251) as u8, (index % 13) as u8, 90, 255])
+            .collect::<Vec<_>>();
+        let mut wide = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut wide, 9_000, 20);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_color(png::ColorType::Rgba);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&wide_pixels).unwrap();
+            writer.finish().unwrap();
+        }
+        let image = store.import_compressed("wide.png", &wide).unwrap();
+        // 20 * 2000 / 9000 = 4.44, rounded.
+        assert_eq!((image.width, image.height), (2_000, 4));
+        assert!(image.bytes <= 512_000);
+        assert_eq!(store.read_bytes(&image).unwrap().len() as u64, image.bytes);
+        assert!(store
+            .data_url_by_id(&image.id)
+            .unwrap()
+            .starts_with(&format!("data:{};base64,", image.mime)));
+
+        // A photo already small enough keeps its own JPEG data, less its EXIF.
+        let photo_pixels = (0..48_u32 * 32)
+            .flat_map(|index| [(index % 48 * 5) as u8, (index / 48 * 7) as u8, 60, 255])
+            .collect::<Vec<_>>();
+        let mut photo = Vec::new();
+        jpeg_encoder::Encoder::new(&mut photo, 90)
+            .encode(&photo_pixels, 48, 32, jpeg_encoder::ColorType::Rgba)
+            .unwrap();
+        let tagged = jpeg_with_orientation(&photo, 1);
+        let stored = store.import_compressed("photo.jpg", &tagged).unwrap();
+        assert_eq!(
+            (stored.mime.as_str(), stored.width, stored.height),
+            ("image/jpeg", 48, 32)
+        );
+        let bytes = store.read_bytes(&stored).unwrap();
+        assert_eq!(bytes, photo);
+        assert!(!bytes.windows(6).any(|window| window == b"Exif\0\0"));
+
+        assert!(store
+            .import_compressed("empty.png", b"")
+            .unwrap_err()
+            .contains("empty"));
+        let oversized = vec![0_u8; MAX_IMAGE_UPLOAD_BYTES + 1];
+        assert!(store
+            .import_compressed("huge.png", &oversized)
+            .unwrap_err()
+            .contains("upload limit"));
+    }
+
+    #[test]
+    fn a_palette_png_is_canonical_only_with_its_chunks_in_order() {
+        let mut palette_png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut palette_png, 2, 1);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_color(png::ColorType::Indexed);
+            encoder.set_palette(vec![255, 0, 0, 0, 0, 255]);
+            encoder.set_trns(vec![128]);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0, 1]).unwrap();
+            writer.finish().unwrap();
+        }
+        validate_canonical_png_container(&palette_png).unwrap();
+        let decoded = decode_supported_image(&palette_png).unwrap();
+        assert_eq!(decoded.rgba, vec![255, 0, 0, 128, 0, 0, 255, 255]);
+
+        // A palette may not follow the image data.
+        let plte = palette_png
+            .windows(4)
+            .position(|window| window == b"PLTE")
+            .unwrap()
+            - 4;
+        let plte_end = plte + 12 + 6;
+        let idat = palette_png
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .unwrap()
+            - 4;
+        let idat_length = u32::from_be_bytes(palette_png[idat..idat + 4].try_into().unwrap());
+        let idat_end = idat + 12 + idat_length as usize;
+        let mut reordered = palette_png[..plte].to_vec();
+        reordered.extend_from_slice(&palette_png[plte_end..idat_end]);
+        reordered.extend_from_slice(&palette_png[plte..plte_end]);
+        reordered.extend_from_slice(&palette_png[idat_end..]);
+        assert_eq!(reordered.len(), palette_png.len());
+        assert!(validate_canonical_png_container(&reordered)
+            .unwrap_err()
+            .contains("order"));
     }
 
     #[test]
@@ -1809,7 +2238,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
         assert_eq!(
-            store.import("static.gif", &static_gif).unwrap().mime,
+            store.import_compressed("static.gif", &static_gif).unwrap().mime,
             "image/png"
         );
 
@@ -1817,7 +2246,7 @@ mod tests {
         animated.extend_from_slice(&static_gif[19..static_gif.len() - 1]);
         animated.push(59);
         assert!(store
-            .import("animated.gif", &animated)
+            .import_compressed("animated.gif", &animated)
             .unwrap_err()
             .contains("animated GIF"));
     }
@@ -1895,7 +2324,7 @@ mod tests {
     fn reference_scan_covers_queue_branches_and_subagents() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let document = document_with_references(&image);
         assert_eq!(referenced_image_ids(&document), HashSet::from([image.id]));
     }
@@ -1904,7 +2333,7 @@ mod tests {
     fn removed_references_are_quarantined_but_active_snapshots_can_restore_them() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let canonical = store.read_bytes(&image).unwrap();
         let previous = document_with_references(&image);
         let next = crate::catalog::default_document();
@@ -1927,7 +2356,7 @@ mod tests {
     fn removing_one_branch_does_not_quarantine_content_still_referenced_elsewhere() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let previous = document_with_references(&image);
         let mut next = crate::catalog::default_document();
         next.workspaces[0].conversations[0].contexts = vec![serde_json::from_value(json!({
@@ -1957,7 +2386,7 @@ mod tests {
     fn startup_restores_crash_references_before_deleting_expired_quarantine() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let canonical = store.read_bytes(&image).unwrap();
         let referenced = document_with_references(&image);
         let empty = crate::catalog::default_document();
@@ -1989,7 +2418,7 @@ mod tests {
     fn pinned_template_images_survive_both_reclaim_passes() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let canonical = store.read_bytes(&image).unwrap();
         let referenced = document_with_references(&image);
         let empty = crate::catalog::default_document();
@@ -2024,7 +2453,7 @@ mod tests {
     fn startup_deletes_only_expired_unreferenced_quarantine_entries() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let referenced = document_with_references(&image);
         let empty = crate::catalog::default_document();
 
@@ -2048,7 +2477,7 @@ mod tests {
     fn startup_quarantines_old_never_persisted_import_without_same_pass_deletion() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        let image = store.import("pixel.png", PNG).unwrap();
+        let image = store.import_compressed("pixel.png", PNG).unwrap();
         let active = store.path_for_id(&image.id).unwrap();
         fs::OpenOptions::new()
             .write(true)
@@ -2068,7 +2497,7 @@ mod tests {
     fn explicit_purge_removes_only_the_fixed_attachment_root() {
         let temp = tempfile::tempdir().unwrap();
         let store = ImageAttachmentStore::new(temp.path());
-        store.import("pixel.png", PNG).unwrap();
+        store.import_compressed("pixel.png", PNG).unwrap();
         let unrelated = temp.path().join("unrelated.txt");
         fs::write(&unrelated, b"keep").unwrap();
 
@@ -2085,7 +2514,7 @@ mod tests {
         let store = ImageAttachmentStore::new(temp.path());
 
         assert!(store
-            .import("pixel.png", PNG)
+            .import_compressed("pixel.png", PNG)
             .unwrap_err()
             .contains("not a regular directory"));
         assert!(store

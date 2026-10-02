@@ -2,6 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
+import type { LockTone } from "../lib/toolLock";
 import type { ToolDescriptor } from "../types";
 import { ToolSelectionGroups } from "./ToolSelectionGroups";
 
@@ -95,22 +96,6 @@ const tools: ToolDescriptor[] = [
     parameters: []
   },
   {
-    name: "send_message",
-    label: "发送消息",
-    description: "",
-    category: "orchestration",
-    dangerous: false,
-    parameters: []
-  },
-  {
-    name: "followup_task",
-    label: "追加任务",
-    description: "",
-    category: "orchestration",
-    dangerous: false,
-    parameters: []
-  },
-  {
     name: "task_wait",
     label: "等待任务",
     description: "",
@@ -131,12 +116,13 @@ const tools: ToolDescriptor[] = [
 function ControlledGroups({
   initialEnabledTools,
   expansionKey,
-  lockedTools,
+  tones,
   onChange
 }: {
   initialEnabledTools: string[];
   expansionKey: string;
-  lockedTools?: string[];
+  /** How the conversation's lock draws each named row; the rest are plain. */
+  tones?: Record<string, LockTone>;
   onChange?: (enabledTools: string[]) => void;
 }) {
   const [enabledTools, setEnabledTools] = useState(initialEnabledTools);
@@ -144,7 +130,7 @@ function ControlledGroups({
     <ToolSelectionGroups
       tools={tools}
       enabledTools={enabledTools}
-      lockedTools={lockedTools}
+      toneOf={tones && ((name) => tones[name] ?? null)}
       expansionKey={expansionKey}
       onChange={(next) => {
         onChange?.(next);
@@ -245,59 +231,34 @@ describe("ToolSelectionGroups", () => {
     expect(within(region).queryAllByRole("switch")).toHaveLength(0);
   });
 
-  it("folds locked tools into one collapsed bar and drops them from the picker", async () => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    render(
-      <ControlledGroups
-        initialEnabledTools={["read", "lsp", "agent_spawn", "powershell"]}
-        lockedTools={["lsp", "agent_spawn", "powershell"]}
-        expansionKey="preset-one"
-        onChange={onChange}
-      />
-    );
-
-    const filesystemDisclosure = groupDisclosure("文件与搜索");
-    expect(within(filesystemDisclosure).getByText("1 / 2")).toBeInTheDocument();
-    const filesystemRegion = groupRegion(filesystemDisclosure);
-    expect(Array.from(filesystemRegion.querySelectorAll<HTMLElement>(".tool-toggle-row--pick"))
-      .map((row) => row.dataset.toolName)).toEqual(["read", "write"]);
-    // A group whose every tool is spent has nothing left to offer, so it leaves too.
-    expect(screen.queryByRole("button", { name: "Shell" })).not.toBeInTheDocument();
-
-    const lockBar = screen.getByRole("button", { name: /已生效的工具/ });
-    expect(lockBar).toHaveAttribute("aria-expanded", "false");
-    expect(within(lockBar).getByText("3")).toBeInTheDocument();
-
-    await user.click(lockBar);
-    const lockRegion = groupRegion(lockBar);
-    expect(Array.from(lockRegion.querySelectorAll<HTMLElement>(".tool-toggle-row--locked"))
-      .map((row) => row.dataset.toolName)).toEqual(["lsp", "powershell", "agent_spawn"]);
-    // A spent row is a statement, not a control.
-    expect(within(lockRegion).queryAllByRole("button")).toHaveLength(0);
-    expect(onChange).not.toHaveBeenCalled();
-  });
-
-  it("keeps a locked parent's dependants pickable in its place", async () => {
+  it("draws toned rows where they stand, trading the sign for a lock", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     const { container } = render(
       <ControlledGroups
-        initialEnabledTools={["agent_spawn", "send_message"]}
-        lockedTools={["agent_spawn"]}
+        initialEnabledTools={["read", "lsp", "agent_spawn", "powershell"]}
+        tones={{ lsp: "cache", powershell: "hard" }}
         expansionKey="preset-one"
         onChange={onChange}
       />
     );
 
-    expect(container.querySelector('[data-tool-name="agent_spawn"].tool-toggle-row--pick'))
-      .not.toBeInTheDocument();
-    expect(Array.from(container.querySelectorAll<HTMLElement>(".tool-toggle-row--nested"))
-      .map((row) => row.dataset.toolName)).toEqual(["send_message", "followup_task"]);
+    // Nothing is folded away: every group counts and lists all of its rows.
+    expect(within(groupDisclosure("文件与搜索")).getByText("2 / 3")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Shell" })).toBeInTheDocument();
+    expect(screen.queryByText("已生效的工具")).toBeNull();
 
-    // The dependant is its own name and still free, so it can go back off.
-    await user.click(screen.getByRole("button", { name: "发送消息已启用" }));
-    expect(onChange).toHaveBeenLastCalledWith(["agent_spawn"]);
+    const lsp = container.querySelector<HTMLButtonElement>('[data-tool-name="lsp"]')!;
+    expect(lsp).toHaveClass("tool-toggle-row--cache");
+    expect(lsp.querySelector(".lock-mark--cache")).not.toBeNull();
+    // Orange still moves; the warning before it is the caller's.
+    await user.click(lsp);
+    expect(onChange).toHaveBeenLastCalledWith(["read", "agent_spawn", "powershell"]);
+
+    const powershell = container.querySelector<HTMLButtonElement>('[data-tool-name="powershell"]')!;
+    expect(powershell).toHaveClass("tool-toggle-row--hard");
+    expect(powershell).toBeDisabled();
+    expect(powershell.querySelector(".lock-mark--hard")).not.toBeNull();
   });
 
   it("lets disclosure change expansion without changing enabled tools", async () => {
@@ -387,30 +348,29 @@ describe("ToolSelectionGroups", () => {
     ]);
   });
 
-  it("keeps a spent lifecycle tool, and never shows it in the lock bar", async () => {
+  it("drops the lifecycle tools with the last preview tool, orange or not", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     render(
       <ControlledGroups
         initialEnabledTools={["preview_click", "preview_start", "preview_stop", "preview_list"]}
-        lockedTools={["preview_start"]}
+        tones={{ preview_click: "cache", preview_start: "cache" }}
         expansionKey="preset-one"
         onChange={onChange}
       />
     );
 
-    expect(screen.queryByRole("button", { name: /已生效的工具/ })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "点击元素已启用" }));
-    expect(onChange).toHaveBeenLastCalledWith(["preview_start"]);
+    expect(onChange).toHaveBeenLastCalledWith([]);
   });
 
-  it("keeps the lifecycle tools while a spent preview tool is still on", async () => {
+  it("keeps the lifecycle tools while a gray preview tool is still on", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     render(
       <ControlledGroups
         initialEnabledTools={["preview_snapshot", "preview_click", "preview_start", "preview_stop", "preview_list"]}
-        lockedTools={["preview_snapshot"]}
+        tones={{ preview_snapshot: "hard" }}
         expansionKey="preset-one"
         onChange={onChange}
       />
@@ -440,27 +400,21 @@ describe("ToolSelectionGroups", () => {
     expect(webDisclosure).toHaveAttribute("aria-expanded", "true");
   });
 
-  it("renders subagent children under an enabled parent without a disclosure arrow, and clears them with the parent", async () => {
+  it("draws every row flat, with its title as the row's first child and no disclosure of its own", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     const { container } = render(
       <ControlledGroups
-        initialEnabledTools={["read", "agent_spawn", "send_message", "followup_task"]}
+        initialEnabledTools={["read", "agent_spawn"]}
         expansionKey="preset-one"
         onChange={onChange}
       />
     );
 
-    const parent = container.querySelector<HTMLElement>('[data-tool-name="agent_spawn"]')!;
-    expect(parent).toHaveTextContent("子代理");
-    const nestedRows = container.querySelectorAll<HTMLElement>(".tool-toggle-row--nested");
-    expect(nestedRows).toHaveLength(2);
-    expect([...nestedRows].map((row) => row.dataset.toolName)).toEqual(["send_message", "followup_task"]);
-
-    // Dependent rows are controlled by the parent toggle, not a parent-row disclosure.
-    expect(screen.queryByRole("button", { name: "子代理的从属工具" })).not.toBeInTheDocument();
-    expect(parent.querySelector(".tool-toggle-row__disclosure")).toBeNull();
-    expect(parent.querySelector(".disclosure-chevron")).toBeNull();
+    const spawn = container.querySelector<HTMLElement>('[data-tool-name="agent_spawn"]')!;
+    expect(spawn).toHaveTextContent("子代理");
+    expect(spawn.querySelector(".tool-toggle-row__disclosure")).toBeNull();
+    expect(spawn.querySelector(".disclosure-chevron")).toBeNull();
     // The layout targets `.tool-toggle-row > span:first-child`, so the title must
     // be the row's direct first child to align with other tool rows.
     const labelHolder = (row: HTMLElement): HTMLElement => {
@@ -469,24 +423,12 @@ describe("ToolSelectionGroups", () => {
       expect(first.firstElementChild?.tagName).toBe("STRONG");
       return first;
     };
-    expect(labelHolder(parent)).toHaveTextContent("子代理");
+    expect(labelHolder(spawn)).toHaveTextContent("子代理");
     const sibling = container.querySelector<HTMLElement>('[data-tool-name="lsp"]')!;
     expect(labelHolder(sibling)).toHaveTextContent("代码语义导航");
 
     await user.click(screen.getByRole("button", { name: "子代理已启用" }));
     expect(onChange).toHaveBeenLastCalledWith(["read"]);
-    expect(container.querySelector('[data-tool-name="send_message"]')).not.toBeInTheDocument();
-    expect(container.querySelector('[data-tool-name="followup_task"]')).not.toBeInTheDocument();
-  });
-
-  it("does not render subagent children when their parent is disabled", () => {
-    const { container } = render(
-      <ControlledGroups initialEnabledTools={["read", "send_message", "followup_task"]} expansionKey="preset-one" />
-    );
-
-    expect(container.querySelector('[data-tool-name="send_message"]')).not.toBeInTheDocument();
-    expect(container.querySelector('[data-tool-name="followup_task"]')).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "子代理的从属工具" })).not.toBeInTheDocument();
   });
 
   it("does not render host-derived task runtime controls", () => {
@@ -521,7 +463,7 @@ describe("ToolSelectionGroups", () => {
     expect(grip).toHaveAttribute("tabindex", "-1");
   });
 
-  it("turns a whole group on and off from its heading, dependants included", async () => {
+  it("turns a whole group on and off from its heading", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     render(
@@ -532,15 +474,11 @@ describe("ToolSelectionGroups", () => {
     expect(onChange).toHaveBeenLastCalledWith(["read", "write", "lsp"]);
     expect(within(groupDisclosure("文件与搜索")).getByText("3 / 3")).toBeInTheDocument();
 
-    // A group's pair reaches the dependants that only ever render under a
-    // parent, so the count it reports is the count it can actually move.
     await user.click(groupBulk("代理编排", "select"));
-    expect(onChange).toHaveBeenLastCalledWith([
-      "read", "write", "lsp", "agent_spawn", "send_message", "followup_task"
-    ]);
+    expect(onChange).toHaveBeenLastCalledWith(["read", "write", "lsp", "agent_spawn"]);
 
     await user.click(groupBulk("文件与搜索", "clear"));
-    expect(onChange).toHaveBeenLastCalledWith(["agent_spawn", "send_message", "followup_task"]);
+    expect(onChange).toHaveBeenLastCalledWith(["agent_spawn"]);
     expect(groupBulk("文件与搜索", "clear")).toBeDisabled();
   });
 
@@ -562,19 +500,19 @@ describe("ToolSelectionGroups", () => {
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("leaves a locked group's row untouched when a bulk pair sweeps its category", async () => {
+  it("leaves a gray row untouched when a bulk pair sweeps its category", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     render(
       <ControlledGroups
         initialEnabledTools={["read", "write"]}
-        lockedTools={["read"]}
+        tones={{ read: "hard" }}
         expansionKey="preset-one"
         onChange={onChange}
       />
     );
 
-    // `read` is spent: it is not in the picker and the pair cannot take it back.
+    // `read` cannot move, so the pair takes only what can.
     await user.click(groupBulk("文件与搜索", "clear"));
     expect(onChange).toHaveBeenLastCalledWith(["read"]);
   });

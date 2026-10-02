@@ -554,6 +554,50 @@ pub fn workspace_snapshot(workspace: &Path) -> Result<Option<GitWorkspaceSnapsho
     snapshot_for_repository(&repository).map(Some)
 }
 
+/// Whether writing `path` changes what a Git repository holds: the file is
+/// tracked, or it sits inside a work tree without being ignored, so Git would
+/// list it as a change (a new file included — it need not exist yet).
+///
+/// One `git check-ignore -q`, run from the nearest directory that exists: it
+/// answers 1 for exactly those paths — a tracked file is never reported as
+/// ignored — 0 for an ignored one, and fails outside any work tree. Anything
+/// but 1 is `false`, Git missing included: this is a guard for plan mode, not
+/// a security boundary, and an unanswerable question must not stop a write.
+pub fn write_changes_repository(path: &Path) -> bool {
+    let Some(git) = find_program("git") else {
+        return false;
+    };
+    let mut directory = path.parent();
+    while let Some(candidate) = directory {
+        if candidate.is_dir() {
+            break;
+        }
+        directory = candidate.parent();
+    }
+    let Some(directory) = directory else {
+        return false;
+    };
+    let Ok(relative) = path.strip_prefix(directory) else {
+        return false;
+    };
+    let mut args = git_command_prefix();
+    args.push(OsString::from("--no-optional-locks"));
+    args.push(OsString::from("check-ignore"));
+    args.push(OsString::from("-q"));
+    args.push(OsString::from("--"));
+    args.push(relative.as_os_str().to_owned());
+    run_program(
+        &git,
+        directory,
+        args,
+        None,
+        LOCAL_COMMAND_TIMEOUT,
+        64 * 1024,
+        CliKind::GitPassive,
+    )
+    .is_ok_and(|output| output.status.and_then(|status| status.code()) == Some(1))
+}
+
 pub fn workspace_summary(
     workspace: &Path,
     known_revision: Option<String>,
@@ -1067,6 +1111,11 @@ pub struct IsolatedWorktree {
 /// - The checkout is the HEAD commit, excluding uncommitted and untracked parent
 ///   files; this is the definition of Git worktree isolation.
 /// - Hold `repository_lock` throughout to exclude UI-initiated Git writes.
+/// - A resumed run reuses its run id, so the slot can already be taken by an
+///   earlier attempt: a worktree kept because it had changes, or one a crash
+///   left behind. That checkout may hold work and is never reclaimed here; the
+///   step takes the next free `<slot>-<n>` instead, as a conversation worktree
+///   steps aside from a taken name.
 ///
 /// This host-internal operation does not use the user-facing `GitAction` protocol.
 pub fn create_isolated_worktree(
@@ -1076,9 +1125,33 @@ pub fn create_isolated_worktree(
 ) -> Result<IsolatedWorktree, String> {
     let run_id = validate_worktree_component(phrase("运行 id", "The run id"), run_id)?;
     let slot = validate_worktree_component(phrase("步骤槽位名", "The step slot name"), slot)?;
-    let branch = format!("{ISOLATED_WORKTREE_BRANCH_PREFIX}/{run_id}/{slot}");
-    create_worktree(workspace, &[&run_id, &slot], &branch, None)
+    let repository = require_repository(workspace)?;
+    let container = repository
+        .root
+        .join(MEWORK_PROJECT_DIRECTORY)
+        .join(ISOLATED_WORKTREE_DIRECTORY)
+        .join(&run_id);
+    for attempt in 1..=ISOLATED_WORKTREE_SLOT_ATTEMPTS {
+        let candidate = if attempt == 1 {
+            slot.clone()
+        } else {
+            format!("{slot}-{attempt}")
+        };
+        let branch = format!("{ISOLATED_WORKTREE_BRANCH_PREFIX}/{run_id}/{candidate}");
+        if container.join(&candidate).exists() || local_branch_exists(&repository, &branch)? {
+            continue;
+        }
+        return create_worktree(workspace, &[&run_id, &candidate], &branch, None);
+    }
+    Err(text!(
+        "运行 {run_id} 的步骤槽位 {slot} 及其后缀都已被之前的尝试占用；请先清理残留的 mework/wf/{run_id} 分支或目录",
+        "The step slot {slot} of run {run_id} and all its suffixed forms are taken by earlier attempts; clean up leftover mework/wf/{run_id} branches or directories first"
+    ))
 }
+
+/// How many `-2`, `-3`, … suffixes a workflow step's worktree slot may take
+/// when earlier attempts of the same run left theirs behind.
+const ISOLATED_WORKTREE_SLOT_ATTEMPTS: usize = 9;
 
 /// A conversation's isolated worktree, as [`create_conversation_worktree`]
 /// made it.
@@ -6249,6 +6322,36 @@ mod tests {
         find_program("git").is_some()
     }
 
+    /// Plan mode's question, answered by Git: tracked files and files a work
+    /// tree would pick up count, a new one under a missing directory included;
+    /// ignored paths, even beneath tracked ones, and anything outside a work
+    /// tree do not.
+    #[test]
+    fn a_write_changes_the_repository_when_git_would_list_it() {
+        if !git_available() {
+            return;
+        }
+        let outside = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        run_test_git(root, &["init", "-q"]);
+        fs::write(root.join(".gitignore"), "build/\n*.log\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("forced.log"), "kept\n").unwrap();
+        run_test_git(root, &["add", ".gitignore", "src/main.rs"]);
+        run_test_git(root, &["add", "-f", "forced.log"]);
+
+        assert!(write_changes_repository(&root.join("src/main.rs")));
+        assert!(write_changes_repository(&root.join("src/new.rs")));
+        assert!(write_changes_repository(&root.join("docs/deep/new.md")));
+        // A tracked file stays the repository's even when a rule would ignore it.
+        assert!(write_changes_repository(&root.join("forced.log")));
+        assert!(!write_changes_repository(&root.join("debug.log")));
+        assert!(!write_changes_repository(&root.join("build/out/app.bin")));
+        assert!(!write_changes_repository(&outside.path().join("scratch.txt")));
+    }
+
     fn run_test_git(root: &Path, args: &[&str]) {
         let git = find_program("git").expect("Git is available");
         let output = Command::new(git)
@@ -6576,6 +6679,38 @@ u UU N... 100644 100644 100644 100644 a b c d conflict.txt\0\
         ))
         .unwrap();
         assert!(!branches.trim().is_empty(), "保留的工作树要连分支一起留住");
+    }
+
+    /// A resumed run reuses its run id. The slot a kept worktree still holds —
+    /// with the work in it — is left alone, and the rerun step takes the next
+    /// free suffix instead of failing.
+    #[test]
+    fn a_resumed_step_steps_aside_from_the_worktree_an_earlier_attempt_kept() {
+        if !git_available() {
+            return;
+        }
+        let repository = initialized_repository();
+        let kept =
+            create_isolated_worktree(repository.path(), "run1", "ws1").expect("worktree created");
+        fs::write(kept.path.join("tracked.txt"), "earlier attempt\n").unwrap();
+        assert!(!release_isolated_worktree(repository.path(), &kept).unwrap());
+
+        let rerun = create_isolated_worktree(repository.path(), "run1", "ws1")
+            .expect("重跑的步骤换一个槽位，而不是失败");
+        assert_eq!(rerun.branch, "mework/wf/run1/ws1-2");
+        assert_ne!(rerun.path, kept.path);
+        assert_eq!(
+            fs::read_to_string(kept.path.join("tracked.txt")).unwrap(),
+            "earlier attempt\n",
+            "之前那次尝试留下的改动不得被动"
+        );
+
+        // A leftover branch alone — its directory already gone — takes the slot too.
+        assert!(release_isolated_worktree(repository.path(), &rerun).unwrap());
+        run_test_git(repository.path(), &["branch", "mework/wf/run1/ws2"]);
+        let beside_branch =
+            create_isolated_worktree(repository.path(), "run1", "ws2").expect("worktree created");
+        assert_eq!(beside_branch.branch, "mework/wf/run1/ws2-2");
     }
 
     /// Isolation must fail for a workspace that is not a repository root rather

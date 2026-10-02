@@ -6,6 +6,7 @@ import { ImageStrip } from "./ImageStrip";
 
 const runtimeMocks = vi.hoisted(() => ({
   imageAttachmentData: vi.fn(),
+  imageAttachmentThumbnail: vi.fn(),
   fileAttachmentData: vi.fn()
 }));
 
@@ -24,10 +25,11 @@ describe("ImageStrip", () => {
   beforeEach(() => {
     configureI18n("zh-CN");
     runtimeMocks.imageAttachmentData.mockReset().mockResolvedValue("data:image/png;base64,AAAA");
+    runtimeMocks.imageAttachmentThumbnail.mockReset().mockResolvedValue("data:image/jpeg;base64,THUMB");
     runtimeMocks.fileAttachmentData.mockReset();
   });
 
-  it("loads bytes on demand and exposes a removable thumbnail", async () => {
+  it("draws the chip from the host's thumbnail and exposes it as removable", async () => {
     const user = userEvent.setup();
     const onRemove = vi.fn();
 
@@ -35,9 +37,11 @@ describe("ImageStrip", () => {
 
     expect(await screen.findByRole("img", { name: "screen.png" })).toHaveAttribute(
       "src",
-      "data:image/png;base64,AAAA"
+      "data:image/jpeg;base64,THUMB"
     );
-    expect(runtimeMocks.imageAttachmentData).toHaveBeenCalledWith("image-one");
+    expect(runtimeMocks.imageAttachmentThumbnail).toHaveBeenCalledWith("image-one");
+    // The full picture is low-priority data: nothing reads it until the viewer opens.
+    expect(runtimeMocks.imageAttachmentData).not.toHaveBeenCalled();
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "移除图片 screen.png" }));
     expect(onRemove).toHaveBeenCalledWith("image-one");
@@ -54,8 +58,11 @@ describe("ImageStrip", () => {
 
     let dialog = screen.getByRole("dialog", { name: "查看原图 screen.png" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
-    expect(within(dialog).getByRole("img", { name: "screen.png 原图" }))
-      .toHaveClass("image-viewer__image");
+    const full = within(dialog).getByRole("img", { name: "screen.png 原图" });
+    expect(full).toHaveClass("image-viewer__image");
+    // The thumbnail stands in until the full picture arrives.
+    await waitFor(() => expect(full).toHaveAttribute("src", "data:image/png;base64,AAAA"));
+    expect(runtimeMocks.imageAttachmentData).toHaveBeenCalledWith("keyboard-viewer-image");
     const close = within(dialog).getByRole("button", { name: "关闭原图 screen.png" });
     expect(close).toHaveFocus();
 
@@ -73,7 +80,7 @@ describe("ImageStrip", () => {
 
   it("announces a local failure and retries without failing the whole strip", async () => {
     const user = userEvent.setup();
-    runtimeMocks.imageAttachmentData
+    runtimeMocks.imageAttachmentThumbnail
       .mockRejectedValueOnce(new Error("missing"))
       .mockResolvedValueOnce("data:image/png;base64,BBBB");
 
@@ -90,7 +97,7 @@ describe("ImageStrip", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     fireEvent.load(recoveredImage);
     expect(await screen.findByRole("status")).toHaveTextContent("screen.png 已重新加载");
-    expect(runtimeMocks.imageAttachmentData).toHaveBeenCalledTimes(2);
+    expect(runtimeMocks.imageAttachmentThumbnail).toHaveBeenCalledTimes(2);
   });
 
   it("turns a browser decode failure into the same local placeholder", async () => {

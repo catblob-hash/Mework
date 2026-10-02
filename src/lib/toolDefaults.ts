@@ -9,9 +9,6 @@ const englishParameterLabels: Record<string, string> = {
   accept: "Accept",
   action: "Action",
   args: "Arguments",
-  activeForm: "Active form",
-  addBlockedBy: "Add blockers",
-  addBlocks: "Add blocked tasks",
   case_sensitive: "Case sensitive",
   character: "Character",
   colorScheme: "Color scheme",
@@ -37,13 +34,11 @@ const englishParameterLabels: Record<string, string> = {
   line: "Line",
   lines: "Line limit",
   max_results: "Maximum results",
-  message: "Message",
-  metadata: "Metadata",
   name: "Name",
   new_text: "New text",
+  none: "Empty argument",
   offset: "Offset",
   old_text: "Original text",
-  owner: "Owner",
   operation: "Operation",
   path: "Path",
   pattern: "Search pattern",
@@ -63,12 +58,8 @@ const englishParameterLabels: Record<string, string> = {
   selector: "CSS selector",
   serverId: "Server ID",
   start_line: "Start line",
-  status: "Status",
   styles: "CSS properties",
-  subject: "Task subject",
-  taskId: "Task ID",
   tasks: "Tasks",
-  target: "Child agent",
   timeout: "Timeout (ms)",
   timeout_seconds: "Timeout (seconds)",
   token_budget: "Token budget",
@@ -90,8 +81,8 @@ const englishParameterHelp: Record<string, string> = {
     "JSON value exposed to the script as the global `args`, verbatim; pass arrays and objects directly, not as encoded strings.",
   "本次运行允许消耗的 token 硬顶，脚本经 budget 读到；耗尽后新的 agent() 调用抛错":
     "Hard token ceiling for this run, readable as budget in the script; once exhausted, further agent() calls throw.",
-  "上一次同脚本运行报出的运行 ID；已入日志的步骤即时重放，其余步骤重跑。脚本正文必须与获批时逐字一致":
-    "Run id from a previous run of this same script; journaled steps replay, the first unjournaled one and everything after it re-runs.",
+  "上一次运行报出的运行 ID；提示词与选项没变的步骤即时重放，上次停下时还在跑的步骤单独重跑，从第一个改动或失败的步骤起其余全部重跑。可省略脚本与 args 沿用上次的；传入改过的脚本会重新审批":
+    "Run id from a previous run; steps whose prompt and options are unchanged replay, a step the last attempt left running re-runs alone, and everything from the first changed or failed step re-runs. script and args may be omitted to reuse the last ones; an edited script is approved again.",
   "记忆索引里列出的文档名，.md 后缀可写可不写":
     "A document name listed in the memory index. The .md suffix is optional.",
   "memory 目录下的单个文档名，不能包含路径分隔符；.md 后缀可写可不写":
@@ -161,31 +152,29 @@ const englishParameterHelp: Record<string, string> = {
   "默认子代理看不到当前对话，任务描述必须自包含全部背景": "Child agents do not see this conversation by default; include all required context in the task.",
   "可选的 JSON Schema 子集；给出后子代理必须调用 structured_output 交回符合该模式的结果，返回值会随 task_wait 一起回来。顶层必须是 type 为 object 的对象模式；支持 type、properties、required、items、enum、const、additionalProperties、minItems/maxItems、minLength/maxLength、minimum/maximum，其余关键字会被当场拒绝": "Optional JSON Schema subset. When set, the child must call structured_output with a result matching it, and that value comes back with task_wait. The top level must be an object schema; type, properties, required, items, enum, const, additionalProperties, minItems/maxItems, minLength/maxLength and minimum/maximum are supported and every other keyword is rejected on the spot.",
   "可选的可信命名定义短名称；可用的名称与用途列在本轮的可用 Agent 清单里。由宿主解析，不能与 context=conversation 同时使用": "Optional trusted definition slug; the available names and what each is for are listed in this turn's available-agents context. Resolved by the host; cannot be combined with context=conversation.",
-  "必填。用于 send_message / followup_task / task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名": "Required. Name the child yourself: it is the address send_message / followup_task / task_wait take, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree.",
+  "必填。用于 task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名": "Required. Name the child yourself: it is the address task_wait takes, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree.",
   "必填。这次运行在会话代理命名空间里的地址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名，续跑也要换新名字": "Required. This run's address in the same namespace agents are named in, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree, so a resume still needs a fresh one.",
   "显示在时间线上的短名称": "Short name shown in the timeline.",
   "none（默认）：只看到任务；conversation：携带当前对话历史副本": "none (default): task only; conversation: include a copy of the current conversation history.",
-  "agent_spawn 返回的名称": "Name returned by agent_spawn.",
   "5–600 秒，默认 60": "5–600 seconds; default: 60.",
   "Claude Code AskUserQuestion 格式：1–4 题；每题含 header、question、2–4 个 label/description 选项及 multiSelect；无需添加 Other": "Claude Code AskUserQuestion format: 1–4 questions, each with header, question, 2–4 label/description options, and multiSelect. Do not add Other.",
   "分叉会话的第一条用户消息，也是你唯一一次下达指令的机会；说清任务与需要的全部背景":
     "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs",
-  "选择操作：create、update、get、list": "create, update, get, list.",
-  "用于 update、get；create 返回的不透明 ID": "update, get; the opaque ID returned by create.",
-  "create 必填；update 可选": "Required by create; optional patch field for update.",
-  "create、update；任务处于 in_progress 时显示的简短进行时文案":
-    "create, update; short present-continuous text shown while the task is in_progress.",
-  "用于 update；pending | in_progress | completed | deleted":
-    "update; pending | in_progress | completed | deleted",
-  "仅用于 update": "update.",
-  "用于 update；由本任务阻塞的 task ID 数组": "update; array of task IDs that this task blocks.",
-  "用于 update；阻塞本任务的 task ID 数组": "update; array of task IDs that block this task.",
-  "create 整体写入；update 按 key 合并，值为 null 时删除该 key":
-    "create writes the whole object; update merges keys, and a null value removes that key.",
   "选择操作：write 写入或覆盖计划、read 读取当前计划":
     "Choose an action: write stores or replaces the plan, read returns the current one.",
   "write 必填；计划的 Markdown 正文，整篇覆盖上一版":
-    "Required for write; the plan's Markdown body, which replaces the previous one in full."
+    "Required for write; the plan's Markdown body, which replaces the previous one in full.",
+  "交接索引里列出的文档名，.md 后缀可写可不写":
+    "A note name listed in the handoff index. The .md suffix is optional.",
+  "交接文档名，不能包含路径分隔符；.md 后缀可写可不写":
+    "The handoff note's name. Path separators are forbidden; the .md suffix is optional.",
+  "要修改的交接文档名，.md 后缀可写可不写": "The handoff note to modify. The .md suffix is optional.",
+  "交接文档的完整 Markdown 正文": "The note's complete Markdown body.",
+  "一句话说明这份交接文档写了什么，会写进交接索引":
+    "One sentence describing what this handoff note holds. It is written into the handoff index.",
+  "修改后这份交接文档的一句话说明，会刷新交接索引里的对应条目":
+    "One sentence describing this handoff note after the change. It refreshes the note's entry in the handoff index.",
+  "始终为空数组": "Always an empty list."
 };
 
 const englishParameterPlaceholders: Record<string, string> = {
@@ -194,14 +183,13 @@ const englishParameterPlaceholders: Record<string, string> = {
   "Anthropic Claude 4.5 发布日期": "Anthropic Claude 4.5 release date",
   "用户偏好": "user-preferences",
   "构建环境": "build-environment",
+  "当前进度": "current-state",
+  "任务目标、已完成的工作与下一步": "The goal, the work done and the next step",
   "用户长期偏好的语言与代码风格": "The user's long-standing language and code-style preferences",
   "测试必须用项目自带环境运行": "Tests must run in the project's own environment",
   "调查 src/ 下的路由结构并总结关键文件": "Inspect routing under src/ and summarize the key files",
   "调查路由": "Inspect routing",
   "在分叉出的会话里要完成的任务": "The task to complete in the forked conversation",
-  "补全用户认证": "Implement user authentication",
-  "实现登录与注册接口，并补齐测试。": "Add login and signup endpoints and cover them with tests.",
-  "正在补全用户认证": "Implementing user authentication",
   "[{\"question\":\"采用哪个方案？\",\"header\":\"实现方案\",\"options\":[{\"label\":\"方案 A\",\"description\":\"保持改动最小\"},{\"label\":\"方案 B\",\"description\":\"完整重构\"}],\"multiSelect\":false}]":
     "[{\"question\":\"Which approach should I use?\",\"header\":\"Approach\",\"options\":[{\"label\":\"Approach A\",\"description\":\"Keep the change small\"},{\"label\":\"Approach B\",\"description\":\"Perform a full rewrite\"}],\"multiSelect\":false}]"
 };
@@ -240,8 +228,6 @@ const englishToolLabels: Record<string, string> = {
   preview_upload_image: "Upload image",
   preview_dialog: "Answer dialog",
   agent_spawn: "Subagent",
-  send_message: "Send message",
-  followup_task: "Follow up",
   task_wait: "Wait for tasks",
   task_list: "List tasks",
   box: "Background result",
@@ -253,11 +239,14 @@ const englishToolLabels: Record<string, string> = {
   edit_project_memory: "Edit project memory",
   ask_user: "Ask user",
   fork: "Fork conversation",
-  todo: "Todo",
   skill: "Skill",
   tool_search: "Tool discovery",
   plan: "Plan document",
-  exit_plan_mode: "Exit plan mode"
+  exit_plan_mode: "Exit plan mode",
+  read_handoff_note: "Read handoff note",
+  create_handoff_note: "Write handoff note",
+  edit_handoff_note: "Edit handoff note",
+  handoff: "Hand off"
 };
 
 function cloneDefaultValue(value: ToolParameter["defaultValue"]): ToolParameter["defaultValue"] {

@@ -25,6 +25,7 @@ import {
 } from "./test/appMocks";
 import { emitAppPushEvent } from "./test/appMockInstances";
 import { CONVERSATION_TURNS_STORAGE_KEY } from "./lib/conversationTurns";
+import { EMPTY_TOOL_LOCK } from "./lib/toolLock";
 
 vi.mock("./lib/appEvents", async () => (await import("./test/appMockInstances")).appEventsModuleMock());
 
@@ -80,28 +81,28 @@ describe("App model run flow — modelRun", () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByRole("button", { name: /^思考程度：/ });
-    expect(composerOptionValue("思考程度")).toBe("低");
+    expect(composerOptionValue("思考程度")).toBe("low");
 
-    await chooseComposerOption(user, "思考程度", "极高");
-    expect(composerOptionValue("思考程度")).toBe("极高");
+    await chooseComposerOption(user, "思考程度", "extra");
+    expect(composerOptionValue("思考程度")).toBe("extra");
     await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some((call) => {
       const saved = call[0] as AppDocument;
-      return saved.globalSettings.lastReasoningEffort === "xhigh"
-        && saved.workspaces[0].conversations.find((conversation) => conversation.id === first.id)?.settings.reasoningEffort === "xhigh"
+      return saved.globalSettings.lastReasoningEffort === "extra"
+        && saved.workspaces[0].conversations.find((conversation) => conversation.id === first.id)?.settings.reasoningEffort === "extra"
         && saved.workspaces[0].conversations.find((conversation) => conversation.id === second.id)?.settings.reasoningEffort === "high";
     })).toBe(true));
 
     await user.click(screen.getByText("高思考任务"));
-    expect(composerOptionValue("思考程度")).toBe("高");
+    expect(composerOptionValue("思考程度")).toBe("high");
 
     await user.click(screen.getByRole("button", { name: /^新建任务/ }));
-    expect(composerOptionValue("思考程度")).toBe("极高");
+    expect(composerOptionValue("思考程度")).toBe("extra");
 
     await user.click(screen.getByText("高思考任务"));
-    expect(composerOptionValue("思考程度")).toBe("高");
+    expect(composerOptionValue("思考程度")).toBe("high");
   });
 
-  it("offers exactly the five provider effort rungs and no orchestration mode", async () => {
+  it("offers exactly the five effort levels, by their own names, with no thinking-off level", async () => {
     const document = documentWithModel();
     document.workspaces[0].conversations[0].settings.reasoningEffort = "low";
     runtimeMocks.loadDocument.mockResolvedValue(document);
@@ -110,22 +111,23 @@ describe("App model run flow — modelRun", () => {
     render(<App />);
 
     await screen.findByRole("button", { name: /^思考程度：/ });
-    expect(composerOptionValue("思考程度")).toBe("低");
+    expect(composerOptionValue("思考程度")).toBe("low");
     expect(composerOptionTrigger("思考程度")).toBeEnabled();
     // The retired ultracode rung must not come back: effort is a purely
     // provider-facing axis, and orchestration is the `workflow` tool, which the
     // user enables in the tool list like any other tool.
     const menu = await openComposerOption(user, "思考程度");
+    // The names are not translated (this runs under zh-CN), and nothing turns thinking off.
     expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual([
-      "关闭思考",
-      "低",
-      "中",
-      "高",
-      "极高"
+      "low",
+      "medium",
+      "high",
+      "extra",
+      "max"
     ]);
 
-    await user.click(within(menu).getByRole("menuitemradio", { name: "高" }));
-    expect(composerOptionValue("思考程度")).toBe("高");
+    await user.click(within(menu).getByRole("menuitemradio", { name: "high" }));
+    expect(composerOptionValue("思考程度")).toBe("high");
     await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some((call) => {
       const saved = call[0] as AppDocument;
       return saved.workspaces[0].conversations[0].settings.reasoningEffort === "high"
@@ -145,7 +147,7 @@ describe("App model run flow — modelRun", () => {
     expect(screen.queryByText(/最高思考程度|maximum reasoning/i)).toBeNull();
     expect(screen.queryByRole("button", { name: /Ultracode/i })).toBeNull();
     // Typing the word is now just text: it must not change the effort picker.
-    expect(composerOptionValue("思考程度")).toBe("关闭思考");
+    expect(composerOptionValue("思考程度")).toBe("low");
   });
 
   it("orders the composer safety, model, and reasoning controls", async () => {
@@ -200,8 +202,8 @@ describe("App model run flow — modelRun", () => {
     expect(reasoningPicker.compareDocumentPosition(usage!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(modelPicker).toHaveAttribute("title", "OpenAI Responses · test-model");
 
-    await chooseComposerOption(user, "思考程度", "低");
-    expect(composerOptionValue("思考程度")).toBe("低");
+    await chooseComposerOption(user, "思考程度", "medium");
+    expect(composerOptionValue("思考程度")).toBe("medium");
 
     await chooseComposerOption(user, "安全层级", "允许编辑");
     expect(composerOptionValue("安全层级")).toBe("允许编辑");
@@ -452,7 +454,7 @@ describe("App model run flow — modelRun", () => {
     expect(screen.queryByText("网络中断")).not.toBeInTheDocument();
   });
 
-  it("keeps retry available but blocks it when generated history exceeds the request image budget", async () => {
+  it("retries however many images the generated history holds", async () => {
     const document = documentWithModel();
     document.globalSettings.apiProviders[0].models[0] = {
       ...document.globalSettings.apiProviders[0].models[0],
@@ -468,7 +470,8 @@ describe("App model run flow — modelRun", () => {
       result: {
         success: true,
         output: "图片",
-        images: budgetImages(prefix, 11),
+        // Two results of 51 put the history past the 100 images one request was once allowed.
+        images: budgetImages(prefix, 51),
         executedAt: "2026-07-24T00:00:01Z",
         durationMs: 1
       },
@@ -496,12 +499,9 @@ describe("App model run flow — modelRun", () => {
 
     await user.click(retry);
 
-    // A budget rejection sends no request but leaves retry available.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    // No request budget holds the retry back.
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("消息没有发送")).not.toBeInTheDocument();
   });
 
   it("keeps a failed image request available when retry switches to a text-only model", async () => {
@@ -597,7 +597,7 @@ describe("App model run flow — modelRun", () => {
     expect(within(modelMenu).queryByRole("menuitemradio", { name: /^hidden-provider-model$/ })).not.toBeInTheDocument();
 
     await user.click(within(modelMenu).getByRole("menuitemradio", { name: /^test-model$/ }));
-    await chooseComposerOption(user, "思考程度", "高");
+    await chooseComposerOption(user, "思考程度", "high");
     await user.type(screen.getByLabelText("向 Agent 发送消息"), "深入思考");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -607,6 +607,36 @@ describe("App model run flow — modelRun", () => {
       model,
       reasoningEffort: "high"
     }), expect.any(Function), expect.any(String));
+  });
+
+  it("marks each model whose prompt cache for this conversation is still warm", async () => {
+    const document = documentWithModel();
+    const secondModel: ModelProfile = { ...model, id: "second-model" };
+    const shortModel: ModelProfile = { ...model, id: "short-model", cacheTtlMinutes: 5 };
+    const provider = document.globalSettings.apiProviders[0];
+    provider.models.push(secondModel, shortModel);
+    const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+    const request = (modelId: string, minutes: number) => ({ providerId: provider.id, modelId, at: minutesAgo(minutes) });
+    document.workspaces[0].conversations[0].settings.toolLock = {
+      ...EMPTY_TOOL_LOCK,
+      promptSkillIds: [],
+      lastRequest: request("second-model", 40),
+      // The last request went to a model whose cache has run out; the two
+      // before it went to models whose caches still hold, or do not.
+      modelRequests: [request("test-model", 10), request("short-model", 10), request("second-model", 40)]
+    };
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("button", { name: /^模型：/ });
+    const modelMenu = await openComposerOption(user, "模型");
+    const row = (name: string) => within(modelMenu).getByRole("menuitemradio", { name: new RegExp(`^${name}`) });
+    // Warm whether or not it sent last, and whether or not it is selected.
+    expect(within(row("test-model")).getByRole("img", { name: /^提示缓存有效，.+ 过期$/ })).toBeInTheDocument();
+    // Each model's own lifetime decides: five minutes are long gone.
+    expect(within(row("short-model")).queryByRole("img", { name: /提示缓存/ })).toBeNull();
+    expect(within(row("second-model")).queryByRole("img", { name: /提示缓存/ })).toBeNull();
   });
 
   it("keeps a stopped run visible until the backend returns its settlement", async () => {

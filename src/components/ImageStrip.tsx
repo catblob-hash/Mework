@@ -13,42 +13,30 @@ import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { fileExtension, fileIconKind } from "../lib/fileIcons";
 import { useFloatingSurface } from "../lib/floatingSurfaces";
-import { imageAttachmentData } from "../lib/runtime";
+import { memoryPool, pooledFetch } from "../lib/memoryPool";
+import { imageAttachmentData, imageAttachmentThumbnail } from "../lib/runtime";
 import type { FileAttachment, ImageAttachment } from "../types";
 import { FileAttachmentPreview } from "./FileAttachmentPreview";
 import { formatBytes } from "./FilePreview/format";
 import "./ImageStrip.css";
 
-const imageDataCache = new Map<string, Promise<string>>();
-const IMAGE_DATA_CACHE_LIMIT = 24;
-
 function imageDataKey(image: ImageAttachment): string {
   return `${image.id}:${image.mime}`;
 }
 
-function imageData(image: ImageAttachment): Promise<string> {
-  const key = imageDataKey(image);
-  const cached = imageDataCache.get(key);
-  if (cached) {
-    imageDataCache.delete(key);
-    imageDataCache.set(key, cached);
-    return cached;
-  }
-  const request = imageAttachmentData(image.id).catch((error) => {
-    imageDataCache.delete(key);
-    throw error;
-  });
-  imageDataCache.set(key, request);
-  while (imageDataCache.size > IMAGE_DATA_CACHE_LIMIT) {
-    const oldest = imageDataCache.keys().next().value as string | undefined;
-    if (!oldest) break;
-    imageDataCache.delete(oldest);
-  }
-  return request;
+/** The chip's picture: the host's thumbnail, high-priority data in the shared pool. */
+function thumbnailData(image: ImageAttachment): Promise<string> {
+  return pooledFetch(memoryPool, "imageThumbnail", imageDataKey(image), () => imageAttachmentThumbnail(image.id));
+}
+
+/** The viewer's picture: the full image, low-priority data in the shared pool. */
+function fullImageData(image: ImageAttachment): Promise<string> {
+  return pooledFetch(memoryPool, "imageData", imageDataKey(image), () => imageAttachmentData(image.id));
 }
 
 function forgetImageData(image: ImageAttachment): void {
-  imageDataCache.delete(imageDataKey(image));
+  memoryPool.delete("imageThumbnail", imageDataKey(image));
+  memoryPool.delete("imageData", imageDataKey(image));
 }
 
 interface ImageViewerState {
@@ -103,6 +91,21 @@ function ImageViewer({
   }, [onClose, returnFocus]);
 
   const dimensions = image.width && image.height ? `${image.width} × ${image.height}` : "";
+  // The chip's thumbnail stands in until the full picture arrives.
+  const [full, setFull] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    setFull(null);
+    fullImageData(image).then(
+      (value) => {
+        if (active) setFull(value);
+      },
+      () => undefined
+    );
+    return () => {
+      active = false;
+    };
+  }, [image]);
 
   return createPortal(
     <div
@@ -123,7 +126,7 @@ function ImageViewer({
       >
         <img
           className="image-viewer__image"
-          src={source}
+          src={full ?? source}
           alt={t("{name} 原图", "Full image {name}", { name: image.name })}
         />
         <div className="image-viewer__caption">
@@ -169,7 +172,7 @@ function ImageThumbnail({
     setSource("");
     setFailed(false);
     setAnnouncement(null);
-    void imageData(image).then(
+    void thumbnailData(image).then(
       (value) => {
         if (!active) return;
         setSource(value);

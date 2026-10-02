@@ -410,6 +410,7 @@ export function ConversationTemplateEditor({
           onDeleteQuestion={editable
             ? (item: ToolContext, answer?: UserContext) => removeIds(answer ? [item.id, answer.id] : [item.id])
             : undefined}
+          onDeleteContexts={editable ? removeIds : undefined}
           onInsert={editable
             ? (index: number, kind: InsertableContextKind, toolName?: string) => setEditor({
               mode: "insert",

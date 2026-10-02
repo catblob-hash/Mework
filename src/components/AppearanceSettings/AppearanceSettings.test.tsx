@@ -69,6 +69,7 @@ function modelStatus({
     active,
     recommended,
     warming: false,
+    loading: false,
     device,
     loaded: false,
     running: 0,
@@ -96,7 +97,8 @@ function globalSettings(): GlobalSettings {
     appearance: defaultAppearancePreferences(),
     shortcuts: {},
     environmentTools: [],
-  executionEnvironments: { sshMachines: [], envVars: {} }
+  executionEnvironments: { sshMachines: [], envVars: {} },
+    autoCompact: { enabled: true, thresholdPercent: 80 }
   };
 }
 
@@ -321,7 +323,7 @@ describe("AppearanceSettings", () => {
       localModelMocks.controller.remove.mockClear();
       localModelMocks.controller.promptInfo.mockReset();
       localModelMocks.controller.defaultPrompts.mockReset();
-      localModelMocks.controller.defaultPrompts.mockResolvedValue({ title: "Default title prompt", shell: "Default shell prompt" });
+      localModelMocks.controller.defaultPrompts.mockResolvedValue({ title: "Default title prompt", shell: "Default shell prompt", error: "Default error prompt" });
     });
 
     it("asks which build to download when a use is turned on without a model", async () => {
@@ -401,6 +403,15 @@ describe("AppearanceSettings", () => {
       expect(localModelMocks.controller.install).toHaveBeenCalledWith("mlx", false);
     });
 
+    it("reaches subagents without asking for a download, since it turns no use on by itself", async () => {
+      localModelMocks.setStatus(modelStatus());
+      const user = userEvent.setup();
+      const { getSettings } = renderSettings();
+      await user.click(screen.getByRole("switch", { name: "Also for subagents" }));
+      expect(screen.queryByRole("dialog", { name: "Download the local model?" })).not.toBeInTheDocument();
+      expect(getSettings().appearance.localModel.subagents).toBe(true);
+    });
+
     it("leaves the use off when the download is declined", async () => {
       localModelMocks.setStatus(modelStatus());
       const user = userEvent.setup();
@@ -422,6 +433,10 @@ describe("AppearanceSettings", () => {
       await user.click(screen.getByRole("switch", { name: "Explain shell commands" }));
       expect(screen.queryByRole("dialog", { name: "Download the local model?" })).not.toBeInTheDocument();
       expect(getSettings().appearance.localModel.shellExplanations).toBe(true);
+      await user.click(screen.getByRole("switch", { name: "Explain errors" }));
+      expect(getSettings().appearance.localModel.errorExplanations).toBe(true);
+      await user.click(screen.getByRole("switch", { name: "Also for subagents" }));
+      expect(getSettings().appearance.localModel.subagents).toBe(true);
     });
 
     it("switches between installed builds and removes one", async () => {
@@ -451,13 +466,48 @@ describe("AppearanceSettings", () => {
       await waitFor(() => expect(titlePrompt).toHaveValue("Default title prompt"));
       expect(
         await screen.findAllByText("231 tokens · KV cache 12.4 MB (limit 737 tokens)", {}, { timeout: 3000 })
-      ).toHaveLength(2);
-      expect(localModelMocks.controller.promptInfo).toHaveBeenCalledWith("title", "Default title prompt");
+      ).toHaveLength(3);
+      // Opening the dialog only reads caches already on disk.
+      expect(localModelMocks.controller.promptInfo).toHaveBeenCalledWith("title", "Default title prompt", false);
+      expect(localModelMocks.controller.promptInfo).toHaveBeenCalledWith("error", "Default error prompt", false);
 
       fireEvent.change(titlePrompt, { target: { value: "Name it." } });
       expect(getSettings().appearance.localModel.titlePrompt).toBe("Name it.");
       fireEvent.change(titlePrompt, { target: { value: "Default title prompt" } });
       expect(getSettings().appearance.localModel.titlePrompt).toBe("");
+    });
+
+    it("builds a prompt's KV cache only once the prompt is edited", async () => {
+      localModelMocks.setStatus(modelStatus({ ane: { phase: "ready" }, active: "ane" }));
+      localModelMocks.controller.promptInfo.mockImplementation(async (_task: string, prompt: string, build: boolean) =>
+        build ? { tokens: prompt.length, cacheBytes: 2_000_000, maxTokens: 737 } : { tokens: 231, cacheBytes: null, maxTokens: 737 }
+      );
+      renderSettings();
+      fireEvent.click(screen.getByRole("button", { name: "Manage…" }));
+      const titlePrompt = await screen.findByRole("textbox", { name: "Prompt for conversation titles" });
+      await waitFor(() => expect(titlePrompt).toHaveValue("Default title prompt"));
+      expect(
+        await screen.findAllByText(
+          "231 tokens (limit 737 tokens) · the KV cache is built the next time the model uses this prompt",
+          {},
+          { timeout: 3000 }
+        )
+      ).toHaveLength(3);
+      expect(localModelMocks.controller.promptInfo).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), true);
+
+      fireEvent.change(titlePrompt, { target: { value: "Name it." } });
+      expect(await screen.findByText("8 tokens · KV cache 1.9 MB (limit 737 tokens)", {}, { timeout: 3000 })).toBeInTheDocument();
+      expect(localModelMocks.controller.promptInfo).toHaveBeenCalledWith("title", "Name it.", true);
+    });
+
+    it("says when the model in use is loading", async () => {
+      localModelMocks.setStatus({ ...modelStatus({ ane: { phase: "ready" }, active: "ane" }), loading: true });
+      renderSettings();
+      expect(
+        await screen.findByText(
+          "Neural Engine build (Core ML) · Loading (compiled for this Mac first when the system has no compiled copy, about two minutes)…"
+        )
+      ).toBeInTheDocument();
     });
   });
 });

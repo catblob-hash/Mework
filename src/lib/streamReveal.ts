@@ -21,7 +21,7 @@ import { MODEL_STREAM_COMMIT_INTERVAL_MS } from "./modelStream";
  * One sweep lasts one commit, so each commit's text finishes arriving just as
  * the next begins and the stream moves continuously.
  */
-export const STREAM_REVEAL_MS = MODEL_STREAM_COMMIT_INTERVAL_MS;
+const STREAM_REVEAL_MS = MODEL_STREAM_COMMIT_INTERVAL_MS;
 
 export interface StreamRevealSplit {
   /** The text the split was taken against. */

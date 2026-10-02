@@ -6,17 +6,23 @@
   display: flex; flex-direction: column; overflow: hidden;
   background: var(--color-e8e7e8); color: var(--color-272227);
 }
+/* The command sits on a card whose bottom corners round off into the output below it. Controls
+   keep to the top line, so a command that wraps grows downwards without moving them. */
 .shell-task-panel__header {
   min-height: 34px; flex: 0 0 auto; padding: 6px 10px 6px 13px;
-  display: flex; align-items: center; gap: 9px;
-  border-bottom: 1px solid var(--color-cfccd0); background: var(--color-dfdddf);
+  display: flex; align-items: flex-start; gap: 9px;
+  border-bottom: 1px solid var(--color-cfccd0); border-radius: 0 0 10px 10px;
+  background: var(--color-dfdddf);
 }
+/* The whole command, wrapped, up to six lines; a longer one scrolls in place. The 5px above and
+   below put a one-line command on the controls' centre line. */
 .shell-task-panel__command {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--color-342e34); font: 10px var(--mono);
+  flex: 1; min-width: 0; max-height: 100px; padding: 5px 0;
+  overflow-y: scroll; white-space: pre-wrap; overflow-wrap: anywhere;
+  color: var(--color-342e34); font: 10px/15px var(--mono);
 }
 .shell-task-panel__status {
-  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  flex: 0 0 auto; height: 25px; display: inline-flex; align-items: center; gap: 5px;
   white-space: nowrap; color: var(--color-776f77); font-size: 9px;
 }
 /* Semantic aliases, not raw palette tokens: `--accent` and `--danger` are what every other
@@ -47,6 +53,9 @@
 .shell-task-panel__error { color: var(--danger); }
 
 .shell-task-panel__viewport {
-  flex: 1; min-height: 0; padding: 7px 10px 5px; overflow: hidden; background: var(--color-e8e7e8);
+  flex: 1; min-height: 0; overflow: hidden; background: var(--color-e8e7e8);
 }
-.shell-task-panel__viewport .xterm { height: 100%; }
+/* The ground under the last whole row, as in `terminal.css`; xterm's own viewport layer under the
+   grid is black and would show there instead. */
+.shell-task-panel__viewport .xterm { height: 100%; background: var(--color-e8e7e8); }
+.shell-task-panel__viewport .xterm .xterm-viewport { background: transparent; }

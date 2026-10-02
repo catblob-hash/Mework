@@ -10,18 +10,19 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    ContextItem, Conversation, ConversationBranch, ConversationForkOrigin, ConversationSettings,
-    ConversationWorktree, FileAttachment, ImageAttachment, QueuedMessage, RunTarget,
+    ContextItem, Conversation, ConversationBranch, ConversationForkOrigin,
+    ConversationHandoffOrigin, ConversationSettings, ConversationWorktree, FileAttachment, ImageAttachment, QueuedMessage, RunTarget,
     UserAbortedTaskRecord,
 };
 use crate::model::AttachedWorkspace;
+use crate::memory_pool::{MemoryPool, PoolKey, PoolKind};
 
 /// Database file name, stored beside the anchor file.
 pub const DATABASE_FILE_NAME: &str = "conversations.v1.sqlite3";
@@ -36,10 +37,10 @@ pub const DATABASE_FILE_NAME: &str = "conversations.v1.sqlite3";
 /// open. A stamp is not evidence: a store carrying this number can still be missing
 /// a column, because a build whose upgrade steps differed, an upgrade that died
 /// between two `ALTER`s, and a hand-edited database all leave the number claiming
-/// more than the schema delivers. Trusting it is what let a `wire_request` without
-/// `owner` sit behind a current stamp and fail every ledger read and write for the
-/// remaining life of the store.
-pub const STORE_VERSION: i32 = 17;
+/// more than the schema delivers. Trusting it is what once let a request ledger
+/// without its `owner` column sit behind a current stamp and fail every read and
+/// write of it for the remaining life of the store.
+pub const STORE_VERSION: i32 = 19;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,11 +55,18 @@ const FORK_START_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pending_fork_start (
     prompt_context_id TEXT NOT NULL
 ) STRICT;";
 
-/// One-line descriptions of shell commands written by the local helper model,
-/// one per tool card. Kept beside the card rather than in it: the card's
-/// payload is attested, and a description arriving after the card was saved
-/// must not touch it.
+/// What the local helper model wrote about tool cards, one line per card and
+/// kind: `tool_explanation` describes a shell command (or titles a subagent),
+/// `tool_error_explanation` says why a failed call failed. A failed command
+/// has both. Kept beside the card rather than in it: the card's payload is
+/// attested, and a line arriving after the card was saved must not touch it.
 const TOOL_EXPLANATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tool_explanation (
+    conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+    context_id      TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, context_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS tool_error_explanation (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     context_id      TEXT NOT NULL,
     text            TEXT NOT NULL,
@@ -92,50 +100,6 @@ const FORK_DECISION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS fork_decision (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS fork_decision_source_idx ON fork_decision (source_conversation_id, decided_at);";
 
-/// Append-only history of the trunk timeline, kept as a delta chain rather than a
-/// copy of the prefix per event: a snapshot per backend request would grow with the
-/// square of the conversation, while the changes themselves grow with it linearly.
-///
-/// `timeline_head` materializes the trunk as of the newest event so a recording only
-/// has to diff against one table instead of replaying the whole chain. It holds each
-/// row's body verbatim instead of a hash: a digest would have to stay stable across
-/// toolchain versions to avoid inventing a replacement for every row at once.
-const TIMELINE_HISTORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS timeline_event (
-    conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
-    seq             INTEGER NOT NULL,
-    kind            TEXT NOT NULL CHECK (kind IN ('baseline', 'run', 'edit')),
-    -- The backend request this settled, for 'run' events only.
-    request_id      TEXT,
-    inserted        INTEGER NOT NULL,
-    removed         INTEGER NOT NULL,
-    replaced        INTEGER NOT NULL,
-    -- Trunk length once this event applied, so the list reads without a replay.
-    row_count       INTEGER NOT NULL,
-    created_at      TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, seq)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS timeline_op (
-    conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
-    seq             INTEGER NOT NULL,
-    ordinal         INTEGER NOT NULL,
-    op              TEXT NOT NULL CHECK (op IN ('remove', 'insert', 'replace')),
-    context_id      TEXT NOT NULL,
-    -- Final index of an 'insert'; NULL otherwise.
-    position        INTEGER,
-    -- Row body for 'insert' and 'replace'; NULL for 'remove'.
-    data            TEXT,
-    PRIMARY KEY (conversation_id, seq, ordinal)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS timeline_head (
-    conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
-    position        INTEGER NOT NULL,
-    context_id      TEXT NOT NULL,
-    data            TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, position)
-) STRICT;";
-
 /// Saved message queues, reusable as the opening history of a conversation or a
 /// subagent role. Templates are global rather than conversation-scoped, so
 /// neither table references `conversation` — deleting the conversation a
@@ -165,69 +129,69 @@ CREATE TABLE IF NOT EXISTS template_context (
 
 CREATE INDEX IF NOT EXISTS template_context_order_idx ON template_context (template_id, order_key);";
 
-/// Forensic ledger of what actually left this process, one `wire_request` row per
-/// request that went on the wire, with the request's own parts named in wire order.
+/// The conversation's history: one ordered, append-only record of everything the
+/// host saw happen to it — every request it put on the wire, every response that
+/// came back, every hook decision, every tool call as it actually ran and what it
+/// returned, and every change to the trunk timeline, whether the user made it or a
+/// run settled it. See `crate::history` for what each kind means and when it is
+/// written.
 ///
-/// Bodies are content-addressed instead of being stored beside the request that
-/// sent them because every round of a turn re-sends the entire history: keeping
-/// each request's message list verbatim would grow with the square of the
-/// conversation, while hashing a body once and naming it from each request that
-/// carried it grows with it linearly. A message that survives twenty rounds costs
-/// one `wire_blob` row and twenty names.
+/// One `seq` per conversation across every kind and every owner, because the
+/// questions the record is read for are about order: whether anything followed an
+/// agent's last reply, which input a call ran with after the hooks had spoken,
+/// what the user changed between two requests. Children — subagents, workflow
+/// steps — run under their parent's conversation id and are told apart by
+/// `owner`; the trunk's own entries have none.
 ///
-/// The address is a hash within one conversation rather than a global one: the
-/// ledger is capped and pruned per conversation, and a body shared across
-/// conversations would have to be reference counted across all of them before
-/// anything could be dropped. `truncated` lives with the body and not with the
-/// part because it describes what was stored, which is what the hash covers.
+/// Bodies are content-addressed in `history_blob`: every round re-sends the whole
+/// history, so keeping each request's messages verbatim would grow with the square
+/// of the conversation, while hashing a body once and naming it from each entry
+/// that carried it grows with it linearly. The address is a hash within one
+/// conversation, so a body dies with its conversation (`ON DELETE CASCADE`) without
+/// any reference counting across conversations.
 ///
-/// A conversation holds one ledger per agent plus the trunk's, separated by
-/// `owner` — the child's name — and sharing one `seq` space, because children
-/// run under their parent's conversation id and nothing else would keep their
-/// traffic apart. Bodies are shared across all of them, which is what a child's
-/// replayed system prompt and tool surface cost: one row, however many agents
-/// carried them.
-const WIRE_LEDGER_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS wire_request (
+/// Nothing here is pruned. The record is the host's evidence of what happened —
+/// the timeline is the user's to edit, the record is not — and recovery checks
+/// deliveries, approvals and final replies against it, so a retention window would
+/// erase exactly what it is read for.
+///
+/// - `history_part` names, in wire order, the parts a `request` carried.
+/// - `history_op` is the delta an `edit` or `run` applied to the trunk, kept as a
+///   chain rather than a snapshot per entry for the same reason bodies are
+///   addressed: snapshots grow with the square of the conversation.
+/// - `history_head` materializes the trunk as of the newest trunk entry, so a new
+///   one only has to diff against one table instead of replaying the whole chain.
+///   It holds each row's body verbatim instead of a hash: a digest would have to
+///   stay stable across toolchain versions to avoid inventing a replacement for
+///   every row at once.
+const HISTORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS history_entry (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
-    kind            TEXT NOT NULL CHECK (kind IN ('model', 'search', 'fetch')),
-    -- The run this request belonged to; empty for host-minted one-shots.
-    request_id      TEXT NOT NULL,
-    round           INTEGER NOT NULL,
-    attempt         INTEGER NOT NULL,
-    provider_name   TEXT NOT NULL,
-    family          TEXT NOT NULL,
-    model_id        TEXT NOT NULL,
-    -- Redacted StepRequest with the large, separately-stored fields removed.
-    envelope        TEXT NOT NULL,
-    part_count      INTEGER NOT NULL,
-    bytes           INTEGER NOT NULL,
-    -- Provider-reported usage for the response this request got back. NULL
-    -- until the response lands, and NULL forever on a request the transport
-    -- lost: a request that got no answer has no usage, and a zero would be a
-    -- number the record cannot support.
-    input_tokens         INTEGER,
-    cached_input_tokens  INTEGER,
-    output_tokens        INTEGER,
-    -- Messages the user added and removed between the request before this one
-    -- and this one, counted against the predecessor's own parts when the row
-    -- was written. NULL on rows written before the ledger counted them.
-    messages_added       INTEGER,
-    messages_removed     INTEGER,
-    -- Name of the child agent that issued this request, and NULL for the
-    -- conversation's own trunk. A child shares its parent's conversation id, so
-    -- without this column a subagent's traffic would be filed as the session's
-    -- own; with it, one conversation holds one ledger per agent plus the
-    -- trunk's, each read on its own. The name and not the call id: a name is
-    -- reserved for the whole conversation and is what every later message
-    -- addresses the child by, while the provider's call id never reaches the
-    -- timeline the renderer matches against.
-    owner                TEXT,
+    kind            TEXT NOT NULL CHECK (kind IN ('request', 'response', 'hook', 'tool', 'result', 'edit', 'run')),
+    -- NULL for the conversation's own trunk; the child's address otherwise: an
+    -- agent's name, or a workflow step's `<run>/ws<N>`.
+    owner           TEXT,
+    -- The run this entry belongs to; NULL for an edit.
+    request_id      TEXT,
+    round           INTEGER,
+    -- The provider call id a tool entry, a result or a tool hook is about.
+    call_id         TEXT,
+    -- The request a response answers; NULL when that request was never written.
+    answers         INTEGER,
+    -- Small, kind-specific metadata as a JSON object.
+    detail          TEXT NOT NULL DEFAULT '{}',
+    -- The entry's body in `history_blob`: a request's envelope, a response's
+    -- message, a hook's decision, a call's input, a result's output. NULL for a
+    -- trunk change, whose bodies are its ops'.
+    hash            TEXT,
     PRIMARY KEY (conversation_id, seq)
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS wire_blob (
+CREATE INDEX IF NOT EXISTS history_entry_owner_idx ON history_entry (conversation_id, owner, kind, seq);
+CREATE INDEX IF NOT EXISTS history_entry_call_idx ON history_entry (conversation_id, call_id);
+
+CREATE TABLE IF NOT EXISTS history_blob (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     hash            TEXT NOT NULL,
     body            TEXT NOT NULL,
@@ -235,7 +199,7 @@ CREATE TABLE IF NOT EXISTS wire_blob (
     PRIMARY KEY (conversation_id, hash)
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS wire_request_part (
+CREATE TABLE IF NOT EXISTS history_part (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL,
     ordinal         INTEGER NOT NULL,
@@ -246,92 +210,137 @@ CREATE TABLE IF NOT EXISTS wire_request_part (
     -- without reading a single body back.
     role            TEXT,
     PRIMARY KEY (conversation_id, seq, ordinal)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS history_op (
+    conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    op              TEXT NOT NULL CHECK (op IN ('remove', 'insert', 'replace')),
+    context_id      TEXT NOT NULL,
+    -- Final index of an 'insert'; NULL otherwise.
+    position        INTEGER,
+    -- Row body for 'insert' and 'replace', in `history_blob`; NULL for 'remove'.
+    hash            TEXT,
+    PRIMARY KEY (conversation_id, seq, ordinal)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS history_op_context_idx ON history_op (conversation_id, context_id, seq);
+
+CREATE TABLE IF NOT EXISTS history_head (
+    conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,
+    context_id      TEXT NOT NULL,
+    data            TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, position)
 ) STRICT;";
 
-/// Largest body the ledger stores. One message can carry an entire file, and the
-/// ledger is an audit trail rather than a second copy of the workspace: past this
-/// the marker stands in for what was sent.
-const WIRE_BLOB_MAX_BYTES: usize = 256 * 1024;
+/// Tables the history replaced. A store that still has any of them is migrated
+/// into the history on open and then loses them; see [`migrate_legacy_history`].
+const LEGACY_HISTORY_TABLES: [&str; 7] = [
+    "wire_request",
+    "wire_request_part",
+    "wire_blob",
+    "wire_response",
+    "timeline_event",
+    "timeline_op",
+    "timeline_head",
+];
+
+/// Columns older builds added to the legacy tables after they shipped. The
+/// migration reads them, so a legacy table from before one of them is brought up
+/// to shape first — only when the table is still there.
+const LEGACY_COLUMNS: &[(&str, &str, &str)] = &[
+    ("wire_request", "input_tokens", "INTEGER"),
+    ("wire_request", "cached_input_tokens", "INTEGER"),
+    ("wire_request", "output_tokens", "INTEGER"),
+    ("wire_request", "messages_added", "INTEGER"),
+    ("wire_request", "messages_removed", "INTEGER"),
+    ("wire_request", "owner", "TEXT"),
+    ("wire_request_part", "role", "TEXT"),
+];
+
+/// Largest body a request part, a tool result or a trunk row is stored whole at.
+/// One message can carry an entire file, and the record is an account of what
+/// happened rather than a second copy of the workspace: past this the marker
+/// stands in for the rest.
+pub(crate) const HISTORY_PART_MAX_BYTES: usize = 256 * 1024;
+
+/// Largest body an evidence entry is stored whole at: a response, a hook
+/// decision, a call's input, a request's envelope. These are bounded by the
+/// model's output rather than by what the workspace holds, and they are read back
+/// as evidence — a `workflow` call carries a script of up to
+/// `workflow_core::MAX_SCRIPT_BYTES`, whose digest is what a resume is checked
+/// against — so the part cap would cut exactly the bodies recovery reads.
+pub(crate) const HISTORY_EVIDENCE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Appended to a body in place of the bytes the cap dropped. It is part of the
 /// stored body, so the hash covers it too: what reads back is what was hashed.
-const WIRE_BLOB_TRUNCATION_MARKER: &str = "…（请求账本正文已截断）";
+const HISTORY_TRUNCATION_MARKER: &str = "…（历史记录正文已截断）";
 
-/// How many requests one ledger keeps. The ledger answers what the recent turns
-/// put on the wire, so it is bounded and pruned on write rather than growing for
-/// the lifetime of the conversation.
-///
-/// The cap is per ledger — the trunk's and each agent's separately — because a
-/// shared one would let a chatty child evict the session's own history, and the
-/// trunk ledger is the one a reader opens by default.
-const WIRE_LEDGER_MAX_REQUESTS: i64 = 300;
-
-/// Ceiling across every ledger of one conversation. The per-ledger cap bounds
-/// each agent, but a conversation may spawn agents without limit; this bounds
-/// their sum so a long session cannot grow the store without end.
-const WIRE_LEDGER_MAX_ROWS: i64 = 3_000;
-
-/// Provider-reported usage for one recorded request. Every field is optional:
-/// providers disclose different subsets, and an absent counter must read as
-/// absent rather than as zero.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+/// Provider-reported usage for one response. Every field is optional: providers
+/// disclose different subsets, and an absent counter must read as absent rather
+/// than as zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WireUsage {
-    #[serde(skip_serializing_if = "Option::is_none")]
+pub struct HistoryUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<i64>,
 }
 
-impl WireUsage {
-    /// True when the provider disclosed nothing at all, which is the case the
-    /// recorder drops instead of writing a row of NULLs over a row that may
-    /// already hold numbers.
+impl HistoryUsage {
+    /// True when the provider disclosed nothing at all.
     pub fn is_empty(&self) -> bool {
         self.input_tokens.is_none()
             && self.cached_input_tokens.is_none()
             && self.output_tokens.is_none()
     }
+
+    /// The usage a `detail` object carries under `usage`, when it carries any.
+    fn from_detail(detail: &serde_json::Value) -> Option<Self> {
+        let usage = serde_json::from_value::<Self>(detail.get("usage")?.clone()).ok()?;
+        (!usage.is_empty()).then_some(usage)
+    }
 }
 
-/// One recorded request without its bodies: what the ledger list draws a row from.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// One entry without its body: what the history pane lists.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WireRequestSummary {
+pub struct HistoryEntry {
     pub seq: i64,
     pub created_at: String,
+    /// `request`, `response`, `hook`, `tool`, `result`, `edit` or `run`.
     pub kind: String,
-    pub request_id: String,
-    pub round: i64,
-    pub attempt: i64,
-    pub provider_name: String,
-    pub family: String,
-    pub model_id: String,
-    pub part_count: i64,
-    pub bytes: i64,
-    /// Absent while the response has not landed, and absent forever on a
-    /// request that never got one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<WireUsage>,
-    /// Messages the user wrote between the previous request and this one.
-    /// Absent on rows written before the ledger counted them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages_added: Option<i64>,
-    /// Messages that vanished from the history over the same interval.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages_removed: Option<i64>,
-    /// Name of the child agent that issued this request, absent on the
-    /// conversation's own trunk. What the renderer matches an agent's ledger by.
+    /// The child agent this entry belongs to; absent on the trunk's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// For a response: the request it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answers: Option<i64>,
+    /// Kind-specific metadata, as recorded.
+    pub detail: serde_json::Value,
+    /// What the provider reported. On a response it is its own; on a request it is
+    /// the usage of the response that answered it, so the pane can put the cost on
+    /// the send that incurred it. Absent where nothing came back or nothing was
+    /// disclosed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<HistoryUsage>,
 }
 
 /// One part of a recorded request, resolved through its hash to the stored body.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WireRequestPart {
+pub struct HistoryPart {
     pub ordinal: i64,
     pub kind: String,
     pub hash: String,
@@ -342,19 +351,89 @@ pub struct WireRequestPart {
     pub truncated: bool,
 }
 
-/// One recorded request in full, as the detail view reads it.
+/// One step of a trunk change, with the row as it read before and after.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryOp {
+    pub ordinal: i64,
+    /// `insert`, `remove` or `replace`.
+    pub op: String,
+    pub context_id: String,
+    /// Final index of an insert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<i64>,
+    /// The row after this change; absent on a removal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// The row as the record last had it before this change; absent on a first
+    /// insert, and on a row the record never saw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+}
+
+/// One entry in full, as the pane reads it when a row opens.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WireRequestDetail {
-    pub summary: WireRequestSummary,
-    /// Redacted StepRequest without messages/system/systemDynamic/tools.
-    pub envelope: serde_json::Value,
-    pub parts: Vec<WireRequestPart>,
+pub struct HistoryEntryDetail {
+    pub entry: HistoryEntry,
+    /// JSON text of the entry's body: a request's redacted envelope, a response's
+    /// message, a hook's decision, a call's input, a result's output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub truncated: bool,
+    /// The parts a request carried, in wire order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<HistoryPart>,
+    /// The steps a trunk change applied, in replay order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ops: Vec<HistoryOp>,
+}
+
+/// One entry read back as evidence: its identity, its metadata and its body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryRecord {
+    pub seq: i64,
+    pub kind: String,
+    pub request_id: Option<String>,
+    pub round: Option<i64>,
+    pub call_id: Option<String>,
+    pub answers: Option<i64>,
+    pub detail: serde_json::Value,
+    pub body: Option<String>,
+    /// The body was cut at the size cap and no longer parses.
+    pub truncated: bool,
+}
+
+impl HistoryRecord {
+    /// A string field of `detail`.
+    pub fn detail_str(&self, key: &str) -> Option<&str> {
+        self.detail.get(key).and_then(serde_json::Value::as_str)
+    }
+
+    /// A boolean field of `detail`, false when absent.
+    pub fn detail_flag(&self, key: &str) -> bool {
+        self.detail
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+/// Which entries an evidence read wants. `owner` picks whose (`None` is the
+/// conversation's own trunk), `kinds` which kinds (empty is every kind), `call_id`
+/// the call they are about, and `needle` keeps only bodies containing that literal
+/// text.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HistoryFilter<'a> {
+    pub owner: Option<&'a str>,
+    pub kinds: &'a [&'a str],
+    pub call_id: Option<&'a str>,
+    pub needle: &'a str,
 }
 
 /// One part as the recorder hands it over.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WireRecordedPart {
+pub struct HistoryPartRecord {
     pub kind: String,
     /// Wire role of a message part; `None` for the prompt and tool-spec parts.
     pub role: Option<String>,
@@ -368,12 +447,11 @@ pub struct WireRecordedPart {
 /// One outgoing request as the recorder hands it over. Hashing, dedupe and
 /// truncation are the store's business, so the recorder passes bodies verbatim.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WireRequestRecord {
+pub struct HistoryRequestRecord {
     pub conversation_id: String,
-    /// The child agent this request ran as, or `None` for the main session. A
-    /// child shares the parent's conversation id, so this is the only thing
-    /// that keeps its traffic out of the session's own ledger.
+    /// The child agent this request ran as, or `None` for the main session.
     pub owner: Option<String>,
+    /// `model`, `search` or `fetch`.
     pub kind: String,
     pub request_id: String,
     pub round: i64,
@@ -384,7 +462,24 @@ pub struct WireRequestRecord {
     /// Already-redacted envelope, serialised.
     pub envelope: String,
     /// Parts in wire order.
-    pub parts: Vec<WireRecordedPart>,
+    pub parts: Vec<HistoryPartRecord>,
+}
+
+/// Any other entry as the recorder hands it over: a response, a hook decision, a
+/// call, a result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryEntryRecord {
+    pub conversation_id: String,
+    pub kind: &'static str,
+    pub owner: Option<String>,
+    pub request_id: Option<String>,
+    pub round: Option<i64>,
+    pub call_id: Option<String>,
+    pub answers: Option<i64>,
+    pub detail: serde_json::Value,
+    pub body: Option<String>,
+    /// Bytes of `body` stored whole; past this it is cut and marked.
+    pub body_cap: usize,
 }
 
 /// Lifecycle status for one context row.
@@ -408,14 +503,17 @@ impl ContextStatus {
 /// Default gap between ordering keys. Insertions use the midpoint; exhausted precision reindexes the segment.
 const ORDER_STEP: f64 = 1.0;
 
-/// One recorded moment in a conversation's trunk history, as the tests read it back.
+/// One recorded change to the trunk, as the tests read it back.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TimelineEvent {
+pub struct TrunkChangeSummary {
     pub seq: i64,
-    /// `baseline` for the entry a conversation's history starts from, `run` for a
-    /// settled backend request, `edit` for a change the renderer committed.
+    /// `edit` or `run`.
     pub kind: String,
+    /// `baseline` for the change a conversation's record starts from, `message`
+    /// for an edit that only appended what the user typed, `edit` for any other
+    /// edit, `run` for a settled run.
+    pub source: String,
     pub request_id: Option<String>,
     pub inserted: i64,
     pub removed: i64,
@@ -424,22 +522,15 @@ pub struct TimelineEvent {
     pub created_at: String,
 }
 
-/// Why a history entry is being recorded. The first entry of a conversation is
-/// always stored as `baseline` whatever the caller's reason: replay starts from an
-/// empty trunk, so the rows that already existed have to enter the chain somewhere.
+/// Who changed the trunk. The first change a conversation records is always a
+/// `baseline` edit whatever the caller's reason: replay starts from an empty trunk,
+/// so the rows that already existed have to enter the chain somewhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimelineEventKind {
+pub enum TrunkChange {
+    /// A run settled.
     Run,
+    /// The renderer committed a change — the user's.
     Edit,
-}
-
-impl TimelineEventKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Run => "run",
-            Self::Edit => "edit",
-        }
-    }
 }
 
 /// One trunk row as history sees it: an identity and a body, without the ordering
@@ -522,7 +613,10 @@ CREATE TABLE IF NOT EXISTS conversation (
     title_settled INTEGER NOT NULL DEFAULT 0,
     -- JSON `{conversationId, number}` naming the conversation a timeline fork
     -- was taken from; NULL = not a fork. A trace like preset_id: may dangle.
-    fork_of TEXT
+    fork_of TEXT,
+    -- JSON `{conversationId, number}` naming the conversation an auto-compact
+    -- continuation carries on; NULL = not one. A trace like fork_of: may dangle.
+    handoff_of TEXT
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS conversation_workspace_order_idx ON conversation (workspace_id, order_key);
@@ -583,14 +677,13 @@ CREATE TABLE IF NOT EXISTS aborted_task (
 /// Every creation statement the store is built from, in the order a fresh store
 /// runs them. Repair walks the same list, so "what a new store gets" and "what an
 /// old store is brought up to" cannot drift apart.
-const SCHEMAS: [&str; 8] = [
+const SCHEMAS: [&str; 7] = [
     SCHEMA_SQL,
     FORK_START_SCHEMA,
     PLAN_SCHEMA,
     FORK_DECISION_SCHEMA,
-    TIMELINE_HISTORY_SCHEMA,
     TEMPLATE_SCHEMA,
-    WIRE_LEDGER_SCHEMA,
+    HISTORY_SCHEMA,
     TOOL_EXPLANATION_SCHEMA,
 ];
 
@@ -618,13 +711,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // cannot clear it; only `set_title_settled` does.
     ("conversation", "title_settled", "INTEGER NOT NULL DEFAULT 0"),
     ("conversation", "fork_of", "TEXT"),
-    ("wire_request", "input_tokens", "INTEGER"),
-    ("wire_request", "cached_input_tokens", "INTEGER"),
-    ("wire_request", "output_tokens", "INTEGER"),
-    ("wire_request", "messages_added", "INTEGER"),
-    ("wire_request", "messages_removed", "INTEGER"),
-    ("wire_request", "owner", "TEXT"),
-    ("wire_request_part", "role", "TEXT"),
+    ("conversation", "handoff_of", "TEXT"),
     ("queued_message", "files", "TEXT NOT NULL DEFAULT '[]'"),
 ];
 
@@ -664,11 +751,130 @@ pub fn close_store_for(anchor: &Path) {
     if let Ok(mut registry) = registry().lock() {
         registry.remove(&path);
     }
+    BodyCache::for_file(&path).invalidate_all();
 }
 
 pub struct ConversationStore {
     conn: Mutex<Connection>,
+    bodies: BodyCache,
 }
+
+/// The read-through body cache behind [`ConversationStore::conversation`].
+///
+/// Bodies live in the shared [`MemoryPool`] as high-priority entries, so the
+/// pool may unload any of them; a read then falls back to the database and
+/// fills the pool again. Every write that can change a [`Conversation`] goes
+/// through this store and invalidates the body it touched once the write has
+/// committed, so a cached body is never older than the database.
+///
+/// Reads and writes race without a shared lock: a read notes the body's
+/// generation before reading the database and fills the pool only if no write
+/// has invalidated the body since. A read that loses the race still returns
+/// what it read — as a direct database read would — it just does not keep it.
+///
+/// Cache and generations belong to the database file, not to one store
+/// instance: every instance opened on the same file shares them, so a write
+/// through one invalidates what another cached. Opening a file, and closing it
+/// for a reset, drop whatever the pool held for it.
+struct BodyCache {
+    /// Prefix of this file's keys in the process-wide pool.
+    scope: String,
+    generations: Arc<Mutex<BodyGenerations>>,
+}
+
+#[derive(Default)]
+struct BodyGenerations {
+    /// Bumped by writes that can touch every conversation: startup recovery of
+    /// streaming rows, and the re-parenting done by deletion and reordering.
+    epoch: u64,
+    by_id: HashMap<String, u64>,
+}
+
+impl BodyGenerations {
+    fn of(&self, conversation_id: &str) -> (u64, u64) {
+        (
+            self.epoch,
+            self.by_id.get(conversation_id).copied().unwrap_or_default(),
+        )
+    }
+}
+
+impl BodyCache {
+    fn for_file(db_path: &Path) -> Self {
+        static FILES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<BodyGenerations>>>>> =
+            OnceLock::new();
+        let generations = FILES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(db_path.to_owned())
+            .or_default()
+            .clone();
+        Self {
+            scope: Self::scope_of(db_path),
+            generations,
+        }
+    }
+
+    fn scope_of(db_path: &Path) -> String {
+        // NUL cannot occur in a path, so no file's scope is a prefix of another's.
+        format!("{}\u{0}", db_path.display())
+    }
+
+    fn key(&self, conversation_id: &str) -> PoolKey {
+        PoolKey::new(
+            PoolKind::ConversationBody,
+            format!("{}{conversation_id}", self.scope),
+        )
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BodyGenerations> {
+        self.generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cached(&self, conversation_id: &str) -> Option<Arc<Conversation>> {
+        MemoryPool::global().get::<Conversation>(&self.key(conversation_id))
+    }
+
+    fn generation(&self, conversation_id: &str) -> (u64, u64) {
+        self.lock().of(conversation_id)
+    }
+
+    /// Keeps a body read at generation `seen`, unless a write has invalidated
+    /// it since.
+    fn fill(&self, conversation_id: &str, seen: (u64, u64), body: &Arc<Conversation>) {
+        let bytes = crate::memory_pool::serialized_bytes(body.as_ref());
+        let generations = self.lock();
+        if generations.of(conversation_id) == seen {
+            MemoryPool::global().insert(self.key(conversation_id), Arc::clone(body), bytes);
+        }
+    }
+
+    fn invalidate(&self, conversation_id: &str) {
+        let mut generations = self.lock();
+        *generations
+            .by_id
+            .entry(conversation_id.to_owned())
+            .or_default() += 1;
+        MemoryPool::global().remove(&self.key(conversation_id));
+    }
+
+    fn invalidate_all(&self) {
+        let mut generations = self.lock();
+        generations.epoch += 1;
+        self.forget_all();
+    }
+
+    fn forget_all(&self) {
+        let scope = self.scope.as_str();
+        MemoryPool::global().retain(|key| {
+            !(key.kind == PoolKind::ConversationBody && key.id.starts_with(scope))
+        });
+    }
+}
+
 
 impl ConversationStore {
     /// Opens the store, setting aside and rebuilding a database this build cannot
@@ -700,7 +906,11 @@ impl ConversationStore {
     fn connect(db_path: &Path) -> Result<Self, String> {
         let store = Self {
             conn: Mutex::new(open_configured(db_path)?),
+            bodies: BodyCache::for_file(db_path),
         };
+        // A file opened afresh may not be the one cached bodies came from (a
+        // reset deletes it; recovery replaces it).
+        store.bodies.invalidate_all();
         store.ensure_schema()?;
         Ok(store)
     }
@@ -786,6 +996,9 @@ impl ConversationStore {
             )
             .map_err(|error| format!("无法升级对话库结构：{error}"))?;
         }
+        // After every table exists: the migration writes into the history tables
+        // the pass above just made sure of.
+        migrate_legacy_history(&tx)?;
         if has_column(&tx, "fork_decision", "inherit_context")? {
             // `fork` lost its inherit-context option, so the recorded answer to it is
             // meaningless. Dropping the column in place keeps the rest of each
@@ -823,24 +1036,12 @@ impl ConversationStore {
 
     // ---------------------------------------------------------------- Read
 
-    /// Lists every conversation in a workspace in sidebar order.
+    /// Lists every conversation in a workspace in sidebar order, bodies and
+    /// all. Nothing in the app wants every body of a workspace at once; tests
+    /// read them back this way.
+    #[cfg(test)]
     pub fn workspace_conversations(&self, workspace_id: &str) -> Result<Vec<Conversation>, String> {
-        let ids = {
-            let conn = self.lock()?;
-            let mut statement = conn
-                .prepare(
-                    "SELECT id FROM conversation WHERE workspace_id = ?1 ORDER BY order_key, id",
-                )
-                .map_err(|error| format!("无法查询对话列表：{error}"))?;
-            let rows = statement
-                .query_map([workspace_id], |row| row.get::<_, String>(0))
-                .map_err(|error| format!("无法查询对话列表：{error}"))?;
-            let mut ids = Vec::new();
-            for row in rows {
-                ids.push(row.map_err(|error| format!("无法读取对话行：{error}"))?);
-            }
-            ids
-        };
+        let ids = self.workspace_conversation_ids(workspace_id)?;
         let mut conversations = Vec::with_capacity(ids.len());
         for id in ids {
             // A malformed row affects only its conversation, not the entire list.
@@ -851,6 +1052,25 @@ impl ConversationStore {
             }
         }
         Ok(conversations)
+    }
+
+    /// Ids of a workspace's conversations, in sidebar order.
+    pub(crate) fn workspace_conversation_ids(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare("SELECT id FROM conversation WHERE workspace_id = ?1 ORDER BY order_key, id")
+            .map_err(|error| format!("无法查询对话列表：{error}"))?;
+        let rows = statement
+            .query_map([workspace_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法查询对话列表：{error}"))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|error| format!("无法读取对话行：{error}"))?);
+        }
+        Ok(ids)
     }
 
     /// Maps every existing conversation to its workspace.
@@ -947,12 +1167,96 @@ impl ConversationStore {
         Ok(ordered)
     }
 
-    /// Assembles a complete conversation body, returning `None` when absent.
+    /// A complete conversation body, or `None` when absent: from memory when the
+    /// shared pool still holds it, otherwise from the database (which then fills
+    /// the pool). This is the one way the host reads a body; see [`BodyCache`].
     pub fn conversation(&self, conversation_id: &str) -> Result<Option<Conversation>, String> {
+        Ok(self
+            .conversation_shared(conversation_id)?
+            .map(|conversation| (*conversation).clone()))
+    }
+
+    /// [`Self::conversation`] without the copy, for readers that only look.
+    pub fn conversation_shared(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<Arc<Conversation>>, String> {
+        if let Some(cached) = self.bodies.cached(conversation_id) {
+            return Ok(Some(cached));
+        }
+        let seen = self.bodies.generation(conversation_id);
+        let Some(conversation) = self.conversation_from_disk(conversation_id)? else {
+            return Ok(None);
+        };
+        let conversation = Arc::new(conversation);
+        self.bodies.fill(conversation_id, seen, &conversation);
+        Ok(Some(conversation))
+    }
+
+    /// A conversation without its body — no contexts, no branches — with its
+    /// metadata, settings, queued messages and aborted tasks, always from the
+    /// database. What a document needs to list a conversation whose body is not
+    /// loaded (see `attachment_refs::strip_body` for why branches are body).
+    pub fn conversation_shell(&self, conversation_id: &str) -> Result<Option<Conversation>, String> {
+        self.read_conversation(conversation_id, false)
+    }
+
+    /// [`Self::conversation_shell`] for every conversation in a workspace, in
+    /// sidebar order.
+    pub fn workspace_conversation_shells(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<Conversation>, String> {
+        let mut shells = Vec::new();
+        for id in self.workspace_conversation_ids(workspace_id)? {
+            match self.conversation_shell(&id) {
+                Ok(Some(shell)) => shells.push(shell),
+                Ok(None) => {}
+                Err(error) => eprintln!("对话 {id} 的外壳无法装配，已跳过：{error}"),
+            }
+        }
+        Ok(shells)
+    }
+
+    /// Ids of the conversations that hold at least one context, on any branch.
+    pub fn conversations_with_contexts(&self) -> Result<HashSet<String>, String> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare("SELECT DISTINCT conversation_id FROM context")
+            .map_err(|error| format!("无法查询对话正文：{error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法查询对话正文：{error}"))?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("无法读取对话正文：{error}"))
+    }
+
+    /// Whether the shared pool holds this conversation's body now.
+    #[cfg(test)]
+    pub(crate) fn body_is_cached(&self, conversation_id: &str) -> bool {
+        MemoryPool::global().contains(&self.bodies.key(conversation_id))
+    }
+
+    /// Assembles a complete conversation body from the database, returning
+    /// `None` when absent, without going through the shared memory pool: for a
+    /// reader that uses a body once and drops it (the startup scan), where
+    /// filling the pool would keep every body it passed over.
+    pub(crate) fn conversation_from_disk(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<Conversation>, String> {
+        self.read_conversation(conversation_id, true)
+    }
+
+    fn read_conversation(
+        &self,
+        conversation_id: &str,
+        with_contexts: bool,
+    ) -> Result<Option<Conversation>, String> {
         let conn = self.lock()?;
         let shell = conn
             .query_row(
-                "SELECT title, created_at, updated_at, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories, attached_workspaces, fork_of FROM conversation WHERE id = ?1",
+                "SELECT title, created_at, updated_at, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories, attached_workspaces, fork_of, handoff_of FROM conversation WHERE id = ?1",
                 [conversation_id],
                 |row| {
                     Ok((
@@ -968,6 +1272,7 @@ impl ConversationStore {
                         row.get::<_, Option<String>>(9)?,
                         row.get::<_, Option<String>>(10)?,
                         row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
                     ))
                 },
             )
@@ -986,11 +1291,17 @@ impl ConversationStore {
             additional_directories_json,
             attached_workspaces_json,
             fork_of_json,
+            handoff_of_json,
         )) = shell
         else {
             return Ok(None);
         };
-        let settings: ConversationSettings = serde_json::from_str(&settings_json)
+        // Settings written while plan mode was a security level move it to the
+        // plan-mode setting on the way in.
+        let mut settings_value: serde_json::Value = serde_json::from_str(&settings_json)
+            .map_err(|error| format!("对话设置无法解析：{error}"))?;
+        crate::model::migrate_legacy_plan_level(&mut settings_value);
+        let settings: ConversationSettings = serde_json::from_value(settings_value)
             .map_err(|error| format!("对话设置无法解析：{error}"))?;
         // An unreadable worktree record falls back to the workspace root, which is the safe target.
         let worktrees = worktree_json
@@ -1018,11 +1329,19 @@ impl ConversationStore {
         let fork_of = fork_of_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<ConversationForkOrigin>(value).ok());
+        // Likewise: an unreadable one only restarts the next handoff's numbering.
+        let handoff_of = handoff_of_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<ConversationHandoffOrigin>(value).ok());
 
-        let contexts = read_contexts(&conn, conversation_id, None)?;
+        let contexts = if with_contexts {
+            read_contexts(&conn, conversation_id, None)?
+        } else {
+            Vec::new()
+        };
 
         let mut branches = Vec::new();
-        {
+        if with_contexts {
             let mut statement = conn
                 .prepare(
                     "SELECT id, fork_context_id, active, created_at, updated_at
@@ -1123,6 +1442,7 @@ impl ConversationStore {
             run_target,
             parent_conversation_id,
             fork_of,
+            handoff_of,
             preset_id: preset_id.unwrap_or_default(),
             template_id: template_id.unwrap_or_default(),
             attached_workspaces,
@@ -1349,36 +1669,51 @@ impl ConversationStore {
             .map_err(|error| format!("无法提交模板删除事务：{error}"))
     }
 
-    /// Every recorded change to the trunk timeline, oldest first. Test-only: it
-    /// reads back what the recorder wrote.
+    /// Every recorded change to the trunk, oldest first. Test-only: it reads back
+    /// what the recorder wrote.
     #[cfg(test)]
-    pub fn timeline_events(&self, conversation_id: &str) -> Result<Vec<TimelineEvent>, String> {
+    pub fn trunk_changes(&self, conversation_id: &str) -> Result<Vec<TrunkChangeSummary>, String> {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
-                "SELECT seq, kind, request_id, inserted, removed, replaced, row_count, created_at
-                 FROM timeline_event WHERE conversation_id = ?1 ORDER BY seq",
+                "SELECT seq, kind, request_id, detail, created_at FROM history_entry
+                 WHERE conversation_id = ?1 AND kind IN ('edit', 'run') ORDER BY seq",
             )
             .map_err(|error| format!("无法查询时间线历史：{error}"))?;
         let rows = statement
             .query_map([conversation_id], |row| {
-                Ok(TimelineEvent {
-                    seq: row.get(0)?,
-                    kind: row.get(1)?,
-                    request_id: row.get(2)?,
-                    inserted: row.get(3)?,
-                    removed: row.get(4)?,
-                    replaced: row.get(5)?,
-                    row_count: row.get(6)?,
-                    created_at: row.get(7)?,
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
             })
             .map_err(|error| format!("无法查询时间线历史：{error}"))?;
-        let mut events = Vec::new();
+        let mut changes = Vec::new();
         for row in rows {
-            events.push(row.map_err(|error| format!("无法读取时间线历史行：{error}"))?);
+            let (seq, kind, request_id, detail, created_at) =
+                row.map_err(|error| format!("无法读取时间线历史行：{error}"))?;
+            let detail = parse_detail(&detail);
+            let count = |key: &str| detail.get(key).and_then(serde_json::Value::as_i64).unwrap_or(0);
+            changes.push(TrunkChangeSummary {
+                seq,
+                kind,
+                source: detail
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                request_id,
+                inserted: count("inserted"),
+                removed: count("removed"),
+                replaced: count("replaced"),
+                row_count: count("rowCount"),
+                created_at,
+            });
         }
-        Ok(events)
+        Ok(changes)
     }
 
     /// The trunk as it stood once `seq` applied, rebuilt by folding the chain from
@@ -1386,7 +1721,7 @@ impl ConversationStore {
     /// failing the whole snapshot: one unreadable card must not hide the history
     /// around it. Test-only: it reads back what the recorder wrote.
     #[cfg(test)]
-    pub fn timeline_snapshot(
+    pub fn trunk_snapshot(
         &self,
         conversation_id: &str,
         seq: i64,
@@ -1394,8 +1729,11 @@ impl ConversationStore {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
-                "SELECT op, context_id, position, data FROM timeline_op
-                 WHERE conversation_id = ?1 AND seq <= ?2 ORDER BY seq, ordinal",
+                "SELECT op.op, op.context_id, op.position, stored.body
+                 FROM history_op op
+                 LEFT JOIN history_blob stored
+                   ON stored.conversation_id = op.conversation_id AND stored.hash = op.hash
+                 WHERE op.conversation_id = ?1 AND op.seq <= ?2 ORDER BY op.seq, op.ordinal",
             )
             .map_err(|error| format!("无法查询时间线快照：{error}"))?;
         let rows = statement
@@ -1434,32 +1772,35 @@ impl ConversationStore {
             .collect())
     }
 
-    /// Appends the trunk's current shape to its history. A recording that finds
-    /// nothing changed writes no event: a run that produced no lasting row and a
+    /// Appends the trunk's current shape to the history. A recording that finds
+    /// nothing changed writes no entry: a run that produced no lasting row and a
     /// debounced metadata commit both reach here, and neither is a moment in the
     /// timeline's history.
-    pub fn record_timeline_event(
+    pub fn record_trunk_change(
         &self,
         conversation_id: &str,
-        kind: TimelineEventKind,
+        change: TrunkChange,
         request_id: Option<&str>,
     ) -> Result<(), String> {
-        self.with_write_tx(|tx| record_timeline_event_tx(tx, conversation_id, kind, request_id))
+        self.with_write_tx(|tx| record_trunk_change_tx(tx, conversation_id, change, request_id))
     }
 
-    /// Every recorded request of one ledger, oldest first. The list is bounded by
-    /// retention, so it needs no limit of its own.
+    /// Every entry of one owner, oldest first, without bodies: what the history
+    /// pane lists. Nothing is ever pruned, so this is the whole record.
     ///
-    /// `owners` selects which ledger: `None` is the conversation's own trunk, and
-    /// a list of child-agent names is those agents'. Defaulting to the trunk
-    /// rather than to everything is deliberate: a pane that asked for the
-    /// session's requests must not silently start reporting its children's as
-    /// the session's own.
-    pub fn wire_requests(
+    /// `owners` picks whose: `None` is the conversation's own trunk — its requests
+    /// and responses, its hooks and calls, and every change to its timeline — and a
+    /// list of child addresses is those children's. Defaulting to the trunk rather
+    /// than to everything is deliberate: a pane that asked for the session's
+    /// history must not silently start reporting its children's as its own.
+    ///
+    /// A request carries the usage of the response that answered it, so the cost
+    /// sits on the send that incurred it.
+    pub fn history_entries(
         &self,
         conversation_id: &str,
         owners: Option<&[String]>,
-    ) -> Result<Vec<WireRequestSummary>, String> {
+    ) -> Result<Vec<HistoryEntry>, String> {
         // An agent nobody has addressed yet owns nothing, which is not the same
         // question as "the trunk" and must not be answered with the trunk's rows.
         if owners.is_some_and(<[String]>::is_empty) {
@@ -1478,160 +1819,342 @@ impl ConversationStore {
         };
         let mut statement = conn
             .prepare(&format!(
-                "SELECT seq, created_at, kind, request_id, round, attempt,
-                        provider_name, family, model_id, part_count, bytes,
-                        input_tokens, cached_input_tokens, output_tokens,
-                        messages_added, messages_removed, owner
-                 FROM wire_request WHERE conversation_id = ?1 AND {filter} ORDER BY seq"
+                "SELECT seq, created_at, kind, owner, request_id, round, call_id, answers, detail
+                 FROM history_entry WHERE conversation_id = ?1 AND {filter} ORDER BY seq"
             ))
-            .map_err(|error| format!("无法查询请求账本：{error}"))?;
+            .map_err(|error| format!("无法查询历史记录：{error}"))?;
         let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&conversation_id];
         for owner in owners.unwrap_or_default() {
             bound.push(owner);
         }
         let rows = statement
-            .query_map(bound.as_slice(), |row| {
-                Ok(WireRequestSummary {
-                    seq: row.get(0)?,
-                    created_at: row.get(1)?,
-                    kind: row.get(2)?,
-                    request_id: row.get(3)?,
-                    round: row.get(4)?,
-                    attempt: row.get(5)?,
-                    provider_name: row.get(6)?,
-                    family: row.get(7)?,
-                    model_id: row.get(8)?,
-                    part_count: row.get(9)?,
-                    bytes: row.get(10)?,
-                    usage: read_wire_usage(row, 11)?,
-                    messages_added: row.get(14)?,
-                    messages_removed: row.get(15)?,
-                    owner: row.get(16)?,
-                })
-            })
-            .map_err(|error| format!("无法查询请求账本：{error}"))?;
-        let mut requests = Vec::new();
+            .query_map(bound.as_slice(), read_history_entry)
+            .map_err(|error| format!("无法查询历史记录：{error}"))?;
+        let mut entries = Vec::new();
         for row in rows {
-            requests.push(row.map_err(|error| format!("无法读取请求账本行：{error}"))?);
+            entries.push(row.map_err(|error| format!("无法读取历史记录行：{error}"))?);
         }
-        Ok(requests)
+        let answered: HashMap<i64, HistoryUsage> = entries
+            .iter()
+            .filter(|entry| entry.kind == "response")
+            .filter_map(|entry| Some((entry.answers?, entry.usage?)))
+            .collect();
+        for entry in &mut entries {
+            if entry.kind == "request" {
+                // A request recorded before responses were, carries its own.
+                entry.usage = answered.get(&entry.seq).copied().or(entry.usage);
+            }
+        }
+        Ok(entries)
     }
 
-    /// One recorded request with its envelope and ordered parts. An envelope that
-    /// no longer parses reads as `null` instead of failing the whole request: the
-    /// parts beside it are still evidence, and one corrupt row must not hide them.
-    pub fn wire_request(
+    /// One entry with its body — and a request's parts, a trunk change's steps —
+    /// as the pane reads it when a row opens. A body that no longer parses reads as
+    /// text instead of failing the entry: the rest is still evidence, and one
+    /// corrupt row must not hide it.
+    pub fn history_entry(
         &self,
         conversation_id: &str,
         seq: i64,
-    ) -> Result<Option<WireRequestDetail>, String> {
+    ) -> Result<Option<HistoryEntryDetail>, String> {
         let conn = self.lock()?;
         let found = conn
             .query_row(
-                "SELECT seq, created_at, kind, request_id, round, attempt,
-                        provider_name, family, model_id, part_count, bytes, envelope,
-                        input_tokens, cached_input_tokens, output_tokens,
-                        messages_added, messages_removed, owner
-                 FROM wire_request WHERE conversation_id = ?1 AND seq = ?2",
+                "SELECT entry.seq, entry.created_at, entry.kind, entry.owner, entry.request_id,
+                        entry.round, entry.call_id, entry.answers, entry.detail,
+                        stored.body, stored.truncated
+                 FROM history_entry entry
+                 LEFT JOIN history_blob stored
+                   ON stored.conversation_id = entry.conversation_id AND stored.hash = entry.hash
+                 WHERE entry.conversation_id = ?1 AND entry.seq = ?2",
                 rusqlite::params![conversation_id, seq],
                 |row| {
                     Ok((
-                        WireRequestSummary {
-                            seq: row.get(0)?,
-                            created_at: row.get(1)?,
-                            kind: row.get(2)?,
-                            request_id: row.get(3)?,
-                            round: row.get(4)?,
-                            attempt: row.get(5)?,
-                            provider_name: row.get(6)?,
-                            family: row.get(7)?,
-                            model_id: row.get(8)?,
-                            part_count: row.get(9)?,
-                            bytes: row.get(10)?,
-                            usage: read_wire_usage(row, 12)?,
-                            messages_added: row.get(15)?,
-                            messages_removed: row.get(16)?,
-                            owner: row.get(17)?,
-                        },
-                        row.get::<_, String>(11)?,
+                        read_history_entry(row)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
                     ))
                 },
             )
             .optional()
-            .map_err(|error| format!("无法查询请求账本条目：{error}"))?;
-        let Some((summary, envelope)) = found else {
+            .map_err(|error| format!("无法查询历史记录条目：{error}"))?;
+        let Some((mut entry, body, truncated)) = found else {
             return Ok(None);
         };
-        let mut statement = conn
-            .prepare(
-                "SELECT part.ordinal, part.kind, part.hash, stored.body, stored.truncated
-                 FROM wire_request_part part
-                 JOIN wire_blob stored
-                   ON stored.conversation_id = part.conversation_id AND stored.hash = part.hash
-                 WHERE part.conversation_id = ?1 AND part.seq = ?2
-                 ORDER BY part.ordinal",
-            )
-            .map_err(|error| format!("无法查询请求账本分段：{error}"))?;
-        let rows = statement
-            .query_map(rusqlite::params![conversation_id, seq], |row| {
-                let body: String = row.get(3)?;
-                Ok(WireRequestPart {
-                    ordinal: row.get(0)?,
-                    kind: row.get(1)?,
-                    hash: row.get(2)?,
-                    // Counted here rather than in the renderer: JavaScript would
-                    // count UTF-16 units, and these have to add up to the
-                    // request's own `bytes`, which is a sum of UTF-8 lengths.
-                    bytes: body.len() as i64,
-                    body,
-                    truncated: row.get::<_, i64>(4)? != 0,
-                })
-            })
-            .map_err(|error| format!("无法查询请求账本分段：{error}"))?;
         let mut parts = Vec::new();
-        for row in rows {
-            parts.push(row.map_err(|error| format!("无法读取请求账本分段行：{error}"))?);
+        let mut ops = Vec::new();
+        match entry.kind.as_str() {
+            "request" => {
+                let answered = conn
+                    .query_row(
+                        "SELECT detail FROM history_entry
+                         WHERE conversation_id = ?1 AND kind = 'response' AND answers = ?2
+                         ORDER BY seq DESC LIMIT 1",
+                        rusqlite::params![conversation_id, seq],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("无法查询历史记录条目：{error}"))?;
+                if let Some(detail) = answered {
+                    entry.usage = HistoryUsage::from_detail(&parse_detail(&detail)).or(entry.usage);
+                }
+                let mut statement = conn
+                    .prepare(
+                        "SELECT part.ordinal, part.kind, part.hash, stored.body, stored.truncated
+                         FROM history_part part
+                         JOIN history_blob stored
+                           ON stored.conversation_id = part.conversation_id AND stored.hash = part.hash
+                         WHERE part.conversation_id = ?1 AND part.seq = ?2
+                         ORDER BY part.ordinal",
+                    )
+                    .map_err(|error| format!("无法查询请求分段：{error}"))?;
+                let rows = statement
+                    .query_map(rusqlite::params![conversation_id, seq], |row| {
+                        let body: String = row.get(3)?;
+                        Ok(HistoryPart {
+                            ordinal: row.get(0)?,
+                            kind: row.get(1)?,
+                            hash: row.get(2)?,
+                            // Counted here rather than in the renderer: JavaScript would
+                            // count UTF-16 units, and these have to add up to the
+                            // request's own `bytes`, which is a sum of UTF-8 lengths.
+                            bytes: body.len() as i64,
+                            body,
+                            truncated: row.get::<_, i64>(4)? != 0,
+                        })
+                    })
+                    .map_err(|error| format!("无法查询请求分段：{error}"))?;
+                for row in rows {
+                    parts.push(row.map_err(|error| format!("无法读取请求分段行：{error}"))?);
+                }
+            }
+            "edit" | "run" => {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT op.ordinal, op.op, op.context_id, op.position, stored.body
+                         FROM history_op op
+                         LEFT JOIN history_blob stored
+                           ON stored.conversation_id = op.conversation_id AND stored.hash = op.hash
+                         WHERE op.conversation_id = ?1 AND op.seq = ?2 ORDER BY op.ordinal",
+                    )
+                    .map_err(|error| format!("无法查询时间线改动：{error}"))?;
+                let rows = statement
+                    .query_map(rusqlite::params![conversation_id, seq], |row| {
+                        Ok(HistoryOp {
+                            ordinal: row.get(0)?,
+                            op: row.get(1)?,
+                            context_id: row.get(2)?,
+                            position: row.get(3)?,
+                            body: row.get(4)?,
+                            before: None,
+                        })
+                    })
+                    .map_err(|error| format!("无法查询时间线改动：{error}"))?;
+                for row in rows {
+                    ops.push(row.map_err(|error| format!("无法读取时间线改动行：{error}"))?);
+                }
+                // What a row said before this change is the body the chain last gave
+                // it, so a rewrite can be drawn as a diff and a removal as what went.
+                let mut previous = conn
+                    .prepare(
+                        "SELECT stored.body
+                         FROM history_op op
+                         JOIN history_blob stored
+                           ON stored.conversation_id = op.conversation_id AND stored.hash = op.hash
+                         WHERE op.conversation_id = ?1 AND op.context_id = ?2 AND op.seq < ?3
+                           AND op.op IN ('insert', 'replace')
+                         ORDER BY op.seq DESC, op.ordinal DESC LIMIT 1",
+                    )
+                    .map_err(|error| format!("无法查询时间线改动：{error}"))?;
+                for op in &mut ops {
+                    op.before = previous
+                        .query_row(rusqlite::params![conversation_id, op.context_id, seq], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .optional()
+                        .map_err(|error| format!("无法查询时间线改动：{error}"))?;
+                }
+            }
+            _ => {}
         }
-        Ok(Some(WireRequestDetail {
-            summary,
-            envelope: serde_json::from_str(&envelope).unwrap_or(serde_json::Value::Null),
+        Ok(Some(HistoryEntryDetail {
+            entry,
+            body,
+            truncated,
             parts,
+            ops,
         }))
     }
 
-    /// Appends one outgoing request to the conversation's wire ledger and returns
-    /// the `seq` it was written under, which is the only handle a later usage
-    /// report has on this exact row. `None` means the conversation has no row in
-    /// the store, so nothing was written and nothing can be attached later.
-    pub fn record_wire_request(&self, record: &WireRequestRecord) -> Result<Option<i64>, String> {
-        self.with_write_tx(|tx| record_wire_request_tx(tx, record))
+    /// Appends one outgoing request to the history and returns the `seq` it was
+    /// written under, which is the only handle the response has on this exact
+    /// entry. `None` means the conversation has no row in the store, so nothing
+    /// was written and nothing can be linked to it later.
+    pub fn record_history_request(
+        &self,
+        record: &HistoryRequestRecord,
+    ) -> Result<Option<i64>, String> {
+        self.with_write_tx(|tx| record_history_request_tx(tx, record))
     }
 
-    /// Attaches the usage a request's response reported to the row that request
-    /// wrote. A no-op when the row is gone or was never written: the ledger must
-    /// never fail a run, and a usage with nowhere to land is not an error.
-    pub fn record_wire_usage(
+    /// Appends one entry — a response, a hook decision, a call, a result — and
+    /// returns its `seq`, or `None` when the conversation has no row in the store
+    /// (a draft).
+    pub fn record_history_entry(&self, record: &HistoryEntryRecord) -> Result<Option<i64>, String> {
+        self.with_write_tx(|tx| record_history_entry_tx(tx, record))
+    }
+
+    /// Message bodies one owner's requests carried to the model, each distinct body once, in the
+    /// order the model first received them. `owner` picks whose (`None` is the conversation's
+    /// own), `role` keeps only messages of that wire role, and `needle` keeps only bodies
+    /// containing that literal text. Bodies the size cap truncated are left out: they no longer
+    /// parse.
+    ///
+    /// This answers "what did the model receive", which only a request can: a result the host
+    /// produced reaches the model when a request carries it, and not before.
+    pub fn history_message_bodies(
         &self,
         conversation_id: &str,
-        seq: i64,
-        usage: &WireUsage,
-    ) -> Result<(), String> {
-        self.with_write_tx(|tx| {
-            tx.execute(
-                "UPDATE wire_request
-                 SET input_tokens = ?3, cached_input_tokens = ?4, output_tokens = ?5
-                 WHERE conversation_id = ?1 AND seq = ?2",
-                rusqlite::params![
-                    conversation_id,
-                    seq,
-                    usage.input_tokens,
-                    usage.cached_input_tokens,
-                    usage.output_tokens,
-                ],
+        owner: Option<&str>,
+        role: Option<&str>,
+        needle: &str,
+    ) -> Result<Vec<String>, String> {
+        let conn = self.lock()?;
+        // `min()` picks, per body, the earliest (request, position) that carried it. Positions
+        // within one request stay far below the multiplier.
+        let mut statement = conn
+            .prepare(
+                "SELECT stored.body, min(part.seq * 1048576 + part.ordinal) AS first_seen
+                 FROM history_blob stored
+                 JOIN history_part part
+                   ON part.conversation_id = stored.conversation_id AND part.hash = stored.hash
+                 JOIN history_entry entry
+                   ON entry.conversation_id = part.conversation_id AND entry.seq = part.seq
+                 WHERE stored.conversation_id = ?1
+                   AND stored.truncated = 0
+                   AND instr(stored.body, ?4) > 0
+                   AND part.kind = 'message'
+                   AND (?3 IS NULL OR part.role = ?3)
+                   AND entry.kind = 'request'
+                   AND json_extract(entry.detail, '$.type') = 'model'
+                   AND entry.owner IS ?2
+                 GROUP BY stored.hash
+                 ORDER BY first_seen",
             )
-            .map_err(|error| format!("无法写入请求账本用量：{error}"))?;
-            Ok(())
-        })
+            .map_err(|error| format!("无法查询历史记录正文：{error}"))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![conversation_id, owner, role, needle],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("无法查询历史记录正文：{error}"))?;
+        let mut bodies = Vec::new();
+        for row in rows {
+            bodies.push(row.map_err(|error| format!("无法读取历史记录正文：{error}"))?);
+        }
+        Ok(bodies)
+    }
+
+    /// Entries read back as evidence, oldest first, with their bodies. See
+    /// [`HistoryFilter`] for what selects them.
+    ///
+    /// This is the host's record of what happened. Recovery reads what an agent
+    /// answered, what came after it, and what a call ran with here: the timeline is
+    /// the user's to edit, and a request holds a response only once a later request
+    /// replays it — which a crash can prevent — and then as the timeline projects it.
+    pub fn history_records(
+        &self,
+        conversation_id: &str,
+        filter: HistoryFilter<'_>,
+    ) -> Result<Vec<HistoryRecord>, String> {
+        let conn = self.lock()?;
+        let kinds = if filter.kinds.is_empty() {
+            String::new()
+        } else {
+            let slots = (0..filter.kinds.len())
+                .map(|index| format!("?{}", index + 5))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("AND entry.kind IN ({slots})")
+        };
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT entry.seq, entry.kind, entry.request_id, entry.round, entry.call_id,
+                        entry.answers, entry.detail, stored.body, stored.truncated
+                 FROM history_entry entry
+                 LEFT JOIN history_blob stored
+                   ON stored.conversation_id = entry.conversation_id AND stored.hash = entry.hash
+                 WHERE entry.conversation_id = ?1
+                   AND entry.owner IS ?2
+                   AND (?3 IS NULL OR entry.call_id = ?3)
+                   AND (?4 = '' OR instr(stored.body, ?4) > 0)
+                   {kinds}
+                 ORDER BY entry.seq"
+            ))
+            .map_err(|error| format!("无法查询历史记录：{error}"))?;
+        let mut bound: Vec<&dyn rusqlite::ToSql> =
+            vec![&conversation_id, &filter.owner, &filter.call_id, &filter.needle];
+        for kind in filter.kinds {
+            bound.push(kind);
+        }
+        let rows = statement
+            .query_map(bound.as_slice(), |row| {
+                Ok(HistoryRecord {
+                    seq: row.get(0)?,
+                    kind: row.get(1)?,
+                    request_id: row.get(2)?,
+                    round: row.get(3)?,
+                    call_id: row.get(4)?,
+                    answers: row.get(5)?,
+                    detail: parse_detail(&row.get::<_, String>(6)?),
+                    body: row.get(7)?,
+                    truncated: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+                })
+            })
+            .map_err(|error| format!("无法查询历史记录：{error}"))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|error| format!("无法读取历史记录行：{error}"))?);
+        }
+        Ok(records)
+    }
+
+    /// The card that owns agent `name`'s run record on the main timeline: the newest card
+    /// already holding a record of that name, else its `agent_spawn` card — found by the
+    /// provider call id the spawn carried, then by the name it was given. A child that
+    /// settles within its first round never had a record written, so its spawn card is the
+    /// only place to put one.
+    pub(crate) fn task_card_owner(
+        &self,
+        conversation_id: &str,
+        name: &str,
+        spawn_call_id: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let conn = self.lock()?;
+        let find = |condition: &str, value: &str| -> Result<Option<String>, String> {
+            conn.query_row(
+                &format!(
+                    "SELECT id FROM context
+                     WHERE conversation_id = ?1 AND branch_id IS NULL AND json_valid(data)
+                       AND {condition} = ?2
+                     ORDER BY order_key DESC, rowid DESC LIMIT 1"
+                ),
+                rusqlite::params![conversation_id, value],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法查找子代理记录所在的卡片：{error}"))
+        };
+        if let Some(id) = find("json_extract(data, '$.subagent.name')", name)? {
+            return Ok(Some(id));
+        }
+        let spawn = "json_extract(data, '$.toolName') = 'agent_spawn' AND ";
+        if let Some(call_id) = spawn_call_id {
+            if let Some(id) = find(&format!("{spawn}json_extract(data, '$.providerCallId')"), call_id)? {
+                return Ok(Some(id));
+            }
+        }
+        find(&format!("{spawn}json_extract(data, '$.input.name')"), name)
     }
 
     // ---------------------------------------------------------------- Write
@@ -1643,25 +2166,32 @@ impl ConversationStore {
         workspace_id: &str,
         conversation: &Conversation,
     ) -> Result<(), String> {
-        self.with_write_tx(|tx| put_conversation_tx(tx, workspace_id, conversation))
+        let written = self.with_write_tx(|tx| {
+            put_conversation_tx(tx, workspace_id, conversation, NewRowAt::End)
+        });
+        self.bodies.invalidate(&conversation.id);
+        written
     }
 
-    /// Atomically persists the child and its explicit first-run intent.
+    /// Atomically persists the child and its explicit first-run intent. The child
+    /// opens its workspace's list, where a conversation the user starts goes.
     pub fn put_fork_conversation(
         &self,
         workspace_id: &str,
         conversation: &Conversation,
         prompt_context_id: &str,
     ) -> Result<(), String> {
-        self.with_write_tx(|tx| {
+        let written = self.with_write_tx(|tx| {
             if !matches!(conversation.contexts.last(), Some(ContextItem::User { id, .. }) if id == prompt_context_id) {
                 return Err("分叉首轮提示标识无效".into());
             }
-            put_conversation_tx(tx, workspace_id, conversation)?;
+            put_conversation_tx(tx, workspace_id, conversation, NewRowAt::Top)?;
             tx.execute("INSERT INTO pending_fork_start (conversation_id, prompt_context_id) VALUES (?1, ?2)",
                 [&conversation.id, prompt_context_id]).map_err(|error| error.to_string())?;
             Ok(())
-        })
+        });
+        self.bodies.invalidate(&conversation.id);
+        written
     }
 
     pub fn pending_fork_starts(&self) -> Result<Vec<PendingForkStart>, String> {
@@ -1890,16 +2420,36 @@ impl ConversationStore {
         .map_err(|error| format!("无法写入命令说明：{error}"))
     }
 
+    pub fn put_tool_error_explanation(&self, conversation_id: &str, context_id: &str, text: &str) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO tool_error_explanation (conversation_id, context_id, text) VALUES (?1, ?2, ?3)
+             ON CONFLICT (conversation_id, context_id) DO UPDATE SET text = excluded.text",
+            rusqlite::params![conversation_id, context_id, text],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法写入错误解释：{error}"))
+    }
+
     /// Descriptions by tool card id.
     pub fn tool_explanations(&self, conversation_id: &str) -> Result<HashMap<String, String>, String> {
+        self.explanations_in("tool_explanation", conversation_id)
+    }
+
+    /// Why each failed call failed, by tool card id.
+    pub fn tool_error_explanations(&self, conversation_id: &str) -> Result<HashMap<String, String>, String> {
+        self.explanations_in("tool_error_explanation", conversation_id)
+    }
+
+    fn explanations_in(&self, table: &str, conversation_id: &str) -> Result<HashMap<String, String>, String> {
         let conn = self.lock()?;
         let mut statement = conn
-            .prepare("SELECT context_id, text FROM tool_explanation WHERE conversation_id = ?1")
-            .map_err(|error| format!("无法读取命令说明：{error}"))?;
+            .prepare(&format!("SELECT context_id, text FROM {table} WHERE conversation_id = ?1"))
+            .map_err(|error| format!("无法读取工具卡说明：{error}"))?;
         let rows = statement
             .query_map([conversation_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .map_err(|error| format!("无法读取命令说明：{error}"))?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(|error| format!("无法读取命令说明：{error}"))
+            .map_err(|error| format!("无法读取工具卡说明：{error}"))?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(|error| format!("无法读取工具卡说明：{error}"))
     }
 
     pub fn put_conversation_metadata(
@@ -1907,16 +2457,19 @@ impl ConversationStore {
         workspace_id: &str,
         conversation: &Conversation,
     ) -> Result<(), String> {
-        self.with_write_tx(|tx| {
-            put_conversation_row_tx(tx, workspace_id, conversation)?;
+        let written = self.with_write_tx(|tx| {
+            put_conversation_row_tx(tx, workspace_id, conversation, NewRowAt::End)?;
             replace_queued_messages_tx(tx, conversation)?;
             replace_aborted_tasks_tx(tx, conversation)
-        })
+        });
+        self.bodies.invalidate(&conversation.id);
+        written
     }
 
     /// Deletes a conversation and its dependent rows, re-parenting children to its parent.
     pub fn delete_conversation(&self, conversation_id: &str) -> Result<(), String> {
-        self.with_write_tx(|tx| {
+        // Children are re-parented, so their bodies change too.
+        let deleted = self.with_write_tx(|tx| {
             tx.execute(
                 "UPDATE conversation SET parent_conversation_id =
                  (SELECT parent_conversation_id FROM conversation WHERE id = ?1)
@@ -1927,7 +2480,9 @@ impl ConversationStore {
             tx.execute("DELETE FROM conversation WHERE id = ?1", [conversation_id])
                 .map_err(|error| format!("无法删除对话：{error}"))?;
             Ok(())
-        })
+        });
+        self.bodies.invalidate_all();
+        deleted
     }
 
     /// Reorders a workspace's conversations. The caller moves or deletes omitted conversations;
@@ -1937,7 +2492,9 @@ impl ConversationStore {
         workspace_id: &str,
         ordered_ids: &[String],
     ) -> Result<(), String> {
-        self.with_write_tx(|tx| {
+        // Parents left behind in another workspace are cleared, which changes
+        // bodies beyond the ones named.
+        let reordered = self.with_write_tx(|tx| {
             for (index, id) in ordered_ids.iter().enumerate() {
                 tx.execute(
                     "UPDATE conversation SET workspace_id = ?1, order_key = ?2 WHERE id = ?3",
@@ -1959,7 +2516,9 @@ impl ConversationStore {
                 .map_err(|error| format!("无法更新跨工作区父对话：{error}"))?;
             }
             Ok(())
-        })
+        });
+        self.bodies.invalidate_all();
+        reordered
     }
 
     /// Appends or updates contexts in place. New rows use the current maximum ordering key;
@@ -1992,7 +2551,7 @@ impl ConversationStore {
         if items.is_empty() {
             return Ok(());
         }
-        self.with_write_tx(|tx| {
+        let written = self.with_write_tx(|tx| {
             if !conversation_exists(tx, conversation_id)? {
                 // Subagent and temporary conversations have no row; skip writes without requiring callers to classify the run.
                 return Ok(());
@@ -2051,7 +2610,9 @@ impl ConversationStore {
             }
             touch_conversation_tx(tx, conversation_id)?;
             Ok(())
-        })
+        });
+        self.bodies.invalidate(conversation_id);
+        written
     }
 
     /// Atomically revise a task's current card and its superseded holders,
@@ -2064,7 +2625,7 @@ impl ConversationStore {
         task_name: &str,
         mut revise: impl FnMut(&mut ContextItem) -> bool,
     ) -> Result<bool, String> {
-        self.with_write_tx(|tx| {
+        let revised = self.with_write_tx(|tx| {
             let data: Option<String> = tx.query_row(
                 "SELECT data FROM context WHERE conversation_id = ?1 AND id = ?2 AND branch_id IS NULL",
                 rusqlite::params![conversation_id, context_id],
@@ -2108,7 +2669,9 @@ impl ConversationStore {
             }
             touch_conversation_tx(tx, conversation_id)?;
             Ok(true)
-        })
+        });
+        self.bodies.invalidate(conversation_id);
+        revised
     }
 
     /// Folds committed WAL frames into the main database and fsyncs them. Use only for writes that
@@ -2122,7 +2685,7 @@ impl ConversationStore {
     /// Test helper that corrupts a conversation's first context row.
     #[cfg(test)]
     pub(crate) fn corrupt_context_for_test(&self, conversation_id: &str) -> Result<(), String> {
-        self.with_write_tx(|tx| {
+        let written = self.with_write_tx(|tx| {
             tx.execute(
                 "UPDATE context SET data = '{ not json' WHERE conversation_id = ?1
                  AND id = (SELECT id FROM context WHERE conversation_id = ?1
@@ -2131,7 +2694,9 @@ impl ConversationStore {
             )
             .map_err(|error| format!("无法制造坏行：{error}"))?;
             Ok(())
-        })
+        });
+        self.bodies.invalidate(conversation_id);
+        written
     }
 
     /// Startup recovery marks streaming rows left by the previous process as interrupted.
@@ -2157,7 +2722,7 @@ impl ConversationStore {
         if ids.is_empty() {
             return Ok(0);
         }
-        self.with_write_tx(|tx| {
+        let discarded = self.with_write_tx(|tx| {
             let mut removed = 0usize;
             for id in ids {
                 removed += tx
@@ -2169,11 +2734,13 @@ impl ConversationStore {
                     .map_err(|error| format!("无法丢弃未定稿上下文：{error}"))?;
             }
             Ok(removed)
-        })
+        });
+        self.bodies.invalidate(conversation_id);
+        discarded
     }
 
     fn reconcile_streaming_where(&self, conversation_id: Option<&str>) -> Result<usize, String> {
-        self.with_write_tx(|tx| {
+        let reconciled = self.with_write_tx(|tx| {
             let stale: Vec<(String, String, String)> = {
                 let mut statement = tx
                     .prepare(
@@ -2207,7 +2774,12 @@ impl ConversationStore {
                 .map_err(|error| format!("无法回收未定稿上下文：{error}"))?;
             }
             Ok(count)
-        })
+        });
+        match conversation_id {
+            Some(conversation_id) => self.bodies.invalidate(conversation_id),
+            None => self.bodies.invalidate_all(),
+        }
+        reconciled
     }
 
     /// Removes queued messages once they enter a turn, so durable queued rows cannot coexist with
@@ -2220,7 +2792,7 @@ impl ConversationStore {
         if ids.is_empty() {
             return Ok(());
         }
-        self.with_write_tx(|tx| {
+        let removed = self.with_write_tx(|tx| {
             for id in ids {
                 tx.execute(
                     "DELETE FROM queued_message WHERE conversation_id = ?1 AND id = ?2",
@@ -2229,7 +2801,9 @@ impl ConversationStore {
                 .map_err(|error| format!("无法删除排队消息：{error}"))?;
             }
             Ok(())
-        })
+        });
+        self.bodies.invalidate(conversation_id);
+        removed
     }
 }
 
@@ -2278,6 +2852,12 @@ fn shape_is_current(conn: &Connection) -> Result<bool, String> {
     }
     for &(table, column, _) in ADDED_COLUMNS {
         if !has_column(conn, table, column)? {
+            return Ok(false);
+        }
+    }
+    for table in LEGACY_HISTORY_TABLES {
+        // A legacy table still standing is history not yet migrated.
+        if has_table(conn, table)? {
             return Ok(false);
         }
     }
@@ -2559,14 +3139,14 @@ fn trunk_rows_tx(
     Ok(trunk)
 }
 
-/// The trunk as of the newest recorded event.
-fn timeline_head_tx(
+/// The trunk as of the newest recorded change.
+fn history_head_tx(
     tx: &rusqlite::Transaction<'_>,
     conversation_id: &str,
 ) -> Result<Vec<TimelineRow>, String> {
     let mut statement = tx
         .prepare(
-            "SELECT context_id, data FROM timeline_head
+            "SELECT context_id, data FROM history_head
              WHERE conversation_id = ?1 ORDER BY position",
         )
         .map_err(|error| format!("无法查询时间线历史头：{error}"))?;
@@ -2682,10 +3262,28 @@ fn diff_timeline(head: &[TimelineRow], current: &[TimelineRow]) -> Vec<TimelineO
     ops
 }
 
-fn record_timeline_event_tx(
+/// Whether every step of a change only appended rows the user typed: inserts at
+/// the tail of the trunk, each of a `user` row. That is sending a message, not
+/// editing the context, and the pane draws the two differently.
+fn only_appends_user_messages(head: &[TimelineRow], ops: &[TimelineOp]) -> bool {
+    !ops.is_empty()
+        && ops.iter().all(|op| match op {
+            TimelineOp::Insert { position, data, .. } => {
+                *position >= head.len() as i64
+                    && serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|row| row.get("kind").and_then(|kind| kind.as_str().map(str::to_owned)))
+                        .as_deref()
+                        == Some("user")
+            }
+            TimelineOp::Remove { .. } | TimelineOp::Replace { .. } => false,
+        })
+}
+
+fn record_trunk_change_tx(
     tx: &rusqlite::Transaction<'_>,
     conversation_id: &str,
-    kind: TimelineEventKind,
+    change: TrunkChange,
     request_id: Option<&str>,
 ) -> Result<(), String> {
     if !conversation_exists(tx, conversation_id)? {
@@ -2693,26 +3291,25 @@ fn record_timeline_event_tx(
         return Ok(());
     }
     let current = trunk_rows_tx(tx, conversation_id)?;
-    let head = timeline_head_tx(tx, conversation_id)?;
+    let head = history_head_tx(tx, conversation_id)?;
     let ops = diff_timeline(&head, &current);
     if ops.is_empty() {
         return Ok(());
     }
-    let previous: Option<i64> = tx
-        .query_row(
-            "SELECT max(seq) FROM timeline_event WHERE conversation_id = ?1",
-            [conversation_id],
-            |row| row.get(0),
+    let first: bool = !tx
+        .prepare(
+            "SELECT 1 FROM history_entry
+             WHERE conversation_id = ?1 AND kind IN ('edit', 'run') LIMIT 1",
         )
-        .optional()
-        .map_err(|error| format!("无法读取时间线历史序号：{error}"))?
-        .flatten();
-    let seq = previous.unwrap_or(0) + 1;
-    let kind = if previous.is_none() {
-        "baseline"
-    } else {
-        kind.as_str()
+        .and_then(|mut statement| statement.exists([conversation_id]))
+        .map_err(|error| format!("无法读取时间线历史：{error}"))?;
+    let (kind, source) = match change {
+        TrunkChange::Edit if only_appends_user_messages(&head, &ops) => ("edit", "message"),
+        _ if first => ("edit", "baseline"),
+        TrunkChange::Run => ("run", "run"),
+        TrunkChange::Edit => ("edit", "edit"),
     };
+    let seq = next_history_seq(tx, conversation_id)?;
     let (mut inserted, mut removed, mut replaced) = (0i64, 0i64, 0i64);
     for (ordinal, op) in ops.iter().enumerate() {
         let (name, context_id, position, data) = match op {
@@ -2733,9 +3330,12 @@ fn record_timeline_event_tx(
                 ("replace", context_id, None, Some(data))
             }
         };
+        let hash = data
+            .map(|data| store_blob_tx(tx, conversation_id, data, HISTORY_EVIDENCE_MAX_BYTES))
+            .transpose()?;
         tx.execute(
-            "INSERT INTO timeline_op
-             (conversation_id, seq, ordinal, op, context_id, position, data)
+            "INSERT INTO history_op
+             (conversation_id, seq, ordinal, op, context_id, position, hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 conversation_id,
@@ -2744,36 +3344,41 @@ fn record_timeline_event_tx(
                 name,
                 context_id,
                 position,
-                data
+                hash
             ],
         )
         .map_err(|error| format!("无法写入时间线历史步骤：{error}"))?;
     }
+    let detail = serde_json::json!({
+        "source": source,
+        "inserted": inserted,
+        "removed": removed,
+        "replaced": replaced,
+        // Trunk length once this change applied, so the list reads without a replay.
+        "rowCount": current.len() as i64,
+    });
     tx.execute(
-        "INSERT INTO timeline_event
-         (conversation_id, seq, kind, request_id, inserted, removed, replaced, row_count, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO history_entry
+         (conversation_id, seq, created_at, kind, owner, request_id, round, call_id, answers, detail, hash)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, NULL, NULL, ?6, NULL)",
         rusqlite::params![
             conversation_id,
             seq,
+            now(),
             kind,
             request_id,
-            inserted,
-            removed,
-            replaced,
-            current.len() as i64,
-            now(),
+            detail.to_string(),
         ],
     )
     .map_err(|error| format!("无法写入时间线历史：{error}"))?;
     tx.execute(
-        "DELETE FROM timeline_head WHERE conversation_id = ?1",
+        "DELETE FROM history_head WHERE conversation_id = ?1",
         [conversation_id],
     )
     .map_err(|error| format!("无法清空时间线历史头：{error}"))?;
     for (position, row) in current.iter().enumerate() {
         tx.execute(
-            "INSERT INTO timeline_head (conversation_id, position, context_id, data)
+            "INSERT INTO history_head (conversation_id, position, context_id, data)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![conversation_id, position as i64, row.id, row.data],
         )
@@ -2782,19 +3387,34 @@ fn record_timeline_event_tx(
     Ok(())
 }
 
-/// The body as the ledger stores it, and whether the cap cut it. The cut lands on
-/// a UTF-8 boundary so the stored text is still text, and the marker goes inside
-/// the stored body so a reader sees why it ends where it does.
-fn stored_wire_body(body: &str) -> (String, bool) {
-    if body.len() <= WIRE_BLOB_MAX_BYTES {
+/// The next `seq` of a conversation's history. One sequence across every kind and
+/// every owner: order across them is what the record is read for.
+fn next_history_seq(tx: &rusqlite::Transaction<'_>, conversation_id: &str) -> Result<i64, String> {
+    let previous: Option<i64> = tx
+        .query_row(
+            "SELECT max(seq) FROM history_entry WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取历史记录序号：{error}"))?
+        .flatten();
+    Ok(previous.unwrap_or(0) + 1)
+}
+
+/// The body as the record stores it under `cap`, and whether the cap cut it. The
+/// cut lands on a UTF-8 boundary so the stored text is still text, and the marker
+/// goes inside the stored body so a reader sees why it ends where it does.
+fn stored_body(body: &str, cap: usize) -> (String, bool) {
+    if body.len() <= cap {
         return (body.to_owned(), false);
     }
-    let mut end = WIRE_BLOB_MAX_BYTES;
+    let mut end = cap;
     while !body.is_char_boundary(end) {
         end -= 1;
     }
     (
-        format!("{}\n{WIRE_BLOB_TRUNCATION_MARKER}", &body[..end]),
+        format!("{}\n{HISTORY_TRUNCATION_MARKER}", &body[..end]),
         true,
     )
 }
@@ -2802,23 +3422,60 @@ fn stored_wire_body(body: &str) -> (String, bool) {
 /// Lowercase hex SHA-256 of what is actually stored, which is what a reader will
 /// be able to verify. Hashing the pre-truncation body would address something no
 /// row holds.
-fn wire_body_hash(stored: &str) -> String {
+fn body_hash(stored: &str) -> String {
     Sha256::digest(stored.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-/// Reads the three usage columns starting at `offset` as one optional value: a
-/// row whose provider disclosed nothing must read as "no usage" rather than as a
-/// usage of three absent numbers, which the renderer would have to special-case.
-fn read_wire_usage(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Option<WireUsage>> {
-    let usage = WireUsage {
-        input_tokens: row.get(offset)?,
-        cached_input_tokens: row.get(offset + 1)?,
-        output_tokens: row.get(offset + 2)?,
-    };
-    Ok((!usage.is_empty()).then_some(usage))
+/// Stores `body` under `cap` once per conversation and returns its address. A body
+/// the conversation already holds costs nothing more, however many entries name it.
+fn store_blob_tx(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: &str,
+    body: &str,
+    cap: usize,
+) -> Result<String, String> {
+    let (stored, truncated) = stored_body(body, cap);
+    let hash = body_hash(&stored);
+    tx.execute(
+        "INSERT OR IGNORE INTO history_blob (conversation_id, hash, body, truncated)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![conversation_id, hash, stored, i64::from(truncated)],
+    )
+    .map_err(|error| format!("无法写入历史记录正文：{error}"))?;
+    Ok(hash)
+}
+
+/// A `detail` column as JSON. A value that no longer parses reads as an empty
+/// object: one damaged entry must not fail the whole list.
+fn parse_detail(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Reads columns 0..=8 — seq, created_at, kind, owner, request_id, round,
+/// call_id, answers, detail — as one listed entry. A response's usage is its own;
+/// a request's is only what a request migrated from before responses were kept
+/// carries, and the list replaces it with its response's when there is one.
+fn read_history_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    let kind: String = row.get(2)?;
+    let detail = parse_detail(&row.get::<_, String>(8)?);
+    let usage = matches!(kind.as_str(), "response" | "request")
+        .then(|| HistoryUsage::from_detail(&detail))
+        .flatten();
+    Ok(HistoryEntry {
+        seq: row.get(0)?,
+        created_at: row.get(1)?,
+        kind,
+        owner: row.get(3)?,
+        request_id: row.get(4)?,
+        round: row.get(5)?,
+        call_id: row.get(6)?,
+        answers: row.get(7)?,
+        detail,
+        usage,
+    })
 }
 
 /// One `message` part as the delta compares it. The address stands in for the
@@ -2846,7 +3503,7 @@ struct DeltaMessage<'a> {
 /// not read as the user having thrown a message away and written another. Roles
 /// pair greedily in order, and an unknown role pairs with nothing, since a part
 /// whose role could not be read carries no evidence either way.
-fn wire_message_delta(before: &[DeltaMessage<'_>], after: &[DeltaMessage<'_>]) -> (i64, i64) {
+fn message_delta(before: &[DeltaMessage<'_>], after: &[DeltaMessage<'_>]) -> (i64, i64) {
     let mut head = 0;
     while head < before.len() && head < after.len() && before[head].hash == after[head].hash {
         head += 1;
@@ -2891,17 +3548,17 @@ fn wire_message_delta(before: &[DeltaMessage<'_>], after: &[DeltaMessage<'_>]) -
 /// The `message` parts the request numbered `seq` carried, in wire order.
 ///
 /// Hashes and roles only, never a body: a round re-sends the whole history, so
-/// joining `wire_blob` here would make each write read back everything every
-/// earlier write stored, and the ledger would cost the square of the
-/// conversation to maintain — the exact cost content addressing exists to avoid.
-fn previous_wire_messages(
+/// joining `history_blob` here would make each write read back everything every
+/// earlier write stored, and the record would cost the square of the conversation
+/// to maintain — the exact cost content addressing exists to avoid.
+fn previous_request_messages(
     tx: &rusqlite::Transaction<'_>,
     conversation_id: &str,
     seq: i64,
 ) -> Result<Vec<(String, Option<String>)>, String> {
     let mut statement = tx
         .prepare(
-            "SELECT hash, role FROM wire_request_part
+            "SELECT hash, role FROM history_part
              WHERE conversation_id = ?1 AND seq = ?2 AND kind = 'message'
              ORDER BY ordinal",
         )
@@ -2919,7 +3576,7 @@ fn previous_wire_messages(
 }
 
 /// One part of this request, hashed and ready to insert.
-struct StoredWirePart<'a> {
+struct StoredPart<'a> {
     kind: &'a str,
     role: Option<&'a str>,
     author: Option<&'a str>,
@@ -2928,52 +3585,41 @@ struct StoredWirePart<'a> {
     hash: String,
 }
 
-fn record_wire_request_tx(
+fn record_history_request_tx(
     tx: &rusqlite::Transaction<'_>,
-    record: &WireRequestRecord,
+    record: &HistoryRequestRecord,
 ) -> Result<Option<i64>, String> {
     let conversation_id = record.conversation_id.as_str();
     let owner = record.owner.as_deref();
     if !conversation_exists(tx, conversation_id)? {
-        // A draft or temporary conversation has no row, and so no ledger. A
+        // A draft or temporary conversation has no row, and so no history. A
         // child does have one — it shares its parent's — and is separated from
         // the trunk by `owner` instead.
         return Ok(None);
     }
-    // The number is the conversation's, not the ledger's: `seq` is what the part
-    // and blob tables key on, and two ledgers handing out the same one would file
-    // an agent's parts against a trunk request.
-    let previous: Option<i64> = tx
-        .query_row(
-            "SELECT max(seq) FROM wire_request WHERE conversation_id = ?1",
-            [conversation_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| format!("无法读取请求账本序号：{error}"))?
-        .flatten();
-    let seq = previous.unwrap_or(0) + 1;
+    let seq = next_history_seq(tx, conversation_id)?;
     // The request this one is read against is the previous request *of the same
-    // ledger*. Comparing a child's first payload with whatever the trunk last
-    // sent would report the whole of one history as deleted and the whole of the
-    // other as written by the user.
+    // owner*. Comparing a child's first payload with whatever the trunk last sent
+    // would report the whole of one history as deleted and the whole of the other
+    // as written by the user.
     let predecessor: Option<i64> = tx
         .query_row(
-            "SELECT max(seq) FROM wire_request WHERE conversation_id = ?1 AND owner IS ?2",
+            "SELECT max(seq) FROM history_entry
+             WHERE conversation_id = ?1 AND kind = 'request' AND owner IS ?2",
             rusqlite::params![conversation_id, owner],
             |row| row.get(0),
         )
         .optional()
-        .map_err(|error| format!("无法读取请求账本序号：{error}"))?
+        .map_err(|error| format!("无法读取历史记录序号：{error}"))?
         .flatten();
 
-    let stored: Vec<StoredWirePart<'_>> = record
+    let stored: Vec<StoredPart<'_>> = record
         .parts
         .iter()
         .map(|part| {
-            let (body, truncated) = stored_wire_body(&part.body);
-            let hash = wire_body_hash(&body);
-            StoredWirePart {
+            let (body, truncated) = stored_body(&part.body, HISTORY_PART_MAX_BYTES);
+            let hash = body_hash(&body);
+            StoredPart {
                 kind: part.kind.as_str(),
                 role: part.role.as_deref(),
                 author: part.author.as_deref(),
@@ -2989,13 +3635,12 @@ fn record_wire_request_tx(
         .map(|part| part.body.len() as i64)
         .sum::<i64>();
 
-    // `predecessor` is `None` only for a ledger's very first row: `seq` only
-    // grows and pruning only drops rows older than the one being written, so a
-    // ledger that has ever recorded anything still has a newest row to compare
-    // against. An empty predecessor therefore means "nothing was here before",
-    // and everything the user wrote is new.
+    // `predecessor` is `None` only for an owner's very first request: nothing is
+    // ever pruned, so an owner that has sent anything still has a newest request
+    // to compare against. An empty predecessor therefore means "nothing was here
+    // before", and everything the user wrote is new.
     let previous_messages = match predecessor {
-        Some(previous) => previous_wire_messages(tx, conversation_id, previous)?,
+        Some(previous) => previous_request_messages(tx, conversation_id, previous)?,
         None => Vec::new(),
     };
     let before: Vec<DeltaMessage<'_>> = previous_messages
@@ -3015,39 +3660,48 @@ fn record_wire_request_tx(
             author: part.author,
         })
         .collect();
-    let (messages_added, messages_removed) = wire_message_delta(&before, &after);
+    let (messages_added, messages_removed) = message_delta(&before, &after);
 
+    let envelope = store_blob_tx(
+        tx,
+        conversation_id,
+        &record.envelope,
+        HISTORY_EVIDENCE_MAX_BYTES,
+    )?;
+    let detail = serde_json::json!({
+        "type": record.kind,
+        "attempt": record.attempt,
+        "providerName": record.provider_name,
+        "family": record.family,
+        "modelId": record.model_id,
+        "partCount": stored.len() as i64,
+        "bytes": bytes,
+        // Messages the user added and removed between the request before this
+        // one and this one, counted against the predecessor's own parts.
+        "messagesAdded": messages_added,
+        "messagesRemoved": messages_removed,
+    });
     tx.execute(
-        "INSERT INTO wire_request
-         (conversation_id, seq, created_at, kind, request_id, round, attempt,
-          provider_name, family, model_id, envelope, part_count, bytes,
-          messages_added, messages_removed, owner)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO history_entry
+         (conversation_id, seq, created_at, kind, owner, request_id, round, call_id, answers, detail, hash)
+         VALUES (?1, ?2, ?3, 'request', ?4, ?5, ?6, NULL, NULL, ?7, ?8)",
         rusqlite::params![
             conversation_id,
             seq,
             now(),
-            record.kind,
+            owner,
             record.request_id,
             record.round,
-            record.attempt,
-            record.provider_name,
-            record.family,
-            record.model_id,
-            record.envelope,
-            stored.len() as i64,
-            bytes,
-            messages_added,
-            messages_removed,
-            owner,
+            detail.to_string(),
+            envelope,
         ],
     )
-    .map_err(|error| format!("无法写入请求账本：{error}"))?;
+    .map_err(|error| format!("无法写入历史记录：{error}"))?;
     for (ordinal, part) in stored.iter().enumerate() {
         // A body this conversation already sent costs one row in total, however
         // many requests carried it.
         tx.execute(
-            "INSERT OR IGNORE INTO wire_blob (conversation_id, hash, body, truncated)
+            "INSERT OR IGNORE INTO history_blob (conversation_id, hash, body, truncated)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
                 conversation_id,
@@ -3056,9 +3710,9 @@ fn record_wire_request_tx(
                 i64::from(part.truncated)
             ],
         )
-        .map_err(|error| format!("无法写入请求账本正文：{error}"))?;
+        .map_err(|error| format!("无法写入历史记录正文：{error}"))?;
         tx.execute(
-            "INSERT INTO wire_request_part (conversation_id, seq, ordinal, kind, hash, role)
+            "INSERT INTO history_part (conversation_id, seq, ordinal, kind, hash, role)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 conversation_id,
@@ -3069,97 +3723,449 @@ fn record_wire_request_tx(
                 part.role
             ],
         )
-        .map_err(|error| format!("无法写入请求账本分段：{error}"))?;
+        .map_err(|error| format!("无法写入请求分段：{error}"))?;
     }
-    prune_wire_ledger_tx(tx, conversation_id, owner)?;
     Ok(Some(seq))
 }
 
-/// The `seq` at or below which rows fall outside a retention window, or `None`
-/// when the window is not full yet. `owner` scopes it to one ledger; passing the
-/// whole conversation counts across all of them.
-fn wire_retention_cutoff(
+fn record_history_entry_tx(
     tx: &rusqlite::Transaction<'_>,
-    conversation_id: &str,
-    owner: Option<Option<&str>>,
-    keep: i64,
+    record: &HistoryEntryRecord,
 ) -> Result<Option<i64>, String> {
-    let scoped = owner.is_some();
-    let owner = owner.flatten();
-    let (filter, slot) = if scoped {
-        ("AND owner IS ?2", "?3")
-    } else {
-        ("", "?2")
-    };
-    let bound: Vec<&dyn rusqlite::ToSql> = if scoped {
-        vec![&conversation_id, &owner, &keep]
-    } else {
-        vec![&conversation_id, &keep]
-    };
-    // `OFFSET keep` lands on the newest row that is one past the window, so what
-    // comes back is a cutoff rather than a count: everything at or below it goes.
-    tx.query_row(
-        &format!(
-            "SELECT seq FROM wire_request WHERE conversation_id = ?1 {filter}
-             ORDER BY seq DESC LIMIT 1 OFFSET {slot}"
-        ),
-        bound.as_slice(),
-        |row| row.get(0),
+    let conversation_id = record.conversation_id.as_str();
+    if !conversation_exists(tx, conversation_id)? {
+        return Ok(None);
+    }
+    let seq = next_history_seq(tx, conversation_id)?;
+    let hash = record
+        .body
+        .as_deref()
+        .map(|body| store_blob_tx(tx, conversation_id, body, record.body_cap))
+        .transpose()?;
+    tx.execute(
+        "INSERT INTO history_entry
+         (conversation_id, seq, created_at, kind, owner, request_id, round, call_id, answers, detail, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            conversation_id,
+            seq,
+            now(),
+            record.kind,
+            record.owner,
+            record.request_id,
+            record.round,
+            record.call_id,
+            record.answers,
+            record.detail.to_string(),
+            hash,
+        ],
     )
-    .optional()
-    .map_err(|error| format!("无法读取请求账本保留窗口：{error}"))
+    .map_err(|error| format!("无法写入历史记录：{error}"))?;
+    Ok(Some(seq))
 }
 
-/// Drops everything a retention window pushed out, in the same transaction as the
-/// write that pushed it. Each ledger is capped on its own so a child cannot evict
-/// the session's history, and the conversation is capped across all of them so an
-/// unbounded number of children cannot grow the store without end. A body outlives
-/// the requests that named it only until the last of them is gone.
-fn prune_wire_ledger_tx(
-    tx: &rusqlite::Transaction<'_>,
-    conversation_id: &str,
-    owner: Option<&str>,
-) -> Result<(), String> {
-    let mut pruned = false;
-    if let Some(cutoff) =
-        wire_retention_cutoff(tx, conversation_id, Some(owner), WIRE_LEDGER_MAX_REQUESTS)?
-    {
-        tx.execute(
-            "DELETE FROM wire_request_part WHERE conversation_id = ?1 AND seq IN
-             (SELECT seq FROM wire_request
-              WHERE conversation_id = ?1 AND owner IS ?2 AND seq <= ?3)",
-            rusqlite::params![conversation_id, owner, cutoff],
-        )
-        .map_err(|error| format!("无法清理请求账本分段：{error}"))?;
-        tx.execute(
-            "DELETE FROM wire_request WHERE conversation_id = ?1 AND owner IS ?2 AND seq <= ?3",
-            rusqlite::params![conversation_id, owner, cutoff],
-        )
-        .map_err(|error| format!("无法清理请求账本：{error}"))?;
-        pruned = true;
+/// Where a legacy row came from, and so where it sorts among rows written at the
+/// same instant: a request before the response that answers it, both before the
+/// trunk change the run settled into.
+const LEGACY_REQUEST: i64 = 0;
+const LEGACY_RESPONSE: i64 = 1;
+const LEGACY_TRUNK: i64 = 2;
+
+/// Moves the two ledgers and the trunk history older builds kept apart —
+/// `wire_request*` and `wire_blob` (what went out), `wire_response` (what came
+/// back), `timeline_event` / `timeline_op` / `timeline_head` (what changed on the
+/// trunk) — into the one history, then drops them.
+///
+/// Rows are interleaved by the time they were written, which each legacy table
+/// kept to the millisecond, so the migrated record reads in the order things
+/// happened; each legacy table's own order breaks ties. A response keeps its link
+/// to the request it answered, and a request keeps the usage the old ledger
+/// attached to it. An old trunk change that only appended user rows at the tail is
+/// filed as a sent message, the way a new one is.
+///
+/// Runs inside the schema pass's transaction: a store is migrated whole or not at
+/// all, and a legacy table still standing is what marks a store as not yet
+/// migrated.
+fn migrate_legacy_history(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    let mut present = HashSet::new();
+    for table in LEGACY_HISTORY_TABLES {
+        if has_table(tx, table)? {
+            present.insert(table);
+        }
     }
-    if let Some(cutoff) = wire_retention_cutoff(tx, conversation_id, None, WIRE_LEDGER_MAX_ROWS)? {
-        tx.execute(
-            "DELETE FROM wire_request_part WHERE conversation_id = ?1 AND seq <= ?2",
-            rusqlite::params![conversation_id, cutoff],
-        )
-        .map_err(|error| format!("无法清理请求账本分段：{error}"))?;
-        tx.execute(
-            "DELETE FROM wire_request WHERE conversation_id = ?1 AND seq <= ?2",
-            rusqlite::params![conversation_id, cutoff],
-        )
-        .map_err(|error| format!("无法清理请求账本：{error}"))?;
-        pruned = true;
-    }
-    if !pruned {
+    if present.is_empty() {
         return Ok(());
     }
-    tx.execute(
-        "DELETE FROM wire_blob WHERE conversation_id = ?1 AND hash NOT IN
-         (SELECT hash FROM wire_request_part WHERE conversation_id = ?1)",
-        [conversation_id],
+    let fail = |error: rusqlite::Error| format!("无法迁移旧的请求账本与时间线历史：{error}");
+    for &(table, column, declaration) in LEGACY_COLUMNS {
+        if present.contains(table) && !has_column(tx, table, column)? {
+            tx.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            ))
+            .map_err(fail)?;
+        }
+    }
+    let live = "conversation_id IN (SELECT id FROM conversation)";
+
+    // One ordering across the three sources, per conversation.
+    let mut order: Vec<(String, String, i64, i64)> = Vec::new();
+    for (table, source, at) in [
+        ("wire_request", LEGACY_REQUEST, "created_at"),
+        ("wire_response", LEGACY_RESPONSE, "received_at"),
+        ("timeline_event", LEGACY_TRUNK, "created_at"),
+    ] {
+        if !present.contains(table) {
+            continue;
+        }
+        let mut statement = tx
+            .prepare(&format!(
+                "SELECT conversation_id, {at}, seq FROM {table} WHERE {live}"
+            ))
+            .map_err(fail)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
+            .map_err(fail)?;
+        for row in rows {
+            let (conversation, at, seq) = row.map_err(fail)?;
+            order.push((conversation, at, source, seq));
+        }
+    }
+    order.sort();
+    let mut next: HashMap<String, i64> = HashMap::new();
+    let mut mapped: HashMap<(String, i64, i64), i64> = HashMap::new();
+    for (conversation, _, source, old) in &order {
+        let seq = match next.get_mut(conversation) {
+            Some(seq) => seq,
+            None => {
+                let base = next_history_seq(tx, conversation)?;
+                next.entry(conversation.clone()).or_insert(base)
+            }
+        };
+        mapped.insert((conversation.clone(), *source, *old), *seq);
+        *seq += 1;
+    }
+    tx.execute_batch(
+        "CREATE TEMP TABLE history_legacy_seq (
+             conversation_id TEXT NOT NULL,
+             source          INTEGER NOT NULL,
+             old_seq         INTEGER NOT NULL,
+             new_seq         INTEGER NOT NULL,
+             PRIMARY KEY (conversation_id, source, old_seq)
+         )",
     )
-    .map_err(|error| format!("无法清理请求账本正文：{error}"))?;
+    .map_err(fail)?;
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO history_legacy_seq (conversation_id, source, old_seq, new_seq)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(fail)?;
+        for ((conversation, source, old), new) in &mapped {
+            insert
+                .execute(rusqlite::params![conversation, source, old, new])
+                .map_err(fail)?;
+        }
+    }
+    let new_seq = |conversation: &str, source: i64, old: i64| {
+        mapped.get(&(conversation.to_owned(), source, old)).copied()
+    };
+
+    if present.contains("wire_blob") {
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO history_blob (conversation_id, hash, body, truncated)
+                 SELECT conversation_id, hash, body, truncated FROM wire_blob WHERE {live}"
+            ),
+            [],
+        )
+        .map_err(fail)?;
+    }
+
+    if present.contains("wire_request") {
+        let rows = {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT conversation_id, seq, created_at, kind, request_id, round, attempt,
+                            provider_name, family, model_id, envelope, part_count, bytes,
+                            input_tokens, cached_input_tokens, output_tokens,
+                            messages_added, messages_removed, owner
+                     FROM wire_request WHERE {live}"
+                ))
+                .map_err(fail)?;
+            let rows = statement
+                .query_map([], |row| {
+                    let usage = HistoryUsage {
+                        input_tokens: row.get(13)?,
+                        cached_input_tokens: row.get(14)?,
+                        output_tokens: row.get(15)?,
+                    };
+                    let mut detail = serde_json::json!({
+                        "type": row.get::<_, String>(3)?,
+                        "attempt": row.get::<_, i64>(6)?,
+                        "providerName": row.get::<_, String>(7)?,
+                        "family": row.get::<_, String>(8)?,
+                        "modelId": row.get::<_, String>(9)?,
+                        "partCount": row.get::<_, i64>(11)?,
+                        "bytes": row.get::<_, i64>(12)?,
+                    });
+                    for (key, column) in [("messagesAdded", 16), ("messagesRemoved", 17)] {
+                        if let Some(count) = row.get::<_, Option<i64>>(column)? {
+                            detail[key] = serde_json::json!(count);
+                        }
+                    }
+                    if !usage.is_empty() {
+                        detail["usage"] = serde_json::to_value(usage).unwrap_or_default();
+                    }
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<String>>(18)?,
+                        detail,
+                    ))
+                })
+                .map_err(fail)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(fail)?
+        };
+        for (conversation, old, created_at, request_id, round, envelope, owner, detail) in rows {
+            let Some(seq) = new_seq(&conversation, LEGACY_REQUEST, old) else {
+                continue;
+            };
+            let hash = store_blob_tx(tx, &conversation, &envelope, HISTORY_EVIDENCE_MAX_BYTES)?;
+            tx.execute(
+                "INSERT INTO history_entry
+                 (conversation_id, seq, created_at, kind, owner, request_id, round, call_id, answers, detail, hash)
+                 VALUES (?1, ?2, ?3, 'request', ?4, ?5, ?6, NULL, NULL, ?7, ?8)",
+                rusqlite::params![
+                    conversation,
+                    seq,
+                    created_at,
+                    owner,
+                    request_id,
+                    round,
+                    detail.to_string(),
+                    hash
+                ],
+            )
+            .map_err(fail)?;
+        }
+    }
+
+    if present.contains("wire_request_part") {
+        tx.execute(
+            &format!(
+                "INSERT INTO history_part (conversation_id, seq, ordinal, kind, hash, role)
+                 SELECT part.conversation_id, moved.new_seq, part.ordinal, part.kind, part.hash, part.role
+                 FROM wire_request_part part
+                 JOIN temp.history_legacy_seq moved
+                   ON moved.conversation_id = part.conversation_id
+                  AND moved.source = {LEGACY_REQUEST}
+                  AND moved.old_seq = part.seq"
+            ),
+            [],
+        )
+        .map_err(fail)?;
+    }
+
+    if present.contains("wire_response") {
+        let rows = {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT conversation_id, seq, received_at, request_seq, owner, request_id,
+                            round, attempt, model_id, finish_reason, raw_finish_reason, hash
+                     FROM wire_response WHERE {live}"
+                ))
+                .map_err(fail)?;
+            let rows = statement
+                .query_map([], |row| {
+                    let mut detail = serde_json::json!({"attempt": row.get::<_, i64>(7)?});
+                    for (key, column) in [("modelId", 8), ("finishReason", 9), ("rawFinishReason", 10)] {
+                        if let Some(value) = row.get::<_, Option<String>>(column)? {
+                            detail[key] = serde_json::json!(value);
+                        }
+                    }
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(11)?,
+                        detail,
+                    ))
+                })
+                .map_err(fail)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(fail)?
+        };
+        for (conversation, old, received_at, request_seq, owner, request_id, round, hash, detail) in
+            rows
+        {
+            let Some(seq) = new_seq(&conversation, LEGACY_RESPONSE, old) else {
+                continue;
+            };
+            let answers =
+                request_seq.and_then(|request| new_seq(&conversation, LEGACY_REQUEST, request));
+            tx.execute(
+                "INSERT INTO history_entry
+                 (conversation_id, seq, created_at, kind, owner, request_id, round, call_id, answers, detail, hash)
+                 VALUES (?1, ?2, ?3, 'response', ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+                rusqlite::params![
+                    conversation,
+                    seq,
+                    received_at,
+                    owner,
+                    request_id,
+                    round,
+                    answers,
+                    detail.to_string(),
+                    hash
+                ],
+            )
+            .map_err(fail)?;
+        }
+    }
+
+    if present.contains("timeline_op") {
+        let rows = {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT conversation_id, seq, ordinal, op, context_id, position, data
+                     FROM timeline_op WHERE {live}"
+                ))
+                .map_err(fail)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })
+                .map_err(fail)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(fail)?
+        };
+        for (conversation, old, ordinal, op, context_id, position, data) in rows {
+            let Some(seq) = new_seq(&conversation, LEGACY_TRUNK, old) else {
+                continue;
+            };
+            let hash = data
+                .as_deref()
+                .map(|data| store_blob_tx(tx, &conversation, data, HISTORY_EVIDENCE_MAX_BYTES))
+                .transpose()?;
+            tx.execute(
+                "INSERT INTO history_op (conversation_id, seq, ordinal, op, context_id, position, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![conversation, seq, ordinal, op, context_id, position, hash],
+            )
+            .map_err(fail)?;
+        }
+    }
+
+    if present.contains("timeline_event") {
+        let rows = {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT conversation_id, seq, kind, request_id, inserted, removed, replaced,
+                            row_count, created_at
+                     FROM timeline_event WHERE {live}"
+                ))
+                .map_err(fail)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        [row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?],
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
+                .map_err(fail)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(fail)?
+        };
+        for (conversation, old, kind, request_id, [inserted, removed, replaced], row_count, created_at) in
+            rows
+        {
+            let Some(seq) = new_seq(&conversation, LEGACY_TRUNK, old) else {
+                continue;
+            };
+            // Judged from the migrated steps, the way a new change is judged from
+            // its own: only tail inserts of user rows is a message that was sent.
+            let head_before = row_count - inserted + removed;
+            let appended = removed == 0
+                && replaced == 0
+                && inserted > 0
+                && !tx
+                    .prepare(
+                        "SELECT 1 FROM history_op op
+                         LEFT JOIN history_blob stored
+                           ON stored.conversation_id = op.conversation_id AND stored.hash = op.hash
+                         WHERE op.conversation_id = ?1 AND op.seq = ?2
+                           AND (op.op <> 'insert' OR op.position < ?3 OR stored.body IS NULL
+                                OR NOT json_valid(stored.body)
+                                OR json_extract(stored.body, '$.kind') IS NOT 'user')
+                         LIMIT 1",
+                    )
+                    .and_then(|mut statement| {
+                        statement.exists(rusqlite::params![conversation, seq, head_before])
+                    })
+                    .map_err(fail)?;
+            let (kind, source) = match kind.as_str() {
+                "edit" if appended => ("edit", "message"),
+                "baseline" => ("edit", "baseline"),
+                "run" => ("run", "run"),
+                _ => ("edit", "edit"),
+            };
+            let detail = serde_json::json!({
+                "source": source,
+                "inserted": inserted,
+                "removed": removed,
+                "replaced": replaced,
+                "rowCount": row_count,
+            });
+            tx.execute(
+                "INSERT INTO history_entry
+                 (conversation_id, seq, created_at, kind, owner, request_id, round, call_id, answers, detail, hash)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, NULL, NULL, ?6, NULL)",
+                rusqlite::params![conversation, seq, created_at, kind, request_id, detail.to_string()],
+            )
+            .map_err(fail)?;
+        }
+    }
+
+    if present.contains("timeline_head") {
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO history_head (conversation_id, position, context_id, data)
+                 SELECT conversation_id, position, context_id, data FROM timeline_head WHERE {live}"
+            ),
+            [],
+        )
+        .map_err(fail)?;
+    }
+
+    tx.execute_batch("DROP TABLE temp.history_legacy_seq")
+        .map_err(fail)?;
+    for table in LEGACY_HISTORY_TABLES {
+        if present.contains(table) {
+            tx.execute_batch(&format!("DROP TABLE {table}"))
+                .map_err(fail)?;
+        }
+    }
     Ok(())
 }
 
@@ -3167,8 +4173,9 @@ fn put_conversation_tx(
     tx: &rusqlite::Transaction<'_>,
     workspace_id: &str,
     conversation: &Conversation,
+    new_row: NewRowAt,
 ) -> Result<(), String> {
-    put_conversation_row_tx(tx, workspace_id, conversation)?;
+    put_conversation_row_tx(tx, workspace_id, conversation, new_row)?;
 
     tx.execute(
         "DELETE FROM context WHERE conversation_id = ?1",
@@ -3222,7 +4229,7 @@ fn put_conversation_tx(
     replace_aborted_tasks_tx(tx, conversation)?;
     // In the same transaction as the replace it describes: a history that can
     // outlive a rolled-back write would name a timeline that never existed.
-    record_timeline_event_tx(tx, &conversation.id, TimelineEventKind::Edit, None)
+    record_trunk_change_tx(tx, &conversation.id, TrunkChange::Edit, None)
 }
 
 /// The `worktree` column: a list of records, or — written before every
@@ -3238,12 +4245,24 @@ fn read_worktrees(value: &str) -> Vec<ConversationWorktree> {
         .unwrap_or_default()
 }
 
-/// Inserts or updates the conversation's own row. A new conversation goes to the end of its
-/// workspace; an existing one keeps its sidebar position.
+/// Where a conversation the store has not seen before enters its workspace's list.
+#[derive(Clone, Copy)]
+enum NewRowAt {
+    /// After every other one: load-time seeding keeps the document's order, and
+    /// the renderer sends the workspace's order itself right after a creation.
+    End,
+    /// Above every other one, as the sidebar lists a conversation the user just
+    /// started: the child of a host-made fork or handover, whose order no one sends.
+    Top,
+}
+
+/// Inserts or updates the conversation's own row. A new conversation goes where
+/// `new_row` says; an existing one keeps its sidebar position.
 fn put_conversation_row_tx(
     tx: &rusqlite::Transaction<'_>,
     workspace_id: &str,
     conversation: &Conversation,
+    new_row: NewRowAt,
 ) -> Result<(), String> {
     let settings = serde_json::to_string(&conversation.settings)
         .map_err(|error| format!("对话设置无法序列化：{error}"))?;
@@ -3287,6 +4306,12 @@ fn put_conversation_row_tx(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| format!("对话分叉来源无法序列化：{error}"))?;
+    let handoff_of = conversation
+        .handoff_of
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("对话交接来源无法序列化：{error}"))?;
     let order_key: Option<f64> = tx
         .query_row(
             "SELECT order_key FROM conversation WHERE id = ?1",
@@ -3298,21 +4323,25 @@ fn put_conversation_row_tx(
     let order_key = match order_key {
         Some(existing) => existing,
         None => {
-            let max: Option<f64> = tx
+            let (edge, step) = match new_row {
+                NewRowAt::End => ("max", ORDER_STEP),
+                NewRowAt::Top => ("min", -ORDER_STEP),
+            };
+            let edge: Option<f64> = tx
                 .query_row(
-                    "SELECT max(order_key) FROM conversation WHERE workspace_id = ?1",
+                    &format!("SELECT {edge}(order_key) FROM conversation WHERE workspace_id = ?1"),
                     [workspace_id],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(|error| format!("无法读取对话排序键：{error}"))?
                 .flatten();
-            max.map(|value| value + ORDER_STEP).unwrap_or(0.0)
+            edge.map(|value| value + step).unwrap_or(0.0)
         }
     };
     tx.execute(
-        "INSERT INTO conversation (id, workspace_id, title, created_at, updated_at, order_key, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories, attached_workspaces, fork_of)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        "INSERT INTO conversation (id, workspace_id, title, created_at, updated_at, order_key, settings, worktree, run_target, parent_conversation_id, preset_id, template_id, additional_directories, attached_workspaces, fork_of, handoff_of)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT (id) DO UPDATE SET workspace_id = excluded.workspace_id,
            title = excluded.title, created_at = excluded.created_at,
            updated_at = excluded.updated_at, settings = excluded.settings,
@@ -3321,7 +4350,7 @@ fn put_conversation_row_tx(
            preset_id = excluded.preset_id, template_id = excluded.template_id,
            additional_directories = excluded.additional_directories,
            attached_workspaces = excluded.attached_workspaces,
-           fork_of = excluded.fork_of",
+           fork_of = excluded.fork_of, handoff_of = excluded.handoff_of",
         rusqlite::params![
             conversation.id,
             workspace_id,
@@ -3338,6 +4367,7 @@ fn put_conversation_row_tx(
             additional_directories,
             attached_workspaces,
             fork_of,
+            handoff_of,
         ],
     )
     .map_err(|error| format!("无法写入对话：{error}"))?;
@@ -3471,6 +4501,7 @@ mod tests {
             run_target: None,
             parent_conversation_id: None,
             fork_of: None,
+            handoff_of: None,
             preset_id: String::new(),
             template_id: String::new(),
             attached_workspaces: Vec::new(),
@@ -3510,6 +4541,173 @@ mod tests {
         }
     }
 
+    fn cached(store: &ConversationStore, id: &str) -> bool {
+        MemoryPool::global().contains(&store.bodies.key(id))
+    }
+
+    /// A read keeps the body in memory; the next read comes from there.
+    #[test]
+    fn a_read_fills_the_pool_and_the_next_read_is_served_from_it() {
+        let (_dir, store) = temp_store();
+        let mut conversation = conversation("c1");
+        conversation.contexts.push(user("u1", "hello"));
+        store.put_conversation("ws", &conversation).unwrap();
+        assert!(!cached(&store, "c1"), "a write leaves nothing behind to go stale");
+        let first = store.conversation_shared("c1").unwrap().unwrap();
+        assert!(cached(&store, "c1"));
+        let second = store.conversation_shared("c1").unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Unloaded from memory, a body is read from the database again.
+    #[test]
+    fn an_unloaded_body_falls_back_to_the_database() {
+        let (_dir, store) = temp_store();
+        let mut conversation = conversation("c1");
+        conversation.contexts.push(user("u1", "hello"));
+        store.put_conversation("ws", &conversation).unwrap();
+        let first = store.conversation_shared("c1").unwrap().unwrap();
+        MemoryPool::global().remove(&store.bodies.key("c1"));
+        let again = store.conversation_shared("c1").unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &again));
+        assert_eq!(*first, *again);
+        assert!(cached(&store, "c1"));
+    }
+
+    /// Every write path that changes a body drops the cached copy, so a read
+    /// after it sees the database, never the body from before the write.
+    #[test]
+    fn every_body_write_invalidates_the_cached_copy() {
+        let (_dir, store) = temp_store();
+        let mut base = conversation("c1");
+        base.contexts.push(user("u1", "hello"));
+        base.queued_messages.push(QueuedMessage {
+            id: "q1".into(),
+            content: "later".into(),
+            images: Vec::new(),
+            files: Vec::new(),
+            created_at: "2026-08-25T00:00:02.000Z".into(),
+        });
+        store.put_conversation("ws", &base).unwrap();
+
+        let writes: Vec<(&str, Box<dyn Fn(&ConversationStore)>)> = vec![
+            (
+                "upsert",
+                Box::new(|store| {
+                    store
+                        .upsert_contexts("c1", &[user("u2", "streamed")], ContextStatus::Streaming)
+                        .unwrap()
+                }),
+            ),
+            (
+                "reconcile one",
+                Box::new(|store| {
+                    store.reconcile_streaming_in("c1").unwrap();
+                }),
+            ),
+            (
+                "metadata",
+                Box::new(|store| {
+                    let mut renamed = store.conversation("c1").unwrap().unwrap();
+                    renamed.title = "renamed".into();
+                    store.put_conversation_metadata("ws", &renamed).unwrap()
+                }),
+            ),
+            (
+                "dequeue",
+                Box::new(|store| store.remove_queued_messages("c1", &["q1".into()]).unwrap()),
+            ),
+            (
+                "discard",
+                Box::new(|store| {
+                    store
+                        .upsert_contexts("c1", &[user("u3", "draft")], ContextStatus::Streaming)
+                        .unwrap();
+                    store.conversation_shared("c1").unwrap();
+                    store.discard_streaming_contexts("c1", &["u3"]).unwrap();
+                }),
+            ),
+            (
+                "reconcile all",
+                Box::new(|store| {
+                    store.reconcile_streaming().unwrap();
+                }),
+            ),
+            (
+                "reorder",
+                Box::new(|store| store.set_workspace_order("ws", &["c1".into()]).unwrap()),
+            ),
+            (
+                "replace",
+                Box::new(|store| {
+                    let mut replaced = store.conversation("c1").unwrap().unwrap();
+                    replaced.contexts.push(user("u4", "edited"));
+                    store.put_conversation("ws", &replaced).unwrap()
+                }),
+            ),
+        ];
+        for (name, write) in writes {
+            store.conversation_shared("c1").unwrap();
+            assert!(cached(&store, "c1"), "{name}: primed");
+            write(&store);
+            assert!(!cached(&store, "c1"), "{name}: the write invalidates");
+            assert_eq!(
+                store.conversation("c1").unwrap(),
+                store.conversation_from_disk("c1").unwrap(),
+                "{name}: the next read matches the database"
+            );
+        }
+        store.delete_conversation("c1").unwrap();
+        assert!(store.conversation("c1").unwrap().is_none());
+    }
+
+    /// A read that raced a write returns what it read but does not keep it: the
+    /// write's invalidation came after the read noted the generation.
+    #[test]
+    fn a_read_that_raced_a_write_is_not_kept() {
+        let (_dir, store) = temp_store();
+        store.put_conversation("ws", &conversation("c1")).unwrap();
+        let seen = store.bodies.generation("c1");
+        let stale = Arc::new(store.conversation_from_disk("c1").unwrap().unwrap());
+        store
+            .upsert_contexts("c1", &[user("u1", "new")], ContextStatus::Settled)
+            .unwrap();
+        store.bodies.fill("c1", seen, &stale);
+        assert!(!cached(&store, "c1"));
+        assert_eq!(store.conversation("c1").unwrap().unwrap().contexts.len(), 1);
+    }
+
+    /// Stores on different files never share cached bodies, even for the same
+    /// id.
+    #[test]
+    fn stores_on_different_files_keep_apart() {
+        let (_dir_a, a) = temp_store();
+        let (_dir_b, b) = temp_store();
+        let mut first = conversation("same");
+        first.title = "a".into();
+        let mut second = conversation("same");
+        second.title = "b".into();
+        a.put_conversation("ws", &first).unwrap();
+        b.put_conversation("ws", &second).unwrap();
+        assert_eq!(a.conversation("same").unwrap().unwrap().title, "a");
+        assert_eq!(b.conversation("same").unwrap().unwrap().title, "b");
+    }
+
+    /// Two stores on one file share one cache: a write through either
+    /// invalidates what the other read.
+    #[test]
+    fn stores_on_one_file_share_their_invalidations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE_FILE_NAME);
+        let a = ConversationStore::open(&path).unwrap();
+        a.put_conversation("ws", &conversation("c1")).unwrap();
+        let b = ConversationStore::open(&path).unwrap();
+        assert!(b.conversation("c1").unwrap().unwrap().contexts.is_empty());
+        a.upsert_contexts("c1", &[user("u1", "new")], ContextStatus::Settled)
+            .unwrap();
+        assert_eq!(b.conversation("c1").unwrap().unwrap().contexts.len(), 1);
+    }
+
     /// The point of recording history at all: a row the user later deleted, and a
     /// row they later rewrote, both still read the way they did at the time. A
     /// snapshot rebuilt from the current timeline could not do this.
@@ -3538,16 +4736,21 @@ mod tests {
         conversation.contexts = vec![user("ctx_a", "rewritten"), user("ctx_c", "third")];
         store.put_conversation("ws", &conversation).expect("edit");
 
-        let events = store.timeline_events("conv_history").expect("events");
+        let events = store.trunk_changes("conv_history").expect("events");
         assert_eq!(events.len(), 3, "one entry per committed change");
-        assert_eq!(events[0].kind, "baseline");
+        assert_eq!((events[0].kind.as_str(), events[0].source.as_str()), ("edit", "message"));
         assert_eq!(events[0].inserted, 2);
-        assert_eq!(events[1].kind, "edit");
+        assert_eq!(
+            (events[1].kind.as_str(), events[1].source.as_str()),
+            ("edit", "message"),
+            "appending what the user typed is sending, not editing"
+        );
         assert_eq!((events[1].inserted, events[1].removed), (1, 0));
+        assert_eq!(events[2].source, "edit");
         assert_eq!((events[2].removed, events[2].replaced), (1, 1));
 
         let seeded = store
-            .timeline_snapshot("conv_history", events[0].seq)
+            .trunk_snapshot("conv_history", events[0].seq)
             .expect("baseline snapshot");
         assert_eq!(
             seeded.iter().map(ContextItem::id).collect::<Vec<_>>(),
@@ -3555,7 +4758,7 @@ mod tests {
         );
 
         let before_edit = store
-            .timeline_snapshot("conv_history", events[1].seq)
+            .trunk_snapshot("conv_history", events[1].seq)
             .expect("snapshot before the edit");
         assert_eq!(
             before_edit.iter().map(ContextItem::id).collect::<Vec<_>>(),
@@ -3568,7 +4771,7 @@ mod tests {
         assert_eq!(content, "first", "the rewrite must not reach back in time");
 
         let newest = store
-            .timeline_snapshot("conv_history", events[2].seq)
+            .trunk_snapshot("conv_history", events[2].seq)
             .expect("newest snapshot");
         assert_eq!(
             newest.iter().map(ContextItem::id).collect::<Vec<_>>(),
@@ -3590,12 +4793,12 @@ mod tests {
         store.put_conversation("ws", &conversation).expect("seed");
         store.put_conversation("ws", &conversation).expect("resave");
         store
-            .record_timeline_event("conv_quiet", TimelineEventKind::Run, Some("req_1"))
+            .record_trunk_change("conv_quiet", TrunkChange::Run, Some("req_1"))
             .expect("record");
 
-        let events = store.timeline_events("conv_quiet").expect("events");
+        let events = store.trunk_changes("conv_quiet").expect("events");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "baseline");
+        assert_eq!(events[0].source, "message");
     }
 
     /// Reordering has to replay as a reorder, not as a body swap: the rows keep
@@ -3615,10 +4818,10 @@ mod tests {
             .put_conversation("ws", &conversation)
             .expect("reorder");
 
-        let events = store.timeline_events("conv_moved").expect("events");
+        let events = store.trunk_changes("conv_moved").expect("events");
         assert_eq!(events.len(), 2);
         let moved = store
-            .timeline_snapshot("conv_moved", events[1].seq)
+            .trunk_snapshot("conv_moved", events[1].seq)
             .expect("snapshot");
         assert_eq!(
             moved.iter().map(ContextItem::id).collect::<Vec<_>>(),
@@ -3642,12 +4845,13 @@ mod tests {
             )
             .expect("reply");
         store
-            .record_timeline_event("conv_run", TimelineEventKind::Run, Some("req_7"))
+            .record_trunk_change("conv_run", TrunkChange::Run, Some("req_7"))
             .expect("record");
 
-        let events = store.timeline_events("conv_run").expect("events");
+        let events = store.trunk_changes("conv_run").expect("events");
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "run");
+        assert_eq!(events[1].source, "run");
         assert_eq!(events[1].request_id.as_deref(), Some("req_7"));
         assert_eq!(events[1].row_count, 2);
     }
@@ -3699,6 +4903,27 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_child_opens_its_workspace_list_and_keeps_its_place_when_saved_again() {
+        let (_dir, store) = temp_store();
+        store.put_conversation("ws", &conversation("first")).unwrap();
+        store.put_conversation("ws", &conversation("second")).unwrap();
+        let mut child = conversation("fork_child");
+        child.contexts.push(user("prompt", "hello"));
+        store.put_fork_conversation("ws", &child, "prompt").unwrap();
+        store.put_conversation("ws", &conversation("seeded")).unwrap();
+        store.put_conversation("ws", &child).unwrap();
+        assert_eq!(
+            store.workspace_conversation_ids("ws").unwrap(),
+            ["fork_child", "first", "second", "seeded"]
+        );
+        // The first conversation of a workspace has no neighbour to go above.
+        let mut lone = conversation("lone_child");
+        lone.contexts.push(user("prompt", "hello"));
+        store.put_fork_conversation("empty", &lone, "prompt").unwrap();
+        assert_eq!(store.workspace_conversation_ids("empty").unwrap(), ["lone_child"]);
+    }
+
+    #[test]
     fn fork_start_creation_is_atomic_and_delete_cascades() {
         let (_dir, store) = temp_store();
         let mut child = conversation("fork_child");
@@ -3723,7 +4948,7 @@ mod tests {
         let mut child = conversation("history");
         child.contexts.push(user("prompt", "hello"));
         store.put_conversation("ws", &child).unwrap();
-        store.lock().unwrap().execute_batch("DROP TABLE pending_fork_start; DROP TABLE conversation_plan; DROP TABLE fork_decision; DROP TABLE timeline_event; DROP TABLE timeline_op; DROP TABLE timeline_head; DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE wire_request_part; DROP TABLE wire_blob; DROP TABLE wire_request; ALTER TABLE conversation DROP COLUMN preset_id; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 2;").unwrap();
+        store.lock().unwrap().execute_batch("DROP TABLE pending_fork_start; DROP TABLE conversation_plan; DROP TABLE fork_decision; DROP TABLE history_op; DROP TABLE history_head; DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE history_part; DROP TABLE history_blob; DROP TABLE history_entry; ALTER TABLE conversation DROP COLUMN preset_id; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 2;").unwrap();
         drop(store);
         let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
         assert_eq!(
@@ -3748,7 +4973,7 @@ mod tests {
         let mut child = conversation("history");
         child.contexts.push(user("prompt", "hello"));
         store.put_conversation("ws", &child).unwrap();
-        store.lock().unwrap().execute_batch("DROP TABLE conversation_plan; DROP TABLE fork_decision; DROP TABLE timeline_event; DROP TABLE timeline_op; DROP TABLE timeline_head; DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE wire_request_part; DROP TABLE wire_blob; DROP TABLE wire_request; ALTER TABLE conversation DROP COLUMN preset_id; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 3;").unwrap();
+        store.lock().unwrap().execute_batch("DROP TABLE conversation_plan; DROP TABLE fork_decision; DROP TABLE history_op; DROP TABLE history_head; DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE history_part; DROP TABLE history_blob; DROP TABLE history_entry; ALTER TABLE conversation DROP COLUMN preset_id; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 3;").unwrap();
         drop(store);
         let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).unwrap();
         assert_eq!(
@@ -3902,7 +5127,7 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .execute_batch("DROP TABLE fork_decision; DROP TABLE timeline_event; DROP TABLE timeline_op; DROP TABLE timeline_head; DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE wire_request_part; DROP TABLE wire_blob; DROP TABLE wire_request; ALTER TABLE conversation DROP COLUMN preset_id; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 4;")
+            .execute_batch("DROP TABLE fork_decision; DROP TABLE history_op; DROP TABLE history_head; DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE history_part; DROP TABLE history_blob; DROP TABLE history_entry; ALTER TABLE conversation DROP COLUMN preset_id; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 4;")
             .unwrap();
         drop(store);
 
@@ -4047,6 +5272,31 @@ mod tests {
             .put_conversation_metadata("ws", &fork)
             .expect("metadata");
         assert_eq!(store.conversation("fork").expect("read").expect("fork"), fork);
+    }
+
+    #[test]
+    fn handoff_origin_round_trips_through_inserts_and_metadata_writes() {
+        let (_dir, store) = temp_store();
+        let mut continuation = conversation("continuation");
+        continuation.handoff_of = Some(ConversationHandoffOrigin {
+            conversation_id: "origin".into(),
+            number: 2,
+        });
+        store.put_conversation("ws", &continuation).expect("insert");
+        assert_eq!(
+            store.conversation("continuation").expect("read").expect("row"),
+            continuation
+        );
+        // A rename is a metadata write and keeps the trace: the next handoff
+        // still numbers under the same origin.
+        continuation.title = "renamed".into();
+        store
+            .put_conversation_metadata("ws", &continuation)
+            .expect("metadata");
+        assert_eq!(
+            store.conversation("continuation").expect("read").expect("row"),
+            continuation
+        );
     }
 
     #[test]
@@ -4198,7 +5448,7 @@ mod tests {
             .lock()
             .expect("lock")
             .execute_batch(
-                "DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE wire_request_part; DROP TABLE wire_blob; DROP TABLE wire_request; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 7;",
+                "DROP TABLE template_context; DROP TABLE conversation_template; DROP TABLE history_part; DROP TABLE history_blob; DROP TABLE history_entry; ALTER TABLE conversation DROP COLUMN template_id; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 7;",
             )
             .expect("downgrade to v7");
         drop(store);
@@ -4248,12 +5498,12 @@ mod tests {
         );
     }
 
-    fn wire_record(conversation_id: &str, parts: &[(&str, &str)]) -> WireRequestRecord {
-        wire_record_of(
+    fn request_record(conversation_id: &str, parts: &[(&str, &str)]) -> HistoryRequestRecord {
+        request_record_of(
             conversation_id,
             parts
                 .iter()
-                .map(|(kind, body)| WireRecordedPart {
+                .map(|(kind, body)| HistoryPartRecord {
                     kind: (*kind).to_owned(),
                     role: None,
                     author: None,
@@ -4265,8 +5515,11 @@ mod tests {
 
     /// The same request with parts that carry the role and author the recorder
     /// derives, which is all the message delta ever looks at.
-    fn wire_record_of(conversation_id: &str, parts: Vec<WireRecordedPart>) -> WireRequestRecord {
-        WireRequestRecord {
+    fn request_record_of(
+        conversation_id: &str,
+        parts: Vec<HistoryPartRecord>,
+    ) -> HistoryRequestRecord {
+        HistoryRequestRecord {
             conversation_id: conversation_id.into(),
             owner: None,
             kind: "model".into(),
@@ -4282,29 +5535,127 @@ mod tests {
     }
 
     /// The same request as a named child agent issued it.
-    fn wire_child_record(
+    fn child_request_record(
         conversation_id: &str,
         owner: &str,
         parts: &[(&str, &str)],
-    ) -> WireRequestRecord {
-        WireRequestRecord {
+    ) -> HistoryRequestRecord {
+        HistoryRequestRecord {
             owner: Some(owner.into()),
-            ..wire_record(conversation_id, parts)
+            ..request_record(conversation_id, parts)
         }
     }
 
-    /// The trunk's ledger, which is what the conversation's own pane reads.
-    fn trunk_requests(store: &ConversationStore, conversation_id: &str) -> Vec<WireRequestSummary> {
-        store.wire_requests(conversation_id, None).expect("ledger")
-    }
-
-    fn wire_message(role: &str, author: &str, body: &str) -> WireRecordedPart {
-        WireRecordedPart {
+    fn message_part(role: &str, author: &str, body: &str) -> HistoryPartRecord {
+        HistoryPartRecord {
             kind: "message".into(),
             role: Some(role.into()),
             author: Some(author.into()),
             body: body.into(),
         }
+    }
+
+    /// A response the way the recorder hands one over: answering `answers`, with
+    /// whatever usage the provider disclosed.
+    fn response_record(
+        conversation_id: &str,
+        owner: Option<&str>,
+        answers: Option<i64>,
+        usage: Option<HistoryUsage>,
+        body: String,
+    ) -> HistoryEntryRecord {
+        let mut detail = serde_json::json!({
+            "attempt": 1,
+            "modelId": "claude-opus-5",
+            "finishReason": "stop",
+            "rawFinishReason": "end_turn",
+        });
+        if let Some(usage) = usage {
+            detail["usage"] = serde_json::to_value(usage).expect("usage");
+        }
+        HistoryEntryRecord {
+            conversation_id: conversation_id.into(),
+            kind: "response",
+            owner: owner.map(str::to_owned),
+            request_id: Some("req_a".into()),
+            round: Some(2),
+            call_id: None,
+            answers,
+            detail,
+            body: Some(body),
+            body_cap: HISTORY_EVIDENCE_MAX_BYTES,
+        }
+    }
+
+    /// A request entry with its detail read out, the way the pane reads one.
+    #[derive(Debug)]
+    struct RequestRow {
+        seq: i64,
+        created_at: String,
+        kind: String,
+        request_id: Option<String>,
+        round: Option<i64>,
+        attempt: Option<i64>,
+        provider_name: String,
+        family: String,
+        model_id: String,
+        part_count: i64,
+        bytes: i64,
+        usage: Option<HistoryUsage>,
+        messages_added: Option<i64>,
+        messages_removed: Option<i64>,
+        owner: Option<String>,
+    }
+
+    fn request_rows(
+        store: &ConversationStore,
+        conversation_id: &str,
+        owners: Option<&[String]>,
+    ) -> Vec<RequestRow> {
+        store
+            .history_entries(conversation_id, owners)
+            .expect("history")
+            .into_iter()
+            .filter(|entry| entry.kind == "request")
+            .map(|entry| {
+                let text = |key: &str| {
+                    entry.detail[key]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                let number = |key: &str| entry.detail[key].as_i64();
+                RequestRow {
+                    seq: entry.seq,
+                    created_at: entry.created_at.clone(),
+                    kind: text("type"),
+                    request_id: entry.request_id.clone(),
+                    round: entry.round,
+                    attempt: number("attempt"),
+                    provider_name: text("providerName"),
+                    family: text("family"),
+                    model_id: text("modelId"),
+                    part_count: number("partCount").unwrap_or_default(),
+                    bytes: number("bytes").unwrap_or_default(),
+                    usage: entry.usage,
+                    messages_added: number("messagesAdded"),
+                    messages_removed: number("messagesRemoved"),
+                    owner: entry.owner.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// The trunk's requests, which is what the conversation's own pane reads.
+    fn trunk_requests(store: &ConversationStore, conversation_id: &str) -> Vec<RequestRow> {
+        request_rows(store, conversation_id, None)
+    }
+
+    fn entry_detail(store: &ConversationStore, conversation_id: &str, seq: i64) -> HistoryEntryDetail {
+        store
+            .history_entry(conversation_id, seq)
+            .expect("read")
+            .expect("entry")
     }
 
     fn row_count(store: &ConversationStore, query: &str) -> i64 {
@@ -4315,70 +5666,170 @@ mod tests {
             .expect("count")
     }
 
-    /// The renderer reads these rows as JSON, so the names and the absences are
+    /// The renderer reads these entries as JSON, so the names and the absences are
     /// part of the contract: an undisclosed counter must be missing rather than
-    /// present and null, which is what the panel distinguishes on.
+    /// present and null, which is what the pane distinguishes on. A request carries
+    /// the usage of the response that answered it.
     #[test]
-    fn a_wire_summary_serialises_the_shape_the_panel_reads() {
+    fn a_history_entry_serialises_the_shape_the_panel_reads() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_json"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record_of(
+            .record_history_request(&request_record_of(
                 "conv_json",
-                vec![wire_message("user", "user", "{\"role\":\"user\"}")],
+                vec![message_part("user", "user", "{\"role\":\"user\"}")],
             ))
             .expect("record");
+        let usage = HistoryUsage {
+            input_tokens: Some(12),
+            cached_input_tokens: None,
+            output_tokens: Some(3),
+        };
         store
-            .record_wire_usage(
+            .record_history_entry(&response_record(
                 "conv_json",
-                1,
-                &WireUsage {
-                    input_tokens: Some(12),
-                    cached_input_tokens: None,
-                    output_tokens: Some(3),
-                },
-            )
-            .expect("attach usage");
+                None,
+                Some(1),
+                Some(usage),
+                "{\"role\":\"assistant\"}".into(),
+            ))
+            .expect("respond");
 
-        let mut summary = trunk_requests(&store, "conv_json").remove(0);
-        summary.created_at = "2026-08-25T00:00:00.000Z".into();
+        let mut entries = store.history_entries("conv_json", None).expect("history");
+        for entry in &mut entries {
+            entry.created_at = "2026-08-25T00:00:00.000Z".into();
+        }
         assert_eq!(
-            serde_json::to_value(&summary).expect("serialise"),
-            serde_json::json!({
-                "seq": 1,
-                "createdAt": "2026-08-25T00:00:00.000Z",
-                "kind": "model",
-                "requestId": "req_a",
-                "round": 0,
-                "attempt": 0,
-                "providerName": "anthropic",
-                "family": "messages",
-                "modelId": "claude-opus-5",
-                "partCount": 1,
-                "bytes": 15,
-                "usage": { "inputTokens": 12, "outputTokens": 3 },
-                "messagesAdded": 1,
-                "messagesRemoved": 0,
-            })
+            serde_json::to_value(&entries).expect("serialise"),
+            serde_json::json!([
+                {
+                    "seq": 1,
+                    "createdAt": "2026-08-25T00:00:00.000Z",
+                    "kind": "request",
+                    "requestId": "req_a",
+                    "round": 0,
+                    "detail": {
+                        "type": "model",
+                        "attempt": 0,
+                        "providerName": "anthropic",
+                        "family": "messages",
+                        "modelId": "claude-opus-5",
+                        "partCount": 1,
+                        "bytes": 15,
+                        "messagesAdded": 1,
+                        "messagesRemoved": 0,
+                    },
+                    "usage": { "inputTokens": 12, "outputTokens": 3 },
+                },
+                {
+                    "seq": 2,
+                    "createdAt": "2026-08-25T00:00:00.000Z",
+                    "kind": "response",
+                    "requestId": "req_a",
+                    "round": 2,
+                    "answers": 1,
+                    "detail": {
+                        "attempt": 1,
+                        "modelId": "claude-opus-5",
+                        "finishReason": "stop",
+                        "rawFinishReason": "end_turn",
+                        "usage": { "inputTokens": 12, "outputTokens": 3 },
+                    },
+                    "usage": { "inputTokens": 12, "outputTokens": 3 },
+                },
+            ])
         );
 
-        // A request whose response never landed carries no `usage` key at all.
+        // A request no response answered carries no `usage` key at all.
         store
-            .record_wire_request(&wire_record("conv_json", &[("message", "{}")]))
+            .record_history_request(&request_record("conv_json", &[("message", "{}")]))
             .expect("record");
-        let unanswered = trunk_requests(&store, "conv_json").remove(1);
+        let unanswered = store
+            .history_entries("conv_json", None)
+            .expect("history")
+            .remove(2);
         let unanswered = serde_json::to_value(&unanswered).expect("serialise");
         assert!(unanswered.get("usage").is_none());
-        assert_eq!(unanswered["messagesRemoved"], serde_json::json!(1));
+        assert_eq!(unanswered["detail"]["messagesRemoved"], serde_json::json!(1));
     }
 
-    /// The ledger is an append-only list: one row per request that went out,
-    /// numbered from one, carrying what identified the request rather than what
-    /// it said.
+    /// Responses are kept per owner and read back whole — a body past the part cap
+    /// included, since what it holds is what recovery checks — and go with their
+    /// conversation.
     #[test]
-    fn wire_ledger_records_a_request_and_numbers_it_from_one() {
+    fn responses_are_kept_per_owner_whole_and_die_with_their_conversation() {
+        let (_dir, store) = temp_store();
+        store
+            .put_conversation("ws", &conversation("conv_in"))
+            .expect("seed");
+        let script = "x".repeat(HISTORY_PART_MAX_BYTES + 1024);
+        let trunk_body = serde_json::json!({"role": "assistant", "content": [
+            {"type": "tool-call", "toolCallId": "c1", "toolName": "workflow", "input": {"script": script}}
+        ]})
+        .to_string();
+        assert_eq!(
+            store
+                .record_history_entry(&response_record("conv_in", None, Some(7), None, trunk_body.clone()))
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .record_history_entry(&response_record(
+                    "conv_in",
+                    Some("reviewer"),
+                    None,
+                    None,
+                    "{\"role\":\"assistant\"}".into()
+                ))
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .record_history_entry(&response_record("conv_draft", None, None, None, "{}".into()))
+                .unwrap(),
+            None,
+            "草稿没有历史记录"
+        );
+
+        let responses = |owner: Option<&str>, needle: &str| {
+            store
+                .history_records(
+                    "conv_in",
+                    HistoryFilter {
+                        owner,
+                        kinds: &["response"],
+                        needle,
+                        ..HistoryFilter::default()
+                    },
+                )
+                .unwrap()
+        };
+        let trunk = responses(None, "");
+        assert_eq!(trunk.len(), 1);
+        assert_eq!(trunk[0].body.as_deref(), Some(trunk_body.as_str()), "超过分段上限的回复原样保存");
+        assert!(!trunk[0].truncated);
+        assert_eq!(trunk[0].answers, Some(7));
+        assert_eq!((trunk[0].round, trunk[0].detail["attempt"].as_i64()), (Some(2), Some(1)));
+        assert_eq!(trunk[0].detail_str("finishReason"), Some("stop"));
+        assert_eq!(trunk[0].detail_str("rawFinishReason"), Some("end_turn"));
+        assert_eq!(responses(Some("reviewer"), "").len(), 1);
+        assert!(responses(None, "\"toolCallId\":\"c2\"").is_empty());
+        assert_eq!(responses(None, "\"toolCallId\":\"c1\"").len(), 1);
+
+        store.delete_conversation("conv_in").unwrap();
+        assert!(responses(None, "").is_empty());
+        assert!(responses(Some("reviewer"), "").is_empty());
+        assert_eq!(row_count(&store, "SELECT count(*) FROM history_blob"), 0);
+    }
+
+    /// The record is append-only: one entry per request that went out, numbered
+    /// from one, carrying what identified the request rather than what it said.
+    #[test]
+    fn requests_are_numbered_from_one_and_carry_what_identified_them() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_wire"))
@@ -4389,14 +5840,14 @@ mod tests {
             ("message", "{\"role\":\"user\"}"),
         ];
         store
-            .record_wire_request(&wire_record("conv_wire", &parts))
+            .record_history_request(&request_record("conv_wire", &parts))
             .expect("first request");
-        let mut second = wire_record("conv_wire", &parts[..1]);
+        let mut second = request_record("conv_wire", &parts[..1]);
         second.request_id = "req_b".into();
         second.round = 3;
         second.attempt = 1;
         second.kind = "search".into();
-        store.record_wire_request(&second).expect("second request");
+        store.record_history_request(&second).expect("second request");
 
         let recorded = trunk_requests(&store, "conv_wire");
         assert_eq!(recorded.len(), 2);
@@ -4406,8 +5857,8 @@ mod tests {
             "序号从 1 开始并逐条递增"
         );
         assert_eq!(recorded[0].kind, "model");
-        assert_eq!(recorded[0].request_id, "req_a");
-        assert_eq!((recorded[0].round, recorded[0].attempt), (0, 0));
+        assert_eq!(recorded[0].request_id.as_deref(), Some("req_a"));
+        assert_eq!((recorded[0].round, recorded[0].attempt), (Some(0), Some(0)));
         assert_eq!(recorded[0].provider_name, "anthropic");
         assert_eq!(recorded[0].family, "messages");
         assert_eq!(recorded[0].model_id, "claude-opus-5");
@@ -4419,15 +5870,15 @@ mod tests {
         );
         assert!(!recorded[0].created_at.is_empty());
         assert_eq!(recorded[1].kind, "search");
-        assert_eq!((recorded[1].round, recorded[1].attempt), (3, 1));
+        assert_eq!((recorded[1].round, recorded[1].attempt), (Some(3), Some(1)));
         assert_eq!(recorded[1].part_count, 1);
     }
 
     /// The point of content addressing: a turn's second round re-sends the first
-    /// round's messages, and the ledger must not pay for them twice. Each request
+    /// round's messages, and the record must not pay for them twice. Each request
     /// still names every part it carried.
     #[test]
-    fn wire_ledger_stores_a_repeated_body_once_and_names_it_twice() {
+    fn a_repeated_body_is_stored_once_and_named_twice() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_dedupe"))
@@ -4435,10 +5886,10 @@ mod tests {
 
         let shared = ("message", "{\"role\":\"user\",\"content\":\"hi\"}");
         store
-            .record_wire_request(&wire_record("conv_dedupe", &[("system", "rules"), shared]))
+            .record_history_request(&request_record("conv_dedupe", &[("system", "rules"), shared]))
             .expect("first round");
         store
-            .record_wire_request(&wire_record(
+            .record_history_request(&request_record(
                 "conv_dedupe",
                 &[
                     ("system", "rules"),
@@ -4449,28 +5900,20 @@ mod tests {
             .expect("second round");
 
         assert_eq!(
-            row_count(&store, "SELECT count(*) FROM wire_blob"),
-            3,
-            "重复的正文只占一行，三段不同正文就是三行"
+            row_count(&store, "SELECT count(*) FROM history_blob"),
+            4,
+            "重复的正文只占一行：三段不同正文加上两次请求共用的信封"
         );
         assert_eq!(
-            row_count(&store, "SELECT count(*) FROM wire_request_part"),
+            row_count(&store, "SELECT count(*) FROM history_part"),
             5,
             "每次请求仍然点名自己带过的每一段"
         );
-        let detail = store
-            .wire_request("conv_dedupe", 2)
-            .expect("read")
-            .expect("row");
+        let detail = entry_detail(&store, "conv_dedupe", 2);
         assert_eq!(detail.parts[1].body, shared.1, "共享正文读回的是原文");
         assert_eq!(
             detail.parts[1].hash,
-            store
-                .wire_request("conv_dedupe", 1)
-                .expect("read")
-                .expect("row")
-                .parts[1]
-                .hash,
+            entry_detail(&store, "conv_dedupe", 1).parts[1].hash,
             "同一段正文在两次请求里是同一个地址"
         );
     }
@@ -4478,7 +5921,7 @@ mod tests {
     /// The detail view reads a request the way it went out: the parts in wire
     /// order, and the envelope that carried them.
     #[test]
-    fn wire_ledger_reads_parts_in_wire_order_with_their_envelope() {
+    fn a_request_reads_back_its_parts_in_wire_order_with_its_envelope() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_detail"))
@@ -4490,18 +5933,15 @@ mod tests {
             ("message", "{\"role\":\"user\"}"),
         ];
         store
-            .record_wire_request(&wire_record("conv_detail", &parts))
+            .record_history_request(&request_record("conv_detail", &parts))
             .expect("record");
 
-        let detail = store
-            .wire_request("conv_detail", 1)
-            .expect("read")
-            .expect("row");
-        assert_eq!(detail.summary.seq, 1);
-        assert_eq!(detail.summary.part_count, 4);
+        let detail = entry_detail(&store, "conv_detail", 1);
+        assert_eq!(detail.entry.seq, 1);
+        assert_eq!(detail.entry.detail["partCount"], serde_json::json!(4));
         assert_eq!(
-            detail.envelope,
-            serde_json::json!({ "maxOutputTokens": 4096 })
+            detail.body.as_deref(),
+            Some(serde_json::json!({ "maxOutputTokens": 4096 }).to_string().as_str())
         );
         assert_eq!(
             detail
@@ -4517,98 +5957,88 @@ mod tests {
             "分段按上线顺序读回"
         );
         assert!(detail.parts.iter().all(|part| !part.truncated));
-        assert_eq!(store.wire_request("conv_detail", 7).expect("read"), None);
+        assert!(detail.ops.is_empty());
+        assert_eq!(store.history_entry("conv_detail", 7).expect("read"), None);
 
-        // A corrupt envelope costs its own field, not the parts recorded beside it.
+        // A corrupt detail costs its own field, not the parts recorded beside it.
         store
             .lock()
             .expect("lock")
             .execute(
-                "UPDATE wire_request SET envelope = 'not json' WHERE conversation_id = 'conv_detail'",
+                "UPDATE history_entry SET detail = 'not json' WHERE conversation_id = 'conv_detail'",
                 [],
             )
             .expect("corrupt");
-        let corrupt = store
-            .wire_request("conv_detail", 1)
-            .expect("read")
-            .expect("row");
-        assert_eq!(corrupt.envelope, serde_json::Value::Null);
+        let corrupt = entry_detail(&store, "conv_detail", 1);
+        assert_eq!(corrupt.entry.detail, serde_json::json!({}));
         assert_eq!(corrupt.parts.len(), 4);
     }
 
     #[test]
-    fn wire_ledger_ignores_a_conversation_it_has_no_row_for() {
+    fn a_conversation_without_a_row_records_nothing() {
         let (_dir, store) = temp_store();
         store
-            .record_wire_request(&wire_record("subagent_only", &[("message", "{}")]))
+            .record_history_request(&request_record("subagent_only", &[("message", "{}")]))
             .expect("库里没有行的对话不入账也不报错");
         assert!(trunk_requests(&store, "subagent_only").is_empty());
-        assert_eq!(row_count(&store, "SELECT count(*) FROM wire_request"), 0);
-        assert_eq!(row_count(&store, "SELECT count(*) FROM wire_blob"), 0);
+        assert_eq!(row_count(&store, "SELECT count(*) FROM history_entry"), 0);
+        assert_eq!(row_count(&store, "SELECT count(*) FROM history_blob"), 0);
     }
 
     /// A child runs under its parent's conversation id, so the only thing keeping
-    /// its traffic out of the session's own ledger is `owner`. Read the trunk and
-    /// a child never appears; read the child and the trunk never does.
+    /// its entries out of the session's own is `owner`. Read the trunk and a child
+    /// never appears; read the child and the trunk never does.
     #[test]
-    fn a_child_turns_requests_form_a_ledger_of_their_own() {
+    fn a_childs_entries_are_its_own() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_owned"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record("conv_owned", &[("message", "{\"t\":1}")]))
+            .record_history_request(&request_record("conv_owned", &[("message", "{\"t\":1}")]))
             .expect("trunk");
         store
-            .record_wire_request(&wire_child_record(
+            .record_history_request(&child_request_record(
                 "conv_owned",
                 "reviewer",
                 &[("message", "{\"c\":1}")],
             ))
             .expect("child");
         store
-            .record_wire_request(&wire_child_record(
+            .record_history_request(&child_request_record(
                 "conv_owned",
                 "reviewer",
                 &[("message", "{\"c\":2}")],
             ))
             .expect("child again");
         store
-            .record_wire_request(&wire_record("conv_owned", &[("message", "{\"t\":2}")]))
+            .record_history_request(&request_record("conv_owned", &[("message", "{\"t\":2}")]))
             .expect("trunk again");
 
         let trunk = trunk_requests(&store, "conv_owned");
         assert_eq!(
             trunk.iter().map(|row| row.seq).collect::<Vec<_>>(),
             vec![1, 4],
-            "主干账本只有主干自己发出的请求"
+            "主干只有主干自己发出的请求"
         );
         assert!(trunk.iter().all(|row| row.owner.is_none()));
 
         let owners = ["reviewer".to_owned()];
-        let child = store
-            .wire_requests("conv_owned", Some(&owners))
-            .expect("child ledger");
+        let child = request_rows(&store, "conv_owned", Some(&owners));
         assert_eq!(
             child.iter().map(|row| row.seq).collect::<Vec<_>>(),
             vec![2, 3],
-            "子代理账本只有它自己发出的请求"
+            "子代理只有它自己发出的请求"
         );
         assert_eq!(child[0].owner.as_deref(), Some("reviewer"));
         assert_eq!(
-            store
-                .wire_request("conv_owned", 2)
-                .expect("read")
-                .expect("row")
-                .summary
-                .owner
-                .as_deref(),
+            entry_detail(&store, "conv_owned", 2).entry.owner.as_deref(),
             Some("reviewer"),
             "逐条读回来也带着归属"
         );
         assert!(
             store
-                .wire_requests("conv_owned", Some(&[]))
+                .history_entries("conv_owned", Some(&[]))
                 .expect("no owners")
                 .is_empty(),
             "还没有被寻址过的代理什么都没发出去，不能拿主干的行搪塞"
@@ -4616,7 +6046,7 @@ mod tests {
     }
 
     /// The request a payload is read against is the previous one *of the same
-    /// ledger*. Against the trunk's, a child's first payload would report the
+    /// owner*. Against the trunk's, a child's first payload would report the
     /// session's whole history as deleted.
     #[test]
     fn a_child_request_is_read_against_its_own_predecessor() {
@@ -4625,25 +6055,23 @@ mod tests {
             .put_conversation("ws", &conversation("conv_delta_owned"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record_of(
+            .record_history_request(&request_record_of(
                 "conv_delta_owned",
-                vec![wire_message("user", "user", "{\"role\":\"user\",\"t\":1}")],
+                vec![message_part("user", "user", "{\"role\":\"user\",\"t\":1}")],
             ))
             .expect("trunk");
         store
-            .record_wire_request(&WireRequestRecord {
+            .record_history_request(&HistoryRequestRecord {
                 owner: Some("writer".into()),
-                ..wire_record_of(
+                ..request_record_of(
                     "conv_delta_owned",
-                    vec![wire_message("user", "user", "{\"role\":\"user\",\"c\":1}")],
+                    vec![message_part("user", "user", "{\"role\":\"user\",\"c\":1}")],
                 )
             })
             .expect("child");
 
         let owners = ["writer".to_owned()];
-        let child = store
-            .wire_requests("conv_delta_owned", Some(&owners))
-            .expect("child ledger");
+        let child = request_rows(&store, "conv_delta_owned", Some(&owners));
         assert_eq!(
             (child[0].messages_added, child[0].messages_removed),
             (Some(1), Some(0)),
@@ -4651,8 +6079,8 @@ mod tests {
         );
     }
 
-    /// Each ledger is capped on its own. A child that runs for hundreds of rounds
-    /// must not push the session's own history out from under the reader.
+    /// A child that runs for hundreds of rounds adds to its own entries only; the
+    /// trunk's stay exactly as they were, and so does every one of the child's.
     #[test]
     fn a_chatty_child_does_not_evict_the_trunks_history() {
         let (_dir, store) = temp_store();
@@ -4660,15 +6088,16 @@ mod tests {
             .put_conversation("ws", &conversation("conv_shared_cap"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record(
+            .record_history_request(&request_record(
                 "conv_shared_cap",
                 &[("message", "{\"trunk\":1}")],
             ))
             .expect("trunk");
-        for index in 1..=(WIRE_LEDGER_MAX_REQUESTS + 5) {
+        let rounds = 305;
+        for index in 1..=rounds {
             let unique = format!("{{\"child\":{index}}}");
             store
-                .record_wire_request(&wire_child_record(
+                .record_history_request(&child_request_record(
                     "conv_shared_cap",
                     "looper",
                     &[("message", unique.as_str())],
@@ -4684,45 +6113,437 @@ mod tests {
         );
         let owners = ["looper".to_owned()];
         assert_eq!(
-            store
-                .wire_requests("conv_shared_cap", Some(&owners))
-                .expect("child ledger")
-                .len(),
-            WIRE_LEDGER_MAX_REQUESTS as usize,
-            "子代理自己的账本照常按上限收窄"
+            request_rows(&store, "conv_shared_cap", Some(&owners)).len(),
+            rounds as usize,
+            "子代理自己的记录也一条不删"
         );
     }
 
-    /// Everything written before the column existed is trunk traffic: children
-    /// were not recorded at all until it did.
+    /// Every kind of entry takes its number from one sequence, so "what came after"
+    /// has an answer across kinds — the question recovery asks. Evidence reads pick
+    /// entries by owner, kind, call and body.
     #[test]
-    fn version_twelve_upgrades_in_place_and_reads_old_rows_as_the_trunks() {
-        let (dir, store) = temp_store();
-        let mut source = conversation("released_v12");
-        source.contexts.push(user("history", "保留的历史"));
-        store.put_conversation("ws", &source).expect("seed history");
+    fn every_kind_of_entry_shares_one_sequence_and_reads_back_as_evidence() {
+        let (_dir, store) = temp_store();
+        let mut source = conversation("conv_all");
+        store.put_conversation("ws", &source).expect("seed");
         store
-            .record_wire_request(&wire_record(
-                &source.id,
-                &[("message", "{\"role\":\"user\",\"content\":\"旧的\"}")],
+            .record_history_request(&request_record("conv_all", &[("message", "{}")]))
+            .expect("request");
+        store
+            .record_history_entry(&response_record(
+                "conv_all",
+                None,
+                Some(1),
+                None,
+                serde_json::json!({"role": "assistant", "content": [
+                    {"type": "tool-call", "toolCallId": "c1", "toolName": "shell", "input": {"command": "ls"}}
+                ]})
+                .to_string(),
             ))
-            .expect("seed ledger");
+            .expect("response");
+        let entry = |kind: &'static str, detail: serde_json::Value, body: serde_json::Value| {
+            HistoryEntryRecord {
+                conversation_id: "conv_all".into(),
+                kind,
+                owner: None,
+                request_id: Some("req_a".into()),
+                round: Some(0),
+                call_id: Some("c1".into()),
+                answers: None,
+                detail,
+                body: Some(body.to_string()),
+                body_cap: HISTORY_EVIDENCE_MAX_BYTES,
+            }
+        };
+        store
+            .record_history_entry(&entry(
+                "hook",
+                serde_json::json!({"event": "PreToolUse", "rewroteInput": true}),
+                serde_json::json!({"output": "", "updatedInput": {"command": "ls -a"}}),
+            ))
+            .expect("hook");
+        store
+            .record_history_entry(&entry(
+                "tool",
+                serde_json::json!({"name": "shell", "rewritten": true}),
+                serde_json::json!({"input": {"command": "ls -a"}, "requestedInput": {"command": "ls"}}),
+            ))
+            .expect("tool");
+        store
+            .record_history_entry(&entry(
+                "result",
+                serde_json::json!({"name": "shell", "success": true}),
+                serde_json::json!({"output": "a b"}),
+            ))
+            .expect("result");
+        source.contexts.push(user("ctx_next", "再来"));
+        store.put_conversation("ws", &source).expect("send");
+
+        let entries = store.history_entries("conv_all", None).expect("history");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.seq, entry.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "request"),
+                (2, "response"),
+                (3, "hook"),
+                (4, "tool"),
+                (5, "result"),
+                (6, "edit"),
+            ],
+            "所有种类共用一个序号"
+        );
+        assert_eq!(entries[5].detail["source"], serde_json::json!("message"));
+
+        let about_the_call = store
+            .history_records(
+                "conv_all",
+                HistoryFilter {
+                    call_id: Some("c1"),
+                    ..HistoryFilter::default()
+                },
+            )
+            .expect("call");
+        assert_eq!(
+            about_the_call
+                .iter()
+                .map(|record| record.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["hook", "tool", "result"]
+        );
+        let ran = store
+            .history_records(
+                "conv_all",
+                HistoryFilter {
+                    kinds: &["tool"],
+                    call_id: Some("c1"),
+                    ..HistoryFilter::default()
+                },
+            )
+            .expect("tool");
+        assert_eq!(
+            crate::history::recorded_tool_input(ran[0].body.as_deref().expect("body")),
+            Some(serde_json::json!({"command": "ls -a"})),
+            "执行时的输入是钩子改写之后的"
+        );
+        assert!(ran[0].detail_flag("rewritten"));
+        assert!(store
+            .history_records(
+                "conv_all",
+                HistoryFilter {
+                    owner: Some("someone"),
+                    ..HistoryFilter::default()
+                },
+            )
+            .expect("owner")
+            .is_empty());
+    }
+
+    /// The tables the history replaced, as older builds shipped them.
+    const LEGACY_SCHEMA: &str = "CREATE TABLE timeline_event (
+        conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('baseline', 'run', 'edit')),
+        request_id TEXT,
+        inserted INTEGER NOT NULL,
+        removed INTEGER NOT NULL,
+        replaced INTEGER NOT NULL,
+        row_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, seq)
+    ) STRICT;
+    CREATE TABLE timeline_op (
+        conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL,
+        op TEXT NOT NULL CHECK (op IN ('remove', 'insert', 'replace')),
+        context_id TEXT NOT NULL,
+        position INTEGER,
+        data TEXT,
+        PRIMARY KEY (conversation_id, seq, ordinal)
+    ) STRICT;
+    CREATE TABLE timeline_head (
+        conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        context_id TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, position)
+    ) STRICT;
+    CREATE TABLE wire_request (
+        conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('model', 'search', 'fetch')),
+        request_id TEXT NOT NULL,
+        round INTEGER NOT NULL,
+        attempt INTEGER NOT NULL,
+        provider_name TEXT NOT NULL,
+        family TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        envelope TEXT NOT NULL,
+        part_count INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        input_tokens INTEGER,
+        cached_input_tokens INTEGER,
+        output_tokens INTEGER,
+        messages_added INTEGER,
+        messages_removed INTEGER,
+        owner TEXT,
+        PRIMARY KEY (conversation_id, seq)
+    ) STRICT;
+    CREATE TABLE wire_blob (
+        conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+        hash TEXT NOT NULL,
+        body TEXT NOT NULL,
+        truncated INTEGER NOT NULL,
+        PRIMARY KEY (conversation_id, hash)
+    ) STRICT;
+    CREATE TABLE wire_request_part (
+        conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('system', 'systemDynamic', 'tools', 'message')),
+        hash TEXT NOT NULL,
+        role TEXT,
+        PRIMARY KEY (conversation_id, seq, ordinal)
+    ) STRICT;
+    CREATE TABLE wire_response (
+        conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        received_at TEXT NOT NULL,
+        request_seq INTEGER,
+        owner TEXT,
+        request_id TEXT NOT NULL,
+        round INTEGER NOT NULL,
+        attempt INTEGER NOT NULL,
+        model_id TEXT,
+        finish_reason TEXT,
+        raw_finish_reason TEXT,
+        hash TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, seq)
+    ) STRICT;";
+
+    /// Takes a store back to before the history: its tables gone, the legacy ones
+    /// in their place.
+    fn install_legacy_tables(store: &ConversationStore) {
         store
             .lock()
             .expect("lock")
-            .execute_batch(
-                "ALTER TABLE wire_request DROP COLUMN owner; PRAGMA user_version = 12;",
+            .execute_batch(&format!(
+                "DROP TABLE history_op; DROP TABLE history_part; DROP TABLE history_head;
+                 DROP TABLE history_entry; DROP TABLE history_blob; {LEGACY_SCHEMA}"
+            ))
+            .expect("legacy tables");
+    }
+
+    fn quarantined_nothing(dir: &Path) -> bool {
+        std::fs::read_dir(dir).expect("directory").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains("quarantine-")
+        })
+    }
+
+    /// A store from before the history keeps what its two ledgers and its trunk
+    /// history held: every row moves into the one record, interleaved in the order
+    /// it was written, with a response still naming its request and a request still
+    /// carrying the usage the old ledger gave it. The legacy tables go. A legacy
+    /// table still standing is what says the store is not migrated, whatever its
+    /// stamp claims.
+    #[test]
+    fn legacy_ledgers_and_trunk_history_migrate_into_one_record_in_the_order_they_happened() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("legacy");
+        source.contexts = vec![
+            user("ask", "问"),
+            assistant("reply", "答", 0),
+            user("again", "再问"),
+        ];
+        store.put_conversation("ws", &source).expect("seed");
+        install_legacy_tables(&store);
+        {
+            let conn = store.lock().expect("lock");
+            let rows: Vec<(String, String)> = conn
+                .prepare("SELECT id, data FROM context WHERE conversation_id = 'legacy' ORDER BY order_key")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let at = |second: u32| format!("2026-09-01T00:00:{second:02}.000Z");
+            let event = |seq: i64, kind: &str, request: Option<&str>, row_count: i64, second: u32| {
+                conn.execute(
+                    "INSERT INTO timeline_event VALUES ('legacy', ?1, ?2, ?3, 1, 0, 0, ?4, ?5)",
+                    rusqlite::params![seq, kind, request, row_count, at(second)],
+                )
+                .unwrap();
+                let position = row_count - 1;
+                conn.execute(
+                    "INSERT INTO timeline_op VALUES ('legacy', ?1, 0, 'insert', ?2, ?3, ?4)",
+                    rusqlite::params![seq, rows[position as usize].0, position, rows[position as usize].1],
+                )
+                .unwrap();
+            };
+            event(1, "baseline", None, 1, 0);
+            conn.execute_batch(
+                r#"INSERT INTO wire_blob VALUES
+                     ('legacy', 'h_sys', '规则', 0),
+                     ('legacy', 'h_ask', '{"role":"user","content":"问"}', 0),
+                     ('legacy', 'h_child', '{"role":"user","content":"子"}', 0),
+                     ('legacy', 'h_reply', '{"role":"assistant","content":[{"type":"text","text":"答"}]}', 0);
+                   INSERT INTO wire_request VALUES
+                     ('legacy', 1, '2026-09-01T00:00:01.000Z', 'model', 'req_1', 0, 1, 'anthropic',
+                      'messages', 'claude-opus-5', '{"maxOutputTokens":4096}', 2, 30, 100, 80, 7, 1, 0, NULL),
+                     ('legacy', 2, '2026-09-01T00:00:02.000Z', 'model', 'req_c', 0, 1, 'anthropic',
+                      'messages', 'claude-opus-5', '{}', 1, 10, NULL, NULL, NULL, 1, 0, 'reviewer');
+                   INSERT INTO wire_request_part VALUES
+                     ('legacy', 1, 0, 'system', 'h_sys', NULL),
+                     ('legacy', 1, 1, 'message', 'h_ask', 'user'),
+                     ('legacy', 2, 0, 'message', 'h_child', 'user');
+                   INSERT INTO wire_response VALUES
+                     ('legacy', 1, '2026-09-01T00:00:03.000Z', 1, NULL, 'req_1', 0, 1,
+                      'claude-opus-5', 'stop', 'end_turn', 'h_reply');"#,
             )
-            .expect("downgrade to v12");
+            .unwrap();
+            event(2, "run", Some("req_1"), 2, 4);
+            event(3, "edit", None, 3, 5);
+            for (position, (id, data)) in rows.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO timeline_head VALUES ('legacy', ?1, ?2, ?3)",
+                    rusqlite::params![position as i64, id, data],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 18).unwrap();
+        }
         drop(store);
 
-        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("upgrade");
-        let version: i32 = store
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("migrate");
+        {
+            let conn = store.lock().expect("lock");
+            for table in LEGACY_HISTORY_TABLES {
+                assert!(!has_table(&conn, table).unwrap(), "{table} 迁移后必须删掉");
+            }
+            let version: i32 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, STORE_VERSION);
+        }
+        let trunk = store.history_entries("legacy", None).expect("history");
+        assert_eq!(
+            trunk
+                .iter()
+                .map(|entry| (entry.seq, entry.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "edit"), (2, "request"), (4, "response"), (5, "run"), (6, "edit")],
+            "按写入时间交错排成一条序列；子代理的请求占 3 号但不在主干里"
+        );
+        assert_eq!(trunk[0].detail["source"], serde_json::json!("baseline"));
+        assert_eq!(trunk[3].detail["source"], serde_json::json!("run"));
+        assert_eq!(trunk[3].request_id.as_deref(), Some("req_1"));
+        assert_eq!(
+            trunk[4].detail["source"],
+            serde_json::json!("message"),
+            "只在末尾追加用户消息的旧改动读作发送"
+        );
+        assert_eq!(trunk[2].answers, Some(2), "回复仍指向它回答的那次请求");
+        assert_eq!(
+            trunk[1].usage,
+            Some(HistoryUsage {
+                input_tokens: Some(100),
+                cached_input_tokens: Some(80),
+                output_tokens: Some(7),
+            }),
+            "旧账本记在请求上的用量保留"
+        );
+        assert_eq!(trunk[1].detail["messagesAdded"], serde_json::json!(1));
+
+        let request = entry_detail(&store, "legacy", 2);
+        assert_eq!(request.body.as_deref(), Some("{\"maxOutputTokens\":4096}"));
+        assert_eq!(
+            request
+                .parts
+                .iter()
+                .map(|part| part.body.as_str())
+                .collect::<Vec<_>>(),
+            ["规则", "{\"role\":\"user\",\"content\":\"问\"}"]
+        );
+        let reply = store
+            .history_records(
+                "legacy",
+                HistoryFilter {
+                    kinds: &["response"],
+                    ..HistoryFilter::default()
+                },
+            )
+            .expect("responses");
+        assert_eq!(
+            crate::history::recorded_message_text(reply[0].body.as_deref().unwrap()),
+            "答"
+        );
+        assert_eq!(reply[0].detail_str("rawFinishReason"), Some("end_turn"));
+
+        let owners = ["reviewer".to_owned()];
+        let child = request_rows(&store, "legacy", Some(&owners));
+        assert_eq!(child.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![3]);
+
+        assert_eq!(
+            store
+                .trunk_snapshot("legacy", 5)
+                .expect("snapshot")
+                .iter()
+                .map(ContextItem::id)
+                .collect::<Vec<_>>(),
+            ["ask", "reply"]
+        );
+        // The head came along, so an unchanged trunk records nothing new.
+        store
+            .record_trunk_change("legacy", TrunkChange::Edit, None)
+            .expect("record");
+        assert_eq!(store.trunk_changes("legacy").expect("changes").len(), 3);
+        assert!(quarantined_nothing(dir.path()), "迁移不得隔离原数据库");
+    }
+
+    /// A legacy request ledger written before it counted anything — no usage, no
+    /// delta, no owner, no roles — migrates as the trunk's, with those absences
+    /// intact, even behind a stamp that already reads current. New requests then
+    /// read against it as before.
+    #[test]
+    fn a_legacy_ledger_from_before_its_counters_migrates_with_its_absences() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("legacy_v10");
+        source.contexts.push(user("history", "保留的历史"));
+        store.put_conversation("ws", &source).expect("seed history");
+        install_legacy_tables(&store);
+        let carried_over = "{\"role\":\"user\",\"content\":\"旧的\"}";
+        // The address the old ledger gave it, which is the one a new request computes.
+        let old_hash = body_hash(carried_over);
+        store
             .lock()
             .expect("lock")
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("version");
-        assert_eq!(version, STORE_VERSION, "升级必须写入当前版本号");
+            .execute_batch(&format!(
+                "ALTER TABLE wire_request DROP COLUMN input_tokens;
+                 ALTER TABLE wire_request DROP COLUMN cached_input_tokens;
+                 ALTER TABLE wire_request DROP COLUMN output_tokens;
+                 ALTER TABLE wire_request DROP COLUMN messages_added;
+                 ALTER TABLE wire_request DROP COLUMN messages_removed;
+                 ALTER TABLE wire_request DROP COLUMN owner;
+                 ALTER TABLE wire_request_part DROP COLUMN role;
+                 INSERT INTO wire_blob VALUES ('legacy_v10', '{old_hash}', '{carried_over}', 0);
+                 INSERT INTO wire_request VALUES ('legacy_v10', 1, '2026-09-01T00:00:01.000Z', 'model',
+                   'req_old', 0, 1, 'anthropic', 'messages', 'claude-opus-5', '{{}}', 1, 26);
+                 INSERT INTO wire_request_part VALUES ('legacy_v10', 1, 0, 'message', '{old_hash}');
+                 PRAGMA user_version = {STORE_VERSION};"
+            ))
+            .expect("legacy v10 ledger");
+        drop(store);
+
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("migrate");
         assert_eq!(
             store
                 .conversation(&source.id)
@@ -4730,32 +6551,48 @@ mod tests {
                 .expect("preserved row")
                 .contexts,
             source.contexts,
-            "v12 升级必须保留既有对话历史"
+            "迁移必须保留既有对话历史"
         );
         let carried = trunk_requests(&store, &source.id);
-        assert_eq!(carried.len(), 1, "旧行必须留在主干账本里");
-        assert_eq!(carried[0].owner, None);
+        assert_eq!(carried.len(), 1, "旧行必须留在主干里");
+        assert_eq!(
+            (
+                carried[0].usage,
+                carried[0].messages_added,
+                carried[0].messages_removed,
+                carried[0].owner.clone()
+            ),
+            (None, None, None, None),
+            "旧行没有的数字读回来必须是空"
+        );
+
         store
-            .record_wire_request(&wire_child_record(
+            .record_history_request(&request_record_of(
+                &source.id,
+                vec![
+                    // The body the legacy row carried, whose role was never kept.
+                    message_part("user", "user", carried_over),
+                    message_part("user", "user", "{\"role\":\"user\",\"content\":\"新的\"}"),
+                ],
+            ))
+            .expect("write after migration");
+        let recorded = trunk_requests(&store, &source.id);
+        assert_eq!(
+            (recorded[1].messages_added, recorded[1].messages_removed),
+            (Some(1), Some(0)),
+            "迁移后必须能写入并读回增删计数"
+        );
+        let owners = ["late-agent".to_owned()];
+        store
+            .record_history_request(&child_request_record(
                 &source.id,
                 "late-agent",
                 &[("message", "{\"role\":\"user\",\"content\":\"子的\"}")],
             ))
-            .expect("write child ledger after upgrade");
-        let owners = ["late-agent".to_owned()];
-        assert_eq!(
-            store
-                .wire_requests(&source.id, Some(&owners))
-                .expect("child ledger")
-                .len(),
-            1,
-            "升级后必须能按归属写入与读取"
-        );
-        assert_eq!(
-            trunk_requests(&store, &source.id).len(),
-            1,
-            "升级后主干账本不得被子代理的行污染"
-        );
+            .expect("write child after migration");
+        assert_eq!(request_rows(&store, &source.id, Some(&owners)).len(), 1);
+        assert_eq!(trunk_requests(&store, &source.id).len(), 2, "主干不被子代理的行污染");
+        assert!(quarantined_nothing(dir.path()), "迁移不得隔离原数据库");
     }
 
     fn queued_with_files(id: &str) -> QueuedMessage {
@@ -4852,78 +6689,6 @@ mod tests {
                 .expect("present")
                 .queued_messages,
             source.queued_messages
-        );
-    }
-
-    /// A store can carry a current stamp and still be missing a column: a build
-    /// whose upgrade steps differed, an upgrade that died between two `ALTER`s, a
-    /// database edited by hand. The stamp is not evidence of shape, so the open
-    /// path repairs from the schema it can read rather than the number it is told.
-    #[test]
-    fn a_store_stamped_current_but_missing_owner_is_repaired_on_open() {
-        let (dir, store) = temp_store();
-        let mut source = conversation("stamped_current");
-        source.contexts.push(user("history", "保留的历史"));
-        store.put_conversation("ws", &source).expect("seed history");
-        store
-            .record_wire_request(&wire_record(
-                &source.id,
-                &[("message", "{\"role\":\"user\",\"content\":\"旧的\"}")],
-            ))
-            .expect("seed ledger");
-        // The column goes and the stamp stays — the one shape a version ladder can
-        // never see, because it only repairs what the stamp admits is outstanding.
-        store
-            .lock()
-            .expect("lock")
-            .execute_batch("ALTER TABLE wire_request DROP COLUMN owner")
-            .expect("drop owner behind a current stamp");
-        let stamped: i32 = store
-            .lock()
-            .expect("lock")
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("version");
-        assert_eq!(stamped, STORE_VERSION, "前提是版本号仍然自称当前");
-        drop(store);
-
-        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("repair");
-        assert_eq!(
-            store
-                .conversation(&source.id)
-                .expect("read history")
-                .expect("preserved row")
-                .contexts,
-            source.contexts,
-            "补列不得动到既有对话历史"
-        );
-        let carried = trunk_requests(&store, &source.id);
-        assert_eq!(carried.len(), 1, "补列前写下的行必须留在主干账本里");
-        assert_eq!(carried[0].owner, None);
-        store
-            .record_wire_request(&wire_child_record(
-                &source.id,
-                "late-agent",
-                &[("message", "{\"role\":\"user\",\"content\":\"子的\"}")],
-            ))
-            .expect("write child ledger after repair");
-        let owners = ["late-agent".to_owned()];
-        assert_eq!(
-            store
-                .wire_requests(&source.id, Some(&owners))
-                .expect("child ledger")
-                .len(),
-            1,
-            "补列后必须能按归属写入与读取"
-        );
-        assert!(
-            std::fs::read_dir(dir.path()).expect("directory").all(|entry| {
-                !entry
-                    .expect("entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("quarantine-")
-            }),
-            "缺一列是可就地修复的，不该封存整个对话库"
         );
     }
 
@@ -5100,15 +6865,15 @@ mod tests {
             "pending_fork_start",
             "conversation_plan",
             "fork_decision",
-            "timeline_event",
-            "timeline_op",
-            "timeline_head",
             "conversation_template",
             "template_context",
-            "wire_request",
-            "wire_blob",
-            "wire_request_part",
+            "history_entry",
+            "history_blob",
+            "history_part",
+            "history_op",
+            "history_head",
             "tool_explanation",
+            "tool_error_explanation",
         ] {
             assert!(
                 declared.contains(&expected),
@@ -5116,6 +6881,12 @@ mod tests {
             );
         }
         assert_eq!(declared.len(), 17, "读出的表名与实际建的表不符：{declared:?}");
+        for table in LEGACY_HISTORY_TABLES {
+            assert!(
+                !declared.contains(&table),
+                "{table} 已并入历史记录，不得再建"
+            );
+        }
         for &(table, _, _) in ADDED_COLUMNS {
             assert!(
                 declared.contains(&table),
@@ -5128,57 +6899,54 @@ mod tests {
 
     /// A body past the cap is stored cut, and the address is the address of what
     /// was stored: a reader can hash the text they were given and get the hash the
-    /// ledger holds.
+    /// record holds.
     #[test]
-    fn an_oversized_wire_body_is_stored_cut_and_addressed_as_stored() {
+    fn an_oversized_part_is_stored_cut_and_addressed_as_stored() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_big"))
             .expect("seed");
         // Three-byte characters, so the cap does not land on a boundary.
-        let huge = "漢".repeat(WIRE_BLOB_MAX_BYTES / 3 + 16);
-        assert!(huge.len() > WIRE_BLOB_MAX_BYTES);
+        let huge = "漢".repeat(HISTORY_PART_MAX_BYTES / 3 + 16);
+        assert!(huge.len() > HISTORY_PART_MAX_BYTES);
         store
-            .record_wire_request(&wire_record("conv_big", &[("message", huge.as_str())]))
+            .record_history_request(&request_record("conv_big", &[("message", huge.as_str())]))
             .expect("record");
 
-        let detail = store
-            .wire_request("conv_big", 1)
-            .expect("read")
-            .expect("row");
+        let detail = entry_detail(&store, "conv_big", 1);
         let part = &detail.parts[0];
         assert!(part.truncated, "超限正文必须标记为已截断");
-        assert!(part.body.ends_with(WIRE_BLOB_TRUNCATION_MARKER));
+        assert!(part.body.ends_with(HISTORY_TRUNCATION_MARKER));
         assert!(
-            part.body.starts_with(&huge[..WIRE_BLOB_MAX_BYTES - 1]),
+            part.body.starts_with(&huge[..HISTORY_PART_MAX_BYTES - 1]),
             "截断落在字符边界上，前面的正文原样保留"
         );
         assert_eq!(
             part.body.len(),
-            WIRE_BLOB_MAX_BYTES - 1 + 1 + WIRE_BLOB_TRUNCATION_MARKER.len()
+            HISTORY_PART_MAX_BYTES - 1 + 1 + HISTORY_TRUNCATION_MARKER.len()
         );
+        assert_eq!(part.hash, body_hash(&part.body), "哈希对应的是落库的正文");
+        assert_ne!(part.hash, body_hash(&huge));
         assert_eq!(
-            part.hash,
-            wire_body_hash(&part.body),
-            "哈希对应的是落库的正文"
+            detail.entry.detail["bytes"],
+            serde_json::json!(part.body.len() as i64)
         );
-        assert_ne!(part.hash, wire_body_hash(&huge));
-        assert_eq!(detail.summary.bytes, part.body.len() as i64);
     }
 
-    /// The ledger is bounded per conversation: a long-lived conversation keeps the
-    /// recent requests, and the bodies only the pruned ones named go with them.
+    /// The record is what recovery reads deliveries, approvals and final replies
+    /// from, so nothing ages out of it: a long-lived conversation keeps its first
+    /// request and every body it named.
     #[test]
-    fn wire_ledger_keeps_the_newest_requests_and_drops_bodies_nothing_names() {
+    fn the_history_keeps_every_request_and_every_body() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_cap"))
             .expect("seed");
-        let overflow = 5;
-        for index in 1..=(WIRE_LEDGER_MAX_REQUESTS + overflow) {
+        let requests: i64 = 3_005;
+        for index in 1..=requests {
             let unique = format!("{{\"round\":{index}}}");
             store
-                .record_wire_request(&wire_record(
+                .record_history_request(&request_record(
                     "conv_cap",
                     &[("system", "共享提示"), ("message", unique.as_str())],
                 ))
@@ -5186,80 +6954,60 @@ mod tests {
         }
 
         let recorded = trunk_requests(&store, "conv_cap");
-        assert_eq!(recorded.len(), WIRE_LEDGER_MAX_REQUESTS as usize);
-        assert_eq!(recorded.first().expect("oldest").seq, overflow + 1);
-        assert_eq!(
-            recorded.last().expect("newest").seq,
-            WIRE_LEDGER_MAX_REQUESTS + overflow
-        );
-        for seq in 1..=overflow {
-            assert_eq!(
-                store.wire_request("conv_cap", seq).expect("read"),
-                None,
-                "第 {seq} 条已被保留上限挤出"
-            );
-        }
-        assert_eq!(
-            row_count(
-                &store,
-                "SELECT count(*) FROM wire_blob WHERE body = '{\"round\":1}'"
-            ),
-            0,
-            "被挤出的请求独有的正文不得留成孤儿"
+        assert_eq!(recorded.len(), requests as usize);
+        assert_eq!(recorded.first().expect("oldest").seq, 1);
+        assert!(
+            store.history_entry("conv_cap", 1).expect("read").is_some(),
+            "最早的请求仍可读回"
         );
         assert_eq!(
             row_count(
                 &store,
-                "SELECT count(*) FROM wire_blob WHERE body = '共享提示'"
+                "SELECT count(*) FROM history_blob WHERE body = '{\"round\":1}'"
             ),
             1,
-            "还有请求点名的共享正文必须留下"
+            "最早那条请求独有的正文仍在"
         );
         assert_eq!(
-            row_count(&store, "SELECT count(*) FROM wire_blob"),
-            WIRE_LEDGER_MAX_REQUESTS + 1,
-            "留下的正文恰好是活着的请求点名的那些"
+            row_count(&store, "SELECT count(*) FROM history_blob"),
+            requests + 2,
+            "共享提示与共用的信封各存一份，其余每条请求各一份"
         );
         assert_eq!(
-            row_count(&store, "SELECT count(*) FROM wire_request_part"),
-            WIRE_LEDGER_MAX_REQUESTS * 2
+            row_count(&store, "SELECT count(*) FROM history_part"),
+            requests * 2
         );
     }
 
-    /// Usage arrives after the row it belongs to was already written, so the
-    /// only thing that can be wrong is which row it lands on.
+    /// Usage belongs to the response, and the list puts it on the request that
+    /// response answered — and on no other.
     #[test]
-    fn wire_usage_lands_on_the_row_that_earned_it() {
+    fn usage_lands_on_the_request_its_response_answered() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_usage"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record("conv_usage", &[("message", "{}")]))
+            .record_history_request(&request_record("conv_usage", &[("message", "{}")]))
             .expect("first");
         store
-            .record_wire_request(&wire_record("conv_usage", &[("message", "{}")]))
+            .record_history_request(&request_record("conv_usage", &[("message", "{}")]))
             .expect("second");
 
-        let usage = WireUsage {
+        let usage = HistoryUsage {
             input_tokens: Some(1200),
             cached_input_tokens: Some(1000),
             output_tokens: Some(48),
         };
         store
-            .record_wire_usage("conv_usage", 1, &usage)
-            .expect("attach usage");
+            .record_history_entry(&response_record("conv_usage", None, Some(1), Some(usage), "{}".into()))
+            .expect("respond");
 
         let recorded = trunk_requests(&store, "conv_usage");
-        assert_eq!(recorded[0].usage, Some(usage), "用量落在自己的那一行上");
-        assert_eq!(recorded[1].usage, None, "别的行不得被顺带写上用量");
+        assert_eq!(recorded[0].usage, Some(usage), "用量落在它回答的那次请求上");
+        assert_eq!(recorded[1].usage, None, "别的请求不得被顺带写上用量");
         assert_eq!(
-            store
-                .wire_request("conv_usage", 1)
-                .expect("read")
-                .expect("row")
-                .summary
-                .usage,
+            entry_detail(&store, "conv_usage", 1).entry.usage,
             Some(usage),
             "详情读到的用量与列表一致"
         );
@@ -5268,29 +7016,31 @@ mod tests {
     /// A provider that discloses one counter and not the others reads as one
     /// counter and two absences, never as zeros.
     #[test]
-    fn a_partly_disclosed_wire_usage_keeps_its_absences() {
+    fn a_partly_disclosed_usage_keeps_its_absences() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_partial"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record("conv_partial", &[("message", "{}")]))
+            .record_history_request(&request_record("conv_partial", &[("message", "{}")]))
             .expect("record");
         store
-            .record_wire_usage(
+            .record_history_entry(&response_record(
                 "conv_partial",
-                1,
-                &WireUsage {
+                None,
+                Some(1),
+                Some(HistoryUsage {
                     output_tokens: Some(7),
-                    ..WireUsage::default()
-                },
-            )
-            .expect("attach usage");
+                    ..HistoryUsage::default()
+                }),
+                "{}".into(),
+            ))
+            .expect("respond");
 
         let recorded = trunk_requests(&store, "conv_partial");
         assert_eq!(
             recorded[0].usage,
-            Some(WireUsage {
+            Some(HistoryUsage {
                 input_tokens: None,
                 cached_input_tokens: None,
                 output_tokens: Some(7),
@@ -5298,42 +7048,32 @@ mod tests {
         );
     }
 
-    /// Retention can drop a row between the send and the response. The ledger
-    /// must not turn that into a failed run.
+    /// A response whose request never became an entry — a full queue, a failed
+    /// write — is still recorded, and its usage lands on no request.
     #[test]
-    fn wire_usage_for_a_row_that_is_gone_is_a_no_op() {
+    fn a_response_without_its_request_puts_its_usage_nowhere() {
         let (_dir, store) = temp_store();
         store
             .put_conversation("ws", &conversation("conv_orphan"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record("conv_orphan", &[("message", "{}")]))
+            .record_history_request(&request_record("conv_orphan", &[("message", "{}")]))
             .expect("record");
+        let usage = Some(HistoryUsage {
+            input_tokens: Some(9),
+            ..HistoryUsage::default()
+        });
         store
-            .record_wire_usage(
-                "conv_orphan",
-                404,
-                &WireUsage {
-                    input_tokens: Some(9),
-                    ..WireUsage::default()
-                },
-            )
-            .expect("补记到不存在的行不得报错");
+            .record_history_entry(&response_record("conv_orphan", None, None, usage, "{}".into()))
+            .expect("unlinked response");
         store
-            .record_wire_usage(
-                "missing_conversation",
-                1,
-                &WireUsage {
-                    input_tokens: Some(9),
-                    ..WireUsage::default()
-                },
-            )
-            .expect("补记到不存在的对话不得报错");
+            .record_history_entry(&response_record("conv_orphan", None, Some(404), usage, "{}".into()))
+            .expect("response to a request that is not there");
 
         assert_eq!(
             trunk_requests(&store, "conv_orphan")[0].usage,
             None,
-            "写偏的用量不得落到别的行上"
+            "写偏的用量不得落到别的请求上"
         );
     }
 
@@ -5345,21 +7085,21 @@ mod tests {
         store
             .put_conversation("ws", &conversation("conv_add"))
             .expect("seed");
-        let first = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"一\"}");
-        let answer = wire_message(
+        let first = message_part("user", "user", "{\"role\":\"user\",\"content\":\"一\"}");
+        let answer = message_part(
             "assistant",
             "model",
             "{\"role\":\"assistant\",\"content\":\"答\"}",
         );
-        let second = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"二\"}");
+        let second = message_part("user", "user", "{\"role\":\"user\",\"content\":\"二\"}");
         store
-            .record_wire_request(&wire_record_of(
+            .record_history_request(&request_record_of(
                 "conv_add",
                 vec![first.clone(), answer.clone()],
             ))
             .expect("first request");
         store
-            .record_wire_request(&wire_record_of("conv_add", vec![first, answer, second]))
+            .record_history_request(&request_record_of("conv_add", vec![first, answer, second]))
             .expect("second request");
 
         let recorded = trunk_requests(&store, "conv_add");
@@ -5378,24 +7118,24 @@ mod tests {
         store
             .put_conversation("ws", &conversation("conv_loop"))
             .expect("seed");
-        let asked = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"跑一下\"}");
-        let called = wire_message(
+        let asked = message_part("user", "user", "{\"role\":\"user\",\"content\":\"跑一下\"}");
+        let called = message_part(
             "assistant",
             "model",
             "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool-call\"}]}",
         );
         // A `user` role the recorder attributed to the model: the host handing
         // back the result of a call the model made.
-        let returned = wire_message(
+        let returned = message_part(
             "user",
             "model",
             "{\"role\":\"user\",\"content\":[{\"type\":\"tool-result\"}]}",
         );
         store
-            .record_wire_request(&wire_record_of("conv_loop", vec![asked.clone()]))
+            .record_history_request(&request_record_of("conv_loop", vec![asked.clone()]))
             .expect("first request");
         store
-            .record_wire_request(&wire_record_of("conv_loop", vec![asked, called, returned]))
+            .record_history_request(&request_record_of("conv_loop", vec![asked, called, returned]))
             .expect("second request");
 
         let recorded = trunk_requests(&store, "conv_loop");
@@ -5411,21 +7151,21 @@ mod tests {
         store
             .put_conversation("ws", &conversation("conv_delete"))
             .expect("seed");
-        let first = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"一\"}");
-        let answer = wire_message(
+        let first = message_part("user", "user", "{\"role\":\"user\",\"content\":\"一\"}");
+        let answer = message_part(
             "assistant",
             "model",
             "{\"role\":\"assistant\",\"content\":\"答\"}",
         );
-        let second = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"二\"}");
+        let second = message_part("user", "user", "{\"role\":\"user\",\"content\":\"二\"}");
         store
-            .record_wire_request(&wire_record_of(
+            .record_history_request(&request_record_of(
                 "conv_delete",
                 vec![first.clone(), answer, second.clone()],
             ))
             .expect("first request");
         store
-            .record_wire_request(&wire_record_of("conv_delete", vec![first, second]))
+            .record_history_request(&request_record_of("conv_delete", vec![first, second]))
             .expect("second request");
 
         let recorded = trunk_requests(&store, "conv_delete");
@@ -5443,22 +7183,22 @@ mod tests {
         store
             .put_conversation("ws", &conversation("conv_edit"))
             .expect("seed");
-        let first = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"一\"}");
-        let answer = wire_message(
+        let first = message_part("user", "user", "{\"role\":\"user\",\"content\":\"一\"}");
+        let answer = message_part(
             "assistant",
             "model",
             "{\"role\":\"assistant\",\"content\":\"答\"}",
         );
-        let second = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"二\"}");
-        let rewritten = wire_message("user", "user", "{\"role\":\"user\",\"content\":\"二改\"}");
+        let second = message_part("user", "user", "{\"role\":\"user\",\"content\":\"二\"}");
+        let rewritten = message_part("user", "user", "{\"role\":\"user\",\"content\":\"二改\"}");
         store
-            .record_wire_request(&wire_record_of(
+            .record_history_request(&request_record_of(
                 "conv_edit",
                 vec![first.clone(), answer.clone(), second],
             ))
             .expect("first request");
         store
-            .record_wire_request(&wire_record_of("conv_edit", vec![first, answer, rewritten]))
+            .record_history_request(&request_record_of("conv_edit", vec![first, answer, rewritten]))
             .expect("second request");
 
         let recorded = trunk_requests(&store, "conv_edit");
@@ -5477,22 +7217,22 @@ mod tests {
             .put_conversation("ws", &conversation("conv_first"))
             .expect("seed");
         store
-            .record_wire_request(&wire_record_of(
+            .record_history_request(&request_record_of(
                 "conv_first",
                 vec![
-                    WireRecordedPart {
+                    HistoryPartRecord {
                         kind: "system".into(),
                         role: None,
                         author: None,
                         body: "规则".into(),
                     },
-                    wire_message("user", "user", "{\"role\":\"user\",\"content\":\"一\"}"),
-                    wire_message(
+                    message_part("user", "user", "{\"role\":\"user\",\"content\":\"一\"}"),
+                    message_part(
                         "assistant",
                         "model",
                         "{\"role\":\"assistant\",\"content\":\"答\"}",
                     ),
-                    wire_message("user", "user", "{\"role\":\"user\",\"content\":\"二\"}"),
+                    message_part("user", "user", "{\"role\":\"user\",\"content\":\"二\"}"),
                 ],
             ))
             .expect("first request");
@@ -5508,7 +7248,7 @@ mod tests {
     /// The alignment itself, without a database: consecutive requests share a
     /// long head and tail, and only what is left between them is compared.
     #[test]
-    fn wire_message_delta_strips_the_common_head_and_tail_before_pairing_roles() {
+    fn message_delta_strips_the_common_head_and_tail_before_pairing_roles() {
         fn before<'a>(hash: &'a str, role: Option<&'a str>) -> DeltaMessage<'a> {
             DeltaMessage {
                 hash,
@@ -5530,7 +7270,7 @@ mod tests {
             before("c", Some("user")),
         ];
         assert_eq!(
-            wire_message_delta(
+            message_delta(
                 &history,
                 &[
                     after("a", Some("user"), "user"),
@@ -5542,7 +7282,7 @@ mod tests {
             "一模一样的两次请求没有增删"
         );
         assert_eq!(
-            wire_message_delta(
+            message_delta(
                 &history,
                 &[
                     after("a", Some("user"), "user"),
@@ -5556,7 +7296,7 @@ mod tests {
             "尾部追加时只有人写的那条算新增"
         );
         assert_eq!(
-            wire_message_delta(
+            message_delta(
                 &history,
                 &[
                     after("a", Some("user"), "user"),
@@ -5567,7 +7307,7 @@ mod tests {
             "公共后缀先剥掉，删掉的是中间那条"
         );
         assert_eq!(
-            wire_message_delta(
+            message_delta(
                 &history,
                 &[
                     after("a", Some("user"), "user"),
@@ -5579,184 +7319,56 @@ mod tests {
             "同角色同位置改写只算一次改写"
         );
         assert_eq!(
-            wire_message_delta(&[before("x", None)], &[after("y", None, "user")]),
+            message_delta(&[before("x", None)], &[after("y", None, "user")]),
             (1, 1),
             "读不出角色的分段不与任何东西配对"
         );
     }
 
+    /// The first change a conversation records is its baseline — unless it only
+    /// appended what the user typed, which is a message like any other.
     #[test]
-    fn version_ten_upgrades_in_place_and_gains_usage_and_delta_columns() {
-        let (dir, store) = temp_store();
-        let mut source = conversation("released_v10");
-        source.contexts.push(user("history", "保留的历史"));
-        store.put_conversation("ws", &source).expect("seed history");
-        let carried_over = "{\"role\":\"user\",\"content\":\"旧的\"}";
-        store
-            .record_wire_request(&wire_record(&source.id, &[("message", carried_over)]))
-            .expect("seed ledger");
-        store
-            .lock()
-            .expect("lock")
-            .execute_batch(
-                "ALTER TABLE wire_request DROP COLUMN input_tokens;
-                 ALTER TABLE wire_request DROP COLUMN cached_input_tokens;
-                 ALTER TABLE wire_request DROP COLUMN output_tokens;
-                 ALTER TABLE wire_request DROP COLUMN messages_added;
-                 ALTER TABLE wire_request DROP COLUMN messages_removed;
-                 ALTER TABLE wire_request DROP COLUMN owner;
-                 ALTER TABLE wire_request_part DROP COLUMN role;
-                 ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 10;",
-            )
-            .expect("downgrade to v10");
-        drop(store);
-
-        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("upgrade");
-        let version: i32 = store
-            .lock()
-            .expect("lock")
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("version");
-        assert_eq!(version, STORE_VERSION, "升级必须写入当前版本号");
+    fn a_first_change_that_is_not_a_sent_message_is_the_baseline() {
+        let (_dir, store) = temp_store();
+        let mut source = conversation("conv_baseline");
+        source.contexts = vec![user("ctx_a", "问"), assistant("ctx_b", "答", 0)];
+        store.put_conversation("ws", &source).expect("seed");
+        let changes = store.trunk_changes("conv_baseline").expect("changes");
         assert_eq!(
-            store
-                .conversation(&source.id)
-                .expect("read history")
-                .expect("preserved row")
-                .contexts,
-            source.contexts,
-            "v10 升级必须保留既有对话历史"
-        );
-        let carried = trunk_requests(&store, &source.id);
-        assert_eq!(carried.len(), 1, "v10 升级必须保留既有账本行");
-        assert_eq!(
-            (
-                carried[0].usage,
-                carried[0].messages_added,
-                carried[0].messages_removed
-            ),
-            (None, None, None),
-            "第 11 版之前写下的行没有这些数字，读回来必须是空"
-        );
-
-        store
-            .record_wire_request(&wire_record_of(
-                &source.id,
-                vec![
-                    // The same body the pre-upgrade row carried, so the delta
-                    // aligns against a row whose `role` column is NULL because
-                    // the column did not exist when it was written.
-                    WireRecordedPart {
-                        kind: "message".into(),
-                        role: Some("user".into()),
-                        author: Some("user".into()),
-                        body: carried_over.into(),
-                    },
-                    wire_message("user", "user", "{\"role\":\"user\",\"content\":\"新的\"}"),
-                ],
-            ))
-            .expect("write ledger after upgrade");
-        store
-            .record_wire_usage(
-                &source.id,
-                2,
-                &WireUsage {
-                    input_tokens: Some(11),
-                    cached_input_tokens: None,
-                    output_tokens: Some(3),
-                },
-            )
-            .expect("attach usage after upgrade");
-        let recorded = trunk_requests(&store, &source.id);
-        assert_eq!(
-            recorded[1].usage,
-            Some(WireUsage {
-                input_tokens: Some(11),
-                cached_input_tokens: None,
-                output_tokens: Some(3),
-            }),
-            "升级后必须能写入并读回用量"
-        );
-        assert_eq!(
-            (recorded[1].messages_added, recorded[1].messages_removed),
-            (Some(1), Some(0)),
-            "升级后必须能写入并读回增删计数"
-        );
-        assert!(
-            std::fs::read_dir(dir.path())
-                .expect("directory")
-                .all(|entry| {
-                    !entry
-                        .expect("entry")
-                        .file_name()
-                        .to_string_lossy()
-                        .contains("quarantine-")
-                }),
-            "v10 升级不得隔离原数据库"
+            (changes[0].kind.as_str(), changes[0].source.as_str()),
+            ("edit", "baseline")
         );
     }
 
+    /// A trunk change opens with each row as it read before and after, so a
+    /// rewrite can be drawn as a diff and a removal as what went.
     #[test]
-    fn version_nine_upgrades_in_place_and_gains_the_wire_ledger() {
-        let (dir, store) = temp_store();
-        let mut source = conversation("released_v9");
-        source.contexts.push(user("history", "保留的历史"));
-        store.put_conversation("ws", &source).expect("seed history");
-        store
-            .lock()
-            .expect("lock")
-            .execute_batch(
-                "DROP TABLE wire_request_part; DROP TABLE wire_blob; DROP TABLE wire_request; ALTER TABLE conversation DROP COLUMN additional_directories; PRAGMA user_version = 9;",
-            )
-            .expect("downgrade to v9");
-        drop(store);
+    fn a_trunk_change_reads_back_each_row_before_and_after() {
+        let (_dir, store) = temp_store();
+        let mut source = conversation("conv_ops");
+        source.contexts = vec![user("ctx_a", "原话"), user("ctx_b", "要删的")];
+        store.put_conversation("ws", &source).expect("seed");
+        source.contexts = vec![user("ctx_a", "改过的")];
+        store.put_conversation("ws", &source).expect("edit");
 
-        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("upgrade");
-        assert_eq!(
-            store
-                .conversation(&source.id)
-                .expect("read history")
-                .expect("preserved row")
-                .contexts,
-            source.contexts,
-            "v9 升级必须保留既有对话历史"
-        );
-        store
-            .record_wire_request(&wire_record(
-                &source.id,
-                &[("message", "{\"role\":\"user\"}")],
-            ))
-            .expect("write ledger after upgrade");
-        let recorded = trunk_requests(&store, &source.id);
-        assert_eq!(recorded.len(), 1, "升级后必须能写入请求账本");
-        assert_eq!(
-            store
-                .wire_request(&source.id, recorded[0].seq)
-                .expect("read")
-                .expect("row")
-                .parts[0]
-                .body,
-            "{\"role\":\"user\"}",
-            "升级后必须能读回请求正文"
-        );
-        let version: i32 = store
-            .lock()
-            .expect("lock")
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("version");
-        assert_eq!(version, STORE_VERSION, "升级必须写入当前版本号");
-        assert!(
-            std::fs::read_dir(dir.path())
-                .expect("directory")
-                .all(|entry| {
-                    !entry
-                        .expect("entry")
-                        .file_name()
-                        .to_string_lossy()
-                        .contains("quarantine-")
-                }),
-            "v9 升级不得隔离原数据库"
-        );
+        let changes = store.trunk_changes("conv_ops").expect("changes");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[1].source, "edit", "删与改是编辑，不是发送");
+        let detail = entry_detail(&store, "conv_ops", changes[1].seq);
+        let by_op = |op: &str| {
+            detail
+                .ops
+                .iter()
+                .find(|entry| entry.op == op)
+                .unwrap_or_else(|| panic!("{op}"))
+        };
+        let removed = by_op("remove");
+        assert_eq!(removed.context_id, "ctx_b");
+        assert!(removed.body.is_none());
+        assert!(removed.before.as_deref().is_some_and(|body| body.contains("要删的")));
+        let replaced = by_op("replace");
+        assert!(replaced.before.as_deref().is_some_and(|body| body.contains("原话")));
+        assert!(replaced.body.as_deref().is_some_and(|body| body.contains("改过的")));
     }
 
     #[test]
@@ -5952,6 +7564,7 @@ mod tests {
                 duration_ms: 1,
             },
             subagent: None,
+            notice: None,
             attestation: "sig".into(),
             created_at: "2026-08-25T00:00:03.000Z".into(),
         }
@@ -6729,8 +8342,14 @@ mod tests {
         store.put_tool_explanation("conv_t", "tool_1", "列出目录").expect("replace");
         let explanations = store.tool_explanations("conv_t").expect("explanations");
         assert_eq!(explanations.get("tool_1").map(String::as_str), Some("列出目录"));
+        // A failed command keeps its description and gains a reason beside it.
+        store.put_tool_error_explanation("conv_t", "tool_1", "没有安装 pnpm").expect("explain error");
+        assert_eq!(store.tool_explanations("conv_t").expect("explanations").get("tool_1").map(String::as_str), Some("列出目录"));
+        let errors = store.tool_error_explanations("conv_t").expect("errors");
+        assert_eq!(errors.get("tool_1").map(String::as_str), Some("没有安装 pnpm"));
         store.delete_conversation("conv_t").expect("delete");
         assert!(store.tool_explanations("conv_t").expect("after delete").is_empty());
+        assert!(store.tool_error_explanations("conv_t").expect("after delete").is_empty());
     }
 
     #[test]

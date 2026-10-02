@@ -165,25 +165,29 @@ describe("InlineTextEditor", () => {
     expect(onSave).toHaveBeenCalledWith("", [], [expect.objectContaining({ id: "file-one" })]);
   });
 
-  it("turns a long paste into a Markdown file instead of prose", async () => {
-    const attached = file("pasted", "pasted-text.md");
-    const onAddAttachments = vi.fn().mockResolvedValue({ images: [], files: [attached], rejected: [] });
-    render(
-      <InlineTextEditor kind="user" content="" onAddAttachments={onAddAttachments} onCancel={vi.fn()} onSave={vi.fn()} />
+  it("folds a long paste into a tag, and saves it as the text it stands for", async () => {
+    const user = userEvent.setup();
+    const onAddAttachments = vi.fn();
+    const onSave = vi.fn();
+    const { container } = render(
+      <InlineTextEditor kind="user" content="看看这段" onAddAttachments={onAddAttachments} onCancel={vi.fn()} onSave={onSave} />
     );
 
     const long = Array.from({ length: 120 }, (_, index) => `line ${index}`).join("\n");
-    const box = screen.getByRole("textbox");
+    const box = screen.getByRole<HTMLTextAreaElement>("textbox");
+    box.setSelectionRange(4, 4);
     const pasteEvent = fireEvent.paste(box, {
-      clipboardData: { files: [], getData: () => long }
+      clipboardData: { files: [], getData: (type: string) => (type === "text/plain" ? long : "") }
     });
 
     expect(pasteEvent).toBe(false);
-    expect(await screen.findByRole("button", { name: "预览文件 pasted-text.md" })).toBeInTheDocument();
-    const [[files]] = onAddAttachments.mock.calls;
-    expect(files[0].name).toBe("pasted-text.md");
-    expect(await files[0].text()).toBe(long);
-    expect(box).toHaveValue("");
+    expect(onAddAttachments).not.toHaveBeenCalled();
+    const label = "\u00a0粘贴文本\u00a0#1\u00a0+119\u00a0行\u00a0";
+    expect(box).toHaveValue(`看看这段${label}`);
+    expect(container.querySelector(".pasted-text-tag")).toHaveTextContent("粘贴文本 #1 +119 行", { normalizeWhitespace: true });
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(onSave).toHaveBeenCalledWith(`看看这段${long}`, [], []);
   });
 
   it("leaves a short paste in the box", () => {

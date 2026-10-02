@@ -90,10 +90,10 @@ impl Machine {
                 }
             }
             VariantId::Llama => {
-                if cfg!(target_os = "macos") {
-                    Err(Unavailable::NotInThisBuild)
-                } else {
+                if llama_built() {
                     Ok(())
+                } else {
+                    Err(Unavailable::NotInThisBuild)
                 }
             }
         }
@@ -113,6 +113,17 @@ fn mlx_built() -> bool {
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn mlx_built() -> bool {
+    false
+}
+
+/// llama.cpp publishes a release build for this platform (`local_model::llama::runtime`).
+#[cfg(not(target_os = "macos"))]
+fn llama_built() -> bool {
+    !local_model::llama::runtime::archives().is_empty()
+}
+
+#[cfg(target_os = "macos")]
+fn llama_built() -> bool {
     false
 }
 

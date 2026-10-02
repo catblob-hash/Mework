@@ -723,12 +723,12 @@ impl GrepPage {
                 let limit = value
                     .as_u64()
                     .ok_or("Parameter limit must be a positive integer")?;
-                if limit == 0 || limit > GREP_MAX_LIMIT as u64 {
-                    return Err(format!(
-                        "Parameter limit must be between 1 and {GREP_MAX_LIMIT}"
-                    ));
+                // Zero is a placeholder rather than a request for no matches, and
+                // more than the cap reads as asking for the most there can be.
+                match limit {
+                    0 => GREP_DEFAULT_LIMIT,
+                    limit => (limit as usize).min(GREP_MAX_LIMIT),
                 }
-                limit as usize
             }
         };
         let offset = match input.get("offset") {
@@ -1082,9 +1082,18 @@ mod tests {
         let rendered = past.render(vec!["a.rs:1:x".into()], Vec::new(), &profile);
         assert!(rendered.contains("offset 10"), "{rendered}");
 
-        assert!(GrepPage::from_input(&json!({"limit": 0}).as_object().unwrap().clone()).is_err());
-        assert!(
-            GrepPage::from_input(&json!({"limit": 1001}).as_object().unwrap().clone()).is_err()
+        // A zero limit is a placeholder and one past the cap asks for the most there is.
+        assert_eq!(
+            GrepPage::from_input(&json!({"limit": 0}).as_object().unwrap().clone())
+                .unwrap()
+                .limit,
+            GREP_DEFAULT_LIMIT
+        );
+        assert_eq!(
+            GrepPage::from_input(&json!({"limit": 1001}).as_object().unwrap().clone())
+                .unwrap()
+                .limit,
+            GREP_MAX_LIMIT
         );
         assert_eq!(
             GrepPage::from_input(&JsonObject::new()).unwrap(),

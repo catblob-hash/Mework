@@ -1,10 +1,17 @@
 import type { SelectedElement } from "./browser";
 import type { AttachmentRejection } from "./fileAttachments";
+import type { PastedText } from "./pastedText";
 import type { FileAttachment, ImageAttachment } from "../types";
 
 export interface ComposerControllerState {
   /** Composer text drafts per conversation. */
   drafts: Record<string, string>;
+  /**
+   * The text behind each long paste's label in a draft, per conversation
+   * (`lib/pastedText.ts`). Kept until the draft is sent, not only while its
+   * label is in the box: an undo can bring a deleted label back.
+   */
+  pastedTexts: Record<string, PastedText[]>;
   /** Prepared image attachments per conversation. */
   imageDrafts: Record<string, ImageAttachment[]>;
   /** Prepared non-image file attachments per conversation. */
@@ -30,6 +37,9 @@ export interface ComposerController {
   current(): ComposerControllerState;
   updateDrafts(
     updater: (current: Record<string, string>) => Record<string, string>
+  ): void;
+  updatePastedTexts(
+    updater: (current: Record<string, PastedText[]>) => Record<string, PastedText[]>
   ): void;
   updateImageDrafts(
     updater: (current: Record<string, ImageAttachment[]>) => Record<string, ImageAttachment[]>
@@ -74,6 +84,7 @@ export interface ComposerController {
 export function createComposerController(): ComposerController {
   let state: ComposerControllerState = {
     drafts: {},
+    pastedTexts: {},
     imageDrafts: {},
     fileDrafts: {},
     attachmentNotices: {},
@@ -107,6 +118,9 @@ export function createComposerController(): ComposerController {
     },
     updateDrafts(updater) {
       commit({ drafts: updater(state.drafts) });
+    },
+    updatePastedTexts(updater) {
+      commit({ pastedTexts: updater(state.pastedTexts) });
     },
     updateImageDrafts(updater) {
       commit({ imageDrafts: updater(state.imageDrafts) });

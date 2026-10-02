@@ -170,21 +170,22 @@ describe("conversation turn presentation state", () => {
     });
   });
 
-  it("preserves a persisted ask_user pause so its answer can resume the same turn", () => {
+  it("reads a turn persisted as paused on an old ask_user as the unfinished turn it is", () => {
     window.localStorage.setItem(CONVERSATION_TURNS_STORAGE_KEY, JSON.stringify({
       conversation: [{
         ...turn({
           id: "turn-waiting",
-          status: "awaiting_user",
+          contextIds: ["ask"],
           usage: { inputTokens: 20, cachedInputTokens: 5, outputTokens: 3 }
-        })
+        }),
+        status: "awaiting_user"
       }]
     }));
 
     expect(loadConversationTurns(Date.parse("2026-07-24T00:00:12.500Z")).conversation[0])
       .toMatchObject({
         id: "turn-waiting",
-        status: "awaiting_user",
+        status: "interrupted",
         durationMs: 0,
         usage: { inputTokens: 20, cachedInputTokens: 5, outputTokens: 3 }
       });
@@ -197,9 +198,9 @@ describe("conversation turn presentation state", () => {
     at: "2026-07-24T00:00:12.500Z"
   };
 
-  it("records a failure on the request's last turn, so an ask_user split blames the running segment", () => {
+  it("records a failure on the request's last turn, so a split request blames the running segment", () => {
     const turns = [
-      turn({ id: "turn-first", requestId: "run-1", status: "awaiting_user", contextIds: ["a"] }),
+      turn({ id: "turn-first", requestId: "run-1", status: "interrupted", contextIds: ["a"] }),
       turn({ id: "turn-tail", requestId: "run-1", status: "interrupted" }),
       turn({ id: "turn-other", requestId: "run-2", status: "completed", contextIds: ["b"] })
     ];
@@ -274,7 +275,6 @@ describe("a round that produced nothing", () => {
     ["a stop before the first message", turn({ status: "interrupted" }), true],
     ["a run that finished empty", turn({ status: "completed" }), true],
     ["one still streaming", turn({ status: "running" }), false],
-    ["one paused on a question", turn({ status: "awaiting_user" }), false],
     ["one carrying a failure notice", turn({ status: "interrupted", error: notice }), false],
     ["one that owns a message", turn({ status: "interrupted", contextIds: ["partial"] }), false]
   ])("%s", (_name, entry, discarded) => {
@@ -323,8 +323,8 @@ describe("a round that produced nothing", () => {
     const empty = turn({ id: "turn-empty", anchorContextId: "user-round", status: "interrupted" });
     const produced = turn({ id: "turn-partial", anchorContextId: "user-round", status: "interrupted", contextIds: ["partial"] });
 
-    expect(findResumableTurn([empty], contexts, "continue")).toBeUndefined();
-    expect(findResumableTurn([produced], contexts, "continue")).toBe(produced);
+    expect(findResumableTurn([empty], contexts)).toBeUndefined();
+    expect(findResumableTurn([produced], contexts)).toBe(produced);
   });
 });
 
@@ -381,17 +381,16 @@ describe("continuing an unfinished round", () => {
   });
 
   it("continues the newest round while a stop left it unfinished", () => {
-    expect(findResumableTurn([stopped], contexts, "continue")).toBe(stopped);
+    expect(findResumableTurn([stopped], contexts)).toBe(stopped);
     expect(findResumableTurn(
       [turn({ id: "turn-done", status: "completed", contextIds: ["assistant-round"] })],
-      contexts,
-      "continue"
+      contexts
     )).toBeUndefined();
-    expect(findResumableTurn([], contexts, "continue")).toBeUndefined();
+    expect(findResumableTurn([], contexts)).toBeUndefined();
   });
 
   it("continues a round whose messages were all deleted, which is the only trace left of it", () => {
-    expect(findResumableTurn([stopped], previousRound, "continue")).toBe(stopped);
+    expect(findResumableTurn([stopped], previousRound)).toBe(stopped);
   });
 
   it("refuses to continue a round a later user message already closed", () => {
@@ -411,16 +410,8 @@ describe("continuing an unfinished round", () => {
       }
     ];
 
-    expect(findResumableTurn([stopped], withNextMessage, "continue")).toBeUndefined();
-    expect(findResumableTurn([stopped], withHostNotice, "continue")).toBe(stopped);
-  });
-
-  it("answers the question that paused, even when a newer round sits behind it", () => {
-    const paused = turn({ id: "turn-paused", status: "awaiting_user" });
-    const newer = turn({ id: "turn-newer", status: "completed", contextIds: ["assistant-round"] });
-
-    expect(findResumableTurn([paused, newer], contexts, "awaiting")).toBe(paused);
-    expect(findResumableTurn([newer], contexts, "awaiting")).toBeUndefined();
+    expect(findResumableTurn([stopped], withNextMessage)).toBeUndefined();
+    expect(findResumableTurn([stopped], withHostNotice)).toBe(stopped);
   });
 
   it("carries elapsed time and every token counter into the continuing request", () => {

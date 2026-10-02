@@ -3,7 +3,6 @@ import {
   Folder,
   FolderClock,
   FolderKanban,
-  FolderPlus,
   Server,
   Settings,
   SquareTerminal
@@ -107,7 +106,6 @@ export function ProjectSelector({
               id: project.id,
               label: project.name,
               title: projectTitle(project, sshMachines),
-              icon: <FolderKanban size={14} />,
               hint: project.additionalWorkspaces?.length
                 ? String(project.additionalWorkspaces.length + 1)
                 : undefined,
@@ -118,7 +116,6 @@ export function ProjectSelector({
             : [{
               id: "empty",
               label: t("还没有项目", "No projects yet"),
-              icon: <Folder size={14} />,
               disabled: true
             }]
         },
@@ -128,7 +125,6 @@ export function ProjectSelector({
             {
               id: TEMPORARY_WORKSPACE_ID,
               label: t("临时项目", "Temporary project"),
-              icon: <FolderClock size={14} />,
               checked: isTemporaryWorkspace(activeProject),
               disabled: sourceDeleting || isProjectDeleting(TEMPORARY_WORKSPACE_ID),
               onSelect: () => choose(TEMPORARY_WORKSPACE_ID)
@@ -136,7 +132,6 @@ export function ProjectSelector({
             {
               id: "create",
               label: t("新建项目…", "New project…"),
-              icon: <FolderPlus size={14} />,
               disabled: sourceDeleting,
               onSelect: () => onCreateProject()
             }
@@ -155,7 +150,7 @@ export function ProjectSelector({
  * and where the terminal pane starts a shell when it opens with none.
  *
  * Each machine heading carries a gear for that machine's settings, and each workspace a gear
- * for its environment variables: the variables belong to the workspace, not to its machine.
+ * for its own — its sandbox and variables, which belong to the workspace, not to its machine.
  */
 export function WorkspaceMemberSelector({
   workspaces,
@@ -180,7 +175,7 @@ export function WorkspaceMemberSelector({
   onSelect: (member: number) => void;
   /** Opens the settings of a machine (`null` is this one). */
   onConfigureMachine: (machine: RunTarget | null) => void;
-  /** Opens the environment variables of workspace `member` (1-based). */
+  /** Opens the settings of workspace `member` (1-based): its sandbox and variables. */
   onConfigureWorkspace: (member: number) => void;
 }) {
   const { t } = useI18n();
@@ -199,12 +194,11 @@ export function WorkspaceMemberSelector({
       id: `${index + 1}`,
       label: directory,
       title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
-      icon: machineIcon(workspace.machine, 14),
       hint: String(index + 1),
       checked: index + 1 === selected,
       onSelect: () => onSelect(index + 1),
       action: {
-        label: t("{name} 的环境变量", "Environment variables for {name}", { name: directory }),
+        label: t("{name} 的设置", "Settings for {name}", { name: directory }),
         icon: <Settings size={13} />,
         onSelect: () => onConfigureWorkspace(index + 1)
       }

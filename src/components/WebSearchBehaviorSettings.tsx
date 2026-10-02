@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import { NATIVE_SEARCH_TOOLS } from "../types";
 import { FetchProviderField } from "./FetchProviderField";
+import type { BackendLock } from "./LockTone";
 import { SearchDomainFilterRow } from "./SearchDomainFilterRow";
 import { SearchProviderField } from "./SearchProviderField";
 import { SearchResultShapingFields } from "./SearchResultShapingFields";
@@ -52,15 +53,13 @@ interface WebSearchBehaviorCommonProps {
    */
   nativeToolTypeSelectable?: boolean;
   /**
-   * Said of a selector a run has already acted on. Both backends are pinned the
-   * moment their tool reaches the model: the transcript holds results only that
-   * backend could have produced, so a different one cannot take over mid-way.
+   * How the conversation's lock draws the search selector (`backendTone`):
+   * gray once a native search has sealed results into the transcript, or on a
+   * frozen surface; orange while a host-run backend's cache is warm.
    */
-  lockedHint?: string;
-  /** Pins the search backend. Set once `web_search` has gone out. */
-  searchLocked?: boolean;
-  /** Pins the fetch backend. Set once `web_fetch` has gone out. */
-  fetchLocked?: boolean;
+  searchLock?: BackendLock | null;
+  /** The same for the fetch selector. */
+  fetchLock?: BackendLock | null;
 }
 
 export type WebSearchBehaviorSettingsProps = WebSearchBehaviorCommonProps & (
@@ -114,9 +113,8 @@ export function WebSearchBehaviorSettings(props: WebSearchBehaviorSettingsProps)
     webSearchAssets,
     nativeFetchAvailable = false,
     nativeToolTypeSelectable = false,
-    lockedHint,
-    searchLocked = false,
-    fetchLocked = false
+    searchLock,
+    fetchLock
   } = props;
   const { t } = useI18n();
   const [domainWindowOpen, setDomainWindowOpen] = useState(false);
@@ -146,8 +144,7 @@ export function WebSearchBehaviorSettings(props: WebSearchBehaviorSettingsProps)
         "这个角色的「联网搜索」用哪个后端。留在「跟随对话设置」就用调用方对话的选择。选「原生」时用的是这个角色自己的模型——它所在的协议家族如果不支持模型自带搜索，检索会以可修复的错误失败，而不会悄悄换一家。",
         "Which backend this role's web search goes through. Leave it on \"follow the conversation\" to use the caller's choice. \"Native\" means this role's OWN model — if its protocol family has no built-in search, the search fails with a fixable error rather than quietly switching backends."
       ) : undefined}
-      disabled={searchLocked}
-      disabledHint={searchLocked ? lockedHint : undefined}
+      lock={searchLock}
       nativeToolChoice={versions && nativeToolTypeSelectable
         ? {
           offered: NATIVE_SEARCH_TOOLS,
@@ -168,8 +165,7 @@ export function WebSearchBehaviorSettings(props: WebSearchBehaviorSettingsProps)
         "这个角色抓取网页用哪个后端，和上面的搜索后端各答各的。留在「跟随对话设置」就用调用方对话的选择。这里选什么都不能让一个关掉联网的对话联网——联网与否由对话决定，这里只决定由谁去抓。",
         "Which backend this role fetches pages with, answered separately from the search backend above. Leave it on \"follow the conversation\" to use the caller's choice. Nothing chosen here can put a conversation that is offline back on the network: whether to reach the web at all is the conversation's decision, and this one is only who does the fetching."
       ) : undefined}
-      disabled={fetchLocked}
-      disabledHint={fetchLocked ? lockedHint : undefined}
+      lock={fetchLock}
       nativeToolChoice={versions && fetchVersionSelectable
         ? {
           selected: versions.nativeFetchTool,

@@ -1,6 +1,6 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { configureI18n } from "../i18n";
 import type { ContextItem } from "../types";
 import { ContextUsageMeter, type ContextUsageMeterProps } from "./ContextUsageMeter";
@@ -117,6 +117,121 @@ describe("ContextUsageMeter", () => {
     await user.click(screen.getByRole("button", { name: "上下文用量：不可投影" }));
     const panel = await screen.findByRole("dialog", { name: "上下文窗口用量" });
     expect(within(panel).getByText("不可投影")).toBeInTheDocument();
+  });
+
+  describe("auto-compact", () => {
+    async function openAutoCompact(overrides: Partial<ContextUsageMeterProps> = {}) {
+      const user = userEvent.setup();
+      const onAutoCompactChange = vi.fn();
+      renderMeter({
+        autoCompact: { enabled: true, thresholdPercent: 80 },
+        onAutoCompactChange,
+        ...overrides
+      });
+      await user.click(screen.getByRole("button", { name: /^上下文用量：/ }));
+      const panel = await screen.findByRole("dialog", { name: "上下文窗口用量" });
+      return { user, panel, onAutoCompactChange };
+    }
+
+    it("opens its submenu from a row at the foot of the panel", async () => {
+      const { user, panel } = await openAutoCompact();
+      expect(panel.lastElementChild).toHaveClass("context-usage-compact");
+      const row = within(panel).getByRole("button", { name: /自动压缩/ });
+      expect(row).toHaveTextContent("80%");
+      expect(row).toHaveAttribute("aria-expanded", "false");
+      expect(screen.queryByRole("group", { name: "自动压缩" })).not.toBeInTheDocument();
+
+      await user.click(row);
+      expect(row).toHaveAttribute("aria-expanded", "true");
+      const menu = screen.getByRole("group", { name: "自动压缩" });
+      expect(within(menu).getByRole("switch", { name: "启用自动压缩" })).toHaveAttribute("aria-checked", "true");
+      expect(within(menu).getByRole("spinbutton", { name: "压缩阈值（百分比）" })).toHaveValue(80);
+      const slider = within(menu).getByRole("slider", { name: "压缩阈值" });
+      expect(slider).toHaveValue("80");
+      expect(slider).toHaveAttribute("min", "20");
+      expect(slider).toHaveAttribute("max", "97");
+      // 80% of the 1m window.
+      expect(menu).toHaveTextContent("上下文达到 800k tokens 时，模型写好交接文档，在新的交接会话中继续");
+
+      await user.click(row);
+      expect(screen.queryByRole("group", { name: "自动压缩" })).not.toBeInTheDocument();
+    });
+
+    it("marks the threshold on the usage bar", async () => {
+      const { panel } = await openAutoCompact({ autoCompact: { enabled: true, thresholdPercent: 64 } });
+      const marker = panel.querySelector<HTMLElement>(".context-usage-panel__threshold");
+      expect(marker?.style.left).toBe("64%");
+    });
+
+    it("switches auto-compact off without touching the threshold", async () => {
+      const { user, panel, onAutoCompactChange } = await openAutoCompact();
+      await user.click(within(panel).getByRole("button", { name: /自动压缩/ }));
+      await user.click(screen.getByRole("switch", { name: "启用自动压缩" }));
+      expect(onAutoCompactChange).toHaveBeenCalledWith({ enabled: false, thresholdPercent: 80 });
+    });
+
+    it("commits a typed threshold on Enter, clamped to 20–97", async () => {
+      const { user, panel, onAutoCompactChange } = await openAutoCompact();
+      await user.click(within(panel).getByRole("button", { name: /自动压缩/ }));
+      const field = screen.getByRole("spinbutton", { name: "压缩阈值（百分比）" });
+
+      await user.clear(field);
+      await user.type(field, "8");
+      // "8" is on its way to something; nothing is saved while typing.
+      expect(onAutoCompactChange).not.toHaveBeenCalled();
+      await user.type(field, "5{Enter}");
+      expect(onAutoCompactChange).toHaveBeenLastCalledWith({ enabled: true, thresholdPercent: 85 });
+
+      await user.clear(field);
+      await user.type(field, "150{Enter}");
+      expect(onAutoCompactChange).toHaveBeenLastCalledWith({ enabled: true, thresholdPercent: 97 });
+
+      await user.clear(field);
+      await user.type(field, "5");
+      await user.tab();
+      expect(onAutoCompactChange).toHaveBeenLastCalledWith({ enabled: true, thresholdPercent: 20 });
+    });
+
+    it("commits the slider when it is released, not at every step", async () => {
+      const { user, panel, onAutoCompactChange } = await openAutoCompact();
+      await user.click(within(panel).getByRole("button", { name: /自动压缩/ }));
+      const slider = screen.getByRole("slider", { name: "压缩阈值" });
+
+      fireEvent.input(slider, { target: { value: "60" } });
+      expect(onAutoCompactChange).not.toHaveBeenCalled();
+      // The number field follows the drag as it happens.
+      expect(screen.getByRole("spinbutton", { name: "压缩阈值（百分比）" })).toHaveValue(60);
+      fireEvent.pointerUp(slider);
+      expect(onAutoCompactChange).toHaveBeenCalledTimes(1);
+      expect(onAutoCompactChange).toHaveBeenCalledWith({ enabled: true, thresholdPercent: 60 });
+    });
+
+    it("rounds the token threshold down", async () => {
+      const { user, panel } = await openAutoCompact({
+        contextWindow: 999,
+        tokens: 100,
+        autoCompact: { enabled: true, thresholdPercent: 97 }
+      });
+      await user.click(within(panel).getByRole("button", { name: /自动压缩/ }));
+      // 999 × 97% = 969.03.
+      expect(screen.getByRole("group", { name: "自动压缩" })).toHaveTextContent("上下文达到 969 tokens 时");
+    });
+
+    it("disables the threshold while it is off, and says when there is no window to measure", async () => {
+      const { user, panel } = await openAutoCompact({
+        contextWindow: null,
+        autoCompact: { enabled: false, thresholdPercent: 80 }
+      });
+      const row = within(panel).getByRole("button", { name: /自动压缩/ });
+      expect(row).toHaveTextContent("已关闭");
+      expect(panel.querySelector(".context-usage-panel__threshold")).toBeNull();
+      await user.click(row);
+      const menu = screen.getByRole("group", { name: "自动压缩" });
+      expect(within(menu).getByRole("switch", { name: "启用自动压缩" })).toHaveAttribute("aria-checked", "false");
+      expect(within(menu).getByRole("slider", { name: "压缩阈值" })).toBeDisabled();
+      expect(within(menu).getByRole("spinbutton", { name: "压缩阈值（百分比）" })).toBeDisabled();
+      expect(menu).toHaveTextContent("当前模型没有设置上下文窗口，无法自动压缩");
+    });
   });
 
   it("renders in English when the app language is English", async () => {

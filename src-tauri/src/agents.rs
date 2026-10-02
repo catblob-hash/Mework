@@ -1,6 +1,5 @@
 //! Conversation-scoped background subagent runtime backing the `agent` tool
-//! group: `agent_spawn`, `send_message`, `followup_task`, `task_wait`, and
-//! `task_list`.
+//! group: `agent_spawn`, `task_wait`, and `task_list`.
 //!
 //! Only the user can stop a task, through `stop_conversation_task` over IPC;
 //! the model has no entry point for stopping another task. `request_stop` is
@@ -13,13 +12,14 @@
 //! threads, so round settlement does not interrupt them. Idle completion can
 //! trigger a wake notification. Nested agents (`depth > 0`) retain a private
 //! round pool and end at child-round quiescence. Agent identity is
-//! durable: the cumulative child transcript is persisted on the latest
-//! agent tool context, and a later turn rehydrates it from the conversation
-//! timeline to continue the agent.
+//! durable: the child transcript is persisted on its spawn tool context, and a
+//! later turn rehydrates it from the conversation timeline so `task_wait` can
+//! still address the agent.
 //!
-//! Communication model (after Codex Multi-agent V2 and Claude Code):
-//! - parent → child: `send_message` queues without waking; `followup_task`
-//!   triggers another turn and is promoted after an in-flight turn finishes;
+//! Communication model: a child is one-shot. The parent hands it its whole
+//! task at spawn and never speaks to it again — the parent cannot see inside a
+//! child, so a mid-run instruction or a second task could only be written
+//! blind. The only channel runs the other way:
 //! - child → parent: `subagent_update` progress envelopes plus an automatic
 //!   final-result envelope, both drained by `task_wait`;
 //! - worker → current or future run: the conversation-scoped task surface
@@ -38,7 +38,7 @@ use serde_json::Value;
 use crate::{
     model::{
         canonical_subagent_execution_mode_payload, ContextItem, FileAttachment, ImageAttachment,
-        ModelUsage, QueuedSubagentMessage, RunModelRequest, SubagentRunKind, SubagentRunRecord,
+        ModelUsage, RunModelRequest, SubagentRunKind, SubagentRunRecord,
         SubagentRunStatus, SubagentUpdate,
     },
     prompt_profile::PromptKey,
@@ -66,14 +66,6 @@ pub const WAIT_MIN_TIMEOUT_SECONDS: u64 = 5;
 pub const WAIT_MAX_TIMEOUT_SECONDS: u64 = 600;
 pub const WAIT_DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 pub const MAX_AGENT_NAME_CHARS: usize = 32;
-/// How many unsent child→main messages one agent may hold.
-///
-/// The queue drains at the parent's next round boundary, so it only grows while
-/// the parent is not running — an idle conversation with a background child that
-/// keeps talking. The bound is what stops that from being unbounded; past it the
-/// oldest messages are dropped, because a queue that refuses new sends would
-/// preserve stale news at the expense of current news.
-pub const MAX_PENDING_MAIN_MESSAGES: usize = 32;
 /// Poll cadence while `task_wait` blocks; every tick emits a heartbeat so a
 /// cancelled run aborts the wait promptly.
 pub const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -88,12 +80,14 @@ const QUIESCENCE_DEADLINE: Duration = Duration::from_secs(30);
 /// The task-runtime tools. They are never user-selectable: the model needs
 /// to be able to wait for and inspect tasks whenever anything can produce one,
 /// and a conversation that can spawn a task but cannot collect it is a dead
-/// state rather than a configuration. `box` rides along because it is the
-/// carrier the host uses to hand back a task the model never waited for. Same
-/// shape as the memory tools — kept in the catalog, stripped from every
-/// persisted enabled list, re-derived by the trusted request builder. Mirrored
-/// by TS `src/lib/taskTools.ts`.
+/// state rather than a configuration. `box` is listed with them because it is
+/// derived the same way, though on a wider rule — see
+/// [`apply_task_runtime_tools`]. Same shape as the memory tools — kept in the
+/// catalog, stripped from every persisted enabled list, re-derived by the
+/// trusted request builder. Mirrored by TS `src/lib/taskTools.ts`.
 pub const TASK_RUNTIME_TOOL_NAMES: [&str; 3] = ["task_wait", "task_list", "box"];
+/// The pair that follows a task producer.
+const TASK_COLLECTION_TOOL_NAMES: [&str; 2] = ["task_wait", "task_list"];
 
 /// Enabling any of these can put a row in the task list, so the task-runtime
 /// tools above become reachable.
@@ -144,22 +138,27 @@ pub fn produces_tasks(name: &str) -> bool {
 /// conversation that no longer enables anything able to produce a task, and the
 /// derived pair must not depend on whether the renderer happened to write those
 /// names — the same shape the memory tiers use.
+///
+/// `box` is derived for every run. It carries every message the host appends
+/// to a conversation, and some of those need no feature at all — the
+/// continue-after-truncation nudge can reach any conversation — so it is
+/// declared from the first request on rather than joining the tool set the
+/// first time the host has something to say.
 pub fn apply_task_runtime_tools(enabled_tools: &mut Vec<String>) {
     enabled_tools.retain(|name| !is_task_runtime_tool_name(name));
     if enabled_tools.iter().any(|name| produces_tasks(name)) {
         enabled_tools.extend(
-            TASK_RUNTIME_TOOL_NAMES
+            TASK_COLLECTION_TOOL_NAMES
                 .iter()
                 .map(|name| (*name).to_owned()),
         );
     }
+    enabled_tools.push(crate::api::BOX_TOOL.to_owned());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentToolKind {
     Spawn,
-    SendMessage,
-    FollowupTask,
     Wait,
     List,
 }
@@ -167,8 +166,6 @@ pub enum AgentToolKind {
 pub fn agent_tool_kind(name: &str) -> Option<AgentToolKind> {
     match name {
         "agent_spawn" => Some(AgentToolKind::Spawn),
-        "send_message" => Some(AgentToolKind::SendMessage),
-        "followup_task" => Some(AgentToolKind::FollowupTask),
         "task_wait" => Some(AgentToolKind::Wait),
         "task_list" => Some(AgentToolKind::List),
         _ => None,
@@ -204,13 +201,12 @@ pub fn validate_agent_name(name: &str) -> Result<(), String> {
 pub enum AgentLiveStatus {
     /// A worker thread is executing a child turn.
     Running,
-    /// The last child turn finished normally; the agent is continuable.
+    /// The child turn finished normally.
     Idle,
-    /// The last child turn ended for a reason the host could not classify,
-    /// including a user-initiated task stop observed mid-turn. The agent
-    /// remains continuable via `followup_task`.
+    /// The child turn ended for a reason the host could not classify,
+    /// including a user-initiated task stop observed mid-turn.
     Interrupted,
-    /// The last child turn errored. Continuable; retrying may succeed.
+    /// The child turn errored.
     Failed,
     /// Deliberately halted (explicit stop, hook stop, revoked definition).
     Stopped,
@@ -259,23 +255,19 @@ impl AgentLiveStatus {
 }
 
 /// The identity of one task incarnation: its generation and a digest of the
-/// parameters that started it. `register` mints the first incarnation;
-/// a successful `begin_turn` mints each successor; envelopes copy the identity
-/// at their point of creation.
+/// parameters that started it. `register` mints it; envelopes copy it at their
+/// point of creation.
 ///
 /// The host supplies this task-parameter digest to the shadow kernel so it can
-/// map each envelope to its originating incarnation. Identity is minted only at
-/// `register` and `begin_turn`. Results, progress, and cleanup use the identity
-/// captured at the child turn's start, and incumbent guards in `complete_turn`,
-/// `push_update`, and `RunningTurnGuard` reject stale worker writes.
+/// map each envelope to its originating incarnation. Results, progress, and
+/// cleanup use the identity captured at the child turn's start, and incumbent
+/// guards in `complete_turn`, `push_update`, and `RunningTurnGuard` reject any
+/// write stamped with another identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskIdentity {
-    /// Incarnation generation for this task name. It starts at 1 and increases
-    /// monotonically after each successful `begin_turn` in this process.
+    /// Incarnation generation for this task name. A registration starts it at 1.
     pub generation: u64,
-    /// Digest of the parameters that started this generation. The first
-    /// generation uses the task text; later generations use its follow-up batch
-    /// and task name to prevent cross-name mismatches.
+    /// Digest of the task name and text that started this generation.
     pub params_digest: u64,
 }
 
@@ -335,9 +327,7 @@ pub enum EnvelopeKind {
     Result(SubagentRunStatus),
 }
 
-/// One queued instruction. Top-level steer messages preserve the frontend's
-/// queue id and timestamp; agent-to-agent messages receive canonical context
-/// metadata when the child drains them.
+/// One queued user steer, carrying the frontend's queue id and timestamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailboxMessage {
     pub id: Option<String>,
@@ -347,25 +337,14 @@ pub struct MailboxMessage {
     pub created_at: Option<String>,
 }
 
-/// Message queue shared by top-level steering and parent→child communication.
-/// A handle is attached to `RunModelRequest`, and the model loop drains it
-/// before every model round.
+/// The user's steer queue for a running top-level turn. A handle is attached to
+/// `RunModelRequest`, and the model loop drains it before every model round.
 #[derive(Debug, Default)]
 pub struct AgentMailbox {
     messages: Mutex<Vec<MailboxMessage>>,
 }
 
 impl AgentMailbox {
-    pub fn push(&self, message: String) {
-        self.push_message(MailboxMessage {
-            id: None,
-            content: message,
-            images: Vec::new(),
-            files: Vec::new(),
-            created_at: None,
-        });
-    }
-
     pub fn push_message(&self, message: MailboxMessage) {
         self.messages
             .lock()
@@ -388,23 +367,9 @@ impl AgentMailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty()
     }
-
-    pub fn snapshot(&self) -> Vec<MailboxMessage> {
-        self.messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    pub fn extend(&self, messages: impl IntoIterator<Item = MailboxMessage>) {
-        self.messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend(messages);
-    }
 }
 
-/// `RunModelRequest` attachment for the child mailbox. Never serialized and
+/// `RunModelRequest` attachment for the steer queue. Never serialized and
 /// compared by identity so the request keeps its derives.
 #[derive(Clone, Default)]
 pub struct AgentMailboxHandle(pub Option<Arc<AgentMailbox>>);
@@ -429,42 +394,21 @@ impl PartialEq for AgentMailboxHandle {
     }
 }
 
-/// One message a still-running child sent to the main agent, held until the
-/// parent's next round boundary turns it into a host task notification.
-#[derive(Clone, Debug)]
-pub struct PendingMainMessage {
-    /// The child that sent it. Copied at enqueue time so a drain can name the
-    /// sender without holding the agent alive or re-resolving it in the pool.
-    pub agent: String,
-    pub content: String,
-    pub created_at: String,
-}
-
 #[derive(Debug)]
 struct AgentCore {
     status: AgentLiveStatus,
-    /// Identity of the incumbent task incarnation. `register` mints the first
-    /// identity, `begin_turn` mints successors, and envelopes copy it when made.
+    /// Identity of the incumbent task incarnation. `register` mints it and
+    /// envelopes copy it when made.
     identity: TaskIdentity,
     /// At most one explicit-stop timer per incarnation; repeated stops never
     /// move its deadline. Old timers still verify identity under this lock.
     stop_timer: Option<TaskIdentity>,
-    /// Cumulative transcript across every child turn, starting with the task.
+    /// The child's transcript, starting with the task.
     contexts: Vec<ContextItem>,
     updates: Vec<SubagentUpdate>,
     outbox: Vec<AgentEnvelope>,
-    /// Messages this child sent to the main agent with the child form of
-    /// `send_message`, waiting for the parent's next round boundary.
-    ///
-    /// Deliberately NOT the outbox. An outbox entry is a task deliverable:
-    /// `task_wait` can claim it, and a `Result` there is a delivery obligation
-    /// the turn cannot end while holding. A message is neither. It is delivered
-    /// as a host notification when the parent next assembles a request, and if
-    /// no request ever comes it simply is not delivered — the child is still
-    /// running, and nothing about its task changed by saying something.
-    main_messages: Vec<PendingMainMessage>,
-    /// The agent tool call that last created, messaged, or continued the child;
-    /// the persisted record is backfilled onto this tool context.
+    /// The agent tool call that created the child; the persisted record is
+    /// backfilled onto this tool context.
     latest_call_id: String,
     /// Timeline id of the tool card `latest_call_id` produced, recorded when
     /// the parent run minted that card. Round-boundary record checkpoints use
@@ -479,11 +423,8 @@ struct AgentCore {
     /// record were also folded into the parent. This copy exists solely to be
     /// persisted per agent, and is the value the task sidebar shows.
     lifetime_usage: ModelUsage,
-    /// Result of the LATEST child turn, not a cumulative best-known value.
-    /// `complete_turn` overwrites it unconditionally, mirroring `status`
-    /// (contexts extend; status and this replace), so a follow-up turn that
-    /// ended without a structured result cannot leave the previous turn's value
-    /// standing as if it described the current one.
+    /// Result of the child turn. `complete_turn` overwrites it unconditionally,
+    /// mirroring `status` (contexts extend; status and this replace).
     structured_output: Option<Value>,
     /// Text of the latest terminal envelope, replaced the same way: what the
     /// child answered, or why it failed. `task_wait` reads it from the envelope;
@@ -542,10 +483,6 @@ pub struct AgentShared {
     pub name: String,
     pub label: String,
     pub task: String,
-    pub mailbox: Arc<AgentMailbox>,
-    /// Follow-up tasks are not visible to an in-flight child request. The
-    /// worker promotes them only after that child turn has completed.
-    pub followups: Arc<AgentMailbox>,
     /// Stop flag shared by value with synchronous blocking operations in the
     /// task turn, including shell processes, hook commands, and approval cards.
     /// Use [`Self::cancel_flag`] to obtain a clone for polling.
@@ -555,7 +492,7 @@ pub struct AgentShared {
     /// the task was closed by hand. Set by [`Self::request_stop`].
     stopped_by_user: AtomicBool,
     /// Prototype child request (provider, tools, hooks, depth…) with empty
-    /// contexts; each child turn clones it and fills contexts + mailbox.
+    /// contexts; the child turn clones it and fills in the transcript.
     pub template: RunModelRequest,
     /// Host-selected role. Part of the signed execution-mode payload, so a
     /// search-group worker's receipt can never be replayed as an ordinary
@@ -565,36 +502,9 @@ pub struct AgentShared {
     signal: Arc<(Mutex<u64>, Condvar)>,
     /// Settlement observer slot shared with the pool. See [`SettleObserver`].
     settle_observer: SettleObserverSlot,
-    /// Shared with the pool so old handles cannot start follow-up incarnations.
-    retired: Arc<AtomicBool>,
 }
 
 impl AgentShared {
-    /// Claims the agent for a new child turn. Returns false when another
-    /// worker already runs it, so exactly one thread continues an agent.
-    pub fn begin_turn(&self, call_id: &str) -> bool {
-        let mut core = self.lock_core();
-        if self.retired.load(Ordering::Acquire) || core.status == AgentLiveStatus::Running {
-            return false;
-        }
-        core.status = AgentLiveStatus::Running;
-        core.latest_call_id = call_id.to_owned();
-        // A new call card has not been minted, so the previous card no longer
-        // owns persistence.
-        core.latest_context_id = None;
-        // A successful claim creates a new incarnation using the follow-up
-        // messages that woke it. Both wake paths enqueue the trigger before
-        // `begin_turn`; later messages cannot rewrite startup parameters.
-        // Lock order is core → followups, matching `record`.
-        let trigger = self.followups.snapshot();
-        core.identity = TaskIdentity::mint(
-            &self.name,
-            core.identity.generation + 1,
-            trigger.iter().map(|message| message.content.as_str()),
-        );
-        true
-    }
-
     /// Identity of the incumbent incarnation submitted to the shadow kernel at
     /// wait-start and timeout observation points.
     pub fn identity(&self) -> TaskIdentity {
@@ -622,8 +532,8 @@ impl AgentShared {
             merge_shared_usage(&mut core.usage, usage);
             merge_shared_usage(&mut core.lifetime_usage, usage);
             if core.identity != incarnation {
-                // A follow-up replaced this incarnation. Do not merge its
-                // orphaned result into the successor transcript.
+                // Not this incarnation's result. Do not merge it into the
+                // incumbent's transcript.
                 eprintln!(
                     "[agents] 丢弃陈旧化身的迟到结果：{}（第 {} 代已被第 {} 代更替）",
                     self.name, incarnation.generation, core.identity.generation
@@ -696,44 +606,6 @@ impl AgentShared {
         self.notify();
     }
 
-    /// Queues one child→main message. Same incumbent guard as `push_update`, and
-    /// deliberately no `notify`: a message is not a task deliverable, so it must
-    /// not end a `task_wait` that is blocking for one.
-    ///
-    /// Only a `General` agent may speak. Shell and workflow-step rows are
-    /// accounting templates that never run a model, so a message attributed to
-    /// one could only have come from somewhere it does not belong.
-    pub fn queue_message_for_main(
-        &self,
-        incarnation: TaskIdentity,
-        content: String,
-        created_at: String,
-    ) {
-        if self.kind != SubagentRunKind::General {
-            return;
-        }
-        let mut core = self.lock_core();
-        if core.identity != incarnation || core.status != AgentLiveStatus::Running {
-            return;
-        }
-        core.main_messages.push(PendingMainMessage {
-            agent: self.name.clone(),
-            content,
-            created_at,
-        });
-        let overflow = core
-            .main_messages
-            .len()
-            .saturating_sub(MAX_PENDING_MAIN_MESSAGES);
-        if overflow > 0 {
-            core.main_messages.drain(..overflow);
-        }
-    }
-
-    fn take_main_messages(&self) -> Vec<PendingMainMessage> {
-        std::mem::take(&mut self.lock_core().main_messages)
-    }
-
     pub fn status(&self) -> AgentLiveStatus {
         self.lock_core().status
     }
@@ -746,7 +618,7 @@ impl AgentShared {
     /// Forces an agent that ignored its cancel flag to a terminal state,
     /// preserving its transcript and emitting a result envelope so the parent
     /// learns why it stopped. Never drops the record — a settled agent must
-    /// still be continuable.
+    /// still be addressable by `task_wait` and readable from the timeline.
     ///
     /// Called only after `await_quiescence_until` expires following a
     /// cancellation request that the worker did not honor. It is unrelated to
@@ -877,20 +749,6 @@ impl AgentShared {
         }
     }
 
-    /// Makes a queue-only message the latest persistence owner without changing
-    /// the agent's live status or waking a worker.
-    pub fn record_message_call(&self, call_id: &str) {
-        let mut core = self.lock_core();
-        core.latest_call_id = call_id.to_owned();
-        core.latest_context_id = None;
-    }
-
-    /// Moves follow-up tasks into the child-visible inbox at the boundary
-    /// between child turns.
-    pub fn activate_followups(&self) {
-        self.mailbox.extend(self.followups.drain());
-    }
-
     pub fn transcript(&self) -> Vec<ContextItem> {
         self.lock_core().contexts.clone()
     }
@@ -909,7 +767,7 @@ impl AgentShared {
 
     /// A recovery-only copy of this incarnation's settled rounds. Hold the
     /// identity/owner lock THROUGH persistence, not just while taking a snapshot:
-    /// otherwise a late database write could overwrite a successor's card.
+    /// otherwise a late checkpoint could overwrite the record a settled turn wrote.
     /// The callback must not re-enter AgentShared or emit lifecycle events.
     pub(crate) fn checkpoint_transcript(
         &self,
@@ -975,24 +833,6 @@ impl AgentShared {
                 .output_schema
                 .as_ref()
                 .map(|schema| schema.as_value().clone()),
-            queued_messages: self
-                .mailbox
-                .snapshot()
-                .into_iter()
-                .map(|message| QueuedSubagentMessage {
-                    content: message.content,
-                    trigger_turn: false,
-                })
-                .chain(
-                    self.followups
-                        .snapshot()
-                        .into_iter()
-                        .map(|message| QueuedSubagentMessage {
-                            content: message.content,
-                            trigger_turn: true,
-                        }),
-                )
-                .collect(),
         }
     }
 
@@ -1082,8 +922,7 @@ impl AgentShared {
 
 /// Ensures a worker thread that unwinds (panic or early exit) leaves its agent
 /// in a terminal state so `finalize` never waits forever. The same incumbent
-/// guard as `complete_turn` lets a guard clean up only its own incarnation; a
-/// stale worker must not interrupt an incarnation replaced by a follow-up.
+/// guard as `complete_turn` lets a guard clean up only its own incarnation.
 pub struct RunningTurnGuard {
     shared: Arc<AgentShared>,
     incarnation: TaskIdentity,
@@ -1309,9 +1148,9 @@ impl AgentPool {
         status: AgentLiveStatus,
         call_id: String,
         // Structured result carried over from the persisted record when this
-        // registration is a rehydration. Without it, continuing an agent whose
-        // last turn returned a structured value would write `None` back on the
-        // next `record()` and silently drop it from the document.
+        // registration is a rehydration. Without it, restoring an agent whose
+        // turn returned a structured value would write `None` back on the next
+        // `record()` and silently drop it from the document.
         initial_structured_output: Option<Value>,
     ) -> Result<Arc<AgentShared>, String> {
         validate_agent_name(&name)?;
@@ -1334,16 +1173,13 @@ impl AgentPool {
         }
         state.reserve_subagent_execution_mode(&template.conversation_id, &name, &canonical_mode)?;
         Self::validate_registration_availability(&agents, &name, status, self.max_live)?;
-        // Registration mints the first identity from the task text. Rehydration
-        // follows the same path; generation need only be monotonic during one
-        // `AgentShared` lifetime.
+        // Registration mints the identity from the task text. Rehydration
+        // follows the same path.
         let identity = TaskIdentity::mint(&name, 1, [task.as_str()]);
         let shared = Arc::new(AgentShared {
             name,
             label,
             task,
-            mailbox: Arc::new(AgentMailbox::default()),
-            followups: Arc::new(AgentMailbox::default()),
             cancel: Arc::new(AtomicBool::new(false)),
             stopped_by_user: AtomicBool::new(false),
             template,
@@ -1355,7 +1191,6 @@ impl AgentPool {
                 contexts: initial_contexts,
                 updates: initial_updates,
                 outbox: Vec::new(),
-                main_messages: Vec::new(),
                 latest_call_id: call_id,
                 latest_context_id: None,
                 usage: ModelUsage::default(),
@@ -1365,15 +1200,13 @@ impl AgentPool {
             }),
             signal: Arc::clone(&self.signal),
             settle_observer: self.settle_observer.clone(),
-            retired: Arc::clone(&self.retired),
         });
         agents.push(Arc::clone(&shared));
         Ok(shared)
     }
 
     /// Non-destructive wake snapshot for the main-thread kernel observer. Use
-    /// each envelope's identity, not the agent's current incarnation: an older
-    /// result can still await delivery while a follow-up is already running.
+    /// each envelope's identity, not the agent's current incarnation.
     pub(crate) fn undelivered_result_identities(&self) -> Vec<(String, TaskIdentity)> {
         self.all()
             .into_iter()
@@ -1396,18 +1229,6 @@ impl AgentPool {
         self.lock_agents()
             .iter()
             .flat_map(|agent| agent.take_undelivered_results())
-            .collect()
-    }
-
-    /// Claims every agent's queued child→main messages, in registration order.
-    ///
-    /// Deliberately separate from `take_undelivered_results`: this claims nothing
-    /// terminal, discharges no delivery obligation, and leaves every agent's
-    /// lifecycle exactly as it found it.
-    pub fn take_pending_main_messages(&self) -> Vec<PendingMainMessage> {
-        self.lock_agents()
-            .iter()
-            .flat_map(|agent| agent.take_main_messages())
             .collect()
     }
 
@@ -1484,12 +1305,6 @@ impl AgentPool {
 
     pub fn is_empty(&self) -> bool {
         self.lock_agents().is_empty()
-    }
-
-    /// True when one more agent may transition to `Running`.
-    pub fn can_run_one_more(&self) -> bool {
-        self.max_live
-            .is_none_or(|limit| Self::running_count(&self.lock_agents()) < limit)
     }
 
     /// Picks the first free auto name (`a1`, `a2`, …) also avoiding names used
@@ -1633,8 +1448,8 @@ impl AgentPool {
                 // Drain again because `complete_turn` and cancellation-timeout
                 // settlement write state and the result envelope in one core
                 // critical section, but this drain and the status check are not
-                // one snapshot. Once no task is running, only `followup_task`
-                // can wake an idle task, so no further envelopes can arrive.
+                // one snapshot. Once no task is running, nothing can start it
+                // again, so no further envelopes can arrive.
                 buffered
                     .envelopes
                     .extend(watched.iter().flat_map(|agent| agent.drain_outbox()));
@@ -1893,12 +1708,13 @@ pub(crate) mod tests {
             enabled
         };
 
-        // No producer: a persisted set is removed rather than honoured.
+        // No producer: a persisted pair is removed rather than honoured, and
+        // `box` is there regardless — every run can be handed a host notice.
         assert_eq!(
             derive(&["read", "task_wait", "task_list", "box"]),
-            vec!["read"]
+            vec!["read", "box"]
         );
-        assert_eq!(derive(&[]), Vec::<String>::new());
+        assert_eq!(derive(&[]), vec!["box"]);
 
         // Every producer derives the set on its own, without the renderer
         // having to name it. The list is the address space of `TaskRef`.
@@ -1915,20 +1731,20 @@ pub(crate) mod tests {
             );
         }
 
-        // A non-producer never derives it, however many are enabled.
+        // A non-producer never derives the pair, however many are enabled.
         assert_eq!(
             derive(&["read", "write", "ls", "grep"]),
-            vec!["read", "write", "ls", "grep"]
+            vec!["read", "write", "ls", "grep", "box"]
         );
         // A preview *page* tool is not a producer: the task is the dev server
         // process, and a conversation that can only click a page owns none.
         assert_eq!(
             derive(&["preview_click", "preview_screenshot"]),
-            vec!["preview_click", "preview_screenshot"]
+            vec!["preview_click", "preview_screenshot", "box"]
         );
         assert_eq!(
             derive(&["web_search", "web_fetch"]),
-            vec!["web_search", "web_fetch"]
+            vec!["web_search", "web_fetch", "box"]
         );
 
         // Idempotent: deriving over an already-derived list adds nothing.
@@ -1976,6 +1792,7 @@ pub(crate) mod tests {
                 capabilities: Default::default(),
                 reasoning_content: Default::default(),
                 prompt_cache: true,
+                cache_ttl_minutes: None,
             },
             reasoning_effort: Default::default(),
             conversation_id: "conv".into(),
@@ -1995,19 +1812,22 @@ pub(crate) mod tests {
             enabled_tools: Vec::new(),
             contexts: Vec::new(),
             ephemeral_contexts: Vec::new(),
+            host_notices: Vec::new(),
             tools: Vec::new(),
             active_hooks: Vec::new(),
             security_level: SecurityLevel::FullAccess,
             live_security_level: None,
+            plan_tools: false,
+            live_plan_mode: None,
             app_data_path: ".".into(),
             mcp_servers: Vec::new(),
             mcp_bindings: Vec::new(),
             subagent_depth: 1,
+            handoff: Default::default(),
             request_id: String::new(),
             subagent_name: None,
             subagent_call_id: None,
-            wire_ledger_owner: None,
-            agent_mailbox: AgentMailboxHandle::default(),
+            history_owner: None,
             steer_mailbox: AgentMailboxHandle::default(),
             task_cancel: crate::cancel::CancelSignal::default(),
             run_cancel: crate::cancel::CancelSignal::default(),
@@ -2113,8 +1933,6 @@ pub(crate) mod tests {
             1,
             None,
         );
-        assert!(agent.begin_turn("followup"));
-        assert_ne!(agent.identity(), settled_identity);
         let expected = vec![("a1".to_owned(), settled_identity)];
         assert_eq!(pool.undelivered_result_identities(), expected);
         assert_eq!(pool.undelivered_result_identities(), expected);
@@ -2204,8 +2022,6 @@ pub(crate) mod tests {
             .wake_pending_conversations()
             .contains(&conversation.id));
         assert!(register_result(&tasks.pool, "late", AgentLiveStatus::Running).is_err());
-        assert!(!done.begin_turn("late-followup"));
-        assert!(!running.begin_turn("late-followup"));
     }
 
     #[test]
@@ -2269,8 +2085,8 @@ pub(crate) mod tests {
     }
 
     /// Only terminal settlement that passes the incumbent guard notifies the
-    /// observer. A stale return from a superseded worker must not wake an idle
-    /// conversation.
+    /// observer. A late second return for an already settled incarnation must
+    /// not wake an idle conversation again.
     #[test]
     fn settle_observer_fires_only_for_applied_terminals() {
         let pool = AgentPool::new();
@@ -2295,14 +2111,12 @@ pub(crate) mod tests {
             &[("a1".to_owned(), SubagentRunStatus::Completed)]
         );
 
-        // The incumbent guard discards the superseded incarnation's late result;
+        // The incumbent guard discards the settled incarnation's late result;
         // it must not notify the observer again.
-        shared.followups.push("next".into());
-        assert!(shared.begin_turn("call-2"));
         shared.complete_turn(
             incumbent,
             Vec::new(),
-            "stale".into(),
+            "late".into(),
             AgentLiveStatus::Idle,
             &ModelUsage::default(),
             1,
@@ -2497,7 +2311,6 @@ pub(crate) mod tests {
         for index in 2..=MAX_LIVE_AGENTS {
             register(&pool, &format!("a{index}"), AgentLiveStatus::Running);
         }
-        assert!(!pool.can_run_one_more());
         let overflow_template = template();
         let error = pool
             .register(
@@ -2530,7 +2343,6 @@ pub(crate) mod tests {
         for index in 1..=3 {
             register(&pool, &format!("a{index}"), AgentLiveStatus::Running);
         }
-        assert!(!pool.can_run_one_more());
 
         let error = pool
             .preflight_registration("a4", &template(), AgentLiveStatus::Running)
@@ -2544,7 +2356,6 @@ pub(crate) mod tests {
         for index in 1..=MAX_LIVE_AGENTS + 8 {
             register(&raised, &format!("b{index}"), AgentLiveStatus::Running);
         }
-        assert!(!raised.can_run_one_more());
 
         // A zero request is raised to one rather than producing a pool that can
         // never run anything.
@@ -2572,7 +2383,6 @@ pub(crate) mod tests {
         for index in MAX_LIVE_AGENTS + 2..=RAISED {
             register(&pool, &format!("a{index}"), AgentLiveStatus::Running);
         }
-        assert!(!pool.can_run_one_more());
         let error = pool
             .preflight_registration("a17", &template(), AgentLiveStatus::Running)
             .unwrap_err();
@@ -2588,18 +2398,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn begin_turn_claims_exclusively_and_guard_interrupts_on_unwind() {
+    fn turn_guard_interrupts_on_unwind_and_defuses_on_return() {
         let pool = AgentPool::new();
-        let shared = register(&pool, "a1", AgentLiveStatus::Idle);
-        assert!(shared.begin_turn("call-2"));
-        assert!(!shared.begin_turn("call-3"));
-        assert_eq!(shared.latest_call_id(), "call-2");
-
+        let shared = register(&pool, "a1", AgentLiveStatus::Running);
         let guard = RunningTurnGuard::new(Arc::clone(&shared));
         drop(guard);
         assert_eq!(shared.status(), AgentLiveStatus::Interrupted);
 
-        assert!(shared.begin_turn("call-4"));
+        let shared = register(&pool, "a2", AgentLiveStatus::Running);
         RunningTurnGuard::new(Arc::clone(&shared)).defuse();
         assert_eq!(shared.status(), AgentLiveStatus::Running);
     }
@@ -2615,11 +2421,9 @@ pub(crate) mod tests {
         assert!(outcome.envelopes.is_empty());
     }
 
-    /// `register` mints the first identity, each successful `begin_turn` mints
-    /// a successor, and envelopes copy their identity when produced. A late
-    /// envelope therefore retains its originating generation.
+    /// `register` mints the identity, and envelopes copy it when produced.
     #[test]
-    fn task_identity_rotates_per_incarnation_and_stamps_envelopes() {
+    fn registration_mints_the_identity_that_stamps_envelopes() {
         let pool = AgentPool::new();
         let shared = register(&pool, "a1", AgentLiveStatus::Running);
         let first = shared.identity();
@@ -2627,30 +2431,15 @@ pub(crate) mod tests {
         shared.complete_turn(
             shared.identity(),
             Vec::new(),
-            "第一代结论".into(),
-            AgentLiveStatus::Idle,
-            &ModelUsage::default(),
-            1,
-            None,
-        );
-        shared.followups.push("再深入一层".into());
-        assert!(shared.begin_turn("call-2"));
-        let second = shared.identity();
-        assert_eq!(second.generation, 2);
-        assert_ne!(first, second, "化身更替必须重铸身份");
-        shared.complete_turn(
-            shared.identity(),
-            Vec::new(),
-            "第二代结论".into(),
+            "结论".into(),
             AgentLiveStatus::Idle,
             &ModelUsage::default(),
             1,
             None,
         );
         let envelopes = shared.take_undelivered_results();
-        assert_eq!(envelopes.len(), 2);
-        assert_eq!(envelopes[0].identity, first, "旧代信封归旧代");
-        assert_eq!(envelopes[1].identity, second, "新代信封归新代");
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].identity, first);
     }
 
     /// Cancellation-timeout settlement also stamps its terminal envelope with
@@ -2713,75 +2502,6 @@ pub(crate) mod tests {
         assert_eq!(shared.lifetime_usage().total_tokens, Some(7));
     }
 
-    /// A late `complete_turn` from an incarnation superseded by a follow-up
-    /// must not stamp its result with the successor identity or rewind the
-    /// successor's Running state and transcript.
-    #[test]
-    fn stale_worker_result_after_followup_is_discarded() {
-        let pool = AgentPool::new();
-        let shared = register(&pool, "a1", AgentLiveStatus::Running);
-        let old_incarnation = shared.identity();
-        // Cancellation-timeout settlement terminates the old incarnation before
-        // a follow-up wakes its successor.
-        shared.settle_after_cancel_timeout();
-        shared.followups.push("再试一次".into());
-        assert!(shared.begin_turn("call-2"));
-        let new_incarnation = shared.identity();
-        assert_ne!(old_incarnation, new_incarnation);
-
-        // The incumbent guard rejects every write from the stale worker.
-        shared.complete_turn(
-            old_incarnation,
-            vec![ContextItem::Assistant {
-                id: "ctx_orphan".into(),
-                content: "孤儿结论".into(),
-                round: None,
-                model_turn_id: None,
-                interrupted: false,
-                sources: Vec::new(),
-                created_at: "2026-08-13T00:00:00Z".into(),
-            }],
-            "孤儿结论".into(),
-            AgentLiveStatus::Idle,
-            &ModelUsage {
-                total_tokens: Some(3),
-                ..Default::default()
-            },
-            5,
-            None,
-        );
-        assert_eq!(
-            shared.status(),
-            AgentLiveStatus::Running,
-            "新化身不得被回卷"
-        );
-        let envelopes = shared.drain_outbox();
-        assert_eq!(envelopes.len(), 1, "不得出现盖着新代身份的孤儿信封");
-        assert_eq!(envelopes[0].identity, old_incarnation);
-        assert!(
-            shared.record().contexts.is_empty(),
-            "孤儿转写不得混入新化身"
-        );
-        // Tokens were actually spent and remain accounted for.
-        assert_eq!(shared.lifetime_usage().total_tokens, Some(3));
-
-        // A stale worker's cleanup guard must not affect the successor.
-        drop(RunningTurnGuard {
-            shared: Arc::clone(&shared),
-            incarnation: old_incarnation,
-            defused: false,
-        });
-        assert_eq!(shared.status(), AgentLiveStatus::Running);
-
-        // Progress from the stale incarnation is rejected as well.
-        shared.push_update(
-            old_incarnation,
-            "旧代进度".into(),
-            "2026-08-13T00:00:01Z".into(),
-        );
-        assert!(shared.drain_outbox().is_empty());
-    }
-
     /// Forced terminal settlement is a deliverable result like any other: its
     /// reason rides the envelope to the model, and it raises the same settlement
     /// edge as `complete_turn` so an idle conversation wakes for it.
@@ -2811,11 +2531,6 @@ pub(crate) mod tests {
             "{}",
             claimed[0].content
         );
-        assert!(
-            claimed[0].content.contains("followup_task"),
-            "{}",
-            claimed[0].content
-        );
     }
 
     /// Delivery-round probing counts every terminal result. A task the user
@@ -2841,8 +2556,7 @@ pub(crate) mod tests {
         );
         pool.take_undelivered_results();
 
-        shared.followups.push("继续".into());
-        assert!(shared.begin_turn("call-2"));
+        let shared = register(&pool, "a2", AgentLiveStatus::Running);
         shared.complete_turn(
             shared.identity(),
             Vec::new(),
@@ -2858,8 +2572,7 @@ pub(crate) mod tests {
         );
         pool.take_undelivered_results();
 
-        shared.followups.push("再来".into());
-        assert!(shared.begin_turn("call-3"));
+        let shared = register(&pool, "a3", AgentLiveStatus::Running);
         shared.complete_turn(
             shared.identity(),
             Vec::new(),
@@ -2941,7 +2654,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stale_stop_timer_cannot_settle_a_new_incarnation() {
+    fn a_stop_timer_firing_after_a_cooperative_exit_settles_nothing() {
         let pool = AgentPool::new();
         let shared = register(&pool, "a1", AgentLiveStatus::Running);
         let old = shared.identity();
@@ -2958,16 +2671,7 @@ pub(crate) mod tests {
         shared.take_undelivered_results();
         shared.settle_cancelled_incarnation(Some(old));
         assert!(shared.take_undelivered_results().is_empty());
-        assert!(shared.begin_turn("next"));
-        // Even if the new incarnation is cancelled too, the old timer may not
-        // consume its independently granted grace period.
-        shared.request_stop(StopOrigin::User);
-        shared.settle_cancelled_incarnation(Some(old));
-        assert_eq!(shared.status(), AgentLiveStatus::Running);
-        assert!(shared.take_undelivered_results().is_empty());
-        shared.settle_cancelled_incarnation(Some(shared.identity()));
         assert_eq!(shared.status(), AgentLiveStatus::Stopped);
-        assert_eq!(shared.take_undelivered_results().len(), 1);
     }
 
     #[test]
@@ -3218,9 +2922,9 @@ pub(crate) mod tests {
             .unwrap();
         assert!(outcome.envelopes.is_empty());
 
-        assert!(shared.begin_turn("call-2"));
+        let running = register(&pool, "a2", AgentLiveStatus::Running);
         let error = pool
-            .wait_activity(&[shared], Duration::from_secs(30), &|| {
+            .wait_activity(&[running], Duration::from_secs(30), &|| {
                 Err("模型运行已停止".into())
             })
             .unwrap_err();
@@ -3700,9 +3404,9 @@ pub(crate) mod tests {
 
     /// A name can bind only one execution mode within a conversation.
     ///
-    /// Names are addressable identities for `send_message` and `followup_task`.
-    /// Rebinding `a1` to a different inheritance, fork, or named-definition
-    /// binding would silently change the recipient. The in-process registry
+    /// Names are addressable identities for `task_wait`. Rebinding `a1` to a
+    /// different inheritance, fork, or named-definition binding would silently
+    /// change what the address refers to. The in-process registry
     /// therefore maintains a one-to-one name-to-mode mapping. Both registrations
     /// must share one `AppState` for this test to exercise that registry.
     #[test]
@@ -3776,8 +3480,10 @@ pub(crate) mod tests {
         assert!(error.contains("已绑定到另一种执行模式"), "{error}");
         assert!(pool.is_empty(), "被拒绝的注册不能留下活代理");
     }
+    /// A return the incumbent guard refuses — here a late second one after the
+    /// turn settled — still spent real tokens, so its usage is still counted.
     #[test]
-    fn usage_accumulates_across_turns_and_is_taken_once() {
+    fn usage_accumulates_across_returns_and_is_taken_once() {
         let pool = AgentPool::new();
         let shared = register(&pool, "a1", AgentLiveStatus::Running);
         shared.complete_turn(
@@ -3795,7 +3501,6 @@ pub(crate) mod tests {
             0,
             None,
         );
-        assert!(shared.begin_turn("call-2"));
         shared.complete_turn(
             shared.identity(),
             Vec::new(),
@@ -3826,8 +3531,8 @@ pub(crate) mod tests {
     }
 
     /// Restoring a record must not re-bill the parent. `restore_lifetime_usage`
-    /// seeds only the never-taken copy, so a continuation reports the agent's
-    /// full history while `take_usage` still yields just this turn's tokens.
+    /// seeds only the never-taken copy, so the record reports the agent's full
+    /// history while `take_usage` yields nothing.
     #[test]
     fn restored_usage_reaches_the_record_without_re_billing_the_parent() {
         let pool = AgentPool::new();
@@ -3841,26 +3546,5 @@ pub(crate) mod tests {
         });
         assert_eq!(shared.record().usage.total_tokens, Some(150));
         assert_eq!(shared.take_usage(), ModelUsage::default());
-
-        assert!(shared.begin_turn("call-2"));
-        shared.complete_turn(
-            shared.identity(),
-            Vec::new(),
-            "续跑".into(),
-            AgentLiveStatus::Idle,
-            &ModelUsage {
-                input_tokens: Some(5),
-                cached_input_tokens: Some(1),
-                output_tokens: Some(3),
-                total_tokens: Some(8),
-                reasoning_tokens: None,
-            },
-            0,
-            None,
-        );
-        // The parent is billed for this turn alone...
-        assert_eq!(shared.take_usage().total_tokens, Some(8));
-        // ...while the record carries the agent's whole history.
-        assert_eq!(shared.record().usage.total_tokens, Some(158));
     }
 }

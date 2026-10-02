@@ -726,14 +726,6 @@ function DiffFileBody({
   fullyExpanded
 }: DiffFileBodyProps) {
   const { t } = useI18n();
-  // The gutter is as wide as its widest number and no narrower than three digits,
-  // so a file with three-digit lines does not pay for a five-digit column.
-  const widest = hunks.reduce((width, hunk) => Math.max(
-    width,
-    String(hunk.oldStart + hunk.oldLines).length,
-    String(hunk.newStart + hunk.newLines).length
-  ), 3);
-
   const canExpand = onExpandContext !== undefined && !fullyExpanded;
   const expand = () => onExpandContext?.(path);
 
@@ -777,7 +769,7 @@ function DiffFileBody({
   return (
     <div
       className={`diff-viewer__code diff-viewer__code--${style}${wordWrap ? " diff-viewer__code--wrap" : ""}`}
-      style={{ ["--diff-gutter" as string]: `${widest}ch` }}
+      data-selection-columns={style === "split" || undefined}
     >
       {hunks.map((hunk, index) => {
         const previous = index === 0 ? null : hunks[index - 1];
@@ -861,6 +853,12 @@ function UnifiedHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: bo
   );
 }
 
+/**
+ * Side by side, still one number column: the gutter sits at the left edge and
+ * the two sides share the rest equally. It shows what the unified gutter does —
+ * the new file's number, or the old one on a row with nothing on the new side —
+ * and the old side's own number rides along as an attribute.
+ */
 function SplitHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: boolean }) {
   const pairs = useMemo(() => pairHunkLines(hunk.lines), [hunk]);
   const segments = useMemo(() => wordSegmentsFor(pairs, enabled), [pairs, enabled]);
@@ -872,26 +870,20 @@ function SplitHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: bool
         const context = left !== null && left === right;
         return (
           <div className="diff-viewer__row" key={index}>
-            <span
-              className={`diff-viewer__number diff-viewer__number--left${left && !context ? " diff-viewer__number--deletion" : ""}`}
-              aria-hidden="true"
-            >
-              {left?.oldLine ?? ""}
+            <span className="diff-viewer__number" aria-hidden="true">
+              {right?.newLine ?? left?.oldLine ?? ""}
             </span>
             <span
               className={`diff-viewer__text diff-viewer__text--left${left === null ? " diff-viewer__text--absent" : context ? "" : " diff-viewer__text--deletion"}`}
+              data-alt-line={left?.oldLine ?? undefined}
+              data-selection-column="old"
             >
               {left === null ? "" : context ? left.text : lineContent(left, segments, "deletion")}
               {left?.noNewline && <span className="diff-viewer__no-newline">{"↵"}</span>}
             </span>
             <span
-              className={`diff-viewer__number diff-viewer__number--right${right && !context ? " diff-viewer__number--addition" : ""}`}
-              aria-hidden="true"
-            >
-              {right?.newLine ?? ""}
-            </span>
-            <span
               className={`diff-viewer__text diff-viewer__text--right${right === null ? " diff-viewer__text--absent" : context ? "" : " diff-viewer__text--addition"}`}
+              data-selection-column="new"
             >
               {right === null ? "" : context ? right.text : lineContent(right, segments, "addition")}
               {right?.noNewline && right !== left && <span className="diff-viewer__no-newline">{"↵"}</span>}

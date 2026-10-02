@@ -55,10 +55,14 @@ pub struct ResolvedWorkspace {
     /// Human-readable machine name, used when the list is stated to the model.
     /// Empty for the host machine, which needs no qualifier.
     pub machine_label: String,
-    /// The sandbox this workspace's commands run in, when sandboxing is on:
+    /// The sandbox this workspace's commands run in, when its sandbox is on:
     /// the conversation's cell on this workspace's machine (see
     /// [`WorkspaceSet::sandboxed`]).
     pub sandbox: Option<remote_agent::protocol::SandboxSpec>,
+    /// The registered directory whose variable table and sandbox this
+    /// workspace runs with: `root` itself, or for a worktree the directory it
+    /// was checked out from.
+    pub env_path: String,
     /// Whether `root` is the conversation's isolated worktree standing in for
     /// the project workspace at this position, rather than that workspace's
     /// registered directory.
@@ -167,7 +171,7 @@ impl WorkspaceSet {
             let workspace = &entry.workspace;
             let runner =
                 resolve_shell_runner(assets, workspace.machine.as_ref(), Some(&entry.env_path))?;
-            let (os, shells) = crate::machine_shells::known(workspace.machine.as_ref());
+            let (os, shells) = crate::machine_shells::known(workspace.machine.as_ref(), &runner);
             resolved.push(ResolvedWorkspace {
                 index: position as u32 + 1,
                 machine: workspace.machine.clone(),
@@ -177,6 +181,7 @@ impl WorkspaceSet {
                 machine_label: machine_label(assets, workspace.machine.as_ref()),
                 runner,
                 sandbox: None,
+                env_path: entry.env_path.clone(),
                 is_worktree: entry.is_worktree,
             });
         }
@@ -199,12 +204,14 @@ impl WorkspaceSet {
     /// The shape every caller that predates machine-bound workspaces still wants:
     /// one local root, no catalog to consult.
     pub fn local_root(path: impl Into<String>) -> Self {
-        let (os, shells) = crate::machine_shells::known(None);
+        let (os, shells) = crate::machine_shells::known(None, &ShellRunner::default());
+        let root = path.into();
         Self {
             entries: vec![ResolvedWorkspace {
                 index: 1,
                 machine: None,
-                root: path.into(),
+                env_path: root.clone(),
+                root,
                 runner: ShellRunner::default(),
                 os,
                 shells,
@@ -240,13 +247,15 @@ impl WorkspaceSet {
             // An SSH runner's machine id is unrecoverable, so its last probe is
             // too; it keeps what an unprobed machine is assumed to have.
             ShellRunner::Ssh { .. } => crate::machine_shells::assumed(machine.as_ref()),
-            _ => crate::machine_shells::known(machine.as_ref()),
+            _ => crate::machine_shells::known(machine.as_ref(), &runner),
         };
+        let root = root.into();
         Self {
             entries: vec![ResolvedWorkspace {
                 index: 1,
                 machine,
-                root: root.into(),
+                env_path: root.clone(),
+                root,
                 os,
                 shells,
                 machine_label: String::new(),
@@ -257,42 +266,54 @@ impl WorkspaceSet {
         }
     }
 
-    /// The same set with every workspace's commands confined to the sandbox
-    /// `settings` describe, when they are on.
+    /// The same set with each workspace's commands confined to the sandbox
+    /// its own settings in `assets` describe, when they are on.
     ///
-    /// A conversation has one cell per machine, named for the conversation, and
-    /// each cell may write every workspace the conversation has on that
-    /// machine: one command may well build in workspace 1 and write its
-    /// output to workspace 2. A different conversation — or this one after its
-    /// workspaces or the settings changed — is a different cell.
-    pub fn sandboxed(mut self, settings: &crate::model::SandboxSettings, conversation_id: &str) -> Self {
-        if !settings.enabled {
-            return self;
-        }
-        let machine_of = |workspace: &ResolvedWorkspace| crate::run_environment::env_key(workspace.machine.as_ref());
-        let roots: Vec<(String, String)> = self
+    /// The sandbox is a setting of the workspace — of its registered
+    /// directory, keyed like its variables — so a worktree standing in for one
+    /// runs under the sandbox of the directory it was checked out from.
+    ///
+    /// The cells are still the conversation's own, named for it: one per
+    /// machine and settings. A cell may write every workspace of the
+    /// conversation on its machine whose sandbox reads exactly the same — one
+    /// command may well build in workspace 1 and write its output to
+    /// workspace 2 — and no other: a workspace sandboxed differently, or not
+    /// at all, would later run what the cell wrote there under rules the cell
+    /// was never given. A different conversation — or this one after its
+    /// workspaces or their settings changed — is a different cell.
+    pub fn sandboxed(mut self, assets: &ExecutionEnvironmentAssets, conversation_id: &str) -> Self {
+        let machines: Vec<String> = self
             .entries
             .iter()
-            .map(|workspace| (machine_of(workspace), workspace.root.clone()))
+            .map(|workspace| crate::run_environment::env_key(workspace.machine.as_ref()))
             .collect();
-        for workspace in &mut self.entries {
-            let machine = machine_of(workspace);
-            let mut writable: Vec<String> = roots
-                .iter()
-                .filter(|(other, _)| *other == machine)
-                .map(|(_, root)| root.clone())
+        let settings: Vec<Option<&crate::model::SandboxSettings>> = self
+            .entries
+            .iter()
+            .map(|workspace| {
+                let key = crate::run_environment::workspace_env_key(workspace.machine.as_ref(), &workspace.env_path);
+                assets.sandboxes.get(&key).filter(|settings| settings.enabled)
+            })
+            .collect();
+        for index in 0..self.entries.len() {
+            let Some(own) = settings[index] else {
+                continue;
+            };
+            let mut writable: Vec<String> = (0..self.entries.len())
+                .filter(|&other| machines[other] == machines[index] && settings[other] == Some(own))
+                .map(|other| self.entries[other].root.clone())
                 .collect();
-            writable.extend(settings.writable.iter().cloned());
+            writable.extend(own.writable.iter().cloned());
             writable.sort();
             writable.dedup();
-            workspace.sandbox = Some(remote_agent::protocol::SandboxSpec {
+            self.entries[index].sandbox = Some(remote_agent::protocol::SandboxSpec {
                 cell: format!("conversation-{conversation_id}"),
                 policy: remote_agent::protocol::SandboxPolicy {
                     writable,
-                    deny_read: settings.deny_read.clone(),
+                    deny_read: own.deny_read.clone(),
                     readable: Vec::new(),
                     deny_write: Vec::new(),
-                    network: settings.network_policy(),
+                    network: own.network_policy(),
                 },
             });
         }
@@ -426,36 +447,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_sandboxed_set_gives_each_machine_one_cell_writing_all_its_workspaces() {
-        let assets = assets();
+    fn each_workspace_runs_in_its_own_sandbox_writing_the_ones_sandboxed_alike() {
+        let mut assets = assets();
+        let ssh = Some(RunTarget::Ssh { machine_id: "m1".into() });
         let set = WorkspaceSet::resolve(
             &assets,
             &AttachedWorkspace { machine: None, path: "/work/a".into() },
             &[
                 AttachedWorkspace { machine: None, path: "/work/b".into() },
-                AttachedWorkspace {
-                    machine: Some(RunTarget::Ssh { machine_id: "m1".into() }),
-                    path: "/home/dev/c".into(),
-                },
+                AttachedWorkspace { machine: ssh.clone(), path: "/home/dev/c".into() },
+                AttachedWorkspace { machine: None, path: "/work/d".into() },
+                AttachedWorkspace { machine: None, path: "/work/e".into() },
             ],
         )
         .unwrap();
-        assert!(set.clone().sandboxed(&crate::model::SandboxSettings::default(), "c1").entries().iter().all(|w| w.sandbox.is_none()));
+        assert!(set.clone().sandboxed(&assets, "c1").entries().iter().all(|w| w.sandbox.is_none()));
         let settings = crate::model::SandboxSettings {
             enabled: true,
             writable: vec!["~/shared".into()],
             ..Default::default()
         };
-        let set = set.sandboxed(&settings, "c1");
+        let key = |machine: Option<&RunTarget>, path: &str| crate::run_environment::workspace_env_key(machine, path);
+        for (machine, path) in [(None, "/work/a"), (None, "/work/b"), (ssh.as_ref(), "/home/dev/c")] {
+            assets.sandboxes.insert(key(machine, path), settings.clone());
+        }
+        // Sandboxed, but let out to the whole network: not the others' rules.
+        let open = crate::model::SandboxSettings {
+            network: crate::model::SandboxNetworkSettings {
+                mode: crate::model::SandboxNetworkMode::Open,
+                ..Default::default()
+            },
+            ..settings.clone()
+        };
+        assets.sandboxes.insert(key(None, "/work/d"), open);
+        // Switched off: an answer, not a sandbox.
+        assets.sandboxes.insert(key(None, "/work/e"), crate::model::SandboxSettings::default());
+
+        let set = set.sandboxed(&assets, "c1");
         let local = set.get(1).unwrap().sandbox.clone().unwrap();
         assert_eq!(local.cell, "conversation-c1");
         assert_eq!(local.policy.writable, vec!["/work/a".to_owned(), "/work/b".into(), "~/shared".into()]);
         assert_eq!(set.get(2).unwrap().sandbox, Some(local.clone()));
-        let ssh = set.get(3).unwrap().sandbox.clone().unwrap();
-        assert_eq!(ssh.cell, "conversation-c1");
-        assert_eq!(ssh.policy.writable, vec!["/home/dev/c".to_owned(), "~/shared".into()]);
-        assert_eq!(ssh.policy.network.mode, remote_agent::protocol::NetworkMode::Allowlist);
-        assert!(ssh.policy.network.allow.iter().any(|host| host == "registry.npmjs.org"));
+        let remote = set.get(3).unwrap().sandbox.clone().unwrap();
+        assert_eq!(remote.cell, "conversation-c1");
+        assert_eq!(remote.policy.writable, vec!["/home/dev/c".to_owned(), "~/shared".into()]);
+        assert_eq!(remote.policy.network.mode, remote_agent::protocol::NetworkMode::Allowlist);
+        assert!(remote.policy.network.allow.iter().any(|host| host == "registry.npmjs.org"));
+        let differently = set.get(4).unwrap().sandbox.clone().unwrap();
+        assert_eq!(differently.policy.writable, vec!["/work/d".to_owned(), "~/shared".into()]);
+        assert_eq!(differently.policy.network.mode, remote_agent::protocol::NetworkMode::Open);
+        assert!(set.get(5).unwrap().sandbox.is_none());
+    }
+
+    /// A worktree runs under the sandbox of the directory it was checked out
+    /// from, and may write the worktree rather than that directory.
+    #[test]
+    fn a_worktree_runs_in_the_sandbox_of_its_registered_directory() {
+        let mut assets = assets();
+        assets.sandboxes.insert(
+            crate::run_environment::workspace_env_key(None, "/work/a"),
+            crate::model::SandboxSettings { enabled: true, ..Default::default() },
+        );
+        let set = WorkspaceSet::resolve_with_primary_env(
+            &assets,
+            &AttachedWorkspace { machine: None, path: "/trees/a-1".into() },
+            "/work/a",
+            &[],
+        )
+        .unwrap()
+        .sandboxed(&assets, "c1");
+        let sandbox = set.primary().unwrap().sandbox.clone().expect("sandboxed");
+        assert_eq!(sandbox.policy.writable, vec!["/trees/a-1".to_owned()]);
     }
     use crate::model::SshMachineConfig;
 
@@ -558,7 +620,7 @@ mod tests {
     /// addresses are the workspaces on machines that have it.
     #[test]
     fn shell_addresses_follow_each_machines_probe() {
-        use crate::machine_shells::{seed_for_test, MachineShells};
+        use crate::machine_shells::{seed_for_test, Endpoint, MachineShells};
         let assets = ExecutionEnvironmentAssets {
             ssh_machines: vec![SshMachineConfig {
                 id: "winbox".into(),
@@ -571,6 +633,7 @@ mod tests {
         };
         seed_for_test(
             "ssh:winbox",
+            Some(Endpoint::of_machine(&assets.ssh_machines[0])),
             MachineShells {
                 os: MachineOs::Windows,
                 shells: vec![DetectedShell {

@@ -2,7 +2,7 @@ The `sh` tool runs one command line through the machine's POSIX `/bin/sh` — of
 
 ## Approval
 
-Every call raises a card at Manual approval, Accept edits and Plan mode; only Full access — or a `PreToolUse` hook answering `allow` — clears it. The command is read with the same static analysis as `bash`. `sh` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox.
+Every call raises a card at Manual approval and Accept edits; only Full access — or a `PreToolUse` hook answering `allow` — clears it. The command is read with the same static analysis as `bash`. `sh` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox.
 
 ## Behavior and limits
 

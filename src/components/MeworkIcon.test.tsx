@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   BRAND_AMBER,
@@ -10,7 +10,7 @@ import {
   MARK_PATH,
   WORDMARK_PATH
 } from "./brandMark";
-import { MeworkIcon, MeworkLockup, MeworkMark } from "./MeworkIcon";
+import { MeworkIcon, MeworkMark } from "./MeworkIcon";
 import logoSvg from "../logo.svg?raw";
 import iconSvg from "../mework-icon.svg?raw";
 import smallIconSvg from "../mework-icon-small.svg?raw";
@@ -90,17 +90,5 @@ describe("MeworkMark", () => {
     expect(mark?.getAttribute("class")).toBe("app-loading__mark");
     expect(mark?.getAttribute("fill")).toBe("currentColor");
     expect(container.querySelector("path")?.getAttribute("d")).toBe(MARK_PATH);
-  });
-});
-
-describe("MeworkLockup", () => {
-  it("names itself and leaves the mark's color to the stylesheet", () => {
-    const { container } = render(<MeworkLockup className="brand-lockup" />);
-    expect(screen.getByRole("img", { name: "Mework" })).toBe(container.querySelector("svg"));
-    const mark = container.querySelector(".mework-lockup__mark");
-    expect(mark?.getAttribute("d")).toBe(MARK_PATH);
-    expect(mark?.getAttribute("transform")).toBe(LOCKUP_MARK_TRANSFORM);
-    // A fill attribute would pin one palette; the class takes the amber token, day or night.
-    expect(mark?.hasAttribute("fill")).toBe(false);
   });
 });

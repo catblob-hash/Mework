@@ -9,6 +9,8 @@ export interface ConversationViewProps extends Omit<ContextStreamProps, "readOnl
   editable?: boolean;
   beforeTimeline?: ReactNode;
   composer?: ReactNode;
+  /** Drawn in place of the timeline while the conversation's body is not in memory yet. */
+  timelinePlaceholder?: ReactNode;
 }
 
 function useStableCallback<Args extends unknown[]>(callback: ((...args: Args) => void) | undefined) {
@@ -35,6 +37,7 @@ export function ConversationView({
   editable = true,
   beforeTimeline,
   composer,
+  timelinePlaceholder,
   ...timelineProps
 }: ConversationViewProps) {
   const stableOnEdit = useStableCallback(timelineProps.onEdit);
@@ -50,6 +53,9 @@ export function ConversationView({
   const stableOnBranchFrom = useStableCallback(timelineProps.onBranchFrom);
   const stableOnSelectBranch = useStableCallback(timelineProps.onSelectBranch);
   const stableOnInsert = useStableCallback(timelineProps.onInsert);
+  const stableOnDeleteContexts = useStableCallback(timelineProps.onDeleteContexts);
+  const stableOnUndo = useStableCallback(timelineProps.onUndo);
+  const stableOnRedo = useStableCallback(timelineProps.onRedo);
   const stableOnForkAt = useStableCallback(timelineProps.onForkAt);
   const stableOnOpenSubagent = useStableCallback(timelineProps.onOpenSubagent);
   const stableOnOpenWorkflowRun = useStableCallback(timelineProps.onOpenWorkflowRun);
@@ -63,7 +69,7 @@ export function ConversationView({
       data-conversation-view={editable ? "editable" : "readonly"}
     >
       {beforeTimeline}
-      <ContextStream
+      {timelinePlaceholder ?? <ContextStream
         {...timelineProps}
         readOnly={!editable}
         onEdit={timelineProps.onEdit ? stableOnEdit : undefined}
@@ -79,13 +85,16 @@ export function ConversationView({
         onBranchFrom={timelineProps.onBranchFrom ? stableOnBranchFrom : undefined}
         onSelectBranch={timelineProps.onSelectBranch ? stableOnSelectBranch : undefined}
         onInsert={timelineProps.onInsert ? stableOnInsert : undefined}
+        onDeleteContexts={timelineProps.onDeleteContexts ? stableOnDeleteContexts : undefined}
+        onUndo={timelineProps.onUndo ? stableOnUndo : undefined}
+        onRedo={timelineProps.onRedo ? stableOnRedo : undefined}
         onForkAt={timelineProps.onForkAt ? stableOnForkAt : undefined}
         onOpenSubagent={timelineProps.onOpenSubagent ? stableOnOpenSubagent : undefined}
         onOpenWorkflowRun={timelineProps.onOpenWorkflowRun ? stableOnOpenWorkflowRun : undefined}
         onRetryTurnError={timelineProps.onRetryTurnError ? stableOnRetryTurnError : undefined}
         onDismissTurnError={timelineProps.onDismissTurnError ? stableOnDismissTurnError : undefined}
         onOpenTasks={timelineProps.onOpenTasks ? stableOnOpenTasks : undefined}
-      />
+      />}
       {editable ? composer : null}
     </div>
   );

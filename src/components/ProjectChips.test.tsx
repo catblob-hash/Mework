@@ -191,7 +191,7 @@ describe("WorkspaceMemberSelector", () => {
     expect(onConfigureMachine).toHaveBeenLastCalledWith(null);
 
     await user.click(screen.getByRole("button", { name: "工作区：api" }));
-    await user.click(screen.getByRole("button", { name: "tokens 的环境变量" }));
+    await user.click(screen.getByRole("button", { name: "tokens 的设置" }));
     expect(onConfigureWorkspace).toHaveBeenCalledWith(3);
     expect(onSelect).not.toHaveBeenCalled();
   });

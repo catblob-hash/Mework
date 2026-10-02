@@ -5,6 +5,7 @@ import type {
   ConversationSettings,
   RunTarget
 } from "../types";
+import { conversationHasNoContexts } from "./conversationBodies";
 
 /**
  * Fixed ID for the renderer-owned draft conversation. It is never persisted or
@@ -75,7 +76,8 @@ export function isDraftConversationId(conversationId: string | null | undefined)
  */
 export function isUnsentConversation(conversation: Conversation, hasChildren = false): boolean {
   return !hasChildren
-    && conversation.contexts.length === 0
+    // A body that is not loaded is not an empty one (`conversationBodies.ts`).
+    && conversationHasNoContexts(conversation)
     && conversation.queuedMessages.length === 0;
 }
 

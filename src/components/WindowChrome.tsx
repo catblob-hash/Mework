@@ -15,30 +15,26 @@ import { IconButton } from "./Common";
 
 interface WindowFrameProps {
   chrome: WindowChromeKind;
-  /** What the Windows title bar carries at its left end. */
-  nav?: ReactNode;
   /**
-   * The page draws no top row of its own (loading, the fatal error), so on macOS a strip
-   * along the top stands in for one and keeps the window movable.
+   * The page draws no top row of its own (loading, the fatal error), so a strip along the
+   * top stands in for one and keeps the window movable.
    */
   bare?: boolean;
   children: ReactNode;
 }
 
-/** The window around the whole renderer: on Windows, a title bar strip above everything. */
-export function WindowFrame({ chrome, nav, bare = false, children }: WindowFrameProps) {
+/**
+ * The window around the whole renderer. On Windows the caption buttons float over its top
+ * right corner the way the traffic lights float over the top left on macOS, and the top bar
+ * leaves room for them.
+ */
+export function WindowFrame({ chrome, bare = false, children }: WindowFrameProps) {
   return (
     <div className="window-frame">
       <AppBackdrop />
-      {chrome === "windows" && (
-        <div className="window-titlebar" data-tauri-drag-region="deep">
-          {nav}
-          <div className="window-titlebar__fill" />
-          <WindowCaptionControls />
-        </div>
-      )}
-      {chrome === "mac" && bare && <div className="window-drag-strip" data-tauri-drag-region />}
+      {chrome !== "none" && bare && <div className="window-drag-strip" data-tauri-drag-region />}
       {children}
+      {chrome === "windows" && <WindowCaptionControls />}
     </div>
   );
 }
@@ -100,8 +96,8 @@ function withCurrentWindow(action: (window: TauriWindow) => Promise<unknown>): v
 
 /**
  * Minimize, maximize and close for the frameless Windows window, drawn the way Windows 11
- * draws its own: flat, full-height, and a red close. Close asks the window to close, which
- * the host turns into hiding it to the tray exactly as the system button did.
+ * draws its own: flat, as tall as the top bar, and a red close. Close asks the window to
+ * close, which the host turns into hiding it to the tray exactly as the system button did.
  */
 export function WindowCaptionControls() {
   const { t } = useI18n();

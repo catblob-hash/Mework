@@ -2,29 +2,27 @@ import { createId } from "./id";
 import { estimateContextsTokens } from "./contextTokens";
 import { errorMessage } from "./errors";
 import { withSelectedElements } from "./selectedElement";
-import { acceptsMidConversationTools, hasUsableBaseUrl, supportsVision } from "./modelCapabilities";
+import { expandPastedTexts } from "./pastedText";
+import { hasUsableBaseUrl, supportsVision } from "./modelCapabilities";
 import { grantsWebFetch } from "./webSearch";
 import {
-  toolLockAdditions,
-  toolLockEngaged,
-  toolLockOf,
+  restoreLockedSettings,
+  toolLockModelOf,
+  toolLockState,
   withRunToolLock,
   type ToolExposureContext
 } from "./toolLock";
 import { findConversation, modelChoiceForConversation } from "./documentUpdates";
 import { isDraftConversationId } from "./draftConversation";
+import { isBodyUnloaded } from "./conversationBodies";
 import {
   contextsContainProjectedImages,
-  MAX_COMPOSER_IMAGE_BYTES,
-  MAX_COMPOSER_IMAGE_PIXELS,
-  MAX_COMPOSER_IMAGES,
   MAX_IMAGE_ATTACHMENT_BYTES,
   MAX_IMAGE_ATTACHMENT_PIXELS
 } from "./imageBudget";
 import {
   backfillRequestedToolInput,
   contextsFromInterruptedRun,
-  contextsFromModelRun,
   mergeFinalizedInterruptedRunContexts,
   mergeUniqueContexts,
   runStreamContextPrefixes
@@ -59,6 +57,7 @@ import {
 import {
   intakeAttachments,
   mergeFileAttachments,
+  messageAttachmentRoom,
   type AttachmentRejection
 } from "./fileAttachments";
 import type { ComposerController } from "./composerController";
@@ -70,13 +69,13 @@ import type {
   ContextItem,
   Conversation,
   ConversationSettings,
-  ConversationToolLock,
   FileAttachment,
   ImageAttachment,
   ModelRunRequest,
   ModelStreamEvent,
   ModelUsage,
   PendingToolPrompt,
+  QuestionResponse,
   QueuedMessage,
   ToolContext,
   ToolDescriptor,
@@ -87,7 +86,6 @@ import type {
  * Which tool set a send carries. `"locked"` is the answer to the exposure
  * prompt: hold the conversation at what the model has already been given.
  */
-export type ToolExposureMode = "current" | "locked";
 
 export type ModelRunErrorState = Pick<
   ModelRunState,
@@ -131,18 +129,22 @@ export interface SendPipelineHost {
   activeConversationTools(): ToolDescriptor[];
   /** Names enabled for the active conversation and present in the catalog. */
   activeEnabledTools(): string[];
-  /** Records what a run put in front of the model, so later rounds can only widen it. */
-  lockConversationTools(workspaceId: string, conversationId: string, tools: string[]): void;
-  /**
-   * Asks the user what to do about tools added to a conversation whose model
-   * cannot take a wider set mid-transcript. The send is abandoned; the answer
-   * comes back as a fresh send, a settings visit, or a model change.
-   */
-  promptToolExposureChange(conversationId: string, additions: ConversationToolLock): void;
-  requestFitsImageBudget(contexts: ContextItem[]): boolean;
+  /** Records the tool surface and model a run's request goes out with (`toolLock.ts`). */
+  lockConversationTools(
+    workspaceId: string,
+    conversationId: string,
+    tools: string[],
+    request: { providerId: string; modelId: string }
+  ): void;
+  /** Moves the lock's last-request time to now: the run's last request just went out. */
+  refreshConversationToolLock(workspaceId: string, conversationId: string): void;
   contextMutationIsBlocked(conversationId: string): boolean;
-  /** Invalidate a pending timeline undo for this conversation; a new turn makes the old deletion final. */
-  clearPendingUndo(conversationId: string): void;
+  /**
+   * Fetches a conversation's body when it is not in memory (`conversationBodies.ts`). A user
+   * turn is written as the body plus the new message, so nothing that writes one may start from
+   * an unloaded body.
+   */
+  ensureConversationBody(conversationId: string): Promise<void>;
   /** Close the open context editor if this is the active conversation. */
   closeEditorIfActive(conversationId: string): void;
   scrollTimelineToBottom(): void;
@@ -165,18 +167,16 @@ export interface SendPipelineHost {
   /**
    * Attach a run that carries no new user message to a round.
    *
-   * `"awaiting"` resumes the turn an `ask_user` pause left open; `"continue"`
-   * resumes the newest round while it is still unfinished — a stop or a failure
-   * does not end one, only a new user message or a normal final reply does.
-   * Either way a turn exists afterwards, so no run streams into a timeline with
-   * no header over it.
+   * It resumes the newest round while it is still unfinished — a stop or a
+   * failure does not end one, only a new user message or a normal final reply
+   * does. Either way a turn exists afterwards, so no run streams into a
+   * timeline with no header over it.
    */
   continueConversationTurn(
     conversationId: string,
     requestId: string,
     modelId: string,
-    contexts: ContextItem[],
-    mode: "continue" | "awaiting"
+    contexts: ContextItem[]
   ): void;
   /** Restore an adopted same-generation turn to running if loading marked it interrupted. */
   resumeAdoptedConversationTurn(conversationId: string, requestId: string, contexts: ContextItem[], modelId: string): void;
@@ -191,12 +191,6 @@ export interface SendPipelineHost {
     requestId: string,
     usage: ModelUsage,
     revision: number
-  ): void;
-  pauseConversationTurnForUser(
-    conversationId: string,
-    requestId: string,
-    contexts: ContextItem[],
-    meta: TurnCompletionMeta
   ): void;
   finishConversationTurns(
     conversationId: string,
@@ -240,6 +234,11 @@ export interface SendPipelineHost {
   /** Reconcile this conversation's approval cards with the host's pending list at
    * run completion. Background-task cards remain visible while the host retains them. */
   reconcileToolPrompts(conversationId: string): void;
+  /** The `ask_user` card this conversation's run is blocked on, with what it would
+   * hand back if a composer message were sent now; `null` when there is none. */
+  pendingQuestionFor(conversationId: string): { promptId: string; response: QuestionResponse } | null;
+  /** Answers a question card. `false` when the host did not take the answer. */
+  answerQuestion(conversationId: string, promptId: string, response: QuestionResponse): Promise<boolean>;
   /** A tool this conversation ran finished successfully; the host registers its preview
    * session when the name is one of the preview page tools. */
   registerPreviewSessionForTool(conversationId: string, toolName: string): void;
@@ -256,13 +255,11 @@ export interface SendPipeline {
     workspaceId: string,
     conversationId: string,
     request: ModelRunRequest,
-    turnAnchor?: { id: string; startedAt: string },
-    /** This run delivers the answer to a pending `ask_user`, so it resumes the turn that paused. */
-    answersPendingQuestion?: boolean
+    turnAnchor?: { id: string; startedAt: string }
   ): Promise<void>;
   /** Reattach surviving host runs, live or awaiting settlement, after startup or loading. */
   adoptResumableRuns(): Promise<void>;
-  sendComposer(overrideText?: string, toolExposure?: ToolExposureMode): Promise<void>;
+  sendComposer(): Promise<void>;
   /** Start a run without a new user message to deliver a settled task for the active
    * conversation. `true` means an existing or started run will consume it; `false`
    * means it cannot yet start because configuration or mutual exclusion blocks it. */
@@ -273,7 +270,8 @@ export interface SendPipeline {
    * existing run blocked it; the child then simply waits for the user. */
   startForkedConversationRun(workspaceId: string, conversationId: string): Promise<boolean>;
   deleteQueuedMessage(workspaceId: string, conversationId: string, messageId: string): void;
-  steerQueuedMessage(conversationId: string, message: QueuedMessage): Promise<void>;
+  /** `true` once the message is in the run's steer mailbox. */
+  steerQueuedMessage(conversationId: string, message: QueuedMessage): Promise<boolean>;
   addComposerImages(conversationId: string, files: File[]): Promise<ImageAttachment[]>;
   /**
    * Attaches whatever the user picked, pasted or dropped: images join the image
@@ -324,6 +322,7 @@ export function createSendPipeline(
         streamedToolsByRound: {},
         streamedHooksByRound: {},
         steeredInputsByRound: {},
+        hostContextsByRound: {},
         usageByRound: {},
         subagentUsageByCall: {},
         workflowProgressByCall: {},
@@ -421,7 +420,8 @@ export function createSendPipeline(
           sourceCallId: event.sourceCallId,
           allowAlwaysOffered: event.allowAlwaysOffered,
           mandatory: event.mandatory,
-          kind: event.kind
+          kind: event.kind,
+          ...(event.questions !== undefined ? { questions: event.questions } : {})
         });
         return;
       }
@@ -473,7 +473,8 @@ export function createSendPipeline(
             reasoningDurationByRound: {},
             streamedToolsByRound: {},
             streamedHooksByRound: {},
-            steeredInputsByRound: {}
+            steeredInputsByRound: {},
+            hostContextsByRound: {}
           }
         };
       });
@@ -526,7 +527,6 @@ export function createSendPipeline(
       // and remove local residue from the read model.
       host().refreshConversation(workspaceId, conversationId);
       const hookStopped = response.stopReason?.startsWith("hook_") === true;
-      const awaitingUser = response.stopReason === "awaiting_user";
       let failure: { message: string; providerName: string; modelName: string } | undefined;
       if (response.stopReason === "error") {
         const t = host().t;
@@ -551,22 +551,13 @@ export function createSendPipeline(
         // message this notice is the entire record of it.
         host().failConversationTurn(conversationId, requestId, failure);
       }
-      if (awaitingUser) {
-        host().pauseConversationTurnForUser(
-          conversationId,
-          requestId,
-          completedContexts,
-          { modelId: response.model, usage: response.usage, durationMs: response.durationMs }
-        );
-      } else {
-        host().finishConversationTurns(
-          conversationId,
-          requestId,
-          completedContexts,
-          response.stopReason === "error" || hookStopped || userCancelled ? "interrupted" : "completed",
-          { modelId: response.model, usage: response.usage, durationMs: response.durationMs }
-        );
-      }
+      host().finishConversationTurns(
+        conversationId,
+        requestId,
+        completedContexts,
+        response.stopReason === "error" || hookStopped || userCancelled ? "interrupted" : "completed",
+        { modelId: response.model, usage: response.usage, durationMs: response.durationMs }
+      );
       const fallbackContextTokens = estimateContextsTokens([...request.contexts, ...responseContexts]);
       const measuredContextTokens = response.contextTokens ?? fallbackContextTokens;
       host().setContextUsage(conversationId, {
@@ -648,14 +639,14 @@ export function createSendPipeline(
     workspaceId: string,
     conversationId: string,
     request: ModelRunRequest,
-    turnAnchor?: { id: string; startedAt: string },
-    answersPendingQuestion = false
+    turnAnchor?: { id: string; startedAt: string }
   ) => {
-    if (!host().requestFitsImageBudget(request.contexts)) return;
     if (host().contextMutationIsBlocked(conversationId)) return;
-    // What this run shows the model is spent: later rounds inherit it as a floor.
-    host().lockConversationTools(workspaceId, conversationId, request.enabledTools);
-    host().clearPendingUndo(conversationId);
+    // What this run shows the model, and which model it is, becomes the lock.
+    host().lockConversationTools(workspaceId, conversationId, request.enabledTools, {
+      providerId: request.provider.id,
+      modelId: request.model.id
+    });
     host().closeEditorIfActive(conversationId);
     const requestId = createId("run");
     modelRunController.addPerformingRun(conversationId);
@@ -685,13 +676,15 @@ export function createSendPipeline(
         conversationId,
         requestId,
         request.model.id,
-        request.contexts,
-        answersPendingQuestion ? "awaiting" : "continue"
+        request.contexts
       );
     }
     await runTurnLifecycle(workspaceId, conversationId, requestId, request, (handleEvent) => (
       runModel(request, handleEvent, requestId)
     ));
+    // The prompt cache is counted from the last request, which a long run sent
+    // just now rather than when it started.
+    host().refreshConversationToolLock(workspaceId, conversationId);
   };
 
   const settlementToResponse = (
@@ -819,12 +812,12 @@ export function createSendPipeline(
     images: ImageAttachment[],
     files: FileAttachment[],
     clearComposer = true
-  ) => {
+  ): QueuedMessage | undefined => {
     const latest = documentStore.current();
     const located = findConversation(latest, workspaceId, conversationId);
-    if (!latest || !located.conversation || (!content.trim() && !images.length && !files.length)) return;
-    if (Array.from(content.trim()).length > 100_000) return;
-    if (located.conversation.queuedMessages.length >= 100) return;
+    if (!latest || !located.conversation || (!content.trim() && !images.length && !files.length)) return undefined;
+    if (Array.from(content.trim()).length > 100_000) return undefined;
+    if (located.conversation.queuedMessages.length >= 100) return undefined;
     // Queued numbers must be unique against the transcript *and* the queue
     // ahead of this message; a second repair happens at delivery (steer goes
     // through the Rust mailbox renumber, promotion re-checks below).
@@ -865,10 +858,12 @@ export function createSendPipeline(
     void savePromise.catch(() => {});
     if (clearComposer) {
       composerController.updateDrafts((current) => ({ ...current, [conversationId]: "" }));
+      composerController.updatePastedTexts((current) => ({ ...current, [conversationId]: [] }));
       composerController.updateImageDrafts((current) => ({ ...current, [conversationId]: [] }));
       composerController.updateElementPicks((current) => ({ ...current, [conversationId]: [] }));
       clearComposerFiles(conversationId);
     }
+    return message;
   };
 
   const deleteQueuedMessage = (
@@ -901,16 +896,16 @@ export function createSendPipeline(
     void host().persistDocumentImmediately(next).catch(() => {});
   };
 
-  const steerQueuedMessage = async (conversationId: string, message: QueuedMessage) => {
+  const steerQueuedMessage = async (conversationId: string, message: QueuedMessage): Promise<boolean> => {
     const runningAtClick = modelRunController.current()[conversationId];
-    if (!runningAtClick || composerController.current().steeringMessageIds.has(message.id)) return;
+    if (!runningAtClick || composerController.current().steeringMessageIds.has(message.id)) return false;
     const pendingSave = composerController.queuedMessageSave(message.id);
     if (pendingSave) {
       try {
         await pendingSave;
       } catch {
         composerController.dropQueuedMessageSaveIfCurrent(message.id, pendingSave);
-        return;
+        return false;
       }
     } else if (composerController.queuedMessageNeedsSave(message.id)) {
       try {
@@ -919,7 +914,7 @@ export function createSendPipeline(
       } catch {
         // Do not steer before durable persistence. Leave the message queued for an
         // explicit retry.
-        return;
+        return false;
       }
     }
     const running = modelRunController.current()[conversationId];
@@ -933,44 +928,12 @@ export function createSendPipeline(
       || running.requestId !== runningAtClick.requestId
       || !currentMessage
       || composerController.current().steeringMessageIds.has(message.id)
-    ) return;
-    if (currentMessage.images?.length) {
-      if (!supportsVision(running.request.model)) return;
-      const pendingSteers = findConversation(
-        documentStore.current(),
-        running.workspaceId,
-        conversationId
-      ).conversation?.queuedMessages.flatMap((queued) => (
-        composerController.current().steeringMessageIds.has(queued.id) && queued.id !== message.id
-          ? [{
-              id: queued.id,
-              kind: "user" as const,
-              content: queued.content,
-              images: queued.images,
-              files: queued.files,
-              createdAt: queued.createdAt
-            }]
-          : []
-      )) ?? [];
-      const steeredContext: UserContext = {
-        id: currentMessage.id,
-        kind: "user",
-        content: currentMessage.content,
-        images: currentMessage.images,
-        files: currentMessage.files,
-        createdAt: currentMessage.createdAt
-      };
-      const requestContexts = mergeUniqueContexts(
-        running.request.contexts,
-        contextsFromModelRun(running, true),
-        pendingSteers,
-        [steeredContext]
-      );
-      if (!host().requestFitsImageBudget(requestContexts)) return;
-    }
+    ) return false;
+    if (currentMessage.images?.length && !supportsVision(running.request.model)) return false;
     composerController.updateSteeringMessageIds((current) => new Set(current).add(currentMessage.id));
     try {
       await steerModelRun(running.requestId, currentMessage);
+      return true;
     } catch {
       // The turn already ended: retract the steering marker and keep the message queued.
       composerController.updateSteeringMessageIds((current) => {
@@ -979,6 +942,7 @@ export function createSendPipeline(
         next.delete(currentMessage.id);
         return next;
       });
+      return false;
     }
   };
 
@@ -996,11 +960,30 @@ export function createSendPipeline(
       ))))
   );
 
+  /**
+   * Images the host hands the composer on its own — a preview pane's capture,
+   * an element pick's crop. They count against what the message's attachments
+   * may come to like any the user adds, and one that does not fit says so.
+   */
   const addComposerImages = (conversationId: string, files: File[]): Promise<ImageAttachment[]> => {
     if (!files.length) return Promise.resolve([]);
-    return composerController.enqueueImageUpload(conversationId, (uploadStillCurrent) => (
-      addComposerImagesNow(conversationId, files, uploadTargetCheck(conversationId, uploadStillCurrent))
-    ));
+    return composerController.enqueueImageUpload(conversationId, (uploadStillCurrent) => {
+      const drafts = composerController.current();
+      const fitsMessage = messageAttachmentRoom(
+        drafts.imageDrafts[conversationId] ?? [],
+        drafts.fileDrafts[conversationId] ?? []
+      );
+      const fitting: File[] = [];
+      const rejected: AttachmentRejection[] = [];
+      for (const file of files) {
+        if (fitsMessage(file)) fitting.push(file);
+        else rejected.push({ name: file.name || undefined, reason: "messageTooLarge" });
+      }
+      if (rejected.length) {
+        composerController.updateAttachmentNotices((current) => ({ ...current, [conversationId]: rejected }));
+      }
+      return addComposerImagesNow(conversationId, fitting, uploadTargetCheck(conversationId, uploadStillCurrent));
+    });
   };
 
   /** The image half of an upload batch, run inside the conversation's upload queue. */
@@ -1016,21 +999,7 @@ export function createSendPipeline(
     const model = choice?.model;
     if (!provider?.enabled || !model || !model.id.trim()) return [];
     if (!supportsVision(model)) return [];
-    const existingImages = composerController.current().imageDrafts[conversationId] ?? [];
-    let selectedBytes = existingImages.reduce((total, image) => total + image.bytes, 0);
-    const acceptedFiles: File[] = [];
-    for (const file of files) {
-      if (
-        file.size <= 0
-        || file.size > MAX_IMAGE_ATTACHMENT_BYTES
-        || existingImages.length + acceptedFiles.length >= MAX_COMPOSER_IMAGES
-        || selectedBytes + file.size > MAX_COMPOSER_IMAGE_BYTES
-      ) {
-        continue;
-      }
-      acceptedFiles.push(file);
-      selectedBytes += file.size;
-    }
+    const acceptedFiles = files.filter((file) => file.size > 0 && file.size <= MAX_IMAGE_ATTACHMENT_BYTES);
     if (!acceptedFiles.length) return [];
     const results = await Promise.allSettled(acceptedFiles.map(async (file) => (
       prepareImageAttachment(file.name, new Uint8Array(await file.arrayBuffer()))
@@ -1038,27 +1007,27 @@ export function createSendPipeline(
     if (!uploadTargetIsCurrent()) return [];
     const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
     const accepted: ImageAttachment[] = [];
+    // The numbers already taken are in the conversation's body, so number against it loaded.
+    const uploadTarget = documentStore.current()?.workspaces
+      .flatMap((workspace) => workspace.conversations)
+      .find((candidate) => candidate.id === conversationId);
+    if (uploaded.length && uploadTarget && isBodyUnloaded(uploadTarget)) {
+      try {
+        await host().ensureConversationBody(conversationId);
+      } catch {
+        // Numbered against what is known; the send boundary still dedupes typed placeholders.
+      }
+      if (!uploadTargetIsCurrent()) return [];
+    }
     if (uploaded.length) {
       composerController.updateImageDrafts((current) => {
         const existing = current[conversationId] ?? [];
         const known = new Set(existing.map((image) => image.id));
-        let selectedPixels = existing.reduce(
-          (total, image) => total + image.width * image.height,
-          0
-        );
         const unique = uploaded.filter((image) => {
           if (known.has(image.id)) return false;
           const pixels = image.width * image.height;
-          if (
-            !Number.isSafeInteger(pixels)
-            || pixels <= 0
-            || pixels > MAX_IMAGE_ATTACHMENT_PIXELS
-            || selectedPixels + pixels > MAX_COMPOSER_IMAGE_PIXELS
-          ) {
-            return false;
-          }
+          if (!Number.isSafeInteger(pixels) || pixels <= 0 || pixels > MAX_IMAGE_ATTACHMENT_PIXELS) return false;
           known.add(image.id);
-          selectedPixels += pixels;
           return true;
         });
         if (!unique.length) return current;
@@ -1079,7 +1048,10 @@ export function createSendPipeline(
         for (const image of existing) {
           if (image.shortId !== undefined) taken.add(image.shortId);
         }
-        for (const id of imagePlaceholderIds(composerController.current().drafts[conversationId] ?? "")) {
+        for (const id of imagePlaceholderIds(expandPastedTexts(
+          composerController.current().drafts[conversationId] ?? "",
+          composerController.current().pastedTexts[conversationId] ?? []
+        ))) {
           taken.add(id);
         }
         const numbered = unique.map((image) => {
@@ -1112,6 +1084,7 @@ export function createSendPipeline(
           ? (images) => addComposerImagesNow(conversationId, images, uploadTargetIsCurrent)
           : undefined,
         existingFiles: () => composerController.current().fileDrafts[conversationId] ?? [],
+        existingImages: () => composerController.current().imageDrafts[conversationId] ?? [],
         preRejected
       });
       if (!uploadTargetIsCurrent()) return;
@@ -1226,7 +1199,7 @@ export function createSendPipeline(
     return committed();
   };
 
-  const sendComposer = async (overrideText?: string, toolExposure: ToolExposureMode = "current") => {
+  const sendComposer = async () => {
     const { t } = host();
     const document = documentStore.current();
     const workspaceId = host().activeWorkspaceId();
@@ -1237,26 +1210,28 @@ export function createSendPipeline(
     const conversationToolsAtSend = host().activeConversationTools();
     const active = findConversation(document, workspaceId, conversationId);
     if (!document || !workspaceId || !conversationId || !active.workspace || !active.conversation) return;
+    if (isBodyUnloaded(active.conversation)) {
+      // The body is still on its way; send once it is here, and only if the user is still on
+      // this conversation — the composer they typed into belongs to it.
+      try {
+        await host().ensureConversationBody(conversationId);
+      } catch {
+        return;
+      }
+      const reloaded = findConversation(documentStore.current(), workspaceId, conversationId).conversation;
+      if (host().activeConversationId() !== conversationId || !reloaded || isBodyUnloaded(reloaded)) return;
+      return sendComposer();
+    }
     const activeWorkspace = active.workspace;
     const activeConversation = active.conversation;
-    // "locked" is the answer to the exposure prompt: send what the model has
-    // already been given and nothing new. The floor is history, so it holds
-    // whether or not the settings revert has committed yet.
-    const lockedToolNames = new Set(toolLockOf(activeConversation.settings).tools);
-    const enabledToolsAtSend = toolExposure === "locked"
-      ? enabledToolsSnapshot.filter((name) => lockedToolNames.has(name))
-      : enabledToolsSnapshot;
-    const typed = (overrideText ?? composerController.current().drafts[conversationId])?.trim() ?? "";
-    // An answer to a pending question is not a new user message, so it carries no chips.
-    const elementPicks = overrideText === undefined
-      ? composerController.current().elementPicks[conversationId] ?? []
-      : [];
-    const images = overrideText === undefined
-      ? composerController.current().imageDrafts[conversationId] ?? []
-      : [];
-    const files = overrideText === undefined
-      ? composerController.current().fileDrafts[conversationId] ?? []
-      : [];
+    // A long paste waited in the box as a tag; it is sent as the text it stands for.
+    const typed = expandPastedTexts(
+      composerController.current().drafts[conversationId] ?? "",
+      composerController.current().pastedTexts[conversationId] ?? []
+    ).trim();
+    const elementPicks = composerController.current().elementPicks[conversationId] ?? [];
+    const images = composerController.current().imageDrafts[conversationId] ?? [];
+    const files = composerController.current().fileDrafts[conversationId] ?? [];
     // The send boundary is where a draft stops being something the user is
     // still arranging: the picked elements expand into the prompt text they
     // stand for, and every attached image gets the `[Image #N]` the model
@@ -1266,7 +1241,7 @@ export function createSendPipeline(
     const provider = composerChoice.provider;
     const model = composerChoice.model;
     const requestContainsImages = images.length > 0 || contextsContainProjectedImages(activeConversation.contexts);
-    if (overrideText === undefined && composerController.current().imageLoadingIds.has(conversationId)) return;
+    if (composerController.current().imageLoadingIds.has(conversationId)) return;
     if (!provider?.enabled) {
       host().openProviderSettings();
       return;
@@ -1280,6 +1255,20 @@ export function createSendPipeline(
       return;
     }
     if (requestContainsImages && !supportsVision(model)) return;
+    /* A model that cannot take a tool mid-conversation keeps the surface its
+       last request had (`toolLock.ts`). The settings panel keeps it from moving;
+       this keeps a change made while another model was selected from riding in
+       once this one is picked again. */
+    const lockModel = toolLockModelOf(provider, model);
+    const frozenSurface = (settings: ConversationSettings): ConversationSettings => {
+      const state = toolLockState(settings, lockModel, Date.now());
+      return state.hard ? restoreLockedSettings(settings, state) : settings;
+    };
+    const frozenAtSend = frozenSurface(activeConversation.settings);
+    const catalogNames = new Set(conversationToolsAtSend.map((tool) => tool.name));
+    const enabledToolsAtSend = frozenAtSend === activeConversation.settings
+      ? enabledToolsSnapshot
+      : frozenAtSend.enabledTools.filter((name) => catalogNames.has(name));
     /* Which web tools this run actually grants. `web_search` follows the switch,
        but `web_fetch` appears only when a fetch backend resolves — which depends
        on the global provider catalog and on this model's family, neither of
@@ -1292,35 +1281,33 @@ export function createSendPipeline(
         provider.family
       )
     });
-    // Tool exposure only ever widens, and not every dialect will take a wider set
-    // part-way through a transcript. Ask before the request goes out rather than
-    // after the upstream rejects it.
-    if (toolExposure === "current" && !acceptsMidConversationTools(provider.family)) {
-      const settingsAtSend = { ...activeConversation.settings, enabledTools: enabledToolsAtSend };
-      const additions = toolLockAdditions(settingsAtSend, exposureContextFor(settingsAtSend));
-      if (toolLockEngaged(toolLockOf(settingsAtSend)) && toolLockEngaged(additions)) {
-        host().promptToolExposureChange(conversationId, additions);
-        return;
-      }
-    }
-    // Queuing means waiting for a busy model. An answer to a pending question must
-    // bypass queued messages: the model is paused for that answer, and an older
-    // queued message would otherwise consume the question and invalidate the answer.
-    const answeringPendingQuestion = overrideText !== undefined;
+    // Queuing means waiting for a busy model.
     const queueIsBlocking = Boolean(modelRunController.current()[conversationId])
-      || (!answeringPendingQuestion && activeConversation.queuedMessages.length > 0);
+      || activeConversation.queuedMessages.length > 0;
     if ((draft || images.length || files.length) && queueIsBlocking) {
-      queueComposerMessage(
+      const queued = queueComposerMessage(
         workspaceId,
         conversationId,
         draft,
         images,
         files,
-        overrideText === undefined
+        true
       );
+      // A run blocked on an `ask_user` card takes a composer message as the
+      // user's way out of the card: the message is steered in first, then the
+      // card is answered with whatever was filled in (a close when nothing
+      // was). The host settles the call with that result and the message
+      // follows it into the next round. Steering first is what keeps a close
+      // from ending the turn: the host only ends it when no message is waiting.
+      const question = host().pendingQuestionFor(conversationId);
+      if (queued && question && modelRunController.current()[conversationId]) {
+        if (await steerQueuedMessage(conversationId, queued)) {
+          await host().answerQuestion(conversationId, question.promptId, question.response);
+        }
+      }
       return;
     }
-    if (!answeringPendingQuestion && activeConversation.queuedMessages.length) return;
+    if (activeConversation.queuedMessages.length) return;
     if (host().contextMutationIsBlocked(conversationId)) return;
 
     // Draft numbers were allocated when the images were added; the transcript
@@ -1342,7 +1329,6 @@ export function createSendPipeline(
     let requestContexts = pendingUserContext
       ? [...activeConversation.contexts, pendingUserContext]
       : [...activeConversation.contexts];
-    if (!host().requestFitsImageBudget(requestContexts)) return;
 
     {
       modelRunController.addPreparingRun(conversationId);
@@ -1354,7 +1340,6 @@ export function createSendPipeline(
           if (!latest || !located.conversation) return;
           launchConversation = located.conversation;
           requestContexts = [...located.conversation.contexts, pendingUserContext];
-          if (!host().requestFitsImageBudget(requestContexts)) return;
           const titleFor = (conversation: Conversation) => (
             conversation.title === "新任务" || conversation.title === "New task" // i18n-audit-ignore: recognizes both localized default-title markers
               ? (textWithoutImagePlaceholders(sendReady.content).slice(0, 32) || files[0]?.name || sendReady.images[0]?.name || t("图片", "Image"))
@@ -1365,12 +1350,17 @@ export function createSendPipeline(
             ...located.conversation,
             title: nextTitle,
             contexts: requestContexts,
-            // The tool surface this turn goes out with becomes durable alongside
-            // the turn itself, so a later round cannot quietly take part of it back.
+            // The tool surface this turn goes out with, and the model it goes
+            // to, become durable alongside the turn itself.
             settings: withRunToolLock(
-              located.conversation.settings,
+              frozenSurface(located.conversation.settings),
               enabledToolsAtSend,
-              exposureContextFor(located.conversation.settings)
+              {
+                ...exposureContextFor(located.conversation.settings),
+                providerId: provider.id,
+                modelId: model.id,
+                at: new Date().toISOString()
+              }
             ),
             updatedAt: pendingUserContext.createdAt
           };
@@ -1392,7 +1382,7 @@ export function createSendPipeline(
             // silently retains host prose when the read model is stale, so a durable
             // write may succeed without storing this user turn. Confirm it reached
             // the store before running; otherwise the model would receive history
-            // missing the message, especially fatal for an `ask_user` answer.
+            // missing the message.
             const committed = await commitUserTurn(
               workspaceId,
               conversationId,
@@ -1425,7 +1415,6 @@ export function createSendPipeline(
             }
             launchConversation = committed;
             requestContexts = [...committed.contexts];
-            if (!host().requestFitsImageBudget(requestContexts)) return;
           } catch {
             const optimistic = documentStore.current();
             const optimisticLocated = findConversation(optimistic, workspaceId, conversationId);
@@ -1483,18 +1472,14 @@ export function createSendPipeline(
         modelRunController.deletePreparingRun(conversationId);
       }
 
-      let turnAnchor: { id: string; startedAt: string } | undefined;
-      if (pendingUserContext) {
-        if (overrideText === undefined) {
-          turnAnchor = { id: pendingUserContext.id, startedAt: pendingUserContext.createdAt };
-        }
-      }
-      if (overrideText === undefined) {
-        composerController.updateDrafts((current) => ({ ...current, [conversationId]: "" }));
-        composerController.updateImageDrafts((current) => ({ ...current, [conversationId]: [] }));
-        composerController.updateElementPicks((current) => ({ ...current, [conversationId]: [] }));
-        clearComposerFiles(conversationId);
-      }
+      const turnAnchor = pendingUserContext
+        ? { id: pendingUserContext.id, startedAt: pendingUserContext.createdAt }
+        : undefined;
+      composerController.updateDrafts((current) => ({ ...current, [conversationId]: "" }));
+      composerController.updatePastedTexts((current) => ({ ...current, [conversationId]: [] }));
+      composerController.updateImageDrafts((current) => ({ ...current, [conversationId]: [] }));
+      composerController.updateElementPicks((current) => ({ ...current, [conversationId]: [] }));
+      clearComposerFiles(conversationId);
       host().scrollTimelineToBottom();
       await performModelRun(workspaceId, conversationId, {
         provider,
@@ -1505,7 +1490,7 @@ export function createSendPipeline(
         enabledTools: enabledToolsAtSend,
         contexts: requestContexts,
         tools: conversationToolsAtSend
-      }, turnAnchor, overrideText !== undefined);
+      }, turnAnchor);
     }
   };
 
@@ -1523,6 +1508,11 @@ export function createSendPipeline(
     if (!document || !workspaceId || !conversationId || !active.workspace || !active.conversation) return false;
     const activeWorkspace = active.workspace;
     const activeConversation = active.conversation;
+    // The wake effect runs again once the body is loaded.
+    if (isBodyUnloaded(activeConversation)) {
+      void host().ensureConversationBody(conversationId).catch(() => undefined);
+      return false;
+    }
     if (
       modelRunController.current()[conversationId]
       || modelRunController.hasRunToken(conversationId)
@@ -1539,7 +1529,6 @@ export function createSendPipeline(
     const model = wakeChoice.model;
     if (!provider?.enabled || !hasUsableBaseUrl(provider) || !model || !model.id.trim()) return false;
     const requestContexts = [...activeConversation.contexts];
-    if (!host().requestFitsImageBudget(requestContexts)) return false;
     modelRunController.addPreparingRun(conversationId);
     try {
       // As on the send path, persist the provider snapshot before issuing a network request.
@@ -1586,7 +1575,6 @@ export function createSendPipeline(
     const anchor = [...conversation.contexts].reverse().find((context) => context.kind === "user");
     if (!anchor) return false;
     const requestContexts = [...conversation.contexts];
-    if (!host().requestFitsImageBudget(requestContexts)) return false;
     // The child is not the active conversation, so its tool set comes from its own
     // settings rather than the active-conversation seams. The catalog itself is
     // document-wide; the host re-derives the enabled list from the store anyway.
@@ -1629,6 +1617,11 @@ export function createSendPipeline(
     const located = findConversation(latest, workspaceId, conversationId);
     const message = located.conversation?.queuedMessages[0];
     if (!latest || !located.workspace || !located.conversation || !message) return;
+    // The queue effect dispatches again once the body is loaded.
+    if (isBodyUnloaded(located.conversation)) {
+      void host().ensureConversationBody(conversationId).catch(() => undefined);
+      return;
+    }
     if (composerController.current().failedQueuedPromotionIds.has(message.id)) return;
     const queuedChoice = modelChoiceForConversation(latest);
     const provider = queuedChoice.provider;
@@ -1680,7 +1673,6 @@ export function createSendPipeline(
           createdAt: currentMessage.createdAt
         };
         requestContexts = [...currentLocated.conversation.contexts, userContext];
-        if (!host().requestFitsImageBudget(requestContexts)) return;
         queuedConversation = {
           ...currentLocated.conversation,
           title: currentLocated.conversation.title === "新任务" || currentLocated.conversation.title === "New task" // i18n-audit-ignore: recognizes both localized default-title markers

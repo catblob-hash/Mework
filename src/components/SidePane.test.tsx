@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sidePaneDomId } from "../lib/sidePanes";
+import { PaneTileGeometryContext } from "./paneTileGeometry";
 import { SidePane } from "./SidePane";
 
 let observed: Element[] = [];
@@ -168,6 +169,63 @@ describe("SidePane", () => {
     expect(frames).toHaveLength(1);
     frames[0]!(0);
     expect(onContentBoundsChange).toHaveBeenCalledTimes(1);
+  });
+
+  /** A column closing to its left moves a tile without resizing it; the observer never hears of that. */
+  it("republishes when its tile moves, and only then", () => {
+    const onContentBoundsChange = vi.fn();
+    const pane = (geometry: string) => (
+      <PaneTileGeometryContext.Provider value={geometry}>
+        <SidePane
+          id="preview:session"
+          title="预览"
+          onClose={() => undefined}
+          onContentBoundsChange={onContentBoundsChange}
+        >
+          <p>页面</p>
+        </SidePane>
+      </PaneTileGeometryContext.Provider>
+    );
+    const { rerender } = render(pane("column 1"));
+    onContentBoundsChange.mockClear();
+
+    rerender(pane("column 1"));
+    expect(onContentBoundsChange).not.toHaveBeenCalled();
+    rerender(pane("column 0"));
+    expect(onContentBoundsChange).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The page is a native view above every HTML layer, out of reach of the pane's own rounded clip,
+   * so the host rounds it itself — to the curve the pane actually cuts its body to, which is the
+   * outer radius less the border, not the radius the stylesheet names.
+   */
+  it("publishes the radius the pane clips the body's bottom corners to", () => {
+    const onContentBoundsChange = vi.fn();
+    const computed = window.getComputedStyle;
+    vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudo) => {
+      const style = computed(element, pseudo);
+      if (!(element instanceof HTMLElement) || !element.classList.contains("side-pane")) return style;
+      return {
+        ...style,
+        borderBottomLeftRadius: "10px",
+        borderBottomRightRadius: "10px",
+        borderBottomWidth: "1px"
+      } as CSSStyleDeclaration;
+    });
+
+    render(
+      <SidePane
+        id="preview:session"
+        title="预览"
+        onClose={() => undefined}
+        onContentBoundsChange={onContentBoundsChange}
+      >
+        <p>页面</p>
+      </SidePane>
+    );
+
+    expect(onContentBoundsChange.mock.calls[0]![0]).toMatchObject({ bottomCornerRadius: 9 });
   });
 
   /** Panes that hold nothing the host has to position must not pay for a ResizeObserver. */

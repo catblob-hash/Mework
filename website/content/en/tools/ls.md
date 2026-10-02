@@ -2,7 +2,7 @@
 
 ## Approval
 
-Calls are classified as reads. Inside the workspace, the app-data directory and any extra working directory granted to the conversation, a listing runs without asking at every security level, Plan mode included. A path outside those roots is an outside read: `request_approval` and Plan mode raise an approval card, `allow_edits` and `full_access` let it through. **Always allow** can remember an outside listing for this tool in this conversation, capped at the risk level of the card you answered and forgotten when the app restarts. One directory is refused at every level and cannot be approved: `memory/` under the app-data directory, which only the long-term memory tools may open.
+Calls are classified as reads. Inside the workspace, the app-data directory and any extra working directory granted to the conversation, a listing runs without asking at every security level. A path outside those roots is an outside read: `request_approval` raises an approval card, `allow_edits` and `full_access` let it through. **Always allow** can remember an outside listing for this tool in this conversation, capped at the risk level of the card you answered and forgotten when the app restarts. One directory is refused at every level and cannot be approved: `memory/` under the app-data directory, which only the long-term memory tools may open.
 
 ## Behavior and limits
 

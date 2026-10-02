@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   initialTerminalTabsState,
+  READ_ONLY_TERMINAL_TAB_ID,
   terminalShellKey,
+  terminalStripIds,
   terminalTabId,
   terminalTabsFor,
   terminalTabsReducer
@@ -27,6 +29,12 @@ function add(state: TerminalTabsState, launch: TerminalLaunchChoice | null = zsh
 }
 function close(state: TerminalTabsState, terminalId: string, id = conversationId) {
   return apply(state, { type: "close", conversationId: id, terminalId });
+}
+function showReadOnly(state: TerminalTabsState, shellTaskId: string, id = conversationId) {
+  return apply(state, { type: "show_read_only", conversationId: id, shellTaskId });
+}
+function strip(state: TerminalTabsState, id = conversationId) {
+  return terminalStripIds(layout(state, id));
 }
 /** Each tab's shell and number, which is what its derived name is made of. */
 function numbered(state: TerminalTabsState, id = conversationId) {
@@ -217,6 +225,76 @@ describe("terminal tabs", () => {
     const state = add(add(initialTerminalTabsState), launch);
     expect(layout(state).tabs.map((tab) => tab.launch)).toEqual([zsh, launch]);
     expect(layout(state).activeId).toBe(terminalTabId(2));
+  });
+
+  describe("the read-only page", () => {
+    it("leads the strip and takes the selection, without minting a shell", () => {
+      const state = showReadOnly(add(add(initialTerminalTabsState)), "shell-1");
+      expect(strip(state)).toEqual([READ_ONLY_TERMINAL_TAB_ID, terminalTabId(1), terminalTabId(2)]);
+      expect(layout(state).readOnly).toBe("shell-1");
+      expect(layout(state).activeId).toBe(READ_ONLY_TERMINAL_TAB_ID);
+      expect(layout(state).nextOrdinal).toBe(3);
+      // A shell opened after it still goes after it.
+      expect(strip(add(state))).toEqual([
+        READ_ONLY_TERMINAL_TAB_ID, terminalTabId(1), terminalTabId(2), terminalTabId(3)
+      ]);
+    });
+
+    it("is one page: another command's output replaces what it shows", () => {
+      const first = showReadOnly(add(initialTerminalTabsState), "shell-1");
+      const second = showReadOnly(
+        apply(first, { type: "activate", conversationId, terminalId: terminalTabId(1) }),
+        "shell-2"
+      );
+      expect(strip(second)).toEqual([READ_ONLY_TERMINAL_TAB_ID, terminalTabId(1)]);
+      expect(layout(second).readOnly).toBe("shell-2");
+      expect(layout(second).activeId).toBe(READ_ONLY_TERMINAL_TAB_ID);
+      expect(showReadOnly(second, "shell-2")).toBe(second);
+    });
+
+    it("stays at the start whatever order the shells are dragged into", () => {
+      const state = showReadOnly(add(add(initialTerminalTabsState)), "shell-1");
+      const next = apply(state, {
+        type: "reorder",
+        conversationId,
+        terminalIds: [terminalTabId(2), READ_ONLY_TERMINAL_TAB_ID, terminalTabId(1)]
+      });
+      expect(strip(next)).toEqual([READ_ONLY_TERMINAL_TAB_ID, terminalTabId(2), terminalTabId(1)]);
+    });
+
+    it("counts as a tab: a pane showing only it starts no shell", () => {
+      const state = showReadOnly(initialTerminalTabsState, "shell-1");
+      expect(apply(state, { type: "ensure", conversationId, launch: zsh })).toBe(state);
+    });
+
+    it("closes like a tab, handing the selection right, and leaves the shells alone", () => {
+      const state = showReadOnly(add(add(initialTerminalTabsState)), "shell-1");
+      const closed = close(state, READ_ONLY_TERMINAL_TAB_ID);
+      expect(strip(closed)).toEqual([terminalTabId(1), terminalTabId(2)]);
+      expect(layout(closed).readOnly).toBeNull();
+      expect(layout(closed).activeId).toBe(terminalTabId(1));
+      // The last shell going hands the selection left, onto the read-only page.
+      const onlyShell = close(close(state, terminalTabId(2)), terminalTabId(1));
+      expect(strip(onlyShell)).toEqual([READ_ONLY_TERMINAL_TAB_ID]);
+      expect(layout(onlyShell).activeId).toBe(READ_ONLY_TERMINAL_TAB_ID);
+      expect(layout(close(onlyShell, READ_ONLY_TERMINAL_TAB_ID)).activeId).toBeNull();
+    });
+
+    it("is forgotten only for the command it shows", () => {
+      const state = showReadOnly(add(initialTerminalTabsState), "shell-1");
+      expect(apply(state, { type: "forget_read_only", conversationId, shellTaskId: "shell-2" }))
+        .toBe(state);
+      const forgotten = apply(state, { type: "forget_read_only", conversationId, shellTaskId: "shell-1" });
+      expect(strip(forgotten)).toEqual([terminalTabId(1)]);
+      expect(layout(forgotten).activeId).toBe(terminalTabId(1));
+    });
+
+    it("takes no name", () => {
+      const state = showReadOnly(initialTerminalTabsState, "shell-1");
+      expect(apply(state, {
+        type: "rename", conversationId, terminalId: READ_ONLY_TERMINAL_TAB_ID, name: "logs"
+      })).toBe(state);
+    });
   });
 
   it("forgets a conversation, and says nothing changed when it never knew it", () => {

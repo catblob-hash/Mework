@@ -2,25 +2,22 @@ import {
   ArrowUp,
   ChevronDown,
   CircleAlert,
+  FileText,
   Folder,
   FolderPlus,
-  Gauge,
   GitBranch,
   GitCompareArrows,
   Globe,
   History,
   LoaderCircle,
   ListChecks,
-  Monitor,
   PanelRight,
   RotateCcw,
-  ShieldCheck,
   Server,
   Settings,
   SlidersHorizontal,
   Square,
   SquareTerminal,
-  Undo2,
   X
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
@@ -31,9 +28,11 @@ import { MeworkMark } from "./components/MeworkIcon";
 import { ComposerAddFiles } from "./components/ComposerAddMenu";
 import { AttachmentDropOverlay, AttachmentNotice } from "./components/AttachmentFeedback";
 import { ComposerCat } from "./components/ComposerCat";
-import { PopoverMenu, type PopoverMenuSection } from "./components/PopoverMenu";
+import { PopoverMenu, type PopoverMenuItem, type PopoverMenuSection } from "./components/PopoverMenu";
+import { ModelCacheMark } from "./components/LockTone";
 import { ContextUsageMeter } from "./components/ContextUsageMeter";
 import { ImageStrip } from "./components/ImageStrip";
+import { usePastedTextTags } from "./components/PastedTextTags";
 import { SelectedElementChips } from "./components/SelectedElementChips";
 import { imagesWithoutElementCrops, selectedElementImageFile } from "./lib/selectedElement";
 import { ConversationSettings } from "./components/ConversationSettings";
@@ -43,10 +42,13 @@ import {
   subagentViewMessages
 } from "./components/StreamedConversationView";
 import { QuestionDock } from "./components/QuestionDock";
+import { SubagentTabBar } from "./components/SubagentPanel";
+import { TasksPaneTabBar, tasksPaneTabLabel } from "./components/TasksPaneTabBar";
 import { ToolApprovalDock } from "./components/ToolApprovalDock";
 import { QueuedMessageList } from "./components/QueuedMessageList";
 import { Dialog, IconButton } from "./components/Common";
 import { GlobalSettings } from "./components/GlobalSettings";
+import { WindowLayerOutlet, WindowLayerProvider } from "./components/WindowLayer";
 import {
   clampSidebarWidth,
   Sidebar,
@@ -56,7 +58,6 @@ import type { ConversationStatus } from "./components/Sidebar";
 import { ShellNav, useWindowFullscreen, WindowFrame } from "./components/WindowChrome";
 import { ConversationSearch } from "./components/ConversationSearch";
 import { windowChromeKind } from "./lib/windowChrome";
-import { glassGroundRef } from "./lib/glassGround";
 import {
   conversationHistoryTarget,
   EMPTY_CONVERSATION_HISTORY,
@@ -75,9 +76,9 @@ import {
 import { ProjectDialog } from "./components/ProjectDialog";
 import {
   MachineSettingsDialog,
-  WorkspaceEnvironmentDialog,
   type MachineShellsControl
 } from "./components/MachineDialogs";
+import { WorkspaceSettingsDialog } from "./components/WorkspaceSettings";
 import { ForkRequestTray } from "./components/ForkRequestTray";
 import { detachAbsentParents, reparentChildren } from "./lib/conversationTree";
 import { GitStatusCard } from "./components/GitStatusCard";
@@ -88,26 +89,20 @@ import {
 } from "./components/TaskContainer";
 import { deriveWorkflowProgress } from "./lib/workflowProgress";
 import type { WorkflowProgressView } from "./lib/workflowProgress";
-import { countRunningTasks, deriveTaskItems, shellTaskTitle } from "./lib/taskContainer";
+import { countRunningTasks, deriveTaskItems, shellTaskDirectory, shellTaskTitle } from "./lib/taskContainer";
 import type { TaskSources } from "./lib/taskContainer";
 import { reorderItems } from "./components/usePointerDrag";
 import { createId } from "./lib/id";
 import { estimateContextsTokens, liveContextTokens } from "./lib/contextTokens";
-import { hasUsableBaseUrl, isEncryptedReasoning, supportsVision } from "./lib/modelCapabilities";
+import { appendsTools, hasUsableBaseUrl, isEncryptedReasoning, supportsVision } from "./lib/modelCapabilities";
 import {
   imageShortIdsInUse,
   reserveQueuedMessageIds
 } from "./lib/imageShortIds";
 import { messageAttachmentAdder } from "./lib/imagePaste";
 import { useAttachmentDropZone } from "./lib/attachmentDrop";
-import { isLongPaste, pastedTextFile } from "./lib/fileAttachments";
-import {
-  contextsContainProjectedImages,
-  MAX_COMPOSER_IMAGE_BYTES,
-  MAX_COMPOSER_IMAGE_PIXELS,
-  MAX_COMPOSER_IMAGES,
-  projectedImageBudget
-} from "./lib/imageBudget";
+import type { PastedText } from "./lib/pastedText";
+import { contextsContainProjectedImages } from "./lib/imageBudget";
 import {
   applyStreamedRunContexts,
   browserAutomationToolForRun,
@@ -122,18 +117,19 @@ import {
   createSendPipeline,
   type ContextUsage,
   type ModelRunErrorState,
-  type SendPipelineHost,
-  type ToolExposureMode
+  type SendPipelineHost
 } from "./lib/sendPipeline";
 import {
   availableShellBackends,
   knownShells,
   listMachineShells,
   probeMachineShells,
+  sshEndpoint,
   terminalShellsFor,
   toolsForShellBackends,
   withAgentShell,
-  withDefaultAgentShell
+  withDefaultAgentShell,
+  withoutProbe
 } from "./lib/machineShells";
 import {
   conversationWorkspaces,
@@ -156,7 +152,13 @@ import {
   worktreeName
 } from "./lib/workspaces";
 import {
-  settingsAtToolLockFloor,
+  modelCacheWarmUntil,
+  planModeLocked,
+  refreshedToolLock,
+  restoreLockedSettings,
+  toolLockModelOf,
+  toolLockOf,
+  toolLockState,
   withRunToolLock
 } from "./lib/toolLock";
 import { grantsWebFetch } from "./lib/webSearch";
@@ -169,22 +171,25 @@ import {
   visibleConversations
 } from "./lib/draftConversation";
 import type { DraftConversationState } from "./lib/draftConversation";
-import { listWslDistros, settleConversationTitle } from "./lib/runtime";
+import {
+  conversationHasNoContexts,
+  createConversationBodyCache,
+  hollowConversation,
+  isBodyUnloaded,
+  keepUnloadedBody
+} from "./lib/conversationBodies";
+import { memoryPool } from "./lib/memoryPool";
+import { hasConversationCommands, listWslDistros, settleConversationTitle, startedOnFreshInstall } from "./lib/runtime";
+import { setUpClaudeAgentOnFirstLaunch } from "./lib/claudeAgentFirstLaunch";
+import { DEFAULT_REASONING_EFFORT, REASONING_EFFORTS } from "./lib/reasoningEffort";
 import { loadToolExplanations } from "./lib/localModel";
-import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, previewConversationTemplate, probeMcpServer, refreshCapabilities, revealCapabilityLocation, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, skipWorkflowStep, workflowStepRecord } from "./lib/runtime";
+import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, captureConversationTemplate, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, previewConversationTemplate, probeMcpServer, refreshCapabilities, revealCapabilityLocation, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, skipWorkflowStep, workflowStepRecord } from "./lib/runtime";
 import { SECURITY_LEVEL_OPTIONS, securityLevelLabel } from "./lib/securityLevels";
 import {
   answersFromFormattedContent,
-  deriveAgentStatus,
-  findPendingQuestion,
   isClaudeQuestionInput,
   questionsFromInput
 } from "./lib/orchestration";
-import type { AgentStatus, PendingQuestion, TodoItemView } from "./lib/orchestration";
-import {
-  deleteStateToolContext,
-  restoreStateToolContexts
-} from "./lib/stateToolDeletion";
 import {
   approvalPromptSubagentView,
   deriveSubagentViews,
@@ -199,14 +204,29 @@ import { GitReviewPageLabel, GitReviewPanel } from "./components/GitReviewPanel"
 import { PageTabs } from "./components/PageTabs";
 import type { GitReviewRevealRequest } from "./components/GitReviewPanel";
 import { ShellTaskPanel } from "./components/ShellTaskPanel";
+import type { ContextMenuAnchor, ContextMenuSection } from "./components/ContextMenu";
+import { PathChoiceMenu, closePathChoice, showPathChoice } from "./components/PathChoiceMenu";
+import { PathText } from "./components/PathText";
 import { FilesPane } from "./components/FilesPane";
-import type { FilesPaneOpenRequest } from "./components/FilesPane";
-import { revealPath, setPathOpenHandler } from "./lib/pathLinks";
+import type { FilesPaneOpenRequest, FilesPaneWorkspace } from "./components/FilesPane";
+import {
+  browseMachineLabel,
+  browsePath,
+  browseProbePaths,
+  formatAddress,
+  isWindowsPath,
+  locationKey,
+  resolveBrowsePath,
+  sameBrowseMachine
+} from "./lib/fileBrowser";
+import type { BrowseMachine, BrowseProbeResult } from "./lib/fileBrowser";
+import { setPathOpenHandler, setPathPrefetchHandler } from "./lib/pathLinks";
+import type { PathOpenRequest } from "./lib/pathLinks";
 import { workspaceRelativePath } from "./lib/workspaceFiles";
 import { HistoryPane } from "./components/HistoryPane";
 import { PaneTiles } from "./components/PaneTiles";
 import { PaneToolbar } from "./components/PaneToolbar";
-import { SidePane } from "./components/SidePane";
+import { innerBottomRadius, SidePane, type SidePaneBounds } from "./components/SidePane";
 import { PlanPane, planStatusLabel, planTitle } from "./components/PlanPage";
 import { TerminalPanel, terminalPanelId } from "./components/TerminalPanel";
 import type { TerminalPanelHandle } from "./components/TerminalPanel";
@@ -224,6 +244,8 @@ import { liveTerminalCount } from "./lib/terminal";
 import type { TerminalLaunchChoice, TerminalSessionState } from "./lib/terminal";
 import {
   initialTerminalTabsState,
+  READ_ONLY_TERMINAL_TAB_ID,
+  terminalStripIds,
   terminalTabsFor,
   terminalTabsReducer
 } from "./lib/terminalTabs";
@@ -299,14 +321,15 @@ import {
   previewSessionBelongsToConversation,
   previewSessionsFor,
   previewWorkspaceOf,
-  shellPaneId,
+  shownSubagent,
+  shownTasksTab,
   sidePaneDomId,
   sidePaneLayoutFor,
   sidePanesReducer,
   subagentHistoryPaneId,
-  subagentPaneId,
   type SidePaneId,
-  type SidePanesAction
+  type SidePanesAction,
+  type TasksPaneTab
 } from "./lib/sidePanes";
 import { resolveApplicationLanguage, translate, useI18n } from "./i18n";
 import { configureApplicationAppearance, getResolvedTheme, useResolvedTheme } from "./theme";
@@ -351,6 +374,17 @@ import {
   isConversationBranchFork,
   switchConversationBranch
 } from "./lib/conversationBranches";
+import {
+  EMPTY_TIMELINE_PATCH,
+  TimelineHistory,
+  applyTimelinePatch,
+  insertionPatch,
+  invertTimelinePatch,
+  placedContexts,
+  removedIds,
+  timelineHistoryShortcut
+} from "./lib/timelineHistory";
+import type { TimelinePatch } from "./lib/timelineHistory";
 import { forkOrigin, forkTitle, nextForkNumber, staleForkTitles } from "./lib/conversationForks";
 import {
   TIMELINE_START_ANCHOR,
@@ -389,9 +423,10 @@ import type {
   PendingForkRequest,
   ForkDecisionRecord,
   PendingToolPrompt,
-  ReasoningEffort,
+  QuestionResponse,
   ResourceDescriptor,
   RunTarget as RunTargetType,
+  SandboxSettings,
   SecurityLevel,
   SshMachineConfig as SshMachineConfigType,
   MachineShells,
@@ -414,40 +449,16 @@ const NO_PROJECTED_CONTEXTS: ContextItem[] = [];
 
 /** Stable identity for empty workflow entries when no run is active. */
 const EMPTY_WORKFLOW_ENTRIES: Record<string, WorkflowProgressEntry[]> = {};
+const NO_PASTED_TEXTS: PastedText[] = [];
 const EMPTY_WORKFLOW_RUN_IDS: Record<string, string> = {};
 
-function todoItemsEqual(previous: TodoItemView, next: TodoItemView): boolean {
-  return previous.id === next.id
-    && previous.content === next.content
-    && previous.status === next.status
-    && previous.description === next.description
-    && previous.activeForm === next.activeForm
-    && (previous.blocks?.length ?? 0) === (next.blocks?.length ?? 0)
-    && (previous.blocks ?? []).every((id, index) => next.blocks?.[index] === id)
-    && (previous.blockedBy?.length ?? 0) === (next.blockedBy?.length ?? 0)
-    && (previous.blockedBy ?? []).every((id, index) => next.blockedBy?.[index] === id);
-}
-
-function agentStatusEqual(previous: AgentStatus, next: AgentStatus): boolean {
-  if (previous === next) return true;
-  if (previous.todo === next.todo) return true;
-  if (!previous.todo || !next.todo || previous.todo.length !== next.todo.length) return false;
-  return previous.todo.every((item, index) => (
-    next.todo?.[index] !== undefined && todoItemsEqual(item, next.todo[index])
-  ));
-}
-
-function pendingQuestionsEqual(
-  previous: PendingQuestion | null,
-  next: PendingQuestion | null
-): boolean {
-  if (previous === next) return true;
-  if (!previous || !next) return false;
-  return previous.context.id === next.context.id
-    && previous.context.input === next.context.input
-    && previous.context.result.success === next.context.result.success
-    && previous.context.result.output === next.context.result.output;
-}
+/**
+ * How long a probe of where a transcript path is stays good for: long enough that the hover's
+ * answer serves the click and a second click, short enough that a file just written is found.
+ */
+const PATH_PROBE_REUSE_MS = 8_000;
+/** How long a click on a path waits for its probe before the menu opens to say it is looking. */
+const PATH_CHOICE_PATIENCE_MS = 150;
 
 /**
  * Compare subagent chrome fields only. Live contexts are intentionally excluded because
@@ -521,13 +532,19 @@ type QuestionEditorState = {
   answer?: UserContext;
 };
 
-/** Undo control for timeline deletion, scoped to the current conversation. */
-type PendingUndoState = {
+/**
+ * The one line saying what an edit on the timeline just did, and which key takes
+ * it back. It belongs to the timeline it was said about.
+ */
+type TimelineNoticeState = {
   id: string;
   conversationId: string;
-  label: string;
-  run: () => void;
+  message: string;
+  hint?: { keys: string; action: string };
 };
+
+/** How long a timeline notice stays up. */
+const TIMELINE_NOTICE_MS = 3200;
 
 export {
   gitReviewSnapshotCacheKey,
@@ -535,8 +552,6 @@ export {
   gitSnapshotsAfterRefresh,
   gitSnapshotsAfterWorkspaceMutation
 } from "./lib/gitController";
-
-const reasoningEffortOptions: ReasoningEffort[] = ["disabled", "low", "medium", "high", "xhigh"];
 
 function failureMessage(reason: unknown, fallback: string): string {
   if (reason instanceof Error && reason.message.trim()) return reason.message;
@@ -633,9 +648,6 @@ function ErrorView({ message, onReset }: { message: string; onReset: () => void 
   );
 }
 
-/** Over glass the chips above the composer are solid, painted like the glass under each. */
-const composerChipsGround = glassGroundRef(".composer-chip-group, .composer-chip:not(.composer-chip--flush)");
-
 function App() {
   const { resolvedLanguage, t } = useI18n();
   const platform = typeof navigator === "undefined" ? "" : navigator.platform;
@@ -659,7 +671,13 @@ function App() {
   }, []);
   /** Authoritative document store; React only subscribes to its publication and save pipeline. */
   const [documentStore] = useState(createDocumentStore);
-  /** Replace local conversation read models with authoritative host-written bodies by id. */
+  /** Bumped as conversation-body fetches start and end, so the loading state redraws. */
+  const [, setBodyLoadTick] = useState(0);
+  /**
+   * Replace local conversation read models with authoritative host-written bodies by id. A
+   * conversation whose body is unloaded takes only the metadata: loading a body back is the body
+   * cache's call, made when the conversation is opened, not a side effect of a write reply.
+   */
   const applyAuthoritativeConversation = useCallback(
     (workspaceId: string, conversation: Conversation) => {
       documentStore.update((current) => current ? {
@@ -668,9 +686,10 @@ function App() {
           workspace.id === workspaceId
             ? {
               ...workspace,
-              conversations: workspace.conversations.map((candidate) => (
-                candidate.id === conversation.id ? conversation : candidate
-              ))
+              conversations: workspace.conversations.map((candidate) => {
+                if (candidate.id !== conversation.id) return candidate;
+                return isBodyUnloaded(candidate) ? hollowConversation(conversation) : conversation;
+              })
             }
             : workspace
         ))
@@ -678,6 +697,50 @@ function App() {
     },
     [documentStore]
   );
+  /**
+   * Conversation bodies as pooled data (`lib/conversationBodies.ts`): installing a fetched body
+   * and dropping an unloaded one are local only — the host already holds both — so neither goes
+   * through the conversation command channel.
+   */
+  const [conversationBodies] = useState(() => createConversationBodyCache({
+    pool: memoryPool,
+    current: () => documentStore.current(),
+    install: (conversation) => documentStore.update((current) => current ? {
+      ...current,
+      workspaces: current.workspaces.map((workspace) => (
+        workspace.conversations.some((candidate) => candidate.id === conversation.id)
+          ? {
+            ...workspace,
+            conversations: workspace.conversations.map((candidate) => (
+              candidate.id === conversation.id && isBodyUnloaded(candidate) ? conversation : candidate
+            ))
+          }
+          : workspace
+      ))
+    } : current),
+    unload: (conversationIds) => {
+      const unloading = new Set(conversationIds);
+      documentStore.update((current) => current ? {
+        ...current,
+        workspaces: current.workspaces.map((workspace) => (
+          workspace.conversations.some((candidate) => unloading.has(candidate.id))
+            ? {
+              ...workspace,
+              conversations: workspace.conversations.map((candidate) => (
+                unloading.has(candidate.id) && !isBodyUnloaded(candidate)
+                  ? hollowConversation(candidate)
+                  : candidate
+              ))
+            }
+            : workspace
+        ))
+      } : current);
+    },
+    load: loadConversationRemote,
+    enabled: hasConversationCommands,
+    onLoadingChange: () => setBodyLoadTick((tick) => tick + 1)
+  }));
+  useEffect(() => () => conversationBodies.dispose(), [conversationBodies]);
   /** The host exclusively writes conversation bodies; the renderer sends intents through this command channel. */
   const [conversationSync] = useState(() => createConversationSync(
     applyAuthoritativeConversation,
@@ -780,6 +843,7 @@ function App() {
   const [composerController] = useState(createComposerController);
   const composerState = useSyncExternalStore(composerController.subscribe, composerController.current);
   const composerDrafts = composerState.drafts;
+  const composerPastedTexts = composerState.pastedTexts;
   const composerImageDrafts = composerState.imageDrafts;
   const composerFileDrafts = composerState.fileDrafts;
   const composerAttachmentNotices = composerState.attachmentNotices;
@@ -818,7 +882,6 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [paneResizing, setPaneResizing] = useState(false);
-  const [saveAsPresetDialog, setSaveAsPresetDialog] = useState<{ name: string; description: string } | null>(null);
   /**
    * Which side panes are open beside the conversation, per conversation, plus the live preview
    * sessions each one owns and the side-column widths the user last settled on. One state, not
@@ -965,10 +1028,14 @@ function App() {
   );
   const [deletingWorkspaceIds, setDeletingWorkspaceIds] = useState<Set<string>>(() => new Set());
   const [deletingConversationIds, setDeletingConversationIds] = useState<Set<string>>(() => new Set());
-  const [pendingUndo, setPendingUndo] = useState<PendingUndoState | null>(null);
+  /* What each timeline remembers of its own edits, for its undo keys. In memory
+     only, one budget shared by every conversation (`timelineHistory.ts`). */
+  const timelineHistoryRef = useRef<TimelineHistory | null>(null);
+  if (!timelineHistoryRef.current) timelineHistoryRef.current = new TimelineHistory();
+  const [timelineNotice, setTimelineNotice] = useState<TimelineNoticeState | null>(null);
+  const timelineNoticeTimerRef = useRef<number | null>(null);
   const contextScrollRef = useRef<Record<string, number>>({});
   const conversationTurnsRef = useRef<ConversationTurns>(conversationTurns);
-  const queuedQuestionAnswersRef = useRef(new Map<string, string>());
   const deletingWorkspaceIdsRef = useRef(new Set<string>());
   const deletingConversationIdsRef = useRef(new Set<string>());
   const activeWorkspaceIdRef = useRef<string | null>(activeWorkspaceId);
@@ -1097,9 +1164,6 @@ function App() {
       session.conversationId === conversationId && session.phase === "running" && session.busy
     ))
   ), [modelRunSummaries, shellTasks, terminalSessions]);
-  const clearPendingUndo = useCallback((conversationId: string) => {
-    setPendingUndo((current) => current?.conversationId === conversationId ? null : current);
-  }, []);
   const conversationModelRunIsActive = useCallback((conversationId: string) => (
     Boolean(modelRunController.current()[conversationId])
     || modelRunController.hasRunToken(conversationId)
@@ -1162,10 +1226,8 @@ function App() {
       // Every poll of this workspace must be invalidated, the draft's included.
       [...new Set([...peers.map((peer) => peer.id), conversationId])]
     );
-    clearPendingUndo(conversationId);
     return true;
   }, [
-    clearPendingUndo,
     contextMutationIsBlocked,
     conversationModelRunIsActive,
     draftWorksIn,
@@ -1180,11 +1242,9 @@ function App() {
   const currentPreviewSessions = previewSessionsFor(sidePanesState, activeConversationId);
   const activeFocusedPane = focusedPane(activeLayout);
   const activeExpandedPane = expandedPane(activeLayout);
-  // Several subagent panes can be stacked; the focused one is the transcript the conversation's
-  // own docks and body-loading effects follow.
-  const selectedSubagentId = (activeFocusedPane && paneKind(activeFocusedPane) === "subagent"
-    ? paneTarget(activeFocusedPane)
-    : paneTarget(activeLayout.panes.find((pane) => paneKind(pane) === "subagent") ?? "review")) || null;
+  // Agents share one pane as its tabs; the shown tab is the transcript the conversation's own
+  // docks and body-loading effects follow.
+  const selectedSubagentId = shownSubagent(activeLayout);
   const openPreviewSessionId = openPreviewSession(activeLayout);
   // The native page is only presented while this conversation's preview pane is open. Anything
   // else — no pane, another conversation — means the surface has to be released.
@@ -1415,6 +1475,28 @@ function App() {
     closeToolPrompt(conversationId, promptId);
   }, [closeToolPrompt]);
 
+  /** What each open question card would hand back if a composer message were sent now. */
+  const questionDraftsRef = useRef(new Map<string, QuestionResponse>());
+  const rememberQuestionDraft = useCallback((promptId: string, response: QuestionResponse) => {
+    questionDraftsRef.current.set(promptId, response);
+  }, []);
+  /** Answers a question card. The card comes down only once the host took the
+   * answer; the host's own `tool_approval_resolved` would close it anyway. */
+  const answerQuestionPrompt = useCallback(async (
+    conversationId: string,
+    promptId: string,
+    response: QuestionResponse
+  ): Promise<boolean> => {
+    try {
+      await resolveToolPrompt(promptId, "deny", undefined, response);
+    } catch {
+      return false;
+    }
+    questionDraftsRef.current.delete(promptId);
+    closeToolPrompt(conversationId, promptId);
+    return true;
+  }, [closeToolPrompt]);
+
   const openForkRequest = useCallback((request: PendingForkRequest) => {
     setForkRequests((current) => (
       current.some((pending) => pending.forkId === request.forkId)
@@ -1440,13 +1522,6 @@ function App() {
       console.error(t("分叉请求未能提交给宿主", "The fork decision could not be delivered to the host"), error);
     });
   }, [closeForkRequest, t]);
-
-  const requestFitsImageBudget = useCallback((contexts: ContextItem[]): boolean => {
-    const budget = projectedImageBudget(contexts);
-    return budget.count <= MAX_COMPOSER_IMAGES
-      && budget.bytes <= MAX_COMPOSER_IMAGE_BYTES
-      && budget.pixels <= MAX_COMPOSER_IMAGE_PIXELS;
-  }, []);
 
   /** Flush the authoritative snapshot through the store's serial queue; durable writes also await conversation commands. */
   const flushLatestDocument = useCallback(
@@ -1735,6 +1810,21 @@ function App() {
     else openPane(pane);
   }, [closePane, openPane]);
 
+  /** Brings the tasks pane forward on one of its tabs; the conversation's history is the other one. */
+  const showTasksTab = useCallback((tab: TasksPaneTab) => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
+    dispatchSidePanes({ type: "show_tasks_tab", conversationId, tab });
+  }, [dispatchSidePanes]);
+
+  /** A tab's menu row: closes the pane when it is that tab on show, and otherwise shows that tab. */
+  const toggleTasksTab = useCallback((tab: TasksPaneTab) => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
+    if (shownTasksTab(sidePaneLayoutFor(sidePanesStateRef.current, conversationId)) === tab) closePane("tasks");
+    else showTasksTab(tab);
+  }, [closePane, showTasksTab]);
+
   /**
    * Height the native page may occupy inside the pane.
    *
@@ -1745,12 +1835,56 @@ function App() {
    * this rectangle.
    */
   const previewReservedBottomRef = useRef<Record<string, number>>({});
-  const lastPreviewBoundsRef = useRef<
-    Record<string, { x: number; y: number; width: number; height: number }>
-  >({});
+  const lastPreviewBoundsRef = useRef<Record<string, SidePaneBounds>>({});
   const previewPageHeight = useCallback((sessionId: string, height: number) => (
     Math.max(1, height - (previewReservedBottomRef.current[sessionId] ?? 0))
   ), []);
+  /**
+   * The page rectangle the host is given for a measured pane body.
+   *
+   * Spelled out field by field: a measured `DOMRect` keeps its coordinates on the prototype, so
+   * spreading one into the wire payload would silently drop every one of them. The page only
+   * reaches the pane's rounded bottom when the log drawer is not taking the bottom from it.
+   */
+  const previewPageBounds = useCallback((sessionId: string, bounds: SidePaneBounds) => {
+    const reserved = previewReservedBottomRef.current[sessionId] ?? 0;
+    return {
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: previewPageHeight(sessionId, bounds.height),
+      visible: true,
+      bottomCornerRadius: reserved > 0 ? 0 : bounds.bottomCornerRadius
+    };
+  }, [previewPageHeight]);
+  /**
+   * One bounds request in flight per page, and only the newest rectangle waiting behind it.
+   *
+   * The page follows the pane while a divider is dragged, which reports a rectangle every frame.
+   * Sent as they come, requests that each take longer than a frame queue up behind one another,
+   * and the page falls further behind the pane the longer the drag goes on; holding only the
+   * newest bounds the lag to a single round trip.
+   */
+  const previewBoundsQueueRef = useRef<Record<string, { busy: boolean; next: (() => Promise<void>) | null }>>({});
+  const sendLatestPreviewBounds = useCallback((sessionId: string, send: () => Promise<void>) => {
+    const queues = previewBoundsQueueRef.current;
+    const queue = queues[sessionId] ?? { busy: false, next: null };
+    queues[sessionId] = queue;
+    if (queue.busy) {
+      queue.next = send;
+      return;
+    }
+    queue.busy = true;
+    const run = (task: () => Promise<void>) => {
+      void task().catch(() => undefined).finally(() => {
+        const next = queue.next;
+        queue.next = null;
+        if (next) run(next);
+        else queue.busy = false;
+      });
+    };
+    run(send);
+  }, []);
   /**
    * The page each conversation last had on screen, so bringing the pane back brings back the page
    * the user left rather than whichever happens to be first in the strip.
@@ -1792,20 +1926,20 @@ function App() {
         ?.getBoundingClientRect();
       // A page that has not been laid out yet measures zero, which the host would reject.
       if (!rect || rect.width < 1 || rect.height < 1) continue;
-      lastPreviewBoundsRef.current = {
-        ...lastPreviewBoundsRef.current,
-        [sessionId]: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-      };
-      await setBrowserPanelBounds(sessionId, {
+      const section = window.document.getElementById(domId);
+      const bounds: SidePaneBounds = {
         x: rect.x,
         y: rect.y,
         width: rect.width,
-        height: previewPageHeight(sessionId, rect.height),
-        visible: true
-      }, epoch).catch(() => undefined);
+        height: rect.height,
+        bottomCornerRadius: section ? innerBottomRadius(section) : 0
+      };
+      lastPreviewBoundsRef.current = { ...lastPreviewBoundsRef.current, [sessionId]: bounds };
+      await setBrowserPanelBounds(sessionId, previewPageBounds(sessionId, bounds), epoch)
+        .catch(() => undefined);
       return;
     }
-  }, [previewPageHeight]);
+  }, [previewPageBounds]);
 
   /**
    * Presents this conversation's preview page.
@@ -1915,13 +2049,15 @@ function App() {
   }, [dispatchSidePanes]);
 
   /**
-   * Shows one agent's read-only transcript in its own pane. The conversation stays on screen
-   * beside it, so the next selection is one click away.
+   * Shows one agent's read-only transcript as a tab of the subagent pane. The conversation stays
+   * on screen beside it, and the agents opened before it stay a tab away.
    */
   const openSubagentPanel = useCallback((subagentId: string) => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
     setEditor(null);
-    openPane(subagentPaneId(subagentId));
-  }, [openPane]);
+    dispatchSidePanes({ type: "open_subagent", conversationId, subagentId });
+  }, [dispatchSidePanes]);
 
   /** Leaves the focused pane, which is what the `panel.close` shortcut addresses. */
   const closeLastPane = useCallback(() => {
@@ -2070,13 +2206,17 @@ function App() {
     // The pane belongs to the conversation on screen, the terminal to its host identity; for the
     // draft the two differ.
     const ownerId = hostConversationId(conversationId);
-    const wasLast = terminalTabsFor(terminalTabsStateRef.current, ownerId).tabs.length <= 1;
-    const handle = terminalPanelHandlesRef.current.get(
+    const wasLast = terminalStripIds(terminalTabsFor(terminalTabsStateRef.current, ownerId)).length <= 1;
+    // The read-only page has no shell behind it: closing it only takes the page away, and the
+    // command it showed runs on.
+    const handle = terminalId === READ_ONLY_TERMINAL_TAB_ID ? null : terminalPanelHandlesRef.current.get(
       terminalSessionKey(ownerId, terminalId)
     );
-    const ended = handle
-      ? handle.close()
-      : requestTerminalSessionClose(ownerId, terminalId).catch(() => undefined);
+    const ended = terminalId === READ_ONLY_TERMINAL_TAB_ID
+      ? undefined
+      : handle
+        ? handle.close()
+        : requestTerminalSessionClose(ownerId, terminalId).catch(() => undefined);
     void Promise.resolve(ended).then(() => {
       dispatchTerminalTabs({ type: "close", conversationId: ownerId, terminalId });
       if (!wasLast) return;
@@ -2092,7 +2232,8 @@ function App() {
    * reach here.
    *
    * A terminal row has no pane of its own: the conversation's single PTY lives in the terminal
-   * pane, so its row opens that pane.
+   * pane, so its row opens that pane. A command the model ran has none either: its output is the
+   * terminal pane's read-only page, which the row points at it.
    */
   const openTaskItemPage = useCallback(async (item: TaskItem) => {
     const conversationId = activeConversationIdRef.current;
@@ -2102,7 +2243,13 @@ function App() {
       return;
     }
     if (item.kind === "shell") {
-      openPane(shellPaneId(item.shell.shellTaskId));
+      // Shown first, so that opening the pane finds a page to show and starts no shell for it.
+      dispatchTerminalTabs({
+        type: "show_read_only",
+        conversationId: hostConversationId(conversationId),
+        shellTaskId: item.shell.shellTaskId
+      });
+      openPane("terminal");
       return;
     }
     if (item.kind === "plan") {
@@ -2129,7 +2276,10 @@ function App() {
     // is showing something else, the pane's own start page lists this server with
     // the button that points it here.
     if (item.kind === "preview") await openBrowserTab();
-  }, [documentStore, openBrowserTab, openPane, setActiveConversationId, setActiveWorkspaceId]);
+  }, [
+    dispatchTerminalTabs, documentStore, hostConversationId, openBrowserTab, openPane,
+    setActiveConversationId, setActiveWorkspaceId
+  ]);
 
   const openGlobalSettings = useCallback((view: SettingsView) => {
     setGlobalSettingsView(view);
@@ -2270,6 +2420,11 @@ function App() {
       .then(async (loaded) => {
         if (cancelled) return;
         documentStore.load(loaded);
+        // In the background: the first draft opens on the seed model and moves to
+        // the CLI's Opus once it answers, unless the user picked a model first.
+        if (startedOnFreshInstall()) {
+          void setUpClaudeAgentOnFirstLaunch(loaded, (updater) => documentStore.update(updater));
+        }
         const firstWorkspace = loaded.workspaces[0];
         const firstConversationId = firstWorkspace?.conversations[0]?.id ?? null;
         if (firstConversationId) {
@@ -2299,6 +2454,9 @@ function App() {
   const pendingForkStartsRef = useRef<{ workspaceId: string; conversationId: string }[]>([]);
   const [forkSignal, setForkSignal] = useState(0);
   const forkStartsAttemptedRef = useRef(new Set<string>());
+  // Handoff continuations, child → source. When the source is still the
+  // conversation on screen once the child is loaded, the page follows it there.
+  const handoffJumpsRef = useRef(new Map<string, string>());
   const [forkStartError, setForkStartError] = useState<string | null>(null);
   const [forkRetrySignal, setForkRetrySignal] = useState(0);
 
@@ -2324,27 +2482,6 @@ function App() {
       closeToolPrompt(event.conversationId, event.promptId);
       return;
     }
-    // The host moved the conversation into or out of plan mode on its own. It has
-    // already committed the level, so this mirrors it into the read model without
-    // writing back — persisting here would race the host's own write.
-    if (event.type === "conversationSecurityLevelChanged") {
-      documentStore.update((current) => current ? {
-        ...current,
-        workspaces: current.workspaces.map((workspace) => ({
-          ...workspace,
-          conversations: workspace.conversations.map((conversation) => (
-            conversation.id === event.conversationId
-            && conversation.settings.securityLevel !== event.securityLevel
-              ? {
-                ...conversation,
-                settings: { ...conversation.settings, securityLevel: event.securityLevel }
-              }
-              : conversation
-          ))
-        }))
-      } : current);
-      return;
-    }
     if (event.type === "conversationTitleChanged") {
       // The host wrote it (placeholder, then the local helper model's title);
       // mirrored without writing back, like the security level above.
@@ -2364,6 +2501,30 @@ function App() {
     if (event.type === "conversationPlanUpdated") {
       planPushCountRef.current += 1;
       setPlans((current) => ({ ...current, [event.conversationId]: event.plan }));
+      return;
+    }
+    if (event.type === "conversationPlanModeChanged") {
+      // The host already wrote it: an approved plan turned plan mode off. It is
+      // written back all the same, because a settings write still waiting in the
+      // commit queue was built before this and carries the old value, and the
+      // latest write for a conversation is the one that lands.
+      const current = documentStore.current();
+      const workspace = current?.workspaces.find((candidate) => (
+        candidate.conversations.some((conversation) => conversation.id === event.conversationId)
+      ));
+      const base = workspace?.conversations.find((conversation) => conversation.id === event.conversationId);
+      if (!workspace || !base || Boolean(base.settings.planModeEnabled) === event.enabled) return;
+      const next = { ...base, settings: { ...base.settings, planModeEnabled: event.enabled } };
+      documentStore.update((document) => document ? {
+        ...document,
+        workspaces: document.workspaces.map((candidate) => candidate.id !== workspace.id ? candidate : {
+          ...candidate,
+          conversations: candidate.conversations.map((conversation) => (
+            conversation.id === event.conversationId ? next : conversation
+          ))
+        })
+      } : document);
+      conversationSync.changed(workspace.id, base, next);
       return;
     }
     // Fork cards are global: the tool call that raised one has already returned, so the
@@ -2386,6 +2547,18 @@ function App() {
         });
         setForkSignal((current) => current + 1);
       }
+      return;
+    }
+    // The model handed its conversation off and the host committed the
+    // continuation, armed on its opening message. It is not a fork, but its
+    // first run starts the way a host-made fork's does.
+    if (event.type === "conversationHandedOff") {
+      handoffJumpsRef.current.set(event.childConversationId, event.sourceConversationId);
+      pendingForkStartsRef.current.push({
+        workspaceId: event.workspaceId,
+        conversationId: event.childConversationId
+      });
+      setForkSignal((current) => current + 1);
       return;
     }
     // Shell lifecycle events are model behavior, not document-save results.
@@ -2422,9 +2595,17 @@ function App() {
       setShellTasks((current) => current.filter(
         (task) => task.shellTaskId !== event.shellTaskId
       ));
-      const pane = shellPaneId(event.shellTaskId);
-      if (paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, event.conversationId), pane)) {
-        dispatchSidePanes({ type: "close", conversationId: event.conversationId, pane });
+      // The read-only page closes like any other tab, and the pane goes with its last tab.
+      const terminals = terminalTabsFor(terminalTabsStateRef.current, event.conversationId);
+      if (terminals.readOnly === event.shellTaskId) {
+        dispatchTerminalTabs({
+          type: "forget_read_only",
+          conversationId: event.conversationId,
+          shellTaskId: event.shellTaskId
+        });
+        if (terminalStripIds(terminals).length <= 1) {
+          dispatchSidePanes({ type: "close", conversationId: event.conversationId, pane: "terminal" });
+        }
       }
       return;
     }
@@ -2440,7 +2621,7 @@ function App() {
     if (event.type === "documentWriteRecovered") {
       documentStore.reportBackendSaveResult("success");
     }
-  }), [documentStore, openToolPrompt, closeToolPrompt, openForkRequest, closeForkRequest, appendForkDecision, dispatchSidePanes]);
+  }), [documentStore, conversationSync, openToolPrompt, closeToolPrompt, openForkRequest, closeForkRequest, appendForkDecision, dispatchSidePanes, dispatchTerminalTabs]);
 
   /** Merge persisted and draft branches into one active workspace/conversation pair; only document writes, sending, and real-workspace panels need to distinguish drafts. */
   const draftActive = isDraftConversationId(activeConversationId) && draftConversation !== null;
@@ -2476,6 +2657,43 @@ function App() {
       ))
     )
   );
+  /**
+   * Conversation bodies that must stay loaded: the one on screen, and every one with a run in
+   * flight — its settlement splices into the body it started from.
+   */
+  const pinnedBodyIds = useMemo(() => {
+    const ids = new Set<string>(Object.keys(modelRunSummaries));
+    if (!draftActive && activeConversationId) ids.add(activeConversationId);
+    return ids;
+  }, [activeConversationId, draftActive, modelRunSummaries]);
+  useEffect(() => {
+    conversationBodies.sync(document, pinnedBodyIds);
+  }, [conversationBodies, document, pinnedBodyIds]);
+  /** Why the on-screen conversation's body last failed to load, by conversation. */
+  const [bodyLoadFailures, setBodyLoadFailures] = useState<Record<string, string>>({});
+  const activeBodyUnloaded = Boolean(
+    !draftActive && activeConversation && isBodyUnloaded(activeConversation)
+  );
+  const loadActiveBody = useCallback((conversationId: string) => {
+    setBodyLoadFailures((current) => {
+      if (!(conversationId in current)) return current;
+      const { [conversationId]: _cleared, ...rest } = current;
+      return rest;
+    });
+    void conversationBodies.ensureLoaded(conversationId).catch((error: unknown) => {
+      setBodyLoadFailures((current) => ({
+        ...current,
+        [conversationId]: error instanceof Error ? error.message : String(error)
+      }));
+    });
+  }, [conversationBodies]);
+  // Opening a conversation is what counts as using its body.
+  useEffect(() => {
+    if (!draftActive && activeConversationId) conversationBodies.touch(activeConversationId);
+  }, [activeConversationId, conversationBodies, draftActive]);
+  useEffect(() => {
+    if (activeBodyUnloaded && activeConversationId) loadActiveBody(activeConversationId);
+  }, [activeBodyUnloaded, activeConversationId, loadActiveBody]);
   /** The project's own workspaces as this conversation uses them: its worktree of each stands in for it. */
   const activeProjectWorkspaces = useMemo(
     () => projectWorkspaces(activeWorkspace, activeConversation),
@@ -2584,7 +2802,7 @@ function App() {
    * so the composer stops offering to change it.
    */
   const activeConversationStarted = Boolean(
-    !draftActive && activeConversation && activeConversation.contexts.length > 0
+    !draftActive && activeConversation && !conversationHasNoContexts(activeConversation)
   );
   /**
    * How many of the conversation's workspace numbers the project takes. A temporary project
@@ -2691,13 +2909,6 @@ function App() {
     if (!paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, activeConversation.id), "review")) return;
     dispatchSidePanes({ type: "close", conversationId: activeConversation.id, pane: "review" });
   }, [activeConversation, activeGitHasNoRepository, dispatchSidePanes]);
-  // The file pane reads this machine's filesystem; a conversation moved to a
-  // remote workspace has nothing for it to show.
-  useEffect(() => {
-    if (!activeConversation || !activeWorkspaceIsRemote) return;
-    if (!paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, activeConversation.id), "files")) return;
-    dispatchSidePanes({ type: "close", conversationId: activeConversation.id, pane: "files" });
-  }, [activeConversation, activeWorkspaceIsRemote, dispatchSidePanes]);
   /**
    * Shows the review pane.
    *
@@ -2714,6 +2925,22 @@ function App() {
     openPane("review");
   }, [activeConversation, activeReviewMember, activeReviewPages, openPane]);
   const activeComposerDraft = activeConversation ? composerDrafts[activeConversation.id] ?? "" : "";
+  const activeComposerConversationId = activeConversation?.id;
+  const updateActiveComposerPastedTexts = useCallback((
+    update: (current: readonly PastedText[]) => PastedText[]
+  ) => {
+    if (!activeComposerConversationId) return;
+    composerController.updatePastedTexts((current) => ({
+      ...current,
+      [activeComposerConversationId]: update(current[activeComposerConversationId] ?? [])
+    }));
+  }, [activeComposerConversationId, composerController]);
+  const composerPasteTags = usePastedTextTags({
+    textareaRef: composerTextareaRef,
+    value: activeComposerDraft,
+    pastes: (activeComposerConversationId && composerPastedTexts[activeComposerConversationId]) || NO_PASTED_TEXTS,
+    onPastesChange: updateActiveComposerPastedTexts
+  });
   const activeComposerImages = activeConversation ? composerImageDrafts[activeConversation.id] ?? [] : [];
   const activeComposerFiles = activeConversation ? composerFileDrafts[activeConversation.id] ?? [] : [];
   const activeComposerAttachmentNotice = activeConversation
@@ -2798,7 +3025,6 @@ function App() {
       })
     ));
   };
-  const activeWorkspacePeerOperationRunning = gitPeerOperationRunningFor(activeWorkspaceMember);
   const activeWorkspaceTerminalBusy = Boolean(
     activeWorkspace && Object.values(terminalSessions).some((session) => (
       session.busy
@@ -2841,6 +3067,46 @@ function App() {
       provider.id === resolved.provider!.id && model.id === resolved.model!.id
     )) ?? null;
   }, [document, enabledModelChoices, modelChoiceForConversation]);
+  /** Puts back what a conversation's lock holds once its model is picked again
+   * (`restoreLockedSettings`). A ref, because the conversation writer it needs
+   * is declared further down than the model menu that calls it. */
+  const restoreLocksForModelRef = useRef<(providerId: string, modelId: string) => void>(() => {});
+  /* Which models this conversation still holds a warm prompt cache on, and until
+     when (`modelCacheWarmUntil`). A fork carries its source's lock, so it marks
+     the same models until the same moment. */
+  const [modelCacheClock, setModelCacheClock] = useState(0);
+  const activeConversationSettings = activeConversation?.settings;
+  /* Plan mode cannot go on where the model cannot take the plan pair
+     mid-conversation and its last request did not carry it (`planModeLocked`). */
+  const activePlanModeLocked = useMemo(() => {
+    if (!activeConversationSettings || !activeModelChoice) return false;
+    const lockModel = toolLockModelOf(activeModelChoice.provider, activeModelChoice.model);
+    return planModeLocked(toolLockState(activeConversationSettings, lockModel, Date.now()));
+  }, [activeConversationSettings, activeModelChoice]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `modelCacheClock` is the moment to read the clock again, though nothing here reads it.
+  const modelCacheMarks = useMemo(() => {
+    const marks = new Map<string, number>();
+    if (!activeConversationSettings) return marks;
+    const now = Date.now();
+    for (const choice of enabledModelChoices) {
+      const until = modelCacheWarmUntil(activeConversationSettings, {
+        providerId: choice.provider.id,
+        modelId: choice.model.id,
+        cacheTtlMinutes: choice.model.cacheTtlMinutes
+      }, now);
+      if (until !== null) marks.set(choice.value, until);
+    }
+    return marks;
+  }, [activeConversationSettings, enabledModelChoices, modelCacheClock]);
+  useEffect(() => {
+    if (!modelCacheMarks.size) return;
+    const soonest = Math.min(...modelCacheMarks.values());
+    const timer = window.setTimeout(
+      () => setModelCacheClock((tick) => tick + 1),
+      Math.max(0, soonest - Date.now()) + 250
+    );
+    return () => window.clearTimeout(timer);
+  }, [modelCacheMarks]);
   /** One section per provider, so the provider reads as a heading rather than a repeated subtitle. */
   const enabledModelSections = useMemo(() => {
     const selectModel = (providerId: string, modelId: string) => {
@@ -2861,13 +3127,16 @@ function App() {
           }
         };
       });
+      restoreLocksForModelRef.current(providerId, modelId);
     };
     const sections: PopoverMenuSection[] = [];
     for (const choice of enabledModelChoices) {
-      const item = {
+      const cachedUntil = modelCacheMarks.get(choice.value);
+      const item: PopoverMenuItem = {
         id: choice.value,
         label: choice.model.id,
         checked: choice.value === activeModelChoice?.value,
+        badge: cachedUntil === undefined ? undefined : <ModelCacheMark until={cachedUntil} />,
         onSelect: () => selectModel(choice.provider.id, choice.model.id)
       };
       const existing = sections.find((section) => section.id === choice.provider.id);
@@ -2875,7 +3144,7 @@ function App() {
       else sections.push({ id: choice.provider.id, label: choice.provider.name, items: [item] });
     }
     return sections;
-  }, [activeModelChoice, documentStore, enabledModelChoices]);
+  }, [activeModelChoice, documentStore, enabledModelChoices, modelCacheMarks]);
   /** Whether the composer's model can see images, which decides how pictures in a paste or drop are taken. */
   const activeComposerImageInput = Boolean(activeModelChoice && supportsVision(activeModelChoice.model));
   const composerDrop = useAttachmentDropZone({
@@ -2906,13 +3175,6 @@ function App() {
     return { tokens, estimated: true, ...activeProjectionTarget };
   }, [activeProjectionTarget]);
   const securityLevelLabelFor = (level: SecurityLevel): string => securityLevelLabel(level, t);
-  const reasoningEffortLabel = (effort: ReasoningEffort): string => (
-    effort === "disabled" ? t("关闭思考", "Disabled")
-      : effort === "low" ? t("低", "Low")
-        : effort === "medium" ? t("中", "Medium")
-          : effort === "high" ? t("高", "High")
-            : t("极高", "Extra high")
-  );
   const activeModelLabel = activeModelChoice
     ? `${activeModelChoice.provider.name} · ${activeModelChoice.model.id}`
     : enabledModelChoices.length
@@ -2962,8 +3224,9 @@ function App() {
   const activeSecurityLevelLabel = securityLevelLabelFor(
     activeConversation?.settings.securityLevel ?? SECURITY_LEVEL_OPTIONS[0]
   );
-  const activeReasoningEffort = activeConversation?.settings.reasoningEffort ?? reasoningEffortOptions[0];
-  const activeReasoningEffortLabel = reasoningEffortLabel(activeReasoningEffort);
+  const activeReasoningEffort = activeConversation?.settings.reasoningEffort ?? DEFAULT_REASONING_EFFORT;
+  // The levels are named the same in every language: they are the providers' own words.
+  const activeReasoningEffortLabel = activeReasoningEffort;
   /** The conversation's isolated worktree of its first workspace; null runs at the registered root. */
   const activePrimaryWorktree = activeGitMembers.find((entry) => entry.member === 1)?.worktree ?? null;
   /** The worktree standing in for the workspace the chip has selected; null runs at its registered root. */
@@ -2986,15 +3249,12 @@ function App() {
       : undefined)
     ?? activeWorkspace?.path
     ?? null;
-  /** The checkout the file pane browses, which is what the pane can show a file from. */
-  // A remote workspace has no host directory for the file pane or a timeline path click to open.
-  const filesPaneRoot = activeWorkspaceIsRemote ? null : activePrimaryWorktree?.path ?? activeWorkspace?.path ?? null;
   /**
-   * Whether the file pane has a checkout to browse. A draft browses its project's root, as its Git
-   * surface does; one aimed at no project has no directory until it is sent, and gets its own
-   * scratch one then.
+   * Whether the file pane can open. It browses any machine the user can reach, so every
+   * conversation has it; one with no workspace yet — a draft aimed at no project — starts at this
+   * computer's home.
    */
-  const filesPaneAvailable = !activeWorkspaceIsRemote && (!draftActive || activePrimaryGitTarget !== null);
+  const filesPaneAvailable = Boolean(activeConversation);
   const [filesPaneRequest, setFilesPaneRequest] = useState<
     (FilesPaneOpenRequest & { conversationId: string }) | null
   >(null);
@@ -3039,40 +3299,73 @@ function App() {
     [activeWorkspace, activeAttachedWorkspaces, activeWorktrees]
   );
   /**
+   * The conversation's workspaces as the file pane offers them, numbered the way the model
+   * addresses them. A draft knows its project's workspaces and nothing it attached, as its
+   * terminals do; one aimed at no project has none yet.
+   */
+  const filesPaneWorkspaces = useMemo((): FilesPaneWorkspace[] => {
+    if (draftActive && activePrimaryGitCheckout === null) return [];
+    const list = draftActive
+      ? activeConversationWorkspaces.slice(0, activeProjectWorkspaceCount)
+      : activeConversationWorkspaces;
+    // A temporary project's scratch directory is the host's to name; the renderer has no path for it.
+    return list.flatMap((workspace, index) => (workspace.path.trim()
+      ? [{
+          number: index + 1,
+          machine: workspace.machine ?? null,
+          path: workspace.path,
+          label: workspaceDirectoryLabel(workspace.path)
+        }]
+      : []));
+  }, [activeConversationWorkspaces, activePrimaryGitCheckout, activeProjectWorkspaceCount, draftActive]);
+  /**
+   * Recent probes, by the targets they asked about. A path is probed when the pointer reaches it
+   * and again when it is clicked; the click finds the hover's answer here, already on its way.
+   */
+  const pathProbes = useRef(new Map<string, { at: number; answer: Promise<BrowseProbeResult[]> }>());
+  // The menu belongs to the conversation whose transcript it was opened from.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: another conversation is the moment to close it, though nothing here reads which.
+  useEffect(() => closePathChoice(), [activeConversation?.id]);
+  /**
    * A file path clicked anywhere in a transcript opens in the file pane, and a
    * file a turn changed opens on its diff in the review pane when Git tracks the
    * change.
    *
    * The interceptor that catches the click lives outside React, so this is where
-   * the two meet: the handler is what knows which workspace is open and can turn
-   * an address written against the conversation's working directory into a path
-   * inside the checkout a pane shows. Anything that does not resolve to one — a
-   * file elsewhere on the disk, a click while no workspace is open — is left for
-   * the file manager by answering false.
+   * the two meet: the handler is what knows the conversation's workspaces and their
+   * machines, and so where a path written against them can be. A path that can only
+   * be one place opens there at once. One that could be in several — a relative path
+   * in a conversation with several workspaces, an absolute one in a conversation on
+   * several machines — is looked up on all of them in one request, started when the
+   * pointer reaches the link so the answer is usually in by the click; found in one,
+   * it opens there, found in several, a menu at the link asks which.
    */
   useEffect(() => {
     const conversationId = activeConversation?.id ?? null;
     if (conversationId === null) return;
-    // Without a checkout to browse — a draft aimed at no project — a path clicked goes to the file
-    // manager like any other path the pane cannot show.
-    const filesRoot = filesPaneAvailable ? filesPaneRoot : null;
+    const workspaces = filesPaneWorkspaces;
     // Each project workspace that is a repository has a review page, on whichever machine it is;
     // Git reads it at its root, which is the conversation's checkout of that workspace.
     const reviewPages = activeReviewPages;
-    if (filesRoot === null && activeGitMembers.length === 0) return;
+    const addressContext = {
+      sshMachines: document?.globalSettings.executionEnvironments.sshMachines ?? [],
+      hostWindows: hostIsWindows(platform)
+    };
     // A pane opened only to show this file opens on the file, its file column folded; one
     // already open keeps its column the way the reader left it.
     const paneWasOpen = (pane: SidePaneId) => (
       paneIsOpen(sidePaneLayoutFor(sidePanesStateRef.current, conversationId), pane)
     );
-    const showInFiles = (relative: string, line: number | null) => {
+    const showInFiles = (machine: BrowseMachine, path: string, line: number | null, newPage = false) => {
       filesPaneRequestNonce.current += 1;
       setFilesPaneRequest({
         conversationId,
-        path: relative,
+        machine,
+        path,
         line,
         nonce: filesPaneRequestNonce.current,
-        collapseTree: !paneWasOpen("files")
+        collapseTree: !paneWasOpen("files"),
+        ...(newPage ? { newPage } : {})
       });
       openPane("files");
     };
@@ -3090,58 +3383,177 @@ function App() {
       });
       openPane("review");
     };
-    return setPathOpenHandler(({ path, baseDir, line, workspace, review }) => {
+
+    interface Candidate {
+      /** The workspace the path was resolved in; null for an absolute path, which names a machine. */
+      workspace: FilesPaneWorkspace | null;
+      machine: BrowseMachine;
+      path: string;
+    }
+    const absolute = (path: string) => (
+      path.startsWith("/") || path.startsWith("~") || isWindowsPath(path)
+    );
+    /** Everywhere a path the transcript wrote could be. */
+    const candidatesFor = ({ path, baseDir, workspace }: PathOpenRequest): Candidate[] => {
+      const number = typeof workspace === "number" && workspace >= 1 ? workspace : null;
+      if (number !== null) {
+        // A tool call that named its workspace wrote its path against that workspace.
+        const named = workspaces.find((entry) => entry.number === number);
+        if (!named) return [];
+        const base = number === 1 ? baseDir ?? named.path : named.path;
+        return [{ workspace: named, machine: named.machine, path: resolveBrowsePath(browsePath(base), path) }];
+      }
+      if (absolute(path)) {
+        const machines: BrowseMachine[] = [];
+        for (const machine of [...workspaces.map((entry) => entry.machine), null]) {
+          if (!machines.some((known) => sameBrowseMachine(known, machine))) machines.push(machine);
+        }
+        return machines.map((machine) => ({ workspace: null, machine, path: browsePath(path) }));
+      }
+      if (!workspaces.length) {
+        return baseDir ? [{ workspace: null, machine: null, path: resolveBrowsePath(browsePath(baseDir), path) }] : [];
+      }
+      // Workspace 1 is the one the transcript's working directory belongs to.
+      return workspaces.map((entry) => ({
+        workspace: entry,
+        machine: entry.machine,
+        path: resolveBrowsePath(browsePath(entry.number === 1 ? baseDir ?? entry.path : entry.path), path)
+      }));
+    };
+    const probe = (candidates: Candidate[]): Promise<BrowseProbeResult[]> => {
+      const key = candidates.map((candidate) => locationKey(candidate.machine, candidate.path)).join("\n");
+      const now = Date.now();
+      for (const [cachedKey, cached] of pathProbes.current) {
+        if (now - cached.at > PATH_PROBE_REUSE_MS) pathProbes.current.delete(cachedKey);
+      }
+      const cached = pathProbes.current.get(key);
+      if (cached) return cached.answer;
+      const answer = browseProbePaths(candidates.map(({ machine, path }) => ({ machine, path })))
+        .catch(() => candidates.map((candidate) => ({ path: candidate.path, kind: null, reached: false })));
+      pathProbes.current.set(key, { at: now, answer });
+      return answer;
+    };
+    const choiceSections = (
+      hits: { candidate: Candidate; result: BrowseProbeResult }[],
+      line: number | null,
+      newPage: boolean
+    ): ContextMenuSection[] => [{
+      id: "targets",
+      label: hits.some(({ candidate }) => candidate.workspace) ? t("在哪个工作区打开", "Open in which workspace") : t("在哪台机器上打开", "Open on which machine"),
+      items: hits.map(({ candidate, result }) => {
+        const machineName = browseMachineLabel(candidate.machine, addressContext.sshMachines, t("本机", "This computer"));
+        return {
+          id: locationKey(candidate.machine, result.path),
+          label: candidate.workspace ? candidate.workspace.label : machineName,
+          hint: candidate.workspace ? `${candidate.workspace.number}` : undefined,
+          description: formatAddress(candidate.machine, result.path, addressContext),
+          descriptionIsPath: true,
+          icon: result.kind === "directory"
+            ? <Folder size={13} aria-hidden="true" />
+            : <FileText size={13} aria-hidden="true" />,
+          onSelect: () => showInFiles(candidate.machine, result.path, line, newPage)
+        };
+      })
+    }];
+
+    const removePrefetch = setPathPrefetchHandler((request) => {
+      if (request.machine !== undefined || request.review) return;
+      const candidates = candidatesFor(request);
+      if (candidates.length > 1) void probe(candidates);
+    });
+    const removeOpen = setPathOpenHandler((request) => {
+      const { path, baseDir, line, workspace, review, machine, anchor } = request;
+      const newPage = request.newPage === true;
+      // A path in a document the file pane shows: on that document's machine.
+      if (machine !== undefined) {
+        showInFiles(machine, baseDir ? resolveBrowsePath(browsePath(baseDir), path) : browsePath(path), line, newPage);
+        return true;
+      }
       const number = typeof workspace === "number" && workspace >= 1 ? workspace : 1;
-      const named = activeConversationWorkspaces[number - 1] ?? null;
-      if (number > 1 && !named) return false;
-      // A call that named another workspace wrote its path against that workspace's directory.
-      const base = number > 1 ? named?.path ?? null : baseDir ?? timelinePathBaseDir;
-      const remote = Boolean(named?.machine);
-      // The file pane and the file manager only reach this computer's disk.
-      const filesRelative = remote || filesRoot === null ? null : workspaceRelativePath(path, base, filesRoot);
       // A workspace has a review page once Git has answered for it, which a conversation just
       // opened (or one whose reads failed) is still waiting on; the click asks Git itself.
       const member = review ? activeGitMembers.find((entry) => entry.member === number) : undefined;
-      const reviewRelative = member && named ? workspaceRelativePath(path, base, named.path) : null;
-      const revealElsewhere = () => {
-        void revealPath(path, base).catch((error: unknown) => {
-          console.error("Failed to reveal the file", error);
-        });
-      };
-      if (!member || reviewRelative === null) {
-        if (filesRelative !== null) showInFiles(filesRelative, line);
-        // Nothing here can show a file on another machine outside its review page.
-        else if (remote) return true;
-        else if (number > 1) revealElsewhere();
-        else return false;
+      const named = workspaces.find((entry) => entry.number === number) ?? null;
+      if (review && member && named) {
+        const base = number > 1 ? named.path : baseDir ?? timelinePathBaseDir;
+        const reviewRelative = workspaceRelativePath(path, base, named.path);
+        if (reviewRelative !== null) {
+          const target = { machine: named.machine, path: resolveBrowsePath(browsePath(base ?? named.path), path) };
+          // Only Git knows whether it tracks the file, so the pane is picked once it has answered.
+          const page = reviewPages.find((entry) => entry.member === number);
+          void (page
+            ? Promise.resolve(page.snapshot)
+            : refreshGitSnapshot(member.key, member.surfaceKey, member.target))
+            .then((snapshot) => snapshot
+              ? gitReviewListsPath(member.target, snapshot, reviewRelative, member.worktree?.baseOid ?? null)
+              : false)
+            .catch(() => false)
+            .then((listed) => {
+              if (activeConversationIdRef.current !== conversationId) return;
+              if (listed) showInReview(member.member, reviewRelative);
+              else showInFiles(target.machine, target.path, line, newPage);
+            });
+          return true;
+        }
+      }
+      const candidates = candidatesFor(request);
+      if (!candidates.length) return false;
+      if (candidates.length === 1) {
+        showInFiles(candidates[0]!.machine, candidates[0]!.path, line, newPage);
         return true;
       }
-      // Only Git knows whether it tracks the file, so the pane is picked once it has answered.
-      const page = reviewPages.find((entry) => entry.member === number);
-      void (page
-        ? Promise.resolve(page.snapshot)
-        : refreshGitSnapshot(member.key, member.surfaceKey, member.target))
-        .then((snapshot) => snapshot
-          ? gitReviewListsPath(member.target, snapshot, reviewRelative, member.worktree?.baseOid ?? null)
-          : false)
-        .catch(() => false)
-        .then((listed) => {
-          if (activeConversationIdRef.current !== conversationId) return;
-          if (listed) showInReview(member.member, reviewRelative);
-          else if (filesRelative !== null) showInFiles(filesRelative, line);
-          else if (!remote) revealElsewhere();
+      let settled = false;
+      let shown = false;
+      const menuAnchor: ContextMenuAnchor = anchor
+        ? { rect: anchor, align: "start" }
+        : { x: window.innerWidth / 2, y: window.innerHeight / 3 };
+      // Most answers are in before anyone could see a menu; one that is not gets the menu at
+      // once, saying it is still looking, rather than a click that seems to do nothing.
+      const pending = window.setTimeout(() => {
+        if (settled) return;
+        shown = true;
+        showPathChoice(menuAnchor, []);
+      }, PATH_CHOICE_PATIENCE_MS);
+      void probe(candidates).then((results) => {
+        settled = true;
+        window.clearTimeout(pending);
+        if (activeConversationIdRef.current !== conversationId) return;
+        const hits = candidates.flatMap((candidate, index) => {
+          const result = results[index];
+          return result?.kind ? [{ candidate, result }] : [];
         });
+        // Two workspaces on one machine can be the same directory under two names.
+        const distinct = hits.filter((hit, index) => hits.findIndex((other) => (
+          locationKey(other.candidate.machine, other.result.path) === locationKey(hit.candidate.machine, hit.result.path)
+        )) === index);
+        if (distinct.length >= 2) {
+          showPathChoice(menuAnchor, choiceSections(distinct, line, newPage));
+          return;
+        }
+        if (shown) closePathChoice();
+        // Nowhere: the first place it could have been, where the pane says what it found — on a
+        // machine that answered, since one that is switched off would only keep the pane waiting.
+        const target = distinct[0]
+          ? { machine: distinct[0].candidate.machine, path: distinct[0].result.path }
+          : candidates.find((_, index) => results[index]?.reached) ?? candidates[0]!;
+        showInFiles(target.machine, target.path, line, newPage);
+      });
       return true;
     });
+    return () => {
+      removeOpen();
+      removePrefetch();
+    };
   }, [
     activeConversation?.id,
-    activeConversationWorkspaces,
     activeGitMembers,
     activeReviewPages,
-    filesPaneAvailable,
-    filesPaneRoot,
+    document?.globalSettings.executionEnvironments.sshMachines,
+    filesPaneWorkspaces,
     openPane,
+    platform,
     refreshGitSnapshot,
+    t,
     timelinePathBaseDir
   ]);
   /**
@@ -3235,12 +3647,6 @@ function App() {
   const activeBranchNavigations = useMemo(
     () => activeConversation ? contextBranchNavigations(activeConversation) : {},
     [activeConversation]
-  );
-  const agentStatus = useStoreSelector(
-    modelRunController.subscribe,
-    modelRunController.current,
-    (runs) => deriveAgentStatus(projectRenderedContexts(runs)),
-    agentStatusEqual
   );
   /** Subagent views for workspace cards, task containers, and guards compare chrome fields only; StreamedSubagentPanel derives live text itself. */
   const subagents = useStoreSelector(
@@ -3368,19 +3774,13 @@ function App() {
    * scroll waits for the frame that mounts it.
    */
   const focusWorkflowRunPanel = useCallback((runId: string) => {
-    openPane("tasks");
+    showTasksTab("tasks");
     window.requestAnimationFrame(() => {
       window.document
         .querySelector(`[data-workflow-run="${CSS.escape(runId)}"]`)
         ?.scrollIntoView({ block: "nearest" });
     });
-  }, [openPane]);
-  const pendingQuestion = useStoreSelector(
-    modelRunController.subscribe,
-    modelRunController.current,
-    (runs) => findPendingQuestion(projectRenderedContexts(runs)),
-    pendingQuestionsEqual
-  );
+  }, [showTasksTab]);
   /** Oldest outstanding card for this conversation shows by default. One at a
    * time: the card sits above the composer, and rendering several would bury
    * the composer — the stack is flipped through with the pager in the card's
@@ -3393,6 +3793,8 @@ function App() {
     activeToolPromptQueue.length - 1
   ));
   const activeToolPrompt = activeToolPromptQueue[activeToolPromptCursor] ?? null;
+  /** The run is blocked on an `ask_user` card: a composer message answers it first. */
+  const activeQuestionPending = activeToolPromptQueue.some((prompt) => prompt.kind === "question");
   /** Pager state for the card's top-right corner; absent for a single card. */
   const activeToolPromptStack = activeConversation && activeToolPromptQueue.length > 1
     ? {
@@ -3407,16 +3809,16 @@ function App() {
     : undefined;
   /**
    * Exactly one surface owns the pending card. Several panes can be open at once now, so the
-   * dock has to be addressed to a single one or the same prompt would be answerable from every
-   * open subagent pane and the composer at the same time.
+   * dock has to be addressed to a single one or the same prompt would be answerable from the
+   * plan, the subagent pane and the composer at the same time. The subagent pane takes it only
+   * while the requesting agent is its shown tab: a card behind another tab is one nobody sees.
    */
   const approvalDockOwner: SidePaneId | "composer" = (() => {
     if (!activeToolPrompt) return "composer";
     if (activeToolPrompt.kind === "plan_exit" && planPageOpen) return "plan";
     if (activeToolPrompt.sourceAgent || activeToolPrompt.sourceCallId) {
       const target = approvalPromptSubagentView(subagents, activeToolPrompt);
-      const pane = target ? subagentPaneId(target.id) : null;
-      if (pane && paneIsOpen(activeLayout, pane)) return pane;
+      if (target && shownSubagent(activeLayout) === target.id) return "subagent";
     }
     return "composer";
   })();
@@ -3722,18 +4124,23 @@ function App() {
    * An agent row's id is its agent id, which is why one field covers transcripts and other panes
    * alike. The review pane has no task row — it is reached from the Git status card.
    */
+  const activeReadOnlyShellTaskId = (() => {
+    const terminals = terminalTabsFor(terminalTabsState, activeHostConversationId);
+    return terminals.activeId === READ_ONLY_TERMINAL_TAB_ID ? terminals.readOnly : null;
+  })();
   const selectedTaskRowId = useMemo(() => {
     if (!activeFocusedPane) return null;
     const kind = paneKind(activeFocusedPane);
-    if (kind === "subagent") return paneTarget(activeFocusedPane);
+    if (kind === "subagent") return selectedSubagentId;
     if (kind === "preview") return activeFocusedPane;
-    if (kind === "shell") return paneTarget(activeFocusedPane);
+    // A command's row is marked while the terminal pane shows its output.
+    if (kind === "terminal") return activeReadOnlyShellTaskId;
     if (kind === "plan") return "plan";
-    // A targeted request ledger is that agent's surface too, so reading what it
-    // sent keeps its row marked rather than clearing the mark the transcript set.
+    // A targeted history pane is that agent's surface too, so reading what it
+    // did keeps its row marked rather than clearing the mark the transcript set.
     if (kind === "history") return paneTarget(activeFocusedPane);
     return null;
-  }, [activeFocusedPane]);
+  }, [activeFocusedPane, activeReadOnlyShellTaskId, selectedSubagentId]);
   /** True while a plan-exit card is waiting on this conversation's plan. */
   const planAwaitingApproval = activeToolPrompt?.kind === "plan_exit";
   /** Everything the conversation currently has running, as one set of inputs. */
@@ -3772,7 +4179,7 @@ function App() {
     () => countRunningTasks(deriveTaskItems(taskSources, taskMessages)),
     [taskMessages, taskSources]
   );
-  const openTasksPane = useCallback(() => openPane("tasks"), [openPane]);
+  const openTasksPane = useCallback(() => showTasksTab("tasks"), [showTasksTab]);
 
   /** The agent whose read-only transcript the focused subagent pane is showing, if any. */
   const selectedSubagentView = useMemo(() => (
@@ -3833,8 +4240,7 @@ function App() {
             "Git changes are unavailable while the project is being deleted."
           )
           : null;
-  const gitMutationDisabledReason = gitMutationDisabledReasonFor(activeWorkspaceMember);
-  // The mirror of `gitMutationDisabledReason`: a Git write is rewriting the very checkout the
+  // The mirror of `gitMutationDisabledReasonFor`: a Git write is rewriting the very checkout the
   // shell is sitting in, so the terminal stops taking input until it lands. The terminal→Git
   // direction is the branch above; both have to hold or the two can still interleave.
   const terminalInputDisabledReason = activeWorkspaceGitMutationRunning
@@ -3866,31 +4272,29 @@ function App() {
     ? t("项目正在删除，无法分叉会话", "Cannot fork the conversation while the project is being deleted")
     : null;
 
-  const syncBrowserPanelBounds = useCallback((bounds: { x: number; y: number; width: number; height: number }) => {
+  const syncBrowserPanelBounds = useCallback((bounds: SidePaneBounds) => {
     const sessionId = browserController.visibleSession();
     if (!isTauriRuntime() || !browserPanelOpen || previewPaneCovered || !sessionId) return;
     const intent = browserController.currentIntent(sessionId);
     if (intent?.desired !== "open") return;
-    lastPreviewBoundsRef.current = {
-      ...lastPreviewBoundsRef.current,
-      [sessionId]: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }
-    };
-    // Spelled out field by field: a measured `DOMRect` keeps its coordinates on the prototype, so
-    // spreading one into the wire payload would silently drop every one of them.
-    void setBrowserPanelBounds(sessionId, {
-      x: bounds.x,
-      y: bounds.y,
-      width: bounds.width,
-      height: previewPageHeight(sessionId, bounds.height),
-      visible: true
-    }, intent.epoch).then((status) => {
-      if (
-        !browserIntentIsCurrent(sessionId, intent.epoch, "open")
-        || browserController.visibleSession() !== sessionId
-      ) return;
-      browserController.updateStatuses((current) => ({ ...current, [sessionId]: status }));
-    }).catch(() => undefined);
-  }, [browserController, browserIntentIsCurrent, browserPanelOpen, previewPageHeight, previewPaneCovered]);
+    lastPreviewBoundsRef.current = { ...lastPreviewBoundsRef.current, [sessionId]: { ...bounds } };
+    const payload = previewPageBounds(sessionId, bounds);
+    sendLatestPreviewBounds(sessionId, () => setBrowserPanelBounds(sessionId, payload, intent.epoch)
+      .then((status) => {
+        if (
+          !browserIntentIsCurrent(sessionId, intent.epoch, "open")
+          || browserController.visibleSession() !== sessionId
+        ) return;
+        browserController.updateStatuses((current) => ({ ...current, [sessionId]: status }));
+      }));
+  }, [
+    browserController,
+    browserIntentIsCurrent,
+    browserPanelOpen,
+    previewPageBounds,
+    previewPaneCovered,
+    sendLatestPreviewBounds
+  ]);
 
   /**
    * Records the pane height the preview's log drawer took and republishes the page rectangle.
@@ -3909,29 +4313,36 @@ function App() {
     if (bounds && browserController.visibleSession() === sessionId) syncBrowserPanelBounds(bounds);
   }, [browserController, syncBrowserPanelBounds]);
 
-  // The main area only shows an agent that still exists. A selection made while
-  // the call was streaming follows the agent to its persisted record, whose view
-  // id switches from the call id to the stable name id. A selection that lands
-  // on a workflow run is dropped outright: a run is a script and has no
-  // transcript, so there is nothing for the main area to show. An agent's
-  // request ledger is addressed by the same id and follows it the same way.
+  // The subagent pane only keeps tabs for agents that still exist. A tab opened
+  // while the call was streaming follows the agent to its persisted record,
+  // whose view id switches from the call id to the stable name id. A tab that
+  // lands on a workflow run is dropped outright: a run is a script and has no
+  // transcript, so there is nothing for it to show. An agent's history pane is
+  // addressed by the same id and follows it the same way.
   useEffect(() => {
     const conversationId = activeConversationId;
     if (!conversationId) return;
-    for (const pane of sidePaneLayoutFor(sidePanesStateRef.current, conversationId).panes) {
-      const kind = paneKind(pane);
-      if (kind !== "subagent" && kind !== "history") continue;
-      const subagentId = paneTarget(pane);
-      // The bare `history` pane is the conversation's own ledger and belongs to
-      // no agent.
+    const layout = sidePaneLayoutFor(sidePanesStateRef.current, conversationId);
+    for (const subagentId of layout.subagentTabs) {
+      const matched = findOpenableSubagentView(subagents, subagentId);
+      if (!matched) {
+        dispatchSidePanes({ type: "close_subagent", conversationId, subagentId });
+      } else if (matched.id !== subagentId) {
+        dispatchSidePanes({ type: "retarget_subagent", conversationId, from: subagentId, to: matched.id });
+      }
+    }
+    for (const pane of layout.panes) {
+      // The conversation's own history is a tab of the tasks pane; a history
+      // pane is always an agent's.
+      const subagentId = paneKind(pane) === "history" ? paneTarget(pane) : null;
       if (!subagentId) continue;
-      const paneFor = kind === "subagent" ? subagentPaneId : subagentHistoryPaneId;
       const matched = findOpenableSubagentView(subagents, subagentId);
       if (!matched) {
         dispatchSidePanes({ type: "close", conversationId, pane });
       } else if (matched.id !== subagentId) {
-        dispatchSidePanes({ type: "close", conversationId, pane });
-        dispatchSidePanes({ type: "open", conversationId, pane: paneFor(matched.id) });
+        dispatchSidePanes({
+          type: "replace", conversationId, pane, replacement: subagentHistoryPaneId(matched.id)
+        });
       }
     }
   }, [activeConversationId, dispatchSidePanes, sidePanesState, subagents]);
@@ -3967,7 +4378,9 @@ function App() {
           let lastConversationSettings = workspace.lastConversationSettings;
           const conversations = workspace.conversations.map((conversation) => {
             if (conversation.id !== conversationId) return conversation;
-            const updated = updater(conversation);
+            // An unloaded body is an empty stand-in: an updater that read it keeps its metadata
+            // changes only, never a body derived from nothing.
+            const updated = keepUnloadedBody(conversation, updater(conversation));
             if (updated.settings !== conversation.settings) lastConversationSettings = updated.settings;
             base = conversation;
             next = updated;
@@ -4003,21 +4416,19 @@ function App() {
       const anchorIndex = contexts.findIndex((context) => context.id === anchorContextId);
       const previousContexts = anchorIndex < 0 ? contexts : contexts.slice(0, anchorIndex);
       const openRequestIds = new Set(existing
-        .filter((turn) => turn.status === "running" || turn.status === "awaiting_user")
+        .filter((turn) => turn.status === "running")
         .map((turn) => turn.requestId));
       let reconciled = existing;
       openRequestIds.forEach((openRequestId) => {
         reconciled = materializeRunTurnContexts(reconciled, previousContexts, openRequestId);
       });
       reconciled = reconciled.map((turn) => (
-        turn.status === "running" || turn.status === "awaiting_user"
+        turn.status === "running"
           ? {
             ...turn,
             status: "interrupted" as const,
             endedAt: startedAt,
-            durationMs: (turn.durationMs ?? 0) + (
-              turn.status === "running" ? activeTurnSegmentDuration(turn, startedAt) : 0
-            )
+            durationMs: (turn.durationMs ?? 0) + activeTurnSegmentDuration(turn, startedAt)
           }
           : turn
       ));
@@ -4116,14 +4527,13 @@ function App() {
     conversationId: string,
     requestId: string,
     modelId: string,
-    contexts: ContextItem[],
-    mode: "continue" | "awaiting"
+    contexts: ContextItem[]
   ) => {
     const resumedAt = new Date().toISOString();
     let resumed = false;
     updateConversationTurns((current) => {
       const existing = current[conversationId] ?? [];
-      const target = findResumableTurn(existing, contexts, mode);
+      const target = findResumableTurn(existing, contexts);
       if (!target) return current;
       resumed = true;
       return {
@@ -4145,39 +4555,6 @@ function App() {
       contexts
     );
   }, [startConversationTurn, updateConversationTurns]);
-
-  const pauseConversationTurnForUser = useCallback((
-    conversationId: string,
-    requestId: string,
-    contexts: ContextItem[],
-    options: { modelId?: string; usage?: ModelUsage; durationMs?: number } = {}
-  ) => {
-    const pausedAt = new Date().toISOString();
-    updateConversationTurns((current) => {
-      const existing = current[conversationId] ?? [];
-      const materialized = materializeRunTurnContexts(existing, contexts, requestId);
-      const requestTurns = materialized.filter((turn) => turn.requestId === requestId);
-      const runningTurn = [...requestTurns].reverse().find((turn) => turn.status === "running");
-      if (!runningTurn) return current;
-      const previousRunUsage = sumModelUsage(requestTurns
-        .filter((turn) => turn.id !== runningTurn.id)
-        .map((turn) => subtractModelUsage(turn.usage, turn.usageOffset)));
-      const currentSegmentUsage = options.usage
-        ? subtractModelUsage(options.usage, previousRunUsage)
-        : subtractModelUsage(runningTurn.usage, runningTurn.usageOffset);
-      const segmentDuration = options.durationMs !== undefined && requestTurns.length === 1
-        ? options.durationMs
-        : activeTurnSegmentDuration(runningTurn, pausedAt);
-      const next = materialized.map((turn) => turn.id === runningTurn.id ? {
-        ...turn,
-        ...(options.modelId ? { modelId: options.modelId } : {}),
-        status: "awaiting_user" as const,
-        durationMs: (turn.durationMs ?? 0) + segmentDuration,
-        usage: sumModelUsage([turn.usageOffset, currentSegmentUsage])
-      } : turn);
-      return { ...current, [conversationId]: next };
-    });
-  }, [updateConversationTurns]);
 
   const splitConversationTurn = useCallback((
     workspaceId: string,
@@ -4519,10 +4896,11 @@ function App() {
   /** The machine whose settings a gear opened; `{ machine: null }` is this one. */
   const [machineSettings, setMachineSettings] = useState<{ machine: RunTargetType | null } | null>(null);
   /**
-   * The workspace whose environment variables a gear opened: its machine and the directory
-   * it is registered at — never a worktree standing in for it — with its display name.
+   * The workspace whose settings a gear opened — its sandbox and variables: its machine and
+   * the directory it is registered at — never a worktree standing in for it — with its
+   * display name.
    */
-  const [workspaceEnvEditor, setWorkspaceEnvEditor] = useState<
+  const [workspaceSettings, setWorkspaceSettings] = useState<
     { machine: RunTargetType | null; path: string; name: string } | null
   >(null);
 
@@ -4588,6 +4966,32 @@ function App() {
     )));
   }, [setConversationAttachedWorkspaces]);
 
+  /**
+   * Sets one workspace's sandbox. The entry stays when it is switched off: it records that
+   * answer, which the host's hand-over of sandboxes conversations used to carry respects.
+   */
+  const saveWorkspaceSandbox = useCallback((
+    machine: RunTargetType | null,
+    path: string,
+    sandbox: SandboxSettings
+  ) => {
+    const key = workspaceEnvKey(machine, path);
+    documentStore.update((current) => {
+      if (!current) return current;
+      const environments = current.globalSettings.executionEnvironments;
+      return {
+        ...current,
+        globalSettings: {
+          ...current.globalSettings,
+          executionEnvironments: {
+            ...environments,
+            sandboxes: { ...environments.sandboxes, [key]: sandbox }
+          }
+        }
+      };
+    });
+  }, [documentStore]);
+
   /** Sets one workspace's environment variables; an empty table removes its entry. */
   const saveWorkspaceEnvVars = useCallback((
     machine: RunTargetType | null,
@@ -4616,8 +5020,14 @@ function App() {
   /** Probes a machine now and keeps the answer; the saved catalog is what the host reads, so pending saves land first. */
   const probeMachine = useCallback(async (machine: RunTargetType | null): Promise<MachineShells> => {
     await documentStore.flush();
+    const endpoint = () => sshEndpoint(documentStore.current()?.globalSettings.executionEnvironments, machine);
+    const probed = endpoint();
     const shells = await probeMachineShells(machine);
-    setMachineShells((current) => ({ ...current, [runEnvKey(machine)]: shells }));
+    // A machine moved to another address while it was being probed is not
+    // described by the old address's answer; the host does not keep using it either.
+    if (endpoint() === probed) {
+      setMachineShells((current) => ({ ...current, [runEnvKey(machine)]: shells }));
+    }
     return shells;
   }, [documentStore]);
 
@@ -4650,6 +5060,9 @@ function App() {
       || previous.port !== machine.port
       || previous.identityFile !== machine.identityFile;
     if (endpointChanged) {
+      // Until the new endpoint answers, the machine reads as never probed:
+      // should that probe fail, the old answer would otherwise stay in force.
+      setMachineShells((current) => withoutProbe(current, runEnvKey({ kind: "ssh", machineId: machine.id })));
       queueMicrotask(() => {
         void probeMachine({ kind: "ssh", machineId: machine.id }).catch(() => undefined);
       });
@@ -4674,12 +5087,14 @@ function App() {
   }, [documentStore, probeMachine]);
 
   /**
-   * Removes an SSH machine from the catalog, and the variables of every workspace on it with
-   * it: a machine registered again gets a new id, so those tables could never be reached.
-   * Workspaces on it stay where they are and read as a deleted machine until chosen again.
+   * Removes an SSH machine from the catalog, and the variables and sandbox of every workspace
+   * on it with it: a machine registered again gets a new id, so those entries could never be
+   * reached. Workspaces on it stay where they are and read as a deleted machine until chosen
+   * again.
    */
   const deleteSshMachine = useCallback((machineId: string) => {
     const prefix = `${runEnvKey({ kind: "ssh", machineId })}|`;
+    setMachineShells((current) => withoutProbe(current, runEnvKey({ kind: "ssh", machineId })));
     documentStore.update((current) => {
       if (!current) return current;
       const environments = current.globalSettings.executionEnvironments;
@@ -4692,7 +5107,14 @@ function App() {
             sshMachines: environments.sshMachines.filter((machine) => machine.id !== machineId),
             envVars: Object.fromEntries(
               Object.entries(environments.envVars).filter(([key]) => !key.startsWith(prefix))
-            )
+            ),
+            ...(environments.sandboxes
+              ? {
+                sandboxes: Object.fromEntries(
+                  Object.entries(environments.sandboxes).filter(([key]) => !key.startsWith(prefix))
+                )
+              }
+              : {})
           }
         }
       };
@@ -4781,24 +5203,6 @@ function App() {
   }, [documentStore]);
 
   /** Saving a preset creates an independent template; neither it nor the source conversation follows later edits. */
-  const saveActiveConversationAsPreset = useCallback((name: string, description: string) => {
-    if (!document || !activeConversation) return;
-    const preset = {
-      id: createId("preset"),
-      name,
-      description,
-      // A new preset opens with nothing. Its template is written on its own page,
-      // which is also what mints the id — capturing the conversation's timeline
-      // here would make "save as preset" a second, silent way to store a body.
-      templateId: "",
-      settings: captureConversationPresetSettings(activeConversation.settings)
-    };
-    handleGlobalSettingsChange((current) => ({
-      ...current,
-      conversationPresets: [...current.conversationPresets, preset]
-    }));
-  }, [activeConversation, document, handleGlobalSettingsChange]);
-
   const conversationMoveIsBlocked = useCallback((
     conversationId: string,
     sourceWorkspaceId: string,
@@ -4823,7 +5227,7 @@ function App() {
       !sourceWorkspaceId
       || !movingConversationId
       || !moving
-      || moving.contexts.length
+      || !conversationHasNoContexts(moving)
     ) return false;
     const destinationId = targetWorkspaceId;
     if (
@@ -4849,7 +5253,7 @@ function App() {
       || !source
       || !destination
       || !latestMoving
-      || latestMoving.contexts.length
+      || !conversationHasNoContexts(latestMoving)
       || conversationMoveIsBlocked(moving.id, sourceWorkspaceId, destinationId)
     ) return false;
     const stripped = latest.workspaces.map((workspace) => workspace.id === sourceWorkspaceId
@@ -4933,6 +5337,11 @@ function App() {
       if (scroller) scroller.scrollTop = contextScrollRef.current[conversationId] ?? scroller.scrollHeight;
     });
   };
+
+  // Effects that switch the page (a handoff continuation) call the
+  // current closure, which saves the scroll position of the page being left.
+  const selectConversationRef = useRef(selectConversation);
+  selectConversationRef.current = selectConversation;
 
   const renameConversation = useCallback((workspaceId: string, conversationId: string, title: string) => {
     updateConversation(workspaceId, conversationId, (conversation) => ({
@@ -5036,24 +5445,15 @@ function App() {
       return next;
     });
   }, [activeConversationId]);
-  /** Conversations waiting on the user: an approval card, an unanswered question, a fork request. */
+  /** Conversations waiting on the user: an approval card, a question card, a fork request. */
   const blockedConversationIds = useMemo(() => {
     const blocked = new Set<string>();
     for (const [conversationId, prompts] of Object.entries(toolPrompts)) {
       if (prompts.length) blocked.add(conversationId);
     }
     for (const request of forkRequests) blocked.add(request.sourceConversationId);
-    // The open conversation's question comes from its live run; the others' from what they saved.
-    if (activeConversationId && pendingQuestion) blocked.add(activeConversationId);
-    for (const workspace of document?.workspaces ?? []) {
-      for (const conversation of workspace.conversations) {
-        if (conversation.id !== activeConversationId && findPendingQuestion(conversation.contexts)) {
-          blocked.add(conversation.id);
-        }
-      }
-    }
     return blocked;
-  }, [activeConversationId, document?.workspaces, forkRequests, pendingQuestion, toolPrompts]);
+  }, [forkRequests, toolPrompts]);
   const conversationStatus = useCallback((conversationId: string): ConversationStatus => (
     blockedConversationIds.has(conversationId) ? "blocked"
       : conversationHasLiveActivity(conversationId) ? "running"
@@ -5113,8 +5513,12 @@ function App() {
       };
     }
     // A remembered snapshot is the workspace's own unnamed draft: it has no preset identity.
+    // Plan mode is not remembered: it belongs to the task it was switched on for.
     if (remembered) {
-      return { settings: cloneConversationSettings(remembered, knownToolNames), presetId: "" };
+      return {
+        settings: { ...cloneConversationSettings(remembered, knownToolNames), planModeEnabled: false },
+        presetId: ""
+      };
     }
     const fallbackPreset = defaultConversationPreset(document.globalSettings);
     if (!fallbackPreset) return { settings: blankSettings, presetId: "" };
@@ -5142,7 +5546,13 @@ function App() {
     /** The id a materialized draft was minted with, which its terminals are already open under. */
     conversationIdOverride?: string,
     /** A timeline fork's name and origin; see `lib/conversationForks.ts`. */
-    fork?: { title: string; forkOf: ConversationForkOrigin }
+    fork?: { title: string; forkOf: ConversationForkOrigin },
+    /**
+     * The source's lock, for a branch or fork that carries history over: the
+     * cache that history rides on is the source's, and it runs out at the same
+     * moment in both (`toolLock.ts`).
+     */
+    inheritedToolLock?: ConversationToolLock
   ): string | null => {
     // The store, not the rendered snapshot: a workspace registered in this same
     // event — the directory the user just picked — is in the store already and
@@ -5164,7 +5574,9 @@ function App() {
       ? { settings: cloneConversationSettings(settingsOverride, knownToolNames), presetId: presetIdOverride }
       : resolveNewConversationSettings(target, source);
     if (!resolved) return null;
-    const resolvedSettings = resolved.settings;
+    const resolvedSettings = inheritedToolLock
+      ? { ...resolved.settings, toolLock: inheritedToolLock }
+      : resolved.settings;
     documentStore.update((current) => {
       if (!current) return current;
       const conversation: Conversation = {
@@ -5453,6 +5865,13 @@ function App() {
       delete next[DRAFT_CONVERSATION_ID];
       return next;
     });
+    composerController.updatePastedTexts((current) => {
+      const pending = current[DRAFT_CONVERSATION_ID];
+      if (!pending?.length) return current;
+      const next = { ...current, [conversationId]: pending };
+      delete next[DRAFT_CONVERSATION_ID];
+      return next;
+    });
     composerController.updateImageDrafts((current) => {
       const pending = current[DRAFT_CONVERSATION_ID];
       if (!pending?.length) return current;
@@ -5626,16 +6045,23 @@ function App() {
    */
   const applyPresetBody = useCallback(async (preset: ConversationPreset) => {
     setTemplateError(null);
-    const knownToolNames = new Set(documentStore.current()?.tools.map((tool) => tool.name) ?? []);
-    const withPreset = (conversation: Conversation): Conversation => ({
-      ...conversation,
-      settings: applyConversationPresetSettings(
-        conversation.settings,
-        preset.settings,
-        knownToolNames
-      ),
-      presetId: preset.id
-    });
+    const latestDocument = documentStore.current();
+    const knownToolNames = new Set(latestDocument?.tools.map((tool) => tool.name) ?? []);
+    const { provider: lockProvider, model: lockModelProfile } = latestDocument
+      ? modelChoiceForConversation(latestDocument)
+      : { provider: undefined, model: undefined };
+    const lockModel = toolLockModelOf(lockProvider, lockModelProfile);
+    /* A model that cannot take a tool mid-conversation keeps the surface its
+       last request had, preset or no preset. */
+    const withPreset = (conversation: Conversation): Conversation => {
+      const applied = applyConversationPresetSettings(conversation.settings, preset.settings, knownToolNames);
+      const state = toolLockState(applied, lockModel, Date.now());
+      return {
+        ...conversation,
+        settings: state.hard ? restoreLockedSettings(applied, state) : applied,
+        presetId: preset.id
+      };
+    };
     let workspaceId = activeWorkspaceId;
     let conversationId = activeConversationId;
     if (isDraftConversationId(conversationId)) {
@@ -5666,6 +6092,8 @@ function App() {
         contexts,
         templateId: preset.templateId
       }));
+      // The timeline is a different one now; nothing on record was done to it.
+      timelineHistoryRef.current!.forget(conversationId);
     } catch (reason) {
       setTemplateError(failureMessage(reason, t("无法套用对话模板", "Could not apply the conversation template")));
     }
@@ -5673,6 +6101,7 @@ function App() {
     activeConversationId,
     activeWorkspaceId,
     documentStore,
+    modelChoiceForConversation,
     redeemDraft,
     t,
     updateActiveConversation,
@@ -5694,7 +6123,7 @@ function App() {
    * does change the count and does prompt.
    */
   const templateSwitchNeedsConfirmation = useCallback((): boolean => {
-    if (!activeConversation || activeConversation.contexts.length === 0) return false;
+    if (!activeConversation || conversationHasNoContexts(activeConversation)) return false;
     const applied = conversationTemplates.find(
       (template) => template.id === activeConversation.templateId
     );
@@ -5882,27 +6311,89 @@ function App() {
   }, [handleGlobalSettingsChange]);
 
   /* Saves what the user made of a preset they cannot change — the built-in one —
-   * as a new preset of their own, named after it. The copy opens with no
-   * template: its body is written on its own page, which is also what mints the
-   * id, the same as for any new preset. */
-  const saveConversationPresetCopy = useCallback((
+   * as a new preset of their own, named after it. The copy opens with the
+   * template as it was edited in the window, or with the built-in's own when it
+   * was not: a copy of a preset is a copy of what it opens with too. The body is
+   * written under a fresh id, since the built-in's own cannot be shared — the
+   * host rewrites it on every start. */
+  const saveConversationPresetCopy = useCallback(async (
     presetId: string,
-    settings: ConversationPresetSettings
+    settings: ConversationPresetSettings,
+    templateBody: ContextItem[] | null
   ) => {
-    handleGlobalSettingsChange((current) => {
-      const source = current.conversationPresets.find((preset) => preset.id === presetId);
-      return {
-        ...current,
-        conversationPresets: [...current.conversationPresets, {
-          id: createId("preset"),
-          name: t("{name} 副本", "{name} copy", { name: source?.name ?? "" }).trim(),
-          description: "",
-          templateId: "",
-          settings
-        }]
-      };
-    });
-  }, [handleGlobalSettingsChange, t]);
+    setTemplateError(null);
+    const source = documentStore.current()?.globalSettings.conversationPresets
+      .find((preset) => preset.id === presetId);
+    let templateId = "";
+    try {
+      const body = templateBody ?? (source?.templateId ? await previewConversationTemplate(source.templateId) : []);
+      if (body.length) {
+        const id = createId("template");
+        await updateConversationTemplate(id, body);
+        templateId = id;
+        await refreshConversationTemplates();
+      }
+    } catch (reason) {
+      // The settings are still worth keeping; the copy opens with nothing, and says why.
+      setTemplateError(failureMessage(reason, t("无法复制对话模板", "Could not copy the conversation template")));
+    }
+    handleGlobalSettingsChange((current) => ({
+      ...current,
+      conversationPresets: [...current.conversationPresets, {
+        id: createId("preset"),
+        name: t("{name} 副本", "{name} copy", { name: source?.name ?? "" }).trim(),
+        description: "",
+        templateId,
+        settings
+      }]
+    }));
+  }, [documentStore, handleGlobalSettingsChange, refreshConversationTemplates, t]);
+
+  /**
+   * Saves the active conversation's settings as a new preset, and with them, when
+   * asked, its timeline as the preset's template.
+   *
+   * The timeline is taken by the host from its own store
+   * (`captureConversationTemplate`), so the tool cards in it keep the results
+   * this application really produced; the document is flushed first, so the
+   * host's copy is the one on screen. A draft has no row there yet, and nothing
+   * but prose in it either — a tool card is what makes a draft real — so its
+   * timeline is written as a body like any edited template. The template is
+   * stored before the preset is: a preset citing a template that failed to land
+   * would open with nothing and not say why.
+   */
+  const createConversationPreset = useCallback(async ({ name, captureTemplate }: {
+    name: string;
+    captureTemplate: boolean;
+  }): Promise<ConversationPreset> => {
+    const conversation = activeConversation;
+    if (!conversation) throw new Error(t("没有活动对话", "No active conversation"));
+    let templateId = "";
+    if (captureTemplate && conversation.contexts.length) {
+      templateId = createId("template");
+      if (isDraftConversationId(conversation.id)) {
+        await updateConversationTemplate(templateId, conversation.contexts);
+      } else {
+        const workspaceId = activeWorkspaceIdRef.current;
+        if (!workspaceId) throw new Error(t("没有活动对话", "No active conversation"));
+        await flushLatestDocument();
+        await captureConversationTemplate({ workspaceId, conversationId: conversation.id, templateId });
+      }
+      await refreshConversationTemplates();
+    }
+    const preset: ConversationPreset = {
+      id: createId("preset"),
+      name,
+      description: "",
+      templateId,
+      settings: captureConversationPresetSettings(conversation.settings)
+    };
+    handleGlobalSettingsChange((current) => ({
+      ...current,
+      conversationPresets: [...current.conversationPresets, preset]
+    }));
+    return preset;
+  }, [activeConversation, flushLatestDocument, handleGlobalSettingsChange, refreshConversationTemplates, t]);
 
   /* Records which template a preset opens with, the moment its body is written.
    * It is deliberately not part of `saveConversationPreset`: the body is already
@@ -6160,7 +6651,7 @@ function App() {
       && sourceWorkspaceId
       && movingConversationId
       && movingConversation
-      && movingConversation.contexts.length === 0
+      && conversationHasNoContexts(movingConversation)
     );
     if (shouldAssign) {
       await moveActiveConversation(workspace.id);
@@ -6248,7 +6739,13 @@ function App() {
       conversationSync.deleted(latestWorkspace.id, conversation.id);
       dispatchSidePanes({ type: "remove_conversation", conversationId: conversation.id });
       dispatchTerminalTabs({ type: "remove_conversation", conversationId: conversation.id });
+      timelineHistoryRef.current!.forget(conversation.id);
       composerController.updateDrafts((current) => {
+        const next = { ...current };
+        delete next[conversation.id];
+        return next;
+      });
+      composerController.updatePastedTexts((current) => {
         const next = { ...current };
         delete next[conversation.id];
         return next;
@@ -6352,6 +6849,9 @@ function App() {
       composerController.updateDrafts((current) => Object.fromEntries(
         Object.entries(current).filter(([conversationId]) => !removedConversationIds.has(conversationId))
       ));
+      composerController.updatePastedTexts((current) => Object.fromEntries(
+        Object.entries(current).filter(([conversationId]) => !removedConversationIds.has(conversationId))
+      ));
       setModelRunErrors((current) => Object.fromEntries(
         Object.entries(current).filter(([conversationId]) => !removedConversationIds.has(conversationId))
       ));
@@ -6374,6 +6874,7 @@ function App() {
       for (const conversation of removedWorkspace.conversations) {
         dispatchSidePanes({ type: "remove_conversation", conversationId: conversation.id });
         dispatchTerminalTabs({ type: "remove_conversation", conversationId: conversation.id });
+        timelineHistoryRef.current!.forget(conversation.id);
       }
       if (activeWorkspaceIdRef.current === workspace.id) {
         // After deletion, open a draft in the first remaining workspace.
@@ -6424,57 +6925,193 @@ function App() {
     });
   };
 
+  /**
+   * The key a conversation's timeline history is filed under. A draft is filed
+   * under the id it will be sent as, so what was done to it before it was sent
+   * is still there to undo after; a new draft has a new id and starts clean, and
+   * so does a fork or a hand-over, which are conversations of their own.
+   */
+  const timelineHistoryKey = (conversationId: string): string => (
+    isDraftConversationId(conversationId)
+      ? draftConversationRef.current?.materializesAs ?? conversationId
+      : conversationId
+  );
+
+  const showTimelineNotice = (conversationId: string, message: string, hint?: TimelineNoticeState["hint"]) => {
+    const id = createId("notice");
+    setTimelineNotice({ id, conversationId, message, hint });
+    if (timelineNoticeTimerRef.current !== null) window.clearTimeout(timelineNoticeTimerRef.current);
+    timelineNoticeTimerRef.current = window.setTimeout(() => {
+      timelineNoticeTimerRef.current = null;
+      setTimelineNotice((current) => (current?.id === id ? null : current));
+    }, TIMELINE_NOTICE_MS);
+  };
+  useEffect(() => () => {
+    if (timelineNoticeTimerRef.current !== null) window.clearTimeout(timelineNoticeTimerRef.current);
+  }, []);
+
+  /**
+   * Puts focus back in the main timeline when an edit took the focused element
+   * with it — the delete button of the card it deleted, the editor it saved —
+   * so the undo keys answer straight away. Focus the user moved anywhere else
+   * stays where they put it.
+   */
+  const keepTimelineFocus = () => window.requestAnimationFrame(() => {
+    const focused = window.document.activeElement;
+    if (focused && focused !== window.document.body && focused.isConnected) return;
+    window.document
+      .querySelector<HTMLElement>(".conversation-pane__main .context-scroll")
+      ?.focus({ preventScroll: true });
+  });
+
+  /** A conversation's timeline as it stands now, read past the render that is on screen. */
+  const timelineContextsOf = (workspaceId: string, conversationId: string): ContextItem[] => (
+    isDraftConversationId(conversationId)
+      ? draftConversationRef.current?.contexts ?? []
+      : findConversation(documentStore.current(), workspaceId, conversationId).conversation?.contexts ?? []
+  );
+
+  /**
+   * Writes a timeline patch onto a conversation, the draft included, and says
+   * what came of it: the contexts it left, or why it could not land. A patch
+   * lands by id onto whatever the list holds now (`applyTimelinePatch`), so a
+   * reply the model added since is kept.
+   */
+  const writeTimelinePatch = (
+    conversationId: string,
+    patch: TimelinePatch
+  ): { contexts: ContextItem[] } | { refused: "absent" | "branch" } => {
+    if (isDraftConversationId(conversationId)) {
+      const draft = draftConversationRef.current;
+      if (!draft || !isDraftConversationId(activeConversationIdRef.current)) return { refused: "absent" };
+      const contexts = applyTimelinePatch(draft.contexts, patch);
+      if (!contexts) return { refused: "absent" };
+      setDraftConversation((current) => (
+        current ? { ...current, contexts: applyTimelinePatch(current.contexts, patch) ?? current.contexts } : current
+      ));
+      return { contexts };
+    }
+    const latest = documentStore.current();
+    const workspace = latest?.workspaces.find((candidate) => (
+      candidate.conversations.some((conversation) => conversation.id === conversationId)
+    ));
+    const conversation = workspace?.conversations.find((candidate) => candidate.id === conversationId);
+    if (!workspace || !conversation) return { refused: "absent" };
+    // A message a branch was taken from anchors that branch; taking it out would orphan it.
+    if (removedIds(patch).some((id) => isConversationBranchFork(conversation, id))) return { refused: "branch" };
+    const contexts = applyTimelinePatch(conversation.contexts, patch);
+    if (!contexts) return { refused: "absent" };
+    updateConversation(workspace.id, conversationId, (current) => ({
+      ...current,
+      contexts: applyTimelinePatch(current.contexts, patch) ?? current.contexts,
+      updatedAt: new Date().toISOString()
+    }));
+    return { contexts };
+  };
+
+  /**
+   * Makes an edit on a timeline and files it in that timeline's history, so the
+   * undo keys can take it back. Every edit made on the timeline goes through
+   * here: a delete, a placed or rewritten card, a run of a tool by hand.
+   */
+  const commitTimelineEdit = (
+    conversationId: string,
+    patch: TimelinePatch,
+    label: string,
+    notice?: string
+  ): boolean => {
+    const written = writeTimelinePatch(conversationId, patch);
+    if (!("contexts" in written)) return false;
+    timelineHistoryRef.current!.record(timelineHistoryKey(conversationId), { patch, label });
+    setContextUsage((current) => ({ ...current, [conversationId]: estimateActiveContextUsage(written.contexts) }));
+    if (notice) {
+      showTimelineNotice(conversationId, notice, {
+        keys: timelineHistoryShortcut("undo"),
+        action: t("撤回", "to undo")
+      });
+    }
+    keepTimelineFocus();
+    return true;
+  };
+
+  /** Takes back the last edit on a timeline, or makes the last one taken back again. */
+  const stepTimelineHistory = (conversationId: string, action: "undo" | "redo") => {
+    const history = timelineHistoryRef.current!;
+    const key = timelineHistoryKey(conversationId);
+    const entry = action === "undo" ? history.nextUndo(key) : history.nextRedo(key);
+    if (!entry) {
+      showTimelineNotice(conversationId, action === "undo"
+        ? t("没有可撤回的修改", "Nothing to undo")
+        : t("没有可重做的修改", "Nothing to redo"));
+      return;
+    }
+    if (contextMutationIsBlocked(conversationId)) {
+      showTimelineNotice(conversationId, t(
+        "模型回合进行中，暂时不能修改上下文",
+        "Context cannot be changed while a model turn is in progress"
+      ));
+      return;
+    }
+    const written = writeTimelinePatch(
+      conversationId,
+      action === "undo" ? invertTimelinePatch(entry.patch) : entry.patch
+    );
+    if (!("contexts" in written)) {
+      if (written.refused === "branch") {
+        showTimelineNotice(conversationId, t(
+          "有分支从这条消息开始，不能撤回",
+          "A branch starts at this message, so this cannot be undone"
+        ));
+        return;
+      }
+      // Nothing of it is left to change: whatever it touched is gone, or back already.
+      if (action === "undo") history.dropUndo(key);
+      else history.dropRedo(key);
+      showTimelineNotice(conversationId, t("这次修改已不在时间线上", "That edit is no longer on the timeline"));
+      return;
+    }
+    if (action === "undo") history.undone(key);
+    else history.redone(key);
+    closeTimelineEditors();
+    setContextUsage((current) => ({ ...current, [conversationId]: estimateActiveContextUsage(written.contexts) }));
+    showTimelineNotice(
+      conversationId,
+      action === "undo"
+        ? t("已撤回：{label}", "Undone: {label}", { label: entry.label })
+        : t("已重做：{label}", "Redone: {label}", { label: entry.label }),
+      action === "undo"
+        ? { keys: timelineHistoryShortcut("redo"), action: t("重做", "to redo") }
+        : { keys: timelineHistoryShortcut("undo"), action: t("撤回", "to undo") }
+    );
+    keepTimelineFocus();
+  };
+
+  const deletedMessagesNotice = (count: number) => (count === 1
+    ? t("已删除 1 条消息", "Deleted 1 message")
+    : t("已删除 {count} 条消息", "Deleted {count} messages", { count }));
+
   const deleteQuestionContext = (item: ToolContext, answer?: UserContext) => {
     if (!activeConversation || !activeWorkspaceId || contextMutationIsBlocked(activeConversation.id)) return;
     const deletedItems = answer ? [item, answer] : [item];
     if (deletedItems.some((context) => isConversationBranchFork(activeConversation, context.id))) return;
-
-    const conversationId = activeConversation.id;
-    const deletedIds = new Set(deletedItems.map((context) => context.id));
-    const indexedItems = activeConversation.contexts.flatMap((context, index) => (
-      deletedIds.has(context.id) ? [{ context, index }] : []
-    ));
-    if (indexedItems.length !== deletedItems.length) return;
-    const nextContexts = activeConversation.contexts.filter((context) => !deletedIds.has(context.id));
-    queuedQuestionAnswersRef.current.delete(conversationId);
+    const removed = placedContexts(activeConversation.contexts, new Set(deletedItems.map((context) => context.id)));
+    if (removed.length !== deletedItems.length) return;
     setQuestionEditor(null);
-    updateActiveConversation((conversation) => ({ ...conversation, contexts: nextContexts }));
-    setContextUsage((current) => ({ ...current, [conversationId]: estimateActiveContextUsage(nextContexts) }));
-    setPendingUndo({
-      id: createId("undo"),
-      conversationId,
-      label: answer
-        ? t("撤销删除整条提问消息", "Undo deleting the complete question message")
-        : t("撤销删除提问消息", "Undo deleting the question message"),
-      run: () => {
-        if (contextMutationIsBlocked(conversationId)) return;
-        updateConversation(activeWorkspaceId, conversationId, (conversation) => {
-          const contexts = [...conversation.contexts];
-          indexedItems
-            .slice()
-            .sort((left, right) => left.index - right.index)
-            .forEach(({ context, index }) => {
-              if (contexts.some((candidate) => candidate.id === context.id)) return;
-              contexts.splice(Math.min(index, contexts.length), 0, context);
-            });
-          return { ...conversation, contexts, updatedAt: new Date().toISOString() };
-        });
-        setContextUsage((current) => {
-          const next = { ...current };
-          delete next[conversationId];
-          return next;
-        });
-        setPendingUndo(null);
-      }
-    });
+    commitTimelineEdit(
+      activeConversation.id,
+      { ...EMPTY_TIMELINE_PATCH, removed },
+      answer
+        ? t("删除整条提问消息", "Delete the complete question message")
+        : t("删除提问消息", "Delete the question message"),
+      deletedMessagesNotice(1)
+    );
   };
 
   const deleteContext = (item: ContextItem) => {
-    const workspaceId = activeWorkspaceId;
     // A draft has no workspace until it is sent, yet its hand-written content is still deletable.
     if (
       !activeConversation
-      || (!workspaceId && !draftActive)
+      || (!activeWorkspaceId && !draftActive)
       || contextMutationIsBlocked(activeConversation.id)
     ) return;
     if (isConversationBranchFork(activeConversation, item.id)) return;
@@ -6483,82 +7120,46 @@ function App() {
       appearance.confirmMessageDelete
       && !window.confirm(t("确定删除这条上下文？", "Delete this context item?"))
     ) return;
-    const deletedAt = new Date().toISOString();
-    const stateDeletion = deleteStateToolContext(activeConversation, item, deletedAt);
-    const index = activeConversation.contexts.findIndex((context) => context.id === item.id);
-    if (!stateDeletion && index < 0) return;
-    const conversationId = activeConversation.id;
-    const nextConversation = stateDeletion?.conversation ?? {
-      ...activeConversation,
-      contexts: activeConversation.contexts.filter((context) => context.id !== item.id)
-    };
-    const nextContexts = nextConversation.contexts;
-    updateActiveConversation(() => nextConversation);
-    setContextUsage((current) => ({ ...current, [conversationId]: estimateActiveContextUsage(nextContexts) }));
-    setPendingUndo({
-      id: createId("undo"),
-      conversationId,
-      label: stateDeletion
-        ? t("撤销删除任务状态消息", "Undo deleting the task-state messages")
-        : item.kind === "tool"
-          ? t("撤销删除工具调用", "Undo deleting the tool call")
-          : t("撤销删除上下文", "Undo deleting the context"),
-      run: () => {
-        if (contextMutationIsBlocked(conversationId)) return;
-        if (draftActive) {
-          // Draft content lives in the renderer, so restore it there — and only while that draft is
-          // still open, because switching conversations discards the draft outright.
-          if (!isDraftConversationId(activeConversationIdRef.current)) return;
-          setDraftConversation((current) => {
-            if (!current || current.contexts.some((context) => context.id === item.id)) return current;
-            const contexts = [...current.contexts];
-            contexts.splice(Math.min(index, contexts.length), 0, item);
-            return { ...current, contexts };
-          });
-          setContextUsage((current) => {
-            const next = { ...current };
-            delete next[conversationId];
-            return next;
-          });
-          setPendingUndo(null);
-          return;
-        }
-        if (!workspaceId) return;
-        if (stateDeletion) {
-          const currentConversation = documentStore.current()?.workspaces
-            .find((workspace) => workspace.id === workspaceId)?.conversations
-            .find((conversation) => conversation.id === conversationId);
-          const restored = currentConversation
-            ? restoreStateToolContexts(
-              currentConversation,
-              stateDeletion.removed,
-              new Date().toISOString()
-            )
-            : null;
-          // Do not restore the group if task status changed; retain the undo entry instead.
-          if (!restored) return;
-          updateConversation(workspaceId, conversationId, () => restored);
-          setContextUsage((current) => {
-            const next = { ...current };
-            delete next[conversationId];
-            return next;
-          });
-          setPendingUndo(null);
-          return;
-        }
-        updateConversation(workspaceId, conversationId, (conversation) => {
-          if (conversation.contexts.some((context) => context.id === item.id)) return conversation;
-          const contexts = [...conversation.contexts];
-          contexts.splice(Math.min(index, contexts.length), 0, item);
-          return { ...conversation, contexts, updatedAt: new Date().toISOString() };
-        });
-        setContextUsage((current) => ({
-          ...current,
-          [conversationId]: estimateActiveContextUsage(activeConversation.contexts)
-        }));
-        setPendingUndo(null);
-      }
-    });
+    const removed = placedContexts(activeConversation.contexts, new Set([item.id]));
+    if (!removed.length) return;
+    commitTimelineEdit(
+      activeConversation.id,
+      { ...EMPTY_TIMELINE_PATCH, removed },
+      item.kind === "tool" ? t("删除工具调用", "Delete the tool call") : t("删除上下文", "Delete the context"),
+      deletedMessagesNotice(1)
+    );
+  };
+
+  /**
+   * Deletes everything a selection box picked out, as one edit with one undo. A
+   * message a branch was taken from stays: it anchors that branch, and the
+   * single delete refuses it too.
+   */
+  const deleteTimelineContexts = (ids: string[]) => {
+    if (
+      !activeConversation
+      || (!activeWorkspaceId && !draftActive)
+      || contextMutationIsBlocked(activeConversation.id)
+    ) return;
+    const doomed = new Set(ids.filter((id) => !isConversationBranchFork(activeConversation, id)));
+    const removed = placedContexts(activeConversation.contexts, doomed);
+    if (!removed.length) return;
+    if (
+      appearance.confirmMessageDelete
+      && !window.confirm(t("确定删除选中的 {count} 条上下文？", "Delete the {count} selected context items?", {
+        count: removed.length
+      }))
+    ) return;
+    setEditor((current) => (current?.mode === "edit" && doomed.has(current.item.id) ? null : current));
+    setQuestionEditor((current) => (current && doomed.has(current.item.id) ? null : current));
+    commitTimelineEdit(
+      activeConversation.id,
+      { ...EMPTY_TIMELINE_PATCH, removed },
+      removed.length === 1
+        ? t("删除 1 条消息", "Delete 1 message")
+        : t("删除 {count} 条消息", "Delete {count} messages", { count: removed.length }),
+      deletedMessagesNotice(removed.length)
+    );
   };
 
   /**
@@ -6583,22 +7184,20 @@ function App() {
 
   const saveTextContext = (content: string, images?: ImageAttachment[], files?: FileAttachment[]) => {
     if (!editor || !activeConversation || contextMutationIsBlocked(activeConversation.id)) return;
-    const conversationId = activeConversation?.id;
+    const conversationId = activeConversation.id;
     if (editor.mode === "edit") {
-      const id = editor.item.id;
-      updateActiveConversation((conversation) => {
-        const contexts = conversation.contexts.map((item) => {
-          if (item.id !== id || item.kind === "tool") return item;
-          if (item.kind === "assistant" || item.kind === "reasoning") {
-            return { ...item, content, interrupted: false };
-          }
-          if (item.kind === "user" && images) {
-            return { ...item, content, images, files: files?.length ? files : undefined };
-          }
-          return { ...item, content };
-        });
-        return { ...conversation, contexts };
-      });
+      const before = activeConversation.contexts.find((item) => item.id === editor.item.id);
+      if (!before || before.kind === "tool") return;
+      const after: ContextItem = before.kind === "assistant" || before.kind === "reasoning"
+        ? { ...before, content, interrupted: false }
+        : before.kind === "user" && images
+          ? { ...before, content, images, files: files?.length ? files : undefined }
+          : { ...before, content };
+      commitTimelineEdit(
+        conversationId,
+        { ...EMPTY_TIMELINE_PATCH, replaced: [{ before, after }] },
+        t("编辑上下文", "Edit the context")
+      );
     } else {
       const base = { id: createId("ctx"), createdAt: new Date().toISOString(), content };
       const item: ContextItem = editor.kind === "reasoning"
@@ -6609,18 +7208,11 @@ function App() {
           // has nowhere to put an image and is never handed one.
           ? { ...base, kind: "user", ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) }
           : { ...base, kind: editor.kind as "system" | "assistant" };
-      updateActiveConversation((conversation) => {
-        const contexts = [...conversation.contexts];
-        contexts.splice(editor.index, 0, item);
-        return { ...conversation, contexts };
-      });
-    }
-    if (conversationId) {
-      setContextUsage((current) => {
-        const next = { ...current };
-        delete next[conversationId];
-        return next;
-      });
+      commitTimelineEdit(
+        conversationId,
+        insertionPatch(activeConversation.contexts, item, editor.index),
+        t("插入上下文", "Insert a context")
+      );
     }
     setEditor(null);
   };
@@ -6687,24 +7279,20 @@ function App() {
       const index = editor.index;
       const { workspaceId, conversationId } = await conversationForTimelineTool();
       const attested = await attestInsertedToolContext({ conversationId, contextId, toolName, input, output });
-      updateConversation(workspaceId, conversationId, (conversation) => {
-        const contexts = [...conversation.contexts];
-        contexts.splice(Math.min(index, contexts.length), 0, {
-          id: contextId,
-          kind: "tool",
-          toolName,
-          input: attested.input,
-          result: attested.result,
-          attestation: attested.attestation,
-          createdAt: new Date().toISOString()
-        });
-        return { ...conversation, contexts, updatedAt: new Date().toISOString() };
-      });
-      setContextUsage((current) => {
-        const next = { ...current };
-        delete next[conversationId];
-        return next;
-      });
+      const placed: ContextItem = {
+        id: contextId,
+        kind: "tool",
+        toolName,
+        input: attested.input,
+        result: attested.result,
+        attestation: attested.attestation,
+        createdAt: new Date().toISOString()
+      };
+      commitTimelineEdit(
+        conversationId,
+        insertionPatch(timelineContextsOf(workspaceId, conversationId), placed, index),
+        t("插入工具调用", "Insert a tool call")
+      );
       setEditor(null);
       return;
     }
@@ -6721,24 +7309,26 @@ function App() {
       output,
       images
     });
-    updateConversation(workspaceId, conversationId, (conversation) => ({
-      ...conversation,
-      updatedAt: new Date().toISOString(),
-      contexts: conversation.contexts.map((item) => item.id === contextId && item.kind === "tool"
-        ? {
-          ...item,
-          requestedInput: undefined,
-          input: attested.input,
-          result: attested.result,
-          attestation: attested.attestation
-        }
-        : item)
-    }));
-    setContextUsage((current) => {
-      const next = { ...current };
-      delete next[conversationId];
-      return next;
-    });
+    const before = timelineContextsOf(workspaceId, conversationId).find((item) => item.id === contextId);
+    if (before?.kind === "tool") {
+      commitTimelineEdit(
+        conversationId,
+        {
+          ...EMPTY_TIMELINE_PATCH,
+          replaced: [{
+            before,
+            after: {
+              ...before,
+              requestedInput: undefined,
+              input: attested.input,
+              result: attested.result,
+              attestation: attested.attestation
+            }
+          }]
+        },
+        t("编辑工具调用", "Edit the tool call")
+      );
+    }
     setEditor(null);
   };
 
@@ -6781,23 +7371,20 @@ function App() {
     ) {
       throw new Error(t("提问消息已不存在", "The question message no longer exists"));
     }
-    updateActiveConversation((conversation) => ({
-      ...conversation,
-      contexts: conversation.contexts.map((context) => {
-        if (context.id === questionId && context.kind === "tool") {
-          return { ...context, requestedInput: undefined, input };
-        }
-        if (answerId && context.id === answerId && context.kind === "user") {
-          return { ...context, content: answerContent ?? context.content };
-        }
-        return context;
-      })
-    }));
-    setContextUsage((current) => {
-      const next = { ...current };
-      delete next[activeConversation.id];
-      return next;
+    const replaced = activeConversation.contexts.flatMap((context): TimelinePatch["replaced"] => {
+      if (context.id === questionId && context.kind === "tool") {
+        return [{ before: context, after: { ...context, requestedInput: undefined, input } }];
+      }
+      if (answerId && context.id === answerId && context.kind === "user") {
+        return [{ before: context, after: { ...context, content: answerContent ?? context.content } }];
+      }
+      return [];
     });
+    commitTimelineEdit(
+      activeConversation.id,
+      { ...EMPTY_TIMELINE_PATCH, replaced },
+      t("编辑提问", "Edit the questions")
+    );
     setQuestionEditor(null);
   };
 
@@ -6832,19 +7419,14 @@ function App() {
       }
       const id = editor.item.id;
       const existingResult = editor.item.result;
-      updateActiveConversation((conversation) => ({
-        ...conversation,
-        contexts: conversation.contexts.map((item) => (
-          item.id === id && item.kind === "tool"
-            ? { ...item, requestedInput: undefined, input }
-            : item
-        ))
-      }));
-      setContextUsage((current) => {
-        const next = { ...current };
-        delete next[activeConversation.id];
-        return next;
-      });
+      const before = activeConversation.contexts.find((item) => item.id === id);
+      if (before?.kind === "tool") {
+        commitTimelineEdit(
+          activeConversation.id,
+          { ...EMPTY_TIMELINE_PATCH, replaced: [{ before, after: { ...before, requestedInput: undefined, input } }] },
+          t("编辑提问", "Edit the questions")
+        );
+      }
       setEditor(null);
       return existingResult;
     }
@@ -6861,16 +7443,19 @@ function App() {
       ? await awaitManualToolApproval(conversationId, approval.prompt)
       : approval;
     const execution = await executeTool(request, granted?.nonce);
-    const updatedAt = new Date().toISOString();
+    const current = timelineContextsOf(workspaceId, conversationId);
     if (editor.mode === "edit") {
-      const id = editor.item.id;
-      updateConversation(workspaceId, conversationId, (conversation) => {
-        const contexts = conversation.contexts
-          .map((item) => item.id === id && item.kind === "tool"
-            ? { ...item, requestedInput: undefined, input, result: execution }
-            : item);
-        return { ...conversation, contexts, updatedAt };
-      });
+      const before = current.find((item) => item.id === editor.item.id);
+      if (before?.kind === "tool") {
+        commitTimelineEdit(
+          conversationId,
+          {
+            ...EMPTY_TIMELINE_PATCH,
+            replaced: [{ before, after: { ...before, requestedInput: undefined, input, result: execution } }]
+          },
+          t("重新运行工具调用", "Run the tool call again")
+        );
+      }
     } else {
       const item: ContextItem = {
         id: createId("ctx"),
@@ -6878,84 +7463,91 @@ function App() {
         toolName,
         input,
         result: execution,
-        createdAt: updatedAt
+        createdAt: new Date().toISOString()
       };
-      updateConversation(workspaceId, conversationId, (conversation) => {
-        const contexts = [...conversation.contexts];
-        contexts.splice(editor.index, 0, item);
-        return { ...conversation, contexts, updatedAt };
-      });
+      commitTimelineEdit(
+        conversationId,
+        insertionPatch(current, item, editor.index),
+        t("运行工具调用", "Run a tool call")
+      );
     }
-    setContextUsage((current) => {
-      const next = { ...current };
-      delete next[conversationId];
-      return next;
-    });
     setEditor(null);
     return execution;
   };
 
-  /** Pending answer to "this model cannot take the tools you just added". */
-  const [toolExposurePrompt, setToolExposurePrompt] = useState<{
-    conversationId: string;
-    additions: ConversationToolLock;
-  } | null>(null);
-  /** Re-opens the composer's model menu after a dialog closes onto it. */
-  const [modelMenuOpenSignal, setModelMenuOpenSignal] = useState(0);
-  /** Merges a run's exposure into its conversation's lock. Tool surface only
-   * ever widens, so this is the record the settings panel grays out against.
-   * The composer's own send already folds this into its durable write; this
-   * covers the runs that start without a new user message. */
+  /** Records the surface and model a run's request goes out with as the
+   * conversation's lock (`toolLock.ts`). The composer's own send already folds
+   * this into its durable write; this covers the runs that start without a new
+   * user message. */
   const lockConversationTools = useCallback(
-    (workspaceId: string, conversationId: string, tools: string[]) => {
+    (
+      workspaceId: string,
+      conversationId: string,
+      tools: string[],
+      request: { providerId: string; modelId: string }
+    ) => {
       const latest = documentStore.current();
       const current = findConversation(latest, workspaceId, conversationId).conversation;
       if (!current) return;
       /* The same question the composer asks before its own send: did this run
          put `web_fetch` in front of the model, or only `web_search`? */
-      const exposure = {
+      const context = {
         webFetch: latest ? grantsWebFetch(
           current.settings.webSearchEnabled === true,
           current.settings.webSearch,
           latest.globalSettings.webSearch,
           modelChoiceForConversation(latest).provider?.family
-        ) : false
+        ) : false,
+        ...request,
+        at: new Date().toISOString()
       };
-      // Most runs add nothing, and `updateConversation` allocates a fresh
-      // document snapshot even for an updater that changes nothing — which
-      // would schedule a save per round for an unchanged lock.
-      if (withRunToolLock(current.settings, tools, exposure) === current.settings) return;
       updateConversation(workspaceId, conversationId, (conversation) => ({
         ...conversation,
-        settings: withRunToolLock(conversation.settings, tools, exposure)
+        settings: withRunToolLock(conversation.settings, tools, context)
       }));
     },
     [documentStore, modelChoiceForConversation, updateConversation]
   );
-  /** What the exposure prompt is asking about, in the names the user picked them by. */
-  const toolExposureAdditionLabels = useMemo(() => {
-    if (!toolExposurePrompt) return [];
-    const { additions } = toolExposurePrompt;
-    const toolLabels = new Map(activeConversationTools.map((tool) => [tool.name, tool.label]));
-    const mcpLabels = new Map((document?.capabilities.mcps ?? []).map((mcp) => [mcp.id, mcp.name]));
-    return [
-      ...additions.tools.map((name) => toolLabels.get(name) ?? name),
-      ...additions.mcpIds.map((id) => mcpLabels.get(id) ?? id),
-      ...(additions.globalMemory ? [t("全局记忆", "Global memory")] : []),
-      ...(additions.projectMemory ? [t("项目记忆", "Project memory")] : []),
-      ...(additions.skillTool ? [t("技能按需加载", "Load skills on demand")] : []),
-      ...(additions.webSearch ? [t("联网搜索", "Web search")] : []),
-      /* The fetch pin is the only record that `web_fetch` itself is new: web
-         access is one switch, and a conversation can have been searching for
-         rounds before a fetch backend resolved. */
-      ...(additions.fetchProvider ? [t("抓取网页", "Web fetch")] : [])
-    ];
-  }, [activeConversationTools, document, t, toolExposurePrompt]);
-  // The question belongs to one conversation's send. Leaving abandons it rather
-  // than parking it to reappear on the way back.
+  /* Picking a model again puts back what its last request's lock holds, in
+     every conversation that request came from: a change made while another
+     model was selected was free then, and is not now. */
   useEffect(() => {
-    setToolExposurePrompt(null);
-  }, [activeConversationId]);
+    restoreLocksForModelRef.current = (providerId, modelId) => {
+      const latest = documentStore.current();
+      const provider = latest?.globalSettings.apiProviders.find((item) => item.id === providerId);
+      const model = provider?.models.find((item) => item.id === modelId);
+      const lockModel = toolLockModelOf(provider, model);
+      if (!latest || !lockModel) return;
+      const restore = (settings: Conversation["settings"]) => (
+        restoreLockedSettings(settings, toolLockState(settings, lockModel, Date.now()))
+      );
+      for (const workspace of latest.workspaces) {
+        for (const conversation of workspace.conversations) {
+          if (restore(conversation.settings) === conversation.settings) continue;
+          updateConversation(workspace.id, conversation.id, (current) => {
+            const settings = restore(current.settings);
+            return settings === current.settings ? current : { ...current, settings };
+          });
+        }
+      }
+    };
+  }, [documentStore, updateConversation]);
+  const refreshConversationToolLock = useCallback(
+    (workspaceId: string, conversationId: string) => {
+      updateConversation(workspaceId, conversationId, (conversation) => {
+        const lock = conversation.settings.toolLock;
+        if (!lock?.lastRequest) return conversation;
+        return {
+          ...conversation,
+          settings: {
+            ...conversation.settings,
+            toolLock: refreshedToolLock(toolLockOf(conversation.settings), new Date().toISOString())
+          }
+        };
+      });
+    },
+    [updateConversation]
+  );
 
   /** Refresh App facilities after each commit; the send pipeline reads them through `host()` at call time. */  const sendPipelineHostRef = useRef<SendPipelineHost | null>(null);
   useEffect(() => {
@@ -6968,13 +7560,11 @@ function App() {
       activeConversationTools: () => activeConversationTools,
       activeEnabledTools: () => activeEnabledTools,
       lockConversationTools,
-      promptToolExposureChange: (conversationId, additions) => setToolExposurePrompt({
-        conversationId,
-        additions
-      }),
-      requestFitsImageBudget,
+      refreshConversationToolLock,
       contextMutationIsBlocked,
-      clearPendingUndo,
+      ensureConversationBody: async (conversationId) => {
+        await conversationBodies.ensureLoaded(conversationId);
+      },
       closeEditorIfActive: (conversationId) => {
         if (activeConversationIdRef.current === conversationId) setEditor(null);
       },
@@ -6989,7 +7579,6 @@ function App() {
       resumeAdoptedConversationTurn,
       splitConversationTurn,
       updateRunningTurnUsage,
-      pauseConversationTurnForUser,
       finishConversationTurns,
       persistInterruptedRun,
       failConversationTurn,
@@ -7039,6 +7628,15 @@ function App() {
           });
         }).catch(drop);
       },
+      pendingQuestionFor: (conversationId) => {
+        const card = toolPrompts[conversationId]?.find((prompt) => prompt.kind === "question");
+        if (!card) return null;
+        return {
+          promptId: card.promptId,
+          response: questionDraftsRef.current.get(card.promptId) ?? { action: "close", answers: [] }
+        };
+      },
+      answerQuestion: answerQuestionPrompt,
       registerPreviewSessionForTool: (conversationId, toolName) => {
         // The tools that only read or kill a dev-server process are excluded — they never
         // create a page for the conversation to own.
@@ -7070,10 +7668,7 @@ function App() {
   } = sendPipeline;
 
   /** Materialize a draft synchronously before `sendComposer`, which requires both active ids in the document. Do not materialize while images are uploading, because send rejection must not leave an empty conversation. */
-  const sendActiveComposer = useCallback(async (
-    overrideText?: string,
-    toolExposure?: ToolExposureMode
-  ) => {
+  const sendActiveComposer = useCallback(async () => {
     if (isDraftConversationId(activeConversationIdRef.current)) {
       if (composerController.current().imageLoadingIds.has(DRAFT_CONVERSATION_ID)) return;
       try {
@@ -7090,7 +7685,7 @@ function App() {
         return;
       }
     }
-    await sendComposer(overrideText, toolExposure);
+    await sendComposer();
   }, [
     composerController,
     redeemDraft,
@@ -7194,16 +7789,17 @@ function App() {
       forkStartsAttemptedRef.current.add(conversationId);
       void loadConversationRemote(conversationId).then(async (authoritative) => {
         if (!authoritative) throw new Error(t("分叉子会话不存在", "The forked conversation is unavailable"));
+        // A new child opens the list, where the host filed it; one already listed (a start
+        // retried after a restart) keeps its place.
         documentStore.update((current) => current ? {
           ...current,
           workspaces: current.workspaces.map((workspace) => (
             workspace.id === workspaceId
               ? {
                 ...workspace,
-                conversations: [
-                  ...workspace.conversations.filter((candidate) => candidate.id !== authoritative.id),
-                  authoritative
-                ]
+                conversations: workspace.conversations.some((candidate) => candidate.id === authoritative.id)
+                  ? workspace.conversations.map((candidate) => candidate.id === authoritative.id ? authoritative : candidate)
+                  : [authoritative, ...workspace.conversations]
               }
               : workspace
           ))
@@ -7212,8 +7808,17 @@ function App() {
           ...currentUsage,
           [authoritative.id]: estimateActiveContextUsage(authoritative.contexts)
         }));
+        const handedOffFrom = handoffJumpsRef.current.get(conversationId);
+        if (handedOffFrom !== undefined) {
+          handoffJumpsRef.current.delete(conversationId);
+          if (activeConversationIdRef.current === handedOffFrom) {
+            selectConversationRef.current(workspaceId, conversationId);
+          }
+        }
         if (!await startForkedConversationRun(workspaceId, conversationId)) {
-          throw new Error(t("分叉首轮尚未启动，请检查模型配置后重试", "The fork run has not started. Check model settings and retry."));
+          throw new Error(authoritative.handoffOf
+            ? t("交接会话首轮尚未启动，请检查模型配置后重试", "The handover conversation's run has not started. Check model settings and retry.")
+            : t("分叉首轮尚未启动，请检查模型配置后重试", "The fork run has not started. Check model settings and retry."));
         }
       }).catch((error) => {
         setForkStartError(failureMessage(error, t("分叉出的会话未能开始运行", "The forked conversation could not start its run")));
@@ -7249,8 +7854,6 @@ function App() {
           && !modelRunController.current()[conversation.id]
           && !modelRunController.hasPerformingRun(conversation.id)
           && !modelRunController.hasPreparingRun(conversation.id)
-          // A pending question needs a human answer. Do not dispatch queued messages because an unrelated user context would close the question and discard its actual answer.
-          && !findPendingQuestion(conversation.contexts)
         ) {
           void dispatchNextQueuedMessage(workspace.id, conversation.id);
         }
@@ -7298,7 +7901,13 @@ function App() {
       undefined,
       conversationId,
       [],
-      source.presetId
+      source.presetId,
+      "",
+      [],
+      undefined,
+      undefined,
+      // A branch with nothing before it carries no history, and so no cache.
+      forkIndex > 0 ? source.settings.toolLock : undefined
     );
     if (!created) return;
     composerController.updateDrafts((current) => ({ ...current, [created]: item.content ?? "" }));
@@ -7349,7 +7958,9 @@ function App() {
    * the insertion line is copied into a new conversation, which opens. Unlike a
    * branch from a user message nothing is handed to the composer, and the fork
    * keeps the source's settings — it carries on that work rather than starting
-   * a new task. The copy is the host's, on the same terms as a branch's.
+   * a new task. Its lock comes along as it stands, so what is orange there and
+   * which models the menu marks as cached run out when the source's do. The
+   * copy is the host's, on the same terms as a branch's.
    *
    * The fork is named after its origin (`lib/conversationForks.ts`), and the
    * name is settled at once so the local helper model never retitles it.
@@ -7380,7 +7991,8 @@ function App() {
       "",
       [],
       undefined,
-      { title: forkTitle(origin.title, forkOf.number), forkOf }
+      { title: forkTitle(origin.title, forkOf.number), forkOf },
+      source.settings.toolLock
     );
     if (!created) return;
     try {
@@ -7454,11 +8066,12 @@ function App() {
       } : workspace)
     };
 
-    setPendingUndo(null);
+    // The edits on record were made to the branch that is leaving the screen; undoing one
+    // would reach into the branch arriving.
+    timelineHistoryRef.current!.forget(timelineHistoryKey(conversationId));
     modelRunController.addPreparingRun(conversationId);
     try {
       await persistDocumentImmediately(nextDocument);
-      queuedQuestionAnswersRef.current.delete(conversationId);
       setEditor(null);
       setContextUsage((current) => ({
         ...current,
@@ -7479,36 +8092,6 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    if (!activeConversation) return;
-    const conversationId = activeConversation.id;
-    const queuedAnswer = queuedQuestionAnswersRef.current.get(conversationId);
-    if (queuedAnswer === undefined) return;
-    if (modelRunController.hasRunToken(conversationId) || modelRunController.hasPreparingRun(conversationId)) return;
-    if (!findPendingQuestion(activeConversation.contexts)) {
-      queuedQuestionAnswersRef.current.delete(conversationId);
-      return;
-    }
-    queuedQuestionAnswersRef.current.delete(conversationId);
-    // sendComposer is stable; it reads current host facilities from host() at invocation.
-    void sendComposer(queuedAnswer);
-  }, [activeConversation, modelRunSummaries]);
-
-  const answerPendingQuestion = async (answer: string): Promise<boolean> => {
-    if (!activeConversation) return false;
-    const conversationId = activeConversation.id;
-    const workspaceId = activeWorkspaceId;
-    if (modelRunController.hasRunToken(conversationId) || modelRunController.hasPreparingRun(conversationId)) {
-      queuedQuestionAnswersRef.current.set(conversationId, answer);
-      return true;
-    }
-    await sendComposer(answer);
-    // Unlock the question only after the answer reaches the conversation store; host rejection leaves it pending.
-    if (!workspaceId) return false;
-    const located = findConversation(documentStore.current(), workspaceId, conversationId);
-    return Boolean(located.conversation) && !findPendingQuestion(located.conversation!.contexts);
-  };
-
   const retryActiveModelRun = async () => {
     if (!document || !activeWorkspace || !activeConversation) return;
     const failed = modelRunErrors[activeConversation.id];
@@ -7527,7 +8110,6 @@ function App() {
     }
     if (!supportsVision(model) && contextsContainProjectedImages(activeConversation.contexts)) return;
     const requestContexts = [...activeConversation.contexts];
-    if (!requestFitsImageBudget(requestContexts)) return;
     const workspaceId = activeWorkspace.id;
     const conversationId = activeConversation.id;
       modelRunController.addPreparingRun(conversationId);
@@ -7577,7 +8159,6 @@ function App() {
           "The backend did not confirm that this run was still active"
         ));
       }
-      queuedQuestionAnswersRef.current.delete(conversationId);
       await onCancellationAcknowledged?.();
       // The cancellation command only publishes the stop flag. Keep the run and
       // its task cards visible until the run promise has joined every scoped
@@ -7781,6 +8362,14 @@ function App() {
           ? `${terminalShellLabel(shell)} ${tab.number}`
           : t("终端 {n}", "Terminal {n}", { n: tab.number });
       };
+      // The read-only page: a command the model ran, named the way its task row is. A command the
+      // host has already let go of has nothing left to show, so its page is not drawn; the
+      // eviction that dropped the row closes the page too.
+      const readOnlyTask = terminals.readOnly === null ? null
+        : activeShellTasks.find((task) => task.shellTaskId === terminals.readOnly) ?? null;
+      const readOnlyLabel = readOnlyTask ? shellTaskTitle(readOnlyTask) : "";
+      const readOnlyDirectory = readOnlyTask ? shellTaskDirectory(readOnlyTask) : null;
+      const readOnlyOpen = terminalPaneOpen && terminals.activeId === READ_ONLY_TERMINAL_TAB_ID;
       return (
         <SidePane
           id={pane}
@@ -7793,7 +8382,22 @@ function App() {
           // no title of its own — the reference shell puts nothing else above a terminal.
           header={(
             <TerminalTabBar
-              tabs={terminals.tabs.map((tab) => ({ id: tab.id, label: tabLabel(tab) }))}
+              tabs={[
+                ...(readOnlyTask ? [{
+                  id: READ_ONLY_TERMINAL_TAB_ID,
+                  label: readOnlyLabel,
+                  title: readOnlyTask.command,
+                  content: readOnlyDirectory === null ? undefined : (
+                    <PathText
+                      prefix={`${readOnlyTask.toolName}:`}
+                      path={readOnlyDirectory}
+                      title={null}
+                    />
+                  ),
+                  readOnly: true
+                }] : []),
+                ...terminals.tabs.map((tab) => ({ id: tab.id, label: tabLabel(tab) }))
+              ]}
               activeId={terminals.activeId}
               panelId={(terminalId) => terminalPanelId(ownerId, terminalId)}
               closingIds={new Set(terminals.tabs
@@ -7825,6 +8429,26 @@ function App() {
             />
           )}
         >
+          {readOnlyTask && (
+            // Stacked with the shells and kept mounted like them, so coming back to it is a
+            // repaint rather than a fresh subscribe and replay.
+            <section
+              id={terminalPanelId(ownerId, READ_ONLY_TERMINAL_TAB_ID)}
+              className={`collapse-region terminal-panel-region${readOnlyOpen ? "" : " collapse-region--closed"}`}
+              aria-label={readOnlyLabel}
+              aria-hidden={!readOnlyOpen || undefined}
+              inert={!readOnlyOpen || undefined}
+            >
+              <div className="collapse-region__inner terminal-panel-region__inner">
+                <ShellTaskPanel
+                  task={readOnlyTask}
+                  open={readOnlyOpen}
+                  stopping={stoppingTaskIds.includes(JSON.stringify([conversationId, readOnlyTask.shellTaskId]))}
+                  onStop={() => void stopShellTask(readOnlyTask.conversationId, readOnlyTask.shellTaskId)}
+                />
+              </div>
+            </section>
+          )}
           {terminals.tabs.map((tab) => (
             <TerminalPanel
               key={tab.id}
@@ -7957,6 +8581,7 @@ function App() {
           ) : null}
           native={isTauriRuntime()}
           sessionId={target}
+          initialStatus={browserStatuses[target] ?? null}
           // Covered by another pane's expand, this pane keeps a full-size box it is no longer
           // allowed to draw in — the tile is only made `visibility:hidden`, so its rectangle still
           // measures. The host parks the page for the same reason, and the panel has to agree, or
@@ -8072,9 +8697,9 @@ function App() {
         <FilesPane
           key={conversationId}
           paneId={pane}
-          target={activePrimaryGitTarget ?? { kind: "conversation", conversationId }}
-          rootLabel={activeWorkspace?.name ?? t("工作区", "Workspace")}
-          workspacePath={filesPaneRoot}
+          workspaces={filesPaneWorkspaces}
+          sshMachines={document.globalSettings.executionEnvironments.sshMachines}
+          hostWindows={hostIsWindows(platform)}
           active
           openRequest={filesPaneRequest?.conversationId === conversationId ? filesPaneRequest : null}
           onOpenRequestHandled={onFilesPaneRequestHandled}
@@ -8087,62 +8712,68 @@ function App() {
     }
 
     if (kind === "tasks") {
+      const tab = activeLayout.tasksTab;
       return (
         <SidePane
           id={pane}
-          title={t("任务", "Tasks")}
+          // The tabs take the title bar; the pane's region goes by the page on show.
+          title={tasksPaneTabLabel(tab, t)}
+          header={<TasksPaneTabBar activeTab={tab} onSelect={showTasksTab} />}
           onFocus={onFocus}
           expanded={expanded}
           onToggleExpand={onToggleExpand}
           onClose={() => closePane(pane)}
         >
-          <TasksPane
-            agents={subagents}
-            terminals={activeTaskTerminals}
-            shellTasks={activeShellTasks}
-            previewServers={previewServers}
-            browserSessions={activeBrowserSessions}
-            browserSessionId={conversationId}
-            conversationId={conversationId}
-            browserAutomationTool={activePreviewPageTool}
-            browserAutomationStopping={activeBrowserAutomationStopping}
-            modelRequestId={taskSources.modelRequestId}
-            userAbortedTasks={conversation.userAbortedTasks}
-            forkDecisions={forkDecisions[conversationId] ?? []}
-            inheritedModelId={taskSources.inheritedModelId}
-            multipleWorkspaces={activeTerminalWorkspaces.length > 1}
-            plan={activePlan}
-            planAwaitingApproval={planAwaitingApproval}
-            status={agentStatus}
-            selectedAgentId={selectedSubagentId}
-            selectedRowId={selectedTaskRowId}
-            stoppingIds={stoppingTaskIds.flatMap((key) => {
-              const [stoppingConversationId, itemId] = JSON.parse(key) as [string, string];
-              return stoppingConversationId === conversationId ? [itemId] : [];
-            })}
-            workflowProgress={workflowProgressByRun}
-            workflowRunIds={workflowRunIdsByRun}
-            onWorkflowStepControl={handleWorkflowStepControl}
-            onSelectAgent={(agentId) => openSubagentPanel(agentId)}
-            onOpenItem={(item) => void openTaskItemPage(item)}
-            onStopItem={(item) => void stopTaskItem(item)}
-          />
+          {tab === "history" ? (
+            <HistoryPane
+              conversationId={conversationId}
+              contexts={conversation.contexts}
+              streaming={activeModelRunBusy}
+            />
+          ) : (
+            <TasksPane
+              agents={subagents}
+              terminals={activeTaskTerminals}
+              shellTasks={activeShellTasks}
+              previewServers={previewServers}
+              browserSessions={activeBrowserSessions}
+              browserSessionId={conversationId}
+              conversationId={conversationId}
+              browserAutomationTool={activePreviewPageTool}
+              browserAutomationStopping={activeBrowserAutomationStopping}
+              modelRequestId={taskSources.modelRequestId}
+              userAbortedTasks={conversation.userAbortedTasks}
+              forkDecisions={forkDecisions[conversationId] ?? []}
+              inheritedModelId={taskSources.inheritedModelId}
+              plan={activePlan}
+              planAwaitingApproval={planAwaitingApproval}
+              selectedAgentId={selectedSubagentId}
+              selectedRowId={selectedTaskRowId}
+              stoppingIds={stoppingTaskIds.flatMap((key) => {
+                const [stoppingConversationId, itemId] = JSON.parse(key) as [string, string];
+                return stoppingConversationId === conversationId ? [itemId] : [];
+              })}
+              workflowProgress={workflowProgressByRun}
+              workflowRunIds={workflowRunIdsByRun}
+              onWorkflowStepControl={handleWorkflowStepControl}
+              onSelectAgent={(agentId) => openSubagentPanel(agentId)}
+              onOpenItem={(item) => void openTaskItemPage(item)}
+              onStopItem={(item) => void stopTaskItem(item)}
+            />
+          )}
         </SidePane>
       );
     }
 
     if (kind === "history") {
-      // Targeted means one agent's ledger; bare means the conversation's own.
-      // They read the same rows from the same store and differ only in which
-      // ledger they ask for, so one pane draws both.
+      // One agent's history. It reads the same record from the same store as
+      // the tasks pane's history tab and differs only in whose entries it asks for.
       const view = target ? findOpenableSubagentView(subagents, target) : null;
-      if (target && !view) return null;
+      if (!view) return null;
       return (
         <SidePane
           id={pane}
-          title={view
-            ? t("{label} 发出的请求", "{label} · outgoing requests", { label: view.label })
-            : t("发出的请求", "Outgoing requests")}
+          title={t("{label} 的历史记录", "{label} · history", { label: view.label })}
           onFocus={onFocus}
           expanded={expanded}
           onToggleExpand={onToggleExpand}
@@ -8152,12 +8783,12 @@ function App() {
             conversationId={conversationId}
             contexts={conversation.contexts}
             streaming={activeModelRunBusy}
-            /* A spawned agent's ledger is keyed by its name; a workflow step's
-               by the run-scoped address the host publishes on its shell. A view
-               that carries neither — a step shell written before the address
-               rode along — asks for nothing rather than falling back to the
-               conversation's own rows. */
-            owners={view ? (view.ledgerOwner ? [view.ledgerOwner] : []) : undefined}
+            /* A spawned agent's entries are keyed by its name; a workflow
+               step's by the run-scoped address the host publishes on its shell.
+               A view that carries neither — a step shell written before the
+               address rode along — asks for nothing rather than falling back to
+               the conversation's own entries. */
+            owners={view.ledgerOwner ? [view.ledgerOwner] : []}
           />
         </SidePane>
       );
@@ -8199,8 +8830,14 @@ function App() {
     }
 
     if (kind === "subagent") {
-      const view = target ? findOpenableSubagentView(subagents, target) : null;
-      if (!view || !target) return null;
+      const view = selectedSubagentView;
+      if (!view) return null;
+      // A tab still filed under the call id its agent has since left resolves to the agent's
+      // view, and the effects above move it over; until then the two must not draw twice.
+      const tabAgents = [...new Map(activeLayout.subagentTabs.flatMap((subagentId) => {
+        const agent = findOpenableSubagentView(subagents, subagentId);
+        return agent ? [[agent.id, agent] as const] : [];
+      })).values()];
       const ledgerPane = subagentHistoryPaneId(view.id);
       return (
         <SidePane
@@ -8210,13 +8847,29 @@ function App() {
           expanded={expanded}
           onToggleExpand={onToggleExpand}
           onClose={() => closePane(pane)}
-          /* What this agent put on the wire, beside the transcript it settled
+          // Agents share this pane as its tabs, so the strip takes the title bar and names the
+          // shown one; the pane's region keeps that agent's name.
+          header={(
+            <SubagentTabBar
+              agents={tabAgents}
+              activeId={view.id}
+              onSelect={openSubagentPanel}
+              onClose={(subagentId) => dispatchSidePanes({ type: "close_subagent", conversationId, subagentId })}
+              onReorder={(subagentIds) => dispatchSidePanes({
+                type: "reorder_subagents",
+                conversationId,
+                subagentIds
+              })}
+            />
+          )}
+          /* What happened in this agent, beside the transcript it settled
              into. The two are not the same account: the transcript is what the
-             child kept, the ledger is every payload it sent. */
+             child kept, the history is every payload it sent and everything
+             that came back. */
           trailing={(
             <IconButton
               className="side-pane__ledger"
-              label={t("{label} 发出的请求", "{label} · outgoing requests", { label: view.label })}
+              label={t("{label} 的历史记录", "{label} · history", { label: view.label })}
               aria-pressed={paneIsOpen(activeLayout, ledgerPane)}
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => togglePane(ledgerPane)}
@@ -8226,10 +8879,13 @@ function App() {
           )}
         >
           <StreamedSubagentPanel
+            // Each agent's transcript is its own: switching tabs must not carry one's scroll
+            // and open disclosures over to the next.
+            key={view.id}
             conversation={conversation}
             modelRunController={modelRunController}
             externalStepBodies={externalStepBodies}
-            selectedSubagentId={target}
+            selectedSubagentId={view.id}
             tools={activeConversationTools}
             chromeless
             pathBaseDir={timelinePathBaseDir}
@@ -8287,31 +8943,13 @@ function App() {
             onProbeMcpServer={probeCapabilityMcpServer}
             capabilityError={capabilityError}
             presetError={templateError}
-            onSaveAsPreset={() => setSaveAsPresetDialog({ name: "", description: "" })}
+            onCreatePreset={createConversationPreset}
           />
         </SidePane>
       );
     }
 
-    const shellTask = target ? activeShellTasks.find((task) => task.shellTaskId === target) : null;
-    if (!shellTask) return null;
-    return (
-      <SidePane
-        id={pane}
-        title={shellTaskTitle(shellTask, activeTerminalWorkspaces.length > 1)}
-        onFocus={onFocus}
-        expanded={expanded}
-        onToggleExpand={onToggleExpand}
-        onClose={() => closePane(pane)}
-      >
-        <ShellTaskPanel
-          task={shellTask}
-          open
-          stopping={stoppingTaskIds.includes(JSON.stringify([conversationId, shellTask.shellTaskId]))}
-          onStop={() => void stopShellTask(shellTask.conversationId, shellTask.shellTaskId)}
-        />
-      </SidePane>
-    );
+    return null;
   };
 
   const activeProjectName = activeWorkspace
@@ -8328,28 +8966,26 @@ function App() {
     }
     setTitleDraft(null);
   };
-  const shellNav = (
-    <ShellNav
-      sidebarOpen={sidebarOpen}
-      onToggleSidebar={() => setSidebarOpen((open) => !open)}
-      canGoBack={Boolean(historyBack)}
-      canGoForward={Boolean(historyForward)}
-      onBack={() => stepConversationHistory(historyBack)}
-      onForward={() => stepConversationHistory(historyForward)}
-      onSearch={() => setConversationSearchOpen(true)}
-    />
-  );
 
   return (
     <CommonErrorBoundary>
-      <WindowFrame chrome={windowChrome} nav={shellNav}>
+      <WindowLayerProvider>
+      <WindowFrame chrome={windowChrome}>
       <div
         className={`app-shell ${sidebarOpen ? "" : "app-shell--sidebar-closed"} ${sidebarResizing || paneResizing ? "app-shell--resizing" : ""}`}
         style={{
           "--sidebar-width": `${sidebarWidth}px`
         } as AppShellStyle}
       >
-        {windowChrome !== "windows" && shellNav}
+        <ShellNav
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen((open) => !open)}
+          canGoBack={Boolean(historyBack)}
+          canGoForward={Boolean(historyForward)}
+          onBack={() => stepConversationHistory(historyBack)}
+          onForward={() => stepConversationHistory(historyForward)}
+          onSearch={() => setConversationSearchOpen(true)}
+        />
         <Sidebar
             workspaces={document.workspaces}
             sshMachines={document.globalSettings.executionEnvironments.sshMachines}
@@ -8386,9 +9022,11 @@ function App() {
           window.document.body
         )}
 
+        <PathChoiceMenu />
+
         <main className="main-pane">
-          {/* On macOS this is the window's top row, so its empty stretches move the window. */}
-          <header className="topbar" {...(windowChrome === "windows" ? {} : { "data-tauri-drag-region": "deep" })}>
+          {/* This is the window's top row, so its empty stretches move the window. */}
+          <header className="topbar" data-tauri-drag-region="deep">
             <div className="topbar__leading">
               {activeConversation ? (
                 <div className="conversation-title">
@@ -8545,26 +9183,22 @@ function App() {
                       icon: <Folder size={14} aria-hidden="true" />,
                       checked: paneIsOpen(activeLayout, "files"),
                       disabled: !filesPaneAvailable,
-                      title: activeWorkspaceIsRemote
-                        ? t("工作区在另一台机器上，本机的文件面板不可用", "This workspace is on another machine; the host's file pane is unavailable")
-                        : !filesPaneAvailable
-                          ? t("新任务还没选项目，没有可浏览的目录", "This new task has no project yet, so there is no directory to browse")
-                          : undefined,
                       onSelect: () => togglePane("files")
                     },
+                    // Two rows for the one pane: each is that tab on show.
                     {
                       id: "tasks",
                       label: t("任务", "Tasks"),
                       icon: <ListChecks size={14} aria-hidden="true" />,
-                      checked: paneIsOpen(activeLayout, "tasks"),
-                      onSelect: () => togglePane("tasks")
+                      checked: shownTasksTab(activeLayout) === "tasks",
+                      onSelect: () => toggleTasksTab("tasks")
                     },
                     {
                       id: "history",
-                      label: t("发出的请求", "Outgoing requests"),
+                      label: t("历史记录", "History"),
                       icon: <History size={14} aria-hidden="true" />,
-                      checked: paneIsOpen(activeLayout, "history"),
-                      onSelect: () => togglePane("history")
+                      checked: shownTasksTab(activeLayout) === "history",
+                      onSelect: () => toggleTasksTab("history")
                     },
                     {
                       id: "settings",
@@ -8583,13 +9217,20 @@ function App() {
           {activeConversation ? (
             <PaneTiles
               onResizeStateChange={setPaneResizing}
+              columns={activeLayout.columns}
               sideFlex={activeLayout.sideFlex}
+              columnFlex={activeLayout.columnFlex}
               paneFlex={activeLayout.paneFlex}
               expanded={activeExpandedPane}
               onSideFlexChange={(sideFlex) => dispatchSidePanes({
                 type: "set_side_flex",
                 conversationId: activeConversation.id,
                 sideFlex
+              })}
+              onColumnFlexChange={(columnFlex) => dispatchSidePanes({
+                type: "set_column_flex",
+                conversationId: activeConversation.id,
+                columnFlex
               })}
               onPaneFlexChange={(paneFlex) => dispatchSidePanes({
                 type: "set_pane_flex",
@@ -8612,6 +9253,28 @@ function App() {
             <div className="conversation-pane">
               <StreamedConversationView
                 className="conversation-pane__main"
+                timelinePlaceholder={activeBodyUnloaded ? (
+                  <div className="conversation-view__body-loading" role="status">
+                    {bodyLoadFailures[activeConversation.id] ? (
+                      <>
+                        <span>
+                          {t("对话内容载入失败：{error}", "The conversation could not be loaded: {error}", {
+                            error: bodyLoadFailures[activeConversation.id] ?? ""
+                          })}
+                        </span>
+                        <button
+                          type="button"
+                          className="button button--small"
+                          onClick={() => loadActiveBody(activeConversation.id)}
+                        >
+                          {t("重试", "Retry")}
+                        </button>
+                      </>
+                    ) : (
+                      <span>{t("正在载入对话…", "Loading the conversation…")}</span>
+                    )}
+                  </div>
+                ) : undefined}
                 conversation={activeConversation}
                 conversationTurns={conversationTurns[activeConversation.id]}
                 modelRunController={modelRunController}
@@ -8625,7 +9288,6 @@ function App() {
                 tools={activeTimelineTools}
                 enabledTools={activeEnabledTools}
                 pathBaseDir={timelinePathBaseDir}
-                pendingQuestionId={pendingQuestion?.context.id ?? null}
                 timelineMutationLocked={activeTimelineMutationBlocked}
                 onEdit={handleContextEdit}
                 onDelete={deleteContext}
@@ -8652,6 +9314,9 @@ function App() {
                 onSelectBranch={(forkContextId, branchId) => void selectConversationBranch(forkContextId, branchId)}
                 branchSwitchDisabledReason={branchSwitchDisabledReason}
                 onInsert={handleContextInsert}
+                onDeleteContexts={deleteTimelineContexts}
+                onUndo={() => stepTimelineHistory(activeConversation.id, "undo")}
+                onRedo={() => stepTimelineHistory(activeConversation.id, "redo")}
                 onOpenSubagent={(subagentId) => openSubagentPanel(subagentId)}
                 agents={subagents}
                 taskMessages={taskMessages}
@@ -8674,31 +9339,16 @@ function App() {
                   }}
                 />
                 <QuestionDock
-                  pending={pendingQuestion}
+                  prompt={approvalDockOwner === "composer" ? activeToolPrompt : null}
+                  stack={activeToolPromptStack}
                   disabled={activeWorkspaceLifecycleOperationRunning}
-                  editDisabled={activeTimelineMutationBlocked}
-                  onAnswer={answerPendingQuestion}
-                  onEditQuestion={(item) => handleQuestionEdit(item)}
-                  onDismissQuestion={(item) => deleteQuestionContext(item)}
+                  onRespond={(response) => {
+                    if (activeToolPrompt) {
+                      void answerQuestionPrompt(activeConversation.id, activeToolPrompt.promptId, response);
+                    }
+                  }}
+                  onDraftChange={rememberQuestionDraft}
                 />
-                {pendingUndo?.conversationId === activeConversation.id && (
-                  <div className="composer-undo">
-                    <button
-                      type="button"
-                      className="composer-undo__action"
-                      disabled={contextMutationIsBlocked(pendingUndo.conversationId)}
-                      onClick={pendingUndo.run}
-                    >
-                      <Undo2 size={13} />{pendingUndo.label}
-                    </button>
-                    <IconButton
-                      label={t("放弃撤销", "Discard the undo")}
-                      onClick={() => setPendingUndo(null)}
-                    >
-                      <X size={13} />
-                    </IconButton>
-                  </div>
-                )}
                 <QueuedMessageList
                   messages={visibleQueuedMessages}
                   canSteer={(message) => {
@@ -8723,7 +9373,20 @@ function App() {
                   )}
                 />
                 {/* Project, workspace, and branch describe where the conversation runs, so they sit above the composer rather than inside it. */}
-                <div ref={composerChipsGround} className="composer-context">
+                <div className="composer-context">
+                    {/* Floats above this row, whatever it holds: it belongs to the timeline
+                        over it, and says what the last edit there did. */}
+                    {timelineNotice?.conversationId === activeConversation.id && (
+                      <div key={timelineNotice.id} className="timeline-notice" role="status">
+                        <span>{timelineNotice.message}</span>
+                        {timelineNotice.hint && (
+                          <>
+                            <kbd>{timelineNotice.hint.keys}</kbd>
+                            <span>{timelineNotice.hint.action}</span>
+                          </>
+                        )}
+                      </div>
+                    )}
                     {/* The project is chosen before the task starts; once the conversation has
                         content it belongs to that project for good, and the chip goes away. */}
                     {!activeConversationStarted && (
@@ -8760,10 +9423,10 @@ function App() {
                         onConfigureMachine={(machine) => setMachineSettings({ machine })}
                         onConfigureWorkspace={(member) => {
                           // The registered directory, not the worktree standing in for workspace 1:
-                          // the variables belong to the directory the worktree was checked out from.
+                          // its settings belong to the directory the worktree was checked out from.
                           const registered = projectWorkspaces(activeWorkspace)[member - 1];
                           if (!registered) return;
-                          setWorkspaceEnvEditor({
+                          setWorkspaceSettings({
                             machine: registered.machine ?? null,
                             path: registered.path,
                             name: workspaceDirectoryLabel(registered.path)
@@ -8810,7 +9473,6 @@ function App() {
                               : []).map((branch) => ({
                               id: branch.name,
                               label: branch.name,
-                              icon: <GitBranch size={14} />,
                               checked: branch.current,
                               // This menu operates on the workspace root, so require disabling an active worktree rather than silently switching the wrong checkout.
                               disabled: Boolean(activeWorktree),
@@ -8875,13 +9537,13 @@ function App() {
                         <button
                           type="button"
                           className="composer-chip__remove"
-                          aria-label={t("{name} 的环境变量", "Environment variables for {name}", {
+                          aria-label={t("{name} 的设置", "Settings for {name}", {
                             name: directoryLabel(workspace.path)
                           })}
-                          title={t("{name} 的环境变量", "Environment variables for {name}", {
+                          title={t("{name} 的设置", "Settings for {name}", {
                             name: directoryLabel(workspace.path)
                           })}
-                          onClick={() => setWorkspaceEnvEditor({
+                          onClick={() => setWorkspaceSettings({
                             machine: workspace.machine ?? null,
                             path: workspace.path,
                             name: directoryLabel(workspace.path)
@@ -8917,13 +9579,11 @@ function App() {
                             {
                               id: "local",
                               label: t("本机", "This machine"),
-                              icon: <Monitor size={14} />,
                               onSelect: () => void attachLocalWorkspace()
                             },
                             ...(machineMenuDistros ?? []).map((distro) => ({
                               id: `wsl:${distro.name}`,
                               label: distro.name,
-                              icon: <SquareTerminal size={14} />,
                               onSelect: () => setRemoteWorkspacePicker({
                                 machine: { kind: "wsl", distro: distro.name },
                                 name: distro.name,
@@ -8933,7 +9593,6 @@ function App() {
                             ...document.globalSettings.executionEnvironments.sshMachines.map((machine) => ({
                               id: `ssh:${machine.id}`,
                               label: machine.name,
-                              icon: <Server size={14} />,
                               onSelect: () => setRemoteWorkspacePicker({
                                 machine: { kind: "ssh", machineId: machine.id },
                                 name: machine.name,
@@ -9044,56 +9703,51 @@ function App() {
                     onRemoveFile={(fileId) => removeComposerFile(activeConversation.id, fileId)}
                   />
                   <div className="composer__input">
-                    <textarea
-                      ref={composerTextareaRef}
-                      rows={1}
-                      value={activeComposerDraft}
-                      placeholder={pendingQuestion
-                        ? t("回答 Agent 的提问…", "Answer the Agent's question…")
-                        : t("向 Agent 发送消息…", "Message the Agent…")}
-                      aria-label={pendingQuestion
-                        ? t("回答 Agent 的提问", "Answer the Agent's question")
-                        : t("向 Agent 发送消息", "Message the Agent")}
-                      disabled={activeWorkspaceLifecycleOperationRunning}
-                      spellCheck={appearance.spellCheck}
-                      onPaste={(event) => {
-                        const files = Array.from(event.clipboardData.files);
-                        const text = event.clipboardData.getData("text/plain");
-                        if (files.length) {
-                          // A clipboard carrying both keeps its text; the files ride along.
-                          if (!text) event.preventDefault();
-                          void addComposerAttachments(activeConversation.id, files);
-                          return;
-                        }
-                        // A long paste travels as a Markdown file: the box stays
-                        // readable, and the model still reads every word of it.
-                        if (text && isLongPaste(text)) {
-                          event.preventDefault();
-                          void addComposerAttachments(
-                            activeConversation.id,
-                            [pastedTextFile(text, activeComposerFiles)]
-                          );
-                        }
-                      }}
-                      onChange={(event) => {
-                        const draft = event.target.value;
-                        const conversationId = activeConversation.id;
-                        composerController.updateDrafts((current) => ({ ...current, [conversationId]: draft }));
-                      }}
-                      onKeyDown={(event) => {
-                        // Send and newline shortcuts are configurable but mutually exclusive, so checking send first cannot trigger both.
-                        if (isImeKeyEvent(event.nativeEvent)) return;
-                        if (matchesEvent(appearance.sendShortcut, event.nativeEvent)) {
-                          event.preventDefault();
-                          void sendActiveComposer();
-                          return;
-                        }
-                        if (matchesEvent(appearance.newlineShortcut, event.nativeEvent)) {
-                          // Let the textarea handle newline insertion and its undo stack; unmatched keys also pass through.
-                          return;
-                        }
-                      }}
-                    />
+                    <div className="composer__field pasted-text-host">
+                      {composerPasteTags.layer}
+                      <textarea
+                        ref={composerTextareaRef}
+                        rows={1}
+                        value={activeComposerDraft}
+                        placeholder={activeQuestionPending
+                          ? t("发送消息会先交回卡片上已填的回答…", "Sending hands back the card's answers first…")
+                          : t("向 Agent 发送消息…", "Message the Agent…")}
+                        aria-label={t("向 Agent 发送消息", "Message the Agent")}
+                        disabled={activeWorkspaceLifecycleOperationRunning}
+                        spellCheck={appearance.spellCheck}
+                        onPaste={(event) => {
+                          const files = Array.from(event.clipboardData.files);
+                          const text = event.clipboardData.getData("text/plain");
+                          if (files.length) {
+                            // A clipboard carrying both keeps its text; the files ride along.
+                            if (!text) event.preventDefault();
+                            void addComposerAttachments(activeConversation.id, files);
+                            return;
+                          }
+                          // A long paste folds into a tag the send expands again,
+                          // so the box stays readable and the model reads it all.
+                          composerPasteTags.onPaste(event);
+                        }}
+                        onChange={(event) => {
+                          const draft = event.target.value;
+                          const conversationId = activeConversation.id;
+                          composerController.updateDrafts((current) => ({ ...current, [conversationId]: draft }));
+                        }}
+                        onKeyDown={(event) => {
+                          // Send and newline shortcuts are configurable but mutually exclusive, so checking send first cannot trigger both.
+                          if (isImeKeyEvent(event.nativeEvent)) return;
+                          if (matchesEvent(appearance.sendShortcut, event.nativeEvent)) {
+                            event.preventDefault();
+                            void sendActiveComposer();
+                            return;
+                          }
+                          if (matchesEvent(appearance.newlineShortcut, event.nativeEvent)) {
+                            // Let the textarea handle newline insertion and its undo stack; unmatched keys also pass through.
+                            return;
+                          }
+                        }}
+                      />
+                    </div>
                     <div className="composer__send">
                       {activeModelRunning && activeComposerQueuesMessage && (
                         // Queuing repurposes the primary button, but a running conversation must retain a visible stop control.
@@ -9113,7 +9767,9 @@ function App() {
                         type="button"
                         className={`send-button${(activeModelRunning && !activeComposerQueuesMessage) ? " send-button--stop" : ""}`}
                         aria-label={activeComposerQueuesMessage
-                          ? t("加入排队消息", "Queue message")
+                          ? activeQuestionPending
+                            ? t("发送", "Send")
+                            : t("加入排队消息", "Queue message")
                           : activeModelRunning
                             ? activeModelStopping
                               ? t("正在停止生成", "Stopping generation")
@@ -9143,7 +9799,9 @@ function App() {
                       triggerLabel={t("安全层级：{name}", "Security level: {name}", {
                         name: activeSecurityLevelLabel
                       })}
-                      disabled={Boolean(modelRunSummaries[activeConversation.id]) || activeWorkspaceLifecycleOperationRunning}
+                      /* Movable at any time, a streaming turn and a waiting approval
+                         card included: the host moves the running turn's level at once. */
+                      disabled={activeWorkspaceLifecycleOperationRunning}
                       menuLabel={t("安全层级", "Security level")}
                       menuWidth={256}
                       sections={[{
@@ -9151,7 +9809,6 @@ function App() {
                         items: SECURITY_LEVEL_OPTIONS.map((option) => ({
                           id: option,
                           label: securityLevelLabelFor(option),
-                          icon: <ShieldCheck size={14} />,
                           checked: activeConversation.settings.securityLevel === option,
                           onSelect: () => {
                             // Security options are conversation-only settings, not preset composition; update them directly without detaching a preset.
@@ -9163,6 +9820,35 @@ function App() {
                         }))
                       }]}
                     />
+                    {/* Plan mode is a switch of its own, not a level: on, the model plans and
+                       asks for approval before it changes anything; an approved plan turns
+                       it off. Movable at any time, a streaming turn included — the next
+                       round boundary tells the model. */}
+                    <button
+                      type="button"
+                      className="composer-option composer-plan-toggle"
+                      aria-pressed={Boolean(activeConversation.settings.planModeEnabled)}
+                      disabled={activeWorkspaceLifecycleOperationRunning
+                        || (!activeConversation.settings.planModeEnabled && activePlanModeLocked)}
+                      title={!activeConversation.settings.planModeEnabled && activePlanModeLocked
+                        ? t(
+                          "当前模型不能在对话中途加入工具，而计划模式要加入 plan 和 exit_plan_mode；换个模型或开新对话",
+                          "The current model cannot take tools mid-conversation, and plan mode adds plan and exit_plan_mode; switch models or start a new conversation"
+                        )
+                        : activeConversation.settings.planModeEnabled
+                          ? t("计划模式已开启：模型先写计划、请你批准，批准后自动关闭", "Plan mode is on: the model writes a plan and asks you to approve it; approval turns it off")
+                          : t("开启计划模式：模型改动任何东西之前先写计划并请你批准", "Turn on plan mode: the model writes a plan and asks you to approve it before changing anything")}
+                      onClick={() => {
+                        const enabled = !activeConversation.settings.planModeEnabled;
+                        updateActiveConversation((conversation) => ({
+                          ...conversation,
+                          settings: { ...conversation.settings, planModeEnabled: enabled }
+                        }));
+                      }}
+                    >
+                      <span className="composer-option__label">{t("计划", "Plan")}</span>
+                      <span className="composer-plan-toggle__dot" aria-hidden="true" />
+                    </button>
                     <ComposerAddFiles
                       key={activeConversation.id}
                       disabled={activeWorkspaceLifecycleOperationRunning}
@@ -9187,7 +9873,6 @@ function App() {
                         ? t("没有匹配的模型", "No matching models")
                         : t("没有已启用的模型", "No enabled models")}
                       sections={enabledModelSections}
-                      openSignal={modelMenuOpenSignal}
                     />
                     <PopoverMenu
                       triggerClassName="composer-option"
@@ -9201,10 +9886,9 @@ function App() {
                       align="end"
                       sections={[{
                         id: "effort",
-                        items: reasoningEffortOptions.map((effort) => ({
+                        items: REASONING_EFFORTS.map((effort) => ({
                           id: effort,
-                          label: reasoningEffortLabel(effort),
-                          icon: <Gauge size={14} />,
+                          label: effort,
                           checked: activeReasoningEffort === effort,
                           onSelect: () => {
                             const changedAt = new Date().toISOString();
@@ -9249,6 +9933,12 @@ function App() {
                           skills: activeConversation.settings.skillIds.length,
                           agentRoles: activeConversation.settings.agentDefinitions.length
                         }}
+                        autoCompact={document.globalSettings.autoCompact}
+                        onAutoCompactChange={(autoCompact) => handleGlobalSettingsChange(
+                          (current) => ({ ...current, autoCompact })
+                        )}
+                        autoCompactUnavailable={Boolean(activeModelChoice
+                          && !appendsTools(activeModelChoice.provider, activeModelChoice.model))}
                       />
                     )}
                   </div>
@@ -9281,61 +9971,9 @@ function App() {
             />
           </Dialog>
         )}
-
-        {toolExposurePrompt && activeConversation
-          && toolExposurePrompt.conversationId === activeConversation.id && (
-          <Dialog
-            title={t("这个模型接不住中途新增的工具", "This model will not take tools added mid-conversation")}
-            description={t(
-              "{name} 用的协议，在一段对话开始之后就不再接受更宽的工具集。",
-              "The protocol {name} speaks will not accept a wider tool set once a conversation has started.",
-              { name: activeModelLabel }
-            )}
-            onClose={() => setToolExposurePrompt(null)}
-            width="460px"
-            footer={(
-              <>
-                <button
-                  type="button"
-                  className="button"
-                  onClick={() => {
-                    setToolExposurePrompt(null);
-                    openConversationSettings();
-                  }}
-                >{t("打开对话设置", "Open conversation settings")}</button>
-                <button
-                  type="button"
-                  className="button"
-                  onClick={() => {
-                    setToolExposurePrompt(null);
-                    setModelMenuOpenSignal((current) => current + 1);
-                  }}
-                >{t("换个模型", "Switch models")}</button>
-                <button
-                  type="button"
-                  className="button button--primary"
-                  onClick={() => {
-                    setToolExposurePrompt(null);
-                    saveActiveConversationComposition(
-                      settingsAtToolLockFloor(activeConversation.settings)
-                    );
-                    void sendActiveComposer(undefined, "locked");
-                  }}
-                >{t("关掉再发送", "Turn them off and send")}</button>
-              </>
-            )}
-          >
-            <p className="confirm-copy">{t(
-              "上一轮之后新开的这些会被关掉，对话回到模型已经拿到的那套工具。消息还没有发出去。",
-              "What was opened since the last round will be turned back off, returning this conversation to the tool set the model already has. Nothing has been sent yet."
-            )}</p>
-            {toolExposureAdditionLabels.length > 0 && (
-              <ul className="confirm-list">
-                {toolExposureAdditionLabels.map((label) => <li key={label}>{label}</li>)}
-              </ul>
-            )}
-          </Dialog>
-        )}
+        {/* The preset's and the role's windows, opened from the conversation-settings
+            pane but mounted here, where global settings is. */}
+        <WindowLayerOutlet />
 
         {draftRetargetPrompt && (
           <Dialog
@@ -9431,57 +10069,6 @@ function App() {
           </Dialog>
         )}
 
-        {saveAsPresetDialog && activeConversation && (
-          <Dialog
-            title={t("另存为预设", "Save as preset")}
-            description={t(
-              "把当前对话的系统提示词、启用工具、工具描述与技能/MCP/钩子选择保存为可复用模板。之后修改任一方不会影响另一方。",
-              "Save this conversation's system prompt, enabled tools, tool instructions, and skill/MCP/hook selections as a reusable template. Changes to either one won't affect the other."
-            )}
-            onClose={() => setSaveAsPresetDialog(null)}
-            footer={(
-              <>
-                <button type="button" className="button button--ghost" onClick={() => setSaveAsPresetDialog(null)}>
-                  {t("取消", "Cancel")}
-                </button>
-                <button
-                  type="button"
-                  className="button button--primary"
-                  disabled={!saveAsPresetDialog.name.trim()}
-                  onClick={() => {
-                    saveActiveConversationAsPreset(
-                      saveAsPresetDialog.name.trim(),
-                      saveAsPresetDialog.description.trim()
-                    );
-                    setSaveAsPresetDialog(null);
-                  }}
-                >
-                  {t("保存为预设", "Save as preset")}
-                </button>
-              </>
-            )}
-          >
-            <label className="field">
-              <span className="field__label">{t("预设名称", "Preset name")}</span>
-              <input
-                className="input"
-                autoFocus
-                value={saveAsPresetDialog.name}
-                onChange={(event) => setSaveAsPresetDialog((current) => current && ({ ...current, name: event.target.value }))}
-                placeholder={t("例如：代码评审", "e.g. Code review")}
-              />
-            </label>
-            <label className="field">
-              <span className="field__label">{t("说明（可选）", "Description (optional)")}</span>
-              <input
-                className="input"
-                value={saveAsPresetDialog.description}
-                onChange={(event) => setSaveAsPresetDialog((current) => current && ({ ...current, description: event.target.value }))}
-              />
-            </label>
-          </Dialog>
-        )}
-
         {workspaceDialogOpen && <ProjectDialog
           mode="create"
           sshMachines={document.globalSettings.executionEnvironments.sshMachines}
@@ -9522,16 +10109,20 @@ function App() {
           onClose={() => setMachineSettings(null)}
         />}
 
-        {workspaceEnvEditor && <WorkspaceEnvironmentDialog
-          title={t("{name} 的环境变量", "Environment variables for {name}", { name: workspaceEnvEditor.name })}
+        {workspaceSettings && <WorkspaceSettingsDialog
+          name={workspaceSettings.name}
+          machine={workspaceSettings.machine}
+          path={workspaceSettings.path}
+          sshMachines={document.globalSettings.executionEnvironments.sshMachines}
           vars={document.globalSettings.executionEnvironments.envVars[
-            workspaceEnvKey(workspaceEnvEditor.machine, workspaceEnvEditor.path)
+            workspaceEnvKey(workspaceSettings.machine, workspaceSettings.path)
           ] ?? {}}
-          onSave={(vars) => {
-            saveWorkspaceEnvVars(workspaceEnvEditor.machine, workspaceEnvEditor.path, vars);
-            setWorkspaceEnvEditor(null);
-          }}
-          onClose={() => setWorkspaceEnvEditor(null)}
+          sandbox={document.globalSettings.executionEnvironments.sandboxes?.[
+            workspaceEnvKey(workspaceSettings.machine, workspaceSettings.path)
+          ]}
+          onChangeVars={(vars) => saveWorkspaceEnvVars(workspaceSettings.machine, workspaceSettings.path, vars)}
+          onChangeSandbox={(sandbox) => saveWorkspaceSandbox(workspaceSettings.machine, workspaceSettings.path, sandbox)}
+          onClose={() => setWorkspaceSettings(null)}
         />}
 
         {remoteWorkspacePicker && <RemoteDirectoryPicker
@@ -9553,6 +10144,7 @@ function App() {
         />}
       </div>
       </WindowFrame>
+      </WindowLayerProvider>
     </CommonErrorBoundary>
   );
 }

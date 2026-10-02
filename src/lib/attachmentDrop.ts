@@ -319,10 +319,3 @@ export function useAttachmentDropZone(
     items: current.items
   };
 }
-
-/** Test seam: forget every drag and zone. */
-export function resetAttachmentDropForTests(): void {
-  zones.clear();
-  snapshot = IDLE;
-  dragGeneration += 1;
-}

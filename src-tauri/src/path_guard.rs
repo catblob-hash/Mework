@@ -31,6 +31,7 @@ impl ExecutionScope {
         }
     }
 
+    #[cfg(test)]
     pub fn workspace_only(workspace: &Path) -> Self {
         Self::restricted([workspace.to_path_buf()])
     }
@@ -83,6 +84,7 @@ pub fn canonical_workspace(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+#[cfg(test)]
 pub fn resolve_existing(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
     resolve_existing_with_scope(
         workspace,

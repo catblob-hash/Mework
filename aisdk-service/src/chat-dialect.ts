@@ -66,7 +66,11 @@ function normalizeChatChunk(chunk: ChatChunk, indexes: ToolCallIndexState): bool
             ...(hasName ? { id: `legacy_${streamId}`, type: "function" } : {}),
             function: {
               ...(hasName ? { name: legacy.name } : {}),
-              ...(typeof legacy.arguments === "string" ? { arguments: legacy.arguments } : {}),
+              // A relay that sends the arguments as an object rather than as
+              // JSON text still sent them; they are kept, not dropped.
+              ...(typeof legacy.arguments === "string"
+                ? { arguments: legacy.arguments }
+                : legacy.arguments != null ? { arguments: JSON.stringify(legacy.arguments) } : {}),
             },
           },
         ];
@@ -314,6 +318,105 @@ function retryWithoutStreamOptionsFetch(
 }
 
 /**
+ * What an endpoint answered to a `reasoning_effort` it rejected, keyed by request
+ * URL, model and the value sent: the value to send instead, or `null` for none.
+ * Kept for the process, like `streamOptionsRejectors`, so the step down costs one
+ * wasted round trip per endpoint, model and level rather than one per turn.
+ */
+const reasoningEffortFallbacks = new Map<string, string | null>();
+
+/** The levels `reasoning.ts` sends, lowest first. */
+const EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
+
+function reasoningEffortOf(body: string): { model: string; effort: string } | null {
+  if (!body.includes('"reasoning_effort"')) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const { model, reasoning_effort: effort } = parsed as Record<string, unknown>;
+  return typeof effort === "string" ? { model: typeof model === "string" ? model : "", effort } : null;
+}
+
+/** `body` with `reasoning_effort` set to `effort`, or removed for `null`. */
+function withReasoningEffort(body: string, effort: string | null): string {
+  const parsed = JSON.parse(body) as Record<string, unknown>;
+  if (effort === null) delete parsed.reasoning_effort;
+  else parsed.reasoning_effort = effort;
+  return JSON.stringify(parsed);
+}
+
+/** Whether a rejection names the field, rather than being an unrelated 4xx. */
+function blamesReasoningEffort(status: number, body: string): boolean {
+  if (status !== 400 && status !== 422) return false;
+  return /reasoning[_ ]effort/i.test(body);
+}
+
+/**
+ * The value to send after `sent` was rejected with `message`: of the levels the
+ * message names other than `sent` ("Supported values are: 'low', 'medium' and
+ * 'high'", "Expected 'xhigh' | 'high' | …"), the highest not above `sent`, else
+ * the lowest. `null` when it names none, as in "not supported with this model".
+ */
+function effortNamedIn(message: string, sent: string): string | null {
+  const named = new Set<string>();
+  for (const [level] of message.matchAll(/\b(?:low|medium|high|xhigh|max)\b/gi)) {
+    if (level.toLowerCase() !== sent) named.add(level.toLowerCase());
+  }
+  const ranked = EFFORT_LADDER.filter((level) => named.has(level));
+  const sentRank = EFFORT_LADDER.indexOf(sent);
+  const below = ranked.filter((level) => EFFORT_LADDER.indexOf(level) < sentRank);
+  return below.at(-1) ?? ranked[0] ?? null;
+}
+
+/**
+ * Retry a Chat Completions request whose `reasoning_effort` the endpoint
+ * rejected, with a value its rejection names, or without the field.
+ *
+ * A Chat Completions endpoint can be anything, and no level is accepted by all
+ * of them: OpenAI refuses a level a model lacks, OpenRouter's top-level enum has
+ * no `max`, a vLLM chat template may refuse `high`, and a model without
+ * reasoning refuses the field outright. `reasoning.ts` sends the level asked
+ * for; this steps down to what the endpoint says it takes. It fires only when
+ * the rejection names the field, so any other `400` is surfaced as itself.
+ */
+function retryRejectedReasoningEffortFetch(
+  inner: typeof globalThis.fetch,
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const requestUrl = requestUrlOf(input);
+    let body = init && typeof init.body === "string" ? init.body : null;
+    const fallbackKey = (sent: { model: string; effort: string }) => `${requestUrl}\n${sent.model}\n${sent.effort}`;
+    // Start from what this endpoint already answered, through its chain of
+    // step-downs (bounded: an endpoint that names levels in a circle stops).
+    let sent = body ? reasoningEffortOf(body) : null;
+    for (let step = 0; body && sent && step < EFFORT_LADDER.length && reasoningEffortFallbacks.has(fallbackKey(sent)); step += 1) {
+      const instead = reasoningEffortFallbacks.get(fallbackKey(sent)) ?? null;
+      body = withReasoningEffort(body, instead);
+      sent = instead === null ? null : { model: sent.model, effort: instead };
+    }
+    for (let attempt = 0; ; attempt += 1) {
+      const sending = body === null ? init : { ...init, body };
+      const response = await inner(input, sending);
+      const sent = body ? reasoningEffortOf(body) : null;
+      if (!body || !sent || response.ok || response.status >= 500 || attempt >= EFFORT_LADDER.length) return response;
+      // Reading the body consumes it, so rebuild an equivalent response for the
+      // path where no retry happens.
+      const text = await response.text();
+      if (!blamesReasoningEffort(response.status, text)) {
+        return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+      }
+      const instead = effortNamedIn(text, sent.effort);
+      if (requestUrl) reasoningEffortFallbacks.set(fallbackKey(sent), instead);
+      body = withReasoningEffort(body, instead);
+    }
+  };
+}
+
+/**
  * SSE frame carrying one Chat Completions choice, derived from a whole message.
  *
  * `finish_reason` is copied, never invented: synthesizing `stop` for a body that
@@ -413,6 +516,6 @@ export function chatDialectFetch(inner: typeof globalThis.fetch = globalThis.fet
   return sseDialectFetch(
     makeChatLineRewriter,
     backfillReasoningContentFromBody,
-    nonStreamingBodyAsSseFetch(retryWithoutStreamOptionsFetch(inner)),
+    nonStreamingBodyAsSseFetch(retryWithoutStreamOptionsFetch(retryRejectedReasoningEffortFetch(inner))),
   );
 }

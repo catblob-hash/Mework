@@ -122,15 +122,23 @@ function scrollableParent(element: Element): HTMLElement | null {
  * `scrollIntoView` scrolls every ancestor that can move, and `overflow: hidden`
  * boxes can: a jump inside the file pane would also slide the pane's own chrome
  * out from under its title bar.
+ *
+ * `nearest` moves the box only as far as the element needs to be wholly in it,
+ * and not at all when it already is, or when nothing scrolls it.
  */
-export function scrollIntoContainer(element: Element, block: "start" | "center" = "start"): void {
+export function scrollIntoContainer(element: Element, block: "start" | "center" | "nearest" = "start"): void {
   const container = scrollableParent(element);
   if (!container) {
-    element.scrollIntoView({ block });
+    if (block !== "nearest") element.scrollIntoView({ block });
     return;
   }
   const target = element.getBoundingClientRect();
   const frame = container.getBoundingClientRect();
+  if (block === "nearest") {
+    if (target.top < frame.top) container.scrollTop += target.top - frame.top;
+    else if (target.bottom > frame.bottom) container.scrollTop += Math.min(target.bottom - frame.bottom, target.top - frame.top);
+    return;
+  }
   const offset = block === "center"
     ? target.top - frame.top - (frame.height - target.height) / 2
     : target.top - frame.top - 8;

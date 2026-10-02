@@ -90,22 +90,8 @@ const tools: ToolDescriptor[] = [{
   dangerous: false,
   parameters: []
 }, {
-  name: "send_message",
-  label: "发送消息工具（不应出现）",
-  description: "",
-  category: "orchestration",
-  dangerous: false,
-  parameters: []
-}, {
-  name: "followup_task",
-  label: "追加任务工具（不应出现）",
-  description: "",
-  category: "orchestration",
-  dangerous: false,
-  parameters: []
-}, {
-  name: "todo",
-  label: "待办事项工具（不应出现）",
+  name: "task_wait",
+  label: "等待任务工具（不应出现）",
   description: "",
   category: "orchestration",
   dangerous: false,
@@ -119,8 +105,8 @@ const tools: ToolDescriptor[] = [{
   parameters: []
 }];
 
-// Keep the parent enabled so dependent child rows are rendered for the test.
-const conversationEnabledTools = ["read_file", "agent_spawn", "send_message", "todo", "workflow"];
+// Orchestration tools the conversation has on must still stay out of the role picker.
+const conversationEnabledTools = ["read_file", "agent_spawn", "task_wait", "workflow"];
 
 /* A role's template body never travels with the role: the host stores it and
    hands back the id it landed under. These stand in for that store. */
@@ -222,6 +208,12 @@ async function openPage(
   await user.click(within(rail).getByRole("button", { name: page }));
 }
 
+/** The tools page's entry in the rail, which trails the count of tools the role gets. */
+function toolsEntry(dialog: HTMLElement): HTMLElement {
+  const rail = within(dialog).getByRole("navigation", { name: "角色设置分类" });
+  return within(rail).getByRole("button", { name: /^工具/ });
+}
+
 function templateSummary(id: string, messageCount: number): ConversationTemplateSummary {
   return { id, name: "", messageCount, createdAt: "", updatedAt: "" };
 }
@@ -279,7 +271,7 @@ describe("AgentDefinitionSettings", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("lays the role out as a preset's window is: three pages down a rail, the save under it", async () => {
+  it("lays the role out as the global settings are: four pages down a rail, the save at its foot", async () => {
     const user = userEvent.setup();
     renderSettings([userDefinition()]);
 
@@ -287,25 +279,43 @@ describe("AgentDefinitionSettings", () => {
     // Named after the role, the way a preset's window is named after the preset.
     const dialog = screen.getByRole("dialog", { name: "reviewer" });
     const rail = within(dialog).getByRole("navigation", { name: "角色设置分类" });
+    expect(dialog.querySelector(".settings-layout > .settings-nav")).toBe(rail);
+    // The tools page trails the count of tools the role gets — here the one it
+    // inherits from the conversation.
     expect(within(rail).getAllByRole("button").map((button) => button.textContent))
-      .toEqual(["角色设置", "工具", "对话模板0", "保存角色"]);
+      .toEqual(["角色设置", "工具1", "高级工具", "对话模板0", "保存角色"]);
+    // Saving belongs to the window rather than to a page, so it is the rail's
+    // last thing, where a preset's window keeps its own.
+    expect(within(rail).getByRole("button", { name: "保存角色" }).parentElement)
+      .toBe(rail.lastElementChild);
+    // The rail names the page, so the page carries only its description.
+    expect(within(dialog).queryByRole("heading", { level: 3 })).toBeNull();
     // It opens on the role's own settings, and only those: the tool surface is
     // a page of its own.
     expect(within(dialog).getByRole("textbox", { name: "角色名称" })).toBeInTheDocument();
     expect(within(dialog).getByRole("combobox", { name: "执行模型" })).toBeInTheDocument();
-    expect(within(dialog).queryByText("启用工具")).toBeNull();
+    expect(dialog.querySelector('[data-tool-name="read_file"]')).toBeNull();
 
     await openPage(user, dialog, /^工具/);
-    expect(within(dialog).getByText("启用工具")).toBeInTheDocument();
+    // The list alone, with no heading row over it.
+    expect(dialog.querySelector('[data-tool-name="read_file"]')).not.toBeNull();
+    expect(within(dialog).queryByText("启用工具")).toBeNull();
     expect(within(dialog).queryByRole("textbox", { name: "角色名称" })).toBeNull();
-    // The conversation's own features page, minus what a role has no field for.
+    expect(within(dialog).queryByRole("button", { name: /^搜索提供商/ })).toBeNull();
+
+    // The conversation's own advanced tools page, minus what a role has no
+    // field for: the web backends are all that is left.
+    await openPage(user, dialog, /^高级工具/);
+    expect(dialog.querySelector('[data-tool-name="read_file"]')).toBeNull();
     expect(within(dialog).queryByRole("switch", { name: /联网搜索/ })).toBeNull();
+    expect(within(dialog).queryByRole("switch", { name: /计划模式/ })).toBeNull();
+    expect(within(dialog).getByRole("button", { name: /^搜索提供商：/ })).toBeInTheDocument();
     expect(within(dialog).queryByRole("switch", { name: /记忆/ })).toBeNull();
     expect(within(dialog).queryByRole("switch", { name: /应用数据目录/ })).toBeNull();
     expect(within(dialog).queryByRole("combobox", { name: "工具描述" })).toBeNull();
   });
 
-  it("edits the role's template on its own page and slides the presets in under the rail", async () => {
+  it("edits the role's template on its own page and offers the presets from its heading", async () => {
     const user = userEvent.setup();
     const onChange = renderSettings([userDefinition()], vi.fn(), [{
       id: "conversation_default",
@@ -328,20 +338,22 @@ describe("AgentDefinitionSettings", () => {
 
     await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
     const dialog = screen.getByRole("dialog", { name: "reviewer" });
-    // The presets belong to the template page, so they are not on the rail
-    // until that page is open.
-    expect(within(dialog).queryByText("从预设覆盖")).toBeNull();
+    // The presets belong to the template page, so they are not offered until
+    // that page is open.
+    expect(within(dialog).queryByRole("button", { name: "从预设覆盖" })).toBeNull();
 
     await openPage(user, dialog, /^对话模板/);
-    expect(within(dialog).getByText("从预设覆盖")).toBeInTheDocument();
-    const presets = within(dialog).getByRole("navigation", { name: "角色设置分类" });
+    const copy = within(dialog).getByRole("button", { name: "从预设覆盖" });
+    expect(copy.closest(".settings-page-heading")).not.toBeNull();
     // Edits are written as they land, as on a preset's page: no save of its own.
     expect(within(dialog).queryByRole("button", { name: /保存模板/ })).toBeNull();
+    await user.click(copy);
+    const presets = screen.getByRole("menu", { name: "从预设覆盖" });
     // A preset with no template has nothing to copy.
-    expect(within(presets).getByRole("button", { name: "用预设 空白 的对话模板覆盖" })).toBeDisabled();
+    expect(within(presets).getByRole("menuitem", { name: /^空白/ })).toBeDisabled();
 
     // The role's template is empty, so there is nothing to lose and nothing to ask.
-    await user.click(within(presets).getByRole("button", { name: "用预设 默认 的对话模板覆盖" }));
+    await user.click(within(presets).getByRole("menuitem", { name: /^默认/ }));
     expect(screen.queryByRole("dialog", { name: "覆盖对话模板？" })).toBeNull();
     expect(readTemplate).toHaveBeenCalledWith("template_preset");
     expect(writeTemplate).toHaveBeenCalledWith("", [
@@ -375,15 +387,19 @@ describe("AgentDefinitionSettings", () => {
     await openPage(user, dialog, /^对话模板/);
     expect(await within(dialog).findByText("角色自己的开场")).toBeInTheDocument();
 
-    const row = within(dialog).getByRole("button", { name: "用预设 默认 的对话模板覆盖" });
-    await user.click(row);
+    const copyFromDefault = async () => {
+      await user.click(within(dialog).getByRole("button", { name: "从预设覆盖" }));
+      await user.click(within(screen.getByRole("menu", { name: "从预设覆盖" }))
+        .getByRole("menuitem", { name: /^默认/ }));
+    };
+    await copyFromDefault();
     // Declining leaves the role's template exactly as it was.
     await user.click(within(screen.getByRole("dialog", { name: "覆盖对话模板？" }))
       .getByRole("button", { name: "取消" }));
     expect(writeTemplate).not.toHaveBeenCalled();
     expect(within(dialog).getByText("角色自己的开场")).toBeInTheDocument();
 
-    await user.click(row);
+    await copyFromDefault();
     const confirm = screen.getByRole("dialog", { name: "覆盖对话模板？" });
     expect(confirm).toHaveTextContent("已有 1 条消息");
     await user.click(within(confirm).getByRole("button", { name: "覆盖" }));
@@ -618,7 +634,7 @@ describe("AgentDefinitionSettings", () => {
     expect(saved.effort).toBe("high");
   });
 
-  it("selects tools by group and ends its heading with the way in to the docs", async () => {
+  it("selects tools by group and ends the page's line with the way in to the docs", async () => {
     const user = userEvent.setup();
     const existing = userDefinition({ tools: ["run_command"] });
     const onChange = renderSettings([existing]);
@@ -626,22 +642,26 @@ describe("AgentDefinitionSettings", () => {
     const dialog = screen.getByRole("dialog", { name: "reviewer" });
     await openPage(user, dialog, /^工具/);
 
-    /* The three bulk buttons that used to sit in this heading are gone. They
+    /* The three bulk buttons that used to sit over the list are gone. They
        acted on the whole catalogue at once, which is not how anyone picks a
-       tool surface; each group now carries its own pair, and the heading ends
-       the way the conversation's own tool picker ends — with the page that
-       explains what these entries are. */
+       tool surface; each group now carries its own pair. The heading row they
+       sat in is gone too: the line that says what the page is for ends the way
+       the conversation's own does — with the page that explains what these
+       entries are — and the rail carries the count. */
     for (const gone of ["全部启用", "全部关闭", "继承对话设置"]) {
       expect(within(dialog).queryByRole("button", { name: gone })).toBeNull();
     }
-    expect(within(dialog).getByRole("link", { name: "配置说明文档" })).toBeInTheDocument();
+    expect(within(dialog).queryByText("启用工具")).toBeNull();
+    expect(within(dialog).getByRole("link", { name: "配置说明文档" }).parentElement)
+      .toHaveClass("settings-page-heading");
+    expect(toolsEntry(dialog)).toHaveTextContent(/^工具1$/);
 
     await user.click(within(dialog).getByRole("button", { name: "全不选Shell" }));
-    expect(within(dialog).getByText("0 / 2 个已选")).toBeInTheDocument();
+    expect(toolsEntry(dialog)).toHaveTextContent(/^工具0$/);
 
     await user.click(within(dialog).getByRole("button", { name: "全选文件与搜索" }));
     await user.click(within(dialog).getByRole("button", { name: "全选Shell" }));
-    expect(within(dialog).getByText("2 / 2 个已选")).toBeInTheDocument();
+    expect(toolsEntry(dialog)).toHaveTextContent(/^工具2$/);
     await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange).toHaveBeenCalledWith([{
@@ -681,7 +701,7 @@ describe("AgentDefinitionSettings", () => {
       within(dialog).getByRole("textbox", { name: "角色名称" }),
       "searcher"
     );
-    await openPage(user, dialog, /^工具/);
+    await openPage(user, dialog, /^高级工具/);
 
     /* A menu, not a `<select>`: the same control the conversation uses, where
        the native row can open a second step. Its panel is portaled to the body,
@@ -720,7 +740,7 @@ describe("AgentDefinitionSettings", () => {
       within(dialog).getByRole("textbox", { name: "角色名称" }),
       "shaper"
     );
-    await openPage(user, dialog, /^工具/);
+    await openPage(user, dialog, /^高级工具/);
 
     const resultCount = within(dialog).getByRole("spinbutton", { name: "结果数" });
     const compression = within(dialog).getByRole("spinbutton", { name: "结果压缩" });
@@ -751,19 +771,17 @@ describe("AgentDefinitionSettings", () => {
     // template excludes them.
     for (const label of [
       "子代理工具（不应出现）",
-      "发送消息工具（不应出现）",
-      "追加任务工具（不应出现）",
-      "待办事项工具（不应出现）",
+      "等待任务工具（不应出现）",
       "工作流工具（不应出现）"
     ]) {
       expect(within(dialog).queryByText(label)).not.toBeInTheDocument();
     }
-    for (const name of ["agent_spawn", "send_message", "followup_task", "todo", "workflow"]) {
+    for (const name of ["agent_spawn", "task_wait", "workflow"]) {
       expect(dialog.querySelector(`[data-tool-name="${name}"]`)).not.toBeInTheDocument();
     }
     expect(dialog.querySelector('[data-tool-category="orchestration"]')).not.toBeInTheDocument();
     // Inherited conversation settings must not reintroduce orchestration tools.
-    expect(within(dialog).getByText("跟随对话设置：本对话启用哪些，这个角色就有哪些"))
+    expect(within(dialog).getByText(/跟随对话设置：本对话启用哪些，这个角色就有哪些/))
       .toBeInTheDocument();
     expect(dialog.querySelectorAll('[data-tool-name]')).toHaveLength(2);
   });
@@ -773,22 +791,22 @@ describe("AgentDefinitionSettings", () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     renderSettings(
-      [userDefinition({ tools: ["agent_spawn", "read_file", "todo"] })],
+      [userDefinition({ tools: ["agent_spawn", "read_file", "task_wait"] })],
       onChange
     );
     await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
     const dialog = screen.getByRole("dialog", { name: "reviewer" });
     await openPage(user, dialog, /^工具/);
 
-    expect(within(dialog).getByText("1 / 2 个已选")).toBeInTheDocument();
+    expect(toolsEntry(dialog)).toHaveTextContent(/^工具1$/);
 
     // Changing a visible tool must preserve hidden stale names.
     await user.click(within(dialog).getByRole("button", { name: "运行命令已关闭" }));
-    expect(within(dialog).getByText("2 / 2 个已选")).toBeInTheDocument();
+    expect(toolsEntry(dialog)).toHaveTextContent(/^工具2$/);
     await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
 
     expect(onChange.mock.calls.at(-1)![0][0].tools)
-      .toEqual(["agent_spawn", "read_file", "run_command", "todo"]);
+      .toEqual(["agent_spawn", "read_file", "run_command", "task_wait"]);
   });
 
   it("opens a new role on inherit for everything it can follow the caller on", async () => {
@@ -799,15 +817,16 @@ describe("AgentDefinitionSettings", () => {
 
     expect(within(dialog).getByRole("combobox", { name: "执行模型" })).toHaveValue("inherit");
     expect(within(dialog).getByRole("combobox", { name: "推理强度" })).toHaveValue("inherit");
+    // Tools too: the line that says what the page is for says it is following.
     await openPage(user, dialog, /^工具/);
+    expect(within(dialog).getByText(/跟随对话设置：本对话启用哪些，这个角色就有哪些/))
+      .toBeInTheDocument();
+    await openPage(user, dialog, /^高级工具/);
     expect(within(dialog).getByRole("button", { name: "搜索提供商：跟随对话设置" }))
       .toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "抓取提供商：跟随对话设置" }))
       .toBeInTheDocument();
     expect(within(dialog).getByRole("combobox", { name: "域名过滤" })).toHaveValue("inherit");
-    // Tools too: the heading says it is following rather than reporting a count.
-    expect(within(dialog).getByText("跟随对话设置：本对话启用哪些，这个角色就有哪些"))
-      .toBeInTheDocument();
   });
 
   it("saves a role's own fetch backend and domain rules", async () => {
@@ -816,7 +835,7 @@ describe("AgentDefinitionSettings", () => {
     const onChange = renderSettings([existing]);
     await user.click(screen.getByRole("button", { name: "设置角色 reviewer" }));
     const dialog = screen.getByRole("dialog", { name: "reviewer" });
-    await openPage(user, dialog, /^工具/);
+    await openPage(user, dialog, /^高级工具/);
 
     await user.click(within(dialog).getByRole("button", { name: "抓取提供商：跟随对话设置" }));
     await user.click(within(screen.getByRole("menu", { name: "抓取提供商" }))

@@ -222,10 +222,10 @@ describe("agentDefinitions", () => {
     const previous = definition({ revision: 7 });
     expect(buildUserAgentDefinition({
       ...userAgentDefinitionDraft(previous),
-      effort: "xhigh"
+      effort: "extra"
     }, previous)).toMatchObject({
       revision: 8,
-      effort: "xhigh"
+      effort: "extra"
     });
     expect(buildUserAgentDefinition(
       userAgentDefinitionDraft(previous),

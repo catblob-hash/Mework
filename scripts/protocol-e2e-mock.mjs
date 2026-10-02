@@ -122,25 +122,18 @@ const IMAGE_USER_PLACEHOLDERS = {
   anthropic: "[Image #7]"
 };
 
-const TODO_SUBJECTS = {
-  openai_chat: "MEWORK_PROTOCOL_E2E_TODO:openai_chat",
-  openai_responses: "MEWORK_PROTOCOL_E2E_TODO:openai_responses",
-  anthropic: "MEWORK_PROTOCOL_E2E_TODO:anthropic"
-};
-
-const TODO_DESCRIPTIONS = {
-  openai_chat: "Create the OpenAI Chat protocol E2E state-tool task.",
-  openai_responses: "Create the OpenAI Responses protocol E2E state-tool task.",
-  anthropic: "Create the Anthropic Messages protocol E2E state-tool task."
-};
-
-function todoCreateInput(protocol) {
-  return {
-    action: "create",
-    subject: TODO_SUBJECTS[protocol],
-    description: TODO_DESCRIPTIONS[protocol]
-  };
-}
+// Every protocol proves one host-side tool round trip with `task_list`. It takes
+// no arguments, needs no approval and settles inside the run loop, and the host
+// derives it for any conversation that enables a task producer (`agent_spawn`,
+// `workflow`, a shell or `preview_start`: `TASK_PRODUCING_TOOL_NAMES` in
+// src-tauri/src/agents.rs), which the default conversation preset does. The
+// E2E conversation starts no task, so the result is the built-in profile's
+// `task.list_empty` text (src-tauri/src/prompt_profile/english.rs). The call
+// carries no input to tell the protocols apart, so each earlier protocol's
+// exchange is found in later history by the call id this mock minted for it.
+const PROBE_TOOL = "task_list";
+const PROBE_ARGUMENTS = "{}";
+const TASK_LIST_EMPTY_OUTPUT = "This conversation has no tasks yet.";
 
 class ValidationError extends Error {
   constructor(code) {
@@ -289,39 +282,24 @@ function hasExactPureUserImage(body, wireProtocol, fixtureProtocol) {
   return exactPureUserImageMatches(body, wireProtocol, fixtureProtocol).length === 1;
 }
 
-function todoCreateResultMatches(value, subject) {
-  const results = isObject(value) ? [value] : [];
-  for (const text of collectStrings(value)) {
-    try {
-      results.push(JSON.parse(text));
-    } catch {
-      // Provider metadata and tool image bridges are not JSON tool results.
-    }
-  }
-  return results.some((result) => {
-    const task = result?.task;
-    return isObject(result)
-      && Object.keys(result).length === 1
-      && isObject(task)
-      && Object.keys(task).sort().join("\n") === ["id", "subject"].join("\n")
-      && typeof task.id === "string"
-      && /^task-[1-9][0-9]*$/.test(task.id)
-      && task.subject === subject;
-  });
+function taskListResultMatches(value) {
+  return collectStrings(value).some((text) => text.trim() === TASK_LIST_EMPTY_OUTPUT);
 }
 
-function chatTodoCreateExchange(body, subject, description, expectedCallId) {
+function isProbeInput(value) {
+  const input = parseArguments(value);
+  return Boolean(input) && Object.keys(input).length === 0;
+}
+
+function chatTaskListExchange(body, callId) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   for (const message of messages) {
     if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
     for (const call of message.tool_calls) {
-      const callId = call?.id;
-      const input = parseArguments(call?.function?.arguments);
-      if (call?.function?.name !== "todo" || input?.action !== "create"
-        || input?.subject !== subject || input?.description !== description) continue;
-      if (expectedCallId && callId !== expectedCallId) continue;
+      if (call?.id !== callId || call?.function?.name !== PROBE_TOOL
+        || !isProbeInput(call?.function?.arguments)) continue;
       if (messages.some((candidate) => candidate?.role === "tool"
-        && candidate.tool_call_id === callId && todoCreateResultMatches(candidate.content, subject))) return true;
+        && candidate.tool_call_id === callId && taskListResultMatches(candidate.content))) return true;
     }
   }
   return false;
@@ -807,62 +785,42 @@ function exactImageHistoryExchanges(body, wireProtocol, historyProtocol, expecte
   return present;
 }
 
-function responsesTodoCreateExchange(body, subject, description, expectedCallId) {
+function responsesTaskListExchange(body, callId) {
   const input = Array.isArray(body.input) ? body.input : [];
   for (const call of input) {
-    const parsed = parseArguments(call?.arguments);
-    if (call?.type !== "function_call" || call?.name !== "todo"
-      || parsed?.action !== "create" || parsed?.subject !== subject
-      || parsed?.description !== description) continue;
-    if (expectedCallId && call.call_id !== expectedCallId) continue;
+    if (call?.type !== "function_call" || call?.call_id !== callId || call?.name !== PROBE_TOOL
+      || !isProbeInput(call?.arguments)) continue;
     if (input.some((candidate) => candidate?.type === "function_call_output"
-      && candidate.call_id === call.call_id && todoCreateResultMatches(candidate.output, subject))) return true;
+      && candidate.call_id === callId && taskListResultMatches(candidate.output))) return true;
   }
   return false;
 }
 
-function anthropicTodoCreateExchange(body, subject, description, expectedCallId) {
+function anthropicTaskListExchange(body, callId) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const toolResults = messages.flatMap((message) => Array.isArray(message?.content)
     ? message.content.filter((block) => block?.type === "tool_result") : []);
   for (const message of messages) {
     if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
     for (const call of message.content) {
-      if (call?.type !== "tool_use" || call?.name !== "todo"
-        || call?.input?.action !== "create" || call?.input?.subject !== subject
-        || call?.input?.description !== description) continue;
-      if (expectedCallId && call.id !== expectedCallId) continue;
-      if (toolResults.some((result) => result.tool_use_id === call.id
-        && result.is_error !== true && todoCreateResultMatches(result.content, subject))) return true;
+      if (call?.type !== "tool_use" || call?.id !== callId || call?.name !== PROBE_TOOL
+        || !isProbeInput(call?.input)) continue;
+      if (toolResults.some((result) => result.tool_use_id === callId
+        && result.is_error !== true && taskListResultMatches(result.content))) return true;
     }
   }
   return false;
 }
 
-function todoDescriptionForSubject(subject) {
-  const protocol = Object.entries(TODO_SUBJECTS)
-    .find(([, candidate]) => candidate === subject)?.[0];
-  return protocol ? TODO_DESCRIPTIONS[protocol] : null;
-}
-
-function hasTodoCreateExchange(body, protocol, subject, expectedCallId) {
-  const description = todoDescriptionForSubject(subject);
-  if (!description) return false;
+function hasTaskListExchange(body, protocol, callId) {
+  if (!callId) return false;
   if (protocol === "openai_chat") {
-    return chatTodoCreateExchange(body, subject, description, expectedCallId);
+    return chatTaskListExchange(body, callId);
   }
   if (protocol === "openai_responses") {
-    return responsesTodoCreateExchange(body, subject, description, expectedCallId);
+    return responsesTaskListExchange(body, callId);
   }
-  return anthropicTodoCreateExchange(body, subject, description, expectedCallId);
-}
-
-function hasTodoTool(body, protocol) {
-  const tools = Array.isArray(body.tools) ? body.tools : [];
-  if (protocol === "openai_chat") {
-    return tools.some((tool) => tool?.type === "function" && tool?.function?.name === "todo");
-  }
-  return tools.some((tool) => tool?.name === "todo");
+  return anthropicTaskListExchange(body, callId);
 }
 
 function hasNamedTool(body, protocol, toolName) {
@@ -1333,7 +1291,7 @@ function validateEnvelope(body, protocol) {
   requireValue(typeof body.model === "string" && body.model.trim(), "missing_model");
   if (protocol === "openai_responses") requireValue(Array.isArray(body.input), "missing_input");
   else requireValue(Array.isArray(body.messages), "missing_messages");
-  requireValue(hasTodoTool(body, protocol), "todo_tool_not_enabled");
+  requireValue(hasNamedTool(body, protocol, PROBE_TOOL), "task_list_tool_not_enabled");
 }
 
 function validateImageEnvelope(body, protocol) {
@@ -1351,12 +1309,12 @@ function validateImageEnvelope(body, protocol) {
   );
 }
 
-function validatePriorHistory(body, wireProtocol, completedProtocols) {
-  for (const completed of completedProtocols) {
+function validatePriorHistory(body, wireProtocol, session) {
+  for (const completed of session.completed) {
     requireValue(containsText(body, FINAL_LABELS[completed]), `missing_${completed}_final`);
     requireValue(
-      hasTodoCreateExchange(body, wireProtocol, TODO_SUBJECTS[completed]),
-      `missing_${completed}_todo_exchange`
+      hasTaskListExchange(body, wireProtocol, session.protocols[completed].callId),
+      `missing_${completed}_task_list_exchange`
     );
   }
 }
@@ -1573,13 +1531,12 @@ function sseResponse(response, frames, delayMs = 0) {
 }
 
 function chatToolFrames(body, sequence, callId) {
-  const argumentsText = JSON.stringify(todoCreateInput("openai_chat"));
   return [
     dataEvent({
       id: `chatcmpl_e2e_${sequence}`, object: "chat.completion.chunk", created: 0, model: body.model,
       choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{
         index: 0, id: callId, type: "function",
-        function: { name: "todo", arguments: argumentsText }
+        function: { name: PROBE_TOOL, arguments: PROBE_ARGUMENTS }
       }] }, finish_reason: null }]
     }),
     dataEvent({
@@ -1627,7 +1584,7 @@ function chatNamedToolFrames(body, sequence, callId, name, input) {
 }
 
 function chatFinalFrames(body, sequence) {
-  const text = `${FINAL_LABELS.openai_chat} canonical history and todo continuation passed.`;
+  const text = `${FINAL_LABELS.openai_chat} canonical history and task_list continuation passed.`;
   return [
     dataEvent({
       id: `chatcmpl_e2e_${sequence}`, object: "chat.completion.chunk", created: 0, model: body.model,
@@ -1690,8 +1647,8 @@ function responseEnvelope(body, sequence, status, output) {
 
 function responsesToolFrames(body, sequence, callId) {
   const itemId = `fc_e2e_${sequence}`;
-  const argumentsText = JSON.stringify(todoCreateInput("openai_responses"));
-  const started = { type: "function_call", id: itemId, status: "in_progress", call_id: callId, name: "todo", arguments: "" };
+  const argumentsText = PROBE_ARGUMENTS;
+  const started = { type: "function_call", id: itemId, status: "in_progress", call_id: callId, name: PROBE_TOOL, arguments: "" };
   const completed = { ...started, status: "completed", arguments: argumentsText };
   return [
     namedEvent("response.created", { type: "response.created", response: responseEnvelope(body, sequence, "in_progress", []) }),
@@ -1733,7 +1690,7 @@ function responsesNamedToolFrames(body, sequence, callId, name, input) {
 }
 
 function responsesFinalFrames(body, sequence) {
-  const text = `${FINAL_LABELS.openai_responses} canonical history and todo continuation passed.`;
+  const text = `${FINAL_LABELS.openai_responses} canonical history and task_list continuation passed.`;
   const itemId = `msg_e2e_${sequence}`;
   const started = { type: "message", id: itemId, status: "in_progress", role: "assistant", content: [] };
   const part = { type: "output_text", text, annotations: [] };
@@ -1836,10 +1793,10 @@ function anthropicPauseFrames(body, sequence) {
 
 function anthropicToolFrames(body, sequence, callId) {
   return anthropicFrames(body, sequence, {
-    start: { type: "tool_use", id: callId, name: "todo", input: {} },
+    start: { type: "tool_use", id: callId, name: PROBE_TOOL, input: {} },
     delta: {
       type: "input_json_delta",
-      partial_json: JSON.stringify(todoCreateInput("anthropic"))
+      partial_json: PROBE_ARGUMENTS
     }
   }, "tool_use", 4);
 }
@@ -1855,7 +1812,7 @@ function anthropicNamedToolFrames(body, sequence, callId, name, input) {
 }
 
 function anthropicFinalFrames(body, sequence) {
-  const text = `${FINAL_LABELS.anthropic} pause_turn, canonical history and todo continuation passed.`;
+  const text = `${FINAL_LABELS.anthropic} pause_turn, canonical history and task_list continuation passed.`;
   return anthropicFrames(body, sequence, {
     start: { type: "text", text: "" },
     delta: { type: "text_delta", text }
@@ -2710,7 +2667,7 @@ function handleProtocol(response, body, protocol, sequence, headers = {}) {
     handleImageProtocol(response, body, protocol, sequence, session, frameDelayMs);
     return;
   }
-  validatePriorHistory(body, protocol, session.completed);
+  validatePriorHistory(body, protocol, session);
   const state = session.protocols[protocol];
 
   if (protocol === "openai_chat") {
@@ -2722,7 +2679,7 @@ function handleProtocol(response, body, protocol, sequence, headers = {}) {
       return;
     }
     requireValue(state.phase === "awaiting_tool_result", "unexpected_chat_phase");
-    requireValue(hasTodoCreateExchange(body, protocol, TODO_SUBJECTS[protocol], state.callId), "missing_chat_tool_result");
+    requireValue(hasTaskListExchange(body, protocol, state.callId), "missing_chat_tool_result");
     complete(session, protocol);
     sseResponse(response, chatFinalFrames(body, sequence), frameDelayMs);
     safeLog(sequence, protocol, "PASS", "final");
@@ -2738,7 +2695,7 @@ function handleProtocol(response, body, protocol, sequence, headers = {}) {
       return;
     }
     requireValue(state.phase === "awaiting_tool_result", "unexpected_responses_phase");
-    requireValue(hasTodoCreateExchange(body, protocol, TODO_SUBJECTS[protocol], state.callId), "missing_responses_tool_result");
+    requireValue(hasTaskListExchange(body, protocol, state.callId), "missing_responses_tool_result");
     complete(session, protocol);
     sseResponse(response, responsesFinalFrames(body, sequence), frameDelayMs);
     safeLog(sequence, protocol, "PASS", "final");
@@ -2760,7 +2717,7 @@ function handleProtocol(response, body, protocol, sequence, headers = {}) {
     return;
   }
   requireValue(state.phase === "awaiting_tool_result", "unexpected_anthropic_phase");
-  requireValue(hasTodoCreateExchange(body, protocol, TODO_SUBJECTS[protocol], state.callId), "missing_anthropic_tool_result");
+  requireValue(hasTaskListExchange(body, protocol, state.callId), "missing_anthropic_tool_result");
   complete(session, protocol);
   sseResponse(response, anthropicFinalFrames(body, sequence), frameDelayMs);
   safeLog(sequence, protocol, "PASS", "final");

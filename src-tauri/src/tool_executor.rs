@@ -247,6 +247,7 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
         handoff,
         profile,
         None,
+        None,
     )
 }
 
@@ -254,6 +255,9 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
 /// guards this turn runs under. Only the run loop has a guard to pass; every
 /// other caller keeps the unguarded contract, where `read` records nothing and
 /// `write`/`edit` check nothing.
+///
+/// `call_id` is the model's id for this call. A shell command files it on its
+/// task row, which is where the helper model's summary of the call finds it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_with_scope_and_attachments_guarded(
     request: ToolExecutionRequest,
@@ -265,6 +269,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    call_id: Option<&str>,
 ) -> VerifiedToolExecutionResponse {
     let started = Instant::now();
     let attachment_store = app_data.map(ImageAttachmentStore::new);
@@ -279,6 +284,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
         handoff,
         profile,
         file_guard,
+        call_id,
     )
     .unwrap_or_else(|error| Outcome {
         success: false,
@@ -418,6 +424,62 @@ impl From<crate::remote_files::RemoteOutcome> for Outcome {
     }
 }
 
+/// Plan mode's one restriction: `write` and `edit` leave a Git repository's
+/// content alone — a tracked file, or one inside a work tree that Git does not
+/// ignore, a new file included. Every other tool passes.
+///
+/// The run loop asks this before the call meets a hook's confirmation or an
+/// approval card, so the user is never asked to approve a write plan mode then
+/// refuses; nothing after it checks again, and a call the user replays by hand
+/// never comes here. The target resolves the way the tool will resolve it — the
+/// same workspace, the same scope — and one that does not resolve is refused
+/// with the error the tool would have given.
+pub(crate) fn plan_mode_refusal(
+    request: &ToolExecutionRequest,
+    scope: &ExecutionScope,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    profile: &PromptProfile,
+    cancel: &CancelSignal,
+) -> Option<String> {
+    if !matches!(request.tool_name.as_str(), "write" | "edit") {
+        return None;
+    }
+    check_repository_write(request, scope, workspaces, profile, cancel).err()
+}
+
+fn check_repository_write(
+    request: &ToolExecutionRequest,
+    scope: &ExecutionScope,
+    workspaces: &crate::workspace_set::WorkspaceSet,
+    profile: &PromptProfile,
+    cancel: &CancelSignal,
+) -> Result<(), String> {
+    // The workspace `run_tool` will act in.
+    let fallback;
+    let workspaces = if workspaces.is_empty() {
+        fallback = crate::workspace_set::WorkspaceSet::local_root(&request.workspace_path);
+        &fallback
+    } else {
+        workspaces
+    };
+    let selected = workspaces.select(workspace_argument(&request.input)?)?;
+    if !selected.is_local() {
+        let remote = remote_workspace(selected, scope, profile, cancel);
+        return crate::remote_files::check_repository_write(&remote, &request.input);
+    }
+    let workspace = Path::new(&selected.root);
+    let path = required_string(&request.input, "path", MAX_PATH_CHARS, false)?;
+    let file_path = if request.tool_name == "write" {
+        resolve_for_write_with_scope(workspace, &path, scope)?
+    } else {
+        resolve_existing_with_scope(workspace, &path, scope)?
+    };
+    if git_core::write_changes_repository(&file_path) {
+        return Err(crate::plan_mode::repository_write_refusal(&file_path.display().to_string()));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tool(
     request: &ToolExecutionRequest,
@@ -430,6 +492,7 @@ fn run_tool(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    call_id: Option<&str>,
 ) -> Result<Outcome, String> {
     // A caller that resolved no set is a caller with one workspace: its own
     // request path. Direct IPC, replayed timeline entries and tests all arrive
@@ -444,8 +507,15 @@ fn run_tool(
     // Which workspace this call acts in. A conversation with one workspace never
     // sees the parameter and every call lands on workspace 1; a conversation with
     // several has been told their numbers, and the number is the only thing that
-    // selects a machine — a path never does.
-    let selected = workspaces.select(workspace_argument(&request.input)?)?;
+    // selects a machine — a path never does. A tool that acts nowhere in
+    // particular (a preview page, the server list) is never offered the
+    // parameter, so a `workspace` it carries anyway means nothing and is ignored.
+    let requested_workspace = if crate::builtin_schemas::takes_a_workspace(&request.tool_name) {
+        workspace_argument(&request.input)?
+    } else {
+        None
+    };
+    let selected = workspaces.select(requested_workspace)?;
     // The host-side anchor. It is the primary workspace when that is local, and
     // the conversation's local scratch root when it is not: the preview and
     // browser tools are host-machine subsystems and need a real local directory
@@ -525,6 +595,7 @@ fn run_tool(
                 handoff,
                 profile,
                 file_guard,
+                call_id,
             )
         }
         "write" => run_write(workspace, &request.input, scope, profile, file_guard),
@@ -958,10 +1029,12 @@ fn preview_screenshot_outcome(
     // No extension: the store re-encodes every attachment into its own canonical container, so a
     // name claiming ".jpg" would disagree with the bytes the model is handed.
     let name = format!("preview-{}", Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
-    let image = store.import(&name, &bytes)?;
+    // Shrunk like any image the model sees. Nothing here maps pixels back to the page —
+    // preview_click takes element uids — so the size reported is the one delivered.
+    let image = store.import_compressed(&name, &bytes)?;
     let output = serde_json::to_string_pretty(&json!({
-        "width": capture.width,
-        "height": capture.height,
+        "width": image.width,
+        "height": image.height,
     }))
     .map_err(|error| format!("Failed to encode screenshot result: {error}"))?;
     Ok(Outcome::success_with_images(output, vec![image]))
@@ -1255,7 +1328,10 @@ fn run_preview_logs(
     {
         return Err("level must be one of \"all\", \"error\"".into());
     }
-    let lines = optional_u64(&request.input, "lines", 50)?;
+    // Zero lines asks for nothing; it is a filled-in placeholder, so the default stands.
+    let lines = optional_u64_value(&request.input, "lines")?
+        .filter(|lines| *lines > 0)
+        .unwrap_or(50);
     Ok(Outcome::success(crate::preview::logs(
         &state.preview_servers,
         &server.server.handle,
@@ -1414,10 +1490,8 @@ fn run_ls(
     profile: &PromptProfile,
 ) -> Result<String, String> {
     let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
-    let depth = optional_u64(input, "depth", 1)?;
-    if depth > 8 {
-        return Err("Recursive depth cannot exceed 8".into());
-    }
+    // Deeper than the deepest listing there is reads as asking for that one.
+    let depth = optional_u64(input, "depth", 1)?.min(8);
     let workspace = canonical_workspace(workspace)?;
     let root = resolve_existing_with_scope(&workspace, &path, scope)?;
     if !root.is_dir() {
@@ -1728,19 +1802,8 @@ fn run_lsp(
     state: &AppState,
     profile: &PromptProfile,
 ) -> Result<String, String> {
-    let input = &request.input;
-    let operation = required_string(input, "operation", 64, false)?;
-    let requested = required_string(input, "filePath", MAX_PATH_CHARS, false)?;
-    let line = optional_u64_value(input, "line")?
-        .ok_or_else(|| "line is required; it is 1-based, as shown in editors".to_owned())?;
-    let character = optional_u64_value(input, "character")?
-        .ok_or_else(|| "character is required; it is 1-based, as shown in editors".to_owned())?;
-    let query = match input.get("query") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(optional_string(input, "query", "", 1024, true)?),
-    };
-
-    let call = crate::lsp::parse_call(&operation, requested.clone(), line, character, query)?;
+    let call = crate::lsp::parse_input(&request.input)?;
+    let requested = call.requested_path.clone();
     let (_file, path) = crate::path_guard::secure_open_existing_file_with_scope(
         workspace,
         &requested,
@@ -1763,20 +1826,24 @@ fn run_lsp(
     )
 }
 
-/// The line range a `read` asked for, validated. `end_line` is `u64::MAX` when
-/// the call did not bound it.
+/// Most lines one `read` returns, whatever range it asked for.
+const READ_MAX_LINES: u64 = 5_001;
+
+/// The line range a `read` asked for, read for what it plainly means.
+/// `end_line` is `u64::MAX` when the call did not bound it.
+///
+/// Line numbers start at 1, so a `0` is a filled-in placeholder: `start_line: 0`
+/// starts at the top and `end_line: 0` sets no end. A range longer than one read
+/// returns is not refused either; [`slice_text_lines`] returns the first
+/// [`READ_MAX_LINES`] of it and says where to continue. Only an end before the
+/// start is refused — that one is a real contradiction.
 pub(crate) fn parse_read_range(input: &JsonObject) -> Result<(u64, u64), String> {
-    let start_line = optional_u64(input, "start_line", 1)?;
-    let end_line = optional_u64_value(input, "end_line")?;
-    if start_line == 0 {
-        return Err("start_line must begin at 1".into());
-    }
-    let end_line = end_line.unwrap_or(u64::MAX);
+    let start_line = optional_u64(input, "start_line", 1)?.max(1);
+    let end_line = optional_u64_value(input, "end_line")?
+        .filter(|end| *end > 0)
+        .unwrap_or(u64::MAX);
     if end_line < start_line {
         return Err("end_line cannot be less than start_line".into());
-    }
-    if end_line != u64::MAX && end_line.saturating_sub(start_line) > 5_000 {
-        return Err("A single read cannot exceed 5001 lines".into());
     }
     Ok((start_line, end_line))
 }
@@ -1796,7 +1863,8 @@ pub(crate) const READ_DEFAULT_LINES: usize = 2_000;
 pub(crate) const READ_MAX_BYTES: usize = 60 * 1024;
 
 /// Slices `content` to the validated range: [`READ_DEFAULT_LINES`] when no
-/// end was given, and never more than [`READ_MAX_BYTES`] of whole lines.
+/// end was given, never more than [`READ_MAX_LINES`] when one was, and never
+/// more than [`READ_MAX_BYTES`] of whole lines either way.
 /// Shared by the host and remote legs so a file reads the same whichever
 /// machine it is on.
 pub(crate) fn slice_text_lines(
@@ -1815,11 +1883,19 @@ pub(crate) fn slice_text_lines(
             whole_file: start_line == 1 && end_line == u64::MAX,
         });
     }
-    let wanted_end = if end_line == u64::MAX {
-        lines.len().min(start_index.saturating_add(READ_DEFAULT_LINES))
+    // Where the call asked to stop (the file's end when it did not say), and
+    // where this read stops: the default length, or one read's most lines.
+    let asked_end = if end_line == u64::MAX {
+        lines.len()
     } else {
-        (end_line.min(lines.len() as u64)) as usize
+        end_line.min(lines.len() as u64) as usize
     };
+    let length = if end_line == u64::MAX {
+        READ_DEFAULT_LINES
+    } else {
+        READ_MAX_LINES as usize
+    };
+    let wanted_end = asked_end.min(start_index.saturating_add(length));
     let mut end_index = start_index;
     let mut bytes = 0_usize;
     while end_index < wanted_end {
@@ -1843,10 +1919,9 @@ pub(crate) fn slice_text_lines(
         end_index += 1;
     }
     let mut output = lines[start_index..end_index].join("\n");
-    // Short of what was asked for — the byte budget — or, with no end given,
-    // short of the file's end.
-    let stopped_early =
-        end_index < wanted_end || (end_line == u64::MAX && end_index < lines.len());
+    // Short of what was asked for — the byte budget or the line cap — or, with
+    // no end given, short of the file's end.
+    let stopped_early = end_index < asked_end;
     if stopped_early {
         output.push_str(&profile.render(
             PromptKey::ToolReadLimit,
@@ -1873,7 +1948,6 @@ fn run_read(
     file_guard: Option<FileGuardContext<'_>>,
 ) -> Result<Outcome, String> {
     let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
-    let (start_line, end_line) = parse_read_range(input)?;
 
     let (mut file, file_path) = secure_open_existing_file_with_scope(workspace, &path, scope)?;
     let metadata = file
@@ -1884,29 +1958,30 @@ fn run_read(
         .take(12)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Failed to inspect file {}: {error}", file_path.display()))?;
+    // A line range means nothing to an image, so an image read ignores one —
+    // whatever its values — rather than refusing a call whose intent is plain.
     if is_supported_image(&bytes) {
-        if input.contains_key("start_line") || input.contains_key("end_line") {
-            return Err("read does not accept start_line or end_line when reading an image".into());
-        }
-        if metadata.len() > crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES as u64 {
+        // The image is shrunk before the model sees it, so the file may be as
+        // large as one the user could attach.
+        if metadata.len() > crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES as u64 {
             return Err(format!(
                 "Image exceeds the {} MiB limit ({} bytes)",
-                crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024,
+                crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES / 1024 / 1024,
                 metadata.len()
             ));
         }
         file.take(
-            u64::try_from(crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES)
+            u64::try_from(crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES)
                 .unwrap_or(u64::MAX)
                 .saturating_add(1)
                 .saturating_sub(bytes.len() as u64),
         )
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Failed to read file {}: {error}", file_path.display()))?;
-        if bytes.len() > crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES {
+        if bytes.len() > crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES {
             return Err(format!(
                 "Image exceeds the {} MiB limit (at least {} bytes)",
-                crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024,
+                crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES / 1024 / 1024,
                 bytes.len()
             ));
         }
@@ -1917,7 +1992,7 @@ fn run_read(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("image");
-        let image = store.import(name, &bytes)?;
+        let image = store.import_compressed(name, &bytes)?;
         return Ok(Outcome::success_with_images(
             profile.render(
                 PromptKey::ToolReadImage,
@@ -1933,6 +2008,7 @@ fn run_read(
         )
         .with_opened_file(file_path));
     }
+    let (start_line, end_line) = parse_read_range(input)?;
     let content = read_text_file_handle(&mut file)?;
     // The record takes the modification time the handle reported before the
     // bytes were read. If the file changes between the two, the record is
@@ -3453,6 +3529,7 @@ fn run_shell(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    call_id: Option<&str>,
 ) -> Result<Outcome, String> {
     let runner = &workspace.runner;
     let command = parse_shell_command(input)?;
@@ -3519,7 +3596,17 @@ fn run_shell(
                 kind.tool_name(),
                 &command,
                 false,
-                Some(&workspace.root),
+                crate::shell_tasks::ShellTaskOrigin {
+                    workspace_root: Some(&workspace.root),
+                    // A remote command starts at its workspace root; `start_dir` is only this
+                    // host's anchor for it.
+                    cwd: if workspace.is_local() {
+                        start_dir.to_str()
+                    } else {
+                        Some(&workspace.root)
+                    },
+                    call_id,
+                },
             )
         {
             Ok(guard) => guard,
@@ -4421,6 +4508,17 @@ pub(crate) fn required_string(
     Ok(value.to_owned())
 }
 
+/// Whether an optional argument was, in effect, not given: absent, `null`, or
+/// — where an empty value means nothing — a blank string. Models that fill
+/// every optional parameter send `""` for the ones they mean to leave out.
+pub(crate) fn unset_optional(input: &Map<String, Value>, key: &str, allow_empty: bool) -> bool {
+    match input.get(key) {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => !allow_empty && value.trim().is_empty(),
+        Some(_) => false,
+    }
+}
+
 pub(crate) fn optional_string(
     input: &Map<String, Value>,
     key: &str,
@@ -4428,7 +4526,7 @@ pub(crate) fn optional_string(
     max_chars: usize,
     allow_empty: bool,
 ) -> Result<String, String> {
-    if !input.contains_key(key) || input.get(key).is_some_and(Value::is_null) {
+    if unset_optional(input, key, allow_empty) {
         return Ok(default.to_owned());
     }
     required_string(input, key, max_chars, allow_empty)
@@ -4439,7 +4537,7 @@ fn optional_owned_string(
     key: &str,
     max_chars: usize,
 ) -> Result<Option<String>, String> {
-    if !input.contains_key(key) || input.get(key).is_some_and(Value::is_null) {
+    if unset_optional(input, key, false) {
         return Ok(None);
     }
     required_string(input, key, max_chars, false).map(Some)
@@ -5893,6 +5991,38 @@ mod tests {
     /// to be stripped, which only earned its keep while the PowerShell console
     /// was widened to thousands of columns and padded every formatted row out to
     /// that width. Claude Code widens nothing and strips nothing per line.
+    /// Placeholder line numbers and ranges longer than one read are read for
+    /// what they plainly ask; only an end before the start is refused.
+    #[test]
+    fn a_text_read_takes_placeholder_and_oversized_ranges_for_what_they_mean() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = (1..=6_000).map(|n| format!("{n}\n")).collect::<String>();
+        fs::write(directory.path().join("long.txt"), &text).unwrap();
+        let state = AppState::default();
+        let read = |input: Value| execute(request(directory.path(), "read", input), &state);
+
+        // `0` is a placeholder: from the top, and no end.
+        let zero = read(json!({"path": "long.txt", "start_line": 0, "end_line": 0}));
+        assert!(zero.success, "{}", zero.output);
+        assert!(zero.output.starts_with("1\n2\n"), "{}", &zero.output[..20]);
+        assert!(zero.output.ends_with("Continue with start_line=2001."), "{}", zero.output);
+
+        // Longer than one read: the first 5,001 lines and where to go on.
+        let long = read(json!({"path": "long.txt", "start_line": 1, "end_line": 6000}));
+        assert!(long.success, "{}", long.output);
+        assert!(long.output.contains("\n5001"), "{}", &long.output[long.output.len() - 120..]);
+        assert!(!long.output.contains("\n5002\n"));
+        assert!(
+            long.output.ends_with("… showing lines 1–5001 of 6000. Continue with start_line=5002."),
+            "{}",
+            &long.output[long.output.len() - 120..]
+        );
+
+        let backwards = read(json!({"path": "long.txt", "start_line": 10, "end_line": 5}));
+        assert!(!backwards.success);
+        assert_eq!(backwards.output, "end_line cannot be less than start_line");
+    }
+
     #[test]
     fn a_read_without_an_end_returns_two_thousand_lines_and_says_where_to_go_on() {
         let directory = tempfile::tempdir().unwrap();
@@ -6960,6 +7090,34 @@ mod tests {
         ));
     }
 
+    /// Some models fill every optional parameter. A line range means nothing to
+    /// an image, so a read of one ignores the range — even a range that would be
+    /// invalid on a text file — instead of refusing and sending the model round
+    /// in circles guessing values.
+    #[test]
+    fn an_image_read_ignores_any_line_range() {
+        let workspace = tempfile::tempdir().unwrap();
+        let app_data = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("pixel.png"), TEST_PNG).unwrap();
+        for input in [
+            json!({"path": "pixel.png", "start_line": 1, "end_line": 1}),
+            json!({"path": "pixel.png", "start_line": 1, "end_line": 100}),
+            json!({"path": "pixel.png", "start_line": 0, "end_line": -3}),
+            json!({"path": "pixel.png", "start_line": null, "end_line": null}),
+        ] {
+            let result = execute_with_scope_and_attachments(
+                request(workspace.path(), "read", input.clone()),
+                &AppState::default(),
+                ExecutionScope::workspace_only(workspace.path()),
+                Some(app_data.path()),
+                &crate::workspace_set::WorkspaceSet::default(),
+                &PromptProfile::builtin_english(),
+            );
+            assert!(result.success, "{input}: {}", result.output);
+            assert_eq!(result.images.len(), 1, "{input}");
+        }
+    }
+
     #[test]
     fn read_oversized_supported_image_reports_the_image_limit() {
         let workspace = tempfile::tempdir().unwrap();
@@ -6967,7 +7125,9 @@ mod tests {
         let path = workspace.path().join("oversized.png");
         let mut file = File::create(&path).unwrap();
         std::io::Write::write_all(&mut file, b"\x89PNG\r\n\x1a\n\0\0\0\r").unwrap();
-        file.set_len(crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES as u64 + 1)
+        // Images are shrunk before the model sees them, so read takes one as
+        // large as the user could attach — and no larger.
+        file.set_len(crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES as u64 + 1)
             .unwrap();
         drop(file);
 
@@ -6983,7 +7143,7 @@ mod tests {
         );
         assert!(!result.success);
         assert!(
-            result.output.contains("Image exceeds the 5 MiB limit"),
+            result.output.contains("Image exceeds the 32 MiB limit"),
             "{}",
             result.output
         );
@@ -7011,6 +7171,51 @@ mod tests {
         assert_eq!(output.get("height").and_then(Value::as_u64), Some(1));
         // No workspace path is involved at all: the pixels never touch the user's checkout.
         assert!(!outcome.output.contains(".png"));
+    }
+
+    /// A screenshot is shrunk like any image the model sees — at most 2000 px a side and
+    /// 500 KB — and the size the result reports is the one delivered.
+    #[test]
+    fn a_large_preview_screenshot_is_shrunk_before_the_model_sees_it() {
+        let (width, height) = (2560_u32, 1600_u32);
+        // Smooth colour with grain: a real-looking page capture that PNG cannot squeeze.
+        let mut state = 0x2545_f491_u32;
+        let rgba = (0..width * height)
+            .flat_map(|index| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let (x, y) = (index % width, index / width);
+                let grain = (state & 15) as u8;
+                [(x / 10) as u8 ^ grain, (y / 7) as u8 ^ grain, 128 ^ grain, 255]
+            })
+            .collect::<Vec<u8>>();
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, width, height);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_color(png::ColorType::Rgba);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgba).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(png.len() > 512_000, "the capture should need shrinking");
+        let app_data = tempfile::tempdir().unwrap();
+        let store = ImageAttachmentStore::new(app_data.path());
+        let capture = crate::browser::PreviewScreenshot {
+            data: base64::engine::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
+            width,
+            height,
+        };
+
+        let outcome = preview_screenshot_outcome(capture, Some(&store)).unwrap();
+
+        let image = &outcome.images[0];
+        assert_eq!((image.width, image.height), (2000, 1250));
+        assert!(image.bytes <= 512_000, "{} bytes", image.bytes);
+        let output: Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(output["width"], 2000);
+        assert_eq!(output["height"], 1250);
     }
 
     /// The refusals the source answers with when nothing resolves. Getting one of them wrong
@@ -7260,6 +7465,79 @@ mod tests {
             },
             registry,
         }
+    }
+
+    /// Plan mode keeps `write` and `edit` off a repository's content — a
+    /// tracked file, a new file Git would pick up — and lets everything else
+    /// through: ignored paths, paths outside any repository, other tools.
+    #[test]
+    fn plan_mode_refuses_writes_to_the_repository_and_nothing_else() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q"]);
+        fs::write(root.join(".gitignore"), "scratch/\n").unwrap();
+        fs::write(root.join("app.txt"), "alpha\n").unwrap();
+        git(&["add", ".gitignore", "app.txt"]);
+        let outside = tempfile::tempdir().unwrap();
+        let profile = PromptProfile::builtin_english();
+        let refusal = |tool_name: &str, input: Value, scope: ExecutionScope| {
+            plan_mode_refusal(
+                &request(root, tool_name, input),
+                &scope,
+                &crate::workspace_set::WorkspaceSet::default(),
+                &profile,
+                &CancelSignal::default(),
+            )
+        };
+        let workspace = || ExecutionScope::workspace_only(root);
+
+        let edit = refusal(
+            "edit",
+            json!({ "path": "app.txt", "find": "alpha", "replace": "beta" }),
+            workspace(),
+        )
+        .expect("a tracked file is refused");
+        assert!(edit.starts_with("Plan mode is on:"), "{edit}");
+        assert!(edit.contains("exit_plan_mode"), "{edit}");
+        let write = refusal(
+            "write",
+            json!({ "path": "notes/new.md", "content": "draft\n" }),
+            workspace(),
+        )
+        .expect("a new file the repository would pick up is refused");
+        assert!(write.starts_with("Plan mode is on:"), "{write}");
+
+        assert_eq!(
+            refusal("write", json!({ "path": "scratch/idea.md", "content": "free\n" }), workspace()),
+            None,
+            "an ignored path stays writable"
+        );
+        let scratch = outside.path().join("plan.md");
+        assert_eq!(
+            refusal(
+                "write",
+                json!({ "path": scratch.to_string_lossy(), "content": "free\n" }),
+                ExecutionScope::Unrestricted,
+            ),
+            None,
+            "a path outside any repository stays writable"
+        );
+        assert_eq!(refusal("read", json!({ "path": "app.txt" }), workspace()), None);
+        // A target the tool could not resolve is refused with the tool's own error.
+        let missing = refusal(
+            "edit",
+            json!({ "path": "absent.txt", "find": "a", "replace": "b" }),
+            workspace(),
+        )
+        .expect("an unresolvable target is refused");
+        assert!(missing.starts_with("Could not access path absent.txt"), "{missing}");
     }
 
     /// Reads `name` through the tool and commits the record the way the run

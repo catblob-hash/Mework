@@ -771,11 +771,14 @@ describe("model capabilities", () => {
     const dialog = screen.getByRole("dialog", { name: "添加模型" });
     await user.type(within(dialog).getByLabelText("模型 ID"), "gpt-5");
 
-    // A new model claims nothing until the user says so.
+    // A new model claims no vision until the user says so. Appending is what
+    // Mework knows of Codex, so those two are ticked as the ID is typed.
     const vision = within(dialog).getByRole("switch", { name: "gpt-5 视觉输入" });
     expect(vision).toHaveAttribute("aria-checked", "false");
+    expect(within(dialog).getByRole("switch", { name: "gpt-5 中途追加工具" })).toHaveAttribute("aria-checked", "true");
+    expect(within(dialog).getByRole("switch", { name: "gpt-5 中途追加系统提示词" })).toHaveAttribute("aria-checked", "true");
     await user.click(within(dialog).getByRole("button", { name: "保存" }));
-    expect(getSettings().apiProviders[0].models[0].capabilities).toEqual([]);
+    expect(getSettings().apiProviders[0].models[0].capabilities).toEqual(["tool_append", "system_append"]);
     expect(screen.queryByRole("img", { name: "视觉输入" })).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "模型 gpt-5 的属性" }));
@@ -783,8 +786,36 @@ describe("model capabilities", () => {
     await user.click(within(reopened).getByRole("switch", { name: "gpt-5 视觉输入" }));
     await user.click(within(reopened).getByRole("button", { name: "保存" }));
 
-    expect(getSettings().apiProviders[0].models[0].capabilities).toEqual(["image_recognition"]);
+    // Ticking vision leaves the rest of the set alone.
+    expect(getSettings().apiProviders[0].models[0].capabilities)
+      .toEqual(["image_recognition", "tool_append", "system_append"]);
     expect(screen.getByRole("img", { name: "视觉输入" })).toBeInTheDocument();
+  });
+
+  it("leaves appending to the user for a model behind a relay, and stops filling once a switch moves", async () => {
+    const user = userEvent.setup();
+    const { getSettings } = renderProviders((settings) => ({
+      ...settings,
+      apiProviders: settings.apiProviders.map((provider, index) => index === 0
+        ? { ...provider, family: "anthropic", baseUrl: "https://relay.example.com/v1", models: [], activeModelId: null }
+        : provider)
+    }));
+
+    await user.click(screen.getByRole("button", { name: "手动添加模型" }));
+    const dialog = screen.getByRole("dialog", { name: "添加模型" });
+    await user.type(within(dialog).getByLabelText("模型 ID"), "claude-opus-5-5");
+    const tools = within(dialog).getByRole("switch", { name: "claude-opus-5-5 中途追加工具" });
+    const system = within(dialog).getByRole("switch", { name: "claude-opus-5-5 中途追加系统提示词" });
+    expect(tools).toHaveAttribute("aria-checked", "false");
+    expect(system).toHaveAttribute("aria-checked", "false");
+    expect(within(dialog).getAllByText(/Mework 不认得这个模型或这个端点/u)).toHaveLength(2);
+
+    // The user says this relay passes tool additions on.
+    await user.click(tools);
+    await user.clear(within(dialog).getByLabelText("模型 ID"));
+    await user.type(within(dialog).getByLabelText("模型 ID"), "claude-opus-5-5");
+    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    expect(getSettings().apiProviders[0].models[0].capabilities).toEqual(["tool_append"]);
   });
 
   it("renders no chip for a retired capability an archived model still carries", async () => {

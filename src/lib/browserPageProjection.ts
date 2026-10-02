@@ -2,25 +2,21 @@ import type { RefObject } from "react";
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 /**
- * The picture of the native page the pane paints in the page's own place.
+ * The picture of the native page the pane paints in the page's own place while the page is down.
  *
  * The built-in browser's page is a native child window, and a native child window paints above
- * every HTML layer no matter what the stacking context says. That makes the page, not the app,
- * the top surface of the preview pane: menus, dialogs, the pane's own rounded corners and every
- * transition around it are painted over by a rectangle the renderer does not control.
- *
- * So the page is sunk beneath the renderer by default and the pane paints a capture of it
- * instead. What the user looks at is therefore ordinary HTML — clipped, animated and drawn over
- * like anything else — and the live page is raised only for as long as it is being used: the
- * pointer is inside it, or it holds the keyboard. Raising is what keeps this a browser rather
- * than a picture of one; scrolling, text selection, the IME and native right-click all belong to
- * the real page and none of them survives being simulated.
+ * every HTML layer no matter what the stacking context says. The page is nonetheless left on top
+ * whenever nothing needs it gone: that is the only way the user sees it live, at full frame rate,
+ * while the Agent drives it. It goes under the renderer only for as long as something has to be
+ * seen in its place — a menu or dialog drawn across it, a pane covering it, or no page to show —
+ * and the pane paints a capture of it there meanwhile.
  *
  * Two orderings are the whole mechanism, and they are not symmetric:
  *
- * - Sinking: **publish a frame, wait two frames, then sink.** The `<img>` has to have been
- *   painted before the page leaves, or there is a blank frame in between. A native window cannot
- *   be cross-faded with HTML.
+ * - Sinking: **publish a frame in the same commit, wait one frame, then sink.** The transition
+ *   runs as a layout effect, so the `<img>` is painted together with whatever caused the sink;
+ *   one animation frame later it is on screen, and only then does the page leave. A native window
+ *   cannot be cross-faded with HTML.
  * - Raising: **raise, await the host, wait one frame, then drop the `<img>`.** Dropping it first
  *   would show the pane's background until the page came back.
  *
@@ -43,9 +39,9 @@ export type BrowserPageSnapshot = {
 /**
  * A one-value store the frame is published through.
  *
- * The frame now changes on a timer rather than only on a transition, and the panel that owns the
- * page also owns its toolbar, menus and drawer. Publishing through React state would re-render
- * all of that once a second; a store lets the `<img>` be the only subscriber.
+ * The panel that owns the page also owns its toolbar, menus and drawer. Publishing through React
+ * state would re-render all of that for every frame; a store lets the `<img>` be the only
+ * subscriber.
  */
 export type BrowserSnapshotStore = {
   set: (snapshot: BrowserPageSnapshot | null) => void;
@@ -76,21 +72,22 @@ export function createBrowserSnapshotStore(): BrowserSnapshotStore {
 const MIN_USABLE_CAPTURE_PX = 1;
 
 /**
- * How often the projection is refreshed while it is what the user is looking at.
+ * How often a raised page is captured to keep a frame warm for the next cover.
  *
  * One screenshot per second per presented page, on the same WebView2 UI thread the Agent's
- * automation runs on. That is the price of the page not being the top surface of the app, and it
- * is the same price the previous occlusion-only mechanism paid to keep a frame warm — what
- * changed is which state is the resting one, not how much it costs.
+ * automation runs on. A menu that had to wait for a capture round trip would open behind the
+ * page, so the frame has to exist before anything asks for it.
  */
 const FRAME_INTERVAL_MS = 1_000;
+
+/** How soon after the page comes up the first warm frame is taken. */
+const FIRST_FRAME_DELAY_MS = 300;
 
 /**
  * Cadence for a page that has stopped changing.
  *
  * A preview nobody is touching produces byte-identical captures indefinitely. Recognising that
- * costs a string compare and takes the idle pane from one capture a second to one every five,
- * which matters because projecting is now the state the pane spends nearly all its time in.
+ * costs a string compare and takes an idle pane from one capture a second to one every five.
  */
 const IDLE_FRAME_INTERVAL_MS = 5_000;
 const IDENTICAL_FRAMES_BEFORE_IDLE = 5;
@@ -102,8 +99,23 @@ const FAILURES_BEFORE_BACKOFF = 4;
 export type BrowserPageProjectionOptions = {
   /** The session the page belongs to. A change discards the frame rather than re-capturing it. */
   contentKey: string | null;
-  /** Whether there is a live native page to sink at all. */
+  /**
+   * Whether there is a page session to speak for — not whether its page exists yet.
+   *
+   * The pane declares where its page belongs as soon as it mounts, before the page is created or
+   * presented, and the host keeps that declaration through presentation. A pane that waited for
+   * the page to exist would have it presented on top of the start card it should sit beneath, as
+   * a blank rectangle, until the declaration caught up.
+   */
   enabled: boolean;
+  /**
+   * Whether the host is showing the page in the pane right now (`BrowserStatus.open`).
+   *
+   * Only a presented page is captured. A capture of a page that is not presented moves it off
+   * screen and back, which is wasted on a page nobody sees and, if the page is presented while it
+   * runs, ends by putting it back where it was hidden.
+   */
+  presented: boolean;
   /**
    * Whether the pane is presenting the page rather than one of its own cards.
    *
@@ -115,12 +127,12 @@ export type BrowserPageProjectionOptions = {
   /** Whether the page belongs beneath the renderer right now. */
   parked: boolean;
   /**
-   * Whether a trusted surface is drawn over the page, as opposed to the pane merely resting.
+   * Whether a trusted surface is drawn over the page, as opposed to the page merely being out of
+   * sight (its pane covered by another pane, or showing a card of its own).
    *
-   * Two consequences. The host is told, because covering takes the page out of agent automation
-   * and projecting must not. And the frame is taken from the warm capture rather than a fresh one
-   * — a menu that waits for a screenshot round trip is a menu that opens behind the page, which is
-   * the entire fault this mechanism exists to prevent.
+   * The host is told, because covering takes the page out of agent automation: the user is
+   * looking at a dialog, and an Agent click landing behind it would be a click nobody could see.
+   * A page that is merely out of sight stays the Agent's.
    */
   covered: boolean;
   /** The box the host positions the page from; the frame is measured and painted against it. */
@@ -146,7 +158,8 @@ export type BrowserPageProjectionOptions = {
 };
 
 /**
- * Keeps the native page sunk except while it is being used, with a live projection in its place.
+ * Keeps the native page on top except while `parked` says otherwise, with a still in its place
+ * for as long as it is down.
  *
  * Returns nothing: the frame goes to `sink` and the stacking goes to the host, so the caller only
  * has to render the `<img>` and hand this hook the same element it publishes as the page box.
@@ -154,6 +167,7 @@ export type BrowserPageProjectionOptions = {
 export function useBrowserPageProjection({
   contentKey,
   enabled,
+  presented,
   hasContent,
   parked,
   covered,
@@ -174,9 +188,11 @@ export function useBrowserPageProjection({
   }, [setParked, setCovered, capture, sink]);
 
   // The last states the host was asked for, not the last ones React rendered. The transitions are
-  // driven off these so a re-run that did not actually change anything does nothing.
-  const parkedRef = useRef(false);
-  const coveredRef = useRef(false);
+  // driven off these so a re-run that did not actually change anything does nothing. `null` is
+  // "never said": whatever the host holds was declared by some earlier pane, so the first decision
+  // is always sent, whichever way it goes.
+  const parkedRef = useRef<boolean | null>(null);
+  const coveredRef = useRef<boolean | null>(null);
   // How many host requests are still unanswered. The host's reported state disagrees with ours for
   // the whole width of a request, so the reconcile below has to know to keep out of that window
   // rather than re-asking on every 700ms poll for as long as the answer takes.
@@ -198,11 +214,11 @@ export function useBrowserPageProjection({
   const lastHostCoveredRef = useRef(false);
   const repairOwedRef = useRef(false);
   // Whether a transition has decided what to ask for but has not asked yet. Sinking deliberately
-  // waits two animation frames between publishing the frame and taking the page away, and for
-  // that whole window the refs say "sunk" while nothing is in flight and the host still says
-  // "raised". A reconcile that could not see this window would fire inside it and sink the page
-  // early — before the `<img>` standing in for it had been painted, which is the one ordering the
-  // whole mechanism exists to get right.
+  // waits an animation frame between publishing the frame and taking the page away, and for that
+  // whole window the refs say "sunk" while nothing is in flight and the host still says "raised".
+  // A reconcile that could not see this window would fire inside it and sink the page early —
+  // before the `<img>` standing in for it had been painted, which is the one ordering the whole
+  // mechanism exists to get right.
   //
   // A token rather than a boolean: a superseded transition still runs its own tail (a queued
   // animation frame, a capture that lands late) and must not clear a guard a newer one is holding.
@@ -272,16 +288,14 @@ export function useBrowserPageProjection({
   }, [contentKey]);
 
   /**
-   * The capture loop.
+   * The capture loop, which keeps a frame warm for as long as the page is raised.
    *
-   * It runs in two of the three states the page can be in, for two different reasons: while the
-   * page is raised it keeps a frame ready for the next cover, and while the pane is projecting it
-   * *is* the projection. It deliberately does not run while a surface is covering the page —
-   * there the frame is frozen behind a dialog nobody can see past, and a capture a second would
-   * be spent on pixels that are not on screen.
+   * It does not run while the page is down. Covered, the frame is frozen behind a dialog nobody
+   * can see past; out of sight, nobody is looking at all. Either way a capture a second would be
+   * spent on pixels that are not on screen.
    */
   useEffect(() => {
-    if (!enabled || !hasContent || covering) return;
+    if (!enabled || !presented || !hasContent || sunk) return;
     let cancelled = false;
     let timer = 0;
     const key = contentKey ?? "";
@@ -300,19 +314,6 @@ export function useBrowserPageProjection({
           // open, and comparing the payload is cheaper than the capture that produced it.
           identical = frame.data === warmFrameRef.current?.data ? identical + 1 : 0;
           warmFrameRef.current = frame;
-          // Published only while the projection is what the user is looking at, and only when it
-          // would actually change: a raised page is showing itself, and rewriting the `<img>`'s
-          // source once a second with the same bytes is a decode and a paint for nothing on a
-          // preview that is sitting still.
-          if (sunk) {
-            const shown = callbacks.current.sink.get();
-            const changed = (
-              shown?.data !== frame.data
-              || shown?.width !== frame.width
-              || shown?.height !== frame.height
-            );
-            if (changed) callbacks.current.sink.set(frame);
-          }
           if (identical >= IDENTICAL_FRAMES_BEFORE_IDLE) delay = IDLE_FRAME_INTERVAL_MS;
         } else {
           // A failed capture keeps the frame it had rather than dropping to nothing: an older
@@ -330,12 +331,14 @@ export function useBrowserPageProjection({
       if (cancelled) return;
       timer = window.setTimeout(() => void tick(), delay);
     };
-    timer = window.setTimeout(() => void tick(), FRAME_INTERVAL_MS);
+    // The first frame comes sooner than the cadence: a page just raised may be covered again at
+    // any moment, and whatever it showed before it went down may have changed behind the cover.
+    timer = window.setTimeout(() => void tick(), FIRST_FRAME_DELAY_MS);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [enabled, hasContent, covering, sunk, contentKey, placeholderRef, grabFrame]);
+  }, [enabled, presented, hasContent, sunk, contentKey, placeholderRef, grabFrame]);
 
   // A frame is a picture of one session's page. Switching sessions cannot be repaired by
   // re-measuring the way geometry can, so a frame left over from the outgoing session is dropped
@@ -347,8 +350,26 @@ export function useBrowserPageProjection({
   }, [contentKey]);
 
   /**
+   * Cancels the transition in progress, if any.
+   *
+   * Held in a ref rather than returned as the effect's cleanup: the effect re-runs on changes that
+   * are not transitions — a new session key, a placeholder — and a cleanup would cancel a sink
+   * still waiting on its frame without anything taking its place, leaving the page on top of
+   * whatever it was going down for. Only a newer transition, or the pane going away, cancels one.
+   */
+  const cancelTransitionRef = useRef<(() => void) | null>(null);
+  const enabledRef = useRef(enabled);
+  useLayoutEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
+
+  /**
    * The one place stacking is changed, and the only place the two flags are ordered against the
    * frame.
+   *
+   * A layout effect, so that whatever made the page go down — a menu, a dialog, a pane expanded
+   * over this one — and the still standing in for the page are painted in the same frame. The
+   * page itself leaves one animation frame later, once that paint is on screen.
    *
    * `covered` gets no effect of its own because the host sinks the page for either flag: sending
    * it the moment a menu opened would take the page away before its stand-in had been painted,
@@ -356,10 +377,13 @@ export function useBrowserPageProjection({
    * the sink and before the raise — and is sent on its own only while the page is already down,
    * where there is nothing left to order it against.
    */
-  useEffect(() => {
+  useLayoutEffect(() => {
     const wasSunk = parkedRef.current;
     const wasCovering = coveredRef.current;
     if (sunk === wasSunk && covering === wasCovering) return;
+    // Nothing to speak for yet, and nothing said: the first decision waits for a session.
+    if (!enabled && wasSunk === null) return;
+    cancelTransitionRef.current?.();
     parkedRef.current = sunk;
     coveredRef.current = covering;
     const { sink: frames } = callbacks.current;
@@ -369,16 +393,17 @@ export function useBrowserPageProjection({
     const settled = () => {
       if (settlingRef.current === token) settlingRef.current = 0;
     };
+    cancelTransitionRef.current = () => {
+      cancelled = true;
+      settled();
+    };
 
-    // Already down and staying down: a surface opened over a projection, or closed off one. The
-    // page does not move, so there is nothing to sequence — only the host's understanding of why
-    // it is down changes.
+    // Already down and staying down: a surface opened over a page that was out of sight, or one of
+    // two surfaces closed. The page does not move, so there is nothing to sequence — only the
+    // host's understanding of why it is down changes.
     if (sunk && wasSunk) {
       void request("setCovered", covering).finally(settled);
-      return () => {
-        cancelled = true;
-        settled();
-      };
+      return;
     }
 
     if (!sunk) {
@@ -389,16 +414,15 @@ export function useBrowserPageProjection({
         if (wasCovering) await request("setCovered", false);
         if (cancelled) return;
         await request("setParked", false);
-        if (cancelled) return;
+        // No still is standing in — the pane's first word on a page it has only just mounted
+        // over — so there is no frame to wait out before taking it down.
+        if (cancelled || frames.get() === null) return;
         window.requestAnimationFrame(() => {
           if (cancelled) return;
           frames.set(null);
         });
       })().finally(settled);
-      return () => {
-        cancelled = true;
-        settled();
-      };
+      return;
     }
 
     // Sinking.
@@ -427,30 +451,13 @@ export function useBrowserPageProjection({
       })().finally(settled);
     };
 
-    /** Publishes `frame`, lets it paint, and only then takes the page away. */
-    const standIn = (frame: BrowserPageSnapshot) => {
-      if (cancelled) {
-        settled();
-        return;
-      }
-      frames.set(frame);
-      // Two frames, not one: the frame that commits the `<img>` and the frame that paints it.
-      // Sinking after only the first would take the page away before its stand-in was on screen.
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(sinkPage);
-      });
-    };
-
     // Nothing of this page is worth showing — the pane is drawing one of its own cards over the
     // whole body. Sink it with no frame at all rather than publishing a picture of a blank
     // document underneath an opaque card.
     if (!hasContent) {
       frames.set(null);
       sinkPage();
-      return () => {
-        cancelled = true;
-        settled();
-      };
+      return;
     }
 
     const warm = warmFrameRef.current;
@@ -458,39 +465,50 @@ export function useBrowserPageProjection({
       ? { ...warm, width, height }
       : null;
 
-    // A surface has opened over the page and is invisible until this lands, so the warm frame —
-    // at most one refresh interval old, which is invisible on a page the user was not touching —
-    // is what makes covering instant. Waiting for a fresh capture here is exactly what used to
-    // leave menus behind the page.
-    if (covering && usableWarm) {
-      standIn(usableWarm);
-      return () => {
-        cancelled = true;
-        settled();
-      };
+    // Published from this layout effect, the still re-renders before the browser paints, so it
+    // appears in the very frame whatever covered the page does. One animation frame later that
+    // paint is on screen and the page can go.
+    if (usableWarm) {
+      frames.set(usableWarm);
+      window.requestAnimationFrame(sinkPage);
+      return;
     }
 
-    // Nothing is waiting on this one: the user simply moved the pointer off the page. There is
-    // time to capture the page as it is right now, and there has to be — a frame from a second
-    // ago would snap the projection back to a scroll position the user has already left.
+    // No frame yet — the page went down within moments of first coming up. Waiting for a capture
+    // would leave it over whatever is covering it for the whole round trip, so it goes down at
+    // once and the box is filled when the capture lands. A page not yet presented is not on
+    // screen to be stood in for, and is not captured at all.
+    sinkPage();
+    if (!presented) return;
     void grabFrame(key, width, height)
       .then((frame) => {
-        if (cancelled) return;
-        // The freshest frame there is, so it is also the one the next cover should stand in: left
-        // out, the loop below would spend its first five ticks deciding whether the page had
-        // changed against nothing at all, and an idle preview would never reach its idle cadence.
-        if (frame) warmFrameRef.current = frame;
-        const next = frame ?? usableWarm;
-        if (next) standIn(next);
-        else sinkPage();
+        if (cancelled || !frame) return;
+        warmFrameRef.current = frame;
+        frames.set(frame);
       })
-      .catch(sinkPage);
+      .catch(() => undefined);
+  }, [sunk, covering, enabled, presented, hasContent, contentKey, placeholderRef, request, grabFrame]);
 
-    return () => {
-      cancelled = true;
-      settled();
-    };
-  }, [sunk, covering, hasContent, contentKey, placeholderRef, request, grabFrame]);
+  /**
+   * A pane that goes away while its page is up takes the page down on its way out.
+   *
+   * The pane goes because the browser is being hidden, closed, switched to another tab or another
+   * conversation, and the host parks the page on each of those paths — but only once the renderer
+   * gets round to asking, which is after the frame in which the pane has already vanished. For
+   * that frame the page would be painted over whatever took the pane's place. Sinking from the
+   * unmount, before that frame is painted, closes the gap; it cannot race the host's hide the way
+   * a raise did, because both of them put the page down.
+   *
+   * `parkedRef` follows, so a pane that only remounts (React's development double mount) sees the
+   * page as down and raises it again. A pane that never declared anything leaves the page alone.
+   */
+  useLayoutEffect(() => () => {
+    cancelTransitionRef.current?.();
+    cancelTransitionRef.current = null;
+    if (!enabledRef.current || parkedRef.current !== false) return;
+    parkedRef.current = true;
+    void request("setParked", true);
+  }, [request]);
 
   // A frame outliving the content it was a picture of is the same lie as one outliving its
   // session: the pane has swapped to a card, and what is behind that card is no longer this.
@@ -509,8 +527,9 @@ export function useBrowserPageProjection({
    * - The host dropped a sink nobody asked it to drop — sleeping, suspending, hiding and
    *   re-presenting all restack the page on their own — and the pane is left painting a still
    *   over a page that is live again, with whatever it captured for stranded behind it.
-   * - A pane mounted onto a page the host still has sunk, from a previous pane that went away
-   *   while it was projecting. Nothing would ever raise it and the page would simply be invisible.
+   * - The host sank a page this pane had declared up — a capture or another pane's late request
+   *   landing after the declaration. Nothing would ever raise it and the page would simply be
+   *   invisible.
    *
    * Gated on nothing being in flight and no transition mid-way. The host's answer legitimately
    * lags a request by the width of an IPC round trip, and a status poll landing inside that window
@@ -528,9 +547,12 @@ export function useBrowserPageProjection({
     );
     lastHostParkedRef.current = hostParked;
     lastHostCoveredRef.current = hostCovered;
-    if (!enabled) return;
-    const parkedDiffers = hostParked !== parkedRef.current;
-    const coveredDiffers = hostCovered !== coveredRef.current;
+    const declaredParked = parkedRef.current;
+    const declaredCovered = coveredRef.current;
+    // Nothing to repair towards until the pane has said something itself.
+    if (!enabled || declaredParked === null || declaredCovered === null) return;
+    const parkedDiffers = hostParked !== declaredParked;
+    const coveredDiffers = hostCovered !== declaredCovered;
     if (!parkedDiffers && !coveredDiffers) {
       repairOwedRef.current = false;
       return;
@@ -539,15 +561,11 @@ export function useBrowserPageProjection({
     if (!repairOwedRef.current) return;
     if (inFlightRef.current > 0 || settlingRef.current !== 0) return;
     repairOwedRef.current = false;
-    if (parkedDiffers) void request("setParked", parkedRef.current);
-    if (coveredDiffers) void request("setCovered", coveredRef.current);
+    if (parkedDiffers) void request("setParked", declaredParked);
+    if (coveredDiffers) void request("setCovered", declaredCovered);
   });
 
-  // A pane that unmounts deliberately leaves the page's stacking alone. It is not this hook's to
-  // decide: the pane goes away because the browser is being hidden or closed, and the host sinks
-  // and hides it on that path already — a raise racing it from here is what left a live page
-  // painted over the app after the pane was gone. A pane that merely remounts is put back by the
-  // reconcile above, which is the one place that reads what the host actually has.
+  // The still goes with the pane: nothing is left to paint it.
   useEffect(() => () => {
     callbacks.current.sink.set(null);
   }, []);

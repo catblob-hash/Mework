@@ -199,6 +199,20 @@ describe("PageTabs", () => {
     expect(tabNames()).toEqual(["beta", "alpha", "gamma", "delta"]);
   });
 
+  it("keeps a pinned tab where it is with Ctrl+Shift+Arrow, and moves no tab past it", async () => {
+    const user = userEvent.setup();
+    render(<Harness tabs={[{ ...TABS[0], pinned: true }, ...TABS.slice(1)]} />);
+
+    tab("alpha").focus();
+    await user.keyboard("{Control>}{Shift>}{ArrowRight}{/Shift}{/Control}");
+    expect(tabNames()).toEqual(["alpha", "beta", "gamma", "delta"]);
+    tab("beta").focus();
+    await user.keyboard("{Control>}{Shift>}{ArrowLeft}{/Shift}{/Control}");
+    expect(tabNames()).toEqual(["alpha", "beta", "gamma", "delta"]);
+    await user.keyboard("{Control>}{Shift>}{ArrowRight}{/Shift}{/Control}");
+    expect(tabNames()).toEqual(["alpha", "gamma", "beta", "delta"]);
+  });
+
   it("does not move tabs from the keyboard without onReorder", async () => {
     const user = userEvent.setup();
     const onSelect = vi.fn();
@@ -231,16 +245,15 @@ describe("PageTabs", () => {
     expect(onTabDoubleClick).toHaveBeenCalledWith("b");
   });
 
-  it("offers a ⋮ menu of the caller's actions on each tab", async () => {
-    const user = userEvent.setup();
-    const reveal = vi.fn();
-    setup({
-      tabMenu: (id) => [{ id: "actions", items: [{ id: "reveal", label: "Reveal", onSelect: () => reveal(id) }] }]
-    });
+  it("hands a right click on a tab to the caller, at the pointer, without selecting it", () => {
+    const onTabContextMenu = vi.fn();
+    const { onSelect } = setup({ onTabContextMenu });
 
-    await user.click(within(tabBox("gamma")).getByRole("button", { name: "gamma 的操作" }));
-    await user.click(within(screen.getByRole("menu", { name: "gamma 的操作" })).getByRole("menuitem", { name: "Reveal" }));
-    expect(reveal).toHaveBeenCalledExactlyOnceWith("c");
+    fireEvent.contextMenu(tab("gamma"), { clientX: 40, clientY: 12 });
+    expect(onTabContextMenu).toHaveBeenCalledExactlyOnceWith("c", { x: 40, y: 12 });
+    expect(onSelect).not.toHaveBeenCalled();
+    // The tab carries no control of its own for it.
+    expect(within(tabBox("gamma")).queryByRole("button", { name: /操作|Actions/ })).not.toBeInTheDocument();
   });
 
   it("puts trailing controls after the strip", () => {
@@ -392,6 +405,23 @@ describe("PageTabs", () => {
       expect(onReorder).not.toHaveBeenCalled();
       expect(screen.getByRole("menu", { name: "More pages" })).toBeInTheDocument();
       expect(row.closest(".page-tabs__menu-row")).not.toHaveClass("page-tabs__menu-row--dragging");
+    });
+
+    it("holds a pinned tab at the start: it does not drag, and nothing lands ahead of it", () => {
+      layOut({ bar: 500 });
+      const pinned: PageTab[] = [{ ...TABS[0], pinned: true }, ...TABS.slice(1)];
+      const { onReorder } = setup({ tabs: pinned });
+
+      drag(tab("alpha"), { x: 50, y: 16 }, { x: 280, y: 16 });
+      expect(onReorder).not.toHaveBeenCalled();
+      expect(tabBox("alpha")).not.toHaveClass("page-tab--dragging");
+
+      // Aimed before the pinned tab, the drop lands just after it.
+      fireEvent.pointerDown(tab("gamma"), { pointerId: 7, button: 0, isPrimary: true, clientX: 250, clientY: 16 });
+      fireEvent.pointerMove(window, { pointerId: 7, clientX: 10, clientY: 16 });
+      expect(tabBox("alpha")).toHaveClass("page-tab--drop-after");
+      fireEvent.pointerUp(window, { pointerId: 7, clientX: 10, clientY: 16 });
+      expect(onReorder).toHaveBeenCalledExactlyOnceWith(["a", "c", "b", "d"]);
     });
 
     it("does not drag at all without onReorder", () => {

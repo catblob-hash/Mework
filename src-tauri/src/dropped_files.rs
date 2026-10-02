@@ -402,7 +402,7 @@ mod tests {
             .contains("空的"));
         assert!(read_dropped(&session, &text(&oversized))
             .unwrap_err()
-            .contains("10 MiB"));
+            .contains(&format!("{} MiB", MAX_DROPPED_FILE_BYTES / 1024 / 1024)));
         assert!(read_dropped(&session, &text(&exact)).is_ok());
     }
 }

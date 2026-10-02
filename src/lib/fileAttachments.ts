@@ -3,8 +3,10 @@ import { estimateTokens } from "./contextTokens";
 import {
   MAX_FILE_ATTACHMENT_PDF_BYTES,
   MAX_FILE_ATTACHMENT_TEXT_BYTES,
-  MAX_MESSAGE_FILE_TOKENS,
-  MAX_MESSAGE_FILES
+  MAX_MESSAGE_ATTACHMENT_BYTES,
+  MAX_TEXT_FILE_TOKENS,
+  MAX_TEXT_FILE_UPLOAD_BYTES,
+  TRUNCATED_TEXT_FILE_LINES
 } from "./fileBudget";
 import { MAX_IMAGE_ATTACHMENT_BYTES } from "./imageBudget";
 import {
@@ -33,13 +35,15 @@ export type AttachmentRejectionReason =
   | "empty"
   | "unsupported"
   | "tooLarge"
+  /** A text file still over the token cap in its first lines. */
+  | "tooLong"
   | "imageInputUnavailable"
   | "imageRejected"
   | "pdfWithoutText"
   | "pdfPassword"
   | "pdfUnreadable"
-  | "tooMany"
-  | "overBudget"
+  /** Taking it would put the message's attachments past {@link MAX_MESSAGE_ATTACHMENT_BYTES}. */
+  | "messageTooLarge"
   | "failed";
 
 export interface AttachmentRejection {
@@ -53,11 +57,6 @@ export interface AttachmentIntakeResult {
   files: FileAttachment[];
   rejected: AttachmentRejection[];
 }
-
-/** A pasted run of text at least this long becomes a Markdown file instead of prose in the box. */
-export const LONG_PASTE_MIN_CHARACTERS = 5_000;
-/** …and so does one of at least this many lines, however short they are. */
-export const LONG_PASTE_MIN_LINES = 100;
 
 /** What the first bytes of a file say it is. */
 export type ByteSniff = AttachmentKind | "binary" | "empty";
@@ -143,7 +142,27 @@ export interface DragItem {
 function sizeFits(kind: AttachmentKind, size: number): boolean {
   return size <= (kind === "image"
     ? MAX_IMAGE_ATTACHMENT_BYTES
-    : kind === "pdf" ? MAX_FILE_ATTACHMENT_PDF_BYTES : MAX_FILE_ATTACHMENT_TEXT_BYTES);
+    : kind === "pdf" ? MAX_FILE_ATTACHMENT_PDF_BYTES : MAX_TEXT_FILE_UPLOAD_BYTES);
+}
+
+/** The largest file of any kind this intake reads before it knows the kind. */
+const MAX_UNSNIFFED_BYTES = Math.max(MAX_IMAGE_ATTACHMENT_BYTES, MAX_FILE_ATTACHMENT_PDF_BYTES);
+
+/**
+ * What of a text file the model reads, by Claude Code's Read rule (mirrors Rust
+ * `file_attachments::ModelText`): the whole text within
+ * {@link MAX_TEXT_FILE_TOKENS}, else its first {@link TRUNCATED_TEXT_FILE_LINES}
+ * lines when those are within it, else `null` — the file is not attached.
+ */
+export function textForModel(text: string): { text: string; truncated: boolean } | null {
+  if (estimateTokens(text) <= MAX_TEXT_FILE_TOKENS) return { text, truncated: false };
+  let end = -1;
+  for (let line = 0; line < TRUNCATED_TEXT_FILE_LINES; line += 1) {
+    end = text.indexOf("\n", end + 1);
+    if (end < 0) return null;
+  }
+  const head = text.slice(0, end);
+  return estimateTokens(head) <= MAX_TEXT_FILE_TOKENS ? { text: head, truncated: true } : null;
 }
 
 /** The host looked at the path itself: it knows a folder from a file, and what the file starts with. */
@@ -252,29 +271,6 @@ export function rejectionsForDragItems(items: readonly DragItem[], imageInput: b
   });
 }
 
-/** Whether a pasted run of text is long enough to travel as a file. */
-export function isLongPaste(text: string): boolean {
-  if (text.length >= LONG_PASTE_MIN_CHARACTERS) return true;
-  let lines = 1;
-  for (let index = 0; index < text.length; index += 1) {
-    if (text.charCodeAt(index) !== 10) continue;
-    lines += 1;
-    if (lines >= LONG_PASTE_MIN_LINES) return true;
-  }
-  return false;
-}
-
-/**
- * A long paste as a Markdown file, named so it cannot collide with another
- * attachment on the same message.
- */
-export function pastedTextFile(text: string, taken: readonly { name: string }[]): File {
-  const names = new Set(taken.map((entry) => entry.name));
-  let name = "pasted-text.md";
-  for (let index = 2; names.has(name); index += 1) name = `pasted-text-${index}.md`;
-  return new File([text], name, { type: "text/markdown" });
-}
-
 export interface AttachmentIntake {
   /**
    * Takes the image files and returns those it attached. Absent when the model
@@ -283,8 +279,29 @@ export interface AttachmentIntake {
   addImages?: (files: File[]) => Promise<ImageAttachment[]>;
   /** The files this message already carries, read when the batch is ready to land. */
   existingFiles: () => readonly FileAttachment[];
+  /** The images this message already carries; with its files, they count against its size. */
+  existingImages: () => readonly ImageAttachment[];
   /** Rejections decided before the files were read (a folder in a native drop). */
   preRejected?: readonly AttachmentRejection[];
+}
+
+/**
+ * Admits files to one message while its attachments stay within
+ * {@link MAX_MESSAGE_ATTACHMENT_BYTES}, in the order they are offered: one that
+ * would go past it is turned away, and a smaller one after it may still fit.
+ */
+export function messageAttachmentRoom(
+  images: readonly ImageAttachment[],
+  files: readonly FileAttachment[]
+): (file: File) => boolean {
+  let room = MAX_MESSAGE_ATTACHMENT_BYTES
+    - images.reduce((total, image) => total + image.bytes, 0)
+    - files.reduce((total, file) => total + file.bytes, 0);
+  return (file) => {
+    if (file.size > room) return false;
+    room -= file.size;
+    return true;
+  };
 }
 
 async function readFileBytes(file: File): Promise<Uint8Array> {
@@ -311,9 +328,12 @@ async function readDocument(file: File, bytes: Uint8Array, kind: "pdf" | "text")
       if (text === null) return { ok: false, rejection: { name, reason: "unsupported" } };
       // UTF-16 is stored as the UTF-8 the model will read, so the host sees one encoding.
       const utf8 = bytes[0] === 0xff || bytes[0] === 0xfe ? new TextEncoder().encode(text) : bytes;
-      if (utf8.byteLength > MAX_FILE_ATTACHMENT_TEXT_BYTES) return { ok: false, rejection: { name, reason: "tooLarge" } };
+      if (utf8.byteLength > MAX_TEXT_FILE_UPLOAD_BYTES) return { ok: false, rejection: { name, reason: "tooLarge" } };
       if (!text.trim()) return { ok: false, rejection: { name, reason: "empty" } };
-      return { ok: true, name, bytes: utf8, format: "text", tokens: estimateTokens(text) };
+      // A long file is sent as its first lines; the budget counts what is sent.
+      const read = textForModel(text);
+      if (!read) return { ok: false, rejection: { name, reason: "tooLong" } };
+      return { ok: true, name, bytes: utf8, format: "text", tokens: estimateTokens(read.text) };
     }
     let extracted: ExtractedPdfText;
     try {
@@ -335,8 +355,9 @@ async function readDocument(file: File, bytes: Uint8Array, kind: "pdf" | "text")
 /**
  * Attaches a batch of files to one message.
  *
- * Images keep their own budget and numbering (`addImages`); files get the
- * checks here. Files already on the message, and files that turn out to be the
+ * Images keep their own numbering (`addImages`); files get the checks here.
+ * Both count, in the order they come, against what one message's attachments
+ * may come to. Files already on the message, and files that turn out to be the
  * same bytes as one of them, are not attached twice — a duplicate is not an
  * error worth a notice, so it is dropped without one.
  */
@@ -345,6 +366,7 @@ export async function intakeAttachments(
   intake: AttachmentIntake
 ): Promise<AttachmentIntakeResult> {
   const rejected: AttachmentRejection[] = [...(intake.preRejected ?? [])];
+  const fitsMessage = messageAttachmentRoom(intake.existingImages(), intake.existingFiles());
   const imageFiles: File[] = [];
   const documents: { file: File; bytes: Uint8Array; kind: "pdf" | "text" }[] = [];
   for (const file of files) {
@@ -357,10 +379,12 @@ export async function intakeAttachments(
     // host decodes it and is the one to refuse it if it is not.
     if (IMAGE_MEDIA_TYPES.has(file.type.toLowerCase())) {
       if (!intake.addImages) rejected.push({ name, reason: "imageInputUnavailable" });
+      else if (!sizeFits("image", file.size)) rejected.push({ name, reason: "tooLarge" });
+      else if (!fitsMessage(file)) rejected.push({ name, reason: "messageTooLarge" });
       else imageFiles.push(file);
       continue;
     }
-    if (file.size > MAX_FILE_ATTACHMENT_PDF_BYTES) {
+    if (file.size > MAX_UNSNIFFED_BYTES) {
       rejected.push({ name, reason: "tooLarge" });
       continue;
     }
@@ -374,9 +398,14 @@ export async function intakeAttachments(
     const sniff = sniffAttachmentBytes(bytes);
     if (sniff === "image") {
       if (!intake.addImages) rejected.push({ name, reason: "imageInputUnavailable" });
+      else if (!sizeFits("image", file.size)) rejected.push({ name, reason: "tooLarge" });
+      else if (!fitsMessage(file)) rejected.push({ name, reason: "messageTooLarge" });
       else imageFiles.push(file);
+    } else if (sniff === "pdf" && !sizeFits("pdf", file.size)) {
+      rejected.push({ name, reason: "tooLarge" });
     } else if (sniff === "pdf" || sniff === "text") {
-      documents.push({ file, bytes, kind: sniff });
+      if (fitsMessage(file)) documents.push({ file, bytes, kind: sniff });
+      else rejected.push({ name, reason: "messageTooLarge" });
     } else {
       rejected.push({ name, reason: sniff === "empty" ? "empty" : "unsupported" });
     }
@@ -392,25 +421,11 @@ export async function intakeAttachments(
     }
   }
 
-  const room = Math.max(0, MAX_MESSAGE_FILES - intake.existingFiles().length);
-  const within = documents.slice(0, room);
-  for (const overflow of documents.slice(room)) {
-    rejected.push({ name: overflow.file.name || undefined, reason: "tooMany" });
-  }
-  const read = await Promise.all(within.map((entry) => readDocument(entry.file, entry.bytes, entry.kind)));
-  // The model reads every attached file on every request of the conversation,
-  // so one message's files share a budget; past it, the rest wait for another.
-  let tokens = intake.existingFiles().reduce((total, file) => total + file.tokens, 0);
+  const read = await Promise.all(documents.map((entry) => readDocument(entry.file, entry.bytes, entry.kind)));
   const uploads: Extract<ReadDocument, { ok: true }>[] = [];
   for (const result of read) {
-    if (!result.ok) {
-      rejected.push(result.rejection);
-    } else if (tokens + result.tokens > MAX_MESSAGE_FILE_TOKENS) {
-      rejected.push({ name: result.name, reason: "overBudget" });
-    } else {
-      tokens += result.tokens;
-      uploads.push(result);
-    }
+    if (!result.ok) rejected.push(result.rejection);
+    else uploads.push(result);
   }
   const uploaded = await Promise.all(uploads.map(async (entry) => {
     try {
@@ -440,7 +455,7 @@ export function mergeFileAttachments(
   const known = new Set(current.map((file) => file.id));
   const merged = [...current];
   for (const file of added) {
-    if (known.has(file.id) || merged.length >= MAX_MESSAGE_FILES) continue;
+    if (known.has(file.id)) continue;
     known.add(file.id);
     merged.push(file);
   }

@@ -11,6 +11,9 @@
 //! cancel or a restart. Files already verified are recorded in
 //! `verified.json`, so a model update only fetches what changed.
 //!
+//! The one exception is a file with its own `url`: the archives of the
+//! llama.cpp runtime come from their publishers' releases, checked the same way.
+//!
 //! `MEWORK_LOCAL_MODEL_MIRROR` (a base URL serving every file at its `remote`
 //! path) replaces every host; development and tests serve files from it.
 
@@ -53,12 +56,17 @@ pub struct RemoteFile {
     pub local: String,
     pub size: u64,
     pub sha256: String,
+    /// Where the file is published when it is not the repository's own (the
+    /// llama.cpp runtime's archives); a mirror still serves it at `remote`.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// A host files are fetched from, by their `remote` path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    /// For the renderer: `huggingFace`, `hfMirror` or `mirror`.
+    /// For the renderer: `huggingFace`, `hfMirror` or `mirror`; `release`
+    /// while a file comes from its own `url`.
     pub label: &'static str,
     base: String,
 }
@@ -80,8 +88,19 @@ impl Source {
         }
     }
 
-    fn url(&self, remote: &str) -> String {
-        format!("{}/{remote}", self.base.trim_end_matches('/'))
+    fn url(&self, file: &RemoteFile) -> String {
+        match &file.url {
+            Some(url) if self.label != "mirror" => url.clone(),
+            _ => format!("{}/{}", self.base.trim_end_matches('/'), file.remote),
+        }
+    }
+
+    /// The source `file` actually comes from, for progress reports.
+    fn of_file(&self, file: &RemoteFile) -> Self {
+        match file.url {
+            Some(_) if self.label != "mirror" => Self { label: "release", base: self.base.clone() },
+            _ => self.clone(),
+        }
     }
 }
 
@@ -158,12 +177,13 @@ pub fn download(
             "{}.part",
             target.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
         ));
-        let url = source.url(&file.remote);
+        let url = source.url(file);
+        let from = source.of_file(file);
         let mut failures = 0;
         loop {
             let before = part_len(&part);
             let result = fetch(&client, &url, file, &part, cancel, &mut |received| {
-                progress(Progress { received: done_bytes + received, total, source: source.clone() })
+                progress(Progress { received: done_bytes + received, total, source: from.clone() })
             });
             match result {
                 Ok(()) => break,
@@ -188,7 +208,7 @@ pub fn download(
         let text = serde_json::to_string_pretty(&record).expect("record serializes");
         fs::write(dir.join(VERIFIED), text).map_err(|error| format!("无法写入校验记录: {error}"))?;
         done_bytes += file.size;
-        progress(Progress { received: done_bytes, total, source: source.clone() });
+        progress(Progress { received: done_bytes, total, source: from });
     }
     Ok(())
 }
@@ -325,11 +345,22 @@ mod tests {
 
     #[test]
     fn builds_source_urls() {
-        let url = |china| Source::of(&REPO, china).url("a/b.bin");
+        let file = |url: Option<&str>| RemoteFile {
+            remote: "a/b.bin".into(),
+            local: "b.bin".into(),
+            size: 1,
+            sha256: String::new(),
+            url: url.map(Into::into),
+        };
+        let url = |china| Source::of(&REPO, china).url(&file(None));
         assert_eq!(url(false), "https://huggingface.co/owner/model/resolve/abc123/a/b.bin");
         assert_eq!(url(true), "https://hf-mirror.com/owner/model/resolve/abc123/a/b.bin");
         let mirror = Source { label: "mirror", base: "http://127.0.0.1:9/x/".into() };
-        assert_eq!(mirror.url("a/b.bin"), "http://127.0.0.1:9/x/a/b.bin");
+        assert_eq!(mirror.url(&file(None)), "http://127.0.0.1:9/x/a/b.bin");
+        // A file published elsewhere comes from there, except through a mirror.
+        let origin = file(Some("https://example.com/release/b.bin"));
+        assert_eq!(Source::of(&REPO, true).url(&origin), "https://example.com/release/b.bin");
+        assert_eq!(mirror.url(&origin), "http://127.0.0.1:9/x/a/b.bin");
     }
 
     #[test]
@@ -347,6 +378,7 @@ mod tests {
             local: "sub/x.bin".into(),
             size: 3,
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            url: None,
         };
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/x.bin"), b"abc").unwrap();
@@ -418,6 +450,7 @@ mod tests {
             local: "f.bin".into(),
             size: body.len() as u64,
             sha256: Sha256::digest(body).iter().map(|b| format!("{b:02x}")).collect(),
+            url: None,
         }
     }
 

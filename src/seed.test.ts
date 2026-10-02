@@ -28,7 +28,7 @@ describe("seed document", () => {
 
   it("starts with the approval-first security policy", () => {
     const document = createSeedDocument();
-    expect(document.schemaVersion).toBe(3);
+    expect(document.schemaVersion).toBe(4);
     expect(document.globalSettings).toMatchObject({
       appLanguage: "auto",
       resolvedAppLanguage: "zh-CN",
@@ -76,6 +76,7 @@ describe("seed document", () => {
     // Claude Agent ships its seed rows installed; fetching asks the CLI later.
     const claudeModelIds = settings.apiProviders[1].models.map((model) => model.id);
     expect(claudeModelIds).toContain("claude-opus-5-5");
+    expect(claudeModelIds).toContain("claude-sonnet-5-5");
     expect(claudeModelIds).toContain("claude-opus-5");
     expect(claudeModelIds).toContain("claude-sonnet-5");
     expect(claudeModelIds).toContain("claude-haiku-4-5");
@@ -93,7 +94,7 @@ describe("seed document", () => {
 
   it("ships workspace, web, and host-run orchestration tools", () => {
     const tools = createSeedDocument().tools;
-    expect(tools).toHaveLength(48);
+    expect(tools).toHaveLength(49);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     const webTools = tools.filter((tool) => tool.category === "web");
     expect(webTools.map((tool) => tool.name)).toEqual([
@@ -110,14 +111,14 @@ describe("seed document", () => {
     ]);
     const orchestrationTools = tools.filter((tool) => tool.category === "orchestration");
     expect(orchestrationTools.map((tool) => tool.name)).toEqual([
-      "agent_spawn", "send_message", "followup_task", "task_wait", "task_list", "box",
-      "skill", "tool_search", "workflow", "todo", "ask_user", "fork",
-      "plan", "exit_plan_mode"
+      "agent_spawn", "task_wait", "task_list", "box",
+      "skill", "tool_search", "workflow", "ask_user", "fork",
+      "plan", "exit_plan_mode",
+      "read_handoff_note", "create_handoff_note", "edit_handoff_note", "handoff"
     ]);
     expect(orchestrationTools.filter((tool) => tool.dangerous).map((tool) => tool.name)).toEqual(["workflow"]);
     expect(tools.find((tool) => tool.name === "agent_spawn")).toMatchObject({ label: "子代理" });
     expect(tools.find((tool) => tool.name === "workflow")).toMatchObject({ label: "工作流" });
-    expect(tools.find((tool) => tool.name === "todo")).toMatchObject({ label: "待办事项" });
     expect(tools.filter((tool) => tool.category === "memory").map((tool) => tool.name)).toEqual([
       "read_global_memory", "read_project_memory",
       "create_global_memory", "create_project_memory",
@@ -131,7 +132,10 @@ describe("seed document", () => {
         expect(tool.parameters.some((parameter) => parameter.name === forbidden)).toBe(false);
       }
     }
-    expect(tools.some((tool) => tool.name === "subagent")).toBe(false);
+    // Retired agent tools: saved cards still render, but nothing offers them.
+    for (const retired of ["subagent", "agent_send", "send_message", "followup_task"]) {
+      expect(tools.some((tool) => tool.name === retired)).toBe(false);
+    }
   });
 
   it("does not ship demonstration timeline data or any built-in capability", () => {
@@ -151,12 +155,13 @@ describe("seed document", () => {
     expect(preset.name).toBe("mework");
     expect(settings.defaultConversationPresetId).toBe(BUILTIN_PRESET_ID);
 
-    // Three named roles bound to explicit models, thinking on, tools inherited
+    // Four named roles bound to explicit models, thinking on, tools inherited
     // from the preset, and a description saying when to pick each.
     const provider = (family: string) => settings.apiProviders.find((item) => item.family === family)!.id;
     expect(preset.settings.agentDefinitions.map((role) => [role.name, role.modelSelection])).toEqual([
       ["Opus", { kind: "explicit", providerId: provider("claude_agent"), modelId: "claude-opus-5-5" }],
-      ["Sol", { kind: "explicit", providerId: provider("openai_codex"), modelId: "gpt-6-sol" }],
+      ["Sonnet", { kind: "explicit", providerId: provider("claude_agent"), modelId: "claude-sonnet-5-5" }],
+      ["Sol", { kind: "explicit", providerId: provider("openai_codex"), modelId: "gpt-6.1-sol" }],
       ["Luna", { kind: "explicit", providerId: provider("openai_codex"), modelId: "gpt-6-luna" }]
     ]);
     for (const role of preset.settings.agentDefinitions) {
@@ -184,14 +189,15 @@ describe("seed document", () => {
     // No anonymous children: every subagent goes through one of the roles.
     expect(preset.settings.allowRolelessSubagents).toBe(false);
     // Everything on except the names the host derives for itself. The two web
-    // tools among them: they follow `webSearchEnabled`, and the plan tools
-    // follow the security level, not a tool toggle. Of the shells, only this
-    // machine's most preferred one.
+    // tools among them: they follow `webSearchEnabled`, the plan tools follow
+    // the security level and the handoff tools the conversation's context, not
+    // a tool toggle. Of the shells, only this machine's most preferred one.
     expect(preset.settings.enabledTools).toEqual(
       document.tools.map((tool) => tool.name).filter((name) => !(
         document.tools.find((tool) => tool.name === name)!.category === "memory"
         || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
         || ["plan", "exit_plan_mode"].includes(name)
+        || ["read_handoff_note", "create_handoff_note", "edit_handoff_note", "handoff"].includes(name)
         || ["bash", "sh", "powershell"].includes(name)
       ))
     );
@@ -271,7 +277,15 @@ describe("seed document", () => {
       customCss: "",
       liquidGlass: false,
       background: "solid",
-      localModel: { titles: false, shellExplanations: false, titlePrompt: "", shellPrompt: "" }
+      localModel: {
+        titles: false,
+        shellExplanations: false,
+        errorExplanations: false,
+        subagents: false,
+        titlePrompt: "",
+        shellPrompt: "",
+        errorPrompt: ""
+      }
     });
   });
 

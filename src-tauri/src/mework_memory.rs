@@ -68,13 +68,6 @@ pub enum MemoryTier {
 }
 
 impl MemoryTier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Global => "global",
-            Self::Project => "project",
-        }
-    }
-
     pub fn prompt_key(self) -> PromptKey {
         match self {
             Self::Global => PromptKey::MemoryTierGlobal,
@@ -157,13 +150,26 @@ pub fn project_root(workspace: Option<&Path>) -> Option<MemoryRoot> {
 /// separator, a drive letter, `..`, a NUL, a leading dot — is rejected rather
 /// than sanitized, so a rejected name never silently becomes a different one.
 pub fn normalize_document_name(raw: &str) -> Result<String, String> {
+    let normalized = normalize_named_document(raw, "Memory document")?;
+    if normalized.eq_ignore_ascii_case(INDEX_NAME) {
+        return Err(format!(
+            "{INDEX_NAME} is the host-managed memory index and cannot be read or written directly; provide its description when creating or editing memory"
+        ));
+    }
+    Ok(normalized)
+}
+
+/// The rules of [`normalize_document_name`] for any directory of named Markdown
+/// documents, with `noun` naming the kind of document in every error. The
+/// caller rejects its own host-owned index name.
+pub(crate) fn normalize_named_document(raw: &str, noun: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("Memory document name must not be empty".into());
+        return Err(format!("{noun} name must not be empty"));
     }
     if trimmed.chars().count() > MAX_NAME_CHARS {
         return Err(format!(
-            "Memory document name must not exceed {MAX_NAME_CHARS} characters"
+            "{noun} name must not exceed {MAX_NAME_CHARS} characters"
         ));
     }
 
@@ -175,39 +181,39 @@ pub fn normalize_document_name(raw: &str) -> Result<String, String> {
         _ => trimmed,
     };
     if stem.is_empty() {
-        return Err("Memory document name must not be empty".into());
+        return Err(format!("{noun} name must not be empty"));
     }
 
     if stem.contains('/') || stem.contains('\\') {
-        return Err("Memory document name must be a single file in the memory directory, without path separators".into());
+        return Err(format!(
+            "{noun} name must be a single file name, without path separators"
+        ));
     }
     if stem.contains(':') {
-        return Err(
-            "Memory document name must not contain a drive or data-stream separator".into(),
-        );
+        return Err(format!("{noun} name must not contain a drive or data-stream separator"));
     }
     if stem.contains('\0') {
-        return Err("Memory document name must not contain a NUL character".into());
+        return Err(format!("{noun} name must not contain a NUL character"));
     }
     if stem.starts_with('.') {
-        return Err("Memory document name must not start with a dot".into());
+        return Err(format!("{noun} name must not start with a dot"));
     }
     if stem.chars().any(|character| character.is_control()) {
-        return Err("Memory document name must not contain control characters".into());
+        return Err(format!("{noun} name must not contain control characters"));
     }
     // `.` and `..` are already excluded by the leading-dot rule; this covers
     // trailing-dot and trailing-space names, which Windows silently truncates
     // and would therefore resolve to a different file than the one named.
     if stem.ends_with('.') || stem.ends_with(' ') {
-        return Err("Memory document name must not end with a dot or space".into());
+        return Err(format!("{noun} name must not end with a dot or space"));
     }
     if stem
         .chars()
         .any(|character| matches!(character, '<' | '>' | '"' | '|' | '?' | '*'))
     {
-        return Err(
-            "Memory document name must not contain reserved characters: < > \" | ? *".into(),
-        );
+        return Err(format!(
+            "{noun} name must not contain reserved characters: < > \" | ? *"
+        ));
     }
     // Windows reserved device names (CON, NUL, COM1, and others) resolve as
     // devices rather than files. Reject their case-insensitive stem before any
@@ -224,16 +230,10 @@ pub fn normalize_document_name(raw: &str) -> Result<String, String> {
             && upper.as_bytes()[3] != b'0'
     };
     if is_reserved_device {
-        return Err("Memory document name must not use a Windows reserved device name (CON, NUL, COM1, and similar names)".into());
+        return Err(format!("{noun} name must not use a Windows reserved device name (CON, NUL, COM1, and similar names)"));
     }
 
-    let normalized = format!("{stem}.md");
-    if normalized.eq_ignore_ascii_case(INDEX_NAME) {
-        return Err(format!(
-            "{INDEX_NAME} is the host-managed memory index and cannot be read or written directly; provide its description when creating or editing memory"
-        ));
-    }
-    Ok(normalized)
+    Ok(format!("{stem}.md"))
 }
 
 /// Validates the one-line index description supplied with a write.

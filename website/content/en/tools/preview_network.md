@@ -2,7 +2,7 @@ Two shapes in one tool. Without `requestId` it lists the requests the preview pa
 
 ## Approval
 
-Classified as a sensitive browser observation (`browser.sensitive_observation`, high risk, unbounded effect): rows carry complete URLs, query parameters and response bodies from whatever the page is signed in to. Manual, Accept edits and Plan mode ask; Full access does not. **Always allow** never remembers it — no `preview_*` page tool carries a standing allowance. A page you logged into yourself raises a separate takeover confirmation no level or hook turns off.
+Classified as a sensitive browser observation (`browser.sensitive_observation`, high risk, unbounded effect): rows carry complete URLs, query parameters and response bodies from whatever the page is signed in to. Manual and Accept edits ask; Full access does not. **Always allow** never remembers it — no `preview_*` page tool carries a standing allowance. A page you logged into yourself raises a separate takeover confirmation no level or hook turns off.
 
 ## Behavior and limits
 

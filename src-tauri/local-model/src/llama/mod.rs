@@ -1,6 +1,7 @@
 //! The llama.cpp backend, for Windows and Linux (Apple platforms use Core ML).
 //!
-//! It runs the GGUF that `gguf::convert_qwen35_to_gguf` writes. Each slot is a
+//! It runs the GGUF that `gguf::convert_qwen35_to_gguf` writes, on llama.cpp's
+//! own release build (`runtime`), loaded at run time (`ffi`). Each slot is a
 //! llama.cpp sequence (seq id = slot) in one context, plus one scratch
 //! sequence that only `prefix_state` uses, so computing a prefix never
 //! disturbs live requests. Every `step` advances all listed slots in a single
@@ -19,8 +20,15 @@
 //!
 //! Weights are never locked in memory. The slot count comes from a memory
 //! budget (see `plan`), never more than `LlamaOptions::max_slots`.
+//!
+//! Images go through llama.cpp's `mtmd` with the projector file
+//! (`LlamaOptions::projector`, loaded at the first image, on the same device
+//! as the model): it encodes the picture and decodes its rows at 3-D rotary
+//! positions, after which the text continues at the position it reports, not
+//! at the count of positions taken.
 
 mod ffi;
+pub mod runtime;
 mod system;
 #[cfg(test)]
 mod tests;
@@ -28,12 +36,7 @@ mod tests;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::engine::{Backend, Capacity, Logits, PrefixState};
-
-/// The `llama-cpp-sys-2` release this is built against; its bundled llama.cpp
-/// revision decides the state format. Keep it equal to the version pinned in
-/// Cargo.toml.
-pub const LLAMA_CPP_SYS_VERSION: &str = "0.1.157";
+use crate::engine::{Backend, Capacity, Logits, PrefixState, Segment};
 
 /// Tokens per `llama_decode`, and per compute pass: bounds the activation
 /// buffers. Longer inputs are run in chunks of this size.
@@ -48,6 +51,9 @@ const MAX_THREADS: usize = 8;
 /// llama.cpp's `LLAMA_MAX_SEQ` (256), less the scratch sequence.
 const MAX_SLOTS: usize = 255;
 const MIB: u64 = 1 << 20;
+/// The vision tower's compute buffers for the largest image the service
+/// sends (1,024 tokens, 4,096 patches, flash attention).
+const PROJECTOR_COMPUTE: u64 = 256 * MIB;
 
 #[derive(Clone, Debug)]
 pub struct LlamaOptions {
@@ -60,13 +66,18 @@ pub struct LlamaOptions {
     pub cpu_only: bool,
     /// CPU threads; 0 chooses the performance cores (at most 8).
     pub threads: usize,
-    /// Where `llama-dynamic` builds find the ggml backend modules; `None` is
-    /// the executable's directory. Ignored by static builds. Only the first
-    /// backend loaded in a process decides this.
-    pub backend_dir: Option<PathBuf>,
+    /// The unpacked release build (`runtime::install`); `None` is the
+    /// executable's directory. Only the first backend loaded in a process
+    /// decides this.
+    pub runtime_dir: Option<PathBuf>,
     /// Allow an integrated GPU that cannot map the model file to hold its own
     /// copy of the weights. That copy is driver memory the OS cannot page out.
     pub igpu_resident_weights: bool,
+    /// The vision projector (`gguf::MMPROJ_FILE`); without it requests carry
+    /// no images.
+    pub projector: Option<PathBuf>,
+    /// Image sides are multiples of this (`VisionConfig::factor`).
+    pub image_factor: usize,
 }
 
 impl Default for LlamaOptions {
@@ -76,8 +87,10 @@ impl Default for LlamaOptions {
             max_slots: 4,
             cpu_only: false,
             threads: 0,
-            backend_dir: None,
+            runtime_dir: None,
             igpu_resident_weights: false,
+            projector: None,
+            image_factor: 32,
         }
     }
 }
@@ -276,36 +289,46 @@ impl ContextSettings {
 
 pub struct LlamaBackend {
     /// Dropped before `model` (fields drop in order; `Drop` also makes it explicit).
+    projector: Option<ffi::Projector>,
     context: Option<ffi::Context>,
     model: ffi::Model,
     settings: ContextSettings,
     capacity: Capacity,
     device: String,
+    /// Where the weights went (none: the CPU); the projector goes there too.
+    placement: Option<ffi::Device>,
+    projector_path: Option<PathBuf>,
+    image_factor: usize,
     format: String,
-    /// For each live slot, the position its next token goes at.
+    /// For each live slot, the rotary position its next token goes at.
     next_position: Vec<Option<usize>>,
+    /// For each live slot, the sequence positions (KV cells) it holds; behind
+    /// `next_position` once an image has taken fewer rotary positions.
+    cells: Vec<usize>,
     batch: ffi::Batch,
 }
 
 impl LlamaBackend {
     pub fn load(gguf: &Path, options: LlamaOptions) -> Result<Self, String> {
         let file = std::fs::metadata(gguf).map_err(|error| format!("无法读取模型文件 {}: {error}", gguf.display()))?;
-        let missing = ffi::missing_cpu_features();
-        if !missing.is_empty() {
-            return Err(format!("这台电脑的处理器不支持 {}，无法运行此版本的本地模型", missing.join("、")));
-        }
-        ffi::init(options.backend_dir.as_deref());
+        ffi::init(options.runtime_dir.as_deref())?;
         let shape = Shape::read(&ffi::GgufMetadata::read(gguf)?)?;
         let context = options.context.max(1).div_ceil(CONTEXT_ALIGN) * CONTEXT_ALIGN;
         let machine = Machine::detect(&options);
         if !machine.devices.iter().any(|device| device.kind == ffi::DeviceKind::Cpu) {
-            // Only `llama-dynamic` builds can get here: the backend modules were not found.
+            // The release build's CPU modules were not found beside its libraries.
             return Err(format!(
                 "找不到 llama.cpp 的 CPU 后端{}",
-                options.backend_dir.as_ref().map(|dir| format!("（{}）", dir.display())).unwrap_or_default()
+                options.runtime_dir.as_ref().map(|dir| format!("（{}）", dir.display())).unwrap_or_default()
             ));
         }
-        let plan = plan(&options, &machine, &shape, file.len(), context);
+        // The projector's weights and buffers go to the same device.
+        let projector_bytes = options
+            .projector
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |meta| meta.len() + PROJECTOR_COMPUTE);
+        let plan = plan(&options, &machine, &shape, file.len() + projector_bytes, context);
 
         let mut params = ffi::default_model_params();
         params.n_gpu_layers = if plan.devices.is_empty() { 0 } else { -1 };
@@ -327,11 +350,12 @@ impl LlamaBackend {
 
         let settings = ContextSettings { seqs: plan.slots + 1, context, threads: plan.threads };
         let mtime = file.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).unwrap_or_default();
-        // What a saved sequence depends on: the library, the exact file, the
+        // What a saved sequence depends on: the library build, the exact file, the
         // number of KV streams (one per sequence) and the device (whether V is
         // stored transposed follows its flash-attention support).
         let format = format!(
-            "llama.cpp (llama-cpp-sys-2 {LLAMA_CPP_SYS_VERSION}; {}) · gguf {} bytes, mtime {}.{:09} · {} seqs × {} · {}",
+            "llama.cpp {} ({}) · gguf {} bytes, mtime {}.{:09} · {} seqs × {} · {}",
+            runtime::RELEASE,
             ffi::library_identity(),
             file.len(),
             mtime.as_secs(),
@@ -341,13 +365,18 @@ impl LlamaBackend {
             plan.devices.first().map(describe).unwrap_or_else(|| "CPU".into()),
         );
         let mut backend = Self {
+            projector: None,
             context: None,
             model,
             settings,
             capacity: Capacity { slots: plan.slots, context },
             device: plan.description,
+            placement: plan.devices.first().cloned(),
+            projector_path: options.projector.clone(),
+            image_factor: options.image_factor.max(1),
             format,
             next_position: vec![None; plan.slots],
+            cells: vec![0; plan.slots],
             batch: ffi::Batch::default(),
         };
         // Create the context once now so a device that cannot hold it fails
@@ -377,6 +406,27 @@ impl LlamaBackend {
     /// The sequence `prefix_state` works in.
     fn scratch_seq(&self) -> i32 {
         self.capacity.slots as i32
+    }
+
+    /// Runs `picture` in `seq` from rotary position `position`; returns the
+    /// rotary position after it.
+    fn run_picture(&mut self, seq: i32, position: usize, picture: &crate::vision::Picture) -> Result<usize, String> {
+        if self.projector.is_none() {
+            let path = self.projector_path.clone().ok_or("这个模型版本不能读图片")?;
+            self.projector = Some(ffi::Projector::load(
+                &path,
+                &self.model,
+                self.placement.as_ref(),
+                self.settings.threads,
+                crate::service::MIN_IMAGE_TOKENS,
+                crate::service::MAX_IMAGE_TOKENS,
+            )?);
+        }
+        let tokens = Segment::Picture(std::sync::Arc::new(picture.clone())).len(self.image_factor);
+        let context = self.context.as_mut().ok_or("本地模型上下文已释放")?;
+        let n_batch = context.n_batch().clamp(1, BATCH);
+        let projector = self.projector.as_mut().expect("loaded above");
+        projector.eval(context, picture.width, picture.height, &picture.rgb, tokens, position, seq, n_batch)
     }
 
     fn check_tokens(&self, tokens: &[u32]) -> Result<(), String> {
@@ -448,20 +498,26 @@ impl Backend for LlamaBackend {
         Ok(PrefixState { tokens: tokens.len(), format: self.format.clone(), bytes: result?.into() })
     }
 
-    fn admit(&mut self, slot: usize, prefix: &PrefixState, tokens: &[u32]) -> Result<Logits, String> {
+    fn admit(&mut self, slot: usize, prefix: &PrefixState, input: &[Segment]) -> Result<Logits, String> {
         if slot >= self.capacity.slots {
             return Err(format!("槽位 {slot} 不存在"));
         }
-        if tokens.is_empty() {
-            return Err("请求没有词元".into());
+        // The logits come from the last text token.
+        if !matches!(input.last(), Some(Segment::Tokens(tokens)) if !tokens.is_empty()) {
+            return Err("请求必须以词元结尾".into());
         }
         if prefix.format != self.format {
             return Err("前缀状态来自另一个模型或配置，需要重新计算".into());
         }
-        if prefix.tokens + tokens.len() > self.capacity.context {
+        let cells: usize = input.iter().map(|segment| segment.len(self.image_factor)).sum();
+        if prefix.tokens + cells > self.capacity.context {
             return Err("请求超出本地模型上下文".into());
         }
-        self.check_tokens(tokens)?;
+        for segment in input {
+            if let Segment::Tokens(tokens) = segment {
+                self.check_tokens(tokens)?;
+            }
+        }
         self.next_position[slot] = None;
         let seq = slot as i32;
         let context = self.context()?;
@@ -475,10 +531,25 @@ impl Backend for LlamaBackend {
             }
             Ok(())
         })()
-        .and_then(|()| self.run(seq, prefix.tokens, tokens, true));
+        .and_then(|()| {
+            let mut position = prefix.tokens;
+            let mut logits = None;
+            for (index, segment) in input.iter().enumerate() {
+                match segment {
+                    Segment::Tokens(tokens) if tokens.is_empty() => {}
+                    Segment::Tokens(tokens) => {
+                        logits = self.run(seq, position, tokens, index + 1 == input.len())?;
+                        position += tokens.len();
+                    }
+                    Segment::Picture(picture) => position = self.run_picture(seq, position, picture)?,
+                }
+            }
+            Ok((logits, position))
+        });
         match result {
-            Ok(logits) => {
-                self.next_position[slot] = Some(prefix.tokens + tokens.len());
+            Ok((logits, position)) => {
+                self.next_position[slot] = Some(position);
+                self.cells[slot] = prefix.tokens + cells;
                 Ok(logits.expect("logits requested"))
             }
             Err(error) => {
@@ -496,16 +567,13 @@ impl Backend for LlamaBackend {
         }
         let mut seen = vec![false; self.capacity.slots];
         for (slot, token) in batch {
-            let position = self
-                .next_position
-                .get(*slot)
-                .copied()
-                .flatten()
-                .ok_or_else(|| format!("槽位 {slot} 没有进行中的请求"))?;
+            if self.next_position.get(*slot).copied().flatten().is_none() {
+                return Err(format!("槽位 {slot} 没有进行中的请求"));
+            }
             if std::mem::replace(&mut seen[*slot], true) {
                 return Err(format!("槽位 {slot} 在同一步中出现两次"));
             }
-            if position >= self.capacity.context {
+            if self.cells[*slot] >= self.capacity.context {
                 return Err("请求超出本地模型上下文".into());
             }
             self.check_tokens(&[*token])?;
@@ -525,6 +593,7 @@ impl Backend for LlamaBackend {
         for (slot, _) in batch {
             if let Some(position) = self.next_position[*slot].as_mut() {
                 *position += 1;
+                self.cells[*slot] += 1;
             }
         }
         Ok(logits)
@@ -535,6 +604,7 @@ impl Backend for LlamaBackend {
             return;
         }
         self.next_position[slot] = None;
+        self.cells[slot] = 0;
         if let Some(context) = self.context.as_mut() {
             context.seq_remove(slot as i32);
         }
@@ -551,7 +621,8 @@ impl Backend for LlamaBackend {
 
 impl Drop for LlamaBackend {
     fn drop(&mut self) {
-        // The context refers to the model; free it first.
+        // The projector and the context refer to the model; free them first.
+        self.projector = None;
         self.context = None;
     }
 }

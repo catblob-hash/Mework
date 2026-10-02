@@ -3,7 +3,8 @@ import { MEMORY_TOOL_NAME_SET } from "./memoryTools";
 /**
  * Catalog names for task-runtime tools. They are host-derived, not user settings:
  * conversations that produce tasks must also be able to list and await them, and
- * `box` is the carrier the host folds an unawaited task's result into.
+ * `box` is the carrier of every message the host appends — an unawaited task's
+ * result, a hook's context, a skill added later — so every run declares it.
  * Keep descriptors for timeline rendering, but exclude them from selection and
  * persisted enabled lists. Mirrors Rust `agents::TASK_RUNTIME_TOOL_NAMES`.
  */
@@ -76,18 +77,16 @@ export function isPreviewLifecycleToolName(name: string): boolean {
 /**
  * `enabledTools` with the preview lifecycle tools brought in step with the
  * other preview tools: each one in `available` added while any other preview
- * tool is on, and all of them taken off otherwise. A `locked` name counts as
- * on and is never taken off, because the model has already been handed it.
+ * tool is on, and all of them taken off otherwise.
  */
 export function withPreviewLifecycleTools(
   enabledTools: readonly string[],
-  available: ReadonlySet<string>,
-  locked: ReadonlySet<string> = new Set()
+  available: ReadonlySet<string>
 ): string[] {
-  const previewOn = [...enabledTools, ...locked].some(
+  const previewOn = enabledTools.some(
     (name) => isPreviewToolName(name) && !isPreviewLifecycleToolName(name)
   );
-  if (!previewOn) return enabledTools.filter((name) => !isPreviewLifecycleToolName(name) || locked.has(name));
+  if (!previewOn) return enabledTools.filter((name) => !isPreviewLifecycleToolName(name));
   return Array.from(new Set([
     ...enabledTools,
     ...PREVIEW_LIFECYCLE_TOOL_NAMES.filter((name) => available.has(name))
@@ -109,14 +108,28 @@ const TOOL_SEARCH_TOOL_NAME = "tool_search";
 
 /**
  * Catalog names for the plan-mode tools. The host derives them from the
- * conversation's security level — plan mode offers `plan` and `exit_plan_mode`,
- * every other level offers neither — so neither is a user setting. Entering
- * plan mode is the user's own choice in the composer, never a tool call.
- * Mirrors the Rust plan tool names.
+ * conversation's Plan mode switch — on offers `plan` and `exit_plan_mode`, off
+ * offers neither — so neither is a row in the tool picker. Mirrors the Rust
+ * plan tool names.
  */
 const PLAN_TOOL_NAMES = ["plan", "exit_plan_mode"] as const;
 
 const PLAN_TOOL_NAME_SET: ReadonlySet<string> = new Set(PLAN_TOOL_NAMES);
+
+/**
+ * Catalog names for the handoff tools. The host derives them for itself once
+ * the conversation's context crosses the auto-compact threshold (and offers
+ * `read_handoff_note` to a conversation that inherited notes), so none is a
+ * user setting. Mirrors Rust `handoff::TOOL_NAMES`.
+ */
+const HANDOFF_TOOL_NAMES = [
+  "read_handoff_note",
+  "create_handoff_note",
+  "edit_handoff_note",
+  "handoff"
+] as const;
+
+const HANDOFF_TOOL_NAME_SET: ReadonlySet<string> = new Set(HANDOFF_TOOL_NAMES);
 
 /**
  * Catalog names for the two web tools. They follow the conversation's single
@@ -139,14 +152,15 @@ export function isWebToolName(name: string): boolean {
  * Host-derived tools never enter persisted enabled lists. Memory follows memory
  * layer switches, runtime tools follow producers, `skill` follows its switch,
  * `tool_search` follows the MCP tool-discovery switch, the plan tools follow the
- * security level, and the two web tools follow the conversation's web-access
- * switch.
+ * security level, the handoff tools follow the conversation's context, and the
+ * two web tools follow the conversation's web-access switch.
  * Normalization and preset application share this rule.
  */
 export function isHostDerivedToolName(name: string): boolean {
   return MEMORY_TOOL_NAME_SET.has(name)
     || TASK_RUNTIME_TOOL_NAME_SET.has(name)
     || PLAN_TOOL_NAME_SET.has(name)
+    || HANDOFF_TOOL_NAME_SET.has(name)
     || WEB_TOOL_NAME_SET.has(name)
     || name === SKILL_TOOL_NAME
     || name === TOOL_SEARCH_TOOL_NAME;

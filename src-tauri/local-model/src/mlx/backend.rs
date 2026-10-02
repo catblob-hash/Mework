@@ -8,8 +8,9 @@ use memmap2::Mmap;
 
 use super::weights::{Dtype, Index, INDEX_FILE, WEIGHTS_FILE};
 use super::METALLIB_FILE;
-use crate::engine::{Backend, Capacity, Logits, PrefixState};
+use crate::engine::{rope_tables, Backend, Capacity, Input, Layout, Logits, PrefixState, Segment};
 use crate::qwen35::{Config, LayerKind};
+use crate::vision::VisionTower;
 
 /// The MLX release `libmework_mlx.dylib` was built against.
 pub const MLX_VERSION: &str = env!("MEWORK_MLX_VERSION");
@@ -37,6 +38,7 @@ struct RawConfig {
     context: i32,
     cos: *const f32,
     sin: *const f32,
+    axes: *const u8,
 }
 
 #[repr(C)]
@@ -58,7 +60,22 @@ struct Api {
     free: unsafe extern "C" fn(*mut Model),
     prefix: unsafe extern "C" fn(*mut Model, *const u32, usize, *mut *mut u8, *mut usize) -> i32,
     free_bytes: unsafe extern "C" fn(*mut u8),
-    admit: unsafe extern "C" fn(*mut Model, i32, *const u8, usize, i32, *const u32, usize, *mut f32) -> i32,
+    #[allow(clippy::type_complexity)]
+    admit: unsafe extern "C" fn(
+        *mut Model,
+        i32,
+        *const u8,
+        usize,
+        i32,
+        *const u32,
+        *const i32,
+        *const f32,
+        usize,
+        *const i32,
+        usize,
+        i32,
+        *mut f32,
+    ) -> i32,
     step: unsafe extern "C" fn(*mut Model, *const i32, *const u32, usize, *mut f32) -> i32,
     release: unsafe extern "C" fn(*mut Model, i32),
     trim: unsafe extern "C" fn(*mut Model),
@@ -166,6 +183,7 @@ pub struct MlxBackend {
     slots: usize,
     context: usize,
     device: String,
+    vision: Option<VisionTower>,
 }
 
 // SAFETY: the model is only used through `&mut self`, from one thread at a time.
@@ -183,7 +201,8 @@ impl MlxBackend {
         let api = api(&dir.join(METALLIB_FILE))?;
 
         let full: Vec<u8> = config.layers.iter().map(|kind| u8::from(*kind == LayerKind::Full)).collect();
-        let (cos, sin) = rope_table(&config, context);
+        let (cos, sin) = rope_tables(&config, context, |v| v);
+        let axes: Vec<u8> = (0..config.rotary_dim / 2).map(|i| config.rotary_axis(i) as u8).collect();
         let names: Vec<CString> =
             index.tensors.keys().map(|name| CString::new(name.as_str()).expect("tensor name")).collect();
         let tensors: Vec<RawTensor> = index
@@ -228,6 +247,7 @@ impl MlxBackend {
             context: context as i32,
             cos: cos.as_ptr(),
             sin: sin.as_ptr(),
+            axes: axes.as_ptr(),
         };
         // SAFETY: every pointer is valid for the call; the tensor data stays
         // mapped for the model's life (`_weights`).
@@ -237,17 +257,31 @@ impl MlxBackend {
         }
         // SAFETY: returns a NUL-terminated string owned by the library.
         let gpu = unsafe { CStr::from_ptr((api.device_name)()) }.to_string_lossy().into_owned();
-        let mut backend =
-            Self { api, model, _weights: weights, config, slots, context, device: format!("MLX · {gpu}") };
+        let mut backend = Self {
+            api,
+            model,
+            _weights: weights,
+            config,
+            slots,
+            context,
+            device: format!("MLX · {gpu}"),
+            vision: None,
+        };
         backend.warm_up()?;
         Ok(backend)
+    }
+
+    /// Lets requests carry images, encoded by `tower` (on the CPU).
+    pub fn with_vision(mut self, tower: VisionTower) -> Self {
+        self.vision = Some(tower);
+        self
     }
 
     /// The first call compiles the recurrence kernel and MLX's own pipelines;
     /// pay that now rather than in a request.
     fn warm_up(&mut self) -> Result<(), String> {
         let prefix = self.prefix_state(&[0, 1])?;
-        let result = self.admit(0, &prefix, &[2]).and_then(|_| self.step(&[(0, 3)]).map(|_| ()));
+        let result = self.admit_tokens(0, &prefix, &[2]).and_then(|_| self.step(&[(0, 3)]).map(|_| ()));
         self.trim();
         result
     }
@@ -262,25 +296,6 @@ impl Drop for MlxBackend {
         // SAFETY: frees the model before the mapping its weights borrow.
         unsafe { (self.api.free)(self.model) };
     }
-}
-
-/// NeoX RoPE tables `[context, rotary_dim]`, computed in double precision.
-fn rope_table(config: &Config, context: usize) -> (Vec<f32>, Vec<f32>) {
-    let rot = config.rotary_dim;
-    let half = rot / 2;
-    let mut cos = vec![0f32; context * rot];
-    let mut sin = vec![0f32; context * rot];
-    for pos in 0..context {
-        for i in 0..half {
-            let inv = config.rope_theta.powf(-(2.0 * i as f64) / rot as f64);
-            let (s, c) = (pos as f64 * inv).sin_cos();
-            for j in [i, i + half] {
-                cos[pos * rot + j] = c as f32;
-                sin[pos * rot + j] = s as f32;
-            }
-        }
-    }
-    (cos, sin)
 }
 
 impl Backend for MlxBackend {
@@ -310,13 +325,30 @@ impl Backend for MlxBackend {
         Ok(PrefixState { tokens: tokens.len(), format: self.state_format(), bytes: bytes.into() })
     }
 
-    fn admit(&mut self, slot: usize, prefix: &PrefixState, tokens: &[u32]) -> Result<Logits, String> {
+    fn admit(&mut self, slot: usize, prefix: &PrefixState, input: &[Segment]) -> Result<Logits, String> {
         if prefix.format != self.state_format() {
             return Err("前置状态格式不符".into());
         }
-        if prefix.tokens + tokens.len() >= self.context {
+        let layout = Layout::new(input, prefix.tokens, self.vision.as_ref())?;
+        let n = layout.inputs.len();
+        if n == 0 || prefix.tokens + n >= self.context {
             return Err("请求超出上下文长度".into());
         }
+        if layout.width != 0 && layout.width != self.config.hidden_size {
+            return Err("图片特征宽度与模型不符".into());
+        }
+        // Image positions name the placeholder token; their rows replace it.
+        let placeholder = self.vision.as_ref().map(|tower| tower.config().image_token_id).unwrap_or(0);
+        let (tokens, rows): (Vec<u32>, Vec<i32>) = layout
+            .inputs
+            .iter()
+            .map(|input| match input {
+                Input::Token(token) => (*token, -1),
+                Input::Feature(row) => (placeholder, *row as i32),
+            })
+            .unzip();
+        let positions: Vec<i32> = layout.positions.iter().flat_map(|p| p.map(|v| v as i32)).collect();
+        let feature_rows = layout.features.len().checked_div(layout.width).unwrap_or(0);
         let mut logits = vec![0f32; self.vocab()];
         // SAFETY: valid pointers and lengths; `logits` holds `vocab` floats.
         self.api.check(unsafe {
@@ -327,7 +359,12 @@ impl Backend for MlxBackend {
                 prefix.bytes.len(),
                 prefix.tokens as i32,
                 tokens.as_ptr(),
-                tokens.len(),
+                rows.as_ptr(),
+                layout.features.as_ptr(),
+                feature_rows,
+                positions.as_ptr(),
+                n,
+                layout.delta(prefix.tokens) as i32,
                 logits.as_mut_ptr(),
             )
         })?;

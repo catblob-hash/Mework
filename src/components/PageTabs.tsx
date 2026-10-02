@@ -1,4 +1,4 @@
-import { ChevronDown, MoreVertical, X } from "lucide-react";
+import { ChevronDown, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type {
   CSSProperties,
@@ -9,8 +9,6 @@ import type {
 import { createPortal, flushSync } from "react-dom";
 import { useI18n } from "../i18n";
 import { IconButton } from "./Common";
-import { PopoverMenu } from "./PopoverMenu";
-import type { PopoverMenuSection } from "./PopoverMenu";
 import { reorderItems, usePointerDrag } from "./usePointerDrag";
 import type { DragPoint, ReorderDropTarget } from "./usePointerDrag";
 import { usePopoverAnchor } from "./usePopoverAnchor";
@@ -41,6 +39,12 @@ export interface PageTab {
   closable?: boolean;
   /** The close control is shown but spent: the page is already on its way out. */
   closeDisabled?: boolean;
+  /**
+   * Held at the strip's start, ahead of every tab that is not: it does not drag, nothing drops
+   * ahead of it, and Ctrl+Shift+Arrow neither moves it nor moves another tab past it. The caller
+   * lists pinned tabs first.
+   */
+  pinned?: boolean;
   /** Extra class on the tab's box, for a caller's own variant of the tab. */
   className?: string;
 }
@@ -70,10 +74,11 @@ export interface PageTabsProps {
   panelId?: (id: string) => string;
   /** The widest a tab may be, in px; a longer label is ellipsized. */
   maxTabWidth?: number;
-  /** A ⋮ menu on each tab, for acting on what the tab shows. */
-  tabMenu?: (id: string) => PopoverMenuSection[];
-  /** A tab's ⋮ menu's accessible name; defaults to "Actions for <label>". */
-  tabMenuLabel?: (tab: PageTab) => string;
+  /**
+   * A right click on a tab — or the context-menu key on a focused one — for a menu of acting on what
+   * the tab shows. `point` is where the menu opens: the pointer, or under the tab from the keyboard.
+   */
+  onTabContextMenu?: (id: string, point: { x: number; y: number }) => void;
   /** An editor drawn in a tab in place of its label — a rename field — or null for the label. */
   renderEditor?: (tab: PageTab) => ReactNode | null;
   onTabDoubleClick?: (id: string) => void;
@@ -227,8 +232,7 @@ export function PageTabs({
   onReorder,
   panelId,
   maxTabWidth = 180,
-  tabMenu,
-  tabMenuLabel,
+  onTabContextMenu,
   renderEditor,
   onTabDoubleClick,
   trailing,
@@ -249,6 +253,7 @@ export function PageTabs({
 
   const ids = tabs.map((tab) => tab.id);
   const tabById = new Map(tabs.map((tab) => [tab.id, tab]));
+  const pinnedCount = tabs.filter((tab) => tab.pinned).length;
   const currentId = activeId !== null && tabById.has(activeId) ? activeId : null;
   const { shown, hidden } = fitPageTabs(ids, currentId, metrics);
   const tabStopId = currentId ?? shown[0] ?? null;
@@ -276,7 +281,6 @@ export function PageTabs({
   // render, and forcing a layout read on each would cost a reflow per keystroke elsewhere in the app.
   const measureKey = [
     maxTabWidth,
-    tabMenu ? "menu" : "",
     ...tabs.map((tab) => [
       tab.id, tab.label, tab.badge ?? "", tab.icon ? "icon" : "", closable(tab) ? "close" : "", tab.className ?? ""
     ].join("\u0000"))
@@ -319,9 +323,15 @@ export function PageTabs({
 
   const dropSlotAt = (point: DragPoint, sourceId: string): DropSlot | null => {
     const panel = menuOpen ? menuPanelRef.current : null;
+    // Nothing lands among the pinned tabs: a drop aimed at one lands just after the last of them.
+    const unpinned = (slot: DropSlot | null): DropSlot | null => (
+      slot && tabById.get(slot.id)?.pinned
+        ? { ...slot, id: ids[pinnedCount - 1], position: "after" }
+        : slot
+    );
     const inMenu = (slop: number): DropSlot | null => {
       const slot = slotAt(panel, sourceId, point, "y", slop);
-      return slot && { ...slot, list: "menu" };
+      return unpinned(slot && { ...slot, list: "menu" });
     };
     // The menu hangs just below the strip, inside the strip's slop: a pointer over the menu is the
     // menu's, even where the only row in it is the one being dragged.
@@ -330,7 +340,7 @@ export function PageTabs({
       return inMenu(0);
     }
     const inStrip = slotAt(stripRef.current, sourceId, point, "x", DRAG_SLOP);
-    return inStrip ? { ...inStrip, list: "strip" } : inMenu(DRAG_SLOP);
+    return inStrip ? unpinned({ ...inStrip, list: "strip" }) : inMenu(DRAG_SLOP);
   };
 
   const {
@@ -436,8 +446,9 @@ export function PageTabs({
       if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey) {
         if (!onReorder) return;
         event.preventDefault();
+        if (tab.pinned) return;
         const destination = index + delta;
-        if (destination < 0 || destination >= ids.length) return;
+        if (destination < pinnedCount || destination >= ids.length) return;
         const next = ids.filter((id) => id !== tab.id);
         next.splice(destination, 0, tab.id);
         onReorder(next);
@@ -491,7 +502,9 @@ export function PageTabs({
     controls[next]?.focus();
   };
 
-  const dragHandlers = (source: DragSource) => (reorderable ? bindDrag(source) : {});
+  const dragHandlers = (source: DragSource) => (
+    reorderable && !tabById.get(source.id)?.pinned ? bindDrag(source) : {}
+  );
   const dropClass = (list: DropSlot["list"], id: string, base: string) => (
     dropSlot && dropSlot.list === list && dropSlot.id === id ? ` ${base}--drop-${dropSlot.position}` : ""
   );
@@ -502,7 +515,6 @@ export function PageTabs({
     const boxClass = `page-tab${active ? " page-tab--active" : ""}${editor !== undefined ? " page-tab--editing" : ""}${
       dragSource?.id === tab.id ? " page-tab--dragging" : ""
     }${dropClass("strip", tab.id, "page-tab")}${tab.className ? ` ${tab.className}` : ""}`;
-    const menuName = tabMenuLabel?.(tab) ?? t("{name} 的操作", "Actions for {name}", { name: tab.label });
     return (
       // The tab's controls cannot live inside the tab button, so they share a presentational box
       // the tablist looks straight through.
@@ -525,6 +537,15 @@ export function PageTabs({
                 if (event.button === 1) event.preventDefault();
               }}
               onAuxClick={(event) => onMiddleClick(event, tab)}
+              onContextMenu={onTabContextMenu
+                ? (event) => {
+                  event.preventDefault();
+                  // From the keyboard there is no pointer: the menu opens under the tab.
+                  const box = event.currentTarget.getBoundingClientRect();
+                  const keyboard = event.clientX === 0 && event.clientY === 0;
+                  onTabContextMenu(tab.id, keyboard ? { x: box.left, y: box.bottom } : { x: event.clientX, y: event.clientY });
+                }
+                : undefined}
               onKeyDown={(event) => onTabKeyDown(event, tab)}
               {...dragHandlers({ id: tab.id, from: "strip" })}
             >
@@ -532,18 +553,6 @@ export function PageTabs({
               {tab.badge && <span className="page-tab__badge" aria-hidden="true">{tab.badge}</span>}
               <span className="page-tab__text">{tab.content ?? tab.label}</span>
             </button>
-            {tabMenu && (
-              <PopoverMenu
-                rootClassName="page-tab__menu"
-                triggerClassName="icon-button page-tab__menu-trigger"
-                trigger={<MoreVertical size={12} aria-hidden="true" />}
-                triggerLabel={menuName}
-                menuLabel={menuName}
-                sections={tabMenu(tab.id)}
-                align="end"
-                dense
-              />
-            )}
             {closable(tab) && (
               <IconButton
                 className="page-tab__close"
@@ -686,7 +695,6 @@ export function PageTabs({
                 {tab.badge && <span className="page-tab__badge" data-measure-text={tab.badge} />}
                 <span className="page-tab__text" data-measure-text={tab.label} />
               </span>
-              {tabMenu && <span className="page-tab__menu-trigger" />}
               {closable(tab) && <span className="page-tab__close" />}
             </div>
           ))}

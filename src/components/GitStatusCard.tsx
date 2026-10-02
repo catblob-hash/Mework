@@ -1,9 +1,6 @@
 import {
   ChevronRight,
-  GitBranch,
-  GitCommitHorizontal,
-  GitCompareArrows,
-  Laptop
+  GitCompareArrows
 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { useI18n } from "../i18n";
@@ -103,7 +100,6 @@ export function GitStatusCard({
           aria-controls={reviewPageDomId}
           onClick={() => onOpenGitReview()}
         >
-          <GitCompareArrows size={14} aria-hidden="true" />
           <strong>{t("变更", "Changes")}</strong>
           <span className="git-status-card__diff-stat" aria-label={t(
             "新增 {additions} 行，删除 {deletions} 行",
@@ -115,12 +111,10 @@ export function GitStatusCard({
           </span>
         </button>
         <div className="git-status-card__row git-status-card__row--static">
-          <Laptop size={14} aria-hidden="true" />
           <strong>{t("本地", "Local")}</strong>
           <small>{git.remote?.name ?? t("无远程仓库", "No remote")}</small>
         </div>
         <div className="git-status-card__row git-status-card__row--static">
-          <GitBranch size={14} aria-hidden="true" />
           <strong title={git.branch ?? git.head ?? ""}>
             {git.branch ?? (git.head
               ? t("分离头指针 {head}", "Detached at {head}", { head: git.head })
@@ -137,7 +131,6 @@ export function GitStatusCard({
           aria-controls={reviewPageDomId}
           onClick={() => onOpenGitReview()}
         >
-          <GitCommitHorizontal size={14} aria-hidden="true" />
           <strong>{primaryAction}</strong>
           <ChevronRight size={14} aria-hidden="true" />
         </button>

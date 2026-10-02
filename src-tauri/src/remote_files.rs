@@ -204,6 +204,13 @@ pub(crate) fn run_edit(
     edit_with(&target.workspace.runner, target, input, file_guard)
 }
 
+pub(crate) fn check_repository_write(
+    target: &RemoteWorkspace<'_>,
+    input: &JsonObject,
+) -> Result<(), String> {
+    check_repository_write_with(&target.workspace.runner, target, input)
+}
+
 // ---------------------------------------------------------------------------
 // Script construction
 // ---------------------------------------------------------------------------
@@ -591,10 +598,8 @@ fn ls_with(
     input: &JsonObject,
 ) -> Result<String, String> {
     let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
-    let depth = optional_u64(input, "depth", 1)?;
-    if depth > 8 {
-        return Err("Recursive depth cannot exceed 8".into());
-    }
+    // Deeper than the deepest listing there is reads as asking for that one.
+    let depth = optional_u64(input, "depth", 1)?.min(8);
     let wording = ExitWording::new(&path)
         .wrong_kind(format!("ls target is not a directory: {path}"));
     let output = run_script(
@@ -976,7 +981,6 @@ fn read_with(
     file_guard: Option<FileGuardContext<'_>>,
 ) -> Result<RemoteOutcome, String> {
     let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
-    let (start_line, end_line) = parse_read_range(input)?;
     let wording = ExitWording::new(&path)
         .wrong_kind(format!("read target is not a file: {path}"))
         .too_large(format!(
@@ -995,10 +999,8 @@ fn read_with(
     let (meta, body) = take_lines(rest, 2)?;
     let modified_ms = seconds_to_ms(&meta[0]);
 
+    // An image read ignores any line range, as on the host.
     if is_supported_image(body) {
-        if input.contains_key("start_line") || input.contains_key("end_line") {
-            return Err("read does not accept start_line or end_line when reading an image".into());
-        }
         if body.len() > MAX_IMAGE_ATTACHMENT_BYTES {
             return Err(format!(
                 "Image exceeds the {} MiB limit ({} bytes)",
@@ -1009,7 +1011,9 @@ fn read_with(
         let store = attachment_store.ok_or_else(|| {
             "read requires a trusted image attachment directory to read an image".to_owned()
         })?;
-        let image = store.import(base_name(&header.canonical), body)?;
+        // Shrunk like any image the model sees. The transfer cap above stays at
+        // the stored-image size: it bounds every remote read, text included.
+        let image = store.import_compressed(base_name(&header.canonical), body)?;
         return Ok(RemoteOutcome {
             output: target.profile.render(
                 PromptKey::ToolReadImage,
@@ -1033,6 +1037,7 @@ fn read_with(
             MAX_TEXT_FILE / 1024 / 1024
         ));
     }
+    let (start_line, end_line) = parse_read_range(input)?;
     let content = String::from_utf8(body.to_vec())
         .map_err(|error| format!("Failed to read text file as UTF-8: {error}"))?;
     let slice = slice_text_lines(&content, start_line, end_line, target.profile)?;
@@ -1111,6 +1116,71 @@ fi
 "#
     ));
     Ok(script)
+}
+
+/// Plan mode's question about a write target, the POSIX form of
+/// `remote_powershell::repository_probe`: `repository` when Git would count
+/// writing it as a change — tracked, or inside a work tree and not ignored, a
+/// file that does not exist yet included — and `free` otherwise, Git missing
+/// included. `check-ignore` answers 1 for exactly those paths (a tracked file
+/// is never reported as ignored), so it runs from the nearest directory that
+/// exists, on the rest of the path.
+const REPOSITORY_PROBE: &str = r#"_cur=$(dirname -- "$C")
+_rest=$(basename -- "$C")
+while [ ! -d "$_cur" ]; do
+_b=$(basename -- "$_cur")
+_p=$(dirname -- "$_cur")
+if [ "$_p" = "$_cur" ]; then printf 'free
+'; exit 0; fi
+_rest=$_b/$_rest
+_cur=$_p
+done
+if cd -- "$_cur" 2>/dev/null; then
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false check-ignore -q -- "$_rest" >/dev/null 2>&1
+if [ $? -eq 1 ]; then printf 'repository
+'; exit 0; fi
+fi
+printf 'free
+'
+"#;
+
+fn repository_script(target: &RemoteWorkspace<'_>, path: &str) -> Result<String, String> {
+    if let Some(ps) = powershell(target)? {
+        check_operand(path, "path")?;
+        return Ok(crate::remote_powershell::repository_probe(&ps, path));
+    }
+    let mut script = prologue(target, path, TargetMode::ForWrite)?;
+    script.push_str(REPOSITORY_PROBE);
+    Ok(script)
+}
+
+/// Plan mode's check of a `write` or `edit` on that machine: refused when its
+/// target is part of a Git repository's content there
+/// (`plan_mode::repository_write_refusal`). One round trip, which the run loop
+/// takes only in plan mode and before the call reaches an approval card
+/// (`tool_executor::plan_mode_refusal`). A probe that fails refuses the call
+/// with its error: the write would have run the same prologue and failed alike.
+fn check_repository_write_with(
+    shell: &dyn RemoteShell,
+    target: &RemoteWorkspace<'_>,
+    input: &JsonObject,
+) -> Result<(), String> {
+    let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
+    let output = run_script(
+        shell,
+        target,
+        &repository_script(target, &path)?,
+        None,
+        FILE_TIMEOUT,
+        &ExitWording::new(&path),
+    )?;
+    let (header, rest) = take_header(&output.stdout)?;
+    let (answer, _) = take_lines(rest, 1)?;
+    if answer[0] == "repository" {
+        return Err(crate::plan_mode::repository_write_refusal(&header.canonical));
+    }
+    Ok(())
 }
 
 fn probe_file(
@@ -2297,7 +2367,9 @@ pub(crate) mod tests {
         let not_a_directory =
             ls_with(&fixture.shell, &target, &input(json!({"path": "a.txt"}))).refusal();
         assert_eq!(not_a_directory, "ls target is not a directory: a.txt");
-        assert!(ls_with(&fixture.shell, &target, &input(json!({"depth": 9}))).is_err());
+        // Deeper than the cap reads as the deepest listing, not as a mistake.
+        let capped = ls_with(&fixture.shell, &target, &input(json!({"depth": 9}))).unwrap();
+        assert!(capped.contains("sub/deep/c.txt"), "{capped}");
     }
 
     /// Every POSIX agent shell the table registers runs the same scripts to
@@ -2375,6 +2447,38 @@ pub(crate) mod tests {
             invalid.starts_with("Invalid regular expression:"),
             "{invalid}"
         );
+    }
+
+    /// Plan mode on another machine: the repository probe runs there and
+    /// refuses a target in the repository's content — a tracked file, a new
+    /// file Git would pick up — while an ignored path passes.
+    #[test]
+    fn plan_mode_refuses_a_remote_write_to_the_repository() {
+        let Some(fixture) = fixture() else { return };
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(&fixture.workspace)
+                .args(args)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        write_fixture_file(&fixture, ".gitignore", b"tmp/\n");
+        write_fixture_file(&fixture, "app.txt", b"alpha\n");
+        assert!(git(&["add", ".gitignore", "app.txt"]));
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let check = |path: &str| {
+            check_repository_write_with(&fixture.shell, &target, &input(json!({"path": path})))
+        };
+
+        let tracked = check("app.txt").expect_err("a tracked file is refused");
+        assert!(tracked.starts_with("Plan mode is on:"), "{tracked}");
+        let created = check("src/new.rs").expect_err("a new file Git would pick up is refused");
+        assert!(created.starts_with("Plan mode is on:"), "{created}");
+        check("tmp/notes.md").expect("an ignored path passes");
     }
 
     #[test]

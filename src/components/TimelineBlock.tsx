@@ -6,7 +6,7 @@ import {
   Trash2,
   Webhook
 } from "lucide-react";
-import { Fragment, memo, useEffect, useId, useMemo, useState, useSyncExternalStore } from "react";
+import { Fragment, memo, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ComponentType, ReactNode } from "react";
 import { useI18n } from "../i18n";
 import type {
@@ -21,16 +21,24 @@ import type {
 } from "../types";
 import { useAppearance } from "../lib/appearance";
 import { estimateContextTokens, formatCompactTokenCount } from "../lib/contextTokens";
-import { subscribeToolExplanations, toolExplanation, toolExplanationVersion } from "../lib/localModel";
+import {
+  subscribeToolExplanations,
+  toolErrorExplanation,
+  toolExplanation,
+  toolExplanationVersion
+} from "../lib/localModel";
 import { isEncryptedReasoning } from "../lib/modelCapabilities";
-import { isHostAuthoredUserContext } from "../lib/orchestration";
+import { isHostAuthoredUserContext, isLegacyPausedQuestion } from "../lib/orchestration";
+import { openPath, prefetchPath } from "../lib/pathLinks";
+import type { PathOpenRequest } from "../lib/pathLinks";
 import { agentTimelineRouteId, agentTimelineRunStatus } from "../lib/subagents";
 import { isPreviewToolName } from "../lib/taskTools";
 import type { WorkflowRunView } from "../lib/workflowRuns";
-import { IconButton } from "./Common";
+import { CopyButton, IconButton } from "./Common";
 import { InlineTextEditor } from "./InlineTextEditor";
 import { InlineToolEditor } from "./InlineToolEditor";
 import { MarkdownContent } from "./MarkdownContent";
+import { useTimelineSelected } from "./timelineSelection";
 import { StreamRevealText } from "./StreamRevealText";
 import {
   getToolPresentation,
@@ -41,10 +49,8 @@ import {
   toolSummaryKind,
   toolSurfaceForName
 } from "./ToolRenderers";
-import type { SummaryKind, ToolViewFamily } from "./ToolRenderers";
+import type { SummaryKind, TitleSubject, ToolPresentation, ToolViewFamily } from "./ToolRenderers";
 import { WorkflowRunDetail } from "./WorkflowRunDetail";
-
-const COLLAPSE_RELEASE_DELAY_MS = 280;
 
 /** How much of a reasoning line reaches the DOM; CSS ellipsizes whatever still overflows. */
 const REASONING_LINE_LIMIT = 220;
@@ -94,6 +100,11 @@ function isProtocolOnlyContext(item: ContextItem): boolean {
   return (
     item.kind === "assistant"
     && item.content.length === 0
+  ) || (
+    // The point tools joined the conversation: the wire hands them over there,
+    // and there is nothing for a reader to see.
+    item.kind === "system"
+    && (item.toolsAdded?.length ?? 0) > 0
   ) || (
     item.kind === "reasoning"
     && !item.streaming
@@ -147,11 +158,10 @@ export function buildContextRenderNodes(
   const answersByQuestionId = new Map<string, IndexedQuestionAnswer>();
   const projectedAnswerIds = new Set<string>();
   contexts.forEach((item, index) => {
-    if (
-      item.kind !== "tool"
-      || item.toolName !== "ask_user"
-      || !item.result.success
-    ) return;
+    // Only a question from before questions blocked has its answer in the next
+    // user message; a newer one answers in its own result, and the message
+    // after it is just the user's next message.
+    if (!isLegacyPausedQuestion(item)) return;
 
     for (let answerIndex = index + 1; answerIndex < contexts.length; answerIndex += 1) {
       const candidate = contexts[answerIndex];
@@ -326,24 +336,6 @@ function reasoningLine(content: string, streaming: boolean): string | undefined 
 }
 
 /**
- * Keeps a row's body in the DOM for the length of the closing animation, so a
- * collapse does not cut its own transition short.
- */
-function useDetailsMounting(open: boolean): boolean {
-  const [mounted, setMounted] = useState(open);
-  // Opening mounts the body in the same render pass: a body that arrives an
-  // effect-cycle later changes the region's target height mid-transition and
-  // splits the expand animation in two.
-  if (open && !mounted) setMounted(true);
-  useEffect(() => {
-    if (open || !mounted) return;
-    const timer = window.setTimeout(() => setMounted(false), COLLAPSE_RELEASE_DELAY_MS);
-    return () => window.clearTimeout(timer);
-  }, [mounted, open]);
-  return mounted;
-}
-
-/**
  * The shared row: a marker, a name, one line of the record itself, and a body
  * that opens under it.
  *
@@ -359,6 +351,8 @@ export function TimelineRow({
   rowKind,
   icon: Icon,
   name,
+  label,
+  figures,
   line,
   lineStreaming = false,
   stat,
@@ -380,6 +374,10 @@ export function TimelineRow({
   rowKind: string;
   icon: ComponentType<{ size?: number; className?: string }>;
   name: string;
+  /** What the name slot shows when it is more than text; `name` stays its words for assistive tech. */
+  label?: ReactNode;
+  /** Figures that belong to the name and stay whole when it is cut short: a change's line counts. */
+  figures?: ReactNode;
   line?: string;
   /** The line is still being written: what each commit adds sweeps in. */
   lineStreaming?: boolean;
@@ -406,10 +404,7 @@ export function TimelineRow({
   const detailsId = useId();
   const StatusIcon = status?.icon;
   const tone = status?.tone ?? "neutral";
-  // A closed row keeps nothing of its body in the DOM. Markdown, diffs and
-  // terminal output are the expensive part of a long transcript, and a block of
-  // thirty rows would otherwise render all thirty bodies to show none of them.
-  const detailsMounted = useDetailsMounting(expandable && expanded);
+  const selected = useTimelineSelected(contextId);
 
   return (
     <article
@@ -419,6 +414,7 @@ export function TimelineRow({
       data-context-id={contextId}
       data-context-index={index}
       data-row-kind={rowKind}
+      data-timeline-selected={selected || undefined}
       aria-busy={tone === "running" || tone === "ready" || tone === "announced" || undefined}
       onContextMenu={readOnly ? undefined : (event) => {
         event.preventDefault();
@@ -454,7 +450,8 @@ export function TimelineRow({
             onClick={() => (expandable ? onToggleExpanded() : onOpenPanel?.())}
           >
             <span className="timeline-row__icon" aria-hidden="true"><Icon size={14} /></span>
-            <span className="timeline-row__name">{name}</span>
+            <span className="timeline-row__name">{label ?? name}</span>
+            {figures}
             {line && (
               <span className="timeline-row__line">
                 {lineStreaming ? <StreamRevealText text={line} /> : line}
@@ -486,17 +483,14 @@ export function TimelineRow({
           </span>
         )}
       </div>
+      {/* Opens and closes in one frame: a body that slides open moves every
+          row under it for the length of the slide. A closed row keeps nothing
+          of its body in the DOM — Markdown, diffs and terminal output are the
+          expensive part of a long transcript, and a block of thirty rows would
+          otherwise render all thirty bodies to show none of them. */}
       {expandable && (
-        <div
-          className={`collapse-region timeline-row__details-region${expanded ? "" : " collapse-region--closed"}`}
-          aria-hidden={!expanded || undefined}
-          inert={!expanded || undefined}
-        >
-          <div className="collapse-region__inner">
-            <div id={detailsId} className="timeline-row__details" role="region" aria-labelledby={summaryId}>
-              {detailsMounted && children}
-            </div>
-          </div>
+        <div id={detailsId} className="timeline-row__details" role="region" aria-labelledby={summaryId} hidden={!expanded}>
+          {expanded && children}
         </div>
       )}
     </article>
@@ -541,6 +535,96 @@ function RowActions({ item, onEdit, onDelete, allowEdit, editLabel, deleteLabel 
   );
 }
 
+/** The workspace number a call named, or null for the conversation's first. */
+function workspaceOf(item: ToolContext): number | null {
+  const value = item.input.workspace;
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * How a row's file opens: in a page of its own in the file pane, where the
+ * call's workspace has it. A path written against another workspace does not
+ * resolve against this surface's directory; the app knows where it is.
+ */
+function fileRequest(item: ToolContext, subject: TitleSubject, pathBaseDir: string | null): PathOpenRequest | undefined {
+  if (!subject.path) return undefined;
+  const workspace = workspaceOf(item);
+  return {
+    path: subject.path,
+    baseDir: workspace === null || workspace === 1 ? pathBaseDir : null,
+    line: subject.line ?? null,
+    workspace,
+    newPage: true
+  };
+}
+
+/** How long the pointer rests on a file name before the app looks for where it is. */
+const FILE_PREFETCH_DWELL_MS = 60;
+
+/**
+ * A tool row's title with its subject set apart: a file the call read or wrote
+ * is a link into the file pane, a pattern it looked for reads as code.
+ *
+ * The link sits inside the row's disclosure button, so its click stops there
+ * rather than also opening the row's body.
+ */
+function ToolTitle({ subject, request }: { subject: TitleSubject; request?: PathOpenRequest }) {
+  const dwell = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (dwell.current !== null) window.clearTimeout(dwell.current);
+  }, []);
+  const text = request
+    ? (
+      // biome-ignore lint/a11y/noStaticElementInteractions: Inside the row's disclosure button nothing may take focus of its own, so this is the pointer's shortcut; the keyboard reaches the file through the file pane.
+      // biome-ignore lint/a11y/useKeyWithClickEvents: Same reason: a key handler here could never fire, the button holds the focus.
+      // biome-ignore lint/a11y/noNoninteractiveElementInteractions: Same reason.
+      <span
+        className="timeline-row__file"
+        title={subject.path}
+        onMouseEnter={() => {
+          dwell.current = window.setTimeout(() => {
+            dwell.current = null;
+            prefetchPath(request);
+          }, FILE_PREFETCH_DWELL_MS);
+        }}
+        onMouseLeave={() => {
+          if (dwell.current !== null) window.clearTimeout(dwell.current);
+          dwell.current = null;
+        }}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const box = event.currentTarget.getBoundingClientRect();
+          openPath({ ...request, anchor: { left: box.left, top: box.top, right: box.right, bottom: box.bottom } });
+        }}
+      >
+        {subject.text}
+      </span>
+    )
+    : subject.code
+      ? <code className="timeline-row__code">{subject.text}</code>
+      : subject.text;
+  return <>{subject.before}{text}{subject.after}</>;
+}
+
+/** A change's added and removed lines, then what a search found; nothing for any other row. */
+function ToolFigures({ presentation }: { presentation: ToolPresentation }) {
+  const { counts, note } = presentation;
+  if (!counts && !note) return null;
+  return (
+    <span className="timeline-row__figures">
+      {counts && (
+        <>
+          {/* `−` is the typographic minus the review pane uses; a hyphen reads as a dash. */}
+          <b>{`+${counts.additions}`}</b>
+          <em>{`−${counts.deletions}`}</em>
+        </>
+      )}
+      {note && <span>{note}</span>}
+    </span>
+  );
+}
+
 function ToolRow({
   entry,
   descriptor,
@@ -557,12 +641,14 @@ function ToolRow({
   const { t } = useI18n();
   const { item, index } = entry;
   useSyncExternalStore(subscribeToolExplanations, toolExplanationVersion);
-  const presentation = getToolPresentation(item, descriptor, t, toolExplanation(item.id));
+  const presentation = getToolPresentation(item, descriptor, t, toolExplanation(item.id), toolErrorExplanation(item.id));
   const status = toolRowStatus(item, presentation.family, t);
   const transient = item.streaming === true;
   const editing = item.id === callbacks.editingContextId;
-  const failed = status.tone === "error";
-  const [expanded, setExpanded] = useState(failed);
+  // Every row starts closed, a failed one included: its line already turns red,
+  // and a body that opened on its own would push the rest of the round down
+  // the page in the middle of reading it.
+  const [expanded, setExpanded] = useState(false);
   const agentRoute = presentation.family === "agent-run" ? agentTimelineRouteId(item) : null;
   const subagentRoute = callbacks.onOpenSubagent ? agentRoute : null;
   // A run of its own is read in its own panel, not in a drawer under the line:
@@ -580,12 +666,8 @@ function ToolRow({
   const expandable = !openPanel && (!transient || item.streamStatus !== "announced");
   const open = (expanded || editing) && groupExpanded;
 
-  // A failure is the one result nobody opened the row to find, so it opens
-  // itself. An open editor owns the body: collapsing would unmount it and
-  // silently discard whatever had been typed.
-  useEffect(() => {
-    if (failed) setExpanded(true);
-  }, [failed]);
+  // An open editor owns the body: collapsing would unmount it and silently
+  // discard whatever had been typed.
   useEffect(() => {
     if (editing) setExpanded(true);
   }, [editing]);
@@ -603,6 +685,7 @@ function ToolRow({
     : agentRoute && agentRoute !== item.id
       ? agentRoute
       : (presentation.family === "agent-note" && presentation.target) || presentation.title;
+  const named = presentation.subject && name === presentation.title;
   const tokenStat = rowTokenStat(item, t);
   const stat = workflowView
     ? [t("{count} 个代理", "{count} agents", { count: workflowView.stepCount }), tokenStat]
@@ -616,6 +699,10 @@ function ToolRow({
       rowKind={entry.kind}
       icon={presentation.icon}
       name={name}
+      label={named && presentation.subject
+        ? <ToolTitle subject={presentation.subject} request={fileRequest(item, presentation.subject, callbacks.pathBaseDir)} />
+        : undefined}
+      figures={<ToolFigures presentation={presentation} />}
       stat={stat}
       status={status}
       accessibleName={[toolRowName(item, descriptor), presentation.target, status.label]
@@ -722,18 +809,27 @@ function ReasoningRow({
         : encrypted
           ? t("加密思考", "Encrypted reasoning")
           : t("思考过程", "Reasoning")}
-      actions={callbacks.readOnly || editing ? undefined : (
-        <RowActions
-          item={item}
-          onEdit={callbacks.onEdit}
-          onDelete={callbacks.onDelete}
-          // Encrypted reasoning cannot be edited: its body never reached the
-          // client, so anything typed here would be fabricated history the next
-          // round is asked to believe.
-          allowEdit={editable && !encrypted}
-          editLabel={t("编辑上下文", "Edit context")}
-          deleteLabel={t("删除上下文", "Delete context")}
-        />
+      // Copying changes nothing, so a read-only or running timeline keeps it;
+      // a thought still being written has no settled text to copy yet.
+      actions={editing || (callbacks.readOnly && (streaming || !content)) ? undefined : (
+        <>
+          {!streaming && content.length > 0 && (
+            <CopyButton text={content} label={t("复制思考过程", "Copy reasoning")} />
+          )}
+          {!callbacks.readOnly && (
+            <RowActions
+              item={item}
+              onEdit={callbacks.onEdit}
+              onDelete={callbacks.onDelete}
+              // Encrypted reasoning cannot be edited: its body never reached the
+              // client, so anything typed here would be fabricated history the next
+              // round is asked to believe.
+              allowEdit={editable && !encrypted}
+              editLabel={t("编辑上下文", "Edit context")}
+              deleteLabel={t("删除上下文", "Delete context")}
+            />
+          )}
+        </>
       )}
       expandable={expandable}
       expanded={open}
@@ -911,7 +1007,7 @@ export const TimelineBlock = memo(function TimelineBlock({
     () => entries.reduce((total, entry) => total + estimateContextTokens(entry.item), 0),
     [entries]
   );
-  // A collapsed list is `inert`, which would make an open editor unreachable.
+  // A collapsed list is `hidden`, which would make an open editor unreachable.
   const listExpanded = expanded || entries.some((entry) => entry.item.id === editingContextId);
   const callbacks: RowCallbacks = {
     readOnly,
@@ -971,33 +1067,28 @@ export const TimelineBlock = memo(function TimelineBlock({
           </span>
         </button>
       </h3>
-      <div
-        className={`collapse-region timeline-block__list-region${listExpanded ? "" : " collapse-region--closed"}`}
-        aria-hidden={!listExpanded || undefined}
-        inert={!listExpanded || undefined}
-      >
-        <div id={listId} className="collapse-region__inner timeline-block__list" role="list">
-          {entries.map((entry) => (
-            <Fragment key={entry.item.id}>
-              {!readOnly && insertionIndex === entry.index && (
-                <div className="insertion-line timeline-block__insertion" />
-              )}
-              {entry.kind === "reasoning"
-                ? <ReasoningRow entry={entry} groupExpanded={listExpanded} callbacks={callbacks} />
-                : entry.kind === "hook"
-                  ? <HookRow entry={entry} groupExpanded={listExpanded} callbacks={callbacks} />
-                  : (
-                    <ToolRow
-                      entry={entry}
-                      descriptor={tools.find((tool) => tool.name === entry.item.toolName)}
-                      workflowView={entry.kind === "workflow" ? workflowRunByCall?.[entry.item.id] : undefined}
-                      groupExpanded={listExpanded}
-                      callbacks={callbacks}
-                    />
-                  )}
-            </Fragment>
-          ))}
-        </div>
+      {/* Hidden rather than unmounted, so each row keeps whether it was open. */}
+      <div id={listId} className="timeline-block__list" role="list" hidden={!listExpanded}>
+        {entries.map((entry) => (
+          <Fragment key={entry.item.id}>
+            {!readOnly && insertionIndex === entry.index && (
+              <div className="insertion-line timeline-block__insertion" />
+            )}
+            {entry.kind === "reasoning"
+              ? <ReasoningRow entry={entry} groupExpanded={listExpanded} callbacks={callbacks} />
+              : entry.kind === "hook"
+                ? <HookRow entry={entry} groupExpanded={listExpanded} callbacks={callbacks} />
+                : (
+                  <ToolRow
+                    entry={entry}
+                    descriptor={tools.find((tool) => tool.name === entry.item.toolName)}
+                    workflowView={entry.kind === "workflow" ? workflowRunByCall?.[entry.item.id] : undefined}
+                    groupExpanded={listExpanded}
+                    callbacks={callbacks}
+                  />
+                )}
+          </Fragment>
+        ))}
       </div>
     </section>
   );

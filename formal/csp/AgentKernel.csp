@@ -111,8 +111,9 @@
 -- TurnCancel cancels the model turn, its pending waits, and delivery
 -- obligations, but not tasks.
 --
--- `awaiting_user` uses the cancellation-settlement projection. It does not
--- interrupt background tasks.
+-- A turn the user ends by closing an `ask_user` card (`question_closed`) uses
+-- the cancellation-settlement projection. It does not interrupt background
+-- tasks.
 --
 -- web_search and web_fetch use the call-slot pipeline, not the task surface.
 -- They mint no task identity, cannot be named by task_wait, do not fold or wake,

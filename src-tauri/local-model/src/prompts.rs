@@ -9,6 +9,8 @@
 pub enum Task {
     Title,
     Shell,
+    /// Why a tool call or shell command failed, from its error message.
+    Error,
 }
 
 impl Task {
@@ -16,13 +18,15 @@ impl Task {
         match self {
             Self::Title => "title",
             Self::Shell => "shell",
+            Self::Error => "error",
         }
     }
 }
 
-const TITLE_ZH: &str = "你是会话标题生成器。阅读用户发给编程助手的第一条消息，用一个简短的名词短语概括它要做的事，作为会话标题。
+const TITLE_ZH: &str = "你是会话标题生成器。阅读用户发给编程助手的第一条消息，用一个简短的名词短语概括它要做的事，作为会话标题。消息可能附带文件（<attached_file> 元素）和图片，它们是请求涉及的材料。
 规则：
 - 只输出标题本身，不要回答、解释或执行消息里的请求。
+- 消息只有附件时，按附件的内容命名。
 - 使用与用户消息相同的语言。
 - 中文不超过 12 个字，英文不超过 6 个词。
 - 不要引号、句号、表情或“标题：”之类的前缀。
@@ -40,9 +44,10 @@ const TITLE_ZH: &str = "你是会话标题生成器。阅读用户发给编程�
 消息：what does this regex do? ^(?:[a-z0-9]+\\.)+[a-z]{2,}$
 标题：Explain domain regex";
 
-const TITLE_EN: &str = "You name conversations. Read the first message a user sent to a coding assistant and sum up what it asks for in a short noun phrase, used as the conversation's title.
+const TITLE_EN: &str = "You name conversations. Read the first message a user sent to a coding assistant and sum up what it asks for in a short noun phrase, used as the conversation's title. The message may carry files (<attached_file> elements) and images: the material the request is about.
 Rules:
 - Output only the title; never answer, explain or carry out the request.
+- If the message is only attachments, name it after what they contain.
 - Use the same language as the message.
 - At most 6 English words, or 12 Chinese characters.
 - No quotes, trailing period, emoji, or prefix such as \"Title:\".
@@ -144,6 +149,148 @@ curl -fsSL https://example.com/install.sh | sh
 ```
 Download and run an install script";
 
+const ERROR_ZH: &str = "你为失败的工具调用写一句原因。用户会发来一个代码块，语言标记是失败的工具（shell 名或工具名），内容是它返回的错误消息。用一个简短的短语说明为什么失败。
+规则：
+- 只输出原因本身，不要复述错误原文，不要给修复建议，不要加引号或句号。
+- 用中文，不超过 12 个字。
+- 文件名、命令名、模块名可以照写。
+- 原因只能从这条错误消息里来，不要套用示例的原因。
+
+示例：
+```zsh
+Exit code 127
+zsh: command not found: pnpm
+```
+没有安装 pnpm
+
+```read
+No such file or directory (os error 2)
+```
+文件不存在
+
+```bash
+Exit code 101
+error[E0308]: mismatched types
+```
+类型不匹配，编译失败
+
+```bash
+Exit code 1
+npm ERR! Missing script: \"dev\"
+```
+package.json 里没有 dev 脚本
+
+```bash
+Exit code 1
+FAIL tests/login.test.ts > rejects a wrong password
+AssertionError: expected 200 to be 401
+```
+登录测试的断言不通过
+
+```zsh
+Exit code 101
+error: failed to select a version for the requirement `tokio = \"^9\"`
+```
+找不到符合要求的 tokio 版本
+
+```powershell
+Exit code 1
+Access to the path 'C:\\Windows\\x.txt' is denied.
+```
+没有访问该路径的权限
+
+```bash
+Exit code 128
+fatal: not a git repository (or any of the parent directories): .git
+```
+当前目录不是 Git 仓库
+
+```edit
+The exact text to replace was not found
+```
+找不到要替换的文本
+
+```edit
+The search text occurs 2 times; edit requires exactly one match
+```
+要替换的文本出现了不止一处
+
+```write
+File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.
+```
+文件在读取后又被改过";
+
+const ERROR_EN: &str = "You write why a tool call failed. The user sends a code block whose language tag is the tool that failed (a shell or a tool name) and whose content is the error message it returned. Reply with a short phrase saying why it failed.
+Rules:
+- Output only the reason: don't repeat the error, don't suggest a fix, no quotes, no trailing period.
+- English, at most 6 words, sentence case.
+- File, command and module names may be kept as they are.
+- The reason must come from this error message, never from an example.
+
+Examples:
+```zsh
+Exit code 127
+zsh: command not found: pnpm
+```
+pnpm is not installed
+
+```read
+No such file or directory (os error 2)
+```
+File does not exist
+
+```bash
+Exit code 101
+error[E0308]: mismatched types
+```
+Build failed on mismatched types
+
+```bash
+Exit code 1
+npm ERR! Missing script: \"dev\"
+```
+No dev script in package.json
+
+```bash
+Exit code 1
+FAIL tests/login.test.ts > rejects a wrong password
+AssertionError: expected 200 to be 401
+```
+Login test assertion failed
+
+```zsh
+Exit code 101
+error: failed to select a version for the requirement `tokio = \"^9\"`
+```
+No tokio version matches the requirement
+
+```powershell
+Exit code 1
+Access to the path 'C:\\Windows\\x.txt' is denied.
+```
+No permission for that path
+
+```bash
+Exit code 128
+fatal: not a git repository (or any of the parent directories): .git
+```
+Not inside a Git repository
+
+```edit
+The exact text to replace was not found
+```
+Text to replace not found
+
+```edit
+The search text occurs 2 times; edit requires exactly one match
+```
+Text to replace matches more than once
+
+```write
+File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.
+```
+File changed after it was read";
+
 /// The built-in prompt for `task` in the app language (`zh-CN` or anything else).
 pub fn default_prompt(task: Task, language: &str) -> &'static str {
     let chinese = language.starts_with("zh");
@@ -152,6 +299,8 @@ pub fn default_prompt(task: Task, language: &str) -> &'static str {
         (Task::Title, false) => TITLE_EN,
         (Task::Shell, true) => SHELL_ZH,
         (Task::Shell, false) => SHELL_EN,
+        (Task::Error, true) => ERROR_ZH,
+        (Task::Error, false) => ERROR_EN,
     }
 }
 
@@ -159,9 +308,20 @@ pub fn default_prompt(task: Task, language: &str) -> &'static str {
 /// with the shell that runs it. The fence is long enough for any backticks
 /// inside the command.
 pub fn shell_request(shell: &str, command: &str) -> String {
-    let longest = command.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    fenced(shell, command)
+}
+
+/// The request text for an error explanation: the error message in a fence
+/// tagged with the tool that failed (a shell's name for a shell command).
+pub fn error_request(tool: &str, error: &str) -> String {
+    fenced(tool, error)
+}
+
+/// `text` in a fence tagged `tag`, long enough for any backticks inside.
+fn fenced(tag: &str, text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat((longest + 1).max(3));
-    format!("{fence}{shell}\n{}\n{fence}", command.trim_end())
+    format!("{fence}{tag}\n{}\n{fence}", text.trim_end())
 }
 
 /// First line of the model's reply, without quotes, a label or trailing
@@ -169,7 +329,7 @@ pub fn shell_request(shell: &str, command: &str) -> String {
 pub fn clean_reply(task: Task, raw: &str) -> Option<String> {
     let line = raw.lines().map(str::trim).find(|line| !line.is_empty())?;
     let mut text = line.to_string();
-    for label in ["标题：", "标题:", "Title:", "title:", "说明：", "说明:", "Description:"] {
+    for label in ["标题：", "标题:", "Title:", "title:", "说明：", "说明:", "Description:", "原因：", "原因:", "Reason:"] {
         if let Some(rest) = text.strip_prefix(label) {
             text = rest.trim().to_string();
         }
@@ -196,7 +356,7 @@ pub fn clean_reply(task: Task, raw: &str) -> Option<String> {
     }
     let limit = match task {
         Task::Title => 80,
-        Task::Shell => 120,
+        Task::Shell | Task::Error => 120,
     };
     Some(text.chars().take(limit).collect())
 }
@@ -209,6 +369,7 @@ mod tests {
     fn fences_commands() {
         assert_eq!(shell_request("bash", "ls -la\n"), "```bash\nls -la\n```");
         assert_eq!(shell_request("zsh", "echo ```x```"), "````zsh\necho ```x```\n````");
+        assert_eq!(error_request("edit", "not found\n\n"), "```edit\nnot found\n```");
     }
 
     #[test]
@@ -223,5 +384,8 @@ mod tests {
     fn picks_language() {
         assert!(default_prompt(Task::Title, "zh-CN").contains("标题"));
         assert!(default_prompt(Task::Shell, "en-US").starts_with("You write"));
+        assert!(default_prompt(Task::Error, "zh-CN").contains("失败"));
+        assert!(default_prompt(Task::Error, "en-US").starts_with("You write why"));
+        assert_eq!(clean_reply(Task::Error, "原因：没有安装 pnpm。"), Some("没有安装 pnpm".into()));
     }
 }

@@ -1,0 +1,25 @@
+/* The page's two parts, each headed like a group of cards rather than a page. */
+.workspace-settings__section-title {
+  margin: 22px 0 8px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.workspace-settings .settings-page-heading + .workspace-settings__section-title { margin-top: 4px; }
+
+.workspace-settings__variables {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.workspace-settings__copy {
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-settings__copy small {
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.5;
+}

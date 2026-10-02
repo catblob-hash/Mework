@@ -2,7 +2,7 @@ The `zsh` tool runs one command line through zsh. It is listed only when a machi
 
 ## Approval
 
-Every call raises a card at Manual approval, Accept edits and Plan mode; only Full access — or a `PreToolUse` hook answering `allow` — clears it. The command is read with the same static analysis as `bash`, which only sets the card's risk level and rule. `zsh` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox: approval lets the command run, it does not confine it.
+Every call raises a card at Manual approval and Accept edits; only Full access — or a `PreToolUse` hook answering `allow` — clears it. The command is read with the same static analysis as `bash`, which only sets the card's risk level and rule. `zsh` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox: approval lets the command run, it does not confine it.
 
 ## Behavior and limits
 

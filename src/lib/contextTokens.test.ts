@@ -110,6 +110,67 @@ describe("liveContextTokens", () => {
     });
   });
 
+  it("counts what a reported round's calls returned before the next round reports", () => {
+    // The calls are in the round's output; their results reach the provider
+    // only with the next request, so until its snapshot they are estimated
+    // rather than left out.
+    const tool = {
+      id: "t1",
+      callId: "call-1",
+      toolName: "read",
+      input: { path: "a.ts" },
+      result: { success: true, output: FORTY, images: [], executedAt: "", durationMs: 0 },
+      streamStatus: "completed" as const,
+      live: { contexts: [], updates: [] },
+      createdAt: ""
+    };
+    const usage = liveContextTokens(
+      runFixture({
+        usageByRound: { 1: { inputTokens: 5_000, outputTokens: 300 } },
+        streamedToolsByRound: { 1: [tool] }
+      }),
+      1
+    );
+    expect(usage).toEqual({ tokens: 5_310, estimated: true });
+  });
+
+  it("counts a message steered in after the snapshot, not one it already read", () => {
+    const steered = (id: string) => ({
+      kind: "user" as const,
+      id,
+      content: FORTY,
+      createdAt: ""
+    });
+    const usage = liveContextTokens(
+      runFixture({
+        usageByRound: { 2: { inputTokens: 5_000, outputTokens: 300 } },
+        steeredInputsByRound: { 2: [steered("read")], 3: [steered("new")] }
+      }),
+      1
+    );
+    expect(usage).toEqual({ tokens: 5_310, estimated: true });
+  });
+
+  it("counts what the host delivered after the snapshot, not what it already read", () => {
+    const delivered = (id: string) => ({
+      context: {
+        kind: "user" as const,
+        id,
+        content: FORTY,
+        createdAt: ""
+      },
+      afterSteered: 0
+    });
+    const usage = liveContextTokens(
+      runFixture({
+        usageByRound: { 2: { inputTokens: 5_000, outputTokens: 300 } },
+        hostContextsByRound: { 2: [delivered("read")], 3: [delivered("new")] }
+      }),
+      1
+    );
+    expect(usage).toEqual({ tokens: 5_310, estimated: true });
+  });
+
   it("declines to anchor on a snapshot with no input count", () => {
     // A snapshot that reports only output says nothing about how large the
     // context is; anchoring on it would claim the conversation had shrunk to

@@ -941,7 +941,7 @@ describe("workspace and machine settings from the composer", () => {
       .toEqual(["本机", "SSH: devbox"]);
     expect(within(menu).getByRole("button", { name: "本机 的设置" })).toBeInTheDocument();
     expect(within(menu).getByRole("button", { name: "SSH: devbox 的设置" })).toBeInTheDocument();
-    expect(within(menu).getByRole("button", { name: "api 的环境变量" })).toBeInTheDocument();
+    expect(within(menu).getByRole("button", { name: "api 的设置" })).toBeInTheDocument();
   });
 
   it("edits a workspace's own variables from its gear, keyed by its machine and path", async () => {
@@ -954,18 +954,77 @@ describe("workspace and machine settings from the composer", () => {
     await screen.findByLabelText("向 Agent 发送消息");
 
     await user.click(screen.getByRole("button", { name: /^工作区：/ }));
-    await user.click(await screen.findByRole("button", { name: "api 的环境变量" }));
-    const dialog = await screen.findByRole("dialog", { name: "api 的环境变量" });
+    await user.click(await screen.findByRole("button", { name: "api 的设置" }));
+    // The global settings' window, named after the workspace, with one page.
+    const dialog = await screen.findByRole("dialog", { name: "api" });
+    const pages = within(dialog).getByRole("navigation", { name: "工作区设置分类" });
+    expect(within(pages).getAllByRole("button").map((page) => page.textContent)).toEqual(["环境"]);
     const textarea = within(dialog).getByRole("textbox", { name: "环境变量" });
     expect(textarea).toHaveValue("");
+    // Applied as it is typed, like every settings page: there is nothing to save.
     await user.type(textarea, "API_URL=http://localhost:8080");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    expect(within(dialog).queryByRole("button", { name: "保存" })).toBeNull();
 
     await waitFor(() => expect(lastSaved()?.globalSettings.executionEnvironments.envVars).toEqual({
       [localKey]: { KEEP: "1" },
       "ssh:machine-devbox|/srv/api": { API_URL: "http://localhost:8080" }
     }));
-    expect(screen.queryByRole("dialog", { name: "api 的环境变量" })).not.toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "api" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a half-typed variable out of the saved table and says why once the field is left", async () => {
+    const document = documentWithTwoMachines();
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    await user.click(screen.getByRole("button", { name: /^工作区：/ }));
+    await user.click(await screen.findByRole("button", { name: "api 的设置" }));
+    const dialog = await screen.findByRole("dialog", { name: "api" });
+    const textarea = within(dialog).getByRole("textbox", { name: "环境变量" });
+    await user.type(textarea, "GOOD=1{Enter}BAD");
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+    await user.click(within(dialog).getByRole("heading", { name: "环境", level: 3 }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("变量名不合法：BAD");
+    await waitFor(() => expect(lastSaved()?.globalSettings.executionEnvironments.envVars)
+      .toEqual({ "ssh:machine-devbox|/srv/api": { GOOD: "1" } }));
+  });
+
+  it("sandboxes a workspace from its gear, asking the workspace's own machine what it can do", async () => {
+    const document = documentWithTwoMachines();
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.machineSandboxSupport.mockResolvedValue({
+      backend: "bubblewrap",
+      available: true,
+      detail: "",
+      setup: false
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+
+    await user.click(screen.getByRole("button", { name: /^工作区：/ }));
+    await user.click(await screen.findByRole("button", { name: "api 的设置" }));
+    const dialog = await screen.findByRole("dialog", { name: "api" });
+    expect(await within(dialog).findByText("SSH: devbox · 可以使用：bubblewrap")).toBeInTheDocument();
+    expect(runtimeMocks.machineSandboxSupport).toHaveBeenCalledWith({ kind: "ssh", machineId: "machine-devbox" });
+    const toggle = within(dialog).getByRole("switch", { name: "在沙箱中运行命令" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    await user.click(toggle);
+
+    await waitFor(() => expect(lastSaved()?.globalSettings.executionEnvironments.sandboxes).toEqual({
+      "ssh:machine-devbox|/srv/api": expect.objectContaining({
+        enabled: true,
+        network: expect.objectContaining({ mode: "allowlist" })
+      })
+    }));
+    // Switched off, the entry stays: it records the answer.
+    await user.click(toggle);
+    await waitFor(() => expect(lastSaved()?.globalSettings.executionEnvironments.sandboxes)
+      .toEqual({ "ssh:machine-devbox|/srv/api": expect.objectContaining({ enabled: false }) }));
   });
 
   it("opens a machine's settings from its heading's gear, without environment variables", async () => {
@@ -989,12 +1048,22 @@ describe("workspace and machine settings from the composer", () => {
       .toEqual([expect.objectContaining({ id: "machine-devbox", name: "buildbox" })]));
   });
 
-  it("deleting a machine from its settings drops the variables of its workspaces too", async () => {
+  it("deleting a machine from its settings drops the variables and sandboxes of its workspaces too", async () => {
     const document = documentWithTwoMachines();
     const localKey = `local|${document.workspaces[0].path}`;
+    const sandbox = {
+      enabled: true,
+      network: { mode: "off" as const, allow: [], deny: [] },
+      writable: [],
+      denyRead: []
+    };
     document.globalSettings.executionEnvironments.envVars = {
       [localKey]: { KEEP: "1" },
       "ssh:machine-devbox|/srv/api": { GONE: "1" }
+    };
+    document.globalSettings.executionEnvironments.sandboxes = {
+      [localKey]: sandbox,
+      "ssh:machine-devbox|/srv/api": sandbox
     };
     runtimeMocks.loadDocument.mockResolvedValue(document);
     const user = userEvent.setup();
@@ -1011,11 +1080,12 @@ describe("workspace and machine settings from the composer", () => {
 
     await waitFor(() => expect(lastSaved()?.globalSettings.executionEnvironments).toEqual({
       sshMachines: [],
-      envVars: { [localKey]: { KEEP: "1" } }
+      envVars: { [localKey]: { KEEP: "1" } },
+      sandboxes: { [localKey]: sandbox }
     }));
   });
 
-  it("gives an attached workspace's chip a gear for its own variables", async () => {
+  it("gives an attached workspace's chip a gear for its own settings", async () => {
     const document = documentWithModel();
     document.workspaces[0].conversations[0].attachedWorkspaces = [{ path: "D:/shared/design-tokens" }];
     runtimeMocks.loadDocument.mockResolvedValue(document);
@@ -1026,10 +1096,9 @@ describe("workspace and machine settings from the composer", () => {
     // With a second workspace the numbers are stated to the model, so the chip shows one.
     expect(screen.getByRole("button", { name: /^工作区：/ }).querySelector(".composer-chip__index"))
       .toHaveTextContent("1");
-    await user.click(screen.getByRole("button", { name: "design-tokens 的环境变量" }));
-    const dialog = await screen.findByRole("dialog", { name: "design-tokens 的环境变量" });
+    await user.click(screen.getByRole("button", { name: "design-tokens 的设置" }));
+    const dialog = await screen.findByRole("dialog", { name: "design-tokens" });
     await user.type(within(dialog).getByRole("textbox", { name: "环境变量" }), "TOKENS=1");
-    await user.click(within(dialog).getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(lastSaved()?.globalSettings.executionEnvironments.envVars)
       .toEqual({ "local|D:/shared/design-tokens": { TOKENS: "1" } }));

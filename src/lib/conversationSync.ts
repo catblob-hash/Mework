@@ -1,4 +1,5 @@
 import type { AppDocument, Conversation } from "../types";
+import { isBodyUnloaded, UNLOADED_BODY_EXPECTED_IDS } from "./conversationBodies";
 import { errorMessage } from "./errors";
 import {
   createConversationRemote,
@@ -107,7 +108,10 @@ export function createConversationSync(
         authoritative = await updateConversationRemote(
           entry.workspaceId,
           entry.next,
-          entry.baseContextIds
+          // A body that is not loaded is an empty stand-in, never the
+          // conversation's timeline: whatever the baseline, it must not match
+          // the host's, so the host keeps its body and takes the metadata.
+          isBodyUnloaded(entry.next) ? [...UNLOADED_BODY_EXPECTED_IDS] : entry.baseContextIds
         );
       } catch (error) {
         await adoptAuthorityAfterRefusal(entry.workspaceId, conversationId, error);

@@ -11,6 +11,7 @@ import { useId, useState } from "react";
 import { useI18n } from "../i18n";
 import type { WorkflowRunPhase, WorkflowRunStep, WorkflowRunView } from "../lib/workflowRuns";
 import { formatRunElapsed, formatRunTokens, phaseTone, stepTone } from "../lib/workflowRuns";
+import { roleTitle } from "../lib/taskContainer";
 import { IconButton } from "./Common";
 import { RollingNumber } from "./RollingNumber";
 import "./WorkflowRunPanel.css";
@@ -58,9 +59,10 @@ const ABSENT = "—";
 /**
  * One step, as its own tile inside the run's block.
  *
- * It is deliberately the same shape as a task row — icon, name, a smaller line
- * naming the role underneath, metrics on the right — one size down, because a
- * step *is* a task: it just belongs to a run rather than to the conversation.
+ * It is deliberately the same shape as a task row — icon, `role:name`, a
+ * smaller line with what it was asked underneath, metrics on the right — one
+ * size down, because a step *is* a task: it just belongs to a run rather than
+ * to the conversation.
  */
 function StepTile({
   step,
@@ -77,6 +79,7 @@ function StepTile({
 }) {
   const { t } = useI18n();
   const tone = stepTone(step);
+  const title = roleTitle(step.role, step.label);
   const selected = step.agentId !== null && step.agentId === selectedAgentId;
   // A step is a real agent with a real transcript, so its tile opens. A slot
   // with no agent has nothing to open, and the run itself is a script.
@@ -98,7 +101,7 @@ function StepTile({
         tabIndex={openable ? 0 : undefined}
         aria-current={selected || undefined}
         aria-label={openable
-          ? t("打开步骤 {label}", "Open step {label}", { label: step.label })
+          ? t("打开步骤 {label}", "Open step {label}", { label: title })
           : undefined}
         title={step.modelId
           ? t("模型：{model}", "Model: {model}", { model: step.modelId })
@@ -117,14 +120,15 @@ function StepTile({
           <StepIcon step={step} />
         </span>
         <span className="workflow-step__copy">
-          <span className={`workflow-step__label${tone === "running" ? " pulse-text" : ""}`}>{step.label}</span>
-          {/* The role, which is what the plan actually chose: `agentType` is
-              the one thing a script says about who runs a step, and which
-              model answers for that name is the user's configuration. The
-              model stays reachable as the tile's tooltip. A step that named
-              no role has only its model left to report. */}
+          {/* The role leads the title, which is what the plan actually chose:
+              `agentType` is the one thing a script says about who runs a step,
+              and which model answers for that name is the user's
+              configuration. The model stays reachable as the tile's tooltip. */}
+          <span className={`workflow-step__label${tone === "running" ? " pulse-text" : ""}`}>{title}</span>
+          {/* What the run asked of it. A slot no agent has taken yet has no
+              prompt here, and says only which model would answer, if known. */}
           <span className="workflow-step__detail">
-            {step.role ?? step.modelId ?? ABSENT}
+            {step.task ?? step.modelId ?? ABSENT}
           </span>
         </span>
         <span className="workflow-step__metrics" aria-hidden="true">
@@ -133,7 +137,7 @@ function StepTile({
         </span>
         {skippable && (
           <IconButton
-            label={t("跳过 {label}", "Skip {label}", { label: step.label })}
+            label={t("跳过 {label}", "Skip {label}", { label: title })}
             className="workflow-step__skip"
             onClick={(event) => {
               event.stopPropagation();

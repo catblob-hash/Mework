@@ -1,9 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { useRef } from "react";
+import { useContext, useRef } from "react";
 import { describe, expect, it, vi } from "vitest";
 import paneTilesCss from "./PaneTiles.css?raw";
 import { PaneTiles } from "./PaneTiles";
 import type { PaneTilesProps } from "./PaneTiles";
+import { PaneTileGeometryContext } from "./paneTileGeometry";
+import type { SidePaneId } from "../lib/sidePanes";
 
 function setup(overrides: Partial<PaneTilesProps> = {}) {
   const props: PaneTilesProps = {
@@ -35,6 +37,14 @@ function pointer(target: Element | Window, type: string, clientX = 0, clientY = 
 
 const row = () => screen.getByRole("separator", { name: "调整面板宽度" });
 const column = () => screen.getByRole("separator", { name: "调整面板高度" });
+const between = () => screen.getByRole("separator", { name: "调整列宽度" });
+
+/** The column and row shares a tile or divider is placed by. */
+function placement(element: HTMLElement) {
+  const read = (name: string) => element.style.getPropertyValue(`--tile-${name}`);
+  const entries = ["col", "cols", "x", "w", "row", "rows", "y", "h"].map((name) => [name, read(name)] as const);
+  return Object.fromEntries(entries.filter(([, value]) => value !== ""));
+}
 
 /** The declaration block of every rule whose selector mentions `needle`; jsdom loads no stylesheet. */
 function rulesMentioning(needle: string): string[] {
@@ -63,9 +73,11 @@ describe("PaneTiles", () => {
     expect(screen.getAllByRole("separator")).toHaveLength(2);
     expect(container.querySelector(".pane-tiles__chat")).toHaveStyle({ flexGrow: "2", flexShrink: "1", flexBasis: "0px" });
     expect(container.querySelector(".pane-tiles__side")).toHaveStyle({ flexGrow: "3", flexShrink: "1", flexBasis: "0px" });
-    const tiles = container.querySelectorAll(".pane-tiles__tile");
-    expect(tiles[0]).toHaveStyle({ flexGrow: "2", flexShrink: "1", flexBasis: "0px" });
-    expect(tiles[1]).toHaveStyle({ flexGrow: "1", flexShrink: "1", flexBasis: "0px" });
+    const tiles = [...container.querySelectorAll<HTMLElement>(".pane-tiles__tile")];
+    expect(placement(tiles[0])).toEqual({ col: "0", cols: "1", x: "0", w: "1", row: "0", rows: "2", y: "0", h: "0.666667" });
+    expect(placement(tiles[1])).toEqual({ col: "0", cols: "1", x: "0", w: "1", row: "1", rows: "2", y: "0.666667", h: "0.333333" });
+    // The divider sits in the gap under the first tile: where the second one's share starts.
+    expect(placement(column())).toMatchObject({ row: "0", rows: "2", y: "0.666667" });
     expect(tiles[0].nextElementSibling).toBe(column());
     expect(column().nextElementSibling).toBe(tiles[1]);
     expect(tiles[1].nextElementSibling).toBeNull();
@@ -403,16 +415,20 @@ describe("PaneTiles", () => {
    * A short window must stack every open pane rather than overflow: the authored floor is one
    * pane header, and 100px survives only as the drag/keyboard floor inside the component.
    */
-  it("authors a one-header tile floor and keeps the basis at zero", () => {
+  it("authors a one-header tile floor and places tiles by their shares alone", () => {
     const { container } = setup();
     const tile = rulesMentioning(".pane-tiles .pane-tiles__tile").join(" ");
     expect(tile).toContain("min-height: 32px");
     expect(tile).not.toContain("min-height: 100px");
+    expect(tile).toContain("position: absolute");
+    for (const variable of ["--tile-x", "--tile-w", "--tile-y", "--tile-h", "--tile-col", "--tile-row"]) {
+      expect(tile).toContain(`var(${variable})`);
+    }
     const side = rulesMentioning(".pane-tiles > .pane-tiles__side").join(" ");
     expect(side).toContain("min-height: 0");
     expect(side).toContain("overflow: hidden");
-    expect(container.querySelector(".pane-tiles__tile"))
-      .toHaveStyle({ flexGrow: "1", flexShrink: "1", flexBasis: "0px" });
+    expect(side).toContain("position: relative");
+    expect(placement(container.querySelector<HTMLElement>(".pane-tiles__tile")!)).toMatchObject({ h: "0.5" });
   });
 
   /**
@@ -432,8 +448,13 @@ describe("PaneTiles", () => {
     expect(terminal).toHaveAttribute("inert");
     expect(tasks).not.toHaveClass("is-solo-hidden");
     expect(tasks).not.toHaveAttribute("inert");
-    expect(tasks).toHaveStyle({ flexGrow: "1", flexBasis: "0px" });
+    expect(tasks).toHaveClass("is-solo");
+    expect(terminal).not.toHaveClass("is-solo");
     expect(container.querySelector(".pane-tiles")).toHaveClass("pane-tiles--solo");
+    // The shown pane covers the whole area; the others keep their own box, hidden.
+    const shown = rulesMentioning(".pane-tiles__tile.is-solo").join(" ");
+    for (const edge of ["left: 0", "top: 0", "width: 100%", "height: 100%"]) expect(shown).toContain(edge);
+    expect(container.querySelector(".pane-tiles__side")).not.toHaveStyle({ minWidth: "280px" });
   });
 
   it("withdraws every resize handle while a pane is shown alone", () => {
@@ -447,6 +468,203 @@ describe("PaneTiles", () => {
     expect(container.querySelector(".pane-tiles")).not.toHaveClass("pane-tiles--solo");
     expect(container.querySelector(".is-solo-hidden")).toBeNull();
     expect(row()).toBeInTheDocument();
+  });
+
+  describe("columns", () => {
+    const three = [
+      { id: "terminal" as const, node: <div>Terminal</div> },
+      { id: "tasks" as const, node: <div>Tasks</div> },
+      { id: "plan" as const, node: <div>Plan</div> }
+    ];
+    const columns = () => [["terminal", "tasks"], ["plan"]] as SidePaneId[][];
+
+    function setupColumns(overrides: Partial<PaneTilesProps> = {}) {
+      const result = setup({
+        panes: three, columns: columns(), columnFlex: [2, 1], onColumnFlexChange: vi.fn(), ...overrides
+      });
+      const tile = (id: string) => [...result.container.querySelectorAll<HTMLElement>(".pane-tiles__tile")]
+        .find((element) => element.textContent?.toLowerCase().includes(id))!;
+      return { ...result, tile };
+    }
+
+    it("places each pane by its column's share of the width and its share of the column", () => {
+      const { tile } = setupColumns({ paneFlex: { terminal: 3 } });
+      expect(placement(tile("terminal"))).toEqual({ col: "0", cols: "2", x: "0", w: "0.666667", row: "0", rows: "2", y: "0", h: "0.75" });
+      expect(placement(tile("tasks"))).toEqual({ col: "0", cols: "2", x: "0", w: "0.666667", row: "1", rows: "2", y: "0.75", h: "0.25" });
+      expect(placement(tile("plan"))).toEqual({ col: "1", cols: "2", x: "0.666667", w: "0.333333", row: "0", rows: "1", y: "0", h: "1" });
+    });
+
+    it("draws a divider between the columns and one between the tiles of each column", () => {
+      setupColumns();
+      expect(screen.getAllByRole("separator", { name: "调整列宽度" })).toHaveLength(1);
+      expect(screen.getAllByRole("separator", { name: "调整面板高度" })).toHaveLength(1);
+      expect(between()).toHaveAttribute("aria-orientation", "vertical");
+      expect(between()).toHaveAttribute("aria-valuenow", "67");
+      // Its left edge is where the second column's share starts, less one gap.
+      expect(placement(between())).toMatchObject({ col: "0", cols: "2", x: "0.666667" });
+      expect(placement(column())).toMatchObject({ col: "0", w: "0.666667", row: "0", y: "0.5" });
+    });
+
+    it("needs more room for more columns, but not while one pane is shown alone", () => {
+      const { container, rerender, props } = setupColumns();
+      expect(container.querySelector(".pane-tiles__side")).toHaveStyle({ minWidth: "412px" });
+      rerender(<PaneTiles {...props} columns={[["terminal"], ["tasks"], ["plan"]]} columnFlex={[1, 1, 1]} />);
+      expect(container.querySelector(".pane-tiles__side")).toHaveStyle({ minWidth: "624px" });
+      rerender(<PaneTiles {...props} columns={[["terminal", "tasks", "plan"]]} columnFlex={[1]} />);
+      expect(container.querySelector(".pane-tiles__side")).toHaveStyle({ minWidth: "280px" });
+    });
+
+    it("moves the divider between two columns by the pixels dragged, within each column's floor", () => {
+      const { props, tile } = setupColumns();
+      const lastWeights = (expected: number[]) => {
+        const weights = vi.mocked(props.onColumnFlexChange!).mock.lastCall![0];
+        expect(weights).toHaveLength(expected.length);
+        expected.forEach((weight, index) => { expect(weights[index]).toBeCloseTo(weight); });
+      };
+      vi.mocked(tile("terminal").getBoundingClientRect).mockReturnValue({ width: 600, height: 400 } as DOMRect);
+      vi.mocked(tile("plan").getBoundingClientRect).mockReturnValue({ width: 300, height: 800 } as DOMRect);
+      pointer(between(), "pointerdown", 600);
+      expect(document.body).not.toHaveClass("pane-tiles-resize-active--column");
+      pointer(window, "pointermove", 650);
+      lastWeights([650 / 900 * 3, 250 / 900 * 3]);
+      pointer(window, "pointermove", 5000);
+      lastWeights([700 / 900 * 3, 200 / 900 * 3]);
+      pointer(window, "pointermove", -5000);
+      lastWeights([200 / 900 * 3, 700 / 900 * 3]);
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(props.onColumnFlexChange).toHaveBeenLastCalledWith([2, 1]);
+      fireEvent.keyDown(between(), { key: "ArrowRight" });
+      lastWeights([624 / 900 * 3, 276 / 900 * 3]);
+      fireEvent.keyDown(between(), { key: "Home" });
+      lastWeights([200 / 900 * 3, 700 / 900 * 3]);
+      expect(props.onSideFlexChange).not.toHaveBeenCalled();
+      expect(props.onPaneFlexChange).not.toHaveBeenCalled();
+    });
+
+    it("lets a column under its floor be dragged wider, but not narrower", () => {
+      const { props, tile } = setupColumns({ columnFlex: [3, 1] });
+      vi.mocked(tile("terminal").getBoundingClientRect).mockReturnValue({ width: 300, height: 400 } as DOMRect);
+      vi.mocked(tile("plan").getBoundingClientRect).mockReturnValue({ width: 100, height: 800 } as DOMRect);
+      pointer(between(), "pointerdown", 300);
+      expect(document.body).toHaveClass("pane-tiles-resize-active");
+      pointer(window, "pointermove", 350);
+      expect(props.onColumnFlexChange).toHaveBeenLastCalledWith([3, 1]);
+      pointer(window, "pointermove", 250);
+      const [first, second] = vi.mocked(props.onColumnFlexChange!).mock.lastCall![0];
+      expect(first).toBeCloseTo(250 / 400 * 4);
+      expect(second).toBeCloseTo(150 / 400 * 4);
+      pointer(window, "pointermove", -5000);
+      const [floored] = vi.mocked(props.onColumnFlexChange!).mock.lastCall![0];
+      expect(floored).toBeCloseTo(200 / 400 * 4);
+      pointer(window, "pointerup", -5000);
+      expect(document.body).not.toHaveClass("pane-tiles-resize-active");
+    });
+
+    it("lets a tile under its floor be dragged taller, but not shorter", () => {
+      const { props, tile } = setupColumns({ paneFlex: { terminal: 3, tasks: 1 } });
+      vi.mocked(tile("terminal").getBoundingClientRect).mockReturnValue({ width: 500, height: 300 } as DOMRect);
+      vi.mocked(tile("tasks").getBoundingClientRect).mockReturnValue({ width: 500, height: 60 } as DOMRect);
+      pointer(column(), "pointerdown", 0, 300);
+      pointer(window, "pointermove", 0, 350);
+      expect(props.onPaneFlexChange).toHaveBeenLastCalledWith({ terminal: 3, tasks: 1 });
+      pointer(window, "pointermove", 0, 200);
+      const flex = vi.mocked(props.onPaneFlexChange).mock.lastCall![0];
+      expect(flex.terminal).toBeCloseTo(200 / 360 * 4);
+      expect(flex.tasks).toBeCloseTo(160 / 360 * 4);
+      pointer(window, "pointerup", 0, 200);
+    });
+
+    it("evens out the two neighbours on a double click, leaving the other columns' weights", () => {
+      const { props } = setupColumns({
+        columns: [["terminal"], ["tasks"], ["plan"]], columnFlex: [1, 3, 2]
+      });
+      fireEvent.doubleClick(screen.getAllByRole("separator", { name: "调整列宽度" })[1]);
+      expect(props.onColumnFlexChange).toHaveBeenCalledWith([1, 2.5, 2.5]);
+    });
+
+    it("resizes a column's tiles among themselves, leaving the other column alone", () => {
+      const { props } = setupColumns({ paneFlex: { terminal: 1, tasks: 1, plan: 5 } });
+      pointer(column(), "pointerdown", 0, 400);
+      pointer(window, "pointermove", 0, 500);
+      expect(props.onPaneFlexChange).toHaveBeenLastCalledWith({ terminal: 1.25, tasks: 0.75, plan: 5 });
+    });
+
+    it("keeps a pane's React instance when it moves to another column", () => {
+      mountCount = 0;
+      const panes = [
+        { id: "terminal" as const, node: <MountCounted /> },
+        { id: "tasks" as const, node: <div>Tasks</div> },
+        { id: "plan" as const, node: <div>Plan</div> }
+      ];
+      const { rerender, props } = setupColumns({ panes });
+      const before = screen.getByTestId("counted");
+      rerender(<PaneTiles {...props} columns={[["tasks"], ["plan", "terminal"]]} />);
+      rerender(<PaneTiles {...props} columns={[["plan"], ["tasks"], ["terminal"]]} columnFlex={[1, 1, 1]} />);
+      expect(screen.getByTestId("counted")).toBe(before);
+      expect(mountCount).toBe(1);
+    });
+
+    it("tells a pane where its tile is, and changes that only when the tile moves", () => {
+      const seen: string[] = [];
+      function Probe() {
+        seen.push(useContext(PaneTileGeometryContext));
+        return null;
+      }
+      const panes = [three[0], three[1], { id: "plan" as const, node: <Probe /> }];
+      const { rerender, props } = setupColumns({ panes });
+      const first = seen.at(-1);
+      expect(first).toContain("0.666667");
+      // Resizing within the other column leaves this tile where it was.
+      rerender(<PaneTiles {...props} paneFlex={{ terminal: 2 }} />);
+      expect(seen.at(-1)).toBe(first);
+      rerender(<PaneTiles {...props} columnFlex={[1, 1]} />);
+      expect(seen.at(-1)).not.toBe(first);
+      rerender(<PaneTiles {...props} panes={[{ ...panes[0], hidden: true }, panes[1], panes[2]]} />);
+      expect(seen.at(-1)).toBe(first);
+    });
+
+    it("skips panes it was not given and gives a pane no column names a column of its own", () => {
+      const { tile } = setupColumns({
+        columns: [["review", "terminal"], ["files"]],
+        columnFlex: [1, 3]
+      });
+      expect(placement(tile("terminal"))).toMatchObject({ col: "0", cols: "2", rows: "1", w: "0.5" });
+      // `tasks` and `plan` sit in no column, so they share one opened after the given ones.
+      expect(placement(tile("tasks"))).toMatchObject({ col: "1", rows: "2", row: "0" });
+      expect(placement(tile("plan"))).toMatchObject({ col: "1", rows: "2", row: "1" });
+    });
+
+    it("drops a column whose panes are all hidden, but keeps its index in the weights", () => {
+      const { props, tile } = setupColumns({
+        panes: [{ ...three[0], hidden: true }, { ...three[1], hidden: true }, three[2]],
+        columns: [["terminal", "tasks"], ["plan"], []] as SidePaneId[][],
+        columnFlex: [2, 1]
+      });
+      expect(placement(tile("plan"))).toMatchObject({ col: "0", cols: "1", w: "1" });
+      expect(tile("terminal").getAttribute("style")).toBeNull();
+      expect(screen.queryByRole("separator", { name: "调整列宽度" })).toBeNull();
+      fireEvent.doubleClick(row());
+      expect(props.onSideFlexChange).toHaveBeenCalledWith(1);
+    });
+
+    it("resets the side area to its first pane's width plus half the chat for each further column", () => {
+      const { props } = setupColumns({
+        panes: [{ id: "review", node: <div>Review</div> }, ...three],
+        columns: [["review", "terminal"], ["tasks"], ["plan"]], columnFlex: [3, 1, 1]
+      });
+      fireEvent.doubleClick(row());
+      expect(props.onSideFlexChange).toHaveBeenCalledWith(3 + 2);
+    });
+
+    it("draws no divider between columns nobody can resize", () => {
+      setupColumns({ onColumnFlexChange: undefined });
+      expect(screen.queryByRole("separator", { name: "调整列宽度" })).toBeNull();
+    });
+
+    it("withdraws the column dividers while a pane is shown alone", () => {
+      setupColumns({ expanded: "plan" });
+      expect(screen.queryByRole("separator")).toBeNull();
+    });
   });
 
   it("takes a hidden tile out of the flow instead of out of the layout", () => {

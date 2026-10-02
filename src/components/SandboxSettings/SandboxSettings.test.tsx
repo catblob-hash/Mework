@@ -5,7 +5,7 @@ import type { SandboxSupport } from "../../types";
 import { SandboxSettings } from ".";
 
 const runtimeMocks = vi.hoisted(() => ({
-  localSandboxSupport: vi.fn(),
+  machineSandboxSupport: vi.fn(),
   setupLocalSandbox: vi.fn()
 }));
 
@@ -23,26 +23,27 @@ const NEEDS_SETUP: SandboxSupport = {
 
 describe("SandboxSettings", () => {
   beforeEach(() => {
-    runtimeMocks.localSandboxSupport.mockReset();
+    runtimeMocks.machineSandboxSupport.mockReset();
     runtimeMocks.setupLocalSandbox.mockReset();
   });
 
   it("offers the one-time Windows setup and shows the sandbox available after it", async () => {
-    runtimeMocks.localSandboxSupport.mockResolvedValue(NEEDS_SETUP);
+    runtimeMocks.machineSandboxSupport.mockResolvedValue(NEEDS_SETUP);
     runtimeMocks.setupLocalSandbox.mockResolvedValue({ backend: "srt-win", available: true, detail: "", setup: false });
-    render(<SandboxSettings settings={undefined} onChange={vi.fn()} />);
+    render(<SandboxSettings machine={null} machineName="这台电脑" settings={undefined} onChange={vi.fn()} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /Set up|设置/ }));
 
+    expect(runtimeMocks.machineSandboxSupport).toHaveBeenCalledWith(null);
     expect(runtimeMocks.setupLocalSandbox).toHaveBeenCalledTimes(1);
     expect(await screen.findByText(/Windows sandbox$|Windows 沙箱$/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Set up|设置/ })).not.toBeInTheDocument();
   });
 
   it("keeps the setup offered and says why when it fails", async () => {
-    runtimeMocks.localSandboxSupport.mockResolvedValue(NEEDS_SETUP);
+    runtimeMocks.machineSandboxSupport.mockResolvedValue(NEEDS_SETUP);
     runtimeMocks.setupLocalSandbox.mockRejectedValue("The setup was cancelled at the administrator prompt");
-    render(<SandboxSettings settings={undefined} onChange={vi.fn()} />);
+    render(<SandboxSettings machine={null} machineName="这台电脑" settings={undefined} onChange={vi.fn()} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /Set up|设置/ }));
 
@@ -51,15 +52,29 @@ describe("SandboxSettings", () => {
   });
 
   it("offers no setup where the sandbox is unavailable for another reason", async () => {
-    runtimeMocks.localSandboxSupport.mockResolvedValue({
+    runtimeMocks.machineSandboxSupport.mockResolvedValue({
       backend: "bubblewrap",
       available: false,
       detail: "bubblewrap is not installed",
       setup: false
     });
-    render(<SandboxSettings settings={undefined} onChange={vi.fn()} />);
+    render(<SandboxSettings machine={null} machineName="这台电脑" settings={undefined} onChange={vi.fn()} />);
 
     expect(await screen.findByText(/bubblewrap is not installed/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Set up|设置/ })).not.toBeInTheDocument();
+  });
+
+  it("asks the workspace's own machine, and leaves an SSH machine's setup to that machine", async () => {
+    runtimeMocks.machineSandboxSupport.mockResolvedValue({
+      ...NEEDS_SETUP,
+      detail: "Run `mework-remote.exe sandbox-setup` there as an administrator"
+    });
+    const machine = { kind: "ssh" as const, machineId: "winbox" };
+    render(<SandboxSettings machine={machine} machineName="SSH: winbox" settings={undefined} onChange={vi.fn()} />);
+
+    expect(await screen.findByText(/^SSH: winbox · .*sandbox-setup/)).toBeInTheDocument();
+    expect(runtimeMocks.machineSandboxSupport).toHaveBeenCalledWith(machine);
+    expect(screen.queryByRole("button", { name: /Set up|设置/ })).not.toBeInTheDocument();
+    expect(runtimeMocks.setupLocalSandbox).not.toHaveBeenCalled();
   });
 });

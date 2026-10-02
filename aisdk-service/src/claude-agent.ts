@@ -22,6 +22,13 @@
 //! own environment block, model line and date are left out by a plugin this
 //! module writes and loads (`claude-context-plugin.ts`).
 //!
+//! Tools that join mid-conversation. A live session lists them and the CLI hands
+//! them over itself (`publishTools`). Every new turn runs in a session rebuilt
+//! from the host's history, and there the host's tool-append markers become the
+//! CLI's own record of those additions (`toolAdditionEntries`), on the models
+//! the host says take them (`agent.toolChanges`): the tools stay deferred where
+//! they joined and the declared list stays what the conversation began with.
+//!
 //! Tool names. The CLI is started with `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1`, under
 //! which in-process MCP tools register under their bare names, so the model sees
 //! the host's tool names verbatim (no `mcp__mework__` prefix). The prefix is still
@@ -72,6 +79,7 @@ import {
 import { contextPluginDir } from "./claude-context-plugin.js";
 import { redactError, secretsOf } from "./error-redaction.js";
 import { dropForeignSignedReasoning, stripReplayTags } from "./anthropic-dialect.js";
+import { markerTools } from "./tool-append.js";
 import {
   MAX_STREAM_TEXT,
   MAX_TOOL_ARGUMENTS,
@@ -211,11 +219,34 @@ const MCP_INTERNAL_ERROR = -32603;
 
 class MeworkMcpServer {
   private transport: McpTransport | null = null;
+  private tools: ToolSpec[];
+  /** Waiters for the CLI's next `tools/list`, which follows a `list_changed`. */
+  private relisted: Array<() => void> = [];
 
   constructor(
-    private readonly tools: ToolSpec[],
+    tools: ToolSpec[],
     private readonly onCall: (toolUseId: string | undefined, name: string, args: unknown) => Promise<McpToolResult>,
-  ) {}
+  ) {
+    this.tools = [...tools];
+  }
+
+  /**
+   * Adds the tools this server has not listed yet and tells the CLI its list
+   * changed; resolves once the CLI has listed it again. Never withdraws a tool:
+   * the CLI would tell the model about a withdrawal in words of its own.
+   */
+  publish(tools: readonly ToolSpec[]): Promise<void> {
+    const listed = new Set(this.tools.map((tool) => tool.name));
+    const added = tools.filter((tool) => !listed.has(tool.name));
+    if (added.length === 0) return Promise.resolve();
+    this.tools = [...this.tools, ...added];
+    const relisted = new Promise<void>((resolve) => this.relisted.push(resolve));
+    const transport = this.transport;
+    if (!transport) return Promise.reject(new Error("MCP 传输已关闭"));
+    return transport
+      .send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })
+      .then(() => relisted);
+  }
 
   /** Called by the SDK with its in-process transport. */
   async connect(transport: McpTransport): Promise<void> {
@@ -250,7 +281,9 @@ class MeworkMcpServer {
         const requested = params.protocolVersion;
         this.respond(id, {
           protocolVersion: typeof requested === "string" ? requested : MCP_PROTOCOL_FALLBACK,
-          capabilities: { tools: {} },
+          // `listChanged`: a tool that joins mid-session is announced rather
+          // than rebuilt in (`publishTools`).
+          capabilities: { tools: { listChanged: true } },
           serverInfo: { name: SERVER_NAME, version: "1.0.0" },
         });
         break;
@@ -270,6 +303,7 @@ class MeworkMcpServer {
             _meta: { "anthropic/alwaysLoad": true },
           })),
         });
+        for (const wake of this.relisted.splice(0)) wake();
         break;
       case "tools/call": {
         const meta = isObject(params._meta) ? params._meta : {};
@@ -398,6 +432,17 @@ function anthropicUserBlocks(message: JsonObject): JsonObject[] | null {
       } else if (typeof part.image === "string") {
         blocks.push({ type: "image", source: { type: "url", url: part.image } });
       }
+    } else if (part.type === "file" && part.mediaType === "application/pdf") {
+      // A short PDF the host sends as the document itself, as Claude Code's
+      // Read hands one to the model; the CLI passes `document` blocks through.
+      const parsed = parseDataUrl(part.data);
+      if (parsed) {
+        blocks.push({
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: parsed.data },
+          ...(typeof part.filename === "string" && part.filename ? { title: part.filename } : {}),
+        });
+      }
     }
   }
   return blocks.length > 0 ? blocks : null;
@@ -453,7 +498,8 @@ function isBoxResultPart(part: ToolResultPart): boolean {
 /**
  * Splits the request messages into what the CLI must already know (`history`),
  * the results owed for a parked tool round (`results`, with carriers folded in),
- * and the user prompt that starts a new turn (`prompt`).
+ * and the user prompt that starts a new turn (`prompt`, with the tool additions
+ * that follow it).
  */
 interface SplitMessages {
   history: unknown[];
@@ -463,6 +509,12 @@ interface SplitMessages {
   carriers: McpContent[];
   /** Genuine trailing user message(s) merged into one prompt, or `null`. */
   prompt: JsonObject[] | null;
+  /**
+   * Tool-append markers after the prompt: the tools that joined the
+   * conversation with it. `history` stops before the prompt, so they are not
+   * part of it.
+   */
+  promptAdditions: string[][];
 }
 
 function splitMessages(messages: unknown[]): SplitMessages {
@@ -478,9 +530,15 @@ function splitMessages(messages: unknown[]): SplitMessages {
   const results = new Map<string, McpToolResult>();
   const carriers: McpContent[] = [];
   const promptBlocks: JsonObject[] = [];
+  const promptAdditions: string[][] = [];
   let promptStart = -1;
   tail.forEach((message, offset) => {
     if (!isObject(message)) return;
+    const added = markerTools(message);
+    if (added !== null) {
+      if (promptStart !== -1) promptAdditions.push(added);
+      return;
+    }
     if (message.role === "tool") {
       for (const part of toolResultParts(message)) {
         if (isBoxResultPart(part)) carriers.push(...mcpResultOf(part.output).content);
@@ -500,7 +558,7 @@ function splitMessages(messages: unknown[]): SplitMessages {
     if (blocks) promptBlocks.push(...blocks);
   });
   const history = promptStart === -1 ? messages : messages.slice(0, lastAssistant + 1 + promptStart);
-  return { history, results, carriers, prompt: promptBlocks.length > 0 ? promptBlocks : null };
+  return { history, results, carriers, prompt: promptBlocks.length > 0 ? promptBlocks : null, promptAdditions };
 }
 
 // ---------------------------------------------------------------- transcript synthesis
@@ -508,9 +566,10 @@ function splitMessages(messages: unknown[]): SplitMessages {
 // The CLI resumes from a Claude Code transcript (JSONL entries) supplied through
 // `sessionStore.load()`. Host `ModelMessage[]` history is rewritten into that
 // shape: signed reasoning becomes `thinking`, redacted reasoning becomes
-// `redacted_thinking`, unsigned reasoning is dropped (the CLI would strip it), and
+// `redacted_thinking`, unsigned reasoning is dropped (the CLI would strip it),
 // tool messages become `tool_result` user entries with any following carrier
-// messages folded into the same entry.
+// messages folded into the same entry, and a tool-append marker becomes the
+// pair of entries the CLI itself writes when a tool joins its session.
 
 interface TranscriptContext {
   sessionId: string;
@@ -518,6 +577,60 @@ interface TranscriptContext {
   cliVersion: string;
   /** Model name stamped on assistant entries. */
   model: string;
+  /**
+   * The session's tools by name, when the CLI takes tool changes for this
+   * model; `null` drops every tool addition, and the tools it named are then
+   * declared like any other.
+   */
+  appendable: ReadonlyMap<string, ToolSpec> | null;
+  /** Tool additions that follow the prompt the session starts with. */
+  promptAdditions: readonly string[][];
+}
+
+/**
+ * The entries the CLI writes when tools join its session mid-way (a
+ * `list_changed` that widened the pool): a `deferred_tools_delta` naming them,
+ * then a `deferred_tools_record` with the definitions it declared for them.
+ * Resumed, the pair is what makes the CLI keep them where they joined: each
+ * declared `defer_loading` and handed over by a `tool_addition` at that point,
+ * with the line of text the CLI puts beside it. Without the record the CLI only
+ * announces the names in words and declares the tools like the rest; without
+ * either it declares them like the rest, and a list that changes in place loses
+ * the prompt cache behind it. The shape is the CLI's own (2.1.284), field for
+ * field; `rendered` is left out and rendered afresh.
+ */
+function toolAdditionEntries(tools: readonly ToolSpec[]): JsonObject[] {
+  const names = tools.map((tool) => tool.name).sort();
+  return [
+    {
+      type: "attachment",
+      attachment: {
+        type: "deferred_tools_delta",
+        addedNames: names,
+        addedLines: names,
+        removedNames: [],
+        wireHiddenNames: [],
+        readdedNames: [],
+        pendingMcpServers: [],
+        needsAuthMcpServers: [],
+        failedMcpServers: [],
+        surfacedNames: names,
+        toolSearchAbsent: true,
+      },
+    },
+    {
+      type: "attachment",
+      attachment: {
+        type: "deferred_tools_record",
+        entries: tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.inputSchema,
+          defer_loading: true,
+        })),
+      },
+    },
+  ];
 }
 
 function reasoningPayload(part: JsonObject): { signature?: string; redactedData?: string } {
@@ -608,6 +721,26 @@ function synthesizeTranscript(history: unknown[], context: TranscriptContext): J
   // blocks lead the merged message because the API requires it.
   let assistantCount = 0;
   let pendingAssistant: JsonObject[] | null = null;
+  // Each tool joins once; a marker naming it again, or naming a tool the
+  // session no longer lists, adds nothing.
+  const announced = new Set<string>();
+  const addTools = (names: readonly string[]): void => {
+    const appendable = context.appendable;
+    if (appendable === null) return;
+    const tools: ToolSpec[] = [];
+    for (const name of names) {
+      const tool = appendable.get(name);
+      if (tool === undefined || announced.has(name)) continue;
+      announced.add(name);
+      tools.push(tool);
+    }
+    if (tools.length > 0) for (const entry of toolAdditionEntries(tools)) push(entry);
+  };
+  // The role of the last message that was not a marker. A tool addition goes
+  // right after a user turn (a tool result is one), as the Messages API
+  // requires; the host places its markers there, and one anywhere else is
+  // dropped rather than moved.
+  let lastRole: unknown = undefined;
   const flushAssistant = (): void => {
     if (pendingAssistant === null) return;
     const thinking = pendingAssistant.filter((block) => block.type === "thinking" || block.type === "redacted_thinking");
@@ -632,6 +765,15 @@ function synthesizeTranscript(history: unknown[], context: TranscriptContext): J
   };
   for (const message of history) {
     if (!isObject(message)) continue;
+    const added = markerTools(message);
+    if (added !== null) {
+      if (lastRole === "user" || lastRole === "tool") {
+        flushUser();
+        addTools(added);
+      }
+      continue;
+    }
+    lastRole = message.role;
     switch (message.role) {
       case "user": {
         flushAssistant();
@@ -660,6 +802,9 @@ function synthesizeTranscript(history: unknown[], context: TranscriptContext): J
   }
   flushAssistant();
   flushUser();
+  // After the history, before the prompt the session starts with; the CLI
+  // hands the tools over behind that prompt, where the host's markers stand.
+  for (const added of context.promptAdditions) addTools(added);
   return entries;
 }
 
@@ -702,7 +847,10 @@ const CLI_CONTROL_ENV: Record<string, string> = {
   CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1",
   DISABLE_AUTO_COMPACT: "1",
   DISABLE_COMPACT: "1",
-  CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
+  // Attachments stay on: a tool that joins mid-session reaches the model as the
+  // CLI's own `tool_addition`, which only the attachment pipeline produces
+  // (`deferred_tools_delta`). The context plugin leaves every other attachment
+  // out, so switching the pipeline on adds nothing else to the prompt.
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
   CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
   DISABLE_BUILTIN_AGENTS: "1",
@@ -848,21 +996,14 @@ function cliEnv(agent: AgentSession, modelId: string, knobs: CliEnvKnobs = {}) {
   return env;
 }
 
-function reasoningOptions(level: StepRequest["reasoning"]): Pick<Options, "thinking" | "effort"> {
-  switch (level) {
-    case "none":
-      return { thinking: { type: "disabled" } };
-    case "low":
-      return { effort: "low" };
-    case "medium":
-      return { effort: "medium" };
-    case "high":
-      return { effort: "high" };
-    case "xhigh":
-      return { effort: "xhigh" };
-    default:
-      return {};
-  }
+/**
+ * Every level goes to Claude Code's `--effort` as named: the CLI knows each
+ * model's efforts and drops one the model lacks to `high` (`max` and `xhigh` on
+ * the 4.5 and older models, `xhigh` on the 4.6 ones), and sends none to a model
+ * without effort support. Nothing turns thinking off.
+ */
+function reasoningOptions(level: StepRequest["reasoning"]): Pick<Options, "effort"> {
+  return level === undefined ? {} : { effort: level };
 }
 
 function validateAgent(agent: AgentSession | undefined): AgentSession {
@@ -1459,13 +1600,13 @@ function isStepMessage(message: SDKMessage): boolean {
 /**
  * Whether a live session can still serve this step's tool set.
  *
- * The CLI lists the in-process MCP server's tools once, when it connects, so a
- * session's published set is fixed for its lifetime. Tool discovery widens the
- * host's set mid-run — a `tool_search` call hands out a schema and the next step
- * declares that tool for real — and a session that never listed it answers the
- * call with "No such tool available". Rebuilding is the only way to re-list, and
- * it is cheap here: the transcript is synthesized from the history the step
- * already carries, and it happens once per fetch rather than once per step.
+ * The CLI lists the in-process MCP server's tools when it connects and again
+ * whenever the server says its list changed. The host widens its set mid-run —
+ * the handoff tools arm, a `tool_search` call hands out a schema — and a
+ * session that never listed the new tool answers a call to it with "No such
+ * tool available", so `publishTools` lists it first. A rebuild, which
+ * synthesizes the transcript from the history the step carries, is the
+ * fallback when the CLI does not confirm.
  *
  * Narrowing is not a mismatch. A step may legitimately offer fewer tools (plan
  * mode withdraws `exit_plan_mode`, a role intersects the set), and the CLI
@@ -1473,6 +1614,40 @@ function isStepMessage(message: SDKMessage): boolean {
  */
 function sessionServesToolSet(session: Session, tools: readonly { name: string }[]): boolean {
   return tools.every((tool) => session.knownTools.has(tool.name));
+}
+
+/** How long a live session gets to list a tool that joined before it is rebuilt instead. */
+const PUBLISH_TIMEOUT_MS = 5_000;
+
+/**
+ * Hands the tools that joined mid-run to a live session: the in-process server
+ * adds them to its list, `tools/list_changed` makes the CLI ask for the list
+ * again, and the answer to that request is the confirmation. The CLI reads
+ * its stdin in order, so the new list is in its pool before the parked result
+ * that follows it resumes the round, and it refreshes the pool after every
+ * tool batch. From there the CLI appends the tool itself: on a model its
+ * catalogue lists as taking tool changes, a mid-conversation `tool_addition`
+ * (with one line of text beside it) and the tool declared `defer_loading`,
+ * which leaves the cached tool list alone; on any other model, a plain entry
+ * in that list. The CLI's own `mcpServerStatus()` is no witness here: it
+ * reports no tools for an in-process server.
+ *
+ * `false` when the CLI does not ask in time; the caller rebuilds instead.
+ */
+async function publishTools(session: Session, tools: readonly ToolSpec[]): Promise<boolean> {
+  const expired = new Promise<"expired">((resolve) =>
+    setTimeout(() => resolve("expired"), PUBLISH_TIMEOUT_MS).unref());
+  try {
+    if (await Promise.race([session.server.publish(tools).then(() => "listed" as const), expired]) === "expired") {
+      log(`会话 ${session.key} 的 CLI 没有重新列出工具`);
+      return false;
+    }
+  } catch (error) {
+    log(`会话 ${session.key} 发布新工具失败：${errorMessage(error)}`);
+    return false;
+  }
+  session.knownTools = new Set(tools.map((tool) => tool.name));
+  return true;
 }
 
 export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
@@ -1565,6 +1740,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
     agent: AgentSession,
     prompt: SDKUserMessage,
     history: unknown[],
+    promptAdditions: readonly string[][],
   ): Session {
     // First, and throwing: a session without the plugin must not start at all.
     const plugin = contextPluginDir(agent.cwd);
@@ -1602,6 +1778,8 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
           cwd: agent.cwd,
           cliVersion: lastCliVersion ?? FALLBACK_CLI_VERSION,
           model: servedModels.get(request.modelId) ?? request.modelId,
+          appendable: agent.toolChanges === true ? new Map(tools.map((tool) => [tool.name, tool])) : null,
+          promptAdditions,
         })
       : [];
 
@@ -1718,6 +1896,10 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
     io.begin(id, controller, true);
     try {
       const agent = validateAgent(request.agent);
+      // The host's tool-append markers stay in the history. A live session has
+      // its new tools handed over by the CLI itself (`publishTools`); a rebuilt
+      // one gets them back as the CLI's own record of them
+      // (`toolAdditionEntries`).
       // Replayed reasoning parts are tagged by the host with the model that signed
       // them; Anthropic binds a signature to that model, so a switched conversation
       // drops them and the tag itself never reaches the CLI.
@@ -1729,12 +1911,15 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       // Continuation: the parked round gets its results.
       if (live && live.ended === null && live.awaiting.size > 0 && split.prompt === null) {
         const missing = [...live.awaiting].filter((callId) => !split.results.has(callId));
-        if (missing.length === 0 && !sessionServesToolSet(live, request.tools ?? [])) {
-          // The parked call is answerable, but the step that follows it needs a
-          // tool this session never published. Resolving here would strand that
-          // tool for the rest of the run, so the results go into the rebuilt
-          // session's transcript instead — `split.results` is what carries them.
-          log(`会话 ${agent.session} 的工具集已扩大，改为重建会话`);
+        // The parked call is answerable, but the step that follows it may need
+        // a tool this session never listed. The session lists it before the
+        // round resumes; only when the CLI will not confirm it do the results go
+        // into a rebuilt session's transcript instead — `split.results` is what
+        // carries them.
+        const served = missing.length === 0
+          && (sessionServesToolSet(live, request.tools ?? []) || await publishTools(live, request.tools ?? []));
+        if (missing.length === 0 && !served) {
+          log(`会话 ${agent.session} 未能列出新增工具，改为重建会话`);
         } else if (missing.length === 0) {
           const ordered = [...live.awaiting];
           live.awaiting = new Set();
@@ -1764,9 +1949,11 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       if (live) teardown(live);
       let prompt: SDKUserMessage;
       let history: unknown[];
+      let promptAdditions: string[][] = [];
       if (split.prompt) {
         prompt = { type: "user", message: { role: "user", content: split.prompt as never }, parent_tool_use_id: null };
         history = split.history;
+        promptAdditions = split.promptAdditions;
       } else if (split.results.size > 0 || split.carriers.length > 0) {
         // The parked session is gone; the transcript already carries the results.
         // Carriers alone happen when a background delivery wakes a round of its own.
@@ -1775,7 +1962,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       } else {
         throw new Error("Claude Code 需要一条用户消息才能开始回合");
       }
-      const session = startSession(request, agent, prompt, history);
+      const session = startSession(request, agent, prompt, history, promptAdditions);
       await runAttached(session, id, controller);
     } catch (error) {
       io.fail(

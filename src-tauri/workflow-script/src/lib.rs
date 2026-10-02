@@ -391,7 +391,7 @@ pub(crate) fn validate_meta_json(meta: &Value) -> Result<ScriptMeta, WorkflowErr
         .and_then(Value::as_str)
         .map(str::to_owned);
     let mut phases = Vec::new();
-    if let Some(declared) = object.get("phases") {
+    if let Some(declared) = object.get("phases").filter(|declared| !declared.is_null()) {
         let Some(entries) = declared.as_array() else {
             return Err(WorkflowError::Invalid(
                 "meta.phases must be an array".into(),

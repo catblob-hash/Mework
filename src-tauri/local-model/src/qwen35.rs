@@ -38,7 +38,11 @@ pub struct Config {
     pub rope_theta: f64,
     /// Rotary dimensions per head (a prefix of `head_dim`).
     pub rotary_dim: usize,
+    /// Frequencies per position axis (temporal, height, width) for image
+    /// tokens; text tokens have the same position on all three.
     pub mrope_section: Vec<usize>,
+    /// The axes take turns frequency by frequency instead of in runs.
+    pub mrope_interleaved: bool,
     // Gated DeltaNet.
     pub linear_num_key_heads: usize,
     pub linear_num_value_heads: usize,
@@ -90,6 +94,8 @@ struct RawRope {
     #[serde(default)]
     mrope_section: Vec<usize>,
     #[serde(default)]
+    mrope_interleaved: bool,
+    #[serde(default)]
     rope_type: Option<String>,
 }
 
@@ -139,6 +145,10 @@ impl Config {
         if rotary_dim == 0 || rotary_dim % 2 != 0 || rotary_dim > text.head_dim {
             return Err("RoPE 维度无效".into());
         }
+        let sections = &text.rope_parameters.mrope_section;
+        if !sections.is_empty() && (sections.len() != 3 || sections.iter().sum::<usize>() != rotary_dim / 2) {
+            return Err("mrope_section 与 RoPE 维度不符".into());
+        }
         Ok(Self {
             hidden_size: text.hidden_size,
             intermediate_size: text.intermediate_size,
@@ -153,6 +163,7 @@ impl Config {
             rope_theta: text.rope_parameters.rope_theta,
             rotary_dim,
             mrope_section: text.rope_parameters.mrope_section,
+            mrope_interleaved: text.rope_parameters.mrope_interleaved,
             linear_num_key_heads: text.linear_num_key_heads,
             linear_num_value_heads: text.linear_num_value_heads,
             linear_key_head_dim: text.linear_key_head_dim,
@@ -173,6 +184,42 @@ impl Config {
     /// Channels of the DeltaNet short convolution: q, k and v side by side.
     pub fn linear_conv_dim(&self) -> usize {
         2 * self.linear_key_dim() + self.linear_value_dim()
+    }
+
+    /// Which position axis (0 temporal, 1 height, 2 width) turns rotary
+    /// frequency `i` (of `rotary_dim / 2`), as transformers'
+    /// `recomposition_frequencies` assigns them.
+    pub fn rotary_axis(&self, i: usize) -> usize {
+        let s = &self.mrope_section;
+        if s.len() != 3 {
+            return 0;
+        }
+        if self.mrope_interleaved {
+            match i % 3 {
+                1 if i < 3 * s[1] => 1,
+                2 if i < 3 * s[2] => 2,
+                _ => 0,
+            }
+        } else if i < s[0] {
+            0
+        } else if i < s[0] + s[1] {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// RoPE `cos` and `sin` (`rotary_dim` each, both halves filled) at
+    /// position `[t, h, w]`, from per-position tables of `rotary_dim` values
+    /// (`rope_tables`).
+    pub fn rotary_row<T: Copy>(&self, table: &[T], position: [u32; 3], out: &mut [T]) {
+        let rot = self.rotary_dim;
+        let half = rot / 2;
+        for i in 0..half {
+            let p = position[self.rotary_axis(i)] as usize;
+            out[i] = table[p * rot + i];
+            out[i + half] = table[p * rot + i + half];
+        }
     }
 
     pub fn full_attention_layers(&self) -> usize {
@@ -209,6 +256,18 @@ mod tests {
         assert_eq!(config.linear_conv_dim(), 6144);
         assert_eq!(config.vocab_size, 248320);
         assert!(config.tie_word_embeddings);
+        assert!(config.mrope_interleaved);
+        // transformers: h takes 1, 4, …, 31; w takes 2, 5, …, 29; t the rest.
+        let axes: Vec<usize> = (0..32).map(|i| config.rotary_axis(i)).collect();
+        assert_eq!(axes.iter().filter(|a| **a == 1).count(), 11);
+        assert_eq!(axes.iter().filter(|a| **a == 2).count(), 10);
+        assert_eq!(&axes[..6], &[0, 1, 2, 0, 1, 2]);
+        assert_eq!(&axes[29..], &[2, 0, 1]);
+        let table: Vec<u32> = (0..3 * 64).map(|i| i as u32).collect();
+        let mut row = vec![0u32; 64];
+        config.rotary_row(&table, [0, 1, 2], &mut row);
+        assert_eq!(&row[..3], &[0, 64 + 1, 128 + 2]);
+        assert_eq!(&row[32..35], &[32, 64 + 33, 128 + 34]);
     }
 
     #[test]

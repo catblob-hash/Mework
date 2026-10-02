@@ -10,7 +10,7 @@ import {
   Trash2,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { getI18nSnapshot, translate, useI18n } from "../i18n";
 import {
@@ -25,7 +25,6 @@ import {
   type SelectedElement
 } from "../lib/browser";
 import { isBrowserDevRuntime } from "../lib/backend";
-import { useBrowserPageEngagement } from "../lib/browserPageEngagement";
 import {
   anyRectOverlaps,
   createBrowserSnapshotStore,
@@ -49,6 +48,7 @@ import {
   PreviewIdlePage,
   PreviewLogDrawer,
   PreviewLogsMenuItem,
+  PreviewReadingPage,
   PreviewServerMenuItems,
   PreviewStartFailedCard,
   PreviewStartPage,
@@ -221,6 +221,14 @@ interface BrowserPanelProps {
   onOpenPage?: () => Promise<void>;
   /** Uses the real Rust browser session while mirroring its URL in a sandboxed iframe. */
   browserDev?: boolean;
+  /**
+   * What the app last heard about this tab's page, to start from instead of nothing.
+   *
+   * The pane polls its own status, but its first answer is an IPC round trip away. Starting from
+   * nothing, a tab switched to would render its start card for that long — and declare its page
+   * to belong beneath it, so the page would be presented sunk and then raised.
+   */
+  initialStatus?: BrowserStatus | null;
 }
 
 type BrowserRect = Pick<DOMRect, "left" | "top" | "right" | "bottom" | "width" | "height">;
@@ -229,11 +237,10 @@ type BrowserRect = Pick<DOMRect, "left" | "top" | "right" | "bottom" | "width" |
 export type BrowserOverlayRect = BrowserRect;
 
 /**
- * The projection of the page, as its own subscriber.
+ * The still standing in for the page while it is down, as its own subscriber.
  *
- * The frame is refreshed on a timer for as long as the page is the thing being shown, and this
- * panel also owns the toolbar, the menu and the log drawer. Subscribing here rather than holding
- * the frame in panel state keeps a once-a-second capture from re-rendering all of that.
+ * This panel also owns the toolbar, the menu and the log drawer. Subscribing here rather than
+ * holding the frame in panel state keeps a frame swap from re-rendering all of that.
  */
 function BrowserPageStill({ store, contentKey }: { store: BrowserSnapshotStore; contentKey: string | null }) {
   const snapshot = useSyncExternalStore(store.subscribe, store.get, store.get);
@@ -279,7 +286,8 @@ function BackendBrowserPanel({
   linkNotice = null,
   trustedOverlayRect = null,
   onReservedBottomChange,
-  onOpenPage
+  onOpenPage,
+  initialStatus = null
 }: {
   paneId: SidePaneId;
   onPaneClose: () => void;
@@ -301,13 +309,16 @@ function BackendBrowserPanel({
   trustedOverlayRect?: BrowserOverlayRect | null;
   onReservedBottomChange?: (reservedBottom: number) => void;
   onOpenPage?: () => Promise<void>;
+  initialStatus?: BrowserStatus | null;
 }) {
   const { resolvedLanguage, t } = useI18n();
   const menuId = useId();
   const menuTriggerId = useId();
   const embeddedTheme = useEmbeddedUiTheme();
-  const [status, setStatus] = useState<BrowserStatus>(emptyStatus);
-  const [address, setAddress] = useState("");
+  const [status, setStatus] = useState<BrowserStatus>(() => initialStatus ?? emptyStatus);
+  const [address, setAddress] = useState(() => (
+    initialStatus && initialStatus.url !== "about:blank" ? initialStatus.url : ""
+  ));
   const [editingAddress, setEditingAddress] = useState(false);
   const [pending, setPending] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenBrowserMenu>(null);
@@ -327,7 +338,7 @@ function BackendBrowserPanel({
   const menuOpenRef = useRef(false);
   /** Whether any trusted surface is over the page, recomputed by the measurement pass below. */
   const [covered, setCovered] = useState(false);
-  /** The projection painted in the page's place while the page is sunk. */
+  /** The still painted in the page's place while the page is sunk. */
   const [snapshotStore] = useState(createBrowserSnapshotStore);
   /** Last height reported to the parent, so an inline callback prop cannot turn into a flood. */
   const reservedBottomRef = useRef<number | null>(null);
@@ -395,12 +406,25 @@ function BackendBrowserPanel({
 
   const bodyState: PreviewBodyState = useMemo(() => previewBodyState({
     url: status.url,
-    configurationCount: preview.configurations?.servers.length ?? 0,
+    // Still unread only while there is a workspace to read it from and nothing has said it
+    // cannot be: a pane with no workspace, or one whose machine is away, has no servers to list.
+    configurationCount: preview.configurations
+      ? preview.configurations.servers.length
+      : target && !preview.unreachable ? null : 0,
     rows: preview.rows,
     pendingName: preview.pendingName,
     startError: preview.startError,
     stopped: preview.stopped
-  }), [status.url, preview.configurations, preview.rows, preview.pendingName, preview.startError, preview.stopped]);
+  }), [
+    status.url,
+    target,
+    preview.configurations,
+    preview.unreachable,
+    preview.rows,
+    preview.pendingName,
+    preview.startError,
+    preview.stopped
+  ]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -526,11 +550,12 @@ function BackendBrowserPanel({
   }, [nativeChild, sessionId]);
 
   /**
-   * Tells the host whether the sink is a cover or the pane at rest.
+   * Tells the host whether the sink is a cover or the page merely being out of sight.
    *
    * Only this one carries meaning: covering takes the page out of agent automation, because the
    * user is looking at a dialog and an Agent click landing behind it would be a click nobody
-   * could see. Resting must not, or the Agent would lose the page every time the pointer moved.
+   * could see. A page out of sight — its pane under another, or showing a card — stays the
+   * Agent's.
    */
   const sendCovered = useCallback(async (isCovered: boolean) => {
     if (!nativeChild || !sessionId) return;
@@ -545,27 +570,24 @@ function BackendBrowserPanel({
   /** Whether the pane is showing the page itself rather than one of its own cards. */
   const pagePresented = bodyState.kind === "page";
 
-  const engaged = useBrowserPageEngagement({
-    pageAreaRef,
-    enabled: Boolean(nativeChild && sessionId && status.hasPage && pagePresented && active)
-  });
-
   /**
    * Whether the page belongs beneath the renderer.
    *
-   * Sunk is the resting state, not the exceptional one. A native child window paints over every
-   * HTML layer in the app, so leaving the page on top means the pane's rounded corners, its
-   * transitions, and every menu or dialog the rest of the app opens are all painted over by a
-   * rectangle React does not control. It comes up only for the one thing a projection cannot do:
-   * be used. Scrolling, text selection, the IME and native right-click all belong to the real
-   * page, so the real page is what the user gets for as long as they are using it.
+   * On top is the resting state: it is the only way the user sees the page live, scrolls it,
+   * selects in it, types into it, and watches the Agent drive it at full frame rate. A native
+   * child window paints over every HTML layer, though, so the page goes down — with a still in its
+   * place — whenever something has to be seen there instead: a menu or dialog drawn across it, one
+   * of the pane's own cards, or another pane expanded over this one.
    */
-  const parked = !(pagePresented && engaged && !covered);
+  const parked = !pagePresented || covered || !active;
 
   useBrowserPageProjection({
     contentKey: sessionId ?? null,
-    enabled: Boolean(nativeChild && sessionId && status.hasPage),
-    hasContent: pagePresented,
+    // Not gated on the page existing: the pane says where its page belongs before the host
+    // creates or presents it, so a new page arrives under the start card rather than over it.
+    enabled: Boolean(nativeChild && sessionId),
+    presented: status.open,
+    hasContent: pagePresented && status.hasPage,
     parked,
     covered,
     placeholderRef: pageAreaRef,
@@ -641,7 +663,10 @@ function BackendBrowserPanel({
     onReservedBottomChange(reserved);
   }, [measureCovered, onReservedBottomChange]);
 
-  useEffect(() => {
+  // A layout effect: the pane's own surfaces — its menu, the drawing layer, the error strip — are
+  // drawn in the commit that runs this, and measuring before that commit is painted is what lets
+  // the still go up in the same frame as the surface rather than one later.
+  useLayoutEffect(() => {
     // Measured now and again on the next frame: a cancelled frame must never be the only pass, or
     // a surface that appears and is superseded before the frame runs leaves the page covered.
     syncGeometry();
@@ -794,9 +819,9 @@ function BackendBrowserPanel({
     if (pickerArmedRef.current) void action("select_element", false);
     void capture.then((page) => {
       if (annotateGenerationRef.current !== generation) return;
-      // The page is sunk for most of a pane's life, and the drawing layer covers it besides, so
-      // this capture may well come back empty. The projection is a frame of the same page a moment
-      // earlier, which is a better backdrop to draw on than none.
+      // The drawing layer covers the page and takes it down, so this capture may come back empty.
+      // The still standing in for the page is a frame of the same page a moment earlier, which is
+      // a better backdrop to draw on than none.
       const src = page ? `data:image/png;base64,${page.data}` : snapshotStore.get()?.src ?? null;
       if (src) setAnnotateBackdrop(src);
     });
@@ -837,6 +862,8 @@ function BackendBrowserPanel({
     switch (bodyState.kind) {
       case "page":
         return null;
+      case "reading":
+        return <PreviewReadingPage />;
       case "no-config":
         return <PreviewIdlePage />;
       case "start-page":
@@ -1225,7 +1252,8 @@ export function BrowserPanel({
   trustedOverlayRect = null,
   onReservedBottomChange,
   onOpenPage,
-  browserDev = isBrowserDevRuntime()
+  browserDev = isBrowserDevRuntime(),
+  initialStatus = null
 }: BrowserPanelProps) {
   const pane = { paneId, onPaneClose, onPaneFocus, paneTrailing, paneExpanded, onPaneToggleExpand, onAttachImage, onElementPicked, onContentBoundsChange };
   if (native || browserDev) {
@@ -1244,6 +1272,7 @@ export function BrowserPanel({
         trustedOverlayRect={trustedOverlayRect}
         onReservedBottomChange={onReservedBottomChange}
         onOpenPage={onOpenPage}
+        initialStatus={initialStatus}
       />
     );
   }

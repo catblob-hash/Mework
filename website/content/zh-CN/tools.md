@@ -4,7 +4,7 @@ Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它
 
 下面按工具选择器的分组排列。每个可开关的工具在选择器里各占一行，行首的书本图标就通向它在这里的页面。
 
-## 工具怎样变得可用
+## 工具怎样变得可用 {#available}
 
 其中 {{SWITCHABLE_TOOL_COUNT}} 个是对话或预设的「启用的工具」列表里的开关（composer 旁边的滑块图标，或 设置 → 对话预设）。另外 {{DERIVED_TOOL_COUNT}} 个从别的设置或工具**派生**，从不出现在那个列表里：
 
@@ -13,13 +13,25 @@ Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它
 | `read_global_memory`、`create_global_memory`、`edit_global_memory` | **全局记忆**开关 |
 | `read_project_memory`、`create_project_memory`、`edit_project_memory` | **项目记忆**开关 |
 | `web_search`、`web_fetch` | 对话唯一的**启用联网搜索**开关；一次运行拿到其中哪一个，取决于解析出的后端 |
-| `task_wait`、`task_list`、`box` | 任何会产生任务的工具被启用（`agent_spawn`、`workflow`、`bash`、`zsh`、`sh`、`powershell`、`preview_start`） |
+| `task_wait`、`task_list` | 任何会产生任务的工具被启用（`agent_spawn`、`workflow`、`bash`、`zsh`、`sh`、`powershell`、`preview_start`） |
+| `box` | 每次运行都有：宿主追加给对话的每一条消息都由它送达 |
 | `skill` | **技能按需加载**开关，且至少选中了一个技能 |
 | `tool_search` | **工具发现**开关（MCP），且本次运行扣留了 MCP 工具 schema |
-| `plan`、`exit_plan_mode` | **安全层级**处于计划模式 |
+| `plan`、`exit_plan_mode` | 对话的**计划模式**开关 |
 | `preview_start`、`preview_stop`、`preview_list` | 任何其他 `preview_*` 工具被启用 |
 
-一个对话里的工具暴露面只增不减。一次运行把某个工具——或某个 MCP 服务器、某层记忆、技能按需加载、联网——展示给模型之后，它在这个对话余下的时间里一直保持开启，设置面板会把它置灰：已经调用过某个工具的转录，没法重放给一个不再拥有该工具的模型。后面的轮次可以扩大这个面，但不能收窄。
+### 工具锁定 {#lock}
+
+对话上一次请求带出去的工具面——工具、MCP 服务器、记忆层、联网、计划模式、技能和两个传递开关——就是它的**工具锁定**，它属于发出那次请求的模型。只要当前选中的还是那个模型，设置面板就把锁定直接画在各行上，行的右侧有一把锁：
+
+- **橘色**——模型的提示缓存还没过期，而改动这一行会重写它缓存着的那部分提示词：关掉上一次请求带着的某个工具、计划模式、联网或技能，或者无论朝哪个方向改动某个 MCP 服务器、某层记忆、**技能按需加载**或**工具发现**。橘色的行仍然可以改。在一个对话里第一次改动时，Mework 会说明缓存将失效，问过你才改，并附一个**不再显示**选项，勾上后在所有对话里都不再提醒。在下一次请求之前改回原样，缓存仍然有效，这一行也重新变回橘色。打开一个工具永远不是橘色的：工具是追加进来的（见下文），缓存不受影响。**设置 → 提供商**里每个模型的档案都有一个**缓存失效时间**（分钟，默认 30）；距上一次请求超过这么久，橘色就消失。
+- **灰色**——模型不支持在对话中途加入工具（见下文），所以它的整个工具面在首次请求时就固定了：不加也不减，与缓存无关。技能不是工具，不受限制。
+
+换成别的模型，两种状态都解除，因为那个模型的缓存里没有这些；再换回来，锁定里记着的设置会被套回去。对话用过的搜索与抓取后端是另一回事：无论换什么模型都一直固定，因为转录里的搜索结果只有产生它的那个后端能被回放。
+
+对话中途加入的工具——你在设置里新勾选的、自动压缩武装的交接工具、`tool_search` 取回的 MCP 工具——是**追加**进来的，而不是写回每次请求开头声明的工具列表：那份列表排在提示词最前面，改写它会让整段提示词缓存失效。宿主在时间线上记下工具加入的位置，由协议自己的追加接口在那个位置把工具交给模型，不附带任何文字通知。Anthropic Messages 用会话中途的 `tool_addition`（工具本身以 `defer_loading` 声明）；OpenAI Responses、Azure 与 Codex 用 `additional_tools` 输入项。**Claude Agent** 交给 Claude Code 自己追加：在它支持的模型上是它自己的 `tool_addition`，附带它自己的一行「工具现已可用」文字。其余协议没有追加接口。
+
+模型能不能这样接收工具，是它的一项能力，和视觉输入并列：**设置 → 提供商**里模型属性中的**中途追加工具**。Mework 认得的模型由它自己勾上——获取模型时，以及你手动添加模型、输入 ID 时：Anthropic 官方 API 上的 Fable 5、Mythos 5、Opus 4.8 及之后的版本和 Sonnet 5.5；经 **Claude Agent** 时是同一份名单去掉 Sonnet 5.5；OpenAI 或 Azure 自己的端点上以及经 Codex 时，所有模型。Mework 不认得的模型——尤其是经中转站的，中转站未必把追加接口原样转发——一开始不勾，由你按端点的实际能力来勾：勾上后，追加照样发给那个端点。没有追加接口的协议上，这项能力不起作用。没有这项能力的模型，工具面在首次请求时就固定下来（[灰色](#lock)），**自动压缩**不会启动，也不提供**工具发现**。端点仍然拒绝追加时，工具退回声明列表。
 
 ## 审批
 
@@ -77,8 +89,14 @@ Mework 内置 {{TOOL_COUNT}} 个工具。每个工具都有自己的页面：它
 
 ## 代理编排 {#group-orchestration}
 
-{{TOOL_TABLE:agent_spawn,send_message,followup_task,task_wait,task_list,box,workflow,fork,todo,ask_user,skill,tool_search,plan,exit_plan_mode}}
+{{TOOL_TABLE:agent_spawn,task_wait,task_list,box,workflow,fork,ask_user,skill,tool_search,plan,exit_plan_mode}}
 
 ## 长期记忆 {#group-memory}
 
 {{TOOL_TABLE:read_global_memory,create_global_memory,edit_global_memory,read_project_memory,create_project_memory,edit_project_memory}}
+
+## 交接 {#group-handoff}
+
+这四个工具都不是开关。开启**自动压缩**（在上下文用量菜单里）后，上下文越过阈值的对话会收到宿主的通知，形式与后台任务结果相同，并获得这四个工具。模型先写交接文档，再调用 `handoff`：它开启一个新会话，并结束当前对话。新会话只带着原对话的系统提示词、相同的工具和这些交接文档开始，不带任何历史。继承了交接文档的对话从第一轮请求起就能读取它们。
+
+{{TOOL_TABLE:read_handoff_note,create_handoff_note,edit_handoff_note,handoff}}

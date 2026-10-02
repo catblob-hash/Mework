@@ -3,7 +3,6 @@ import type { TerminalSessionState } from "./terminal";
 import type { ShellTaskSnapshot } from "./shellTasks";
 import type { BrowserStatus } from "./browser";
 import { previewServerAddress, previewUrlIsServedAt, type PreviewServerSnapshot } from "./preview";
-import { workspaceDirectoryLabel } from "./workspaces";
 import type { ModelUsage, ConversationPlan, ForkDecisionRecord, UserAbortedTaskKind, UserAbortedTaskRecord } from "../types";
 
 /**
@@ -125,16 +124,12 @@ export interface TaskContainerMessages {
   stepCount: (total: number) => string;
   terminalIdle: string;
   terminalBusy: string;
-  /** What the row calls a running command; the command text is the detail. */
+  /** A command's subtitle when it has neither a summary nor any command text to show. */
   shellRunning: string;
-  shellStopping: string;
-  /** A failed command's row, when the platform reported an exit code. */
+  /** A failed command's hover text, when the platform reported an exit code. */
   shellExited: (code: number) => string;
-  shellFinished: string;
   /** A failure with no exit code the platform could give us. */
   shellFailed: string;
-  /** A command a person killed, which is neither success nor breakage. */
-  shellStopped: string;
   /** What a dev-server row is called before its configuration name. */
   previewLabel: string;
   previewStarting: string;
@@ -265,28 +260,27 @@ function subagentItem(
   _byId: Map<string, SubagentView>,
   _messages: TaskContainerMessages,
   now: number,
-  inheritedModelId: string | null
+  inheritedModelId: string | null,
+  toolExplanation?: ToolExplanationLookup
 ): TaskItem {
   const state = taskStateForStatus(agent.status);
   return {
     kind: "subagent",
     id: agent.id,
-    // The name the model gave this child, which is also the address it talks to
-    // it by. `label` is a fallback for legacy views only: it is free text the
-    // model writes, and what it usually writes there is a précis of the task —
-    // so a row titled by it says what was asked rather than who is doing it,
-    // and two children of the same role become two rows with the same title.
-    label: agent.name || agent.label,
-    // Which role is answering — never what the child was told. The task the
-    // model sent is the child's own transcript; repeating it here made every
-    // row a wall of prompt text and told the reader nothing they could act on.
-    //
-    // The role is the name the user configured and the model selects by, so it
-    // is the fact worth a row: two children on the same model but different
-    // roles are doing different jobs, and the model ID said they were the same.
-    // A child that named no role has none, and then the model it inherits is
-    // the only thing left to say.
-    detail: agent.role?.name ?? agent.modelId ?? inheritedModelId ?? "",
+    // Who is doing it, then what it is called: `role:name`. The name is the
+    // one the model gave this child, which is also the address it talks to it
+    // by; `label` is a fallback for legacy views only. A child that named no
+    // role has none to lead with, and its name stands alone.
+    label: roleTitle(agent.role?.name ?? null, agent.name || agent.label),
+    // What the child was asked, as one line: enough to tell two children of the
+    // same role apart without opening either. The local helper model's title
+    // for the task replaces the excerpt once it lands. A child whose task is
+    // not known yet falls back to the model it answers on.
+    detail: generatedTaskTitle(agent, toolExplanation)
+      || promptPreview(agent.task)
+      || agent.modelId
+      || inheritedModelId
+      || "",
     state,
     agent,
     metrics: agentMetrics(agent, 0, now),
@@ -302,7 +296,8 @@ function workflowItem(
   byId: Map<string, SubagentView>,
   messages: TaskContainerMessages,
   now: number,
-  inheritedModelId: string | null
+  inheritedModelId: string | null,
+  toolExplanation?: ToolExplanationLookup
 ): Extract<TaskItem, { kind: "workflow" }> {
   const steps = agent.childIds.flatMap((childId) => {
     const child = byId.get(childId);
@@ -328,7 +323,7 @@ function workflowItem(
     // of control: the user's layout puts them at the same left edge as any
     // other child.
     metrics: agentMetrics(agent, steps.length, now),
-    children: steps.map((step) => taskItemForAgent(step, byId, messages, now, inheritedModelId)),
+    children: steps.map((step) => taskItemForAgent(step, byId, messages, now, inheritedModelId, toolExplanation)),
     error: agentError(agent, state),
     startedAt: agent.createdAt,
     endedAt: agent.completedAt
@@ -340,11 +335,12 @@ function taskItemForAgent(
   byId: Map<string, SubagentView>,
   messages: TaskContainerMessages,
   now: number,
-  inheritedModelId: string | null
+  inheritedModelId: string | null,
+  toolExplanation?: ToolExplanationLookup
 ): TaskItem {
   return isWorkflowRun(agent)
-    ? workflowItem(agent, byId, messages, now, inheritedModelId)
-    : subagentItem(agent, byId, messages, now, inheritedModelId);
+    ? workflowItem(agent, byId, messages, now, inheritedModelId, toolExplanation)
+    : subagentItem(agent, byId, messages, now, inheritedModelId, toolExplanation);
 }
 
 /**
@@ -466,7 +462,9 @@ function browserItem(
   automationTool: string | null,
   messages: TaskContainerMessages
 ): TaskItem | null {
-  if (!browser.hasPage) return null;
+  // The host reports a sleeping page as having no live surface (`hasPage: false`), and every tab
+  // not in front sleeps, so `suspended` has to keep its row on its own.
+  if (!browser.hasPage && !browser.suspended) return null;
   // A page the model is holding is a task whatever is loaded in it: the automation is the work,
   // and the row is where the task list says so and offers to stop it.
   if (!automationTool && !pageHoldsDocument(browser)) return null;
@@ -510,15 +508,62 @@ function browserItem(
 }
 
 /**
- * What a shell command's row and page are called: the tool, and — once the
- * conversation has more than one workspace, where "which one did that run in"
- * becomes a real question — the workspace it ran in, by the same name its chip
- * carries.
+ * `role:title`, the way every agent row and workflow step is titled. A run that
+ * named no role is titled by its own name alone.
  */
-export function shellTaskTitle(shell: ShellTaskSnapshot, multipleWorkspaces: boolean): string {
-  return multipleWorkspaces && shell.workspaceRoot
-    ? `${shell.toolName} · ${workspaceDirectoryLabel(shell.workspaceRoot)}`
-    : shell.toolName;
+export function roleTitle(role: string | null | undefined, title: string): string {
+  const name = role?.trim();
+  return name ? `${name}:${title}` : title;
+}
+
+/** The text the local helper model stored beside a tool card, by the card's id. */
+export type ToolExplanationLookup = (contextId: string) => string | undefined;
+
+/**
+ * The title the local helper model made of a child's task, if it has: the host
+ * stores it beside the `agent_spawn` card that started the child, so it is
+ * found under one of the child's call ids. Made from the spawn's `prompt`
+ * alone, never the child's opening message, which a role's template may wrap
+ * around it.
+ */
+export function generatedTaskTitle(
+  agent: SubagentView,
+  toolExplanation: ToolExplanationLookup | undefined
+): string {
+  if (!toolExplanation) return "";
+  for (const callId of agent.callIds) {
+    const title = toolExplanation(callId)?.trim();
+    if (title) return title;
+  }
+  return "";
+}
+
+/** Longest task preview a subtitle carries; the row cuts it to its width anyway. */
+const PROMPT_PREVIEW_LENGTH = 240;
+
+/** The prompt an agent was given, as one line for a subtitle. */
+export function promptPreview(text: string | null | undefined): string {
+  const line = (text ?? "").replace(/\s+/g, " ").trim();
+  return line.length > PROMPT_PREVIEW_LENGTH ? `${line.slice(0, PROMPT_PREVIEW_LENGTH)}…` : line;
+}
+
+/**
+ * Where a shell command ran: the directory it started in, or — on a row recorded
+ * before the host kept that — its workspace's root. Null when neither is known.
+ */
+export function shellTaskDirectory(shell: ShellTaskSnapshot): string | null {
+  return shell.cwd?.trim() || shell.workspaceRoot?.trim() || null;
+}
+
+/**
+ * What a shell command's row and page are called: the shell, then the directory
+ * it ran in — `zsh:/Users/me/project`. Which directory is the question a list of
+ * near-identical `bash` rows could not answer, and the path says it on every
+ * machine and in every workspace alike.
+ */
+export function shellTaskTitle(shell: ShellTaskSnapshot): string {
+  const directory = shellTaskDirectory(shell);
+  return directory ? `${shell.toolName}:${directory}` : shell.toolName;
 }
 
 /**
@@ -543,33 +588,20 @@ function shellElapsedMs(shell: ShellTaskSnapshot, now: number): number | null {
 function shellItem(
   shell: ShellTaskSnapshot,
   messages: TaskContainerMessages,
-  now: number,
-  multipleWorkspaces: boolean
+  now: number
 ): TaskItem {
-  // The command text is the detail whatever the state, so the row still answers
-  // "which command was that" once it is in the collapsed finish list. What
-  // changes is the status word in front of it.
-  const command = shell.command || messages.shellRunning;
-  const status = shell.outcome
-    ? shell.outcome === "succeeded"
-      ? messages.shellFinished
-      : shell.outcome === "stopped"
-        ? messages.shellStopped
-        // The exit code is worth surfacing only on a failure: it is the first
-        // thing anyone asks about one, and it is noise on a zero.
-        : shell.exitCode === null
-          ? messages.shellFailed
-          : messages.shellExited(shell.exitCode)
-    : shell.stopping
-      ? messages.shellStopping
-      : null;
+  const failed = shell.outcome === "failed";
   return {
     kind: "shell",
     id: shell.shellTaskId,
-    // The tool name is the label and the command is the detail, so the row
-    // answers "what is running" without the user opening anything.
-    label: shellTaskTitle(shell, multipleWorkspaces),
-    detail: status ? `${status} · ${command}` : command,
+    // The shell and the directory are the label, and what the command does is
+    // the detail, so the row answers "what is running where" without the user
+    // opening anything.
+    label: shellTaskTitle(shell),
+    // The helper model's summary when it wrote one, the command itself
+    // otherwise. No status word goes in front: the section a row sits in says
+    // whether it is still running, and a failure is the row's colour.
+    detail: shell.explanation?.trim() || shell.command || messages.shellRunning,
     // A stopped process is only classified as a user-aborted failure when the
     // taskbar has persisted the corresponding abort record. Other cancellation
     // paths keep the registry's neutral stopped outcome.
@@ -590,7 +622,14 @@ function shellItem(
       elapsedMs: shellElapsedMs(shell, now)
     },
     children: [],
-    error: null,
+    // The exit code is worth surfacing only on a failure: it is the first thing
+    // anyone asks about one, and it is noise on a zero. It is the failed row's
+    // hover text rather than its subtitle.
+    error: failed
+      ? shell.exitCode === null
+        ? messages.shellFailed
+        : messages.shellExited(shell.exitCode)
+      : null,
     startedAt: shell.startedAt,
     endedAt: shell.endedAt
   };
@@ -770,10 +809,10 @@ export interface TaskSources {
    */
   inheritedModelId?: string | null;
   /**
-   * Whether the conversation has more than one workspace, which is when a shell
-   * row names the workspace its command ran in.
+   * What the local helper model stored beside tool cards. A child's subtitle
+   * reads its spawn card's: the title of its task, once one has been made.
    */
-  multipleWorkspaces?: boolean;
+  toolExplanation?: ToolExplanationLookup;
   /** Clock for the elapsed column, so a render stays a pure function. */
   now?: number;
 }
@@ -812,7 +851,7 @@ export function deriveTaskItems(
     planDrafting = false,
     forkDecisions = [],
     inheritedModelId = null,
-    multipleWorkspaces = false,
+    toolExplanation,
     now = Date.now()
   } = sources;
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
@@ -826,7 +865,7 @@ export function deriveTaskItems(
 
   agents.forEach((agent) => {
     if (agent.depth !== 0) return;
-    items.push(taskItemForAgent(agent, byId, messages, now, inheritedModelId));
+    items.push(taskItemForAgent(agent, byId, messages, now, inheritedModelId, toolExplanation));
   });
 
   terminals.forEach((terminal) => {
@@ -848,7 +887,7 @@ export function deriveTaskItems(
   });
 
   shellTasks.forEach((shell) => {
-    items.push(shellItem(shell, messages, now, multipleWorkspaces));
+    items.push(shellItem(shell, messages, now));
   });
 
   previewServers.forEach((server) => {
@@ -878,9 +917,9 @@ export function deriveTaskItems(
     items.push(planItem(plan, planAwaitingApproval, planDrafting, messages, now));
   }
 
-  // Sorted here rather than trusted from the caller: the rows only ever appear
-  // in the finish list, where the order is the order they went in, and that list
-  // is meant to read as the sequence in which things ended.
+  // Sorted here rather than trusted from the caller, so the derived list is the
+  // same whatever order the decisions arrived in. The finish list orders every
+  // row by when it ended on its own; see `finishedTaskItems`.
   [...forkDecisions]
     .sort((left, right) => left.decidedAt.localeCompare(right.decidedAt))
     .forEach((decision) => {
@@ -917,11 +956,31 @@ export function deriveTaskItems(
   return merged.map(bindSource);
 }
 
-/** Rows the "finish" disclosure hides, in the order they finished. */
+/**
+ * When a finished row ended: its end, or its start when it recorded no end.
+ * A row that knows neither — an exited terminal, a page that failed to load —
+ * sorts after every row that does.
+ */
+function finishedAt(item: TaskItem): number {
+  return parseTime(item.endedAt ?? "") ?? parseTime(item.startedAt) ?? Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Rows under the "finish" disclosure: every kind in one list, latest to finish
+ * first. Ordered by time rather than by kind, so whatever just ended sits right
+ * under the running rows it left, and a shell, a subagent and a workflow that
+ * ended together read together.
+ */
 export function finishedTaskItems(items: TaskItem[]): TaskItem[] {
   // The plan is never history: it is the standing artifact of plan mode and the
   // only way into its page, so it stays in the visible list at every status.
-  return items.filter((item) => item.state !== "running" && item.kind !== "plan");
+  return items
+    .filter((item) => item.state !== "running" && item.kind !== "plan")
+    .map((item, index) => ({ item, index, at: finishedAt(item) }))
+    // Two rows with no time at all subtract to NaN, which falls through to the
+    // order they were derived in, as does a tie.
+    .sort((left, right) => (right.at - left.at) || (left.index - right.index))
+    .map(({ item }) => item);
 }
 
 export function runningTaskItems(items: TaskItem[]): TaskItem[] {

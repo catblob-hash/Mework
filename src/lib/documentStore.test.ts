@@ -108,7 +108,7 @@ describe("createDocumentStore", () => {
     const results = [Promise.reject(new Error("first fails")), Promise.resolve()];
     results[0].catch(() => undefined);
     let index = 0;
-    const save = vi.fn((snapshot: AppDocument) => {
+    const save = vi.fn((_snapshot: AppDocument) => {
       order.push(`start-${index}`);
       return results[index++] ?? Promise.resolve();
     });

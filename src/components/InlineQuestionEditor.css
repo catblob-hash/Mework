@@ -54,26 +54,38 @@
   margin-bottom: 13px;
 }
 
+/* The same box every other tool card is read and edited in (`.tool-kv__value`
+   in conversation.css): a thin frame that hovering leaves alone, an error
+   colours red, and focus colours over the error. The fill stays `.input`'s, so
+   glass still swaps it for its panel. */
 .question-editor__field .input,
 .question-editor__answer .input {
-  padding-right: 2px;
-  padding-left: 2px;
-  border: 0;
-  border-bottom: 1px solid var(--border-strong);
-  border-radius: 0;
-  background: transparent;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
   box-shadow: none;
+}
+
+/* One line, as tall as its text; the textareas keep their own minimums below. */
+.question-editor__field input.input,
+.question-editor__answer input.input {
+  min-height: 0;
 }
 
 .question-editor__field .input:hover,
 .question-editor__answer .input:hover {
-  border-color: var(--faint);
+  border-color: var(--border);
+}
+
+.question-editor__field .input.input--error,
+.question-editor__answer .input.input--error {
+  border-color: var(--danger);
 }
 
 .question-editor__field .input:focus,
 .question-editor__answer .input:focus {
   border-color: var(--focus);
-  box-shadow: 0 1px var(--focus);
+  box-shadow: none;
 }
 
 .question-editor__field--error .field__hint,

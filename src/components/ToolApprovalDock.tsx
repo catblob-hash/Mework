@@ -40,9 +40,8 @@ function ToolApprovalDockContent({
   // id twice, and the second call fails with a confusing "prompt not found".
   const decidedRef = useRef(false);
   const [decided, setDecided] = useState<ToolPromptDecision | null>(null);
-  // Revealing the feedback box is not yet an answer: the guard below must stay
-  // unspent until the user actually submits it.
-  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  // A plan card's reply box. Typing in it is not yet an answer: the guard below
+  // stays unspent until the user sends it or approves.
   const [feedback, setFeedback] = useState("");
   const locked = decided !== null;
   const kind = pending.kind ?? "tool";
@@ -52,10 +51,6 @@ function ToolApprovalDockContent({
     (allowRef.current ?? dialogRef.current)?.focus({ preventScroll: true });
   }, []);
 
-  useEffect(() => {
-    if (feedbackOpen) feedbackRef.current?.focus({ preventScroll: true });
-  }, [feedbackOpen]);
-
   const decide = (decision: ToolPromptDecision, text?: string) => {
     if (decidedRef.current) return;
     decidedRef.current = true;
@@ -64,17 +59,15 @@ function ToolApprovalDockContent({
   };
 
   const heading = planExit
-    ? t("计划已就绪，是否开始实施？", "Ready to code?")
+    ? t("计划已就绪，批准或提意见", "Plan ready: approve it or send feedback")
     : t("需要你的确认", "Your approval is needed");
 
   const statusText = (): string => {
     if (decided === null) return "";
     if (planExit) {
       return decided === "deny"
-        ? t("已退回计划，等待模型修改", "Sent the plan back for changes")
-        : decided === "allow_always"
-          ? t("开始实施，编辑将自动接受", "Implementing; edits are accepted automatically")
-          : t("开始实施，编辑仍逐条批准", "Implementing; edits are still approved one by one");
+        ? t("已发送意见，模型会修改计划后再来请你批准", "Feedback sent; the model will revise the plan and ask again")
+        : t("已批准，模型开始实施", "Approved; the model is implementing it");
     }
     return decided === "deny"
       ? t("已拒绝", "Denied")
@@ -159,36 +152,43 @@ function ToolApprovalDockContent({
         </p>
       )}
 
+      {/* A plan card has no refusal: the user approves, or writes what should
+          change and the model revises the plan and asks again. The security
+          level is not part of the answer — it stays whatever the user picked. */}
       {planExit ? (
-        <footer className="tool-approval-dock__footer">
-          <button
-            type="button"
-            className="tool-approval-dock__action tool-approval-dock__action--deny"
-            disabled={locked}
-            onClick={() => setFeedbackOpen(true)}
-          >
-            <X size={14} aria-hidden="true" />
-            {t("否，继续规划", "No, keep planning")}
-          </button>
-          <button
-            type="button"
-            className="tool-approval-dock__action tool-approval-dock__action--always"
-            disabled={locked}
-            onClick={() => decide("allow_once")}
-          >
-            {t("是，手动批准编辑", "Yes, manually approve edits")}
-          </button>
-          <button
-            ref={allowRef}
-            type="button"
-            className="tool-approval-dock__action tool-approval-dock__action--allow"
-            disabled={locked}
-            onClick={() => decide("allow_always")}
-          >
-            {t("是，自动接受编辑", "Yes, auto-accept edits")}
-            <Check size={14} aria-hidden="true" />
-          </button>
-        </footer>
+        <>
+          <div className="tool-approval-dock__feedback">
+            <textarea
+              ref={feedbackRef}
+              className="tool-approval-dock__feedback-input"
+              value={feedback}
+              disabled={locked}
+              aria-label={t("修改意见", "Plan feedback")}
+              placeholder={t("有要改的地方？写在这里发给模型", "Anything to change? Write it here for the model")}
+              onChange={(event) => setFeedback(event.target.value)}
+            />
+          </div>
+          <footer className="tool-approval-dock__footer">
+            <button
+              type="button"
+              className="tool-approval-dock__action tool-approval-dock__action--always"
+              disabled={locked || feedback.trim() === ""}
+              onClick={() => decide("deny", feedback.trim())}
+            >
+              {t("发送意见", "Send feedback")}
+            </button>
+            <button
+              ref={allowRef}
+              type="button"
+              className="tool-approval-dock__action tool-approval-dock__action--allow"
+              disabled={locked}
+              onClick={() => decide("allow_once")}
+            >
+              {t("批准", "Approve")}
+              <Check size={14} aria-hidden="true" />
+            </button>
+          </footer>
+        </>
       ) : (
         <footer className="tool-approval-dock__footer">
           <button
@@ -223,28 +223,6 @@ function ToolApprovalDockContent({
         </footer>
       )}
 
-      {planExit && feedbackOpen && (
-        <div className="tool-approval-dock__feedback">
-          <textarea
-            ref={feedbackRef}
-            className="tool-approval-dock__feedback-input"
-            value={feedback}
-            disabled={locked}
-            aria-label={t("修改意见", "Plan feedback")}
-            placeholder={t("告诉模型需要修改什么", "Tell the model what to change")}
-            onChange={(event) => setFeedback(event.target.value)}
-          />
-          <button
-            type="button"
-            className="tool-approval-dock__action tool-approval-dock__action--allow"
-            disabled={locked || feedback.trim() === ""}
-            onClick={() => decide("deny", feedback.trim())}
-          >
-            {t("提交反馈", "Send feedback")}
-          </button>
-        </div>
-      )}
-
       <div className="tool-approval-dock__status" aria-live="polite">
         {decided && <span role="status">{statusText()}</span>}
       </div>
@@ -253,7 +231,8 @@ function ToolApprovalDockContent({
 }
 
 export function ToolApprovalDock(props: ToolApprovalDockProps) {
-  if (!props.pending) return null;
+  // A question card is answered in the QuestionDock, not with a decision.
+  if (!props.pending || props.pending.kind === "question") return null;
   // Keyed remount: a new prompt id must arrive with its own fresh decision
   // state, never inheriting the previous card's spent guard.
   return (

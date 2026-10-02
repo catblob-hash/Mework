@@ -115,7 +115,7 @@ export function workspaceLocationTitle(
 }
 
 /** Whether two records name the same directory on the same machine. Mirrors the host's `same_location`. */
-export function sameWorkspaceLocation(left: AttachedWorkspace, right: AttachedWorkspace): boolean {
+function sameWorkspaceLocation(left: AttachedWorkspace, right: AttachedWorkspace): boolean {
   const trimmed = (path: string) => path.replace(/[\\/]+$/, "");
   return sameMachine(left.machine, right.machine) && trimmed(left.path) === trimmed(right.path);
 }

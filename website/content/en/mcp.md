@@ -14,8 +14,6 @@ MCP servers are **not** registered in the app. They are declared in a file, the 
 <workspace>/.mework/mcp.json       workspace scope — that workspace only
 ```
 
-A fresh installation writes four entries into the user file — `builtin_sequential_thinking`, `builtin_context7`, `builtin_fetch` and `builtin_time` — and the built-in **mework** preset selects them. Each launches through `npx` or `uvx` and needs no credential.
-
 The shape is Claude Code's `.mcp.json`: a top-level `mcpServers` object keyed by server name.
 
 ```json
@@ -57,7 +55,7 @@ A server name may contain only letters, numbers, `-` and `_`, and may not be `__
 
 Only **tools** are offered to the model. The prompts and resources a server exposes are read by the connection test and go no further.
 
-Each available row has a **Test connection** button: it dials the server once, handshakes, and lists its tools, prompts and resources. The row's badge then reports how many tools it found, with the name and version the server gave in the row's tooltip — or **Connection failed**, with the error and the last lines the server wrote to its stderr. An unavailable row is never dialed; its badge reads **Unavailable** and the reason is in the tooltip. The row's delete button removes the key from the `mcp.json` it was declared in, leaving every other entry and every other top-level key as you wrote them; a server this conversation has already handed to the model is locked and carries neither button.
+Each available row has a **Test connection** button: it dials the server once, handshakes, and lists its tools, prompts and resources. The row's badge then reports how many tools it found, with the name and version the server gave in the row's tooltip — or **Connection failed**, with the error and the last lines the server wrote to its stderr. An unavailable row is never dialed; its badge reads **Unavailable** and the reason is in the tooltip. The row's delete button removes the key from the `mcp.json` it was declared in, leaving every other entry and every other top-level key as you wrote them; a server the conversation's last request carried has no delete button while it is drawn orange (see [the tool lock](tools.html#lock)).
 
 ## Selecting servers for a conversation
 
@@ -82,9 +80,9 @@ A call is translated back to `tools/call` with the tool's original name; the `co
 The **Tool discovery** switch (under the list, always shown) chooses how the discovered tools are handed over:
 
 - **Off, the switch reading *All declared*.** Every discovered tool's full schema goes out with every request, exactly like a built-in tool's.
-- **On, *On demand* — fetched with the [`tool_search` tool](tools/tool_search.html).** No MCP schema is declared. The context carries a `<deferred-tools>` block instead, listing the withheld names grouped by the server that declared them (`tool_search.announcement` and `tool_search.announcement_row` in the [prompt profile](prompt-profiles.html)). `tool_search` takes a `query`: `select:<name>[,<name>…]` returns those exact definitions, anything else is a keyword search over the withheld names, their servers and their descriptions (a `+term` every result must contain, the rest ranking) capped by `max_results`, default 5. A tool whose definition has come back is declared normally from the next step on and callable like any other; calling one whose schema has not been fetched is rejected with the `select:` call that fixes it (`tool_search.not_loaded`).
+- **On, *On demand* — fetched with the [`tool_search` tool](tools/tool_search.html).** No MCP schema is declared. The context carries a `<deferred-tools>` block instead, listing the withheld names grouped by the server that declared them (`tool_search.announcement` and `tool_search.announcement_row` in the [prompt profile](prompt-profiles.html)). `tool_search` takes a `query`: `select:<name>[,<name>…]` returns those exact definitions, anything else is a keyword search over the withheld names, their servers and their descriptions (a `+term` every result must contain, the rest ranking) capped by `max_results`, default 5. A tool whose definition has come back is callable like any other from the next step on: it is [appended](tools.html#available) where it was fetched rather than written into the declared tool list; calling one whose schema has not been fetched is rejected with the `select:` call that fixes it (`tool_search.not_loaded`).
 
-A new conversation takes the switch from the preset it starts from; the built-in **mework** preset starts it on. Once any server has been dialed the switch is frozen, the same way skill delivery is: the transcript already carries the tools one way. The announcement is fixed for the whole run, so a name stays listed after its schema arrives. A subagent inherits the mode and withholds every inherited tool again, since it starts from an empty history and never read the parent's `tool_search` results.
+A new conversation takes the switch from the preset it starts from; the built-in **mework** preset starts it on. Moving it rewrites the part of the prompt that carries the tools, so while the model's cache is warm it is drawn orange like the rest of [the tool lock](tools.html#lock). A model that cannot take a tool mid-conversation has nowhere to put a fetched schema, so on such a model the switch is off and cannot be turned on. The announcement is fixed for the whole run, so a name stays listed after its schema arrives. A subagent inherits the mode and withholds every inherited tool again, since it starts from an empty history and never read the parent's `tool_search` results.
 
 `tool_search` is derived, not in the tool picker: it appears exactly when the switch is on and the run withheld at least one tool.
 
@@ -92,7 +90,7 @@ A new conversation takes the switch from the preset it starts from; the built-in
 
 MCP tools are treated as external side effects:
 
-- At `request_approval`, `allow_edits` and `plan`, every call asks for confirmation unless a `PreToolUse` or `PermissionRequest` hook allows it. At `full_access` calls run without asking.
+- At `request_approval` and `allow_edits`, every call asks for confirmation unless a `PreToolUse` or `PermissionRequest` hook allows it. At `full_access` calls run without asking.
 - A tool that declares `_meta["anthropic/requiresUserInteraction"] = true` asks **on every call**, at every level, and a hook cannot pre-approve it. Its description to the model is prefixed with `mcp.mandatory_description_prefix`, and its label carries a note saying the same. A malformed value fails closed to "ask".
 - A tool named in `disabledAutoApproveTools` behaves the same way: the same prefix, and it asks at every level.
 

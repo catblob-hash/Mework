@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ASK_USER_PENDING_OUTPUT } from "../test/fixtures";
@@ -10,6 +10,9 @@ import type {
   ToolDescriptor
 } from "../types";
 import type { WorkflowRunStep, WorkflowRunView } from "../lib/workflowRuns";
+import { recordToolErrorExplanationForTests, resetToolExplanationsForTests } from "../lib/localModel";
+import { setPathOpenHandler } from "../lib/pathLinks";
+import type { PathOpenRequest } from "../lib/pathLinks";
 import {
   buildContextRenderNodes,
   TimelineBlock,
@@ -116,6 +119,7 @@ function workflowStep(key: string, label: string, state: WorkflowRunStep["state"
     state,
     agentId: null,
     role: null,
+    task: null,
     modelId: null,
     tokens: null,
     elapsedMs: null,
@@ -302,7 +306,9 @@ describe("buildContextRenderNodes", () => {
     ]);
   });
 
-  it("folds agent and task-state calls into blocks, leaving only the question outside", () => {
+  it("folds agent calls into blocks, leaving only the question outside", () => {
+    // Retired names (`agent_send`, `send_message`, `followup_task`, `subagent`,
+    // …) are listed too: saved conversations still hold their cards.
     const agentNames = [
       "agent_spawn",
       "agent_send",
@@ -320,7 +326,6 @@ describe("buildContextRenderNodes", () => {
     const contexts: ContextItem[] = [
       agentCalls[0],
       tool("read-call", "read", { round: 7, input: { path: "src/a.ts" } }),
-      tool("todo-event", "todo", { round: 7, input: { action: "update", taskId: "task-1", status: "in_progress" } }),
       agentCalls[1],
       agentCalls[2],
       tool("edit-call", "edit", { round: 7, input: { path: "src/a.ts" } }),
@@ -335,7 +340,6 @@ describe("buildContextRenderNodes", () => {
         ids: [
           "agent_spawn-call",
           "read-call",
-          "todo-event",
           "agent_send-call",
           "send_message-call",
           "edit-call"
@@ -349,7 +353,7 @@ describe("buildContextRenderNodes", () => {
     // affordances still address the raw index they were built from.
     const blocks = nodes.filter((node) => node.kind === "block");
     expect(blocks.map((node) => (node.kind === "block" ? node.entries.map(({ index }) => index) : [])))
-      .toEqual([[0, 1, 2, 3, 4, 5], [7, 8, 9, 10, 11, 12, 13, 14]]);
+      .toEqual([[0, 1, 2, 3, 4], [6, 7, 8, 9, 10, 11, 12, 13]]);
     // The key names the block by the first record in it, so two blocks in one
     // run never collide.
     expect(blocks.map((node) => (node.kind === "block" ? node.key : "")))
@@ -437,7 +441,7 @@ describe("TimelineBlock", () => {
       entry(tool("read", "read", { round: 1, input: { path: "a.ts" }, output: "line" }), 2),
       entry(tool("find", "find", { round: 1, input: { query: "*.ts" }, output: "a.ts" }), 3)
     ];
-    const { container } = render(
+    render(
       <TimelineBlock entries={entries} tools={[]} insertionIndex={null} />
     );
 
@@ -445,25 +449,24 @@ describe("TimelineBlock", () => {
     // special case and no "N running, N failed" suffix.
     const toggle = screen.getByRole("button", { name: "读取了 1 个文件，检查了 1 次文件与目录" });
     const list = screen.getByRole("list");
-    const listRegion = container.querySelector<HTMLElement>(".timeline-block__list-region")!;
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(toggle).toHaveAttribute("aria-controls", list.id);
-    expect(listRegion).not.toHaveClass("collapse-region--closed");
+    expect(list).not.toHaveAttribute("hidden");
     // The chevron stands against the end of the summary, inside the toggle, and
     // the figure it shares the heading with stays out of the accessible name.
     expect(toggle.querySelector(".timeline-block__chevron"))
       .toHaveClass("disclosure-chevron", "disclosure-chevron--open");
     expect(toggle.querySelector(".timeline-block__tokens")).toHaveTextContent(/token/);
 
+    // The list closes in the same frame, with no region left mid-transition.
     await user.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(listRegion).toHaveClass("collapse-region--closed");
-    expect(listRegion).toHaveAttribute("aria-hidden", "true");
+    expect(list).toHaveAttribute("hidden");
     expect(screen.queryByRole("list")).not.toBeInTheDocument();
 
     await user.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(listRegion).not.toHaveClass("collapse-region--closed");
+    expect(list).not.toHaveAttribute("hidden");
     expect(screen.getByRole("list")).toBe(list);
   });
 
@@ -522,10 +525,13 @@ describe("TimelineBlock", () => {
     const writeToggle = getRowToggle(writeRow);
     const editToggle = getRowToggle(editRow);
 
-    expect(rowText(writeRow, "name")).toBe("创建了文件");
-    expect(rowText(editRow, "name")).toBe("编辑了文件");
-    expect(writeToggle).toHaveAttribute("aria-label", "创建了文件 · write · new.ts · 完成");
-    expect(editToggle).toHaveAttribute("aria-label", "编辑了文件 · edit · existing.ts · 完成");
+    expect(rowText(writeRow, "name")).toBe("已创建：new.ts");
+    expect(rowText(editRow, "name")).toBe("已编辑：existing.ts");
+    // The lines each call changed, as the host diffed them, beside the name.
+    expect(writeRow.querySelector(".timeline-row__figures")).toHaveTextContent("+1−0");
+    expect(editRow.querySelector(".timeline-row__figures")).toHaveTextContent("+1−1");
+    expect(writeToggle).toHaveAttribute("aria-label", "已创建：new.ts · write · new.ts · 完成");
+    expect(editToggle).toHaveAttribute("aria-label", "已编辑：existing.ts · edit · existing.ts · 完成");
     expect(writeToggle).toHaveAttribute("aria-expanded", "false");
     expect(editToggle).toHaveAttribute("aria-expanded", "false");
     expect(writeRow.querySelector('[data-tool-name="write"][data-tool-family="diff"]')).not.toBeInTheDocument();
@@ -562,7 +568,8 @@ describe("TimelineBlock", () => {
     expect(editRow.querySelector('[data-tool-name="edit"][data-tool-family="diff"]')).toBeInTheDocument();
   });
 
-  it("auto-expands a row when an existing call transitions to failure", async () => {
+  it("keeps a row closed when an existing call transitions to failure", async () => {
+    const user = userEvent.setup();
     const succeeded = tool("read-transition", "read", {
       round: 3,
       input: { path: "broken.ts" },
@@ -587,8 +594,13 @@ describe("TimelineBlock", () => {
       <TimelineBlock entries={[entry(failed, 4)]} tools={[]} insertionIndex={null} />
     );
 
-    await waitFor(() => expect(getRowToggle(row)).toHaveAttribute("aria-expanded", "true"));
+    // The red line says it failed; the body waits for the reader to open it.
     expect(row).toHaveClass("timeline-row--error");
+    expect(getRowToggle(row)).toHaveAttribute("aria-expanded", "false");
+    expect(within(row).queryByRole("alert")).not.toBeInTheDocument();
+
+    await user.click(getRowToggle(row));
+    expect(getRowToggle(row)).toHaveAttribute("aria-expanded", "true");
     expect(within(row).getByRole("alert")).toHaveTextContent("读取文件失败");
     expect(within(row).getByRole("alert")).toHaveTextContent("无法读取 broken.ts");
   });
@@ -623,13 +635,63 @@ describe("TimelineBlock", () => {
     expect(toggle).toHaveAttribute("aria-disabled", "true");
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(toggle).not.toHaveAttribute("aria-controls");
-    expect(row.querySelector(".timeline-row__details-region")).not.toBeInTheDocument();
+    expect(row.querySelector(".timeline-row__details")).not.toBeInTheDocument();
     expect(within(row).queryByRole("button", { name: /编辑工具调用/ })).not.toBeInTheDocument();
     expect(within(row).queryByRole("button", { name: /删除工具调用/ })).not.toBeInTheDocument();
 
     await user.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(row.querySelector(".timeline-row__details-region")).not.toBeInTheDocument();
+    expect(row.querySelector(".timeline-row__details")).not.toBeInTheDocument();
+  });
+
+  it("opens the file a row names in a page of its own, without opening the row", async () => {
+    const user = userEvent.setup();
+    const requests: PathOpenRequest[] = [];
+    const remove = setPathOpenHandler((request) => {
+      requests.push(request);
+      return true;
+    });
+    const read = tool("read-row", "read", { input: { path: "src/lib/notes.md", start_line: 12 }, output: "x" });
+    const other = tool("other-row", "edit", { input: { path: "b.ts", workspace: 2 }, output: "ok" });
+    const { container } = render(
+      <TimelineBlock entries={[entry(read, 0), entry(other, 1)]} tools={[]} insertionIndex={null} pathBaseDir="/repo" />
+    );
+    const row = getRow(container, read.id);
+    const link = row.querySelector<HTMLElement>(".timeline-row__file")!;
+    expect(link).toHaveTextContent("notes.md");
+    expect(link).toHaveAttribute("title", "src/lib/notes.md");
+    await user.click(link);
+    expect(requests).toEqual([expect.objectContaining({
+      path: "src/lib/notes.md",
+      baseDir: "/repo",
+      line: 12,
+      workspace: null,
+      newPage: true
+    })]);
+    expect(getRowToggle(row)).toHaveAttribute("aria-expanded", "false");
+    // Written against another workspace, the path is not this surface's to resolve.
+    await user.click(getRow(container, other.id).querySelector<HTMLElement>(".timeline-row__file")!);
+    expect(requests[1]).toMatchObject({ path: "b.ts", baseDir: null, workspace: 2, newPage: true });
+    // The rest of the line still opens the row.
+    await user.click(getRowToggle(row));
+    expect(getRowToggle(row)).toHaveAttribute("aria-expanded", "true");
+    remove();
+  });
+
+  it("titles a failed call with its error until the local model says why", () => {
+    resetToolExplanationsForTests();
+    const failed = tool("failed-row", "bash", {
+      input: { command: "pnpm i" },
+      success: false,
+      output: "Exit code 127\nbash: pnpm: command not found"
+    });
+    const { container } = render(<TimelineBlock entries={[entry(failed, 0)]} tools={[]} insertionIndex={null} />);
+    const row = getRow(container, failed.id);
+    expect(rowText(row, "name")).toBe("Bash 命令失败：bash: pnpm: command not found");
+    act(() => recordToolErrorExplanationForTests(failed.id, "没有安装 pnpm"));
+    expect(rowText(row, "name")).toBe("Bash 命令失败：没有安装 pnpm");
+    expect(row).toHaveClass("timeline-row--error");
+    resetToolExplanationsForTests();
   });
 
   it("edits, deletes, marks insertion, and reports original context indices", async () => {
@@ -659,8 +721,8 @@ describe("TimelineBlock", () => {
     expect(container.querySelectorAll(".timeline-block__insertion")).toHaveLength(1);
     expect(secondRow.previousElementSibling).toBe(insertionLine);
 
-    await user.click(within(firstRow).getByRole("button", { name: "编辑工具调用 读取了文件" }));
-    await user.click(within(secondRow).getByRole("button", { name: "删除工具调用 查找了文件" }));
+    await user.click(within(firstRow).getByRole("button", { name: "编辑工具调用 已读取：first.ts" }));
+    await user.click(within(secondRow).getByRole("button", { name: "删除工具调用 已查找：*.tsx" }));
     // Both callbacks now take the whole context item, because a row may hold
     // reasoning or a hook record rather than a tool call.
     expect(onEdit).toHaveBeenCalledWith(first);
@@ -728,12 +790,12 @@ describe("TimelineBlock", () => {
     // The editor owns the body, so the row's own edit/delete controls step aside.
     expect(within(row).queryByRole("button", { name: /编辑工具调用/ })).not.toBeInTheDocument();
 
-    // A collapsed list is `inert`, which would make the open editor unreachable,
+    // A collapsed list is `hidden`, which would make the open editor unreachable,
     // so the block refuses to close over it.
     const blockToggle = container.querySelector<HTMLButtonElement>(".timeline-block__toggle")!;
     await user.click(blockToggle);
     expect(blockToggle).toHaveAttribute("aria-expanded", "true");
-    expect(container.querySelector(".timeline-block__list-region")).not.toHaveClass("collapse-region--closed");
+    expect(container.querySelector(".timeline-block__list")).not.toHaveAttribute("hidden");
 
     await user.clear(within(editor!).getByLabelText("path"));
     await user.type(within(editor!).getByLabelText("path"), "b.ts");
@@ -837,7 +899,7 @@ describe("TimelineBlock", () => {
     // The child is read in its panel, so the row carries no disclosure at all.
     const spawnRow = getRow(routed.container, spawn.id);
     expect(spawnRow.querySelector(".timeline-row__chevron")).toBeNull();
-    expect(spawnRow.querySelector(".timeline-row__details-region")).toBeNull();
+    expect(spawnRow.querySelector(".timeline-row__details")).toBeNull();
     await user.click(getRowToggle(spawnRow));
     expect(onOpenSubagent).toHaveBeenCalledWith("reviewer");
 
@@ -862,7 +924,7 @@ describe("TimelineBlock", () => {
         entries={[
           entry(tool("s-read", "read", { round: 2, input: { path: "src/a.ts" } }), 0),
           entry(tool("s-spawn", "agent_spawn", { round: 2, input: { name: "reviewer" } }), 1),
-          entry(tool("s-todo", "todo", { round: 2, input: { action: "create", subject: "修复登录" } }), 2)
+          entry(tool("s-skill", "skill", { round: 2, input: { name: "pdf" } }), 2)
         ]}
         tools={[]}
         insertionIndex={null}
@@ -871,7 +933,7 @@ describe("TimelineBlock", () => {
     const toggle = container.querySelector<HTMLElement>(".timeline-block__toggle");
     expect(toggle).toHaveTextContent("读取了 1 个文件");
     expect(toggle).toHaveTextContent("调用了 1 个子代理");
-    expect(toggle).toHaveTextContent("1 次状态变更");
+    expect(toggle).toHaveTextContent("读取了 1 个技能");
   });
 
   it("draws a tool call, a reasoning record and a hook record as three rows of one block", () => {
@@ -979,7 +1041,7 @@ describe("TimelineBlock", () => {
     expect(getRowToggle(row)).toHaveAttribute("aria-label", "think · 加密思考");
     // Nothing to open: an empty body would be a name with a blank under it.
     expect(getRowToggle(row)).toHaveAttribute("aria-disabled", "true");
-    expect(row.querySelector(".timeline-row__details-region")).not.toBeInTheDocument();
+    expect(row.querySelector(".timeline-row__details")).not.toBeInTheDocument();
     expect(within(row).queryByRole("button", { name: "编辑上下文" })).not.toBeInTheDocument();
     expect(within(row).getByRole("button", { name: "删除上下文" })).toBeInTheDocument();
   });
@@ -1015,7 +1077,7 @@ describe("TimelineBlock", () => {
     // A run is read in the task panel, so the row neither draws a disclosure
     // nor keeps a body to draw into.
     expect(row.querySelector(".timeline-row__chevron")).toBeNull();
-    expect(row.querySelector(".timeline-row__details-region")).toBeNull();
+    expect(row.querySelector(".timeline-row__details")).toBeNull();
 
     await user.click(getRowToggle(row));
     expect(container.querySelector(".workflow-run")).toBeNull();

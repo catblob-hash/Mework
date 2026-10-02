@@ -1,8 +1,3 @@
-.update-settings {
-  overflow-y: auto;
-  scrollbar-gutter: stable;
-}
-
 .update-settings__card {
   margin-top: 12px;
   padding: 14px;
@@ -77,11 +72,9 @@
   color: var(--warning);
 }
 
+/* Gives way in the middle (`PathText`), so the install directory's own name stays readable. */
 .update-settings__path {
   margin: 8px 0 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   color: var(--faint);
   font: 8.5px var(--mono);
 }

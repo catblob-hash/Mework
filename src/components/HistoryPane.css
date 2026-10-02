@@ -1,12 +1,12 @@
-/* The conversation's outgoing requests: a row per user-level turn, and inside
-   it a row per part of what that turn sent, with a rule under each request that
-   left. Every row is a single line that opens in place, so the pane reads as one
-   list however deep the reader goes. */
+/* The conversation's history: a bar per thing that happened at the top — a turn,
+   a run of the user's edits, a turn that was cut off — and inside each a row per
+   message it added, removed or rewrote. Every row is a single line that opens in
+   place, so the pane reads as one list however deep the reader goes. */
 .history-pane {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: auto scroll;
   padding: 4px 6px 10px;
 }
 
@@ -17,8 +17,8 @@
   font-size: 11.5px;
 }
 
-/* Inline retry for a row whose parts could not be read. The rest of the ledger
-   stays on screen behind it: one unreadable request is not a broken pane. */
+/* Inline retry for an entry whose body could not be read. The rest of the
+   history stays on screen around it: one unreadable entry is not a broken pane. */
 .history-pane__retry {
   padding: 0 5px;
   border: 1px solid var(--border);
@@ -87,29 +87,26 @@
   color: var(--muted);
 }
 
-/* A user-level turn: the outermost row, and the only one that stands for
-   something the person did rather than for a payload. */
-.history-pane__kind[data-kind="round"] {
+/* A bar: the outermost row, standing for a turn, a run of the user's edits, or
+   a turn that was cut off. */
+.history-pane__kind[data-kind="turn"],
+.history-pane__kind[data-kind="pending"],
+.history-pane__kind[data-kind="edits"] {
   color: var(--text);
+}
+
+/* A turn that never got its answer back is the one bar that is a finding. */
+.history-pane__kind[data-kind="interrupted"] {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.history-pane__row--round[data-kind="interrupted"] .history-pane__title {
+  color: var(--warning);
 }
 
 .history-pane__row--round .history-pane__title {
   font-weight: 650;
-}
-
-.history-pane__glyph {
-  flex: 0 0 auto;
-  color: var(--faint);
-}
-
-/* Request number. Fixed width so the titles beside it line up down the list. */
-.history-pane__index {
-  flex: 0 0 auto;
-  min-width: 16px;
-  color: var(--faint);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
 }
 
 .history-pane__title {
@@ -149,78 +146,15 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Whole messages the user added or removed before this payload went out. A
-   count of zero is not drawn at all: the pair reads as a diff stat, and "+0 −0"
-   on every row would bury the ones that have something to say. */
-.history-pane__counts {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.history-pane__count[data-status="added"] {
-  color: var(--success);
-}
-
-.history-pane__count[data-status="removed"] {
-  color: var(--danger);
-}
-
-/* A turn's parts are quoted inside it: inset and ruled, so a row in here is
-   never read as a row of the ledger itself. */
+/* A bar's messages are quoted inside it: inset and ruled, so a row in here is
+   never read as a bar of its own. */
 .history-pane__body {
   margin: 1px 0 4px 12px;
   padding: 2px 0 2px 8px;
   border-left: 1px solid var(--color-000000-ap10);
 }
 
-.history-pane__row--part {
-  min-height: 22px;
-  font-size: 11px;
-}
-
-/* Replayed history, opened from behind the turn's rule. Held back a step from
-   what the turn itself put on the wire: it is there to be consulted, not to
-   compete with the rows the reader opened the turn for. */
-.history-pane__row--part[data-cached] {
-  opacity: .66;
-}
-
-.history-pane__row--part[data-cached]:hover,
-.history-pane__row--part[data-cached]:focus-visible {
-  opacity: 1;
-}
-
-/* A boundary inside a turn: where one request left, or where the history it
-   replayed ends. It carries a line rather than a preview, because what it
-   stands for is the gap between two rows and not a part of its own. */
-.history-pane__row--rule {
-  min-height: 20px;
-}
-
-.history-pane__rule-label {
-  flex: 0 0 auto;
-  color: var(--faint);
-  font-size: 10px;
-}
-
-.history-pane__rule-line {
-  flex: 1 1 auto;
-  min-width: 12px;
-  height: 0;
-  border-top: 1px dashed var(--border);
-}
-
-/* The line is what takes up the slack on a rule, so the counters beside it sit
-   against the right edge instead of stretching. */
-.history-pane__row--rule .history-pane__change {
-  flex: 0 0 auto;
-}
-
-/* The wire role, which is the one word that says what a part is. */
+/* The one word that says what a row is: who spoke, which tool, which hook. */
 .history-pane__role {
   flex: 0 0 auto;
   padding: 0 4px;
@@ -229,29 +163,6 @@
   color: var(--muted);
   font-size: 9.5px;
   font-weight: 620;
-}
-
-/* What the user did to a message is coloured; what the round produced is not.
-   An addition the model made is what the request was for, so colouring it would
-   leave the two or three rows worth looking at indistinguishable from the rest.
-   A removed message has no row in this payload at all — it is drawn from the
-   previous one, struck through, so a deletion is visible where it happened. */
-.history-pane__row--part[data-tone="user-added"] .history-pane__role {
-  background: var(--success-soft);
-  color: var(--success);
-}
-
-.history-pane__row--part[data-tone="removed"] .history-pane__role {
-  background: var(--danger-soft);
-  color: var(--danger);
-}
-
-.history-pane__row--part[data-tone="removed"] .history-pane__preview {
-  text-decoration: line-through;
-}
-
-.history-pane__row--part[data-tone="changed"] .history-pane__role {
-  color: var(--accent);
 }
 
 .history-pane__detail {
@@ -274,39 +185,13 @@
   font-size: 10px;
 }
 
-.history-pane__meta {
-  flex: 0 0 auto;
-  color: var(--faint);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.history-pane__stat {
-  flex: 0 0 auto;
-  color: var(--faint);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.history-pane__stat[data-status="added"] {
-  color: var(--success);
-}
-
-.history-pane__stat[data-status="removed"] {
-  color: var(--danger);
-}
-
-.history-pane__stat[data-status="changed"] {
-  color: var(--accent);
-}
-
-/* An opened part is its text, verbatim. It is evidence, so it wraps rather than
+/* An opened entry is its text, verbatim. It is evidence, so it wraps rather than
    scrolling sideways, and nothing about it is reformatted. */
 .history-pane__text {
   margin: 2px 0 6px 18px;
   padding: 6px 8px;
   max-height: 420px;
-  overflow: auto;
+  overflow: auto scroll;
   border-radius: 5px;
   background: var(--color-000000-ap2_6);
   color: var(--text);
@@ -315,14 +200,82 @@
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
-}
-
-.history-pane__text--json {
-  max-height: 520px;
+  -webkit-user-select: text; user-select: text;
 }
 
 .history-pane__diff {
   margin: 2px 0 6px 18px;
   max-height: 420px;
-  overflow: auto;
+  overflow: auto scroll;
+}
+
+/* A message a bar added, removed or rewrote, and an entry of a run that never
+   settled. A bar is one list of these in the order they happened. */
+.history-pane__row--message,
+.history-pane__row--event {
+  min-height: 22px;
+  font-size: 11px;
+}
+
+/* A role is a plain tag, whoever spoke. Only what stepped in from outside the
+   conversation is coloured — what a hook did, and the changes the user made by
+   hand. Green and red belong to those changes alone. */
+.history-pane__row--event[data-tone="hook"] .history-pane__role {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* A message put there or taken away whole is said by its colour alone, across
+   the whole row: green for one the user's edits added, red for one that went —
+   drawn from the body it last had, so a deletion is visible where it happened.
+   No count goes with it; lines are counted only on a message that was edited. */
+.history-pane__parts[data-bar="edits"] .history-pane__row--message[data-change="insert"],
+.history-pane__parts[data-bar="edits"] .history-pane__row--message[data-change="insert"]:hover,
+.history-pane__parts[data-bar="edits"] .history-pane__row--message[data-change="insert"]:focus-visible {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.history-pane__row--message[data-change="remove"],
+.history-pane__row--message[data-change="remove"]:hover,
+.history-pane__row--message[data-change="remove"]:focus-visible {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.history-pane__parts[data-bar="edits"] .history-pane__row--message[data-change="insert"] :is(.history-pane__role, .history-pane__detail, .history-pane__preview),
+.history-pane__row--message[data-change="remove"] :is(.history-pane__role, .history-pane__detail, .history-pane__preview) {
+  background: transparent;
+  color: inherit;
+}
+
+/* A message that was edited is neither: it stays in its place uncoloured, and
+   says how many lines the edit added and took away. */
+.history-pane__row--message[data-change="replace"] .history-pane__role {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.history-pane__stat {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-pane__stat [data-status="added"] {
+  color: var(--success);
+}
+
+.history-pane__stat [data-status="removed"] {
+  color: var(--danger);
+}
+
+.history-pane__badge[data-tone="hook"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.history-pane__badge[data-tone="warning"] {
+  background: var(--warning-soft);
+  color: var(--warning);
 }

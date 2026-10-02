@@ -3,7 +3,11 @@
 /* The conversation-settings pane is the global settings page in miniature: a fixed
    list of pages down the left edge, the selected page's body on the right. It is a
    direct child of `.side-pane__body`, which clips rather than scrolls, so the row
-   and the scrolling column are both established here. */
+   and the scrolling column are both established here.
+
+   Opened in a window (a preset, or a role), the same pages take the settings
+   windows' shared layout instead (`SettingsLayout`, settings.css); only the page
+   rules below that are scoped to `.conversation-settings__page-stack` reach them. */
 .conversation-settings {
   flex: 1;
   min-width: 0;
@@ -37,7 +41,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  overflow-y: auto;
+  overflow-y: scroll;
 }
 
 .conversation-settings__nav .settings-nav__item {
@@ -102,18 +106,29 @@
   flex: 0 0 auto;
   padding: 9px 14px 8px;
   border-bottom: 1px solid var(--border);
-  /* The body below reserves a scrollbar gutter whether or not it is scrolling.
+  /* The body below reserves its scrollbar's track whether or not it is scrolling.
      The header is not a scroller and would otherwise centre its blurb over a
      few more pixels than the column beneath it, leaving the two a hair out of
-     line. Reserving the same gutter here — with nothing to scroll, so no
-     scrollbar ever appears — makes both centre over the same width. */
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+     line. Reserving the same track here — with nothing to scroll, so no
+     thumb ever appears — makes both centre over the same width. */
+  overflow-y: scroll;
+}
+
+/* The blurb, and at the far end of its line the page's documentation link where
+   it has one. The line takes the body's measure, so the link's right edge is the
+   one the rows beneath it end on. */
+.conversation-settings__page-header-line {
+  margin: 0 auto;
+  max-width: var(--conversation-settings-measure);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
 }
 
 .conversation-settings__page-header p {
-  margin: 0 auto;
-  max-width: var(--conversation-settings-measure);
+  flex: 1;
+  min-width: 0;
+  margin: 0;
   color: var(--faint);
   font-size: 9px;
   line-height: 1.45;
@@ -123,16 +138,13 @@
   flex: 1;
   min-height: 0;
   padding: 12px 14px 20px;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+  overflow-y: scroll;
 }
 
 /* A ceiling on the body's measure, and the same one the blurb above it takes.
-   This pane is drawn at two very different widths — a side pane a few hundred
-   pixels across, and a preset opened in a 1040px window — and a column of
-   switches stretched to that second width puts its label and its control at
-   opposite ends of a line nobody can read across. The cap does nothing at all
-   in the side pane, which never reaches it. */
+   The side pane can be widened well past a comfortable line, and a column of
+   switches stretched that far puts its label and its control at opposite ends of
+   a line nobody can read across. */
 .conversation-settings {
   --conversation-settings-measure: 680px;
 }
@@ -146,12 +158,16 @@
   gap: 14px;
 }
 
+/* In a window the page is a global settings page: it spans the page's column as
+   theirs do, with no measure of its own. */
+.settings-page > .conversation-settings__page-stack { max-width: none; margin: 0; }
+
 /* Embedded rows bring the padding and negative margins they were given for the
    old drawer. Reset those so everything on a page shares one left edge. The tool
    picker's own rows are exempt: they are not page rows but rows under a group
    heading, and their indent is what keeps them aligned with it. */
-.conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) { padding-left: 0; padding-right: 0; }
-.conversation-settings__page .web-search-provider-field { padding: 0; }
+.conversation-settings__page-stack .tool-toggle-row:not(.tool-toggle-row--pick) { padding-left: 0; padding-right: 0; }
+.conversation-settings__page-stack .web-search-provider-field { padding: 0; }
 
 .conversation-settings__field { display: flex; flex-direction: column; gap: 4px; }
 .conversation-settings__field + .conversation-settings__field {
@@ -162,10 +178,10 @@
 /* A switch or picker row drops its control below the label when the pane is too
    narrow to seat both, rather than squeezing the label to one character per line.
    The tool picker's own rows are excluded: they are the control. */
-.conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) { flex-wrap: wrap; }
-.conversation-settings__page .tool-toggle-row:not(.tool-toggle-row--pick) > span:first-child { flex: 1 1 132px; }
-.conversation-settings__page .tool-toggle-row > .switch,
-.conversation-settings__page .tool-toggle-row > .input { margin-left: auto; }
+.conversation-settings__page-stack .tool-toggle-row:not(.tool-toggle-row--pick) { flex-wrap: wrap; }
+.conversation-settings__page-stack .tool-toggle-row:not(.tool-toggle-row--pick) > span:first-child { flex: 1 1 132px; }
+.conversation-settings__page-stack .tool-toggle-row > .switch,
+.conversation-settings__page-stack .tool-toggle-row > .input { margin-left: auto; }
 
 /* The pane can be dragged down to the side column's 280px floor, far narrower than
    the 640px drawer this replaced. There the page list gives up its counts and
@@ -177,9 +193,9 @@
   .conversation-settings__preset-actions { flex-direction: column; }
   .conversation-settings__page-header { padding: 10px 10px 9px; }
   .conversation-settings__page-body { padding: 10px 10px 18px; }
-  .conversation-settings__page .web-search-provider-field .field { grid-template-columns: minmax(0, 1fr); }
-  .conversation-settings__page .web-search-provider-field .field > .input { grid-area: auto; margin-left: auto; }
-  .conversation-settings__page .web-search-provider-field .field > .field__control-pair {
+  .conversation-settings__page-stack .web-search-provider-field .field { grid-template-columns: minmax(0, 1fr); }
+  .conversation-settings__page-stack .web-search-provider-field .field > .input { grid-area: auto; margin-left: auto; }
+  .conversation-settings__page-stack .web-search-provider-field .field > .field__control-pair {
     grid-area: auto;
     margin-left: auto;
   }
@@ -358,7 +374,7 @@
   background: var(--color-f6f6f3);
 }
 
-.domain-rules__nav { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; border-right: 0; }
+.domain-rules__nav { flex: 1; min-width: 0; min-height: 0; overflow-y: scroll; border-right: 0; }
 
 .domain-rules__page {
   min-width: 0;
@@ -381,7 +397,7 @@
   font-size: 11px;
   line-height: 1.7;
   white-space: pre;
-  overflow: auto;
+  overflow: auto scroll;
   resize: none;
 }
 

@@ -1,5 +1,6 @@
 import { type CSSProperties, useMemo } from "react";
 import { useI18n } from "../i18n";
+import { PathText } from "./PathText";
 
 export type DiffLineKind = "file" | "hunk" | "context" | "addition" | "deletion" | "meta";
 
@@ -146,8 +147,8 @@ function deletionsBeforeAdditions(lines: ParsedDiffLine[]): ParsedDiffLine[] {
 
 /**
  * Width of the number gutter, in characters of the widest number it has to
- * hold, so the numbers sit against the left edge instead of inside a fixed
- * column sized for a file nobody opened.
+ * hold and no more, so the numbers sit against the left edge instead of inside
+ * a fixed column sized for a file nobody opened.
  */
 function gutterCharacters(lines: ParsedDiffLine[]): number {
   let widest = 0;
@@ -155,7 +156,7 @@ function gutterCharacters(lines: ParsedDiffLine[]): number {
     const number = displayedLineNumber(line);
     if (number !== null && number > widest) widest = number;
   }
-  return Math.max(2, String(widest).length);
+  return String(widest).length;
 }
 
 export function DiffOutput({
@@ -185,7 +186,7 @@ export function DiffOutput({
       style={{ "--diff-gutter": `${gutter}ch` } as CSSProperties}
     >
       <div className="diff-output__header">
-        <code title={displayPath}>{displayPath}</code>
+        <PathText className="diff-output__path" path={displayPath} />
         <span className="diff-output__stats" aria-label={t("新增 {additions} 行，删除 {deletions} 行", "{additions} lines added, {deletions} lines deleted", { additions: parsed.additions, deletions: parsed.deletions })}>
           <b className="diff-output__stat diff-output__stat--addition">+{parsed.additions}</b>
           <b className="diff-output__stat diff-output__stat--deletion">−{parsed.deletions}</b>

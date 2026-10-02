@@ -604,16 +604,13 @@ describe("BrowserPanel", () => {
   });
 
   /**
-   * The projection model, end to end: what is on screen is the app, and the page comes up only for
-   * the one thing a picture cannot do.
+   * The resting state, end to end: the page is up, live, for as long as nothing needs it gone.
    *
-   * The page is a native child window that paints above every HTML layer, so leaving it on top
-   * means the pane's corners, its transitions and every menu the rest of the app opens are painted
-   * over by a rectangle React does not control. Raising it on use is what keeps it a browser
-   * rather than a picture of one — scrolling, text selection, the IME and native right-click all
-   * belong to the real page, and none of them survives being simulated.
+   * That is the only way the user sees it at full frame rate — scrolling it, typing into it,
+   * watching the Agent drive it. Where the pointer is has nothing to do with it any more; only a
+   * surface drawn across the page takes it down, and only for as long as the surface is there.
    */
-  it("keeps the page sunk until the pointer is inside it, and puts it back when it leaves", async () => {
+  it("keeps the page up at rest, and takes it down only while something covers it", async () => {
     const base = openStatus("http://localhost:5173/");
     const host = hostFake(base);
     vi.spyOn(browserApi, "getBrowserStatus").mockImplementation(async () => host.status());
@@ -622,23 +619,15 @@ describe("BrowserPanel", () => {
     );
     layOutPage();
 
-    render(<BrowserPanel {...pane} native active sessionId="conversation-projection" />);
+    // Handed what the app already knows about the page, as the app does, the pane's first word is
+    // that the page belongs on top.
+    render(
+      <BrowserPanel {...pane} native active sessionId="conversation-resting" initialStatus={host.status()} />
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "服务器与设置" })).toBeEnabled());
+    expect(projectCalls(performAction)).toEqual([false]);
 
-    // Sunk on arrival: nothing has to happen for the app to be what the user is looking at.
-    await waitFor(() => expect(projectCalls(performAction)).toEqual([true]));
-
-    act(() => {
-      window.dispatchEvent(new MouseEvent("pointerover", {
-        clientX: PAGE.left + 10,
-        clientY: PAGE.top + 10,
-        bubbles: true
-      }));
-    });
-    await waitFor(() => expect(projectCalls(performAction)).toEqual([true, false]));
-
-    // Positive evidence of being elsewhere, which is the only kind there is: the raised page eats
-    // every pointer event over its own box, so the page element's own `pointerleave` fires on the
-    // way *in* and can never mean the user is done.
+    // The pointer going anywhere at all is no reason to move the page.
     act(() => {
       window.dispatchEvent(new MouseEvent("pointerdown", {
         clientX: BESIDE_PAGE.left + 10,
@@ -646,11 +635,104 @@ describe("BrowserPanel", () => {
         bubbles: true
       }));
     });
-    await waitFor(() => expect(projectCalls(performAction)).toEqual([true, false, true]));
+    await act(async () => undefined);
+    expect(projectCalls(performAction)).toEqual([false]);
 
-    // And never once as a cover. Covering hands the page back to the user and takes it out of
-    // agent automation; resting is the pane's normal state and must cost the Agent nothing.
+    const menu = claimFloatingSurfaceId();
+    act(() => publishFloatingSurface(menu, OVER_PAGE));
+    await waitFor(() => expect(projectCalls(performAction)).toEqual([false, true]));
+    await waitFor(() => expect(occludeCalls(performAction)).toEqual([true]));
+
+    act(() => publishFloatingSurface(menu, null));
+    await waitFor(() => expect(projectCalls(performAction)).toEqual([false, true, false]));
+    expect(occludeCalls(performAction)).toEqual([true, false]);
+  });
+
+  /**
+   * Another pane expanded over this one leaves this pane a full-size box it no longer draws in,
+   * and the page — above every HTML layer — would go on painting there over the expanded pane.
+   * It goes down, but not as a cover: nobody is looking at a dialog, and the Agent keeps the page.
+   */
+  it("takes the page down, without covering it, while another pane is expanded over it", async () => {
+    const base = openStatus("http://localhost:5173/");
+    const host = hostFake(base);
+    vi.spyOn(browserApi, "getBrowserStatus").mockImplementation(async () => host.status());
+    const performAction = vi.spyOn(browserApi, "performBrowserAction").mockImplementation(
+      async (_sessionId, action, value) => host.apply(action, value)
+    );
+    layOutPage();
+
+    const { rerender } = render(
+      <BrowserPanel {...pane} native active sessionId="conversation-expanded-over" initialStatus={host.status()} />
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "服务器与设置" })).toBeEnabled());
+    expect(projectCalls(performAction)).toEqual([false]);
+
+    rerender(<BrowserPanel {...pane} native active={false} sessionId="conversation-expanded-over" />);
+    await waitFor(() => expect(projectCalls(performAction)).toEqual([false, true]));
+
+    rerender(<BrowserPanel {...pane} native active sessionId="conversation-expanded-over" />);
+    await waitFor(() => expect(projectCalls(performAction)).toEqual([false, true, false]));
     expect(occludeCalls(performAction)).toEqual([]);
+  });
+
+  /**
+   * The pane goes because the browser is being hidden, closed, or replaced by another tab or
+   * conversation, and the host parks the page on each of those paths — but only once the renderer
+   * asks, after the frame in which the pane has already vanished. Taken down from the unmount, the
+   * page is gone in that same frame rather than painted over whatever took the pane's place.
+   */
+  it("takes a page that is up down with it when the pane goes away", async () => {
+    const base = openStatus("http://localhost:5173/");
+    const host = hostFake(base);
+    vi.spyOn(browserApi, "getBrowserStatus").mockImplementation(async () => host.status());
+    const performAction = vi.spyOn(browserApi, "performBrowserAction").mockImplementation(
+      async (_sessionId, action, value) => host.apply(action, value)
+    );
+    layOutPage();
+
+    const { unmount } = render(
+      <BrowserPanel {...pane} native active sessionId="conversation-goes-away" initialStatus={host.status()} />
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "服务器与设置" })).toBeEnabled());
+    await act(async () => undefined);
+    expect(projectCalls(performAction)).toEqual([false]);
+
+    unmount();
+    await act(async () => undefined);
+
+    // Down, and never back up: a raise from a pane on its way out is what used to leave a live
+    // page painted over the app after the pane was gone.
+    expect(projectCalls(performAction)).toEqual([false, true]);
+  });
+
+  /**
+   * A tab switched to mounts a new pane. Starting from nothing, it would draw its start card for
+   * the round trip its first status poll takes and declare its page to belong beneath that card —
+   * so the page it was switched to would be presented sunk and only then raised. Started from what
+   * the app already knows, its first word is the right one.
+   */
+  it("starts from the status the app already has, so its first word on the page is the right one", async () => {
+    const base = openStatus("http://localhost:5173/");
+    const host = hostFake(base);
+    vi.spyOn(browserApi, "getBrowserStatus").mockImplementation(async () => host.status());
+    const performAction = vi.spyOn(browserApi, "performBrowserAction").mockImplementation(
+      async (_sessionId, action, value) => host.apply(action, value)
+    );
+    layOutPage();
+
+    const { unmount } = render(
+      <BrowserPanel {...pane} native active sessionId="conversation-known" initialStatus={host.status()} />
+    );
+    expect(screen.getByRole("button", { name: "页面网址：http://localhost:5173/" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "服务器与设置" })).toBeEnabled());
+    expect(projectCalls(performAction)).toEqual([false]);
+    unmount();
+    performAction.mockClear();
+
+    // Without it, the card comes first and the page is declared down before it comes back up.
+    render(<BrowserPanel {...pane} native active sessionId="conversation-unknown" />);
+    await waitFor(() => expect(projectCalls(performAction)).toEqual([true, false]));
   });
 
   /**
@@ -925,12 +1007,14 @@ describe("BrowserPanel", () => {
 
   it("opens a local file from the Files group and follows it in the address bar", async () => {
     const user = userEvent.setup();
-    const status = openStatus();
-    vi.spyOn(browserApi, "getBrowserStatus").mockResolvedValue(status);
-    vi.spyOn(browserApi, "performBrowserAction").mockResolvedValue(status);
-    const openFile = vi.spyOn(browserApi, "openLocalFileInBrowser").mockResolvedValue({
-      ...status,
-      url: "https://mework-file-preview.invalid/report.html"
+    // The host answers every request with the page as it is now, the opened file included: the
+    // page comes up once there is something to show, and that request's answer is a status too.
+    let status = openStatus();
+    vi.spyOn(browserApi, "getBrowserStatus").mockImplementation(async () => status);
+    vi.spyOn(browserApi, "performBrowserAction").mockImplementation(async () => status);
+    const openFile = vi.spyOn(browserApi, "openLocalFileInBrowser").mockImplementation(async () => {
+      status = { ...status, url: "https://mework-file-preview.invalid/report.html" };
+      return status;
     });
     const target = { kind: "workspace", workspaceId: "workspace-open-file" } as const;
 
@@ -1220,6 +1304,11 @@ describe("BrowserPanel dev servers", () => {
     expect(previewBodyState({ ...base, url: "about:blank" })).toEqual({ kind: "start-page" });
     expect(previewBodyState({ ...base, url: "about:blank", configurationCount: 0, rows: [] }))
       .toEqual({ kind: "no-config" });
+    // Before `.mework/launch.json` is read there is nothing to say yet, least of all that there
+    // is no dev server; a page that is already loaded does not wait for the file.
+    expect(previewBodyState({ ...base, url: "about:blank", configurationCount: null, rows: [] }))
+      .toEqual({ kind: "reading" });
+    expect(previewBodyState({ ...base, configurationCount: null, rows: [] })).toEqual({ kind: "page" });
     // Stopping a server takes its page down, so the usual ending is no page at all — and what
     // belongs there is the page the server can be run from again, not a card about the thing
     // that was just closed.
@@ -1409,6 +1498,8 @@ describe("BrowserPanel dev servers", () => {
   /** A server that exits by itself keeps its page: what the page shows is the diagnosis. */
   it("offers a restart when the server behind the page disappears", async () => {
     vi.spyOn(browserApi, "getBrowserStatus").mockResolvedValue(openStatus("http://localhost:5173/"));
+    // The page goes down under the stopped card, and the host's answer is the page as it is.
+    vi.spyOn(browserApi, "performBrowserAction").mockResolvedValue(openStatus("http://localhost:5173/"));
     vi.spyOn(previewApi, "listPreviewConfigurations")
       .mockResolvedValue(configuration([configuredServer("web", 5173)]));
     const list = vi.spyOn(previewApi, "listPreviewServers").mockResolvedValue([runningServer("web", 5173)]);

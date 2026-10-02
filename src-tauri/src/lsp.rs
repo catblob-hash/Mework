@@ -138,6 +138,12 @@ impl Operation {
             .into_iter()
             .find(|operation| operation.name() == value)
     }
+
+    /// Whether the operation acts at a position in the file. The two symbol
+    /// listings do not: one covers the whole file, the other the workspace.
+    pub fn takes_a_position(self) -> bool {
+        !matches!(self, Operation::DocumentSymbol | Operation::WorkspaceSymbol)
+    }
 }
 
 /// One validated call.
@@ -150,9 +156,55 @@ pub struct LspCall {
     pub query: Option<String>,
 }
 
-/// Reads the tool arguments. Line and character are 1-based for every
-/// operation, as the source's discriminated schema requires — including
-/// `documentSymbol` and `workspaceSymbol`, which ignore them.
+fn parse_operation(operation: &str) -> Result<Operation, String> {
+    Operation::parse(operation).ok_or_else(|| {
+        format!(
+            "Unknown operation \"{operation}\". Valid operations are: {}",
+            Operation::ALL
+                .iter()
+                .map(|value| value.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+/// Reads an `lsp` call's arguments, shared by the host and remote legs.
+///
+/// Each argument is read only where the operation uses it. `documentSymbol`
+/// and `workspaceSymbol` have no position, so `line` and `character` are
+/// ignored there — whatever they hold, or whether they are there at all — and
+/// `query` is ignored everywhere but `workspaceSymbol`. The schema still lists
+/// the position as required, as the source's does; a call that leaves it out
+/// where it means nothing is not refused for it.
+pub fn parse_input(input: &serde_json::Map<String, Value>) -> Result<LspCall, String> {
+    use crate::tool_executor::{optional_string, optional_u64_value, required_string, MAX_PATH_CHARS};
+    let name = required_string(input, "operation", 64, false)?;
+    let requested = required_string(input, "filePath", MAX_PATH_CHARS, false)?;
+    let operation = parse_operation(&name)?;
+    let (line, character) = if operation.takes_a_position() {
+        (
+            optional_u64_value(input, "line")?
+                .ok_or_else(|| "line is required; it is 1-based, as shown in editors".to_owned())?,
+            optional_u64_value(input, "character")?.ok_or_else(|| {
+                "character is required; it is 1-based, as shown in editors".to_owned()
+            })?,
+        )
+    } else {
+        (1, 1)
+    };
+    let query = match operation {
+        Operation::WorkspaceSymbol => match input.get("query") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(optional_string(input, "query", "", 1024, true)?),
+        },
+        _ => None,
+    };
+    parse_call(&name, requested, line, character, query)
+}
+
+/// Reads the tool arguments. Line and character are 1-based; [`parse_input`]
+/// hands `documentSymbol` and `workspaceSymbol`, which ignore them, a 1.
 pub fn parse_call(
     operation: &str,
     file_path: String,
@@ -160,16 +212,7 @@ pub fn parse_call(
     character: u64,
     query: Option<String>,
 ) -> Result<LspCall, String> {
-    let Some(operation) = Operation::parse(operation) else {
-        return Err(format!(
-            "Unknown operation \"{operation}\". Valid operations are: {}",
-            Operation::ALL
-                .iter()
-                .map(|value| value.name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    };
+    let operation = parse_operation(operation)?;
     if line == 0 {
         return Err("line is 1-based, as shown in editors; it must be at least 1".into());
     }
@@ -1001,6 +1044,32 @@ mod tests {
     fn a_zero_position_is_refused_because_the_schema_promises_editor_numbering() {
         assert!(parse_call("hover", "a.rs".into(), 0, 1, None).is_err());
         assert!(parse_call("hover", "a.rs".into(), 1, 0, None).is_err());
+    }
+
+    /// The symbol listings have no position and only `workspaceSymbol` takes a
+    /// query, so the arguments they do not use are ignored, not required or
+    /// checked; a positional operation still needs its position.
+    #[test]
+    fn arguments_an_operation_does_not_use_are_ignored() {
+        let input = |value: Value| value.as_object().unwrap().clone();
+        let listed = parse_input(&input(json!({"operation": "documentSymbol", "filePath": "a.rs"})))
+            .unwrap();
+        assert_eq!(listed.operation, Operation::DocumentSymbol);
+        let placeholders = parse_input(&input(json!({
+            "operation": "workspaceSymbol", "filePath": "a.rs",
+            "line": 0, "character": "x", "query": "Foo"
+        })))
+        .unwrap();
+        assert_eq!(placeholders.query.as_deref(), Some("Foo"));
+        let hover = parse_input(&input(json!({
+            "operation": "hover", "filePath": "a.rs", "line": 3, "character": 4, "query": 7
+        })))
+        .unwrap();
+        assert_eq!(hover.query, None);
+        assert_eq!(
+            parse_input(&input(json!({"operation": "hover", "filePath": "a.rs"}))).err().as_deref(),
+            Some("line is required; it is 1-based, as shown in editors")
+        );
     }
 
     #[test]

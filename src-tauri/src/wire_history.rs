@@ -14,42 +14,129 @@
 //!   message list without re-projecting anything.
 //! - A process-wide cache keyed by conversation id stores the projected
 //!   prefix per [`WireVariant`] so the next turn only projects what was
-//!   appended since. Manual context edits and provider/model switches are
-//!   re-warmed eagerly in the background from the committed document, so the
-//!   next request does not pay the rebuild either (`on_document_committed`).
+//!   appended since. Its entries live in the shared memory pool
+//!   (`memory_pool`) as high-priority data, so the pool may unload one; the
+//!   next turn then projects from scratch. Manual context edits and
+//!   provider/model switches are re-warmed eagerly in the background — edits
+//!   from the stored body a conversation command just committed
+//!   (`on_conversation_committed`), switches from each entry's own timeline
+//!   (`on_document_committed`) — so the next request does not pay the rebuild
+//!   either. Background work never counts as a use of an entry.
 //!
 //! Correctness never depends on cache freshness: `begin_session` verifies the
 //! cached prefix against the incoming timeline item-by-item and silently falls
 //! back to a full rebuild on any mismatch.
 
 use std::{
-    collections::HashMap,
-    sync::{Arc, Condvar, Mutex, OnceLock},
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
     thread,
 };
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::memory_pool::{MemoryPool, PoolKey, PoolKind};
 use crate::model::{
-    AppDocument, ContextItem, FileAttachment, ImageAttachment, JsonObject, ToolResult,
+    AppDocument, ContextItem, Conversation, FileAttachment, ImageAttachment, JsonObject,
+    ToolResult,
 };
 
-fn is_memory_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "read_global_memory"
-            | "read_project_memory"
-            | "create_global_memory"
-            | "create_project_memory"
-            | "edit_global_memory"
-            | "edit_project_memory"
-    )
+/// Recovers a call's arguments as the model wrote them, for a card that keeps
+/// only a projection of them.
+///
+/// A `workflow` card records the script's name and fingerprint, not its body
+/// (scripts reach 512 KiB; `script.js` holds it). Replayed as it stands, that
+/// fingerprint would reach the model as a call it never made — `{"scriptSha256":
+/// …}` where it wrote a script — and a model shown its own calls in a shape it
+/// did not use starts imitating that shape. The history record keeps every call
+/// as the model sent it, so replay reads the arguments back from there.
+///
+/// Only when the record still matches the card: its projection must equal the
+/// card's arguments, so a card someone edited by hand replays as edited, and a
+/// call the record does not have (or kept only truncated) replays as before.
+#[derive(Debug)]
+pub(crate) struct ReplayInputs {
+    app_data_path: String,
+    conversation_id: String,
 }
 
-/// Upper bound for projected messages retained across conversations. Entries
-/// are evicted least-recently-used once the estimate crosses this budget.
-const WIRE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+impl ReplayInputs {
+    /// `None` when there is no record to read: no app data directory, or no
+    /// conversation to read it for.
+    pub(crate) fn new(app_data_path: &str, conversation_id: &str) -> Option<Arc<Self>> {
+        (!app_data_path.is_empty() && !conversation_id.is_empty()).then(|| {
+            Arc::new(Self {
+                app_data_path: app_data_path.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+            })
+        })
+    }
+
+    /// Whether a card of this tool keeps less than the call's arguments.
+    fn projects(tool_name: &str) -> bool {
+        tool_name == crate::workflow::WORKFLOW_TOOL
+    }
+
+    /// The arguments `call_id` was made with, when the record has them and they
+    /// project to exactly `card_input`.
+    fn model_input(&self, tool_name: &str, call_id: &str, card_input: &JsonObject) -> Option<JsonObject> {
+        use crate::conversation_store::HistoryFilter;
+        use crate::history::{RecordedToolPart, ENTRY_RESPONSE, ENTRY_TOOL};
+        let store = crate::history::history_store(&self.app_data_path).ok()?;
+        // The call as recorded before it ran: `requestedInput` when a hook
+        // rewrote it, otherwise `input`, which is then the model's own.
+        let recorded = store
+            .history_records(
+                &self.conversation_id,
+                HistoryFilter {
+                    kinds: &[ENTRY_TOOL],
+                    call_id: Some(call_id),
+                    ..HistoryFilter::default()
+                },
+            )
+            .ok()?
+            .into_iter()
+            .rev()
+            .filter(|record| !record.truncated && record.detail_str("name") == Some(tool_name))
+            .find_map(|record| {
+                let body = serde_json::from_str::<Value>(record.body.as_deref()?).ok()?;
+                body.get("requestedInput")
+                    .or_else(|| body.get("input"))
+                    .and_then(Value::as_object)
+                    .cloned()
+            });
+        // A call recorded before the history kept calls: the model's response.
+        let recorded = recorded.or_else(|| {
+            let needle = format!("\"toolCallId\":{}", serde_json::to_string(call_id).ok()?);
+            store
+                .history_records(
+                    &self.conversation_id,
+                    HistoryFilter {
+                        kinds: &[ENTRY_RESPONSE],
+                        needle: &needle,
+                        ..HistoryFilter::default()
+                    },
+                )
+                .ok()?
+                .into_iter()
+                .rev()
+                .filter(|record| !record.truncated)
+                .find_map(|record| {
+                    crate::history::recorded_tool_parts(record.body.as_deref()?)
+                        .into_iter()
+                        .find_map(|part| match part {
+                            RecordedToolPart::Call { id, name, input } if id == call_id && name == tool_name => {
+                                Some(crate::aisdk::call_arguments(input))
+                            }
+                            _ => None,
+                        })
+                })
+        })?;
+        (crate::api::public_tool_input(tool_name, &recorded) == *card_input).then_some(recorded)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Canonical (provider-neutral) history folding
@@ -162,6 +249,13 @@ pub(crate) enum CanonicalHistoryBlock {
     /// `box` exchange — a tool call the host issued and answered — rather than
     /// joining the model's own turn. See [`host_task_delivery`].
     HostDelivery(HostDelivery),
+    /// Tools that joined the conversation here (`tool_append.rs`). It carries
+    /// no text; the sidecar turns it into the protocol's own tool addition.
+    ToolAddition(Vec<String>),
+    /// A system prompt that applies from here on (`system_append.rs`). The
+    /// sidecar sends it as the protocol's own mid-conversation system message,
+    /// or lifts it into the system prompt where there is none.
+    SystemAppend(String),
 }
 
 /// One host-delivered background result, ready to project.
@@ -188,11 +282,26 @@ pub(crate) struct HostDelivery {
 /// exchanges.
 pub(crate) const HOST_TASK_DELIVERY_CONTEXT_PREFIX: &str = "ctx_agent-result_";
 
-/// Key under which the host stashes a delivery's structured scalars on the
-/// card's `input`. The big field — the result body — is never duplicated here:
-/// it stays the card's editable `result.output`, so editing the timeline edits
-/// what the model sees.
-const HOST_NOTICE_INPUT_KEY: &str = "notification";
+/// The one argument of a `box` call: always an empty list.
+///
+/// The host's fabricated call carries it, so the model reads a call that
+/// matches the tool's own schema. Everything the host has to say is in the
+/// call's result; nothing rides on the arguments, which the model reads as its
+/// own.
+pub(crate) const BOX_INPUT_KEY: &str = "none";
+
+/// The arguments of every `box` call the host makes, and of every delivery
+/// card it records: the card shows what the model read.
+pub(crate) fn box_call_input() -> JsonObject {
+    let mut input = JsonObject::new();
+    input.insert(BOX_INPUT_KEY.into(), json!([]));
+    input
+}
+
+/// Key under which cards written before the card held the whole message kept
+/// the notification's scalars, beside a `tasks` address. Read only to replay
+/// those cards as they were sent.
+const LEGACY_NOTICE_INPUT_KEY: &str = "notification";
 
 /// A task's own output lives inside `<result>`, so it must not be able to close
 /// that element (or the notification itself) and forge sibling elements — a
@@ -224,17 +333,107 @@ fn push_notice_element(xml: &mut String, tag: &str, value: &str) {
     xml.push_str(&format!("<{tag}>{value}</{tag}>\n"));
 }
 
-/// Renders a host delivery card as the notification the model receives, or
+/// A finished task's cost, as its notification reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NoticeUsage {
+    subagent_tokens: Option<u64>,
+    tool_uses: Option<u64>,
+    duration_ms: Option<u64>,
+}
+
+/// The `<task-notification>` the model reads. An empty field leaves its
+/// element out, which is how a host notice (no task, no status) and a delivery
+/// that never measured its cost read.
+fn render_notification(
+    task: &str,
+    status: &str,
+    summary: &str,
+    body: &str,
+    usage: Option<NoticeUsage>,
+) -> String {
+    let mut xml = String::from("<task-notification>\n");
+    push_notice_element(&mut xml, "task-id", task);
+    push_notice_element(&mut xml, "status", status);
+    push_notice_element(&mut xml, "summary", summary);
+    let body = escape_host_notice_body(body.trim());
+    if !body.is_empty() {
+        xml.push_str(&format!("<result>\n{body}\n</result>\n"));
+    }
+    if let Some(usage) = usage {
+        let number = |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
+        let mut inner = String::new();
+        push_notice_element(&mut inner, "subagent_tokens", &number(usage.subagent_tokens));
+        push_notice_element(&mut inner, "tool_uses", &number(usage.tool_uses));
+        push_notice_element(&mut inner, "duration_ms", &number(usage.duration_ms));
+        if !inner.is_empty() {
+            xml.push_str(&format!("<usage>\n{inner}</usage>\n"));
+        }
+    }
+    xml.push_str("</task-notification>");
+    xml
+}
+
+/// A background task's terminal result as the message its delivery card holds.
+/// `usage` is `orchestration::task_notification_usage`'s triple.
+pub(crate) fn task_notification(
+    task: &str,
+    status: &str,
+    summary: &str,
+    body: &str,
+    usage: Option<(Option<u64>, usize, u64)>,
+) -> String {
+    let usage = usage.map(|(tokens, tool_uses, duration_ms)| NoticeUsage {
+        subagent_tokens: tokens,
+        tool_uses: Some(tool_uses as u64),
+        duration_ms: Some(duration_ms),
+    });
+    render_notification(task, status, summary, body, usage)
+}
+
+/// A message from the host itself — one that concerns no task, such as the
+/// handoff notice — as its delivery card holds it: the same
+/// `<task-notification>`, without `<task-id>` or `<status>`, so everything the
+/// host says between rounds reaches the model in one form.
+pub(crate) fn host_notice_notification(summary: &str, body: &str) -> String {
+    render_notification("", "", summary, body, None)
+}
+
+/// Whether `context` is a host delivery card: the `box` exchange the host
+/// fabricated to hand the model a message.
+///
+/// `task_wait` is still accepted so conversations recorded before the `box`
+/// carrier existed keep projecting as deliveries. The id prefix is what
+/// actually decides.
+fn is_host_delivery_card(context: &ContextItem) -> bool {
+    matches!(
+        context,
+        ContextItem::Tool { id, tool_name, .. }
+            if id.starts_with(HOST_TASK_DELIVERY_CONTEXT_PREFIX)
+                && matches!(
+                    tool_name.as_str(),
+                    crate::api::BOX_TOOL | crate::api::TASK_WAIT_TOOL
+                )
+    )
+}
+
+/// The message a host delivery card carries, as the model receives it, or
 /// `None` when `context` is any other kind of context.
 ///
-/// Single builder on purpose: the live path (which rides the notification along
+/// The card's result *is* the message: what the timeline shows, what an edit
+/// changes and what the model reads are the same text. Cards written before
+/// that kept the notification's scalars in their `input` and only the body in
+/// the result; those are rebuilt here into the bytes they were sent as.
+///
+/// Single reader on purpose: the live path (which rides the notification along
 /// with the round's real tool results) and the replay path (which projects the
 /// persisted card) both call this with the same card, so the bytes the model
 /// sees cannot drift between the turn that produced the delivery and every turn
 /// after it.
 pub(crate) fn host_task_notification(context: &ContextItem) -> Option<String> {
+    if !is_host_delivery_card(context) {
+        return None;
+    }
     let ContextItem::Tool {
-        id,
         tool_name,
         input,
         result,
@@ -243,64 +442,43 @@ pub(crate) fn host_task_notification(context: &ContextItem) -> Option<String> {
     else {
         return None;
     };
-    // `task_wait` is still accepted so conversations recorded before the `box`
-    // carrier existed keep projecting as deliveries instead of decaying into an
-    // ordinary exchange that would put the bookkeeping `notification` object on
-    // the wire. The id prefix is what actually decides.
-    if !id.starts_with(HOST_TASK_DELIVERY_CONTEXT_PREFIX)
-        || !matches!(
-            tool_name.as_str(),
-            crate::api::BOX_TOOL | crate::api::TASK_WAIT_TOOL
-        )
-    {
-        return None;
+    let legacy = tool_name == crate::api::TASK_WAIT_TOOL
+        || input.contains_key(LEGACY_NOTICE_INPUT_KEY)
+        || input.contains_key("tasks");
+    if !legacy {
+        return Some(result.output.clone());
     }
-    let notice = input.get(HOST_NOTICE_INPUT_KEY);
+    let notice = input.get(LEGACY_NOTICE_INPUT_KEY);
     let scalar = |name: &str| {
         notice
             .and_then(|notice| notice.get(name))
             .and_then(Value::as_str)
             .unwrap_or_default()
     };
-    let mut xml = String::from("<task-notification>\n");
-    push_notice_element(
-        &mut xml,
-        "task-id",
-        input
-            .get("tasks")
-            .and_then(Value::as_array)
-            .and_then(|tasks| tasks.first())
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-    );
-    push_notice_element(&mut xml, "status", scalar("status"));
-    push_notice_element(&mut xml, "summary", scalar("summary"));
-    let body = escape_host_notice_body(result.output.trim());
-    if !body.is_empty() {
-        xml.push_str(&format!("<result>\n{body}\n</result>\n"));
-    }
+    let task = input
+        .get("tasks")
+        .and_then(Value::as_array)
+        .and_then(|tasks| tasks.first())
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     // Deliveries persisted before the structured scalars existed carry only the
     // task address and the body; a missing element is the honest projection of
     // a card that never recorded it.
-    let usage = notice.and_then(|notice| notice.get("usage"));
-    if let Some(usage) = usage {
-        let number = |name: &str| {
-            usage
-                .get(name)
-                .and_then(Value::as_u64)
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        };
-        let mut inner = String::new();
-        push_notice_element(&mut inner, "subagent_tokens", &number("subagentTokens"));
-        push_notice_element(&mut inner, "tool_uses", &number("toolUses"));
-        push_notice_element(&mut inner, "duration_ms", &number("durationMs"));
-        if !inner.is_empty() {
-            xml.push_str(&format!("<usage>\n{inner}</usage>\n"));
+    let usage = notice.and_then(|notice| notice.get("usage")).map(|usage| {
+        let number = |name: &str| usage.get(name).and_then(Value::as_u64);
+        NoticeUsage {
+            subagent_tokens: number("subagentTokens"),
+            tool_uses: number("toolUses"),
+            duration_ms: number("durationMs"),
         }
-    }
-    xml.push_str("</task-notification>");
-    Some(xml)
+    });
+    Some(render_notification(
+        task,
+        scalar("status"),
+        scalar("summary"),
+        &result.output,
+        usage,
+    ))
 }
 
 /// A delivery card as the fabricated `box` exchange the model receives, or
@@ -319,33 +497,53 @@ pub(crate) fn host_task_delivery(context: &ContextItem) -> Option<HostDelivery> 
     })
 }
 
-/// The `input` object the host records on a delivery card so
-/// [`host_task_notification`] can rebuild the notification from the persisted
-/// card alone — no re-parsing of the rendered body, no second copy of it.
-pub(crate) fn host_task_delivery_input(
-    task: &str,
-    status: &str,
-    summary: &str,
-    usage: Option<(Option<u64>, usize, u64)>,
-) -> JsonObject {
-    let mut notice = serde_json::Map::new();
-    notice.insert("status".into(), json!(status));
-    notice.insert("summary".into(), json!(summary));
-    if let Some((tokens, tool_uses, duration_ms)) = usage {
-        let mut usage = serde_json::Map::new();
-        if let Some(tokens) = tokens {
-            usage.insert("subagentTokens".into(), json!(tokens));
-        }
-        usage.insert("toolUses".into(), json!(tool_uses));
-        usage.insert("durationMs".into(), json!(duration_ms));
-        notice.insert("usage".into(), Value::Object(usage));
+/// The `kind` of every host notice other than the ones their modules own (the
+/// handoff notice and index in `handoff.rs`, plan mode's two in `plan_mode.rs`).
+/// The renderer titles a card's row by it —
+/// `ToolRenderers.tsx::HOST_NOTICE_TITLES` mirrors this list.
+pub(crate) mod notice_kind {
+    /// The response hit the output limit and the model is asked to go on.
+    pub(crate) const OUTPUT_TRUNCATED: &str = "output_truncated";
+    /// A schema-bound run ended a round without calling `structured_output`.
+    pub(crate) const STRUCTURED_OUTPUT: &str = "structured_output";
+    /// A hook's `additionalContext`.
+    pub(crate) const HOOK_CONTEXT: &str = "hook_context";
+    /// A skill selected after the conversation started.
+    pub(crate) const SKILL_ADDED: &str = "skill_added";
+    /// Problems language servers published since the last round.
+    pub(crate) const DIAGNOSTICS: &str = "diagnostics";
+    /// Files the model read that changed behind its back.
+    pub(crate) const FILE_CHANGES: &str = "file_changes";
+}
+
+/// Which host message a delivery card carries (its `notice`, or what a card
+/// written before that field named in its `input`), when it is a host notice
+/// rather than a background result.
+///
+/// Read off the card alone, not its id: a branch copies a card under a fresh
+/// id, and the host still has to know the notice it holds.
+pub(crate) fn host_notice_kind(context: &ContextItem) -> Option<&str> {
+    let ContextItem::Tool {
+        tool_name,
+        input,
+        notice,
+        ..
+    } = context
+    else {
+        return None;
+    };
+    if !matches!(
+        tool_name.as_str(),
+        crate::api::BOX_TOOL | crate::api::TASK_WAIT_TOOL
+    ) {
+        return None;
     }
-    let mut input = JsonObject::new();
-    // The address stays a top-level `tasks` array: it is the same argument the
-    // model would write itself, and the timeline card reads it from there.
-    input.insert("tasks".into(), json!([task]));
-    input.insert(HOST_NOTICE_INPUT_KEY.into(), Value::Object(notice));
-    input
+    notice.as_deref().or_else(|| {
+        input
+            .get(LEGACY_NOTICE_INPUT_KEY)
+            .and_then(|notice| notice.get("kind"))
+            .and_then(Value::as_str)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -370,6 +568,9 @@ pub(crate) struct CanonicalFold {
     /// rounds whose visible assistant anchors are empty. These values never
     /// enter `CanonicalHistoryBlock` or provider wire history.
     pending_model_turn_id: Option<String>,
+    /// Where a projected card's real arguments are read back from; `None`
+    /// replays every card as it stands.
+    replay: Option<Arc<ReplayInputs>>,
 }
 
 impl CanonicalFold {
@@ -560,19 +761,17 @@ impl CanonicalFold {
                     blocks.push(CanonicalHistoryBlock::HostDelivery(delivery));
                     return;
                 }
-                // Memory exchanges are host context rather than conversation
-                // semantics. Replaying them after a model/provider switch
-                // would disclose one model's recalled memory and could replay
-                // stale write acknowledgements. The durable timeline keeps a
-                // redacted audit card; provider history treats it as transparent.
-                if is_memory_tool_name(tool_name) {
-                    return;
-                }
                 // Matching model-turn provenance preserves true parallel calls.
                 // Different model rounds must remain sequential; when legacy or
                 // manually-created tools lack provenance, visible adjacency is
                 // still the conservative compatibility fallback.
                 let requested_input = requested_input.clone().unwrap_or_else(|| input.clone());
+                let requested_input = match (&self.replay, provider_call_id.as_deref()) {
+                    (Some(replay), Some(call_id)) if ReplayInputs::projects(tool_name) => replay
+                        .model_input(tool_name, call_id, &requested_input)
+                        .unwrap_or(requested_input),
+                    _ => requested_input,
+                };
                 // Validate the receipt against the input that actually executed;
                 // hook-approved rewrites may legitimately differ from the model's
                 // requested arguments, which remain the provider tool-call input.
@@ -593,13 +792,60 @@ impl CanonicalFold {
                     result: result.clone(),
                 });
             }
-            ContextItem::System { .. } => {
-                // System contexts are projected through each provider's system
-                // surface, but their visible position remains a turn boundary.
+            ContextItem::System {
+                tools_added,
+                content,
+                ..
+            } => {
+                // The conversation's own system prompt and a continuation's
+                // notebook index reach the model through each provider's system
+                // surface (`aisdk::step::system_prompt_parts`); any other
+                // system card is not sent. Its visible position still remains a
+                // turn boundary.
                 self.flush(blocks);
+                // Three kinds of system context keep their place: a tool-append
+                // record (the tools join the transcript exactly where it
+                // stands), an appended system prompt (it applies from there),
+                // and a skill an older build delivered as a system card. That
+                // one is a notice, not an instruction, so it goes the way a
+                // skill added now does — in `box` — and never as a system
+                // message.
+                if !tools_added.is_empty() {
+                    blocks.push(CanonicalHistoryBlock::ToolAddition(tools_added.clone()));
+                } else if crate::system_append::is_appended(context) {
+                    blocks.push(CanonicalHistoryBlock::SystemAppend(content.clone()));
+                } else if is_legacy_skill_card(context) {
+                    blocks.push(CanonicalHistoryBlock::HostDelivery(HostDelivery {
+                        local_id: context.id().to_owned(),
+                        body: legacy_skill_notification(content),
+                    }));
+                }
             }
         }
     }
+}
+
+/// A skill selected mid-conversation, as builds before the `box` delivery
+/// recorded it: a system card `ctx_skill_<resource id>`
+/// (`api::legacy_added_skill_context_id`).
+pub(crate) fn is_legacy_skill_card(context: &ContextItem) -> bool {
+    matches!(
+        context,
+        ContextItem::System {
+            id,
+            local_only: false,
+            hook_execution: None,
+            tools_added,
+            ..
+        } if id.starts_with("ctx_skill_") && tools_added.is_empty()
+    )
+}
+
+/// A legacy skill card as the notification a skill added now arrives in. The
+/// card recorded no skill name and this layer has no prompt profile, so the
+/// summary is the fixed English one.
+fn legacy_skill_notification(content: &str) -> String {
+    host_notice_notification("A skill was added to this conversation", content)
 }
 
 /// Converts the editable flat timeline into provider-neutral semantic turns.
@@ -765,48 +1011,50 @@ impl WireSession {
 }
 
 // ---------------------------------------------------------------------------
-// Process-wide cache + background warmer
+// Process-wide cache (entries in the shared memory pool) + background warmer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct WirePrefix {
     segments: Vec<Arc<WireSegment>>,
     consumed: usize,
     bytes: usize,
 }
 
+/// One conversation's cached projection: the timeline it mirrors, and per
+/// wire variant the projected prefix of that timeline. Immutable once pooled;
+/// an update stores a new entry.
 struct CacheEntry {
     contexts: Arc<Vec<ContextItem>>,
     wire: HashMap<WireVariant, WirePrefix>,
-    last_used: u64,
+    /// What the turn that stored the entry read projected cards back with, so
+    /// a background re-projection replays them the same way.
+    replay: Option<Arc<ReplayInputs>>,
 }
 
 impl CacheEntry {
-    fn bytes(&self) -> usize {
-        self.wire.values().map(|prefix| prefix.bytes).sum()
+    /// What the entry holds: the projections, and the timeline copy kept to
+    /// verify them against the next request.
+    fn bytes(&self) -> u64 {
+        let wire: usize = self.wire.values().map(|prefix| prefix.bytes).sum();
+        wire as u64 + crate::memory_pool::serialized_bytes(self.contexts.as_slice())
     }
 }
 
-#[derive(Default)]
-struct CacheState {
-    entries: HashMap<String, CacheEntry>,
-    tick: u64,
-    /// Latest committed document + generation for the background warmer.
-    latest_document: Option<Arc<AppDocument>>,
-    warmed_generation: u64,
-    committed_generation: u64,
-    active_variant: Option<WireVariant>,
-    warmer_started: bool,
+fn cache_key(conversation_id: &str) -> PoolKey {
+    PoolKey::new(PoolKind::WireProjection, conversation_id)
 }
 
-#[derive(Default)]
-struct WireHistoryCache {
-    state: Mutex<CacheState>,
-    wake: Condvar,
+fn pool() -> &'static MemoryPool {
+    MemoryPool::global()
 }
 
-fn cache() -> &'static WireHistoryCache {
-    static CACHE: OnceLock<WireHistoryCache> = OnceLock::new();
-    CACHE.get_or_init(WireHistoryCache::default)
+/// Serializes the read-modify-write of an entry between a finishing turn and
+/// the warmer, so neither overwrites a newer entry with one built from an
+/// older one.
+fn entry_writes() -> MutexGuard<'static, ()> {
+    static WRITES: Mutex<()> = Mutex::new(());
+    WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn common_prefix_len(left: &[ContextItem], right: &[ContextItem]) -> usize {
@@ -819,19 +1067,29 @@ fn common_prefix_len(left: &[ContextItem], right: &[ContextItem]) -> usize {
 /// Starts a turn's wire session. `key` is `Some(conversation_id)` for
 /// cacheable top-level runs and `None` for subagent projections
 /// (which still get in-turn round reuse, just no cross-turn persistence).
+/// [`begin_session_with_replay`] for a timeline whose cards replay as they
+/// stand: what the projection tests exercise.
+#[cfg(test)]
 pub(crate) fn begin_session(
     key: Option<String>,
     variant: WireVariant,
     contexts: &[ContextItem],
 ) -> WireSession {
+    begin_session_with_replay(key, variant, contexts, None)
+}
+
+/// Starts a turn's projection. `replay` reads projected cards' real arguments
+/// back from the history record ([`ReplayInputs`]).
+pub(crate) fn begin_session_with_replay(
+    key: Option<String>,
+    variant: WireVariant,
+    contexts: &[ContextItem],
+    replay: Option<Arc<ReplayInputs>>,
+) -> WireSession {
     let mut base: Vec<Arc<WireSegment>> = Vec::new();
     let mut base_consumed = 0usize;
     if let Some(key) = key.as_deref() {
-        let mut state = cache().lock();
-        state.tick += 1;
-        let tick = state.tick;
-        if let Some(entry) = state.entries.get_mut(key) {
-            entry.last_used = tick;
+        if let Some(entry) = pool().get::<CacheEntry>(&cache_key(key)) {
             let entry_shared = common_prefix_len(&entry.contexts, contexts);
             if let Some(prefix) = entry.wire.get(&variant) {
                 if prefix.consumed <= entry_shared {
@@ -845,7 +1103,10 @@ pub(crate) fn begin_session(
         key,
         variant,
         base,
-        fold: CanonicalFold::default(),
+        fold: CanonicalFold {
+            replay,
+            ..CanonicalFold::default()
+        },
         synced: base_consumed,
         tail_messages: Vec::new(),
         tail_bytes: 0,
@@ -880,48 +1141,28 @@ pub(crate) fn store_session(mut session: WireSession, contexts: Vec<ContextItem>
         consumed: session.cut_consumed,
     };
 
-    let cache = cache();
-    let mut state = cache.lock();
-    state.tick += 1;
-    let tick = state.tick;
-    let entry = state.entries.entry(key).or_insert_with(|| CacheEntry {
-        contexts: Arc::new(Vec::new()),
-        wire: HashMap::new(),
-        last_used: tick,
-    });
-    // Sibling-variant prefixes remain valid only up to the shared prefix
-    // between the entry's previous timeline and the one stored now.
-    let shared = common_prefix_len(&entry.contexts, &contexts);
-    entry.wire.retain(|_, prefix| prefix.consumed <= shared);
-    entry.wire.insert(session.variant, prefix);
-    entry.contexts = Arc::new(contexts);
-    entry.last_used = tick;
-    enforce_budget(&mut state);
-}
-
-fn enforce_budget(state: &mut CacheState) {
-    let mut total: usize = state.entries.values().map(CacheEntry::bytes).sum();
-    while total > WIRE_CACHE_MAX_BYTES && state.entries.len() > 1 {
-        let Some(oldest) = state
-            .entries
+    let _writes = entry_writes();
+    let mut wire = HashMap::new();
+    if let Some(previous) = pool().peek::<CacheEntry>(&cache_key(&key)) {
+        // Sibling-variant prefixes remain valid only up to the shared prefix
+        // between the entry's previous timeline and the one stored now.
+        let shared = common_prefix_len(&previous.contexts, &contexts);
+        wire = previous
+            .wire
             .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        if let Some(entry) = state.entries.remove(&oldest) {
-            total = total.saturating_sub(entry.bytes());
-        }
+            .filter(|(_, prefix)| prefix.consumed <= shared)
+            .map(|(variant, prefix)| (*variant, prefix.clone()))
+            .collect();
     }
-}
-
-impl WireHistoryCache {
-    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    wire.insert(session.variant, prefix);
+    let entry = CacheEntry {
+        contexts: Arc::new(contexts),
+        wire,
+        replay: session.fold.replay.clone(),
+    };
+    let bytes = entry.bytes();
+    // A finished turn is a use: the entry moves to the back of the line.
+    pool().insert(cache_key(&key), Arc::new(entry), bytes);
 }
 
 /// Active wire variant for the document's selected provider/model, if any.
@@ -932,105 +1173,152 @@ fn document_active_variant(document: &AppDocument) -> Option<WireVariant> {
         .api_providers
         .iter()
         .find(|provider| provider.id == provider_id)?;
-    let model_id = provider.active_model_id.as_deref()?;
-    let _ = model_id;
+    provider.active_model_id.as_deref()?;
     Some(WireVariant::for_format(provider.family))
 }
 
-/// Document-commit hook: prunes dead conversations, and asks the background
-/// warmer to (a) mirror manual context edits into the cached projections and
-/// (b) eagerly project the newly selected wire variant when the user switches
-/// provider/model across formats — both before the next request needs them.
+enum WarmJob {
+    /// Re-mirror one entry against the body its conversation's command just
+    /// stored.
+    Mirror {
+        anchor: PathBuf,
+        conversation_id: String,
+    },
+    /// Project a newly selected variant into every entry.
+    Project(WireVariant),
+}
+
+#[derive(Default)]
+struct WarmerState {
+    jobs: VecDeque<WarmJob>,
+    active_variant: Option<WireVariant>,
+    started: bool,
+}
+
+#[derive(Default)]
+struct Warmer {
+    state: Mutex<WarmerState>,
+    wake: Condvar,
+}
+
+fn warmer() -> &'static Warmer {
+    static WARMER: OnceLock<Warmer> = OnceLock::new();
+    WARMER.get_or_init(Warmer::default)
+}
+
+impl Warmer {
+    fn lock(&self) -> MutexGuard<'_, WarmerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn enqueue(&'static self, job: WarmJob) {
+        let mut state = self.lock();
+        state.jobs.push_back(job);
+        if !state.started {
+            state.started = thread::Builder::new()
+                .name("mework-wire-warmer".into())
+                .spawn(move || warmer_loop(self))
+                .is_ok();
+        }
+        self.wake.notify_all();
+    }
+}
+
+/// Document-commit hook: prunes dead conversations, and when the user switched
+/// provider/model across wire formats, has the warmer project the new variant
+/// into every entry before the next request needs it.
 pub(crate) fn on_document_committed(document: &Arc<AppDocument>) {
-    let cache = cache();
-    let mut state = cache.lock();
-    let live_ids: std::collections::HashSet<&str> = document
+    let live: HashSet<&str> = document
         .workspaces
         .iter()
         .flat_map(|workspace| workspace.conversations.iter())
         .map(|conversation| conversation.id.as_str())
         .collect();
-    state
-        .entries
-        .retain(|conversation_id, _| live_ids.contains(conversation_id.as_str()));
-    state.active_variant = document_active_variant(document);
-    state.latest_document = Some(document.clone());
-    state.committed_generation += 1;
-    if !state.entries.is_empty() || state.active_variant.is_some() {
-        ensure_warmer(cache, &mut state);
-    }
-    cache.wake.notify_all();
-}
-
-fn ensure_warmer(cache: &'static WireHistoryCache, state: &mut CacheState) {
-    if state.warmer_started {
-        return;
-    }
-    state.warmer_started = true;
-    let spawned = thread::Builder::new()
-        .name("mework-wire-warmer".into())
-        .spawn(move || warmer_loop(cache));
-    if spawned.is_err() {
-        state.warmer_started = false;
+    pool().retain(|key| key.kind != PoolKind::WireProjection || live.contains(key.id.as_str()));
+    let active = document_active_variant(document);
+    let warmer = warmer();
+    let switched = {
+        let mut state = warmer.lock();
+        let switched = active.is_some() && active != state.active_variant;
+        state.active_variant = active;
+        switched
+    };
+    if let (true, Some(variant)) = (switched, active) {
+        if !pool().keys_of(PoolKind::WireProjection).is_empty() {
+            warmer.enqueue(WarmJob::Project(variant));
+        }
     }
 }
 
-fn warmer_loop(cache: &'static WireHistoryCache) {
+/// Conversation-command hook: the command just stored `conversation_id`'s
+/// body, perhaps edited by hand. When that conversation has an entry, the
+/// warmer mirrors the edit into it from the stored body.
+pub(crate) fn on_conversation_committed(anchor: &Path, conversation_id: &str) {
+    if pool().contains(&cache_key(conversation_id)) {
+        warmer().enqueue(WarmJob::Mirror {
+            anchor: anchor.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+        });
+    }
+}
+
+fn warmer_loop(warmer: &'static Warmer) {
     loop {
-        let (document, active_variant, keys) = {
-            let mut state = cache.lock();
+        let (job, active) = {
+            let mut state = warmer.lock();
             loop {
-                if state.warmed_generation != state.committed_generation {
-                    state.warmed_generation = state.committed_generation;
-                    if let Some(document) = state.latest_document.clone() {
-                        let keys: Vec<String> = state.entries.keys().cloned().collect();
-                        break (document, state.active_variant, keys);
-                    }
+                if let Some(job) = state.jobs.pop_front() {
+                    break (job, state.active_variant);
                 }
-                state = cache
+                state = warmer
                     .wake
                     .wait(state)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         };
-        for key in keys {
-            warm_conversation(cache, &document, &key, active_variant);
+        match job {
+            WarmJob::Mirror {
+                anchor,
+                conversation_id,
+            } => {
+                let stored = crate::conversation_store::store_for(&anchor)
+                    .and_then(|store| store.conversation_shared(&conversation_id));
+                if let Ok(Some(stored)) = stored {
+                    warm_entry(&conversation_id, Some(&stored), active);
+                }
+            }
+            WarmJob::Project(variant) => {
+                for key in pool().keys_of(PoolKind::WireProjection) {
+                    warm_entry(&key.id, None, Some(variant));
+                }
+            }
         }
     }
 }
 
-/// Re-mirrors one cached conversation against the committed document: finds
-/// the best-matching persisted timeline (main or branch), extends or rebuilds
-/// each cached variant projection, and ensures the active variant is present.
-fn warm_conversation(
-    cache: &WireHistoryCache,
-    document: &AppDocument,
+/// Re-mirrors one cached entry: with a stored body, onto the timeline (main or
+/// branch) that best matches the entry's own; and projects `active_variant`
+/// when the entry lacks it. Extends each variant from its still-valid prefix,
+/// or rebuilds it when the timeline diverged inside the cached region.
+///
+/// The entry keeps its place in the pool's unloading order: warming is not a
+/// use, so a background pass cannot promote a conversation nobody opened.
+fn warm_entry(
     conversation_id: &str,
+    stored: Option<&Conversation>,
     active_variant: Option<WireVariant>,
 ) {
-    let Some(conversation) = document
-        .workspaces
-        .iter()
-        .flat_map(|workspace| workspace.conversations.iter())
-        .find(|conversation| conversation.id == conversation_id)
-    else {
+    let key = cache_key(conversation_id);
+    let Some(entry) = pool().peek::<CacheEntry>(&key) else {
         return;
     };
-
-    // Snapshot the entry's current mirror (context timeline + per-variant
-    // prefix segments) so the expensive work happens without the cache lock.
-    let (entry_contexts, mut prefixes) = {
-        let state = cache.lock();
-        let Some(entry) = state.entries.get(conversation_id) else {
-            return;
-        };
-        let prefixes: Vec<(WireVariant, Vec<Arc<WireSegment>>, usize)> = entry
-            .wire
-            .iter()
-            .map(|(variant, prefix)| (*variant, prefix.segments.clone(), prefix.consumed))
-            .collect();
-        (entry.contexts.clone(), prefixes)
-    };
+    let mut prefixes: Vec<(WireVariant, Vec<Arc<WireSegment>>, usize)> = entry
+        .wire
+        .iter()
+        .map(|(variant, prefix)| (*variant, prefix.segments.clone(), prefix.consumed))
+        .collect();
     // A provider/model switch introduces a variant the entry has never
     // projected; it must be built even when the timeline itself is unchanged.
     let missing_active =
@@ -1039,25 +1327,35 @@ fn warm_conversation(
         prefixes.push((active, Vec::new(), 0));
     }
 
-    // Candidate timelines: the main context list plus every branch timeline.
-    let mut best: &Vec<ContextItem> = &conversation.contexts;
-    let mut best_shared = common_prefix_len(&entry_contexts, best);
-    for branch in &conversation.branches {
-        let shared = common_prefix_len(&entry_contexts, &branch.contexts);
-        if shared > best_shared || (shared == best_shared && branch.contexts.len() > best.len()) {
-            best = &branch.contexts;
-            best_shared = shared;
+    // Candidate timelines: the stored main context list plus every branch.
+    let (best, best_shared): (&[ContextItem], usize) = match stored {
+        Some(conversation) => {
+            let mut best: &[ContextItem] = &conversation.contexts;
+            let mut best_shared = common_prefix_len(&entry.contexts, best);
+            for branch in &conversation.branches {
+                let shared = common_prefix_len(&entry.contexts, &branch.contexts);
+                if shared > best_shared
+                    || (shared == best_shared && branch.contexts.len() > best.len())
+                {
+                    best = &branch.contexts;
+                    best_shared = shared;
+                }
+            }
+            (best, best_shared)
         }
-    }
-    let identical = best_shared == entry_contexts.len() && best.len() == entry_contexts.len();
+        None => (&entry.contexts, entry.contexts.len()),
+    };
+    let identical = best_shared == entry.contexts.len() && best.len() == entry.contexts.len();
     if identical && missing_active.is_none() {
         return;
     }
 
-    // Project outside the lock: extend each variant from its still-valid
-    // prefix (the common case after a turn appends items), or rebuild from
-    // scratch when the timeline diverged inside the cached region.
-    let new_contexts = Arc::new(best.clone());
+    // Project outside any lock.
+    let new_contexts = if identical {
+        Arc::clone(&entry.contexts)
+    } else {
+        Arc::new(best.to_vec())
+    };
     let mut rebuilt: HashMap<WireVariant, WirePrefix> = HashMap::new();
     for (variant, segments, consumed) in prefixes {
         let (base, base_consumed) = if consumed <= best_shared {
@@ -1069,7 +1367,10 @@ fn warm_conversation(
             key: None,
             variant,
             base,
-            fold: CanonicalFold::default(),
+            fold: CanonicalFold {
+                replay: entry.replay.clone(),
+                ..CanonicalFold::default()
+            },
             synced: base_consumed,
             tail_messages: Vec::new(),
             tail_bytes: 0,
@@ -1097,26 +1398,26 @@ fn warm_conversation(
         );
     }
 
-    let mut state = cache.lock();
-    state.tick += 1;
-    let tick = state.tick;
-    if let Some(entry) = state.entries.get_mut(conversation_id) {
-        // A concurrent run may have stored a newer mirror; do not regress it.
-        if !Arc::ptr_eq(&entry.contexts, &entry_contexts) && *entry.contexts != *entry_contexts {
-            return;
-        }
-        entry.contexts = new_contexts;
-        entry.wire = rebuilt;
-        entry.last_used = tick;
-        enforce_budget(&mut state);
+    let _writes = entry_writes();
+    // A turn may have stored a newer entry meanwhile; do not regress it.
+    match pool().peek::<CacheEntry>(&key) {
+        Some(current) if Arc::ptr_eq(&current, &entry) => {}
+        _ => return,
     }
+    let warmed = CacheEntry {
+        contexts: new_contexts,
+        wire: rebuilt,
+        replay: entry.replay.clone(),
+    };
+    let bytes = warmed.bytes();
+    pool().replace(key, Arc::new(warmed), bytes);
 }
 
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
-    let mut state = cache().lock();
-    state.entries.clear();
-    state.latest_document = None;
+    pool().retain(|key| key.kind != PoolKind::WireProjection);
+    let mut state = warmer().lock();
+    state.jobs.clear();
     state.active_variant = None;
 }
 
@@ -1133,6 +1434,81 @@ mod tests {
         CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cached(conversation_id: &str) -> Option<Arc<CacheEntry>> {
+        pool().peek::<CacheEntry>(&cache_key(conversation_id))
+    }
+
+    fn big_user(id: &str, bytes: usize) -> ContextItem {
+        user(id, &"x".repeat(bytes))
+    }
+
+    fn store(key: &str, timeline: &[ContextItem]) {
+        store_session(
+            begin_session(Some(key.into()), WireVariant::Anthropic, timeline),
+            timeline.to_vec(),
+        );
+    }
+
+    /// The entry's bytes count the timeline copy it keeps, not only the
+    /// projection: both are resident.
+    #[test]
+    fn an_entry_counts_its_timeline_copy() {
+        let _guard = cache_test_guard();
+        reset_for_tests();
+        let timeline = vec![big_user("u", 1 << 20)];
+        store("conv-bytes", &timeline);
+        let entry = cached("conv-bytes").unwrap();
+        let wire: usize = entry.wire.values().map(|prefix| prefix.bytes).sum();
+        assert!(wire >= 1 << 20);
+        assert!(entry.bytes() >= 2 * (1 << 20) as u64);
+    }
+
+    /// Warming is not a use. Projecting a newly selected variant into every
+    /// entry used to stamp each as just used, in hash order, so which
+    /// conversations the cap then kept was down to hashing.
+    #[test]
+    fn warming_keeps_each_entry_in_its_place_in_line() {
+        let _guard = cache_test_guard();
+        reset_for_tests();
+        let ids = ["conv-old", "conv-mid", "conv-new"];
+        for id in ids {
+            store(id, &[big_user(id, 1024)]);
+        }
+        let ticks = |ids: &[&str]| -> Vec<u64> {
+            ids.iter()
+                .map(|id| pool().last_used(&cache_key(id)).unwrap())
+                .collect()
+        };
+        let before = ticks(&ids);
+        // Warm in the reverse of the order of use, as hash order might.
+        for id in ids.iter().rev() {
+            warm_entry(id, None, Some(WireVariant::OpenaiChat));
+            assert!(cached(id).unwrap().wire.contains_key(&WireVariant::OpenaiChat));
+        }
+        assert_eq!(ticks(&ids), before, "no entry moved in the unloading order");
+    }
+
+    /// A hand edit is mirrored from the body the store holds, never from a
+    /// snapshot — the snapshot carries no bodies, and used to lag a run by a
+    /// round, which re-mirrored the entry backwards.
+    #[test]
+    fn mirroring_follows_the_stored_body_and_is_not_a_use() {
+        let _guard = cache_test_guard();
+        reset_for_tests();
+        let timeline = vec![user("u1", "question"), assistant("a1", "answer", false)];
+        store("conv-mirror", &timeline);
+        let before = cached("conv-mirror").unwrap();
+        let mut stored = crate::catalog::default_document().workspaces[0].conversations[0].clone();
+        stored.id = "conv-mirror".into();
+        stored.contexts = timeline.clone();
+        warm_entry("conv-mirror", Some(&stored), None);
+        let after = cached("conv-mirror").unwrap();
+        assert!(Arc::ptr_eq(&before, &after), "an identical body changes nothing");
+        stored.contexts.push(user("u2", "edited in"));
+        warm_entry("conv-mirror", Some(&stored), None);
+        assert_eq!(*cached("conv-mirror").unwrap().contexts, stored.contexts);
     }
 
     fn user(id: &str, content: &str) -> ContextItem {
@@ -1211,6 +1587,7 @@ mod tests {
                 duration_ms: 1,
             },
             subagent: None,
+            notice: None,
             attestation: String::new(),
             created_at: Utc::now().to_rfc3339(),
         }
@@ -1434,18 +1811,114 @@ mod tests {
         assert_eq!(reverse_mixed_blocks.len(), 2);
     }
 
+    /// A delivery card as the host records one: the empty argument, and the
+    /// whole message as the result.
     fn host_delivery(id: &str, task: &str, output: &str) -> ContextItem {
+        let message = task_notification(
+            task,
+            "completed",
+            "Background task a1 completed",
+            output,
+            Some((Some(321), 2, 450)),
+        );
+        let mut context = tool(id, crate::api::BOX_TOOL, &message);
+        let ContextItem::Tool { input, .. } = &mut context else {
+            unreachable!()
+        };
+        *input = box_call_input();
+        context
+    }
+
+    /// The same delivery as a card written before the card held the whole
+    /// message: the scalars in `input`, only the body in the result.
+    fn legacy_host_delivery(id: &str, task: &str, output: &str) -> ContextItem {
         let mut context = tool(id, crate::api::BOX_TOOL, output);
         let ContextItem::Tool { input, .. } = &mut context else {
             unreachable!()
         };
-        *input = host_task_delivery_input(
-            task,
-            "completed",
-            "Background task a1 completed",
-            Some((Some(321), 2, 450)),
+        input.insert("tasks".into(), json!([task]));
+        input.insert(
+            LEGACY_NOTICE_INPUT_KEY.into(),
+            json!({
+                "status": "completed",
+                "summary": "Background task a1 completed",
+                "usage": {"subagentTokens": 321, "toolUses": 2, "durationMs": 450},
+            }),
         );
         context
+    }
+
+    /// The card is what the model reads: its result goes out byte for byte,
+    /// and its arguments are the one empty list the schema asks for — never the
+    /// host's bookkeeping.
+    #[test]
+    fn a_delivery_card_holds_the_whole_message_and_an_empty_argument() {
+        let card = host_delivery("ctx_agent-result_whole", "a1", "Body");
+        let ContextItem::Tool { input, result, .. } = &card else {
+            unreachable!()
+        };
+        assert_eq!(serde_json::to_value(input).unwrap(), json!({"none": []}));
+        assert!(result.output.starts_with("<task-notification>\n"), "{}", result.output);
+        assert_eq!(delivery_body(&card), result.output);
+
+        // An edit to the result is exactly what the model reads next.
+        let mut edited = card.clone();
+        let ContextItem::Tool { result, .. } = &mut edited else {
+            unreachable!()
+        };
+        let rewritten = "<task-notification>\n<summary>edited</summary>\n</task-notification>";
+        result.output = rewritten.into();
+        assert_eq!(delivery_body(&edited), rewritten);
+
+        let projected = project_full(WireVariant::Anthropic, &[card]);
+        assert_eq!(projected[0]["content"][0]["input"], json!({"none": []}));
+        let wire = serde_json::to_string(&projected).unwrap();
+        assert!(!wire.contains("\"notification\""), "{wire}");
+        assert!(!wire.contains("\"tasks\""), "{wire}");
+    }
+
+    /// A card written before the card held the whole message still reaches the
+    /// model as the very bytes it was first sent as.
+    #[test]
+    fn a_legacy_delivery_card_replays_the_message_it_was_sent_as() {
+        let current = host_delivery("ctx_agent-result_now", "a1", "[a1 · completed]\nDone");
+        let legacy = legacy_host_delivery("ctx_agent-result_then", "a1", "[a1 · completed]\nDone");
+        assert_eq!(delivery_body(&legacy), delivery_body(&current));
+        let projected = project_full(WireVariant::OpenaiChat, &[legacy]);
+        assert_eq!(projected[0]["content"][0]["input"], json!({"none": []}));
+    }
+
+    /// A host notice names itself on the card, and a card written before that
+    /// field still names itself through its legacy input — on the card alone,
+    /// so a branch's fresh id does not hide it.
+    #[test]
+    fn a_host_notice_kind_is_read_off_the_card() {
+        let mut card = tool("ctx_branch-copy", crate::api::BOX_TOOL, "Body");
+        let ContextItem::Tool { notice, .. } = &mut card else {
+            unreachable!()
+        };
+        *notice = Some("plan_mode".into());
+        assert_eq!(host_notice_kind(&card), Some("plan_mode"));
+
+        let mut legacy = tool("ctx_agent-result_old", crate::api::BOX_TOOL, "Body");
+        let ContextItem::Tool { input, .. } = &mut legacy else {
+            unreachable!()
+        };
+        input.insert("tasks".into(), json!([]));
+        input.insert(
+            LEGACY_NOTICE_INPUT_KEY.into(),
+            json!({"kind": "handoff", "summary": "past the threshold"}),
+        );
+        assert_eq!(host_notice_kind(&legacy), Some("handoff"));
+
+        // A background result names no kind, and no other tool is a notice.
+        assert_eq!(host_notice_kind(&host_delivery("ctx_agent-result_r", "a1", "x")), None);
+        let mut other = tool("ctx_other", "read", "Body");
+        let ContextItem::Tool { notice, .. } = &mut other else {
+            unreachable!()
+        };
+        *notice = Some("plan_mode".into());
+        assert_eq!(host_notice_kind(&other), None);
     }
 
     fn delivery_body(context: &ContextItem) -> String {
@@ -1472,7 +1945,7 @@ mod tests {
         };
         input.insert("tasks".into(), json!(["a1"]));
         input.insert(
-            HOST_NOTICE_INPUT_KEY.into(),
+            LEGACY_NOTICE_INPUT_KEY.into(),
             json!({
                 "status": "completed",
                 "summary": "Background task a1 completed",
@@ -1489,7 +1962,7 @@ mod tests {
         // not surface as the fabricated call's arguments.
         assert!(!wire.contains("\"notification\""), "{wire}");
         assert!(!wire.contains("preamble"), "{wire}");
-        assert_eq!(projected[0]["content"][0]["input"], json!({}));
+        assert_eq!(projected[0]["content"][0]["input"], json!({"none": []}));
         assert_eq!(projected[0]["content"][0]["toolName"], crate::api::BOX_TOOL);
         assert!(projected[1]["content"][0]["output"]["value"]
             .as_str()
@@ -1499,6 +1972,38 @@ mod tests {
 
     /// A host delivery projects as its own fabricated `box` exchange, after the
     /// round's real tool results and outside the model's own turn.
+    /// A tool-append record keeps its place: it projects as the marker message
+    /// right where it stands, after the round's results, and nothing of its
+    /// text reaches the model.
+    #[test]
+    fn a_tool_append_record_projects_as_a_marker_where_it_stands() {
+        let timeline = vec![
+            user("u-ask", "Look it up"),
+            in_model_turn(
+                tool("t-read", "read_file", "File contents"),
+                1,
+                "model-turn-1",
+            ),
+            crate::tool_append::marker(
+                "ctx_tools-added_1".into(),
+                vec!["handoff".into()],
+                "2026-09-29T00:00:00Z".into(),
+            ),
+        ];
+        let blocks = canonical_history(&timeline);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(matches!(
+            &blocks[2],
+            CanonicalHistoryBlock::ToolAddition(tools) if tools == &["handoff".to_owned()]
+        ));
+        let projected = project_full(WireVariant::Anthropic, &timeline);
+        assert_eq!(
+            projected.last().unwrap(),
+            &crate::tool_append::marker_message(&["handoff".to_owned()])
+        );
+        assert!(!serde_json::to_string(&projected).unwrap().contains("Tools added"));
+    }
+
     #[test]
     fn a_host_task_delivery_projects_as_a_box_exchange_after_the_real_tool_results() {
         let timeline = vec![
@@ -1555,7 +2060,7 @@ mod tests {
         assert_eq!(call["role"], "assistant");
         assert_eq!(call["content"][0]["type"], "tool-call");
         assert_eq!(call["content"][0]["toolName"], crate::api::BOX_TOOL);
-        assert_eq!(call["content"][0]["input"], json!({}));
+        assert_eq!(call["content"][0]["input"], json!({"none": []}));
         let result = &projected[results_at + 2];
         assert_eq!(result["role"], "tool");
         assert_eq!(result["content"][0]["toolName"], crate::api::BOX_TOOL);
@@ -1637,18 +2142,13 @@ mod tests {
     /// summary are escaped as XML character data.
     #[test]
     fn notification_scalars_are_xml_escaped() {
-        let mut context = tool("ctx_agent-result_scalar", crate::api::BOX_TOOL, "Body");
-        let ContextItem::Tool { input, .. } = &mut context else {
-            unreachable!()
-        };
-        *input = host_task_delivery_input(
+        let text = task_notification(
             "a<x>&y",
             "completed",
             "Background task a<x>&y completed",
+            "Body",
             Some((Some(1), 0, 0)),
         );
-
-        let text = delivery_body(&context);
         assert!(
             text.contains("<task-id>a&lt;x&gt;&amp;y</task-id>"),
             "{text}"
@@ -1659,27 +2159,30 @@ mod tests {
         );
     }
 
+    /// Memory tools are ordinary tools: a memory is Markdown files in a place,
+    /// not something one model owns, so its calls and results replay like any
+    /// other's and the model keeps seeing what it read and wrote.
     #[test]
-    fn memory_tool_exchanges_never_cross_the_provider_history_boundary() {
+    fn memory_tool_exchanges_replay_like_any_other_tool() {
         let timeline = vec![
             user("u-memory", "Please continue"),
             assistant("a-before", "I will review long-term memory.", false),
-            tool("t-memory", "read_project_memory", "PRIVATE_MEMORY_SENTINEL"),
+            tool("t-memory", "read_project_memory", "Build with the bundled toolchain."),
             tool(
                 "t-memory-write",
                 "create_global_memory",
-                "Created PRIVATE_NAME_SENTINEL.md in global memory and wrote its index description.",
+                "Created preferences.md in global memory and wrote its index description.",
             ),
             assistant("a-after", "Continued using memory.", false),
         ];
 
         for variant in variants() {
             let wire = serde_json::to_string(&project_full(variant, &timeline)).unwrap();
-            assert!(!wire.contains("read_project_memory"));
-            assert!(!wire.contains("create_global_memory"));
-            assert!(!wire.contains("PRIVATE_MEMORY_SENTINEL"));
-            assert!(!wire.contains("PRIVATE_NAME_SENTINEL"));
-            assert!(wire.contains("Continued using memory."));
+            assert!(wire.contains("read_project_memory"), "{variant:?}");
+            assert!(wire.contains("create_global_memory"), "{variant:?}");
+            assert!(wire.contains("Build with the bundled toolchain."), "{variant:?}");
+            assert!(wire.contains("Created preferences.md"), "{variant:?}");
+            assert!(wire.contains("Continued using memory."), "{variant:?}");
         }
     }
 
@@ -1985,19 +2488,19 @@ mod tests {
                 store_session(begin_session(key.clone(), first, &a), a.clone());
                 let old = begin_session(key.clone(), first, &a);
                 if warm {
-                    let mut document = crate::catalog::default_document();
-                    document.workspaces[0]
+                    let mut stored = crate::catalog::default_document().workspaces[0]
                         .conversations
-                        .iter_mut()
+                        .iter()
                         .find(|conversation| conversation.id == "conv_welcome")
                         .unwrap()
-                        .contexts = b.clone();
-                    warm_conversation(cache(), &Arc::new(document), "conv_welcome", Some(sibling));
+                        .clone();
+                    stored.contexts = b.clone();
+                    warm_entry("conv_welcome", Some(&stored), Some(sibling));
                 } else {
                     store_session(begin_session(key.clone(), sibling, &b), b.clone());
                 }
                 assert_eq!(
-                    cache().lock().entries["conv_welcome"].wire[&sibling].consumed,
+                    cached("conv_welcome").unwrap().wire[&sibling].consumed,
                     1
                 );
                 store_session(old, a.clone());
@@ -2078,15 +2581,17 @@ mod tests {
         let active = document_active_variant(&document);
         assert_eq!(active, Some(WireVariant::OpenaiChat));
         // Drive the warm step directly (the background thread runs the same
-        // function; calling it here keeps the test deterministic).
-        warm_conversation(cache(), &document, "conv_welcome", active);
+        // function on the body the command stored; calling it here keeps the
+        // test deterministic).
+        let stored = document.workspaces[0]
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == "conv_welcome")
+            .unwrap();
+        warm_entry("conv_welcome", Some(stored), active);
 
         {
-            let state = cache().lock();
-            let entry = state
-                .entries
-                .get("conv_welcome")
-                .expect("entry survives the warm pass");
+            let entry = cached("conv_welcome").expect("entry survives the warm pass");
             assert_eq!(*entry.contexts, extended, "mirror follows the document");
             let chat = entry
                 .wire
@@ -2126,8 +2631,32 @@ mod tests {
         store_session(session, timeline);
         let document = Arc::new(crate::catalog::default_document());
         on_document_committed(&document);
-        let state = cache().lock();
-        assert!(!state.entries.contains_key("conv_deleted"));
+        assert!(cached("conv_deleted").is_none());
+    }
+
+    #[test]
+    fn a_skill_an_older_build_delivered_as_a_system_card_projects_as_a_box_notice() {
+        let timeline = vec![
+            user("u1", "Question"),
+            ContextItem::System {
+                id: "ctx_skill_review".into(),
+                content: "Review </result> carefully.".into(),
+                local_only: false,
+                hook_execution: None,
+                tools_added: Vec::new(),
+                created_at: Utc::now().to_rfc3339(),
+            },
+        ];
+        let blocks = canonical_history(&timeline);
+        assert_eq!(blocks.len(), 2);
+        let CanonicalHistoryBlock::HostDelivery(delivery) = &blocks[1] else {
+            panic!("a notice, never a system message: {:?}", blocks[1]);
+        };
+        assert_eq!(delivery.local_id, "ctx_skill_review");
+        assert_eq!(
+            delivery.body,
+            "<task-notification>\n<summary>A skill was added to this conversation</summary>\n<result>\nReview <\\/result> carefully.\n</result>\n</task-notification>"
+        );
     }
 
     #[test]
@@ -2141,6 +2670,7 @@ mod tests {
                 content: "System injection".into(),
                 local_only: false,
                 hook_execution: None,
+                tools_added: Vec::new(),
                 created_at: Utc::now().to_rfc3339(),
             },
             assistant("a2", "Answer after the system context", false),

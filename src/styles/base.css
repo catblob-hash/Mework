@@ -42,6 +42,9 @@
   --topbar-height: 44px;
   /* Reserve the classic scrollbar width so fixed headers align with scrolling content. */
   --scrollbar-size: 10px;
+  /* The thumb, shared with the scrollbar xterm draws for itself (`terminal.css`). */
+  --scrollbar-thumb: var(--color-c8c8c1);
+  --scrollbar-thumb-hover: var(--color-aaaaaa);
   --mono: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 }
 
@@ -54,21 +57,42 @@
   box-sizing: border-box;
 }
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-body { min-width: 680px; min-height: 520px; background: var(--app); }
+/* Text is not selectable unless it is content: a message, a reasoning body, one part of a
+   tool's result, a file. Each of those opts back in with `-webkit-user-select: text; user-select: text`, and the outermost
+   element that does is one selection region (`lib/selectionRegions.ts`). WebKit knows only the
+   prefixed property, and the dev server does not add it, so every declaration carries both. */
+body { min-width: 680px; min-height: 520px; background: var(--app); -webkit-user-select: none; user-select: none; }
+input, textarea, [contenteditable]:not([contenteditable="false"]) { -webkit-user-select: text; user-select: text; }
 button, input, textarea, select { font: inherit; color: inherit; }
 button { border: 0; }
 button, [role="button"] { -webkit-tap-highlight-color: transparent; }
 button:not(:disabled) { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .48; }
-textarea { resize: vertical; }
+textarea { resize: vertical; overflow-y: scroll; }
 ::selection { background: var(--color-cfdcff); }
+/* Where it can, `selectionRegions.ts` paints the selection as a highlight that covers glyphs
+   only, so the engine's own paint is hidden: WebKit's fills the blank lines and padding around
+   the words and runs to the edge of the window. Editable fields keep the engine's paint, and so
+   does a subtree that asks for it (`data-native-selection`: the PDF text layer, which tints the
+   page beneath it). */
+:root[data-selection-paint="highlight"] :not(input, textarea, [contenteditable], [contenteditable] *, [data-native-selection] *)::selection {
+  background: transparent;
+}
+::highlight(mework-selection) { background-color: var(--color-cfdcff); }
+/* Every box that scrolls up and down and stays on screen keeps its scrollbar's track whether or
+   not it has anything to scroll (`overflow-y: scroll`, textareas included), so a scrollbar turning
+   up never narrows what sits beside it. With nothing to scroll the track is empty and invisible.
+   Not `scrollbar-gutter: stable`: WebKit sizes that gutter as the system's scrollbar (17px) until
+   the box overflows and only then as the 10px one below, so the content still jumps on macOS.
+   Two kinds go without: a box that only scrolls sideways, where the track would be a blank band
+   under every code block, and a menu, which neither grows nor shrinks while it is open. */
 ::-webkit-scrollbar { width: var(--scrollbar-size); height: var(--scrollbar-size); }
-::-webkit-scrollbar-thumb { background: var(--color-c8c8c1); border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
-::-webkit-scrollbar-thumb:hover { background: var(--color-aaaaaa); border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); border: 2px solid transparent; background-clip: padding-box; }
 
 :focus { outline: none; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; -webkit-user-select: none; user-select: none; }
 
 .app-shell {
   --shell-collapse-duration: .24s;
@@ -133,6 +157,24 @@ textarea { resize: vertical; }
 .plain-field:focus-within { background: var(--subtle); box-shadow: inset 0 0 0 1px var(--focus); }
 .plain-field--error { box-shadow: inset 0 0 0 1px var(--danger); }
 .plain-field--failed > textarea { color: var(--danger); }
+/*
+ * A long paste folded into a tag (`PastedTextTags.tsx`). The label is text in
+ * the textarea; the layer shares the textarea's grid cell, copies its metrics,
+ * and draws only the tags, behind the textarea's transparent background. Grid
+ * items paint in document order, so nothing is positioned, and no overlay the
+ * box already has ends up beneath the text. `contain: size` keeps the layer's
+ * own text from making the cell taller than the textarea.
+ */
+.pasted-text-host { display: grid; }
+.pasted-text-host > textarea, .pasted-text-layer { grid-area: 1 / 1; }
+.pasted-text-layer {
+  justify-self: start; align-self: stretch; box-sizing: border-box; min-width: 0; margin: 0; border: 0;
+  contain: size; overflow: hidden; pointer-events: none; -webkit-user-select: none; user-select: none; color: transparent;
+}
+.pasted-text-tag {
+  border-radius: 4px; background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--border);
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+}
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

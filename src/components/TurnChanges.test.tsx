@@ -105,8 +105,7 @@ describe("turnChangeSpans", () => {
     const spans = turnChangeSpans([
       turn("done", "completed", ["a"], ""),
       turn("stopped", "interrupted", ["b"], "a"),
-      turn("live", "running", ["c"], "b"),
-      turn("asking", "awaiting_user", ["d"], "c")
+      turn("live", "running", ["c"], "b")
     ]);
     expect(spans.map((span) => span.key)).toEqual(["turn:done", "turn:stopped"]);
   });

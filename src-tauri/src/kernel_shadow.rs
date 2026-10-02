@@ -41,9 +41,6 @@
 //! * Folded tasks emit `AgentFold` (preceded by `AgentComplete` if not yet observed)
 //!   and create delivery work for a later round — a task the user closed included.
 //!   Folding during abort is a divergence.
-//! * Worker-owned followup turns are outside the main-thread observation scope. When
-//!   a main-thread followup leaves an old envelope unclaimed, its existing mapping is
-//!   retained so delivery remains attributed to the old incarnation.
 //! * Workflow drivers and background shell commands use the outer task pool and the
 //!   same spawn, wait, fold, and settlement projection as agents. Their internal
 //!   workers remain outside this scope. `web_search` and `web_fetch` use the call
@@ -430,31 +427,12 @@ impl KernelShadow {
         });
     }
 
-    /// When a followup leaves an old envelope unclaimed, retain its mapping so its
-    /// later delivery remains attributed to the old incarnation. The new incarnation
-    /// is outside scope until the prior entry has been released.
-    pub fn agent_refollowed(&self, name: &str, identity: TaskIdentity) {
-        self.with_inner(|inner, strict| {
-            if inner.unmapped.contains(name) {
-                return;
-            }
-            if inner.agents.contains_key(name) {
-                inner.scope_gaps += 1;
-                return;
-            }
-            let Some((slot, r)) = inner.allocate_agent(name, identity) else {
-                return;
-            };
-            inner.step(strict, KernelEvent::AgentSpawn { a: slot, r });
-        });
-    }
-
     /// Begin `TaskWait` at the blocking-window boundary. A newer same-name identity
     /// still projects to the tracked incarnation because the wait covers its unclaimed envelope.
     pub fn task_wait_started(&self, name: &str, identity: TaskIdentity) {
         self.with_inner(|inner, strict| {
             let Some(entry) = inner.agents.get(name) else {
-                // Rehydrated and worker-owned-followup incarnations are outside scope.
+                // Rehydrated incarnations are outside scope.
                 inner.scope_gaps += 1;
                 return;
             };
@@ -854,42 +832,6 @@ mod tests {
     }
 
     #[test]
-    fn followup_keeps_old_incarnation_for_its_pending_result() {
-        // Preserve an unclaimed old envelope for real delivery; the new incarnation is a scope gap.
-        let shadow = KernelShadow::strict_for_tests();
-        shadow.begin_turn();
-        shadow.round_started();
-        shadow.agent_spawned("a", tid(1));
-        shadow.agent_refollowed("a", tid(2));
-        shadow.task_wait_started("a", tid(1));
-        shadow.task_wait_claimed("a", tid(1));
-        finish_clean(&shadow);
-        assert!(
-            shadow.divergences().is_empty(),
-            "{:?}",
-            shadow.divergences()
-        );
-    }
-
-    #[test]
-    fn followup_after_claim_registers_fresh_incarnation() {
-        // Once the old entry is released, a followup registers the new incarnation.
-        let shadow = KernelShadow::strict_for_tests();
-        shadow.begin_turn();
-        shadow.round_started();
-        shadow.agent_spawned("a", tid(1));
-        shadow.task_wait_started("a", tid(1));
-        shadow.task_wait_claimed("a", tid(1));
-        shadow.agent_refollowed("a", tid(2));
-        finish_clean(&shadow);
-        assert!(
-            shadow.divergences().is_empty(),
-            "{:?}",
-            shadow.divergences()
-        );
-    }
-
-    #[test]
     fn rejected_precheck_projects_deny() {
         let shadow = KernelShadow::strict_for_tests();
         shadow.begin_turn();
@@ -1139,7 +1081,7 @@ mod tests {
         shadow.agent_spawned("a", tid(1));
         shadow.task_wait_started("a", tid(1));
         shadow.task_wait_claimed("a", tid(1));
-        shadow.agent_refollowed("a", tid(2));
+        shadow.agent_spawned("a", tid(2));
         shadow.task_wait_started("a", tid(2));
         // Inject a duplicate envelope for the old incarnation.
         shadow.task_wait_claimed("a", tid(1));
@@ -1147,25 +1089,6 @@ mod tests {
         assert!(
             divergences.iter().any(|d| d.contains("r = taskRid[a]")),
             "期望身份守卫分歧被记录:{divergences:?}"
-        );
-    }
-
-    #[test]
-    fn newer_incarnation_envelope_is_a_blind_spot_not_a_divergence() {
-        // A newer envelope is a scope gap; the retained old envelope can still deliver.
-        let shadow = KernelShadow::strict_for_tests();
-        shadow.begin_turn();
-        shadow.round_started();
-        shadow.agent_spawned("a", tid(1));
-        shadow.agent_refollowed("a", tid(2)); // Retain the old incarnation entry.
-        shadow.task_wait_started("a", tid(2)); // The current wait covers the tracked envelope.
-        shadow.task_wait_claimed("a", tid(2)); // The newer envelope is outside scope.
-        shadow.task_wait_claimed("a", tid(1)); // Deliver the tracked old envelope.
-        finish_clean(&shadow);
-        assert!(
-            shadow.divergences().is_empty(),
-            "{:?}",
-            shadow.divergences()
         );
     }
 

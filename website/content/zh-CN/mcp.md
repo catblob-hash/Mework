@@ -14,8 +14,6 @@ MCP 服务器**不**在应用内注册。它们和大多数 MCP 客户端一样�
 <workspace>/.mework/mcp.json       工作区范围——仅该工作区
 ```
 
-全新安装会在用户文件里写入四个条目——`builtin_sequential_thinking`、`builtin_context7`、`builtin_fetch` 与 `builtin_time`——内置的 **mework** 预设勾选了它们。每个条目都经 `npx` 或 `uvx` 启动，不需要任何凭据。
-
 文件形状就是 Claude Code 的 `.mcp.json`：顶层一个 `mcpServers` 对象，以服务器名为键。
 
 ```json
@@ -57,7 +55,7 @@ MCP 服务器**不**在应用内注册。它们和大多数 MCP 客户端一样�
 
 只有**工具**会提供给模型。服务器暴露的提示词与资源由连接测试读取，仅此而已。
 
-每个可用的行都有一个**测试连接**按钮：它拨一次服务器，完成握手，并列出它的工具、提示词与资源。该行的徽标随后会报告它找到多少个工具，tooltip 中则带着服务器自报的名称与版本——或者显示**连接失败**，附错误与服务器写进 stderr 的最后几行。不可用的行从不拨号；它的徽标显示**不可用**，原因在 tooltip 中。行的删除按钮会把该键从它被声明的那个 `mcp.json` 中移除，其余条目和其余顶层键都保持你写下的样子；本对话已经交给过模型的服务器会被锁定，两个按钮都没有。
+每个可用的行都有一个**测试连接**按钮：它拨一次服务器，完成握手，并列出它的工具、提示词与资源。该行的徽标随后会报告它找到多少个工具，tooltip 中则带着服务器自报的名称与版本——或者显示**连接失败**，附错误与服务器写进 stderr 的最后几行。不可用的行从不拨号；它的徽标显示**不可用**，原因在 tooltip 中。行的删除按钮会把该键从它被声明的那个 `mcp.json` 中移除，其余条目和其余顶层键都保持你写下的样子；对话上一次请求带着的服务器，在它被画成橘色期间（见[工具锁定](tools.html#lock)）没有删除按钮。
 
 ## 为对话选择服务器
 
@@ -82,9 +80,9 @@ mcp__<server-slug>_<server-digest>__<tool-slug>__<tool-digest>
 **工具发现**开关（位于列表下方，始终显示）决定发现的工具如何交到模型手上：
 
 - **关闭，开关读作*全部声明*。**每个已发现工具的完整 schema 随每个请求发出，与内置工具完全一样。
-- **开启，*按需取回*——经 [`tool_search` 工具](tools/tool_search.html)取回。**不声明任何 MCP schema。上下文改为携带一个 `<deferred-tools>` 块，按声明它们的服务器分组列出被扣留的名字（[提示词档案](prompt-profiles.html)中的 `tool_search.announcement` 与 `tool_search.announcement_row`）。`tool_search` 接受一个 `query`：`select:<name>[,<name>…]` 返回那些确切的定义，其他写法则是对被扣留名字、其服务器及其描述的关键词搜索（`+term` 是每个结果都必须包含的词，其余用于排序），结果数以 `max_results` 为上限，默认 5。定义已经取回的工具从下一步起正常声明，像其他工具一样直接调用；调用一个 schema 还没取回的工具会被拒绝，拒绝消息带着那个能修好它的 `select:` 调用（`tool_search.not_loaded`）。
+- **开启，*按需取回*——经 [`tool_search` 工具](tools/tool_search.html)取回。**不声明任何 MCP schema。上下文改为携带一个 `<deferred-tools>` 块，按声明它们的服务器分组列出被扣留的名字（[提示词档案](prompt-profiles.html)中的 `tool_search.announcement` 与 `tool_search.announcement_row`）。`tool_search` 接受一个 `query`：`select:<name>[,<name>…]` 返回那些确切的定义，其他写法则是对被扣留名字、其服务器及其描述的关键词搜索（`+term` 是每个结果都必须包含的词，其余用于排序），结果数以 `max_results` 为上限，默认 5。定义已经取回的工具从下一步起可以像其他工具一样直接调用：它在取回的位置[追加](tools.html#available)，而不是改写声明的工具列表；调用一个 schema 还没取回的工具会被拒绝，拒绝消息带着那个能修好它的 `select:` 调用（`tool_search.not_loaded`）。
 
-新对话从它起始的预设继承这个开关；内置的 **mework** 预设开局就是开的。任何服务器被拨通之后开关就冻结，与技能传递同理：转录已经按其中一种方式携带着工具。公告在整个运行期间固定，所以某个名字在它的 schema 到达之后仍留在名单里。子代理继承该模式，并把继承到的每个工具重新扣留一次，因为它从空历史起步，从没读过父对话的 `tool_search` 结果。
+新对话从它起始的预设继承这个开关；内置的 **mework** 预设开局就是开的。改动它会重写提示词里携带这些工具的部分，所以在模型缓存还热的时候，它和[工具锁定](tools.html#lock)里的其他设置一样画成橘色。不支持在对话中途加入工具的模型，取回的 schema 无处交付，所以在这类模型上开关保持关闭、无法打开。公告在整个运行期间固定，所以某个名字在它的 schema 到达之后仍留在名单里。子代理继承该模式，并把继承到的每个工具重新扣留一次，因为它从空历史起步，从没读过父对话的 `tool_search` 结果。
 
 `tool_search` 是派生出来的，不在工具选择器中：它恰好出现在开关开启且本次运行至少扣留了一个工具的时候。
 
@@ -92,7 +90,7 @@ mcp__<server-slug>_<server-digest>__<tool-slug>__<tool-digest>
 
 MCP 工具被视为外部副作用：
 
-- 在 `request_approval`、`allow_edits` 与 `plan` 下，每次调用都要确认，除非某个 `PreToolUse` 或 `PermissionRequest` 钩子放行。在 `full_access` 下调用不经询问直接运行。
+- 在 `request_approval` 与 `allow_edits` 下，每次调用都要确认，除非某个 `PreToolUse` 或 `PermissionRequest` 钩子放行。在 `full_access` 下调用不经询问直接运行。
 - 声明了 `_meta["anthropic/requiresUserInteraction"] = true` 的工具**每次调用**都询问，在每一级都如此，钩子无法预先批准它。它给模型的描述会加上 `mcp.mandatory_description_prefix` 前缀，它的标签也带一条写着同样内容的备注。值格式不对时按“询问”失败封闭。
 - `disabledAutoApproveTools` 中点名的工具行为相同：同样的前缀，且它在每一级都询问。
 

@@ -7,6 +7,14 @@ import {
   type AttachmentRejectionReason,
   type DragSummary
 } from "../lib/fileAttachments";
+import {
+  MAX_FILE_ATTACHMENT_PDF_BYTES,
+  MAX_MESSAGE_ATTACHMENT_BYTES,
+  MAX_TEXT_FILE_TOKENS,
+  MAX_TEXT_FILE_UPLOAD_BYTES,
+  TRUNCATED_TEXT_FILE_LINES
+} from "../lib/fileBudget";
+import { MAX_IMAGE_ATTACHMENT_BYTES } from "../lib/imageBudget";
 import { IconButton } from "./Common";
 import "./AttachmentFeedback.css";
 
@@ -77,6 +85,9 @@ export function AttachmentDropOverlay({
   );
 }
 
+const KIB = 1024;
+const MIB = 1024 * 1024;
+
 function rejectionReasonLabel(t: Translate, reason: AttachmentRejectionReason): string {
   switch (reason) {
     case "directory":
@@ -87,25 +98,35 @@ function rejectionReasonLabel(t: Translate, reason: AttachmentRejectionReason): 
       return t("不支持的格式；可添加图片、PDF 和文本文件", "Unsupported format; images, PDFs and text files can be attached");
     case "tooLarge":
       return t(
-        "文件过大（文本不超过 512 KB，PDF 不超过 10 MB，图片不超过 5 MB）",
-        "Too large (text up to 512 KB, PDFs up to 10 MB, images up to 5 MB)"
+        "文件过大（文本不超过 {text} KB，PDF 不超过 {pdf} MB，图片不超过 {image} MB）",
+        "Too large (text up to {text} KB, PDFs up to {pdf} MB, images up to {image} MB)",
+        {
+          text: MAX_TEXT_FILE_UPLOAD_BYTES / KIB,
+          pdf: MAX_FILE_ATTACHMENT_PDF_BYTES / MIB,
+          image: MAX_IMAGE_ATTACHMENT_BYTES / MIB
+        }
+      );
+    case "tooLong":
+      return t(
+        "内容太长：前 {lines} 行仍超过 {tokens} tokens",
+        "Too long: even its first {lines} lines are over {tokens} tokens",
+        { lines: TRUNCATED_TEXT_FILE_LINES, tokens: MAX_TEXT_FILE_TOKENS }
       );
     case "imageInputUnavailable":
       return t("当前模型不支持图片输入", "The current model has no image input");
     case "imageRejected":
-      return t("图片的格式、尺寸或数量超出限制", "The image format, size or count is over the limit");
+      return t("图片的格式或尺寸超出限制", "The image format or size is over the limit");
     case "pdfWithoutText":
       return t("PDF 里没有可读取的文字（可能是扫描件）", "The PDF has no readable text (it may be a scan)");
     case "pdfPassword":
       return t("PDF 有密码保护", "The PDF is password-protected");
     case "pdfUnreadable":
       return t("无法读取这个 PDF", "The PDF could not be read");
-    case "tooMany":
-      return t("一条消息最多带 20 个文件", "A message can carry at most 20 files");
-    case "overBudget":
+    case "messageTooLarge":
       return t(
-        "这条消息的附件文字已达上限（约 40 万 tokens）",
-        "This message's attachments already hold as much text as one message may (about 400k tokens)"
+        "一条消息的附件合计不能超过 {size} MB",
+        "A message's attachments can come to at most {size} MB in all",
+        { size: MAX_MESSAGE_ATTACHMENT_BYTES / MIB }
       );
     case "failed":
       return t("读取或上传失败", "Reading or uploading failed");

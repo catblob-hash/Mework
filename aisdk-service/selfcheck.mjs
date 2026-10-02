@@ -21,7 +21,7 @@ const OVERRIDE = process.argv.includes("--sea")
 const BUNDLE = resolve(here, "dist/main.mjs");
 // Protocol generation. Keep this literal because packaged artifacts do not export
 // the constant; a mismatch must fail during the ready handshake.
-const V = 13;
+const V = 15;
 
 let failures = 0;
 const results = [];
@@ -272,6 +272,31 @@ async function handler(req, res) {
     body: parsedBody,
   });
   const model = parsedBody?.model ?? "";
+  // Check 36: reasoning levels. Claude and Responses models answer plainly; the
+  // `level-*` Chat models refuse a `reasoning_effort` the way real endpoints do.
+  if (model.startsWith("claude-selfcheck-level") || model.startsWith("claude-opus-4-6-selfcheck-level")) {
+    anthropicSse(res, "end_turn");
+    return;
+  }
+  if (model.startsWith("gpt-5.6-selfcheck-level") || model.startsWith("gpt-5-selfcheck-level")) {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    res.end(readFileSync(resolve(here, "fixtures/openai-responses-reasoning.sse"), "utf8"));
+    return;
+  }
+  if (model === "level-refuses-max" && parsedBody?.reasoning_effort === "max") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "invalid_request_error", param: "reasoning_effort", message: "Unsupported value: 'reasoning_effort' does not support 'max' with this model. Supported values are: 'low', 'medium', 'high', and 'xhigh'." } }));
+    return;
+  }
+  if (model === "level-refuses-field" && parsedBody && "reasoning_effort" in parsedBody) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "`reasoning_effort` is not supported with this model" } }));
+    return;
+  }
+  if (model.startsWith("level-") || model === "gpt-4o-selfcheck-level") {
+    sse(res, [chunk({ role: "assistant", content: "" }), chunk({ content: "ok" }), chunk({}, "stop")]);
+    return;
+  }
   if (model.startsWith("anthropic-unsigned-")) {
     if (body.includes("mework-unsigned")) {
       res.writeHead(400, { "content-type": "application/json" });
@@ -283,6 +308,49 @@ async function handler(req, res) {
   if (startFixture) {
     if (parsedBody.messages.some((message) => message.content?.some?.((part) => part.type === "tool_result"))) anthropicSse(res, "end_turn");
     else await startThinkingSse(res, startFixture);
+    return;
+  }
+  // Check 31: a model that refuses a mid-conversation tool change, and a
+  // Responses endpoint that refuses the `additional_tools` item.
+  if (model === "anthropic-tool-append-refused") {
+    if (body.includes("tool_addition")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "messages.3.role: system messages are not supported for this model" } }));
+    } else anthropicSse(res, "end_turn");
+    return;
+  }
+  // A model the host did not declare the capability for gets no tool change
+  // at all, so this one answers whatever arrives.
+  if (model === "anthropic-tool-append" || model === "anthropic-tool-append-undeclared") {
+    anthropicSse(res, "end_turn");
+    return;
+  }
+  // Check 32: a model that takes a mid-conversation system message, and one
+  // that refuses it.
+  if (model === "anthropic-system-append") {
+    anthropicSse(res, "end_turn");
+    return;
+  }
+  if (model === "anthropic-system-append-refused") {
+    if (parsedBody.messages.some((message) => message.role === "system")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "messages.1.role: Input should be 'user' or 'assistant'" } }));
+    } else anthropicSse(res, "end_turn");
+    return;
+  }
+  if (model === "gpt-5-selfcheck-append-undeclared") {
+    codexSse(res);
+    return;
+  }
+  if (model === "gpt-5-selfcheck-append-refused") {
+    if (body.includes("additional_tools")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "Invalid value: 'additional_tools'. Supported values are: 'message', 'function_call' and 'function_call_output'." } }));
+    } else codexSse(res);
+    return;
+  }
+  if (model === "append-dropped") {
+    sse(res, [chunk({ role: "assistant", content: "" }), chunk({ content: "ok" }), chunk({}, "stop")]);
     return;
   }
   if (model.startsWith("gpt-5-selfcheck-codex")) {
@@ -786,6 +854,13 @@ async function handler(req, res) {
     anthropicSse(res, "end_turn");
     return;
   }
+  // Only a breakpoint (`{"type": "ephemeral"}`) is refused; a tool argument that happens
+  // to be named `cache_control` is the model's data and must survive the strip.
+  if (model === "claude-selfcheck-heal-cache-input") {
+    if (body.includes('"cache_control":{"type":"ephemeral"')) return reject400("system.0.cache_control: Extra inputs are not permitted");
+    anthropicSse(res, "end_turn");
+    return;
+  }
 
   // A stream with every relay oddity Claude Code tolerates: an unknown block type,
   // an unknown delta type, a thinking block missing its text field, a citations
@@ -851,9 +926,10 @@ function safeParse(text) {
 // ---------------------------------------------------------------- Sidecar driver
 
 function startSidecar() {
+  const env = { ...process.env };
   const child = OVERRIDE
-    ? spawn(resolve(here, OVERRIDE), [], { stdio: ["pipe", "pipe", "pipe"] })
-    : spawn(process.execPath, [BUNDLE], { stdio: ["pipe", "pipe", "pipe"] });
+    ? spawn(resolve(here, OVERRIDE), [], { stdio: ["pipe", "pipe", "pipe"], env })
+    : spawn(process.execPath, [BUNDLE], { stdio: ["pipe", "pipe", "pipe"], env });
   const frames = [];
   const waiters = [];
   let buffer = "";
@@ -2116,6 +2192,29 @@ async function main() {
     healCache.type === "done" ? `${cacheCalls.length} 次请求` : JSON.stringify(healCache.error),
   );
 
+  sc.send(anthropicStep("s-heal-cache-input", "claude-selfcheck-heal-cache-input", {
+    system: "你是助手",
+    tools: [{ name: "note", description: "Note", inputSchema: { type: "object", properties: { cache_control: { type: "string" } } } }],
+    messages: [
+      { role: "user", content: "记一下" },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "toolu_note", toolName: "note", input: { cache_control: "keep me" } }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "toolu_note", toolName: "note", output: { type: "text", value: "ok" } }] },
+    ],
+  }));
+  const healInput = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === "s-heal-cache-input");
+  const inputCalls = calls("claude-selfcheck-heal-cache-input");
+  const retriedUse = inputCalls.at(-1)?.body.messages
+    ?.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+    .find((block) => block.type === "tool_use");
+  check(
+    "22 自愈：剥掉断点时不碰工具调用参数里同名的 cache_control",
+    healInput.type === "done"
+      && inputCalls.length === 2
+      && retriedUse?.input?.cache_control === "keep me"
+      && inputCalls[1].body.tools?.[0]?.input_schema?.properties?.cache_control?.type === "string",
+    healInput.type === "done" ? JSON.stringify(retriedUse) : `${inputCalls.length} 次请求：${JSON.stringify(healInput.error)}`,
+  );
+
   // Check 23: the stream is as tolerant as Claude Code's assembler.
   sc.send(anthropicStep("s-tolerant", "claude-selfcheck-tolerant-stream", { reasoning: "high" }));
   const tolerant = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === "s-tolerant");
@@ -2368,6 +2467,340 @@ async function main() {
     wideDone.type === "done" && wideDone.result.text === "wide-ok",
     wideDone.type === "done" ? wideDone.result.text : JSON.stringify(wideDone.error),
   );
+
+  // Check 31: a tool that joined mid-conversation is appended at the host's
+  // marker through the protocol's own interface, never written into the
+  // declared list — and falls back into it where the protocol cannot take it.
+  {
+    const lsTool = { name: "ls", description: "List", inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } };
+    const lateTool = { name: "late", description: "Joined later", inputSchema: { type: "object", properties: {} } };
+    const history = [
+      { role: "user", content: "list" },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_ls", toolName: "ls", input: { path: "." } }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "call_ls", toolName: "ls", output: { type: "text", value: "a" } }] },
+      { role: "system", content: "", providerOptions: { mework: { toolAddition: ["late"] } } },
+    ];
+    // `toolAppend` is the host's word for the model at this endpoint (its
+    // declared capability); the fake upstream's loopback address plays no part.
+    const run = async (id, url, model, family, toolAppend = true) => {
+      sc.send(step(id, url, model, { family, tools: [lsTool, lateTool], messages: structuredClone(history), toolAppend }));
+      const frame = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === id);
+      return { frame, calls: observed.filter((o) => o.body?.model === model) };
+    };
+    const toolNames = (tools) => (tools ?? []).map((tool) => tool.name ?? tool.function?.name).sort().join(",");
+
+    const anthropic = await run("s-append-anthropic", baseURL, "anthropic-tool-append", "anthropic");
+    const anthropicBody = anthropic.calls[0]?.body;
+    const addition = anthropicBody?.messages.at(-1);
+    check(
+      "31 追加工具：Anthropic 以末尾的 tool_addition 送达",
+      anthropic.frame.type === "done" && addition?.role === "system"
+        && JSON.stringify(addition.content) === JSON.stringify([{ type: "tool_addition", tool: { type: "tool_reference", name: "late" } }]),
+      JSON.stringify(addition),
+    );
+    const declared = Object.fromEntries((anthropicBody?.tools ?? []).map((tool) => [tool.name, tool]));
+    check(
+      "31 追加工具：Anthropic 只把追加的工具声明为 deferred",
+      declared.late?.defer_loading === true && declared.ls?.defer_loading === undefined,
+      JSON.stringify(anthropicBody?.tools),
+    );
+    check(
+      "31 追加工具：Anthropic 带上工具变更 beta",
+      (anthropic.calls[0]?.betas ?? "").includes("mid-conversation-tool-changes-2026-07-01"),
+      anthropic.calls[0]?.betas ?? "(无)",
+    );
+    const toolResultTurn = anthropicBody?.messages.at(-2);
+    check(
+      "31 追加工具：缓存断点落在工具结果上而不是追加消息上",
+      JSON.stringify(addition?.content ?? []).includes("cache_control") === false
+        && JSON.stringify(toolResultTurn?.content ?? []).includes("cache_control"),
+      JSON.stringify(toolResultTurn),
+    );
+
+    const undeclared = await run("s-append-anthropic-undeclared", baseURL, "anthropic-tool-append-undeclared", "anthropic", false);
+    const undeclaredBody = undeclared.calls[0]?.body;
+    check(
+      "31 追加工具：模型没声明追加能力时照旧声明，不发工具变更",
+      undeclared.frame.type === "done" && undeclared.calls.length === 1
+        && !undeclaredBody?.messages.some((message) => message.role === "system")
+        && toolNames(undeclaredBody?.tools) === "late,ls"
+        && undeclaredBody?.tools.every((tool) => tool.defer_loading === undefined)
+        && !(undeclared.calls[0]?.betas ?? "").includes("mid-conversation-tool-changes-2026-07-01"),
+      JSON.stringify(undeclaredBody?.messages.at(-1)),
+    );
+    const responsesUndeclared = await run("s-append-responses-undeclared", baseURL, "gpt-5-selfcheck-append-undeclared", "openai-responses", false);
+    const responsesUndeclaredBody = responsesUndeclared.calls[0]?.body;
+    check(
+      "31 追加工具：Responses 模型没声明时照旧声明，不发 additional_tools",
+      responsesUndeclared.frame.type === "done"
+        && !responsesUndeclaredBody?.input.some((entry) => entry.type === "additional_tools" || String(JSON.stringify(entry.content ?? "")).includes("additional_tools"))
+        && toolNames(responsesUndeclaredBody?.tools) === "late,ls",
+      JSON.stringify(responsesUndeclaredBody?.input),
+    );
+
+    const refused = await run("s-append-anthropic-refused", baseURL, "anthropic-tool-append-refused", "anthropic");
+    const healed = refused.calls[1]?.body;
+    check(
+      "31 追加工具：模型拒绝时退回声明列表",
+      refused.frame.type === "done" && refused.calls.length === 2
+        && !healed?.messages.some((message) => message.role === "system")
+        && healed?.tools.every((tool) => tool.defer_loading === undefined)
+        && !(refused.calls[1]?.betas ?? "").includes("mid-conversation-tool-changes-2026-07-01"),
+      `${refused.calls.length} 次请求：${JSON.stringify(healed?.messages.at(-1))}`,
+    );
+
+    const responses = await run("s-append-responses", baseURL, "gpt-5-selfcheck-codex-append", "openai-responses");
+    const responsesBody = responses.calls[0]?.body;
+    const item = responsesBody?.input.at(-1);
+    check(
+      "31 追加工具：Responses 以末尾的 additional_tools 送达",
+      responses.frame.type === "done" && item?.type === "additional_tools" && item.role === "developer"
+        && toolNames(item.tools) === "late",
+      JSON.stringify(item),
+    );
+    check(
+      "31 追加工具：Responses 的 tools 不含追加的工具",
+      toolNames(responsesBody?.tools) === "ls",
+      toolNames(responsesBody?.tools),
+    );
+    // Omitting `strict` puts a Responses tool through strict normalization,
+    // which makes every optional parameter required; declared and appended
+    // tools alike must say `false`.
+    check(
+      "31 追加工具：Responses 的工具声明与追加都是 strict:false",
+      (responsesBody?.tools ?? []).every((tool) => tool.type !== "function" || tool.strict === false)
+        && (item?.tools ?? []).every((tool) => tool.strict === false),
+      JSON.stringify([responsesBody?.tools, item?.tools]),
+    );
+
+    const codex = await run("s-append-codex", codexBaseURL, "gpt-5-selfcheck-codex-append-codex", "openai-codex");
+    const codexBody = codex.calls[0]?.body;
+    check(
+      "31 追加工具：Codex 同样以 additional_tools 送达",
+      codex.frame.type === "done" && codexBody?.input.at(-1)?.type === "additional_tools" && toolNames(codexBody?.tools) === "ls",
+      JSON.stringify(codexBody?.input.at(-1)),
+    );
+    check(
+      "31 追加工具：Codex 的工具声明同样是 strict:false",
+      (codexBody?.tools ?? []).length > 0 && codexBody.tools.every((tool) => tool.strict === false),
+      JSON.stringify(codexBody?.tools),
+    );
+
+    const responsesRefused = await run("s-append-responses-refused", baseURL, "gpt-5-selfcheck-append-refused", "openai-responses");
+    const fallback = responsesRefused.calls[1]?.body;
+    check(
+      "31 追加工具：Responses 拒绝时退回声明列表",
+      responsesRefused.frame.type === "done" && responsesRefused.calls.length === 2
+        && !fallback?.input.some((entry) => entry.type === "additional_tools" || String(entry.content ?? "").includes("additional_tools"))
+        && toolNames(fallback?.tools) === "late,ls",
+      `${responsesRefused.calls.length} 次请求`,
+    );
+
+    const chat = await run("s-append-chat", baseURL, "append-dropped", "openai-compatible");
+    const chatBody = chat.calls[0]?.body;
+    check(
+      "31 追加工具：无追加接口的协议照旧声明",
+      chat.frame.type === "done" && !chatBody?.messages.some((message) => message.role === "system")
+        && toolNames(chatBody?.tools) === "late,ls",
+      toolNames(chatBody?.tools),
+    );
+    check(
+      "31 追加工具：Chat 与 Anthropic 不写 strict（缺省本就是非严格）",
+      (chatBody?.tools ?? []).every((tool) => tool.function?.strict === undefined)
+        && (anthropicBody?.tools ?? []).every((tool) => tool.strict === undefined),
+      JSON.stringify([chatBody?.tools, anthropicBody?.tools]),
+    );
+  }
+
+  // Check 32: a system prompt the host appended mid-conversation reaches the
+  // model at its point as the protocol's own system message, never by
+  // rewriting the system prompt — and is lifted into the system prompt where
+  // the protocol, the model, the placement or the endpoint cannot take it.
+  {
+    const appendedText = "Plan mode is active. Do not edit yet.";
+    const marker = { role: "system", content: appendedText, providerOptions: { mework: { systemAppend: true } } };
+    const run = async (id, url, model, family, messages, extra = {}) => {
+      const start = observed.length;
+      sc.send(step(id, url, model, { family, system: "You are helpful.", messages: structuredClone(messages), ...extra }));
+      const frame = await sc.wait((f) => (f.type === "done" || f.type === "error") && f.id === id);
+      return { frame, calls: observed.slice(start).filter((o) => o.body?.model === model) };
+    };
+    const systemText = (body) => JSON.stringify(body?.system ?? "");
+    const afterUser = [{ role: "user", content: "plan it" }, marker];
+
+    const native = await run("s-sysappend-anthropic", baseURL, "anthropic-system-append", "anthropic", afterUser, { systemAppend: true });
+    const nativeBody = native.calls[0]?.body;
+    const last = nativeBody?.messages.at(-1);
+    check(
+      "32 追加系统提示词：Anthropic 以会话中 system 消息原位送达",
+      native.frame.type === "done" && last?.role === "system"
+        && JSON.stringify(last.content).includes(appendedText) && !systemText(nativeBody).includes(appendedText),
+      JSON.stringify({ last, system: nativeBody?.system }),
+    );
+
+    const unsupported = await run("s-sysappend-anthropic-model", baseURL, "anthropic-system-append", "anthropic", afterUser);
+    const unsupportedBody = unsupported.calls[0]?.body;
+    check(
+      "32 追加系统提示词：模型不支持时并入系统提示词",
+      unsupported.frame.type === "done" && !unsupportedBody?.messages.some((message) => message.role === "system")
+        && systemText(unsupportedBody).includes(appendedText),
+      JSON.stringify(unsupportedBody?.system),
+    );
+
+    const misplaced = await run("s-sysappend-anthropic-placement", baseURL, "anthropic-system-append", "anthropic", [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+      marker,
+    ], { systemAppend: true });
+    const misplacedBody = misplaced.calls[0]?.body;
+    check(
+      "32 追加系统提示词：Anthropic 不合放置规则时并入系统提示词",
+      misplaced.frame.type === "done" && !misplacedBody?.messages.some((message) => message.role === "system")
+        && systemText(misplacedBody).includes(appendedText),
+      JSON.stringify(misplacedBody?.messages),
+    );
+
+    const refused = await run("s-sysappend-anthropic-refused", baseURL, "anthropic-system-append-refused", "anthropic", afterUser, { systemAppend: true });
+    const healed = refused.calls[1]?.body;
+    check(
+      "32 追加系统提示词：端点拒绝时并入系统提示词重发",
+      refused.frame.type === "done" && refused.calls.length === 2
+        && !healed?.messages.some((message) => message.role === "system")
+        && systemText(healed).includes(appendedText),
+      `${refused.calls.length} 次请求：${systemText(healed)}`,
+    );
+
+    const lateTool = { name: "late", description: "Joined later", inputSchema: { type: "object", properties: {} } };
+    const lsTool = { name: "ls", description: "List", inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } };
+    const together = await run("s-sysappend-anthropic-tools", baseURL, "anthropic-system-append", "anthropic", [
+      { role: "user", content: "list" },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_ls", toolName: "ls", input: { path: "." } }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "call_ls", toolName: "ls", output: { type: "text", value: "a" } }] },
+      marker,
+      { role: "system", content: "", providerOptions: { mework: { toolAddition: ["late"] } } },
+    ], { systemAppend: true, toolAppend: true, tools: [lsTool, lateTool] });
+    const section = together.calls[0]?.body?.messages.at(-1);
+    check(
+      "32 追加系统提示词：与追加工具相邻时算作同一段 system，二者都原位送达",
+      together.frame.type === "done" && section?.role === "system"
+        && JSON.stringify(section.content).includes(appendedText) && JSON.stringify(section.content).includes("tool_addition"),
+      JSON.stringify(section),
+    );
+
+    const responses = await run("s-sysappend-responses", baseURL, "gpt-5-selfcheck-codex-system-append", "openai-responses", afterUser, { systemAppend: true });
+    const input = responses.calls[0]?.body?.input ?? [];
+    const userAt = input.findIndex((entry) => entry.role === "user");
+    const appendedAt = input.findIndex((entry) => JSON.stringify(entry.content ?? "").includes(appendedText));
+    check(
+      "32 追加系统提示词：Responses 以原位的 system/developer 项送达",
+      responses.frame.type === "done" && appendedAt > userAt && userAt >= 0
+        && ["system", "developer"].includes(input[appendedAt]?.role),
+      JSON.stringify(input),
+    );
+
+    const chat = await run("s-sysappend-chat", baseURL, "append-dropped", "openai-compatible", afterUser);
+    const chatMessages = chat.calls[0]?.body?.messages ?? [];
+    check(
+      "32 追加系统提示词：模型没声明时并入开头的系统提示词",
+      chat.frame.type === "done" && chatMessages[0]?.role === "system"
+        && JSON.stringify(chatMessages[0].content).includes(appendedText)
+        && chatMessages.slice(1).every((message) => message.role !== "system"),
+      JSON.stringify(chatMessages),
+    );
+
+    // A Chat endpoint the user declared it for (a relay, DeepSeek) keeps it in
+    // place: the sidecar does not second-guess the host's word.
+    const declared = await run("s-sysappend-chat-declared", baseURL, "append-dropped", "openai-compatible", afterUser, { systemAppend: true });
+    const declaredMessages = declared.calls[0]?.body?.messages ?? [];
+    const declaredAt = declaredMessages.findIndex((message) => JSON.stringify(message.content ?? "").includes(appendedText));
+    check(
+      "32 追加系统提示词：声明了能力的 Chat 端点原位送达",
+      declared.frame.type === "done" && declaredAt > 0
+        && declaredMessages[declaredAt].role === "system"
+        && declaredMessages[declaredAt - 1]?.role === "user"
+        && !JSON.stringify(declaredMessages[0]?.content ?? "").includes(appendedText),
+      JSON.stringify(declaredMessages),
+    );
+  }
+
+  // Check 36: each level reaches each family as that model's own control,
+  // clamped down to what the model takes (`reasoning.ts`). Relayed Claude
+  // bodies go through the adaptive rewrite, so the effort is read from
+  // `output_config` and the budget from its share.
+  {
+    const bodyOf = async (id, frame, model) => {
+      const start = observed.length;
+      sc.send(frame);
+      const done = await sc.wait((f) => f.id === id && ["done", "error"].includes(f.type));
+      return { done, bodies: observed.slice(start).filter((o) => o.body?.model === model).map((o) => o.body) };
+    };
+    const claudeLevel = async (id, model, reasoning) => {
+      const { done, bodies } = await bodyOf(id, anthropicStep(id, model, { reasoning }), model);
+      return { done, body: bodies[0] };
+    };
+    let claude = await claudeLevel("s-level-max", "claude-selfcheck-level", "max");
+    check(
+      "36 思考档位：Anthropic 的 max 经 provider options 到达 output_config.effort",
+      claude.done.type === "done" && claude.body?.output_config?.effort === "max"
+        && claude.body?.thinking?.type === "enabled" && claude.body.thinking.budget_tokens === Math.round(2048 * 0.9),
+      JSON.stringify({ thinking: claude.body?.thinking, output_config: claude.body?.output_config }),
+    );
+    claude = await claudeLevel("s-level-46", "claude-opus-4-6-selfcheck-level", "xhigh");
+    check(
+      "36 思考档位：4.6 没有 xhigh，extra 降到 high 而不是被 SDK 抬到 max",
+      claude.done.type === "done" && claude.body?.output_config?.effort === "high",
+      JSON.stringify(claude.body?.output_config),
+    );
+    claude = await claudeLevel("s-level-46-max", "claude-opus-4-6-selfcheck-level-max", "max");
+    check(
+      "36 思考档位：4.6 的 max 照发",
+      claude.done.type === "done" && claude.body?.output_config?.effort === "max",
+      JSON.stringify(claude.body?.output_config),
+    );
+
+    const responsesLevel = async (id, model, reasoning) => {
+      const { done, bodies } = await bodyOf(id, { ...responsesStep(id, model), payload: { ...responsesStep(id, model).payload, reasoning } }, model);
+      return { done, body: bodies[0] };
+    };
+    let responses = await responsesLevel("s-level-r56", "gpt-5.6-selfcheck-level", "max");
+    check(
+      "36 思考档位：GPT-5.6 的 max 原样到达 reasoning.effort",
+      responses.done.type === "done" && responses.body?.reasoning?.effort === "max",
+      JSON.stringify(responses.body?.reasoning),
+    );
+    responses = await responsesLevel("s-level-r5", "gpt-5-selfcheck-level", "max");
+    check(
+      "36 思考档位：GPT-5 只到 high，max 降到 high",
+      responses.done.type === "done" && responses.body?.reasoning?.effort === "high",
+      JSON.stringify(responses.body?.reasoning),
+    );
+
+    let chat = await bodyOf("s-level-4o", step("s-level-4o", baseURL, "gpt-4o-selfcheck-level", { reasoning: "high" }), "gpt-4o-selfcheck-level");
+    check(
+      "36 思考档位：gpt-4o 不带 reasoning_effort（带任何值都是 400）",
+      chat.done.type === "done" && chat.bodies.length === 1 && !("reasoning_effort" in chat.bodies[0]),
+      JSON.stringify(chat.bodies.map((body) => body.reasoning_effort)),
+    );
+    chat = await bodyOf("s-level-refuse", step("s-level-refuse", baseURL, "level-refuses-max", { reasoning: "max" }), "level-refuses-max");
+    check(
+      "36 思考档位：端点拒绝 max 时按它列出的值降到 xhigh 重发",
+      chat.done.type === "done" && JSON.stringify(chat.bodies.map((body) => body.reasoning_effort)) === '["max","xhigh"]',
+      JSON.stringify({ type: chat.done.type, efforts: chat.bodies.map((body) => body.reasoning_effort) }),
+    );
+    chat = await bodyOf("s-level-refuse-2", step("s-level-refuse-2", baseURL, "level-refuses-max", { reasoning: "max" }), "level-refuses-max");
+    check(
+      "36 思考档位：记住了这个端点的答复，下一轮直接发 xhigh",
+      chat.done.type === "done" && JSON.stringify(chat.bodies.map((body) => body.reasoning_effort)) === '["xhigh"]',
+      JSON.stringify(chat.bodies.map((body) => body.reasoning_effort)),
+    );
+    chat = await bodyOf("s-level-field", step("s-level-field", baseURL, "level-refuses-field", { reasoning: "low" }), "level-refuses-field");
+    check(
+      "36 思考档位：不支持该字段的模型去掉 reasoning_effort 重发",
+      chat.done.type === "done" && chat.bodies.length === 2 && chat.bodies[0].reasoning_effort === "low"
+        && !("reasoning_effort" in chat.bodies[1]),
+      JSON.stringify({ type: chat.done.type, bodies: chat.bodies.map((body) => body.reasoning_effort ?? null) }),
+    );
+  }
 
   // Check 30: the claude-agent family against the Claude Code executable Mework
   // ships (the Agent SDK's platform package) and a scripted Anthropic upstream.

@@ -1,4 +1,5 @@
 import { hasBackendRuntime, invoke } from "./backend";
+import type { RunTarget } from "../types";
 
 /**
  * The single entry point for a click on a file path the app detected.
@@ -28,6 +29,21 @@ const LINE_ATTRIBUTE = "data-mework-path-line";
 /** Attribute carrying the directory relative paths resolve against. */
 const BASE_ATTRIBUTE = "data-mework-path-base";
 
+/**
+ * Attribute carrying the machine a surface's paths are on, as its key (`local`,
+ * `wsl:<distro>`, `ssh:<id>`): set by a document the file pane shows, whose
+ * paths are on the document's machine whatever the conversation's workspaces are.
+ */
+const MACHINE_ATTRIBUTE = "data-mework-path-machine";
+
+/** The machine a key names, or undefined when it names none. */
+export function machineFromKey(key: string | null | undefined): RunTarget | null | undefined {
+  if (key === "local") return null;
+  if (key?.startsWith("wsl:") && key.length > 4) return { kind: "wsl", distro: key.slice(4) };
+  if (key?.startsWith("ssh:") && key.length > 4) return { kind: "ssh", machineId: key.slice(4) };
+  return undefined;
+}
+
 /** A click on a detected path, before anything has decided what to do with it. */
 export interface PathOpenRequest {
   /** Exactly what the link carries: absolute, or relative to `baseDir`. */
@@ -46,6 +62,19 @@ export interface PathOpenRequest {
    * in the review pane on its diff, and only anything else in the file pane.
    */
   review?: boolean;
+  /**
+   * Set by a tool row's file name: the file opens in a page of its own in the
+   * file pane rather than in the preview page a passing click reuses.
+   */
+  newPage?: boolean;
+  /**
+   * The machine the path is on, when the surface that showed it says so — a
+   * document in the file pane. Absent, the path is somewhere among the
+   * conversation's workspaces, and the handler works out where.
+   */
+  machine?: RunTarget | null;
+  /** The link's box, for a menu that opens where the link is. */
+  anchor?: { left: number; top: number; right: number; bottom: number };
 }
 
 /**
@@ -67,6 +96,31 @@ export function setPathOpenHandler(handler: PathOpenHandler): () => void {
   return () => {
     if (openHandler === handler) openHandler = null;
   };
+}
+
+/**
+ * Told when the pointer reaches a path, before anything is clicked: a path that
+ * could be in several places can be looked up on every machine while the reader
+ * is still deciding, so the click finds the answer waiting.
+ */
+export type PathPrefetchHandler = (request: PathOpenRequest) => void;
+
+let prefetchHandler: PathPrefetchHandler | null = null;
+
+/** Installs the hover handler and returns a function that removes exactly it. */
+export function setPathPrefetchHandler(handler: PathPrefetchHandler): () => void {
+  prefetchHandler = handler;
+  return () => {
+    if (prefetchHandler === handler) prefetchHandler = null;
+  };
+}
+
+/**
+ * Tells the app the pointer has rested on a path a surface opens through
+ * `openPath` itself rather than through a `data-mework-path` element.
+ */
+export function prefetchPath(request: PathOpenRequest): void {
+  prefetchHandler?.(request);
 }
 
 /** Matches the host's own rule so a relative path is recognized identically. */
@@ -128,6 +182,31 @@ export function openPath(
   return true;
 }
 
+/** What a detected path's button says about itself and where it sits. */
+function requestFor(owner: HTMLElement): PathOpenRequest | null {
+  const path = owner.getAttribute(PATH_ATTRIBUTE);
+  if (!path) return null;
+  const baseDir = owner.closest<HTMLElement>(`[${BASE_ATTRIBUTE}]`)?.getAttribute(BASE_ATTRIBUTE) ?? null;
+  const declaredLine = Number.parseInt(owner.getAttribute(LINE_ATTRIBUTE) ?? "", 10);
+  const line = Number.isSafeInteger(declaredLine) && declaredLine > 0 ? declaredLine : null;
+  const machine = machineFromKey(owner.closest<HTMLElement>(`[${MACHINE_ATTRIBUTE}]`)?.getAttribute(MACHINE_ATTRIBUTE));
+  const box = owner.getBoundingClientRect();
+  return {
+    path,
+    baseDir,
+    line,
+    ...(machine !== undefined ? { machine } : {}),
+    anchor: { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+  };
+}
+
+/**
+ * How long the pointer rests on a path before it is looked up: long enough to
+ * pass over links on the way somewhere else, a fraction of how long the reader
+ * takes to click.
+ */
+const PREFETCH_DWELL_MS = 60;
+
 /** Installs the document interceptor and returns its cleanup function. */
 export function installPathLinkInterceptor(
   documentRef: Document = document,
@@ -137,19 +216,36 @@ export function installPathLinkInterceptor(
     if (!activationClick(event)) return;
     const owner = pathTarget(event);
     if (!owner) return;
-    const path = owner.getAttribute(PATH_ATTRIBUTE);
-    if (!path) return;
-    const baseDir = owner.closest<HTMLElement>(`[${BASE_ATTRIBUTE}]`)?.getAttribute(BASE_ATTRIBUTE) ?? null;
-    const declaredLine = Number.parseInt(owner.getAttribute(LINE_ATTRIBUTE) ?? "", 10);
-    const line = Number.isSafeInteger(declaredLine) && declaredLine > 0 ? declaredLine : null;
-    if (!openPath({ path, baseDir, line }, reveal)) return;
+    const request = requestFor(owner);
+    if (!request || !openPath(request, reveal)) return;
     event.preventDefault();
     event.stopPropagation();
   };
+  // Once per link the pointer rests on, not per movement inside it, and not for
+  // every link a pointer sweeping across a reply passes over.
+  let hovered: HTMLElement | null = null;
+  let dwell: ReturnType<typeof setTimeout> | null = null;
+  const hover = (event: MouseEvent) => {
+    const owner = pathTarget(event);
+    if (owner === hovered) return;
+    hovered = owner;
+    if (dwell !== null) clearTimeout(dwell);
+    dwell = null;
+    if (!owner || !prefetchHandler) return;
+    dwell = setTimeout(() => {
+      dwell = null;
+      if (hovered !== owner || !prefetchHandler) return;
+      const request = requestFor(owner);
+      if (request) prefetchHandler(request);
+    }, PREFETCH_DWELL_MS);
+  };
   documentRef.addEventListener("click", handle, true);
   documentRef.addEventListener("auxclick", handle, true);
+  documentRef.addEventListener("mouseover", hover, true);
   return () => {
+    if (dwell !== null) clearTimeout(dwell);
     documentRef.removeEventListener("click", handle, true);
     documentRef.removeEventListener("auxclick", handle, true);
+    documentRef.removeEventListener("mouseover", hover, true);
   };
 }

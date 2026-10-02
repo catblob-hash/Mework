@@ -1,4 +1,4 @@
-import { Eye } from "lucide-react";
+import { Eye, MessageSquarePlus, Wrench } from "lucide-react";
 import { useI18n } from "../../i18n";
 import type { TranslationFunction } from "../../i18n";
 import type { ModelCapability } from "../../types";
@@ -12,12 +12,16 @@ import type { ModelCapability } from "../../types";
 export function capabilityLabel(t: TranslationFunction, capability: ModelCapability): string {
   switch (capability) {
     case "image_recognition": return t("视觉输入", "Vision");
+    case "tool_append": return t("中途追加工具", "Mid-conversation tools");
+    case "system_append": return t("中途追加系统提示词", "Mid-conversation system prompts");
   }
 }
 
 export function capabilityIcon(capability: ModelCapability, size = 13) {
   switch (capability) {
     case "image_recognition": return <Eye size={size} />;
+    case "tool_append": return <Wrench size={size} />;
+    case "system_append": return <MessageSquarePlus size={size} />;
   }
 }
 

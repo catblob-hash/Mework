@@ -16,3 +16,4 @@ pub mod safetensors;
 pub mod scheduler;
 pub mod service;
 pub mod tokenizer;
+pub mod vision;

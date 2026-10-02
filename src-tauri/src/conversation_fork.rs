@@ -109,6 +109,7 @@ pub fn fork_contexts(
                 content: content.clone(),
                 local_only: *local_only,
                 hook_execution: hook_execution.clone(),
+                tools_added: Vec::new(),
                 created_at: created_at.clone(),
             },
             ContextItem::User {
@@ -178,6 +179,7 @@ pub fn fork_contexts(
                 input,
                 result,
                 subagent,
+                notice,
                 created_at,
                 ..
             } => {
@@ -220,6 +222,7 @@ pub fn fork_contexts(
                     input: input.clone(),
                     result: result.clone(),
                     subagent: subagent.clone(),
+                    notice: notice.clone(),
                     attestation,
                     created_at: created_at.clone(),
                 }

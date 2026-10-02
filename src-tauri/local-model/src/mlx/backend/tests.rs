@@ -17,6 +17,7 @@ use crate::engine::{greedy, prefix_tokens, suffix_tokens, Specials};
 use crate::mlx::weights::convert;
 use crate::safetensors::SafeTensors;
 use crate::tokenizer::Tokenizer;
+use crate::vision::VisionTower;
 
 /// Transformers' top-two margin below which float16 may pick the other token.
 const NEAR_TIE: f64 = 0.25;
@@ -97,7 +98,7 @@ fn generate(
         }
     };
     for (i, (slot, tokens)) in requests.iter().enumerate() {
-        let logits = backend.admit(*slot, prefix, tokens).unwrap();
+        let logits = backend.admit_tokens(*slot, prefix, tokens).unwrap();
         accept(backend, &mut out[i], &mut live[i], *slot, &logits);
     }
     loop {
@@ -171,7 +172,7 @@ fn generates_like_transformers() {
 
     // Step cost with one live slot (three others admitted and waiting), then all four.
     let admit_all = |backend: &mut MlxBackend| -> Vec<u32> {
-        (0..4).map(|slot| greedy(&backend.admit(slot, &prefix, &requests[slot % 2]).unwrap(), &specials)).collect()
+        (0..4).map(|slot| greedy(&backend.admit_tokens(slot, &prefix, &requests[slot % 2]).unwrap(), &specials)).collect()
     };
     let timed = |backend: &mut MlxBackend, first: &[u32], live: usize| {
         let mut tokens = first.to_vec();
@@ -205,7 +206,49 @@ fn generates_like_transformers() {
     }
 
     backend.trim();
-    let logits = backend.admit(0, &prefix, &requests[0]).unwrap();
+    let logits = backend.admit_tokens(0, &prefix, &requests[0]).unwrap();
     assert_eq!(greedy(&logits, &specials), alone[0].tokens[0], "admit after trim");
     backend.release(0);
+}
+
+/// The golden image request (`testdata/vision-golden.json`): the picture's
+/// rows from the CPU tower, 3-D rotary positions, and decoding after them at
+/// the shifted position, against transformers' greedy reply.
+#[test]
+fn reads_images_like_transformers() {
+    let Some(official) = std::env::var_os("MEWORK_LOCAL_MODEL_DIR").map(PathBuf::from) else {
+        eprintln!("跳过：未设置 MEWORK_LOCAL_MODEL_DIR（官方模型目录）");
+        return;
+    };
+    let tokenizer = Tokenizer::from_file(&official.join("tokenizer.json")).unwrap();
+    let specials = Specials::from_tokenizer(&tokenizer).unwrap();
+    let golden = crate::vision::tests::golden_request(&tokenizer);
+    let margins: Vec<f64> = serde_json::from_value(crate::vision::tests::golden_json()["margins"].clone()).unwrap();
+    let dir = build_dir(&official);
+    let vision = crate::vision::VisionConfig::load(&official.join("config.json")).unwrap();
+    let tower = VisionTower::open(vision, &official.join("model.safetensors")).unwrap();
+    let mut backend = MlxBackend::load(&dir, 4, 1024).unwrap().with_vision(tower);
+    let prefix = backend.prefix_state(&golden.prefix).unwrap();
+    let text = suffix_tokens(&tokenizer, &specials, "Name three colors.", 512);
+
+    // The image in slot 2 while a text request runs in slot 0.
+    let started = Instant::now();
+    let mut image = vec![greedy(&backend.admit(2, &prefix, &golden.input).unwrap(), &specials)];
+    eprintln!("[mlx] image admit {:.0} ms", ms(started));
+    let mut other = greedy(&backend.admit_tokens(0, &prefix, &text).unwrap(), &specials);
+    while image.len() < golden.expected.len() {
+        let all = backend.step(&[(0, other), (2, *image.last().unwrap())]).unwrap();
+        other = greedy(&all[0], &specials);
+        image.push(greedy(&all[1], &specials));
+    }
+    backend.release(0);
+    backend.release(2);
+    eprintln!("[mlx] image -> {:?}", tokenizer.decode(&image));
+    match divergence(&image, &golden.expected) {
+        None => eprintln!("[mlx] image: matches transformers ({} tokens)", image.len()),
+        Some(k) => {
+            assert!(margins[k] < NEAR_TIE, "image: differs from transformers at token {k} (its margin {})", margins[k]);
+            eprintln!("[mlx] image: matches transformers up to token {k}, a near tie ({:.3})", margins[k]);
+        }
+    }
 }

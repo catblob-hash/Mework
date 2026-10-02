@@ -2,12 +2,22 @@ import { RotateCcw, ShieldCheck } from "lucide-react";
 import type { JSX } from "react";
 import { useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
-import { DEFAULT_SANDBOX_ALLOWLIST, defaultSandboxSettings, localSandboxSupport, setupLocalSandbox } from "../../lib/runtime";
-import type { SandboxNetworkMode, SandboxSettings as SandboxSettingsType, SandboxSupport } from "../../types";
+import { DEFAULT_SANDBOX_ALLOWLIST, defaultSandboxSettings, machineSandboxSupport, setupLocalSandbox } from "../../lib/runtime";
+import { runEnvKey } from "../../lib/workspaces";
+import type {
+  RunTarget,
+  SandboxNetworkMode,
+  SandboxSettings as SandboxSettingsType,
+  SandboxSupport
+} from "../../types";
 import { Switch } from "../Common";
 import "./SandboxSettings.css";
 
 interface SandboxSettingsProps {
+  /** The machine the workspace is on; `null` is this computer. */
+  machine: RunTarget | null;
+  /** How the page names that machine: "This computer", "WSL: Ubuntu", "SSH: devbox". */
+  machineName: string;
   settings: SandboxSettingsType | undefined;
   onChange: (settings: SandboxSettingsType) => void;
 }
@@ -54,32 +64,40 @@ function ListField({
 }
 
 /**
- * The sandbox one conversation's commands run in: one sandboxed agent process
- * per machine the conversation uses, enforced by the operating system
- * (Seatbelt on macOS, bubblewrap and seccomp on Linux and WSL 2, srt-win's
- * restricted account and firewall rules on Windows). A page of the
- * conversation-settings pane, so a preset opened in that pane carries one too:
- * the conversation is the smallest thing a sandbox is ever drawn around. Off
- * unless switched on; a machine that cannot sandbox refuses the command rather
- * than running it unsandboxed. Windows needs a one-time setup with
- * administrator rights, started here — that part belongs to the computer, not
- * to the conversation.
+ * The sandbox one workspace's commands run in: sandboxed agent processes on
+ * the workspace's machine, one per conversation working there, enforced by the
+ * operating system (Seatbelt on macOS, bubblewrap and seccomp on Linux and
+ * WSL 2, srt-win's restricted account and firewall rules on Windows). Part of
+ * the workspace's settings, beside its variables: whether the code in a
+ * directory is trusted is a question about the directory. Off unless switched
+ * on; a machine that cannot sandbox refuses the command rather than running it
+ * unsandboxed.
+ *
+ * What the machine can do is asked of the agent on that machine — this
+ * computer, a WSL distribution, an SSH machine — not of the one showing the
+ * page. Windows needs a one-time setup with administrator rights: this
+ * computer's starts here; an SSH machine's has to be run on that machine,
+ * which its agent's answer says how to do.
  */
-export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): JSX.Element {
+export function SandboxSettings({ machine, machineName, settings, onChange }: SandboxSettingsProps): JSX.Element {
   const { t } = useI18n();
   const current = settings ?? defaultSandboxSettings();
   const [support, setSupport] = useState<SandboxSupport | null | "loading">("loading");
   const [settingUp, setSettingUp] = useState(false);
   const [setupError, setSetupError] = useState<string | null>(null);
+  // The machine by its key, so an equal target rebuilt on each render asks once.
+  const machineKey = runEnvKey(machine);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `machineKey` is `machine`'s identity.
   useEffect(() => {
     let live = true;
-    localSandboxSupport()
+    setSupport("loading");
+    machineSandboxSupport(machine)
       .then((result) => { if (live) setSupport(result); })
       .catch((error: unknown) => {
         if (live) setSupport({ backend: "", available: false, detail: String(error), setup: false });
       });
     return () => { live = false; };
-  }, []);
+  }, [machineKey]);
   const setUp = () => {
     setSettingUp(true);
     setSetupError(null);
@@ -99,17 +117,20 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
       : backend === "srt-win"
         ? t("Windows 沙箱", "Windows sandbox")
         : backend;
-  const status = support === "loading"
-    ? t("正在检查这台电脑……", "Checking this computer…")
+  // Led by the machine's name: the answer is that machine's, whichever computer shows it.
+  const status = `${machineName} · ${support === "loading"
+    ? t("正在检查……", "Checking…")
     : support === null
       ? t("浏览器预览中无法检查。", "Cannot be checked in the browser preview.")
       : support.available
-        ? t("这台电脑可以使用：{backend}", "Available on this computer: {backend}", { backend: backendName(support.backend) })
-        : t("这台电脑不可用：{detail}", "Not available on this computer: {detail}", {
+        ? t("可以使用：{backend}", "Available: {backend}", { backend: backendName(support.backend) })
+        : t("不可用：{detail}", "Not available: {detail}", {
           detail: support.detail || backendName(support.backend)
-        });
+        })}`;
   const unavailable = support !== "loading" && support !== null && !support.available;
-  const needsSetup = unavailable && support.setup;
+  // Only this computer's setup can be started from here: an SSH machine's needs an
+  // administrator at that machine, and its agent's answer above names the command.
+  const needsSetup = unavailable && support.setup && machine === null;
 
   return (
     <section className="sandbox-settings-page">
@@ -149,8 +170,8 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
             <strong>{t("沙箱里的命令", "What sandboxed commands can do")}</strong>
             <ul className="sandbox-settings-page__list">
               <li>{t(
-                "只能写对话在这台机器上的工作区、自己的临时目录和包缓存；工作区里会在沙箱外执行的文件（.git/hooks、.git/config、.mework、.vscode、.envrc 等）仍然只读。",
-                "Write only the conversation's workspaces on the machine, its own temporary directory and package caches — and not the files in them that run outside the sandbox later (.git/hooks, .git/config, .mework, .vscode, .envrc and the like)."
+                "只能写这个工作区、自己的临时目录和包缓存——以及同一对话里、同一台机器上沙箱设置与它完全相同的其他工作区；工作区里会在沙箱外执行的文件（.git/hooks、.git/config、.mework、.vscode、.envrc 等）仍然只读。",
+                "Write only this workspace, their own temporary directory and package caches — and any other workspace of the same conversation on the machine whose sandbox is set exactly the same — but not the files in them that run outside the sandbox later (.git/hooks, .git/config, .mework, .vscode, .envrc and the like)."
               )}</li>
               <li>{t(
                 "读不到凭据：SSH 与 GPG 密钥、云与包仓库令牌、钥匙串、浏览器资料、Mework 自己的密钥库和数据；名字像密钥的环境变量也会被去掉。",
@@ -161,13 +182,13 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
                 "Reach the network only through a proxy outside the sandbox, which applies the rules below and never connects to loopback, private or cloud-metadata addresses."
               )}</li>
               <li>{t(
-                "看不到、也碰不到沙箱外的进程：Mework、代理进程和其他对话的进程。",
-                "Cannot see or touch processes outside the sandbox: Mework, its agent, other conversations."
+                "看不到、也碰不到沙箱外的进程：Mework、代理进程，以及其他对话的进程——每个对话在这个工作区里各有自己的沙箱进程。",
+                "Cannot see or touch processes outside the sandbox: Mework, its agent, other conversations' — each conversation working here has sandboxed processes of its own."
               )}</li>
             </ul>
             <small>{t(
-              "适用于 shell 工具和后台命令，在本机、WSL 2 与 SSH 机器上由 Mework 的代理进程执行。Linux 与 WSL 需要系统自带的 bubblewrap；Windows 需要设置一次：这台电脑在这里设置，SSH 连接的 Windows 机器要在那台机器上以管理员身份设置（命令被拒绝时会给出要运行的命令）。机器不能沙箱时，命令会被拒绝，而不是在沙箱外运行。文件工具、预览服务器、LSP、MCP 服务器、hooks 和你自己打开的终端不在沙箱里。",
-              "Applies to the shell tool and background commands, carried out by Mework's agent on this computer, in WSL 2 and on SSH machines. Linux and WSL need the system's bubblewrap; Windows needs setting up once — this computer here, a Windows machine over SSH by an administrator on that machine (a refused command names what to run). On a machine that cannot sandbox, commands are refused rather than run outside it. File tools, preview servers, language servers, MCP servers, hooks and terminals you open yourself are not sandboxed."
+              "适用于在这个工作区里运行的 shell 工具和后台命令，由 Mework 在工作区所在机器上的代理进程执行。Linux 与 WSL 需要系统自带的 bubblewrap；Windows 需要设置一次：这台电脑在这里设置，SSH 连接的 Windows 机器要在那台机器上以管理员身份设置（上面会给出要运行的命令）。机器不能沙箱时，命令会被拒绝，而不是在沙箱外运行。文件工具、预览服务器、LSP、MCP 服务器、hooks 和你自己打开的终端不在沙箱里。",
+              "Applies to the shell tool and background commands run in this workspace, carried out by Mework's agent on the workspace's machine. Linux and WSL need the system's bubblewrap; Windows needs setting up once — this computer here, a Windows machine over SSH by an administrator on that machine (the status above names what to run). On a machine that cannot sandbox, commands are refused rather than run outside it. File tools, preview servers, language servers, MCP servers, hooks and terminals you open yourself are not sandboxed."
             )}</small>
           </div>
         </div>
@@ -229,8 +250,8 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
         <ListField
           label={t("额外可写目录", "Further writable directories")}
           description={t(
-            "这个对话在各台机器上的沙箱都可写，在哪台机器上存在就在哪台生效。绝对路径或以 ~ 开头。",
-            "Writable by this conversation's sandbox on whichever machine has them. Absolute, or starting with ~."
+            "这个工作区的沙箱也可以写这些目录，指的是工作区所在机器上的路径。绝对路径或以 ~ 开头。",
+            "Writable by this workspace's sandbox too: paths on the workspace's machine. Absolute, or starting with ~."
           )}
           value={current.writable}
           placeholder={"~/shared-data"}
@@ -239,8 +260,8 @@ export function SandboxSettings({ settings, onChange }: SandboxSettingsProps): J
         <ListField
           label={t("额外禁读路径", "Further unreadable paths")}
           description={t(
-            "内置的凭据位置之外，这个对话的沙箱也读不到这些。",
-            "Besides the built-in credential locations, this conversation's sandbox cannot read these."
+            "内置的凭据位置之外，这个工作区的沙箱也读不到这些。",
+            "Besides the built-in credential locations, this workspace's sandbox cannot read these."
           )}
           value={current.denyRead}
           placeholder={"~/secrets"}

@@ -16,6 +16,7 @@ import {
   FolderTree,
   GitFork,
   Globe,
+  Handshake,
   Image,
   Inbox,
   ListChecks,
@@ -27,6 +28,7 @@ import {
   MousePointerClick,
   Network,
   NotebookPen,
+  NotebookText,
   Plug,
   ScanSearch,
   Search,
@@ -43,6 +45,7 @@ import type { LucideIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { t as globalT, useI18n } from "../i18n";
+import { stripAnsi } from "../lib/ansi";
 import { backendOfTool, shellBackendLabel } from "../lib/machineShells";
 import { parseWaitOutput, questionsFromInput } from "../lib/orchestration";
 import { webSourceIcon as siteIcon } from "../lib/runtime";
@@ -50,6 +53,7 @@ import { agentTimelineRunStatus, initialMessage, isChildMainMessageContext } fro
 import type { JsonValue, SubagentUpdate, ToolContext, ToolDescriptor } from "../types";
 import { DiffOutput, parseUnifiedDiff } from "./DiffOutput";
 import { ImageStrip } from "./ImageStrip";
+import { PathText } from "./PathText";
 import "./ToolRenderers.css";
 
 export type ToolSurface = "group" | "question" | "workflow";
@@ -68,7 +72,6 @@ export type ToolViewFamily =
   | "browser-json"
   | "browser-page"
   | "memory"
-  | "persistent"
   | "question"
   | "agent-run"
   | "agent-wait"
@@ -90,9 +93,9 @@ export type SummaryKind =
   | "browser"
   | "fork"
   | "hook"
-  | "state"
   | "skill"
   | "memory"
+  | "handoff"
   | "search"
   | "reads"
   | "files"
@@ -112,15 +115,20 @@ interface ToolViewConfig {
   /** `undefined` falls back to the phase's static title. */
   resolveTitle?: (item: ToolContext, phase: "done" | "running" | "failed", t: Translate) => string | undefined;
   /**
-   * Action-multiplexed tools resolve their icon and detail family per call.
-   *
-   * `todo` is one wire tool covering four operations; without these, creating a
-   * task and reading the list would render as one generic card. Ordinary tools
-   * leave both unset and use the static fields.
+   * A finished call's title that names what it acted on — the file it read or
+   * wrote, the pattern it looked for — in place of the phrase. `undefined`
+   * (no path, no pattern) keeps the phrase.
    */
-  resolveIcon?: (item: ToolContext) => LucideIcon;
+  resolveSubject?: (item: ToolContext, t: Translate) => SubjectTitle | undefined;
+  /**
+   * A tool whose one wire name carries more than one contract resolves its
+   * detail family per call (a saved `send_message` from a child is a note, not
+   * a run). Ordinary tools leave it unset and use the static field.
+   */
   resolveFamily?: (item: ToolContext) => ToolViewFamily;
   target?: PresentationResolver;
+  /** The target is a path, drawn so that it gives way in the middle rather than cut at its end. */
+  targetIsPath?: boolean;
   stat?: PresentationResolver;
   /**
    * The arguments worth reading, in the order the card should show them.
@@ -135,12 +143,51 @@ interface ToolViewConfig {
   summaryKind: SummaryKind;
 }
 
+/**
+ * A title that names something, in parts: the words around the subject and the
+ * subject itself, so a row can set it apart — a file to open, a pattern to read
+ * as code. The parts joined are the title.
+ */
+export interface TitleSubject {
+  before: string;
+  text: string;
+  after: string;
+  /** The subject is this file, as the call named it: a click opens it in the file pane. */
+  path?: string;
+  /** Where in the file the call started reading. */
+  line?: number;
+  /** The subject is a pattern or a query, set in the code face. */
+  code?: boolean;
+}
+
+interface SubjectTitle {
+  subject: TitleSubject;
+  /** Lines the call added and removed. */
+  counts?: { additions: number; deletions: number };
+  /** What it found: how many files or matches. */
+  note?: string;
+}
+
 export interface ToolPresentation {
   surface: ToolSurface;
   family: ToolViewFamily;
   icon: LucideIcon;
   title: string;
+  /** See `TitleSubject`; absent, the title is a phrase with nothing to set apart. */
+  subject?: TitleSubject;
+  /**
+   * Lines a file change added and removed, from the diff the host made of the
+   * file when it wrote it — not Git's: the call's own change, whatever else the
+   * working tree holds.
+   */
+  counts?: { additions: number; deletions: number };
+  /** A figure the title carries after its subject: "12 matches". */
+  note?: string;
+  /** A failed call's title without its reason: what failed. */
+  failure?: string;
   target?: string;
+  /** See `ToolViewConfig.targetIsPath`. */
+  targetIsPath?: boolean;
   stat?: string;
   keys?: readonly string[];
 }
@@ -185,6 +232,11 @@ function compact(value: string | undefined, limit = 108): string | undefined {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (!normalized) return undefined;
   return normalized.length > limit ? `${normalized.slice(0, limit - 1).trimEnd()}…` : normalized;
+}
+
+/** A path target, whole: the surface that draws it shortens it in the middle (`PathText`). */
+function pathTarget(value: string | undefined): string | undefined {
+  return compact(value, Number.POSITIVE_INFINITY);
 }
 
 function targetSelector(item: ToolContext): string | undefined {
@@ -282,6 +334,135 @@ function writeTitle(item: ToolContext, phase: "done" | "running" | "failed", t: 
     : t("写入了文件", "Wrote file");
 }
 
+/** Stands where the subject goes in a translated title, so the parts around it can be found. */
+const SUBJECT_MARK = "\u0000";
+
+/**
+ * `template` is a title translated with `SUBJECT_MARK` for its subject; the
+ * subject goes where the translation put it.
+ */
+function subjectTitle(
+  template: string,
+  text: string,
+  extra: Omit<TitleSubject, "before" | "text" | "after"> = {}
+): TitleSubject {
+  const cut = template.indexOf(SUBJECT_MARK);
+  return cut < 0
+    ? { before: template, text, after: "", ...extra }
+    : { before: template.slice(0, cut), text, after: template.slice(cut + SUBJECT_MARK.length), ...extra };
+}
+
+/** A path's last name: what a row calls the file. */
+function baseName(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return trimmed.slice(cut + 1) || trimmed || path;
+}
+
+function diffCounts(item: ToolContext): SubjectTitle["counts"] {
+  if (!item.result.diff) return undefined;
+  const parsed = parseUnifiedDiff(item.result.diff);
+  return { additions: parsed.additions, deletions: parsed.deletions };
+}
+
+function readSubject(item: ToolContext, t: Translate): SubjectTitle | undefined {
+  const path = inputString(item, "path");
+  if (!path) return undefined;
+  const start = Math.floor(inputNumber(item, "start_line") ?? 1);
+  return {
+    subject: subjectTitle(t("已读取：{name}", "Read {name}", { name: SUBJECT_MARK }), baseName(path), {
+      path,
+      ...(start > 1 ? { line: start } : {})
+    })
+  };
+}
+
+function editSubject(item: ToolContext, t: Translate): SubjectTitle | undefined {
+  const path = inputString(item, "path");
+  if (!path) return undefined;
+  const counts = diffCounts(item);
+  return {
+    subject: subjectTitle(t("已编辑：{name}", "Edited {name}", { name: SUBJECT_MARK }), baseName(path), { path }),
+    ...(counts ? { counts } : {})
+  };
+}
+
+function writeSubject(item: ToolContext, t: Translate): SubjectTitle | undefined {
+  const path = inputString(item, "path");
+  if (!path) return undefined;
+  const created = item.result.diff?.replace(/\r\n?/g, "\n").split("\n").some((line) => line === "--- /dev/null");
+  const template = created
+    ? t("已创建：{name}", "Created {name}", { name: SUBJECT_MARK })
+    : t("已写入：{name}", "Wrote {name}", { name: SUBJECT_MARK });
+  const counts = diffCounts(item);
+  return { subject: subjectTitle(template, baseName(path), { path }), ...(counts ? { counts } : {}) };
+}
+
+/**
+ * The files `find` listed, past its notes. A count the host had to stop short
+ * of reads as a floor: the list shows the first of more matches.
+ */
+function findCount(item: ToolContext): { count: number; more: boolean } {
+  const lines = outputLines(item.result.output).map((line) => line.trim()).filter(Boolean);
+  const empty = ["No matching files", "未找到匹配文件"]; // i18n-audit-ignore: parses backend sentinels
+  const entries = lines.filter((line) => !line.startsWith("(") && !line.startsWith("… ") && !empty.includes(line));
+  return { count: entries.length, more: lines.some((line) => /^\(Showing \d+ of \d+/.test(line)) };
+}
+
+/** The matching lines `grep` returned, past its notes and the entries it could not read. */
+function grepCount(item: ToolContext): { count: number; more: boolean } {
+  const lines = outputLines(item.result.output);
+  return {
+    count: lines.filter((line) => parseGrepLine(line).path !== undefined).length,
+    more: lines.some((line) => line.startsWith("… "))
+  };
+}
+
+function findSubject(item: ToolContext, t: Translate): SubjectTitle | undefined {
+  const query = compact(inputString(item, "query"));
+  if (!query) return undefined;
+  const { count, more } = findCount(item);
+  return {
+    subject: subjectTitle(t("已查找：{query}", "Found {query}", { query: SUBJECT_MARK }), query, { code: true }),
+    note: more
+      ? t("{count}+ 个结果", "{count}+ results", { count })
+      : t("{count} 个结果", "{count} results", { count })
+  };
+}
+
+function grepSubject(item: ToolContext, t: Translate): SubjectTitle | undefined {
+  const pattern = compact(inputString(item, "pattern"));
+  if (!pattern) return undefined;
+  const { count, more } = grepCount(item);
+  return {
+    subject: subjectTitle(t("已搜索：{pattern}", "Searched for {pattern}", { pattern: SUBJECT_MARK }), pattern, { code: true }),
+    note: more
+      ? t("{count}+ 处匹配", "{count}+ matches", { count })
+      : t("{count} 处匹配", "{count} matches", { count })
+  };
+}
+
+/** How much of an error's line a title carries; the row ellipsizes what does not fit. */
+const ERROR_EXCERPT_LIMIT = 240;
+
+/**
+ * The line of a failed call's output that says what went wrong: its first, or
+ * for a command the first after the `Exit code N` it leads with, which says
+ * only that it failed.
+ */
+export function errorExcerpt(output: string): string | undefined {
+  const lines = stripAnsi(output).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const line = lines.length > 1 && /^Exit code \S+$/.test(lines[0]!) ? lines[1] : lines[0];
+  if (!line) return undefined;
+  const flat = line.replace(/\s+/g, " ");
+  return flat.length > ERROR_EXCERPT_LIMIT ? `${flat.slice(0, ERROR_EXCERPT_LIMIT - 1).trimEnd()}…` : flat;
+}
+
+/** A failed call's title: what failed, then why — the local model's reason, or the error's own line. */
+function failureTitle(phrase: string, reason: string | undefined, t: Translate): string {
+  return reason ? t("{title}：{reason}", "{title}: {reason}", { title: phrase, reason }) : phrase;
+}
+
 /** Non-empty output lines, which is how every text-answering preview tool reports its size. */
 function outputLineCount(item: ToolContext): number {
   return outputLines(item.result.output).filter((line) => line.trim()).length;
@@ -326,103 +507,38 @@ function resizeStat(item: ToolContext): string | undefined {
   const height = inputNumber(item, "height");
   return width !== undefined && height !== undefined ? `${width}×${height}` : browserDuration(item);
 }
-/**
- * Presentation of one `todo` action.
- *
- * The task-state surface is one wire tool multiplexed by `action`, but creating a
- * task and reading the list are not the same event to a reader. Each action
- * keeps the icon, titles, target, stat AND detail family it had when it was its
- * own catalog entry — writes get the structured state view, reads keep the raw
- * output.
- */
-interface StateToolActionView {
-  family: ToolViewFamily;
-  icon: LucideIcon;
-  doneTitle: TitleResolver;
-  runningTitle: TitleResolver;
-  failedTitle: TitleResolver;
-  target?: PresentationResolver;
-  stat?: PresentationResolver;
-}
 
 /**
- * Task status is a wire enum. The old compact state marker localized
- * it and the ordinary row has to keep doing so: `in_progress` on screen is a
- * protocol value leaking into copy, and it is untranslatable for an English
- * reader who never sees the wire.
+ * What a host notice card says it is, by the kind its `notice` names. Mirrors
+ * Rust `handoff::NOTICE_KIND` and `wire_history::notice_kind`; a delivered
+ * background result names no kind and keeps the default title.
  */
-function todoStatusLabel(item: ToolContext, t: Translate): string | undefined {
-  switch (inputString(item, "status")) {
-    case "pending": return t("待处理", "Pending");
-    case "in_progress": return t("进行中", "In progress");
-    case "completed": return t("已完成", "Completed");
-    case "deleted": return t("已删除", "Deleted");
-    default: return compact(inputString(item, "status"));
-  }
-}
-
-const TODO_ACTION_VIEWS: Record<string, StateToolActionView> = {
-  create: {
-    family: "persistent",
-    icon: ListChecks,
-    doneTitle: (t) => t("创建了任务", "Created task"),
-    runningTitle: (t) => t("正在创建任务", "Creating task"),
-    failedTitle: (t) => t("创建任务失败", "Failed to create task"),
-    target: (item) => compact(inputString(item, "subject"))
-  },
-  update: {
-    family: "persistent",
-    icon: ListChecks,
-    doneTitle: (t) => t("更新了任务", "Updated task"),
-    runningTitle: (t) => t("正在更新任务", "Updating task"),
-    failedTitle: (t) => t("更新任务失败", "Failed to update task"),
-    target: (item) => compact(inputString(item, "subject") ?? inputString(item, "taskId")),
-    stat: todoStatusLabel
-  },
-  get: {
-    family: "raw",
-    icon: ListChecks,
-    doneTitle: (t) => t("读取了任务", "Read task"),
-    runningTitle: (t) => t("正在读取任务", "Reading task"),
-    failedTitle: (t) => t("读取任务失败", "Failed to read task"),
-    target: (item) => compact(inputString(item, "taskId"))
-  },
-  list: {
-    family: "raw",
-    icon: ListChecks,
-    doneTitle: (t) => t("列出了任务", "Listed tasks"),
-    runningTitle: (t) => t("正在列出任务", "Listing tasks"),
-    failedTitle: (t) => t("列出任务失败", "Failed to list tasks"),
-    stat: (item, t) => {
-      const count = arrayLength(parsedRecord(item)?.tasks);
-      return count === undefined ? undefined : t("{count} 项", "{count} tasks", { count });
-    }
-  }
+const HOST_NOTICE_TITLES: Record<string, (t: Translate) => string> = {
+  handoff: (t) => t("上下文已达自动压缩阈值，请求交接", "Context reached the auto-compact threshold; handoff requested"),
+  handoff_index: (t) => t("送达了交接文档索引", "Delivered the handoff notes index"),
+  plan_mode: (t) => t("送达了计划模式引导", "Delivered the plan mode guidance"),
+  plan_mode_exit: (t) => t("送达了计划模式结束说明", "Delivered the plan mode exit note"),
+  output_truncated: (t) => t("回复超出输出上限，请求继续", "Reply hit the output limit; asked to continue"),
+  structured_output: (t) => t("提醒通过 structured_output 返回结果", "Reminded to return the result through structured_output"),
+  hook_context: (t) => t("送达了钩子补充的上下文", "Delivered context from a hook"),
+  skill_added: (t) => t("送达了新增的技能", "Delivered a newly added skill"),
+  diagnostics: (t) => t("送达了语言服务器诊断", "Delivered language-server diagnostics"),
+  file_changes: (t) => t("送达了文件变更通知", "Delivered a file-change notice")
 };
 
 /**
- * A streamed call can reach the timeline before its arguments finish parsing,
- * so an unresolved action falls back to the write card: it is the surface the
- * call is most likely to be, and it never hides the row.
+ * A card written before cards held the whole message named its kind in its
+ * input (`notification.kind`); those keep their titles.
  */
-function stateToolView(
-  views: Record<string, StateToolActionView>,
-  item: ToolContext
-): StateToolActionView {
-  const action = inputString(item, "action");
-  return (action && views[action]) || views.create;
+function legacyNoticeKind(item: ToolContext): string | undefined {
+  const notification = item.input.notification;
+  if (typeof notification !== "object" || notification === null || Array.isArray(notification)) return undefined;
+  return typeof notification.kind === "string" ? notification.kind : undefined;
 }
 
-function stateToolTitle(
-  views: Record<string, StateToolActionView>,
-  item: ToolContext,
-  phase: "done" | "running" | "failed",
-  t: Translate
-): string {
-  const view = stateToolView(views, item);
-  if (phase === "running") return view.runningTitle(t);
-  if (phase === "failed") return view.failedTitle(t);
-  return view.doneTitle(t);
+function hostNoticeTitle(item: ToolContext, t: Translate): string | undefined {
+  const kind = item.notice ?? legacyNoticeKind(item);
+  return kind ? HOST_NOTICE_TITLES[kind]?.(t) : undefined;
 }
 
 /**
@@ -524,17 +640,17 @@ function webSearchTitle(
  * renderer family, but no tool silently falls into a category-wide default.
  */
 export const TOOL_VIEW_REGISTRY = {
-  ls: { surface: "group", family: "file-list", icon: FolderTree, doneTitle: (t) => t("查看了目录", "Viewed directory"), runningTitle: (t) => t("正在查看目录", "Viewing directory"), failedTitle: (t) => t("查看目录失败", "Failed to view directory"), target: (item) => compact(inputString(item, "path") ?? "."), stat: fileListStat, summaryKind: "files" },
-  grep: { surface: "group", family: "grep", icon: Search, doneTitle: (t) => t("搜索了文件内容", "Searched file contents"), runningTitle: (t) => t("正在搜索文件内容", "Searching file contents"), failedTitle: (t) => t("搜索文件内容失败", "File-content search failed"), target: (item) => compact(inputString(item, "pattern")), stat: grepStat, summaryKind: "search" },
+  ls: { surface: "group", family: "file-list", icon: FolderTree, doneTitle: (t) => t("查看了目录", "Viewed directory"), runningTitle: (t) => t("正在查看目录", "Viewing directory"), failedTitle: (t) => t("查看目录失败", "Failed to view directory"), target: (item) => pathTarget(inputString(item, "path") ?? "."), targetIsPath: true, stat: fileListStat, summaryKind: "files" },
+  grep: { surface: "group", family: "grep", icon: Search, doneTitle: (t) => t("搜索了文件内容", "Searched file contents"), resolveSubject: grepSubject, runningTitle: (t) => t("正在搜索文件内容", "Searching file contents"), failedTitle: (t) => t("搜索文件内容失败", "File-content search failed"), target: (item) => compact(inputString(item, "pattern")), stat: grepStat, summaryKind: "search" },
   powershell: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 PowerShell 命令", "Ran PowerShell command"), runningTitle: (t) => t("正在运行 PowerShell 命令", "Running PowerShell command"), failedTitle: (t) => t("PowerShell 命令失败", "PowerShell command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   bash: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 Bash 命令", "Ran Bash command"), runningTitle: (t) => t("正在运行 Bash 命令", "Running Bash command"), failedTitle: (t) => t("Bash 命令失败", "Bash command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   zsh: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 zsh 命令", "Ran zsh command"), runningTitle: (t) => t("正在运行 zsh 命令", "Running zsh command"), failedTitle: (t) => t("zsh 命令失败", "zsh command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   sh: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 sh 命令", "Ran sh command"), runningTitle: (t) => t("正在运行 sh 命令", "Running sh command"), failedTitle: (t) => t("sh 命令失败", "sh command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
-  write: { surface: "group", family: "diff", icon: FilePenLine, doneTitle: (t) => t("写入了文件", "Wrote file"), resolveTitle: writeTitle, target: (item) => compact(inputString(item, "path")), stat: diffStat, summaryKind: "fileChanges" },
-  edit: { surface: "group", family: "diff", icon: FilePenLine, doneTitle: (t) => t("编辑了文件", "Edited file"), runningTitle: (t) => t("正在编辑文件", "Editing file"), failedTitle: (t) => t("编辑文件失败", "Failed to edit file"), target: (item) => compact(inputString(item, "path")), stat: diffStat, summaryKind: "fileChanges" },
-  find: { surface: "group", family: "file-list", icon: FileSearch, doneTitle: (t) => t("查找了文件", "Found files"), runningTitle: (t) => t("正在查找文件", "Finding files"), failedTitle: (t) => t("查找文件失败", "Failed to find files"), target: (item) => compact(inputString(item, "query")), stat: fileListStat, summaryKind: "files" },
-  read: { surface: "group", family: "read", icon: FileText, doneTitle: (t) => t("读取了文件", "Read file"), runningTitle: (t) => t("正在读取文件", "Reading file"), failedTitle: (t) => t("读取文件失败", "Failed to read file"), target: (item) => compact(inputString(item, "path")), stat: readStat, summaryKind: "reads" },
-  lsp: { surface: "group", family: "raw", icon: Waypoints, doneTitle: (t) => t("查询了代码语义", "Queried code semantics"), runningTitle: (t) => t("正在查询代码语义", "Querying code semantics"), failedTitle: (t) => t("查询代码语义失败", "Code semantics query failed"), target: (item) => compact(inputString(item, "filePath") ?? ""), keys: ["operation", "filePath", "line", "character", "query"], summaryKind: "search" },
+  write: { surface: "group", family: "diff", icon: FilePenLine, doneTitle: (t) => t("写入了文件", "Wrote file"), resolveTitle: writeTitle, resolveSubject: writeSubject, target: (item) => pathTarget(inputString(item, "path")), targetIsPath: true, stat: diffStat, summaryKind: "fileChanges" },
+  edit: { surface: "group", family: "diff", icon: FilePenLine, doneTitle: (t) => t("编辑了文件", "Edited file"), resolveSubject: editSubject, runningTitle: (t) => t("正在编辑文件", "Editing file"), failedTitle: (t) => t("编辑文件失败", "Failed to edit file"), target: (item) => pathTarget(inputString(item, "path")), targetIsPath: true, stat: diffStat, summaryKind: "fileChanges" },
+  find: { surface: "group", family: "file-list", icon: FileSearch, doneTitle: (t) => t("查找了文件", "Found files"), resolveSubject: findSubject, runningTitle: (t) => t("正在查找文件", "Finding files"), failedTitle: (t) => t("查找文件失败", "Failed to find files"), target: (item) => compact(inputString(item, "query")), stat: fileListStat, summaryKind: "files" },
+  read: { surface: "group", family: "read", icon: FileText, doneTitle: (t) => t("读取了文件", "Read file"), resolveSubject: readSubject, runningTitle: (t) => t("正在读取文件", "Reading file"), failedTitle: (t) => t("读取文件失败", "Failed to read file"), target: (item) => pathTarget(inputString(item, "path")), targetIsPath: true, stat: readStat, summaryKind: "reads" },
+  lsp: { surface: "group", family: "raw", icon: Waypoints, doneTitle: (t) => t("查询了代码语义", "Queried code semantics"), runningTitle: (t) => t("正在查询代码语义", "Querying code semantics"), failedTitle: (t) => t("查询代码语义失败", "Code semantics query failed"), target: (item) => pathTarget(inputString(item, "filePath") ?? ""), targetIsPath: true, keys: ["operation", "filePath", "line", "character", "query"], summaryKind: "search" },
 
   workflow: { surface: "workflow", family: "raw", icon: Workflow, doneTitle: (t) => t("完成了工作流", "Completed workflow"), runningTitle: (t) => t("正在运行工作流", "Running workflow"), failedTitle: (t) => t("工作流运行失败", "Workflow failed"), keys: ["name"], summaryKind: "agents" },
   workflow_step: { surface: "group", family: "agent-run", icon: Bot, doneTitle: (t) => t("完成了工作流步骤", "Completed workflow step"), runningTitle: (t) => t("正在运行工作流步骤", "Running workflow step"), failedTitle: (t) => t("工作流步骤失败", "Workflow step failed"), target: (item) => compact(inputString(item, "label") ?? inputString(item, "name")), summaryKind: "agents" },
@@ -583,6 +699,9 @@ export const TOOL_VIEW_REGISTRY = {
   // splits the drained `[name · status]` envelopes; `agent-note` is a one-shot
   // message whose payload already sits in the row's target.
   agent_spawn: { surface: "group", family: "agent-run", icon: Bot, doneTitle: (t) => t("派生了子代理", "Spawned subagent"), runningTitle: (t) => t("正在派生子代理", "Spawning subagent"), failedTitle: (t) => t("派生子代理失败", "Failed to spawn subagent"), target: (item) => compact(inputString(item, "label") ?? inputString(item, "name")), summaryKind: "agents" },
+  // Retired names, kept so saved conversations still render their cards:
+  // `agent_send`, and the `send_message` / `followup_task` pair that replaced
+  // it. None of them is in the catalog any more; nothing issues them.
   agent_send: { surface: "group", family: "agent-run", icon: MessageCircleMore, doneTitle: (t) => t("向子代理发送了消息", "Sent message to subagent"), runningTitle: (t) => t("正在向子代理发送消息", "Sending message to subagent"), failedTitle: (t) => t("发送子代理消息失败", "Failed to send subagent message"), target: (item) => compact(inputString(item, "agent")), summaryKind: "agents" },
   send_message: {
     surface: "group",
@@ -610,7 +729,17 @@ export const TOOL_VIEW_REGISTRY = {
   task_list: { surface: "group", family: "agent-note", icon: ListChecks, doneTitle: (t) => t("查看了任务列表", "Viewed task list"), runningTitle: (t) => t("正在查看任务列表", "Viewing task list"), failedTitle: (t) => t("查看任务列表失败", "Failed to view task list"), summaryKind: "agents" },
   // The host fabricates the call and owns the body, so the row only ever
   // settles as done; the notification text is the result, hence raw detail.
-  box: { surface: "group", family: "raw", icon: Inbox, doneTitle: (t) => t("送达了后台结果", "Delivered a background result"), keys: [], summaryKind: "agents" },
+  // The same carrier brings the host's own notices; each names itself in the
+  // card's `notice` so the row can say what arrived.
+  box: {
+    surface: "group",
+    family: "raw",
+    icon: Inbox,
+    doneTitle: (t) => t("送达了后台结果", "Delivered a background result"),
+    resolveTitle: (item, _phase, t) => hostNoticeTitle(item, t),
+    keys: [],
+    summaryKind: "agents"
+  },
 
   // Skills return instruction text, so they use raw detail; the skill name is
   // this call's only input and becomes its target.
@@ -648,18 +777,6 @@ export const TOOL_VIEW_REGISTRY = {
     keys: ["prompt"],
     summaryKind: "fork"
   },
-  todo: {
-    surface: "group",
-    family: "persistent",
-    icon: ListChecks,
-    doneTitle: (t) => t("更新了任务清单", "Updated task list"),
-    resolveTitle: (item, phase, t) => stateToolTitle(TODO_ACTION_VIEWS, item, phase, t),
-    resolveIcon: (item) => stateToolView(TODO_ACTION_VIEWS, item).icon,
-    resolveFamily: (item) => stateToolView(TODO_ACTION_VIEWS, item).family,
-    target: (item, t) => stateToolView(TODO_ACTION_VIEWS, item).target?.(item, t),
-    stat: (item, t) => stateToolView(TODO_ACTION_VIEWS, item).stat?.(item, t),
-    summaryKind: "state"
-  },
   // The plan itself has a page of its own, so these rows only say what happened;
   // the body is never repeated inline.
   plan: {
@@ -688,6 +805,52 @@ export const TOOL_VIEW_REGISTRY = {
     failedTitle: (t) => t("提交计划失败", "Failed to submit the plan"),
     keys: [],
     summaryKind: "other"
+  },
+  // Handoff notes are the host's own notebook, not memory: the note travels
+  // in the call's input, so the row opens onto it.
+  read_handoff_note: {
+    surface: "group",
+    family: "raw",
+    icon: NotebookText,
+    doneTitle: (t) => t("读取了交接文档", "Read handoff note"),
+    runningTitle: (t) => t("正在读取交接文档", "Reading handoff note"),
+    failedTitle: (t) => t("读取交接文档失败", "Failed to read handoff note"),
+    target: memoryTarget,
+    keys: ["name"],
+    summaryKind: "handoff"
+  },
+  create_handoff_note: {
+    surface: "group",
+    family: "raw",
+    icon: NotebookPen,
+    doneTitle: (t) => t("写了交接文档", "Wrote handoff note"),
+    runningTitle: (t) => t("正在写交接文档", "Writing handoff note"),
+    failedTitle: (t) => t("写交接文档失败", "Failed to write handoff note"),
+    target: memoryTarget,
+    keys: ["name", "description", "content"],
+    summaryKind: "handoff"
+  },
+  edit_handoff_note: {
+    surface: "group",
+    family: "raw",
+    icon: NotebookPen,
+    doneTitle: (t) => t("修改了交接文档", "Edited handoff note"),
+    runningTitle: (t) => t("正在修改交接文档", "Editing handoff note"),
+    failedTitle: (t) => t("修改交接文档失败", "Failed to edit handoff note"),
+    target: memoryTarget,
+    keys: ["name", "description", "old_text", "new_text"],
+    summaryKind: "handoff"
+  },
+  // The result names the conversation the work went on in.
+  handoff: {
+    surface: "group",
+    family: "raw",
+    icon: Handshake,
+    doneTitle: (t) => t("已交接到新会话", "Handed off to a new conversation"),
+    runningTitle: (t) => t("正在交接", "Handing off"),
+    failedTitle: (t) => t("交接未完成", "Handoff not completed"),
+    keys: [],
+    summaryKind: "handoff"
   },
   read_global_memory: {
     surface: "group",
@@ -876,16 +1039,24 @@ export function toolRowName(item: ToolContext, descriptor?: ToolDescriptor): str
 /**
  * `explanation` is the local helper model's one-line description of a shell
  * command; when present it replaces the whole title, prefixed with the shell.
+ *
+ * A failed call's title says why after what failed: `errorExplanation`, the
+ * local helper model's reason, or until there is one (or with that use off)
+ * the error's own line.
  */
 export function getToolPresentation(
   item: ToolContext,
   descriptor?: ToolDescriptor,
   t: Translate = globalT,
-  explanation?: string
+  explanation?: string,
+  errorExplanation?: string
 ): ToolPresentation {
   const config = registryEntry(item.toolName);
+  const phase = executionPhase(item);
+  const reason = phase === "failed"
+    ? errorExplanation?.trim() || errorExcerpt(item.result.output)
+    : undefined;
   if (!config) {
-    const phase = executionPhase(item);
     const duration = item.result.durationMs > 0 ? `${item.result.durationMs} ms` : undefined;
     if (isMcpToolName(item.toolName)) {
       const { server, tool } = mcpToolNaming(item, descriptor);
@@ -897,8 +1068,9 @@ export function getToolPresentation(
         title: phase === "running"
           ? t("正在调用 MCP 工具 {label}", "Calling MCP tool {label}", { label: tool })
           : phase === "failed"
-            ? t("MCP 工具 {label} 调用失败", "MCP tool {label} failed", { label: tool })
+            ? failureTitle(t("MCP 工具 {label} 调用失败", "MCP tool {label} failed", { label: tool }), reason, t)
             : t("调用了 MCP 工具 {label}", "Called MCP tool {label}", { label: tool }),
+        ...(phase === "failed" ? { failure: t("MCP 工具 {label} 调用失败", "MCP tool {label} failed", { label: tool }) } : {}),
         ...(target ? { target } : {}),
         ...(duration ? { stat: duration } : {})
       };
@@ -911,30 +1083,39 @@ export function getToolPresentation(
       title: phase === "running"
         ? t("正在使用 {label}", "Using {label}", { label })
         : phase === "failed"
-          ? t("{label}执行失败", "{label} failed", { label })
+          ? failureTitle(t("{label}执行失败", "{label} failed", { label }), reason, t)
           : t("使用了 {label}", "Used {label}", { label }),
+      ...(phase === "failed" ? { failure: t("{label}执行失败", "{label} failed", { label }) } : {}),
       stat: duration
     };
   }
-  const phase = executionPhase(item);
   const shell = backendOfTool(item.toolName);
   const explained = shell && explanation?.trim()
     ? phase === "failed"
       ? t("{shell}：{text}（失败）", "{shell}: {text} (failed)", { shell: shellBackendLabel(shell), text: explanation.trim() })
       : t("{shell}：{text}", "{shell}: {text}", { shell: shellBackendLabel(shell), text: explanation.trim() })
     : undefined;
-  const title = explained
-    ?? config.resolveTitle?.(item, phase, t)
+  const named = phase === "done" ? config.resolveSubject?.(item, t) : undefined;
+  const phrase = config.resolveTitle?.(item, phase, t)
     ?? (phase === "running" ? config.runningTitle : phase === "failed" ? config.failedTitle : config.doneTitle)?.(t)
     ?? config.doneTitle(t);
+  const title = reason
+    ? failureTitle(phrase, reason, t)
+    : explained
+      ?? (named ? `${named.subject.before}${named.subject.text}${named.subject.after}` : phrase);
   const target = config.target?.(item, t);
   const stat = config.stat?.(item, t);
   return {
     surface: config.surface,
     family: config.resolveFamily?.(item) ?? config.family,
-    icon: config.resolveIcon?.(item) ?? config.icon,
+    icon: config.icon,
     title,
+    ...(named && !explained ? { subject: named.subject } : {}),
+    ...(named?.counts ? { counts: named.counts } : {}),
+    ...(named?.note ? { note: named.note } : {}),
+    ...(phase === "failed" ? { failure: phrase } : {}),
     ...(target ? { target } : {}),
+    ...(target && config.targetIsPath ? { targetIsPath: true } : {}),
     ...(stat ? { stat } : {}),
     ...(config.keys ? { keys: config.keys } : {})
   };
@@ -963,15 +1144,15 @@ function summaryPhrase(kind: SummaryKind, count: number, t: Translate): string {
     case "hook": return count === 1
       ? t("触发了 1 个 hook", "Triggered 1 hook")
       : t("触发了 {count} 个 hook", "Triggered {count} hooks", { count });
-    case "state": return count === 1
-      ? t("1 次状态变更", "1 state change")
-      : t("{count} 次状态变更", "{count} state changes", { count });
     case "skill": return count === 1
       ? t("读取了 1 个技能", "Loaded 1 skill")
       : t("读取了 {count} 个技能", "Loaded {count} skills", { count });
     case "memory": return count === 1
       ? t("访问了 1 次记忆", "Accessed memory once")
       : t("访问了 {count} 次记忆", "Accessed memory {count} times", { count });
+    case "handoff": return count === 1
+      ? t("1 次交接操作", "1 handoff action")
+      : t("{count} 次交接操作", "{count} handoff actions", { count });
     case "search": return count === 1
       ? t("搜索了 1 次内容", "Performed 1 content search")
       : t("搜索了 {count} 次内容", "Performed {count} content searches", { count });
@@ -1005,7 +1186,6 @@ const SUMMARY_ORDER: readonly SummaryKind[] = [
   "browser",
   "fork",
   "hook",
-  "state",
   "skill",
   "memory",
   "search",
@@ -1113,8 +1293,11 @@ function GrepView({ item }: { item: ToolContext }) {
         return (
           <li key={`${index}:${raw}`}>
             <span className="tool-renderer__grep-location">
-              <code>{match.path}</code>
-              <span aria-label={t("第 {line} 行", "Line {line}", { line: match.line })}>{match.line}</span>
+              <PathText className="tool-renderer__grep-path" path={match.path} />
+              <span
+                className="tool-renderer__grep-line"
+                aria-label={t("第 {line} 行", "Line {line}", { line: match.line })}
+              >{match.line}</span>
             </span>
             <code className="tool-renderer__grep-content">{match.content}</code>
           </li>
@@ -1132,7 +1315,7 @@ function ReadView({ item }: { item: ToolContext }) {
     return <EmptyResult>{t("文件内容为空", "File is empty")}</EmptyResult>;
   }
   if (!item.result.output) return null;
-  const gutter = Math.max(2, String(start + Math.max(0, lines.length - 1)).length);
+  const gutter = String(start + Math.max(0, lines.length - 1)).length;
   return (
     <div
       className="diff-output"
@@ -1450,10 +1633,16 @@ function MemoryView({
   const tier = item.toolName.includes("_global_")
     ? t("全局记忆", "Global memory")
     : t("项目记忆", "Project memory");
+  // A memory tool is an ordinary tool: what it wrote is on the card like any
+  // other call's arguments — the whole body of a new document, or the passage an
+  // edit replaced and what replaced it.
   const rows: KvRow[] = [
     [t("范围", "Tier"), tier],
     [t("文档", "Document"), compact(inputString(item, "name"), 160)],
-    [t("索引描述", "Index description"), compact(inputString(item, "description"), 300)]
+    [t("索引描述", "Index description"), compact(inputString(item, "description"), 300)],
+    [t("内容", "Content"), inputString(item, "content")],
+    [t("原文", "Old text"), inputString(item, "old_text")],
+    [t("新文", "New text"), inputString(item, "new_text")]
   ];
   if (failed) {
     return (
@@ -1568,22 +1757,6 @@ function AgentNoteView({ item }: { item: ToolContext }) {
     ?? inputString(item, "content")
     ?? inputString(item, "status");
   return <KeyValueCard rows={[[t("内容", "Message"), message]]} result={item.result.output} />;
-}
-
-/** A `todo` write: the fields the call set, plus the host's receipt. */
-function StateToolView({ item }: { item: ToolContext }) {
-  const { t } = useI18n();
-  return (
-    <KeyValueCard
-      rows={[
-        [t("标题", "Subject"), inputString(item, "subject")],
-        [t("状态", "Status"), todoStatusLabel(item, t)],
-        [t("任务 ID", "Task id"), inputString(item, "taskId")],
-        [t("说明", "Description"), inputString(item, "description")]
-      ]}
-      result={item.result.output}
-    />
-  );
 }
 
 /**
@@ -1702,7 +1875,7 @@ function ErrorView({ item, presentation }: { item: ToolContext; presentation: To
     <div className="tool-renderer__error" role="alert">
       <CircleAlert size={16} aria-hidden="true" />
       <div>
-        <strong>{presentation.title}</strong>
+        <strong>{presentation.failure ?? presentation.title}</strong>
         <pre>{item.result.output || t("工具执行失败，未返回错误详情", "The tool failed without returning error details")}</pre>
       </div>
     </div>
@@ -1730,7 +1903,6 @@ function detailBody(
     case "agent-run": return <AgentRunView item={item} />;
     case "agent-wait": return <AgentWaitView item={item} />;
     case "agent-note": return <AgentNoteView item={item} />;
-    case "persistent": return <StateToolView item={item} />;
     case "web-search": return <WebSearchView item={item} presentation={presentation} />;
     default: return <RawView item={item} presentation={presentation} />;
   }
@@ -1772,7 +1944,7 @@ export function ToolDetailRenderer({
               ? null
               : detailBody(item, presentation)}
       </div>
-      {presentation.family !== "memory" && <RawDataDisclosure item={item} />}
+      <RawDataDisclosure item={item} />
     </section>
   );
 }

@@ -15,7 +15,7 @@
 .diff-viewer__files[hidden] { display: none; }
 .diff-viewer__file-list {
   flex: 1; min-height: 0; padding: 6px 4px;
-  display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column; overflow-y: scroll; overflow-x: hidden;
 }
 
 .diff-viewer__tree-file { position: relative; display: flex; align-items: center; border-radius: 5px; }
@@ -60,7 +60,7 @@
   flex: 1; min-width: 0; min-height: 0;
   display: flex; flex-direction: column; overflow: hidden;
 }
-.diff-viewer__scroll { flex: 1; min-height: 0; overflow-y: auto; }
+.diff-viewer__scroll { flex: 1; min-height: 0; overflow-y: scroll; }
 .diff-viewer__empty {
   margin: 0; padding: 32px 16px; color: var(--muted); font-size: 11.5px; text-align: center;
 }
@@ -104,86 +104,81 @@
 /* ---- code ---- */
 
 .diff-viewer__code {
-  --diff-gutter: 3ch;
-  --diff-number-width: calc(var(--diff-gutter) + 2ch + 5px);
   display: grid; overflow-x: auto;
   font: 12px/17px var(--mono); tab-size: 2;
   background: var(--panel);
   padding-bottom: 8px;
+  -webkit-user-select: text; user-select: text;
 }
-/* One number column: the new file's line, or the old one where there is no new one. */
+/* Side by side, each side is selected on its own: a press in one column leaves the other
+   unselectable until the next press (`selectionRegions.ts`), so a selection runs down one side
+   and copies as that side's lines. */
+.diff-viewer__code[data-selection-column-active="old"] [data-selection-column="new"],
+.diff-viewer__code[data-selection-column-active="new"] [data-selection-column="old"] {
+  -webkit-user-select: none; user-select: none;
+}
+/* One number column in either layout — the new file's line, or the old one where there is no
+   new one — exactly as wide as the file's widest number. Side by side, the two sides split
+   what is left evenly; a side whose lines run longer than its half takes their length, and
+   the grid scrolls sideways as one. */
 .diff-viewer__code--unified {
-  grid-template-columns: var(--diff-number-width) minmax(max-content, 1fr);
+  grid-template-columns: max-content minmax(max-content, 1fr);
 }
 .diff-viewer__code--split {
-  grid-template-columns:
-    var(--diff-number-width) minmax(max-content, 1fr)
-    var(--diff-number-width) minmax(max-content, 1fr);
+  grid-template-columns: max-content minmax(max-content, 1fr) minmax(max-content, 1fr);
 }
-/* Wrapping stops the grid from growing past the pane, so it also stops the scroll. */
+/* Wrapping stops the grid from growing past the pane, so it also stops the scroll, and the
+   two sides are always exactly half each. */
 .diff-viewer__code--wrap { overflow-x: hidden; }
 .diff-viewer__code--wrap.diff-viewer__code--unified {
-  grid-template-columns: var(--diff-number-width) minmax(0, 1fr);
+  grid-template-columns: max-content minmax(0, 1fr);
 }
 .diff-viewer__code--wrap.diff-viewer__code--split {
-  grid-template-columns:
-    var(--diff-number-width) minmax(0, 1fr)
-    var(--diff-number-width) minmax(0, 1fr);
+  grid-template-columns: max-content minmax(0, 1fr) minmax(0, 1fr);
 }
 
 /* Lines and rows are grid pass-throughs so every cell aligns across the whole file. */
 .diff-viewer__line, .diff-viewer__row { display: contents; }
 
+/* No padding either side and no tint: a change colours its line, never its number. */
 .diff-viewer__number {
   position: sticky; left: 0; z-index: 1;
-  padding-left: calc(2ch + 5px); padding-right: 1ch;
-  text-align: right; user-select: none;
+  padding: 0;
+  text-align: right; -webkit-user-select: none; user-select: none;
   background: var(--panel); color: color-mix(in srgb, var(--text) 60%, var(--panel));
 }
-.diff-viewer__code--split .diff-viewer__number--right { position: static; }
+/* With no number column between them, a rule is what tells the two sides apart. */
+.diff-viewer__text--right { border-left: 1px solid var(--border); }
 
-/* The marker is drawn, not typed: a `+` in the text would be copied with the line. */
+/* The marker is drawn, not typed: a `+` in the text would be copied with the line. Every line
+   keeps the marker's column and the space after it, marked or not, so a changed line starts
+   where an unchanged one does. */
 .diff-viewer__text {
-  position: relative; padding-inline: 1ch; white-space: pre; background: var(--panel);
+  position: relative; padding-inline: 2ch 1ch; white-space: pre; background: var(--panel);
 }
 .diff-viewer__code--wrap .diff-viewer__text {
   white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;
 }
-.diff-viewer__line--addition > .diff-viewer__text,
-.diff-viewer__line--deletion > .diff-viewer__text,
-.diff-viewer__text--addition, .diff-viewer__text--deletion {
-  padding-inline-start: 2ch;
-}
 .diff-viewer__line--addition > .diff-viewer__text::before,
 .diff-viewer__text--addition::before {
   content: "+"; position: absolute; left: 0; width: 1ch;
-  color: var(--success); user-select: none;
+  color: var(--success); -webkit-user-select: none; user-select: none;
 }
 .diff-viewer__line--deletion > .diff-viewer__text::before,
 .diff-viewer__text--deletion::before {
   content: "-"; position: absolute; left: 0; width: 1ch;
-  color: var(--danger); user-select: none;
+  color: var(--danger); -webkit-user-select: none; user-select: none;
 }
 
-/* The reference shell mixes the line colour into the surface at 12%, and the gutter
-   at 9%, so a run of changes reads as a band rather than a stack of stripes. */
+/* The reference shell mixes the line colour into the surface at 12%, so a run of changes
+   reads as a band rather than a stack of stripes. The band stops at the number column. */
 .diff-viewer__line--addition > .diff-viewer__text,
 .diff-viewer__text--addition {
   background: color-mix(in srgb, var(--success) 12%, var(--panel));
 }
-.diff-viewer__line--addition > .diff-viewer__number,
-.diff-viewer__number--addition {
-  background: color-mix(in srgb, var(--success) 9%, var(--panel));
-  color: var(--success);
-}
 .diff-viewer__line--deletion > .diff-viewer__text,
 .diff-viewer__text--deletion {
   background: color-mix(in srgb, var(--danger) 12%, var(--panel));
-}
-.diff-viewer__line--deletion > .diff-viewer__number,
-.diff-viewer__number--deletion {
-  background: color-mix(in srgb, var(--danger) 9%, var(--panel));
-  color: var(--danger);
 }
 /* A side with no counterpart is not an empty line — it is the absence of one, and the
    hatch says so rather than leaving a blank that reads as a blank line in the file. */
@@ -197,9 +192,6 @@
       color-mix(in srgb, var(--text) 6%, var(--panel)) 8px
     );
 }
-.diff-viewer__row .diff-viewer__number:empty {
-  background: color-mix(in srgb, var(--text) 3%, var(--panel));
-}
 
 .diff-viewer__word {
   border-radius: 3px; box-decoration-break: clone;
@@ -208,7 +200,7 @@
 .diff-viewer__word--addition { background: color-mix(in srgb, var(--success) 18%, transparent); }
 .diff-viewer__word--deletion { background: color-mix(in srgb, var(--danger) 18%, transparent); }
 
-.diff-viewer__no-newline { padding-left: 4px; color: var(--faint); }
+.diff-viewer__no-newline { padding-left: 4px; color: var(--faint); -webkit-user-select: none; user-select: none; }
 
 /* The break between hunks: how much was left out, and an offer to fetch it. */
 .diff-viewer__hunk-separator {
@@ -217,6 +209,7 @@
   display: flex; align-items: center; gap: 4px; padding: 0 6px;
   background: color-mix(in srgb, var(--text) 4%, var(--panel));
   color: var(--muted); font-size: 10.5px; line-height: 17px;
+  -webkit-user-select: none; user-select: none;
 }
 .diff-viewer__hunk-separator + .diff-viewer__hunk-separator { margin-top: 0; }
 .diff-viewer__hunk-label {

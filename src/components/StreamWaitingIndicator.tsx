@@ -5,6 +5,7 @@ import { useI18n } from "../i18n";
 import { formatCompactTokenCount } from "../lib/contextTokens";
 import { subscribeToolExplanations, toolExplanation, toolExplanationVersion } from "../lib/localModel";
 import type { LiveReasoningView } from "../lib/runContexts";
+import { PathText } from "./PathText";
 import { RollingNumber } from "./RollingNumber";
 import {
   CAT_BODY_WITHOUT_PAWS,
@@ -273,6 +274,8 @@ interface ToolActivity {
   toolName: string;
   title: string;
   target?: string;
+  /** The target is a path, drawn so that it gives way in the middle. */
+  targetIsPath?: boolean;
 }
 
 /**
@@ -295,7 +298,8 @@ function toolActivities(contexts: ContextItem[], tools: ToolDescriptor[], t: Tra
       id: context.id,
       toolName: context.toolName,
       title: presentation.title,
-      ...(presentation.target ? { target: presentation.target } : {})
+      ...(presentation.target ? { target: presentation.target } : {}),
+      ...(presentation.targetIsPath ? { targetIsPath: true } : {})
     });
   }
   return activities;
@@ -313,11 +317,13 @@ function ToolActivityLine({ activity }: { activity: ToolActivity }) {
   return (
     <span className="stream-waiting__activity">
       <span className="stream-waiting__activity-title pulse-text">{activity.title}</span>
-      {activity.target && (
-        <code className="stream-waiting__activity-target" title={activity.target}>
-          {activity.target}
-        </code>
-      )}
+      {activity.target && (activity.targetIsPath
+        ? <PathText className="stream-waiting__activity-target" path={activity.target} />
+        : (
+          <code className="stream-waiting__activity-target" title={activity.target}>
+            {activity.target}
+          </code>
+        ))}
       <span className="stream-waiting__dots" aria-hidden="true">
         <i />
         <i />

@@ -93,6 +93,10 @@ pub struct AppState {
     /// conversation in a workspace shares one rather than paying it again.
     pub lsp_servers: crate::lsp_servers::LspRegistry,
     pub(crate) prose_journals: crate::api::ProseJournalRegistry,
+    /// The tool set each conversation's last request offered, which is what
+    /// tells a tool that just joined from one the declared list already had
+    /// (`tool_append.rs`).
+    pub(crate) offered_tools: crate::tool_append::OfferedToolRegistry,
     /// Process-local, per-conversation MCP sessions. Connections and resolved
     /// secrets never cross renderer IPC or persistence.
     pub mcp_sessions: crate::mcp::McpSessionManager,
@@ -146,13 +150,25 @@ pub struct AppState {
     task_surfaces: Arc<Mutex<HashMap<String, Arc<TaskSurface>>>>,
     /// The security level each live top-level run is executing under. Registered
     /// at run start and removed when that run finishes, so a renderer settings
-    /// write or a plan approval can move a running turn to a different level
-    /// without waiting for it to end.
+    /// write can move a running turn to a different level without waiting for
+    /// it to end.
     live_security_levels: Arc<Mutex<HashMap<String, Arc<crate::model::LiveSecurityLevel>>>>,
+    /// Each conversation's plan-mode switch as it stands now, on the same terms
+    /// as `live_security_levels`: a renderer write moves it at once, and an
+    /// approved plan turns it off in the middle of the turn that asked.
+    live_plan_modes: Arc<Mutex<HashMap<String, Arc<crate::model::LivePlanMode>>>>,
     /// Interrupted workflow notifications claimed at startup, keyed by conversation. Memory holds
     /// only a delivery queue; the manifest's `crashNoticeDelivered` field remains authoritative.
     workflow_restart_notices:
         Arc<Mutex<HashMap<String, Vec<crate::workflow_store::InterruptedRun>>>>,
+    /// Subagents the previous process was still owed a result by, claimed at startup and keyed by
+    /// conversation. As with workflows, memory holds only the delivery queue; the ledger file in
+    /// `subagent_ledger` stays authoritative until the notice is confirmed in the timeline.
+    subagent_restart_notices:
+        Arc<Mutex<HashMap<String, Vec<crate::subagent_ledger::LostSubagent>>>>,
+    /// Top-level agents this process started and recorded in `subagent_ledger`, keyed by
+    /// conversation, whose ledger entries are not settled yet.
+    ledgered_subagents: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
     /// Per-conversation shell session: the snapshot each new Bash sources and
     /// the directory the last successful call reported. There is no shell
     /// process behind this — every call spawns a fresh interpreter — so this map
@@ -348,6 +364,7 @@ impl AppState {
             preview_servers: crate::preview_servers::PreviewServerRegistry::default(),
             lsp_servers: crate::lsp_servers::LspRegistry::default(),
             prose_journals: crate::api::ProseJournalRegistry::default(),
+            offered_tools: crate::tool_append::OfferedToolRegistry::default(),
             mcp_sessions: crate::mcp::McpSessionManager::default(),
             definition_authority_lock: Arc::default(),
             receipts: Arc::default(),
@@ -367,7 +384,10 @@ impl AppState {
             retired_conversations: Arc::default(),
             task_surfaces: Arc::default(),
             live_security_levels: Arc::default(),
+            live_plan_modes: Arc::default(),
             workflow_restart_notices: Arc::default(),
+            subagent_restart_notices: Arc::default(),
+            ledgered_subagents: Arc::default(),
             shell_sessions: Arc::default(),
             file_read_state: Arc::default(),
             app_update: Arc::default(),
@@ -507,7 +527,19 @@ impl AppState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(conversation_id);
+        self.live_plan_modes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(conversation_id);
         self.workflow_restart_notices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(conversation_id);
+        self.subagent_restart_notices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(conversation_id);
+        self.ledgered_subagents
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(conversation_id);
@@ -739,15 +771,111 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// Lists conversations with pending interruption notices as part of wake-level recovery.
+    /// Lists conversations with pending interruption notices — workflow runs or subagents — as part
+    /// of wake-level recovery.
+    ///
+    /// A subagent whose final reply was recovered does not count. It finished and only its
+    /// delivery was lost; the reply is already back on its card, and it reaches the model at the
+    /// conversation's next run rather than starting one on a launch nobody asked to act.
     pub fn conversations_with_restart_notices(&self) -> Vec<String> {
-        self.workflow_restart_notices
+        let mut conversations = self
+            .workflow_restart_notices
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .filter(|(_, notices)| !notices.is_empty())
             .map(|(conversation_id, _)| conversation_id.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        for (conversation_id, notices) in self
+            .subagent_restart_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            if notices.iter().any(|notice| notice.recovered.is_none())
+                && !conversations.contains(conversation_id)
+            {
+                conversations.push(conversation_id.clone());
+            }
+        }
+        conversations
+    }
+
+    /// Queues the startup-claimed subagents the previous process never delivered, by conversation.
+    pub fn seed_subagent_restart_notices(&self, lost: Vec<crate::subagent_ledger::LostSubagent>) {
+        if lost.is_empty() {
+            return;
+        }
+        let mut map = self
+            .subagent_restart_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for agent in lost {
+            map.entry(agent.conversation_id.clone())
+                .or_default()
+                .push(agent);
+        }
+    }
+
+    /// Drains a conversation's pending subagent restart notices once for round-boundary delivery.
+    /// A delivery that is not confirmed is claimed again from the ledger on the next startup.
+    pub fn take_subagent_restart_notices(
+        &self,
+        conversation_id: &str,
+    ) -> Vec<crate::subagent_ledger::LostSubagent> {
+        self.subagent_restart_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(conversation_id)
+            .unwrap_or_default()
+    }
+
+    /// Remembers that `name` has a ledger entry this process must settle once its result is
+    /// durably delivered.
+    pub fn note_ledgered_subagent(&self, conversation_id: &str, name: &str) {
+        self.ledgered_subagents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .insert(name.to_owned());
+    }
+
+    /// Removes and returns the ledgered agents of `conversation_id` that `settled` accepts.
+    ///
+    /// `settled` probes agent state, so it runs on a snapshot with this map unlocked.
+    pub fn take_ledgered_subagents(
+        &self,
+        conversation_id: &str,
+        mut settled: impl FnMut(&str) -> bool,
+    ) -> Vec<String> {
+        let snapshot = self
+            .ledgered_subagents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(conversation_id)
+            .map(|names| names.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let taken = snapshot
+            .into_iter()
+            .filter(|name| settled(name))
+            .collect::<Vec<_>>();
+        if taken.is_empty() {
+            return taken;
+        }
+        let mut map = self
+            .ledgered_subagents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(names) = map.get_mut(conversation_id) {
+            for name in &taken {
+                names.remove(name);
+            }
+            if names.is_empty() {
+                map.remove(conversation_id);
+            }
+        }
+        taken
     }
 
     /// Registers or replaces a conversation task surface. Detached workers lazily resolve it and
@@ -778,8 +906,8 @@ impl AppState {
     /// The conversation's live security-level cell, moved to the level a run is
     /// starting under. One cell per conversation for as long as the conversation
     /// exists, not one per run: task workers that outlive the turn which spawned
-    /// them hold the same `Arc`, so a settings write or a plan approval made
-    /// after that turn still reaches them.
+    /// them hold the same `Arc`, so a settings write made after that turn still
+    /// reaches them.
     pub fn live_security_level_for_run(
         &self,
         conversation_id: &str,
@@ -805,6 +933,35 @@ impl AppState {
         conversation_id: &str,
     ) -> Option<Arc<crate::model::LiveSecurityLevel>> {
         self.live_security_levels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(conversation_id)
+            .cloned()
+    }
+
+    /// The conversation's live plan-mode cell, set to what the persisted
+    /// switch says as a run starts. One cell per conversation, like the
+    /// security level's, so a write made while any run of it is live reaches
+    /// that run.
+    pub fn live_plan_mode_for_run(
+        &self,
+        conversation_id: &str,
+        enabled: bool,
+    ) -> Arc<crate::model::LivePlanMode> {
+        let cell = Arc::clone(
+            self.live_plan_modes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(conversation_id.to_owned())
+                .or_insert_with(|| Arc::new(crate::model::LivePlanMode::new(enabled))),
+        );
+        cell.set(enabled);
+        cell
+    }
+
+    /// The conversation's live plan-mode cell, if a run has started in it.
+    pub fn live_plan_mode(&self, conversation_id: &str) -> Option<Arc<crate::model::LivePlanMode>> {
+        self.live_plan_modes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(conversation_id)
@@ -2137,7 +2294,6 @@ mod tests {
                 content: "captured the page".into(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             }],
-            queued_messages: Vec::new(),
             execution_mode_receipt: String::new(),
             structured_output: None,
             output_schema: None,
@@ -2229,7 +2385,7 @@ mod tests {
     }
 
     #[test]
-    fn steer_model_run_rejects_aggregate_image_list_budgets_before_delivery() {
+    fn steer_model_run_takes_any_number_of_images_but_validates_each() {
         fn image(index: usize, bytes: u64, width: u32, height: u32) -> ImageAttachment {
             ImageAttachment {
                 id: format!("{:064x}", index + 1),
@@ -2246,43 +2402,43 @@ mod tests {
         let (_, inbox) = state
             .begin_model_run("run-image-budget", "conversation-image-budget")
             .unwrap();
-        let oversized_bytes = (0..5)
+        // Past the old per-message budget of 20 images, 20 MiB and 64 MP.
+        let many = (0..25)
             .map(|index| {
                 image(
                     index,
                     crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES as u64,
-                    1,
-                    1,
+                    4096,
+                    4096,
                 )
             })
-            .collect();
-        let error = state
+            .collect::<Vec<_>>();
+        state
             .steer_model_run(
                 "run-image-budget",
-                "queued-image-bytes".into(),
+                "queued-many-images".into(),
                 String::new(),
-                oversized_bytes,
+                many.clone(),
                 Vec::new(),
                 "2026-07-24T00:00:00Z".into(),
             )
-            .unwrap_err();
-        assert!(error.contains("引导消息"));
-        assert!(error.contains("20 MiB"));
-        assert!(inbox.drain().is_empty());
+            .unwrap();
+        assert_eq!(inbox.drain()[0].images, many);
 
-        let oversized_pixels = (0..5).map(|index| image(index, 1, 4096, 4096)).collect();
         let error = state
             .steer_model_run(
                 "run-image-budget",
-                "queued-image-pixels".into(),
+                "queued-empty-image".into(),
                 String::new(),
-                oversized_pixels,
+                vec![image(0, 0, 1, 1)],
                 Vec::new(),
                 "2026-07-24T00:00:00Z".into(),
             )
             .unwrap_err();
-        assert!(error.contains("引导消息"));
-        assert!(error.contains("64 MP"));
+        assert!(
+            error.contains("引导消息 has an invalid image attachment"),
+            "{error}"
+        );
         assert!(inbox.drain().is_empty());
     }
 
@@ -2338,12 +2494,9 @@ mod tests {
         assert!(steer("queued-empty", Vec::new())
             .unwrap_err()
             .contains("不能同时为空"));
-        let too_many = (0..=crate::file_attachments::MAX_MESSAGE_FILES)
-            .map(file)
-            .collect();
-        assert!(steer("queued-too-many", too_many)
-            .unwrap_err()
-            .contains("引导消息"));
+        let many = (0..25).map(file).collect::<Vec<_>>();
+        steer("queued-many", many.clone()).unwrap();
+        assert_eq!(inbox.drain()[0].files, many);
         assert!(steer("queued-duplicate", vec![file(0), file(0)]).is_err());
         let mut forged = file(0);
         forged.pages = Some(1);

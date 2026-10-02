@@ -132,10 +132,12 @@ function isStructuredResult(item: ContextItem): boolean {
 /**
  * A subagent transcript's runs, which it has no turn records for.
  *
- * A message opens a run when the work before it had stopped: a mailbox message
- * that lands mid-run arrives between tool batches, so it follows a call, while
- * one that wakes an idle child follows the reply its last run ended on. The
- * reminder a schema-bound child gets is part of the run it interrupts.
+ * A message opens a run when the work before it had stopped. Saved transcripts
+ * from before `send_message` / `followup_task` were retired still hold such
+ * messages: a mailbox message that landed mid-run arrived between tool batches,
+ * so it follows a call, while one that woke an idle child follows the reply its
+ * last run ended on. The reminder a schema-bound child gets is part of the run
+ * it interrupts.
  *
  * `live` withholds the last run, which is still writing its list — unless it
  * already returned its structured result: the host ends such a run the moment

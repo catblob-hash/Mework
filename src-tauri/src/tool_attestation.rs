@@ -340,7 +340,6 @@ mod tests {
                 created_at: "2026-08-09T00:00:00Z".into(),
             }],
             updates: Vec::new(),
-            queued_messages: Vec::new(),
             structured_output: None,
             output_schema: None,
             usage: crate::model::ModelUsage::default(),

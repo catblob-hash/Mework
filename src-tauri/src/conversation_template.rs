@@ -161,6 +161,7 @@ pub fn normalize_tool_cards(
                     duration_ms: 0,
                 },
                 subagent: None,
+                notice: None,
                 attestation: String::new(),
                 created_at,
             });
@@ -172,6 +173,7 @@ pub fn normalize_tool_cards(
             model_turn_id: stored_model_turn_id,
             result: stored_result,
             subagent: stored_subagent,
+            notice: stored_notice,
             created_at: stored_created_at,
             ..
         } = stored_card
@@ -208,11 +210,31 @@ pub fn normalize_tool_cards(
             result: edited_result,
             // 上面的检查已经证明它没有子代理记录，这里保持存储卡的口径。
             subagent: None,
+            notice: stored_notice.clone(),
             attestation: String::new(),
             created_at: stored_created_at.clone(),
         });
     }
     Ok(normalized)
+}
+
+/// Takes a conversation's trunk as a template body.
+///
+/// The rows are the host's own committed history, read from its store and never
+/// from the renderer, so they are kept exactly as they are: real results,
+/// diffs, images, durations and subagent records. That is what a template edit
+/// already keeps for a stored card handed back unchanged
+/// ([`normalize_tool_cards`]), and nothing is re-attested here — the body is
+/// only shown until it is applied, and [`instantiate`] re-issues every card's
+/// credential for the conversation it lands in.
+///
+/// An empty history is refused: the host refuses an empty template on every
+/// other path too, and a preset that opened with nothing would be no template.
+pub fn capture(contexts: &[ContextItem]) -> Result<Vec<ContextItem>, String> {
+    if contexts.is_empty() {
+        return Err("这段对话还没有消息，不能作为对话模板".into());
+    }
+    Ok(contexts.to_vec())
 }
 
 /// How many `{input}` placeholders the template's user messages hold in total.
@@ -326,6 +348,33 @@ mod tests {
         let body = document.workspaces[0].conversations[0].contexts.clone();
         let error = saves_into_a_second_conversation(body, &AppState::default())
             .expect_err("未经宿主重新签发的工具卡不得进入另一个对话");
+        assert!(!error.is_empty(), "拒绝必须带出原因");
+    }
+
+    #[test]
+    fn a_captured_conversation_keeps_its_tool_cards_and_applies_into_another() {
+        let document = default_document();
+        let workspace = &document.workspaces[0];
+        let body = &workspace.conversations[0].contexts;
+        assert!(
+            body.iter().any(|c| matches!(c, ContextItem::Tool { .. })),
+            "夹具无效：对话里必须有工具卡，否则这条测试什么也没证明"
+        );
+
+        let captured = capture(body).expect("有消息的对话可以作为模板");
+        assert_eq!(&captured, body, "捕获的是宿主自己的历史，原样保留每条上下文");
+        crate::storage::validate_template_contexts(&captured).expect("捕获的正文必须是合法模板");
+
+        let state = AppState::default();
+        let instantiated = instantiate(&state, &workspace.path, "conv_template_target", &captured)
+            .expect("捕获的模板必须能套用");
+        saves_into_a_second_conversation(instantiated, &state)
+            .expect("捕获再套用的工具卡必须能在目标对话落盘");
+    }
+
+    #[test]
+    fn an_empty_conversation_is_not_captured() {
+        let error = capture(&[]).expect_err("空对话不能作为模板");
         assert!(!error.is_empty(), "拒绝必须带出原因");
     }
 
@@ -519,6 +568,7 @@ mod tests {
                 duration_ms: 42,
             },
             subagent: None,
+            notice: None,
             attestation: "另一个对话的凭证".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
@@ -544,6 +594,7 @@ mod tests {
                 duration_ms: 12_345,
             },
             subagent: None,
+            notice: None,
             attestation: "提交方伪造的凭证".into(),
             created_at: "2026-02-02T00:00:00Z".into(),
         }
@@ -568,6 +619,7 @@ mod tests {
                 duration_ms: 0,
             },
             subagent: None,
+            notice: None,
             attestation: String::new(),
             created_at: "2026-02-02T00:00:00Z".into(),
         }
@@ -719,6 +771,7 @@ mod tests {
                     duration_ms: 42,
                 },
                 subagent: None,
+                notice: None,
                 attestation: String::new(),
                 created_at: "2026-01-01T00:00:00Z".into(),
             }]

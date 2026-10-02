@@ -35,7 +35,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{model::AppDocument, storage, wire_history};
+use crate::{attachment_refs::AttachmentRefs, model::AppDocument, storage, wire_history};
 
 /// How long the writer waits before retrying a failed write when no newer
 /// commit supersedes the failed one.
@@ -45,6 +45,22 @@ const WRITE_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// failure, `None` when a write succeeds after a reported failure. Invoked on
 /// the writer thread with no store lock held.
 pub type WriteFailureObserver = Box<dyn Fn(Option<String>) + Send + Sync>;
+
+/// Strips conversation bodies from a document on its way into the snapshot.
+///
+/// Bodies are data the shared memory pool manages: the conversation store
+/// reads them through it and the pool may unload them. A snapshot that kept
+/// every body would hold them all for the life of the process, outside any
+/// cap. Host readers that need a body read it from the store
+/// (`ConversationStore::conversation`); the snapshot keeps settings, metadata
+/// and queued messages, and `refs` keeps what the bodies referenced.
+fn hollowed(
+    mut document: AppDocument,
+    mut refs: AttachmentRefs,
+) -> (Arc<AppDocument>, Arc<AttachmentRefs>) {
+    refs.hollow(&mut document);
+    (Arc::new(document), Arc::new(refs))
+}
 
 #[derive(Clone, Default)]
 pub struct DocumentStore {
@@ -81,6 +97,10 @@ struct StoreState {
     /// unpersisted attachment reference after an upload call returns.
     process_lease: Option<ProcessLease>,
     ipc_ready: bool,
+    /// Whether this process's startup load seeded a brand-new install
+    /// ([`storage::LoadedDocument::fresh_install`]). Fixed for the process: a
+    /// renderer that reloads asks again and gets the same answer.
+    fresh_install: bool,
 }
 
 struct ProcessLease {
@@ -89,7 +109,10 @@ struct ProcessLease {
 }
 
 struct Snapshot {
+    /// Always without conversation bodies (see [`hollowed`]).
     document: Arc<AppDocument>,
+    /// What the stripped bodies referenced, for attachment reclamation.
+    refs: Arc<AttachmentRefs>,
     path: PathBuf,
     /// Fingerprint of the anchor file the snapshot mirrors. Conversation data
     /// lives in the SQLite store, which the host owns exclusively — there is no
@@ -284,13 +307,16 @@ impl DocumentStore {
     /// A second current Mework process fails before it can read, write,
     /// migrate, import, hydrate, quarantine, or purge the shared app-data
     /// directory.
+    ///
+    /// `reconcile` sees the document without bodies, with the attachment
+    /// references of the bodies the load read one at a time and let go of.
     pub fn initialize_with_startup_reconciliation<F>(
         &self,
         path: &Path,
         reconcile: F,
     ) -> Result<Arc<AppDocument>, String>
     where
-        F: FnOnce(&AppDocument) -> Result<(), String>,
+        F: FnOnce(&AppDocument, &AttachmentRefs) -> Result<(), String>,
     {
         let mut state = self.lock();
         match state.process_lease.as_ref() {
@@ -307,14 +333,17 @@ impl DocumentStore {
         // Startup is a recovery boundary: quarantine failed loads and rebuild from the seed.
         // Setup must not bring down the application; non-startup reads still use strict
         // `load_or_initialize`.
-        let loaded = storage::load_or_recover(path);
+        let loaded = storage::load_or_recover_scanned(path);
         let reconciled = loaded
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|document| reconcile(document));
-        let document = Arc::new(loaded?);
+            .and_then(|loaded| reconcile(&loaded.document, &loaded.refs));
+        let loaded = loaded?;
+        state.fresh_install = loaded.fresh_install;
+        let (document, refs) = hollowed(loaded.document, loaded.refs);
         state.snapshot = Some(Snapshot {
             document: document.clone(),
+            refs,
             path: path.to_owned(),
             disk_meta: read_layout_disk_meta(path),
         });
@@ -335,6 +364,29 @@ impl DocumentStore {
             Some(_) => Err("当前文档快照属于另一应用数据路径".into()),
             None => Err("当前文档快照尚未加载".into()),
         }
+    }
+
+    /// [`Self::current_snapshot`] with the attachment references of the bodies
+    /// it no longer carries.
+    pub fn snapshot_with_refs(
+        &self,
+        path: &Path,
+    ) -> Result<(Arc<AppDocument>, Arc<AttachmentRefs>), String> {
+        let state = self.lock();
+        match state.snapshot.as_ref() {
+            Some(snapshot) if snapshot.path == path => {
+                Ok((snapshot.document.clone(), snapshot.refs.clone()))
+            }
+            Some(_) => Err("当前文档快照属于另一应用数据路径".into()),
+            None => Err("当前文档快照尚未加载".into()),
+        }
+    }
+
+    /// Whether this process started on a brand-new install, its startup load
+    /// having written the seed. The renderer reads it with the document to run
+    /// first-launch setup (the Claude Agent models).
+    pub fn fresh_install(&self) -> bool {
+        self.lock().fresh_install
     }
 
     /// Returns the current document snapshot, loading (and migrating +
@@ -361,9 +413,11 @@ impl DocumentStore {
                 }
             }
         }
-        let document = Arc::new(storage::load_or_initialize(path)?);
+        let loaded = storage::load_or_initialize_scanned(path)?;
+        let (document, refs) = hollowed(loaded.document, loaded.refs);
         state.snapshot = Some(Snapshot {
             document: document.clone(),
+            refs,
             path: path.to_owned(),
             disk_meta: read_layout_disk_meta(path),
         });
@@ -374,16 +428,49 @@ impl DocumentStore {
     /// The caller must have validated the document already; this method never
     /// blocks on I/O. If a previous background write failed, that error is
     /// returned now (the new commit still supersedes it and will be retried).
+    ///
+    /// Bodies on `document` are recorded and stripped (see [`hollowed`]); a
+    /// conversation without one keeps what the snapshot recorded for it.
     pub fn commit(&self, path: &Path, document: AppDocument) -> Result<(), String> {
-        let document = Arc::new(document);
+        self.commit_inner(path, document, None)
+    }
+
+    /// [`Self::commit`] with the attachment references the caller already
+    /// worked out — by recording a body that is authoritative even when empty,
+    /// which a stripped conversation cannot say for itself.
+    pub fn commit_with_refs(
+        &self,
+        path: &Path,
+        document: AppDocument,
+        refs: AttachmentRefs,
+    ) -> Result<(), String> {
+        self.commit_inner(path, document, Some(refs))
+    }
+
+    fn commit_inner(
+        &self,
+        path: &Path,
+        document: AppDocument,
+        refs: Option<AttachmentRefs>,
+    ) -> Result<(), String> {
         let mut state = self.lock();
         match state.process_lease.as_ref() {
             Some(lease) if lease.document_path == path => {}
             Some(_) => return Err("当前独占应用数据租约属于另一应用数据路径".into()),
             None => return Err("独占应用数据租约尚未建立，拒绝保存".into()),
         }
+        let refs = refs.unwrap_or_else(|| {
+            state
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.path == path)
+                .map(|snapshot| (*snapshot.refs).clone())
+                .unwrap_or_default()
+        });
+        let (document, refs) = hollowed(document, refs);
         state.snapshot = Some(Snapshot {
             document: document.clone(),
+            refs,
             path: path.to_owned(),
             disk_meta: state
                 .snapshot
@@ -766,7 +853,7 @@ mod tests {
         let store = DocumentStore::default();
         let original = store.read(&path).unwrap();
         let attachment_store = ImageAttachmentStore::new(directory.path());
-        let transient = attachment_store.import("transient.png", PNG).unwrap();
+        let transient = attachment_store.import_compressed("transient.png", PNG).unwrap();
 
         let mut external = test_document();
         external.schema_version = 0;
@@ -799,6 +886,7 @@ mod tests {
                     duration_ms: 1,
                 },
                 subagent: None,
+                notice: None,
                 attestation: String::new(),
                 created_at: "2026-07-24T00:00:00Z".into(),
             });
@@ -830,6 +918,7 @@ mod tests {
             let mut state = store.lock();
             state.snapshot = Some(Snapshot {
                 document: document.clone(),
+                refs: Arc::default(),
                 path: path.clone(),
                 disk_meta: read_layout_disk_meta(&path),
             });

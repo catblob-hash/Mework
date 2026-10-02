@@ -1,0 +1,19 @@
+/* A path that gives way in the middle. See `PathText.tsx` and `lib/pathDisplay.ts`.
+
+   The sizer and the shown text share one grid cell. The sizer draws the whole path, invisibly and
+   at no height, so the box's own width is the full path's wherever its container allows; the
+   shown text is fitted to that width and can never feed back into it. `text-overflow` stays on as
+   the fallback for wherever measuring is off by a hair, or cannot run at all. */
+.path-text {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.path-text__sizer,
+.path-text__shown { grid-area: 1 / 1; min-width: 0; }
+.path-text__sizer { height: 0; overflow: hidden; visibility: hidden; }
+.path-text__sizer::before { content: attr(data-text); }
+.path-text__shown { overflow: hidden; text-overflow: ellipsis; }

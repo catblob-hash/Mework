@@ -73,7 +73,7 @@ fn live_request(
         .model
         .set_capability(ModelCapability::ImageRecognition, false);
     request.model.max_output_tokens = Some(2048);
-    request.reasoning_effort = ReasoningEffort::Disabled;
+    request.reasoning_effort = ReasoningEffort::Low;
     request.tools = catalog::tool_catalog();
     request.enabled_tools = request.tools.iter().map(|tool| tool.name.clone()).collect();
     request.workspace_path = workspace.to_string_lossy().into_owned();

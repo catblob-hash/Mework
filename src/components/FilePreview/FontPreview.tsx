@@ -17,7 +17,7 @@ export interface FontNames {
  * those the file name is all the preview says about them, which is also what it
  * says when a table is malformed.
  */
-export function readFontNames(bytes: Uint8Array): FontNames | null {
+function readFontNames(bytes: Uint8Array): FontNames | null {
   const empty: FontNames = { family: null, subfamily: null, fullName: null, version: null, designer: null };
   if (bytes.length < 12) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);

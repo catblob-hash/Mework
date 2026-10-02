@@ -147,10 +147,20 @@ const RESEARCH_PROFILE_STARTUP_BUDGET: Duration = Duration::from_secs(2);
 pub const BROWSER_TOOLBAR_HEIGHT: f64 = 80.0;
 pub const BROWSER_PANEL_WIDTH: f64 = 560.0;
 const MAX_BROWSER_PANEL_VALUE: f64 = 100_000.0;
-const MAX_AWAKE_BROWSER_PAGES: usize = 3;
+/// Far beyond any pane's rounding; only keeps a hostile value from reaching Core Animation.
+const MAX_BROWSER_CORNER_RADIUS: f64 = 64.0;
+/// How many pages may be awake before admitting another one sleeps the least recently used page
+/// nobody is looking at. A budget, not a limit: tabs are unlimited, and when every awake page is
+/// presented, loading or being driven, the new page is admitted anyway.
+const AWAKE_BROWSER_PAGE_BUDGET: usize = 3;
 /// Sleeping WebViews preserve exact page state, but each isolated task Profile can still retain
-/// native controller/process resources. Older sleeping tasks are cold-closed beyond this bound.
-const MAX_RETAINED_BROWSER_PAGES: usize = 8;
+/// native controller/process resources. Older sleeping pages are cold-closed beyond this budget;
+/// like the awake budget it never refuses a page.
+const RETAINED_BROWSER_PAGE_BUDGET: usize = 8;
+/// A page withdrawn while it is still loading sleeps once the load settles; the background pass
+/// looks again this often, for at most this many times.
+const WITHDRAWN_SLEEP_RETRY: Duration = Duration::from_secs(1);
+const WITHDRAWN_SLEEP_MAX_RETRIES: u32 = 60;
 /// Tab id of a conversation's own page. Extra tabs are addressed by the `#<token>` suffix that
 /// already distinguishes their session, and renderer-minted tokens are `tab_<uuid>`, so this
 /// sentinel cannot collide with a real token.
@@ -736,6 +746,11 @@ pub struct BrowserPanelBounds {
     pub visible: bool,
     #[serde(default)]
     pub occluded_top: Option<f64>,
+    /// The radius the pane rounds the page's bottom corners to. A native page sits above every
+    /// HTML layer, so the pane's own rounded clip cannot reach it; the host rounds the page itself
+    /// (on macOS — a WebView2 child window has no anti-aliased clip to give it).
+    #[serde(default)]
+    pub bottom_corner_radius: Option<f64>,
 }
 
 /// Exact, reversible CDP fields retained only while a task has no live WebView.
@@ -1526,6 +1541,10 @@ impl AttestedPage {
     /// automation must not pay. Parked, the page is fully covered (nothing shows, no pointer
     /// input reaches it) while Chromium still sees an on-screen window.
     fn park(&self, layout: BrowserPageLayout) -> Result<(), String> {
+        // Beneath the renderer before it is moved into the pane's rectangle. A new page is born
+        // above every sibling, and moved and shown first it is painted there, over the React UI,
+        // until the restack after it lands.
+        self.with_native_tail(|native, permit| set_page_stacking(native, permit, true))?;
         self.dispatch_mutation("停放 Chromium 页面", move |page| {
             page.set_position(LogicalPosition::new(layout.x, layout.y))
                 .and_then(|_| page.set_size(LogicalSize::new(layout.width, layout.height)))
@@ -1544,6 +1563,20 @@ impl AttestedPage {
     /// renderer draws over it.
     fn set_stacking(&self, parked: bool) -> Result<(), String> {
         self.with_native_tail(move |native, permit| set_page_stacking(native, permit, parked))
+    }
+
+    /// Rounds the page's bottom corners to the pane's own (see `BrowserPanelBounds`). Only the
+    /// macOS page can be rounded; a WebView2 child window keeps square corners.
+    fn set_bottom_corner_radius(&self, radius: f64) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.with_native_tail(move |native, _permit| native.set_bottom_corner_radius(radius))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = radius;
+            Ok(())
+        }
     }
 
     fn eval_with_callback(
@@ -1725,6 +1758,9 @@ struct BrowserManagerState {
     /// Geometry may arrive before the matching explicit open. Keep it manager-side so publishing
     /// layout never has to allocate a BrowserSession and therefore cannot cross a close fence.
     pending_panel_bounds: HashMap<String, PendingBrowserPanelBounds>,
+    /// Where a closed tab's pane wants its next page, kept until the trusted open that lifts the
+    /// close fence creates the session it belongs to (see [`BrowserRuntime::set_projected`]).
+    pending_projection: HashMap<String, bool>,
     /// The proxy each page's network goes through, by session, for pages of a workspace on
     /// another machine. Kept manager-side like the geometry above: a page is bound before it is
     /// opened — so its first request already leaves from its machine — and a binding has to
@@ -1736,6 +1772,12 @@ struct BrowserManagerState {
     lifecycle_intents: HashMap<String, BrowserSessionLifecycleIntent>,
     access_sequence: u64,
     shutting_down: bool,
+    /// The background pass that puts withdrawn pages to sleep (`sleep_withdrawn_pages_soon`):
+    /// whether one is running, and whether a presentation changed while it was.
+    withdrawn_sleep_running: bool,
+    withdrawn_sleep_again: bool,
+    #[cfg(test)]
+    withdrawn_sleep_requests: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1880,7 +1922,21 @@ impl BrowserRuntime {
         // session: a WebView2 user-data folder is chosen when the controller is created, so the
         // only way out of a profile is closing the tab.
         let session = BrowserSession::new(session_id);
-        session.lock_state().network = lock_unpoison(&self.state).networks.get(session_id).cloned();
+        let (network, projected) = {
+            let state = lock_unpoison(&self.state);
+            (
+                state.networks.get(session_id).cloned(),
+                state.pending_projection.get(session_id).copied(),
+            )
+        };
+        {
+            let mut session_state = session.lock_state();
+            session_state.network = network;
+            if let Some(projected) = projected {
+                session_state.projected = projected;
+                session_state.status.projected = projected;
+            }
+        }
         if let Some(app) = app {
             session.attach_app(app)?;
         }
@@ -1893,11 +1949,45 @@ impl BrowserRuntime {
                 "the embedded browser tab is closed; reopen it from the trusted UI first".into(),
             );
         }
-        Ok(state
+        let session = state
             .sessions
             .entry(session_id.to_owned())
             .or_insert(session)
-            .clone())
+            .clone();
+        state.pending_projection.remove(session_id);
+        Ok(session)
+    }
+
+    /// Records where the pane wants this tab's page: beneath the renderer (`true`) or on top.
+    ///
+    /// The pane says so when it mounts, before the trusted open that creates or presents the page.
+    /// After the user closes a tab that open is also what lifts the close fence, so a pane mounting
+    /// to reopen the tab speaks for a session that may not exist. Refusing it there is what
+    /// presented the reopened page on top of the start card it belonged under, with nothing left to
+    /// sink it: the pane only repairs what the host *changes*. The word is kept manager-side, like
+    /// pending geometry, and given to the session the reopen creates. It allocates nothing and
+    /// cannot cross the fence by itself.
+    pub(crate) fn set_projected(
+        &self,
+        session_id: &str,
+        projected: bool,
+    ) -> Result<BrowserStatus, String> {
+        let session_id = validate_session_id(session_id)?;
+        {
+            let mut state = lock_unpoison(&self.state);
+            if state.shutting_down {
+                return Err(
+                    "the application is shutting down and cannot create a browser page".into(),
+                );
+            }
+            if state.closed_session_ids.contains(session_id) {
+                state
+                    .pending_projection
+                    .insert(session_id.to_owned(), projected);
+                return Ok(absent_session_status(&state, session_id));
+            }
+        }
+        self.session(session_id)?.set_projected(projected)
     }
 
     /// Returns an already-open session without creating one.
@@ -2326,9 +2416,28 @@ impl BrowserRuntime {
         }
         match session.open(url) {
             Ok(status) => {
-                let mut state = lock_unpoison(&self.state);
-                state.active_session_id = status.open.then(|| session_id.to_owned());
-                touch_manager_state(&mut state, session_id);
+                let others = {
+                    let mut state = lock_unpoison(&self.state);
+                    state.active_session_id = status.open.then(|| session_id.to_owned());
+                    touch_manager_state(&mut state, session_id);
+                    state
+                        .sessions
+                        .iter()
+                        .filter(|(id, _)| id.as_str() != session_id)
+                        .map(|(_, other)| other.clone())
+                        .collect::<Vec<_>>()
+                };
+                // Only the page just presented belongs on top. Every other page is re-sunk, as
+                // Claude desktop hides any preview it has not just confirmed: a page left raised
+                // after its pane let it go has no pane of its own left to put it back under, so
+                // without this it would cover the renderer until its tab was opened again.
+                if status.open {
+                    for other in others {
+                        other.sink_if_withdrawn();
+                    }
+                    // Every page but this one is now behind it, and a page behind sleeps.
+                    self.sleep_withdrawn_pages_soon();
+                }
                 Ok(status)
             }
             Err(error) => {
@@ -2421,11 +2530,14 @@ impl BrowserRuntime {
         // Repeating the exact Hidden epoch deliberately reaches the native page again. It is the
         // compensation path after a transient hide failure, not a navigation-capable replay.
         let status = session.hide()?;
-        let mut state = lock_unpoison(&self.state);
-        if state.active_session_id.as_deref() == Some(session_id) {
-            state.active_session_id = None;
+        {
+            let mut state = lock_unpoison(&self.state);
+            if state.active_session_id.as_deref() == Some(session_id) {
+                state.active_session_id = None;
+            }
+            touch_manager_state(&mut state, session_id);
         }
-        touch_manager_state(&mut state, session_id);
+        self.sleep_withdrawn_pages_soon();
         Ok(status)
     }
 
@@ -2831,10 +2943,17 @@ impl BrowserRuntime {
                 return Err(STALE_BROWSER_LIFECYCLE_INTENT_ERROR.to_owned());
             }
             if epoch > current.epoch {
-                if current.desired == BrowserSessionLifecycleDesired::Hidden
-                    && bounds.visible
-                    && !state.closed_session_ids.contains(session_id)
-                {
+                // A closed tab is reopened the same way: the reopening pane lays out before the
+                // Open that lifts the fence, and without its geometry the page was created at the
+                // fallback rectangle, over the pane's own toolbar.
+                let awaiting_open = match current.desired {
+                    BrowserSessionLifecycleDesired::Hidden => {
+                        !state.closed_session_ids.contains(session_id)
+                    }
+                    BrowserSessionLifecycleDesired::Closed => true,
+                    BrowserSessionLifecycleDesired::Open => false,
+                };
+                if awaiting_open && bounds.visible {
                     if let Some(pending) = state.pending_panel_bounds.get(session_id) {
                         if epoch < pending.epoch {
                             return Err(STALE_BROWSER_LIFECYCLE_INTENT_ERROR.to_owned());
@@ -3047,8 +3166,14 @@ impl BrowserRuntime {
     }
 
     pub fn status(&self, session_id: &str) -> BrowserStatus {
-        let session = lock_unpoison(&self.state).sessions.get(session_id).cloned();
-        session.map(|session| session.status()).unwrap_or_default()
+        let session = {
+            let state = lock_unpoison(&self.state);
+            match state.sessions.get(session_id) {
+                Some(session) => session.clone(),
+                None => return absent_session_status(&state, session_id),
+            }
+        };
+        session.status()
     }
 
     /// Releases every conversation WebView before the main React WebView exits. The shared engine
@@ -3069,6 +3194,7 @@ impl BrowserRuntime {
             state.last_used.clear();
             state.closed_session_ids.clear();
             state.pending_panel_bounds.clear();
+            state.pending_projection.clear();
             state.lifecycle_intents.clear();
             let sessions = state
                 .sessions
@@ -3227,12 +3353,11 @@ impl BrowserRuntime {
             }
         }
 
-        self.make_awake_slot_locked()?;
+        self.make_awake_room_locked();
 
         // Waking a native sleeping page does not grow the retained-controller set. A never-opened
-        // or cold-suspended task does, so evict the oldest safe sleeping controller first.
+        // or cold-suspended task does, so cold-close the oldest safe sleeping controller first.
         if !target_already_retained {
-            let mut cold_close_errors = Vec::new();
             let mut attempted_sleepers = HashSet::new();
             loop {
                 let snapshots = self.capacity_snapshots();
@@ -3242,21 +3367,18 @@ impl BrowserRuntime {
                     .map(|snapshot| snapshot.session_id.as_str())
                     .collect::<HashSet<_>>()
                     .len();
-                if retained_count < MAX_RETAINED_BROWSER_PAGES {
+                if retained_count < RETAINED_BROWSER_PAGE_BUDGET {
                     break;
                 }
                 let remaining = snapshots
                     .into_iter()
                     .filter(|snapshot| !attempted_sleepers.contains(&snapshot.session_id))
                     .collect::<Vec<_>>();
+                // Over budget with nothing left that can be cold-closed: the page is admitted
+                // anyway. The number of tabs is the user's; the budget only decides which old
+                // controllers are released to make room.
                 let Some(candidate_id) = select_lru_retained_sleeper(&remaining) else {
-                    let detail = cold_close_errors
-                        .first()
-                        .map(|error| format!(" Most recent cold close failed: {error}"))
-                        .unwrap_or_default();
-                    return Err(format!(
-                        "At most {MAX_RETAINED_BROWSER_PAGES} native browser pages may be retained; the existing sleeping pages cannot be safely cold-closed yet.{detail}"
-                    ));
+                    break;
                 };
                 let candidate = {
                     lock_unpoison(&self.state)
@@ -3268,24 +3390,20 @@ impl BrowserRuntime {
                     attempted_sleepers.insert(candidate_id);
                     continue;
                 };
-                match candidate.try_cold_close_sleeping_for_capacity() {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(error) => cold_close_errors.push(error),
+                if let Ok(true) = candidate.try_cold_close_sleeping_for_capacity() {
+                    continue;
                 }
                 attempted_sleepers.insert(candidate_id);
-                // A failed cold close may have resumed this controller. Restore an empty awake
-                // slot before trying another sleeper; otherwise resuming the next candidate could
-                // transiently create a fourth awake page even though no target was admitted yet.
-                self.make_awake_slot_locked()?;
+                // A failed cold close may have resumed this controller. Put it back to sleep
+                // before trying another sleeper, so the eviction does not leave pages awake.
+                self.make_awake_room_locked();
             }
         }
 
         // A retained-page eviction resumes a native sleeper before capturing its Cookie handoff.
         // If capture/close fails but a later sleeper is evicted successfully, that first candidate
-        // remains awake. Revalidate after the retained phase so adding the target reservation can
-        // never push the manager above the hard awake-page limit.
-        self.make_awake_slot_locked()?;
+        // remains awake. Look again after the retained phase so it goes back to sleep.
+        self.make_awake_room_locked();
 
         let mut state = lock_unpoison(&self.state);
         if state.live_reservations.contains(session_id) {
@@ -3300,29 +3418,25 @@ impl BrowserRuntime {
         }))
     }
 
-    fn make_awake_slot_locked(&self) -> Result<(), String> {
-        let mut suspend_errors = Vec::new();
+    /// Sleeps the least recently used withdrawn pages until admitting one more page stays within
+    /// [`AWAKE_BROWSER_PAGE_BUDGET`]. Never refuses: when every awake page is presented, loading
+    /// or being driven, there is nothing to sleep and the new page is admitted over budget.
+    fn make_awake_room_locked(&self) {
         let mut attempted_candidates = HashSet::new();
         loop {
             // An existing reservation may complete or fail without taking the manager lifecycle.
             // Recompute the union every iteration so a failed creation never causes an unnecessary
             // extra eviction, while a successful one remains represented by the same session id.
             let snapshots = self.capacity_snapshots();
-            if awake_or_reserved_count(&snapshots) < MAX_AWAKE_BROWSER_PAGES {
-                return Ok(());
+            if awake_or_reserved_count(&snapshots) < AWAKE_BROWSER_PAGE_BUDGET {
+                return;
             }
             let remaining = snapshots
                 .into_iter()
                 .filter(|snapshot| !attempted_candidates.contains(&snapshot.session_id))
                 .collect::<Vec<_>>();
             let Some(candidate_id) = select_lru_candidate(&remaining) else {
-                let detail = suspend_errors
-                    .first()
-                    .map(|error| format!(" Most recent release failed: {error}"))
-                    .unwrap_or_default();
-                return Err(format!(
-                    "At most {MAX_AWAKE_BROWSER_PAGES} browser pages may be awake at once; every current page is visible, loading, controlled by the user or Agent, or credential-protected. Suspend a task page first, then try again.{detail}"
-                ));
+                return;
             };
             let candidate = {
                 lock_unpoison(&self.state)
@@ -3334,14 +3448,94 @@ impl BrowserRuntime {
                 attempted_candidates.insert(candidate_id);
                 continue;
             };
-            match candidate.try_suspend_for_capacity() {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(error) => {
-                    suspend_errors.push(error);
-                }
+            if let Ok(true) = candidate.try_sleep_withdrawn() {
+                continue;
             }
             attempted_candidates.insert(candidate_id);
+        }
+    }
+
+    /// Puts every page nobody is looking at to sleep, without waiting for the awake budget to
+    /// fill: a tab that is not in front sleeps. Pages being driven by the Agent, loading, or
+    /// covered are left awake; an Agent tool wakes a sleeping page transparently, so this never
+    /// costs the Agent more than a resume.
+    ///
+    /// Returns whether a withdrawn page was left awake only because its load has not settled,
+    /// which a later pass can finish.
+    fn sleep_withdrawn_pages_locked(&self) -> bool {
+        let mut still_loading = false;
+        for snapshot in self.capacity_snapshots() {
+            if !page_can_sleep(&snapshot) {
+                still_loading |= page_sleeps_once_loaded(&snapshot);
+                continue;
+            }
+            let session = lock_unpoison(&self.state)
+                .sessions
+                .get(&snapshot.session_id)
+                .cloned();
+            if let Some(session) = session {
+                let _ = session.try_sleep_withdrawn();
+            }
+        }
+        still_loading
+    }
+
+    /// Schedules [`Self::sleep_withdrawn_pages_locked`] off the caller's thread. It follows every
+    /// change of which page is presented; the caller is the tab switch itself, and on WebView2 each
+    /// sleep waits for a UI-thread completion that must not hold the switch up.
+    fn sleep_withdrawn_pages_soon(&self) {
+        {
+            let mut state = lock_unpoison(&self.state);
+            if state.shutting_down {
+                return;
+            }
+            // Tests drive the pass themselves; a detached thread would contend for the session
+            // locks they inspect.
+            if cfg!(test) {
+                #[cfg(test)]
+                {
+                    state.withdrawn_sleep_requests += 1;
+                }
+                return;
+            }
+            if state.withdrawn_sleep_running {
+                state.withdrawn_sleep_again = true;
+                return;
+            }
+            state.withdrawn_sleep_running = true;
+        }
+        let runtime = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mework-browser-sleep-withdrawn".into())
+            .spawn(move || runtime.run_withdrawn_sleep_passes());
+        if spawned.is_err() {
+            lock_unpoison(&self.state).withdrawn_sleep_running = false;
+        }
+    }
+
+    fn run_withdrawn_sleep_passes(&self) {
+        let mut retries = 0;
+        loop {
+            let still_loading = {
+                let _manager_lifecycle = lock_unpoison(&self.lifecycle);
+                self.sleep_withdrawn_pages_locked()
+            };
+            let mut state = lock_unpoison(&self.state);
+            if state.shutting_down {
+                state.withdrawn_sleep_running = false;
+                return;
+            }
+            if std::mem::take(&mut state.withdrawn_sleep_again) {
+                retries = 0;
+                continue;
+            }
+            if !still_loading || retries >= WITHDRAWN_SLEEP_MAX_RETRIES {
+                state.withdrawn_sleep_running = false;
+                return;
+            }
+            drop(state);
+            retries += 1;
+            std::thread::sleep(WITHDRAWN_SLEEP_RETRY);
         }
     }
 
@@ -3480,19 +3674,34 @@ fn navigation_resume_plan(
     }
 }
 
+/// An awake page nobody is looking at or using: not presented, not loading, not covered, not in
+/// the Agent's hands. A page the user holds qualifies — the user cannot be using a page they
+/// cannot see, and sleeping keeps it theirs (see [`control_after_release`]).
+fn page_can_sleep(snapshot: &CapacitySnapshot) -> bool {
+    snapshot.has_page
+        && !snapshot.open
+        && !snapshot.loading
+        && !snapshot.pending_navigation
+        && !snapshot.occluded
+        && snapshot.owner != BrowserControlOwner::Agent
+        && !snapshot.active
+        && !snapshot.reserved
+}
+
+/// A withdrawn page that [`page_can_sleep`] passes over only because its load has not settled.
+fn page_sleeps_once_loaded(snapshot: &CapacitySnapshot) -> bool {
+    (snapshot.loading || snapshot.pending_navigation)
+        && page_can_sleep(&CapacitySnapshot {
+            loading: false,
+            pending_navigation: false,
+            ..snapshot.clone()
+        })
+}
+
 fn select_lru_candidate(snapshots: &[CapacitySnapshot]) -> Option<String> {
     snapshots
         .iter()
-        .filter(|snapshot| {
-            snapshot.has_page
-                && !snapshot.open
-                && !snapshot.loading
-                && !snapshot.pending_navigation
-                && !snapshot.occluded
-                && snapshot.owner == BrowserControlOwner::Available
-                && !snapshot.active
-                && !snapshot.reserved
-        })
+        .filter(|snapshot| page_can_sleep(snapshot))
         .min_by(|left, right| {
             (left.last_used, left.session_id.as_str())
                 .cmp(&(right.last_used, right.session_id.as_str()))
@@ -3510,7 +3719,7 @@ fn select_lru_retained_sleeper(snapshots: &[CapacitySnapshot]) -> Option<String>
                 && !snapshot.loading
                 && !snapshot.pending_navigation
                 && !snapshot.occluded
-                && snapshot.owner == BrowserControlOwner::Available
+                && snapshot.owner != BrowserControlOwner::Agent
                 && !snapshot.active
                 && !snapshot.reserved
         })
@@ -3823,12 +4032,17 @@ fn validate_preview_input(
             }
         }
         PreviewTool::Network => {
-            validate_preview_level(input, &["all", "failed"])?;
-            optional_input_string(input, "requestId", 256)?;
+            // A `requestId` asks for one request, and `filter` is then ignored
+            // — whatever it holds — as the schema says.
+            if optional_input_string(input, "requestId", 256)?.is_none() {
+                validate_preview_level(input, &["all", "failed"])?;
+            }
         }
         PreviewTool::Resize => {
-            for key in ["width", "height"] {
-                if let Some(value) = optional_input_f64(input, key)? {
+            // A preset decides the size, so width and height are ignored with one.
+            let preset = optional_input_string(input, "preset", 32)?.is_some();
+            for key in ["width", "height"].into_iter().filter(|_| !preset) {
+                if let Some(value) = optional_viewport_size(input, key)? {
                     if preview_viewport_dimension(Some(value)).is_none() {
                         return Err(format!(
                             "preview_resize {key} must be a number from 1 to {PREVIEW_VIEWPORT_MAX}"
@@ -3856,7 +4070,7 @@ fn validate_preview_input(
                         .ok_or_else(|| "parameter accept must be a boolean".to_owned())?;
                 }
             }
-            if optional_input_string(input, "prompt_text", MAX_DIALOG_PROMPT_CHARS + 1)?
+            if optional_input_text(input, "prompt_text", MAX_DIALOG_PROMPT_CHARS + 1)?
                 .is_some_and(|text| text.chars().count() > MAX_DIALOG_PROMPT_CHARS)
             {
                 return Err(format!(
@@ -3935,6 +4149,9 @@ fn validate_browser_panel_bounds(
     let values = [bounds.x, bounds.y, bounds.width, bounds.height];
     if values.into_iter().any(|value| !value.is_finite())
         || bounds.occluded_top.is_some_and(|value| !value.is_finite())
+        || bounds
+            .bottom_corner_radius
+            .is_some_and(|value| !value.is_finite())
     {
         return Err("浏览器侧边栏 bounds 必须是有限数字".into());
     }
@@ -3958,6 +4175,9 @@ fn validate_browser_panel_bounds(
     bounds.occluded_top = bounds
         .occluded_top
         .map(|value| value.clamp(0.0, MAX_BROWSER_PANEL_VALUE));
+    bounds.bottom_corner_radius = bounds
+        .bottom_corner_radius
+        .map(|value| value.clamp(0.0, MAX_BROWSER_CORNER_RADIUS));
     Ok(bounds)
 }
 
@@ -4045,7 +4265,10 @@ impl BrowserSession {
             .is_some_and(|app| page_webview(app, &self.labels.page).is_some())
     }
 
-    fn try_suspend_for_capacity(&self) -> Result<bool, String> {
+    /// Sleeps this page if it is still one nobody is looking at or using ([`page_can_sleep`]),
+    /// re-checked under its own locks. A page whose locks are busy is being driven, created or
+    /// presented, and is skipped rather than waited for.
+    fn try_sleep_withdrawn(&self) -> Result<bool, String> {
         let Some(_automation) = try_lock_unpoison(&self.automation) else {
             return Ok(false);
         };
@@ -4060,7 +4283,7 @@ impl BrowserSession {
                 || status.loading
                 || state.pending_navigation.is_some()
                 || state.occluded
-                || state.status.control.owner != BrowserControlOwner::Available
+                || state.status.control.owner == BrowserControlOwner::Agent
             {
                 return Ok(false);
             }
@@ -4082,7 +4305,7 @@ impl BrowserSession {
                 || state.status.loading
                 || state.pending_navigation.is_some()
                 || state.occluded
-                || state.status.control.owner != BrowserControlOwner::Available
+                || state.status.control.owner == BrowserControlOwner::Agent
             {
                 return Ok(false);
             }
@@ -4120,11 +4343,8 @@ impl BrowserSession {
         state.status.suspended_at_ms = Some(now);
         state.status.error = None;
         state.status.agent_activity = None;
-        state.status.control = BrowserControlStatus {
-            updated_at_ms: now,
-            ..BrowserControlStatus::default()
-        };
         restore_control_after_menu(&mut state);
+        state.status.control = control_after_release(&state.status.control, now);
         // A sleeping page has nothing left to cover. Saying so is what lets the renderer drop the
         // still frame it captured instead of leaving the user looking at a picture of a page that
         // no longer exists.
@@ -4225,16 +4445,12 @@ impl BrowserSession {
             state.status.suspended_at_ms = Some(now);
             state.status.error = None;
             state.status.agent_activity = None;
-            state.status.control = BrowserControlStatus {
-                updated_at_ms: now,
-                ..BrowserControlStatus::default()
-            };
+            restore_control_after_menu(&mut state);
+            state.status.control = control_after_release(&state.status.control, now);
             state.host = None;
-            // The control status above is already reset, so the pre-cover owner is dropped rather
-            // than restored; what still has to be published is that nothing is covering a page
-            // this conversation no longer has.
+            // What still has to be published is that nothing is covering a page this
+            // conversation no longer has.
             clear_page_cover(&mut state);
-            state.menu_control_before_open = None;
             // Native WebView history cannot be injected into a replacement controller. Keep only
             // the resumable URL rather than advertising back/forward actions that cannot work.
             state.history.clear();
@@ -4356,8 +4572,10 @@ impl BrowserSession {
                 restore_control_after_menu(&mut state);
                 // Whatever was covering this page belonged to the pane as it stood before the
                 // page was retained; the renderer republishes its surfaces against the page it
-                // is being handed now, and until it does the host must not claim one is up.
-                clear_page_cover(&mut state);
+                // is being handed now, and until it does the host must not claim one is up. Where
+                // the pane wants the page is another matter: it said so on mounting, before this
+                // presentation, and is kept (see `clear_page_occlusion`).
+                clear_page_occlusion(&mut state);
             }
             if resuming_native_sleep {
                 self.apply_preferences_to_current_start_page()?;
@@ -4375,6 +4593,12 @@ impl BrowserSession {
                         .set_focus()
                         .map_err(|error| format!("聚焦内置浏览器失败: {error}"))?;
                 } else if let Some(window) = app.get_window(MAIN_WINDOW_LABEL) {
+                    // A page that belongs beneath the renderer goes there before it is moved into
+                    // the pane's rectangle, wherever it was left: moved first, it is painted over
+                    // the start card until the restack below lands.
+                    if page_parked(&self.lock_state()) {
+                        page.set_stacking(true)?;
+                    }
                     let panel_bounds = self.lock_state().panel_bounds;
                     let viewport = resize_page(
                         BrowserHost::MainPanel,
@@ -4424,7 +4648,13 @@ impl BrowserSession {
         };
         let restoring_suspended = previous_status.suspended;
         if !restoring_suspended {
-            reset_closed_state(&mut self.lock_state());
+            let mut state = self.lock_state();
+            // The pane declared where this page belongs before asking for it (see
+            // `clear_page_occlusion`); a page created under a start card is presented beneath it.
+            let projected = state.projected;
+            reset_closed_state(&mut state);
+            state.projected = projected;
+            state.status.projected = projected;
         }
         self.lock_state().status.error = None;
 
@@ -4841,6 +5071,10 @@ impl BrowserSession {
                 .set_focus()
                 .map_err(|error| format!("聚焦内置浏览器失败: {error}"))?;
         } else if let Some(window) = app.get_window(MAIN_WINDOW_LABEL) {
+            // See the same sequence in `ensure_page`: sunk before it is moved into place.
+            if page_parked(&self.lock_state()) {
+                page.set_stacking(true)?;
+            }
             let panel_bounds = self.lock_state().panel_bounds;
             let viewport = resize_page(
                 BrowserHost::MainPanel,
@@ -4874,10 +5108,12 @@ impl BrowserSession {
     ) -> Result<(), String> {
         // A replacement page is born uncovered, and the surfaces that were over the old one went
         // away with it. Say so before anything native exists, so the renderer republishes against
-        // the page it is about to get rather than against the one it lost.
+        // the page it is about to get rather than against the one it lost. The pane's own word on
+        // where the page belongs stands: a page created under a pane showing its start card is
+        // presented beneath it, not as a blank rectangle on top of it.
         {
             let mut state = self.lock_state();
-            clear_page_cover(&mut state);
+            clear_page_occlusion(&mut state);
         }
         // Resolve and exclusively claim storage before creating any native host so a path error or
         // cross-runtime collision cannot leave a detached window or provisional page behind.
@@ -5689,7 +5925,7 @@ impl BrowserSession {
             }
             if state.synthetic_surface {
                 restore_control_after_menu(&mut state);
-                clear_page_cover(&mut state);
+                clear_page_occlusion(&mut state);
                 state.renderer_presentation_generation = None;
                 state.status.open = false;
                 state.status.loading = false;
@@ -5723,9 +5959,11 @@ impl BrowserSession {
         // The pane the surfaces were drawn into is already gone, so the claim goes whether or not
         // the page sank: an occlusion left standing on a page that failed to park would keep the
         // next presentation of it stacked underneath a still frame nobody is painting any more.
+        // The pane's declaration of where the page belongs is left for the next pane to replace,
+        // which it does on mounting, before it is presented.
         {
             let mut state = self.lock_state();
-            clear_page_cover(&mut state);
+            clear_page_occlusion(&mut state);
             restore_control_after_menu(&mut state);
         }
         if let Some(Err(error)) = parked {
@@ -5794,11 +6032,14 @@ impl BrowserSession {
                 !bounds.visible,
             );
             self.lock_state().status.viewport = viewport;
+            // A rounding that fails leaves square corners, which is cosmetic; the page itself is
+            // where it belongs either way.
+            let _ = page.set_bottom_corner_radius(bounds.bottom_corner_radius.unwrap_or(0.0));
             if !bounds.visible {
                 // The pane whose surfaces were over this page has let it go, so nothing is left
-                // to keep it stacked under: the next presentation must be free to raise it.
+                // to keep it stacked under.
                 let mut state = self.lock_state();
-                clear_page_cover(&mut state);
+                clear_page_occlusion(&mut state);
                 restore_control_after_menu(&mut state);
             }
         }
@@ -6353,6 +6594,13 @@ impl BrowserSession {
 
     /// Applies the current sink decision to the live page, if there is one on screen to apply it to.
     fn restack_presented_page(&self) -> Result<BrowserStatus, String> {
+        // Held across the presented check and the native restack, so neither can interleave with
+        // `hide` (or a presentation), which park and present under the same lock. Without it a
+        // raise that found the page presented reached the main thread after a tab switch had
+        // already parked the page, and put the hidden tab's page back on top of the renderer with
+        // nothing left to sink it: the pane's own panel was gone, and every later restack skips a
+        // page that is not presented. Order: `automation`, then this, as everywhere else.
+        let _lifecycle = self.lock_lifecycle();
         // A page that is not presented is already stacked at the bottom and stays there; the flags
         // alone are what the next presentation reads.
         let Ok(page) = self.attested_page(true) else {
@@ -6365,6 +6613,28 @@ impl BrowserSession {
         let parked = page_parked(&self.lock_state());
         page.set_stacking(parked)?;
         Ok(self.status())
+    }
+
+    /// Puts this page back under the renderer if it is not the one being presented, whatever
+    /// left it raised. A page in the main window only: a detached host hides its whole window.
+    ///
+    /// A page whose lifecycle is busy is skipped rather than waited for: it is being created,
+    /// presented or hidden, and whoever holds the lock stacks it; waiting would hold up the
+    /// presentation that called this for as long as a page creation takes.
+    fn sink_if_withdrawn(&self) {
+        let Some(_lifecycle) = try_lock_unpoison(&self.lifecycle) else {
+            return;
+        };
+        let (presented, host) = {
+            let state = self.lock_state();
+            (state.status.open, state.host)
+        };
+        if presented || host != Some(BrowserHost::MainPanel) {
+            return;
+        }
+        if let Ok(page) = self.attested_page(true) {
+            let _ = page.set_stacking(true);
+        }
     }
 
     fn app_handle(&self) -> Result<AppHandle, String> {
@@ -6599,6 +6869,21 @@ fn restore_control_after_menu(state: &mut RuntimeState) {
     }
 }
 
+/// Who holds a page once its live surface is released, by sleep or cold close.
+///
+/// An Agent hold ends with the surface. A page the user took stays the user's: background tabs
+/// sleep as a matter of course, and a tab switch must not hand a page the user is signed in or
+/// typing on to the Agent without the handoff it would otherwise need.
+fn control_after_release(control: &BrowserControlStatus, now: i64) -> BrowserControlStatus {
+    if control.owner == BrowserControlOwner::User {
+        return control.clone();
+    }
+    BrowserControlStatus {
+        updated_at_ms: now,
+        ..BrowserControlStatus::default()
+    }
+}
+
 /// Whether the page's child window belongs at the bottom of the z-order.
 ///
 /// The two reasons are independent and either one is sufficient: a trusted surface is drawn over
@@ -6608,6 +6893,20 @@ fn page_parked(state: &RuntimeState) -> bool {
     state.occluded || state.projected
 }
 
+/// The status of a tab with no session: nothing, except the pane's word on where its next page
+/// belongs. Reporting that word back is what keeps the pane from taking it for a host that
+/// dropped it and asking again on every poll.
+fn absent_session_status(state: &BrowserManagerState, session_id: &str) -> BrowserStatus {
+    BrowserStatus {
+        projected: state
+            .pending_projection
+            .get(session_id)
+            .copied()
+            .unwrap_or(false),
+        ..BrowserStatus::default()
+    }
+}
+
 /// Drops both reasons the page might be sunk, in state and in the polled status together.
 ///
 /// Every path that takes the page away from the pane — sleeping, suspending, hiding, closing,
@@ -6615,10 +6914,20 @@ fn page_parked(state: &RuntimeState) -> bool {
 /// stacked under a renderer that is no longer painting anything in its place, which is a page
 /// that is simply invisible with nothing left to raise it.
 fn clear_page_cover(state: &mut RuntimeState) {
-    state.occluded = false;
-    state.status.occluded = false;
+    clear_page_occlusion(state);
     state.projected = false;
     state.status.projected = false;
+}
+
+/// Drops only the cover a pane's surfaces put over the page, keeping `projected`.
+///
+/// `projected` is the pane's own declaration of where the page belongs, made when it mounts and
+/// whenever that changes. Hiding and presenting a page happen around the pane, not to it: the
+/// pane that will show a page declares before it is presented, and clearing the declaration on
+/// the way in is what presented a page on top of the start card it was meant to sit beneath.
+fn clear_page_occlusion(state: &mut RuntimeState) {
+    state.occluded = false;
+    state.status.occluded = false;
 }
 
 fn reset_closed_state(state: &mut RuntimeState) {
@@ -7491,8 +7800,8 @@ impl BrowserSession {
                 PreviewTool::Resize => self
                     .preview_resize(
                         optional_input_string(input, "preset", 32)?.as_deref(),
-                        optional_input_f64(input, "width")?,
-                        optional_input_f64(input, "height")?,
+                        optional_viewport_size(input, "width")?,
+                        optional_viewport_size(input, "height")?,
                         optional_input_string(input, "colorScheme", 32)?.as_deref(),
                     )
                     .map(PreviewToolOutput::Text),
@@ -7519,7 +7828,7 @@ impl BrowserSession {
                         ),
                     };
                     let prompt_text =
-                        optional_input_string(input, "prompt_text", MAX_DIALOG_PROMPT_CHARS)?;
+                        optional_input_text(input, "prompt_text", MAX_DIALOG_PROMPT_CHARS)?;
                     let answered = self.dialog_tool(accept, prompt_text.as_deref())?;
                     Ok(PreviewToolOutput::Text(answered.to_string()))
                 }
@@ -7818,7 +8127,11 @@ return {
         let _automation = lock_unpoison(&self.automation);
         {
             let state = self.lock_state();
-            if !state.status.has_page || state.status.suspended {
+            // The pane captures the page it is showing, to stand in for it. A page that is not
+            // presented has nothing to stand in for, and capturing one means moving it off screen
+            // and back (see `with_composited_surface`) — a round trip that, if the page is
+            // presented meanwhile, ends by parking the page the pane has just been handed.
+            if !state.status.has_page || state.status.suspended || !state.status.open {
                 return Ok(None);
             }
         }
@@ -7918,6 +8231,12 @@ return {
             .then(|| window.outer_position().ok())
             .flatten();
         let restore_hidden_surface = || {
+            // Presentation does not wait for a capture: a page presented while this one was off
+            // screen has already been placed and stacked by whoever presented it, and putting it
+            // back where it was hidden would park the page the pane is now showing.
+            if self.lock_state().status.open {
+                return;
+            }
             if let Some(position) = original_page_position {
                 let _ = page.set_position(position);
             }
@@ -8694,6 +9013,8 @@ fn clamp_log_limit(limit: Option<u64>, default: u64) -> u64 {
     limit.unwrap_or(default).clamp(1, MAX_LOG_LIMIT)
 }
 
+/// An optional string argument; absent, `null` and blank all mean it was left
+/// out. Models that fill every optional parameter send `""` for those.
 fn optional_input_string(
     input: &Map<String, Value>,
     key: &str,
@@ -8701,7 +9022,21 @@ fn optional_input_string(
 ) -> Result<Option<String>, String> {
     match input.get(key) {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
         Some(_) => required_input_string(input, key, max_chars, false).map(Some),
+    }
+}
+
+/// An optional string argument whose empty value is a value of its own, like
+/// the answer typed into a prompt dialog.
+fn optional_input_text(
+    input: &Map<String, Value>,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<String>, String> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => required_input_string(input, key, max_chars, true).map(Some),
     }
 }
 
@@ -8748,6 +9083,13 @@ fn optional_input_u64(input: &Map<String, Value>, key: &str) -> Result<Option<u6
             .map(Some)
             .ok_or_else(|| format!("parameter {key} must be a non-negative integer")),
     }
+}
+
+/// `preview_resize` `width`/`height`. Zero is how a model that fills every
+/// parameter says it gave no size — say, beside a `colorScheme` — so it reads
+/// as absent rather than as an impossible viewport.
+fn optional_viewport_size(input: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
+    Ok(optional_input_f64(input, key)?.filter(|value| *value != 0.0))
 }
 
 fn optional_input_f64(input: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
@@ -12754,16 +13096,13 @@ pub(crate) fn parse_browser_viewport_action(
     }
 }
 
+/// `preview_screenshot` `scale`, read for what it plainly asks: zero or less is
+/// no scale given (full size), and a value past either end is held to it.
 fn validate_preview_scale(scale: Option<f64>) -> Result<Option<f64>, String> {
-    let Some(scale) = scale else {
+    let Some(scale) = scale.filter(|scale| scale.is_finite() && *scale > 0.0) else {
         return Ok(None);
     };
-    if !scale.is_finite() || scale < PREVIEW_SCALE_MIN || scale > 1.0 {
-        return Err(format!(
-            "scale must be a number in [{PREVIEW_SCALE_MIN}, 1] \u{2014} e.g. 0.5 for a half-size image"
-        ));
-    }
-    Ok(Some(scale))
+    Ok(Some(scale.clamp(PREVIEW_SCALE_MIN, 1.0)))
 }
 
 /// `Math.max(1, Math.round(Math.floor(extent) * scale * ratio))`.
@@ -13148,18 +13487,16 @@ mod preview_primitive_tests {
     }
 
     #[test]
-    fn scale_is_bounded_to_the_documented_range() {
+    fn scale_is_held_to_the_documented_range() {
         assert_eq!(validate_preview_scale(None), Ok(None));
         assert_eq!(validate_preview_scale(Some(0.5)), Ok(Some(0.5)));
         assert_eq!(validate_preview_scale(Some(1.0)), Ok(Some(1.0)));
-        assert_eq!(
-            validate_preview_scale(Some(0.05)),
-            Err(
-                "scale must be a number in [0.1, 1] \u{2014} e.g. 0.5 for a half-size image".into()
-            )
-        );
-        assert!(validate_preview_scale(Some(1.5)).is_err());
-        assert!(validate_preview_scale(Some(f64::INFINITY)).is_err());
+        // Past either end is held to it; zero or less is no scale at all.
+        assert_eq!(validate_preview_scale(Some(0.05)), Ok(Some(PREVIEW_SCALE_MIN)));
+        assert_eq!(validate_preview_scale(Some(1.5)), Ok(Some(1.0)));
+        assert_eq!(validate_preview_scale(Some(0.0)), Ok(None));
+        assert_eq!(validate_preview_scale(Some(-1.0)), Ok(None));
+        assert_eq!(validate_preview_scale(Some(f64::INFINITY)), Ok(None));
     }
 
     #[test]
@@ -13286,6 +13623,30 @@ mod tests {
         assert_eq!(PreviewTool::from_tool_name("playwright"), None);
     }
 
+    /// Arguments that mean nothing where they stand — blank optional strings, a
+    /// `filter` beside a `requestId`, a size beside a preset, zero sizes beside
+    /// a colour scheme — are ignored rather than refused.
+    #[test]
+    fn preview_validation_ignores_arguments_that_do_not_apply() {
+        let grants = BrowserToolGrants::default();
+        let lenient = [
+            (PreviewTool::ConsoleLogs, json!({"level": "", "lines": null})),
+            (PreviewTool::Network, json!({"requestId": "r1", "filter": "slow"})),
+            (PreviewTool::Network, json!({"requestId": "", "filter": ""})),
+            (PreviewTool::Resize, json!({"preset": "mobile", "width": 0, "height": -1})),
+            (PreviewTool::Resize, json!({"colorScheme": "dark", "width": 0, "height": 0})),
+            (PreviewTool::Screenshot, json!({"scale": 0})),
+            (PreviewTool::Dialog, json!({"accept": true, "prompt_text": ""})),
+        ];
+        for (tool, input) in lenient {
+            assert_eq!(
+                validate_preview_input(tool, &object(input.clone()), &grants),
+                Ok(()),
+                "{tool} {input}"
+            );
+        }
+    }
+
     #[test]
     fn browser_dispatch_rejects_invalid_arguments_before_webview_access() {
         let session = BrowserSession::default();
@@ -13316,11 +13677,6 @@ mod tests {
                 "expression must not be empty",
             ),
             (
-                PreviewTool::Screenshot,
-                json!({"scale":2}),
-                "scale must be a number in",
-            ),
-            (
                 PreviewTool::ConsoleLogs,
                 json!({"level":"verbose"}),
                 "level must be one of",
@@ -13332,7 +13688,7 @@ mod tests {
             ),
             (
                 PreviewTool::Resize,
-                json!({"width":0, "height":720}),
+                json!({"width":-5, "height":720}),
                 "preview_resize width must be a number from 1 to",
             ),
             (
@@ -13581,7 +13937,6 @@ mod tests {
             "http://inner.tauri.localhost/",
         ] {
             for level in [
-                SecurityLevel::Plan,
                 SecurityLevel::RequestApproval,
                 SecurityLevel::AllowEdits,
                 SecurityLevel::FullAccess,
@@ -13607,10 +13962,6 @@ mod tests {
         ] {
             let url = Url::parse(origin).unwrap();
             assert!(
-                !is_navigation_allowed_with(&url, SecurityLevel::Plan, dev_port),
-                "{origin} must stay reserved below full access"
-            );
-            assert!(
                 !is_navigation_allowed_with(&url, SecurityLevel::RequestApproval, dev_port),
                 "{origin} must stay reserved below full access"
             );
@@ -13625,7 +13976,6 @@ mod tests {
         }
         // Any other loopback port was never reserved at any level.
         for level in [
-            SecurityLevel::Plan,
             SecurityLevel::RequestApproval,
             SecurityLevel::FullAccess,
         ] {
@@ -13680,7 +14030,6 @@ mod tests {
             let url = Url::parse(origin).unwrap();
             assert!(!is_app_dev_server_origin(&url, None));
             for level in [
-                SecurityLevel::Plan,
                 SecurityLevel::RequestApproval,
                 SecurityLevel::AllowEdits,
                 SecurityLevel::FullAccess,
@@ -13868,6 +14217,7 @@ mod tests {
             height: 0.0,
             visible: false,
             occluded_top: Some(-20.0),
+            bottom_corner_radius: None,
         })
         .unwrap();
         assert_eq!(hidden.x, -MAX_BROWSER_PANEL_VALUE);
@@ -13905,6 +14255,7 @@ mod tests {
             height: 700.0,
             visible: true,
             occluded_top: Some(90.0),
+            bottom_corner_radius: None,
         };
         let layout = browser_layout_for_size(
             LogicalSize::new(600.0, 500.0),
@@ -13931,6 +14282,7 @@ mod tests {
                 height: 100.0,
                 visible: true,
                 occluded_top: None,
+                bottom_corner_radius: None,
             }),
         );
         assert_eq!(right_edge.width, 20.0);
@@ -14082,6 +14434,7 @@ mod tests {
                 height: 200.0,
                 visible: false,
                 occluded_top: Some(80.0),
+                bottom_corner_radius: None,
             }),
         );
         assert_eq!(
@@ -14371,6 +14724,7 @@ mod tests {
             height: 480.0,
             visible: true,
             occluded_top: Some(44.0),
+            bottom_corner_radius: None,
         };
         runtime
             .set_panel_bounds("secondary-fence-rollback", pending)
@@ -14632,6 +14986,7 @@ mod tests {
             height: 480.0,
             visible: false,
             occluded_top: Some(44.0),
+            bottom_corner_radius: None,
         };
 
         assert_eq!(
@@ -14679,6 +15034,7 @@ mod tests {
             height: 400.0,
             visible: true,
             occluded_top: Some(44.0),
+            bottom_corner_radius: None,
         };
 
         assert_eq!(
@@ -14698,14 +15054,97 @@ mod tests {
             .expect("newer Close should remove the session");
         assert_eq!(
             runtime
-                .set_panel_bounds_with_intent("layout-generation", bounds, 23)
-                .expect_err("future layout cannot cross a Closed lifecycle"),
+                .set_panel_bounds_with_intent("layout-generation", bounds, 21)
+                .expect_err("an older layout cannot reach a Closed lifecycle"),
+            STALE_BROWSER_LIFECYCLE_INTENT_ERROR
+        );
+        assert_eq!(
+            runtime
+                .set_panel_bounds_with_intent(
+                    "layout-generation",
+                    BrowserPanelBounds {
+                        visible: false,
+                        ..bounds
+                    },
+                    23
+                )
+                .expect_err("only a visible layout can be waiting for a reopen"),
             FUTURE_BROWSER_PANEL_BOUNDS_ERROR
         );
         let state = lock_unpoison(&runtime.state);
         assert!(state.sessions.is_empty());
         assert!(state.pending_panel_bounds.is_empty());
         assert!(state.closed_session_ids.contains("layout-generation"));
+    }
+
+    /// The pane reopening a closed tab lays out and declares where its page belongs before the
+    /// Open that lifts the close fence. Refused there, the reopened page came up on top of the
+    /// start card, at the fallback rectangle over the pane's toolbar, and stayed: the pane only
+    /// repairs what the host changes. Both are kept without allocating anything, and the reopen
+    /// takes them.
+    #[test]
+    fn a_closed_tab_keeps_its_reopening_panes_layout_and_declaration() {
+        let runtime = BrowserRuntime::default();
+        let open_error = runtime
+            .show_with_intent("reopened-tab", None, 1)
+            .expect_err("an unattached test runtime cannot create a native page");
+        assert!(open_error.contains("AppHandle"));
+        runtime
+            .close_with_intent("reopened-tab", 2)
+            .expect("Close should remove the session");
+        let bounds = BrowserPanelBounds {
+            x: 640.0,
+            y: 88.0,
+            width: 540.0,
+            height: 640.0,
+            visible: true,
+            occluded_top: None,
+            bottom_corner_radius: Some(9.0),
+        };
+
+        let status = runtime
+            .set_panel_bounds_with_intent("reopened-tab", bounds, 3)
+            .expect("the reopening pane's layout may beat its Open");
+        assert!(!status.open);
+        let status = runtime
+            .set_projected("reopened-tab", true)
+            .expect("the reopening pane's declaration may beat its Open");
+        assert!(status.projected);
+        assert!(!status.has_page);
+        assert!(runtime.status("reopened-tab").projected);
+        assert!(runtime.existing_session("reopened-tab").is_err());
+        {
+            let state = lock_unpoison(&runtime.state);
+            assert!(state.sessions.is_empty());
+            assert!(state.closed_session_ids.contains("reopened-tab"));
+        }
+
+        let reopen_error = runtime
+            .show_with_intent("reopened-tab", None, 3)
+            .expect_err("the test runtime has no AppHandle");
+        assert!(reopen_error.contains("AppHandle"));
+        let session = runtime
+            .existing_session("reopened-tab")
+            .expect("the reopen allocates the tab's session");
+        assert_eq!(session.lock_state().panel_bounds, Some(bounds));
+        assert!(session.status().projected);
+        let state = lock_unpoison(&runtime.state);
+        assert!(state.pending_panel_bounds.is_empty());
+        assert!(state.pending_projection.is_empty());
+    }
+
+    #[test]
+    fn a_declaration_for_an_open_tab_goes_to_its_session() {
+        let runtime = BrowserRuntime::default();
+        let status = runtime
+            .set_projected("declared-tab", true)
+            .expect("declaring needs no page");
+        assert!(status.projected);
+        let session = runtime
+            .existing_session("declared-tab")
+            .expect("an unfenced declaration lands on the session");
+        assert!(session.status().projected);
+        assert!(lock_unpoison(&runtime.state).pending_projection.is_empty());
     }
 
     #[test]
@@ -14718,6 +15157,7 @@ mod tests {
             height: 500.0,
             visible: true,
             occluded_top: Some(48.0),
+            bottom_corner_radius: None,
         };
         exact
             .set_panel_bounds_with_intent("exact-pending-layout", bounds, 30)
@@ -14777,6 +15217,7 @@ mod tests {
             height: 520.0,
             visible: true,
             occluded_top: Some(44.0),
+            bottom_corner_radius: None,
         };
 
         let status = runtime
@@ -15001,6 +15442,7 @@ mod tests {
                     height: 480.0,
                     visible: true,
                     occluded_top: Some(44.0),
+                    bottom_corner_radius: None,
                 },
             )
             .expect("a stale layout is an idempotent no-op");
@@ -15022,6 +15464,7 @@ mod tests {
             height: 500.0,
             visible: true,
             occluded_top: Some(48.0),
+            bottom_corner_radius: None,
         };
         let status = runtime
             .set_panel_bounds("layout-before-open", bounds)
@@ -15101,6 +15544,7 @@ mod tests {
                         height: 400.0,
                         visible: true,
                         occluded_top: None,
+                        bottom_corner_radius: None,
                     },
                 },
             );
@@ -15503,13 +15947,57 @@ mod tests {
         assert_eq!(session.status().control.owner, BrowserControlOwner::User);
     }
 
+    /// The pane captures the page it is showing, to stand in for it. A page that is not presented
+    /// has nothing to stand in for, and capturing one moves it off screen and back — which, when
+    /// the page is presented meanwhile, ends by parking the page the pane has just been handed.
+    #[test]
+    fn pane_capture_refuses_a_page_that_is_not_presented() {
+        let session = BrowserSession::new("pane-capture-hidden");
+        {
+            let mut state = session.lock_state();
+            state.status.has_page = true;
+            state.status.open = false;
+        }
+        let capture = session
+            .capture_page()
+            .expect("a page that is not presented is not an error");
+        assert!(capture.is_none());
+    }
+
+    /// Hiding drops the cover the pane's surfaces put over the page and keeps the pane's own word on
+    /// where the page belongs. The pane that shows the page next says so before it is presented;
+    /// resetting it on the way through presented a new page on top of the start card it was meant
+    /// to sit beneath, as a blank rectangle.
+    #[test]
+    fn hiding_drops_the_cover_but_keeps_the_panes_declaration() {
+        let session = BrowserSession::new("hide-keeps-projected");
+        {
+            let mut state = session.lock_state();
+            state.synthetic_surface = true;
+            state.status.has_page = true;
+            state.status.open = true;
+        }
+        session.set_projected(true).expect("declaring needs no page");
+        session.set_occluded(true).expect("covering needs no page");
+
+        let status = session.hide().expect("a synthetic page hides");
+
+        assert!(status.projected);
+        assert!(!status.occluded);
+        assert!(!status.open);
+    }
+
     #[test]
     fn pane_capture_leaves_page_ownership_alone() {
         let session = BrowserSession::new("pane-capture-ownership");
         // Once with nothing to capture and once past that early return, where the capture itself
         // is attempted. Whether that attempt succeeds depends on the platform; ownership must not.
         let _ = session.capture_page();
-        session.lock_state().status.has_page = true;
+        {
+            let mut state = session.lock_state();
+            state.status.has_page = true;
+            state.status.open = true;
+        }
         let _ = session.capture_page();
 
         let status = session.status();
@@ -16151,8 +16639,7 @@ mod tests {
     fn capacity_lru_never_selects_unsafe_or_reserved_pages() {
         let mut snapshots = Vec::new();
         for (index, mutation) in [
-            "active", "open", "loading", "pending", "covered", "user", "agent", "reserved",
-            "missing",
+            "active", "open", "loading", "pending", "covered", "agent", "reserved", "missing",
         ]
         .into_iter()
         .enumerate()
@@ -16164,7 +16651,6 @@ mod tests {
                 "loading" => snapshot.loading = true,
                 "pending" => snapshot.pending_navigation = true,
                 "covered" => snapshot.occluded = true,
-                "user" => snapshot.owner = BrowserControlOwner::User,
                 "agent" => snapshot.owner = BrowserControlOwner::Agent,
                 "reserved" => snapshot.reserved = true,
                 "missing" => snapshot.has_page = false,
@@ -16186,7 +16672,7 @@ mod tests {
 
         assert_eq!(
             awake_or_reserved_count(&before_reservation),
-            MAX_AWAKE_BROWSER_PAGES
+            AWAKE_BROWSER_PAGE_BUDGET
         );
         assert_eq!(
             select_lru_candidate(&before_reservation).as_deref(),
@@ -16201,11 +16687,11 @@ mod tests {
                 before_reservation[2].clone(),
                 next_resumed_sleeper.clone(),
             ]),
-            MAX_AWAKE_BROWSER_PAGES + 1
+            AWAKE_BROWSER_PAGE_BUDGET + 1
         );
 
         // The immediate post-failure awake pass sleeps that failed candidate before another cold
-        // close is attempted. This keeps the next candidate's temporary Resume at the hard limit.
+        // close is attempted. This keeps the next candidate's temporary Resume within budget.
         let mut slept_again = resumed_failed_sleeper;
         slept_again.has_page = false;
         slept_again.suspended = true;
@@ -16216,10 +16702,10 @@ mod tests {
                 slept_again.clone(),
                 next_resumed_sleeper,
             ]),
-            MAX_AWAKE_BROWSER_PAGES
+            AWAKE_BROWSER_PAGE_BUDGET
         );
 
-        // The final pass also keeps admitting the target at the limit after the retained phase.
+        // The final pass also keeps admitting the target within budget after the retained phase.
         let mut target = eligible_capacity_snapshot("new-target", 40);
         target.has_page = false;
         target.retained = false;
@@ -16231,8 +16717,117 @@ mod tests {
                 slept_again,
                 target,
             ]),
-            MAX_AWAKE_BROWSER_PAGES
+            AWAKE_BROWSER_PAGE_BUDGET
         );
+    }
+
+    #[test]
+    fn a_hidden_page_the_user_holds_sleeps_like_any_other() {
+        let mut held = eligible_capacity_snapshot("held-by-user", 10);
+        held.owner = BrowserControlOwner::User;
+        assert!(page_can_sleep(&held));
+        assert_eq!(
+            select_lru_candidate(&[eligible_capacity_snapshot("newer", 20), held]).as_deref(),
+            Some("held-by-user")
+        );
+
+        let mut sleeping = eligible_capacity_snapshot("sleeping-held-by-user", 1);
+        sleeping.has_page = false;
+        sleeping.suspended = true;
+        sleeping.owner = BrowserControlOwner::User;
+        assert_eq!(
+            select_lru_retained_sleeper(&[sleeping]).as_deref(),
+            Some("sleeping-held-by-user")
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_page_still_loading_sleeps_once_it_settles() {
+        let mut loading = eligible_capacity_snapshot("loading", 1);
+        loading.loading = true;
+        let mut navigating = eligible_capacity_snapshot("navigating", 2);
+        navigating.pending_navigation = true;
+        assert!(!page_can_sleep(&loading) && page_sleeps_once_loaded(&loading));
+        assert!(!page_can_sleep(&navigating) && page_sleeps_once_loaded(&navigating));
+
+        // A page in front, or in the Agent's hands, is not waited on: settling would not make it
+        // a page that sleeps.
+        let mut presented = loading.clone();
+        presented.open = true;
+        let mut driven = loading.clone();
+        driven.owner = BrowserControlOwner::Agent;
+        assert!(!page_sleeps_once_loaded(&presented));
+        assert!(!page_sleeps_once_loaded(&driven));
+        let idle = eligible_capacity_snapshot("idle", 3);
+        assert!(!page_sleeps_once_loaded(&idle));
+    }
+
+    #[test]
+    fn releasing_a_page_keeps_the_users_hold_and_ends_the_agents() {
+        let held = BrowserControlStatus {
+            owner: BrowserControlOwner::User,
+            handoff_requested: true,
+            requested_tool: Some("preview_click".into()),
+            updated_at_ms: 5,
+        };
+        assert_eq!(control_after_release(&held, 9), held);
+
+        let driven = BrowserControlStatus {
+            owner: BrowserControlOwner::Agent,
+            updated_at_ms: 5,
+            ..BrowserControlStatus::default()
+        };
+        let released = control_after_release(&driven, 9);
+        assert_eq!(released.owner, BrowserControlOwner::Available);
+        assert_eq!(released.updated_at_ms, 9);
+    }
+
+    /// The fourth tab used to be refused once three awake pages could not be slept, and the
+    /// renderer closed the whole preview pane on that refusal.
+    #[test]
+    fn admission_over_the_awake_budget_is_never_refused() {
+        let runtime = BrowserRuntime::default();
+        for index in 0..AWAKE_BROWSER_PAGE_BUDGET {
+            let session = runtime
+                .session(&format!("user-tab-{index}"))
+                .expect("test session should be created");
+            let mut state = session.lock_state();
+            state.status.has_page = true;
+            // Still loading: not a page the budget can sleep.
+            state.status.loading = true;
+            state.status.control.owner = BrowserControlOwner::User;
+        }
+        let target = runtime
+            .session("user-tab-new")
+            .expect("test session should be created");
+        let _manager_lifecycle = lock_unpoison(&runtime.lifecycle);
+        let reservation = runtime
+            .reserve_live_slot_locked("user-tab-new", &target)
+            .expect("a tab over the awake budget is admitted");
+        assert!(reservation.is_some());
+    }
+
+    #[test]
+    fn presenting_or_hiding_a_page_puts_the_pages_behind_it_to_sleep() {
+        let runtime = BrowserRuntime::default();
+        let session = runtime
+            .session("withdrawn-tab")
+            .expect("test session should be created");
+        {
+            let mut state = session.lock_state();
+            state.synthetic_surface = true;
+            state.status.has_page = true;
+            state.status.open = true;
+        }
+        runtime.hide("withdrawn-tab").expect("hide should succeed");
+        assert_eq!(lock_unpoison(&runtime.state).withdrawn_sleep_requests, 1);
+
+        // The pass itself: a page still loading behind the presented one asks for another look.
+        session.lock_state().status.loading = true;
+        assert!(runtime.sleep_withdrawn_pages_locked());
+        session.lock_state().status.loading = false;
+        session.lock_state().status.has_page = false;
+        assert!(!runtime.sleep_withdrawn_pages_locked());
     }
 
     #[test]
@@ -16258,10 +16853,10 @@ mod tests {
 
     #[test]
     fn retained_lru_rejects_held_active_and_reserved_sleepers() {
-        let mut protected = eligible_capacity_snapshot("held-by-user", 1);
+        let mut protected = eligible_capacity_snapshot("held-by-agent", 1);
         protected.has_page = false;
         protected.suspended = true;
-        protected.owner = BrowserControlOwner::User;
+        protected.owner = BrowserControlOwner::Agent;
         let mut active = eligible_capacity_snapshot("active", 2);
         active.has_page = false;
         active.suspended = true;

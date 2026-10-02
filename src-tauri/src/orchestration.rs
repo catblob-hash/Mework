@@ -1,25 +1,18 @@
 //! Host-side orchestration and agent tools executed by the model run loop
-//! itself: the `agent` group (`agent_spawn`, `send_message`, `followup_task`),
-//! the task group (`task_wait`, `task_list`), `ask_user`, and
-//! `TaskCreate/TaskUpdate/TaskGet/TaskList`. Retired `todo` helpers remain only
-//! for old persisted catalogs and timeline compatibility.
+//! itself: the `agent` group (`agent_spawn`), the task group (`task_wait`,
+//! `task_list`), and `ask_user`.
 //!
 //! They never touch the workspace filesystem. Every non-loop entry point
 //! (manual execution, model loop, approval dialog)
 //! keeps rejecting these names explicitly.
 
-use std::collections::BTreeMap;
-
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::agents::{
     self, AgentEnvelope, AgentLiveStatus, EnvelopeKind, WAIT_DEFAULT_TIMEOUT_SECONDS,
     WAIT_MAX_TIMEOUT_SECONDS, WAIT_MIN_TIMEOUT_SECONDS,
 };
-use crate::model::{
-    validate_agent_type_name, ContextItem, JsonObject, SubagentRunStatus, MAX_AGENT_TYPE_CHARS,
-};
+use crate::model::{validate_agent_type_name, JsonObject, SubagentRunStatus, MAX_AGENT_TYPE_CHARS};
 use crate::prompt_profile::{PromptKey, PromptProfile};
 use crate::subagent_schema::{self, Schema};
 
@@ -31,21 +24,14 @@ const MAX_LABEL_CHARS: usize = 80;
 const MAX_SUBAGENT_UPDATE_CHARS: usize = 4_000;
 const MAX_QUESTION_CHARS: usize = 4_000;
 const MAX_QUESTIONS: usize = 4;
-const MAX_HEADER_CHARS: usize = 12;
+/// Claude Code asks for headers of at most 12 characters but does not enforce
+/// it; the card truncates long ones. This only bounds runaway input.
+const MAX_HEADER_CHARS: usize = 120;
 const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 4;
 const MAX_OPTION_CHARS: usize = 120;
 const MAX_OPTION_DESCRIPTION_CHARS: usize = 1_000;
 const MAX_OPTION_PREVIEW_CHARS: usize = 16 * 1024;
-const MAX_TASKS: usize = 1_000;
-const MAX_TASK_ID_CHARS: usize = 128;
-const MAX_TASK_SUBJECT_CHARS: usize = 500;
-const MAX_TASK_DESCRIPTION_CHARS: usize = 32 * 1024;
-const MAX_TASK_ACTIVE_FORM_CHARS: usize = 500;
-const MAX_TASK_OWNER_CHARS: usize = 256;
-const MAX_TASK_RELATIONS: usize = 256;
-const MAX_TASK_METADATA_FIELDS: usize = 256;
-const MAX_TASK_METADATA_BYTES: usize = 64 * 1024;
 const MAX_SUBAGENT_OUTPUT: usize = 64 * 1024;
 /// Size ceiling for the `agent_spawn` schema document itself. `subagent_schema`
 /// bounds node count and depth; this bounds the bytes, because the schema is
@@ -91,11 +77,6 @@ pub struct AgentSpawnSpec {
     /// [`subagent_schema::compile`], so everything downstream knows the
     /// validity precheck already ran and cannot be skipped.
     pub output_schema: Option<Schema>,
-}
-
-pub struct AgentMessageSpec {
-    pub target: String,
-    pub message: String,
 }
 
 /// One addressable task. The bare form is an agent name so that every existing
@@ -252,7 +233,12 @@ pub fn parse_agent_spawn(
         "max_rounds",
         "maxRounds",
     ] {
-        if input.contains_key(host_owned) {
+        // `null` or a blank string is the field left out; only a value is an
+        // attempt at an override.
+        if input
+            .get(host_owned)
+            .is_some_and(|value| !value.is_null() && value.as_str().is_none_or(|text| !text.trim().is_empty()))
+        {
             return Err(format!(
                 "{host_owned} is host-resolved from the trusted agent_type definition; agent_spawn does not accept this field"
             ));
@@ -275,7 +261,9 @@ pub fn parse_agent_spawn(
                 "agent_type is required: the role determines the child agent's model, and omitting it would silently inherit this conversation's model. See the agent_type enum in this tool's schema for valid values.".into(),
             );
         }
-        if input.contains_key("context") {
+        // Only a fork is incompatible with a role; `none`, the default, says
+        // nothing a role-bound spawn does not already do.
+        if optional_string(input, "context", 16)?.as_deref() == Some("conversation") {
             return Err(
                 "agent_spawn has no context field in this turn: when a role is required, a child agent cannot fork conversation history because a fork inherits this conversation's model and is incompatible with naming a role.".into(),
             );
@@ -327,6 +315,8 @@ pub fn parse_agent_spawn(
 fn parse_output_schema(input: &JsonObject) -> Result<Option<Schema>, String> {
     let value = match input.get("schema") {
         None | Some(Value::Null) => return Ok(None),
+        // An empty object constrains nothing: it is no schema, not a broken one.
+        Some(Value::Object(schema)) if schema.is_empty() => return Ok(None),
         Some(value) => value,
     };
     compile_output_schema(value).map(Some)
@@ -415,28 +405,6 @@ pub fn format_structured_output(value: &Value, profile: &PromptProfile) -> Strin
     profile.render(PromptKey::SubagentStructuredResultBlock, &[("body", &body)])
 }
 
-pub fn parse_agent_message(input: &JsonObject) -> Result<AgentMessageSpec, String> {
-    let target = required_string(input, "target", agents::MAX_AGENT_NAME_CHARS)?;
-    agents::validate_agent_name(&target)?;
-    let message = required_string(input, "message", MAX_TASK_CHARS)?;
-    Ok(AgentMessageSpec { target, message })
-}
-
-/// The child form of `send_message`: one recipient, so one argument.
-///
-/// A `target` is rejected rather than ignored. The child's schema does not
-/// declare it, so a call carrying one was aimed at somebody — a sibling, or the
-/// name the child saw in its own task text — and silently redirecting that to
-/// the main agent would deliver the message to a party the child did not choose.
-pub fn parse_child_send_message(input: &JsonObject) -> Result<String, String> {
-    if input.contains_key("target") {
-        return Err(
-            "send_message takes no target here: the only recipient is the main agent that spawned you. Pass message alone".into(),
-        );
-    }
-    required_string(input, "message", MAX_TASK_CHARS)
-}
-
 pub fn parse_task_wait(input: &JsonObject) -> Result<TaskWaitSpec, String> {
     let tasks_filter = match input.get("tasks") {
         None | Some(Value::Null) => Vec::new(),
@@ -455,8 +423,11 @@ pub fn parse_task_wait(input: &JsonObject) -> Result<TaskWaitSpec, String> {
                 let raw = value
                     .as_str()
                     .map(str::trim)
-                    .filter(|raw| !raw.is_empty())
-                    .ok_or_else(|| "each tasks item must be a non-empty string".to_owned())?;
+                    .ok_or_else(|| "each tasks item must be a string".to_owned())?;
+                // A blank entry names no task; it is skipped, not refused.
+                if raw.is_empty() {
+                    continue;
+                }
                 let parsed = TaskRef::parse(raw)?;
                 if !refs.contains(&parsed) {
                     refs.push(parsed);
@@ -466,24 +437,20 @@ pub fn parse_task_wait(input: &JsonObject) -> Result<TaskWaitSpec, String> {
         }
         Some(_) => return Err("tasks must be an array of strings".into()),
     };
+    // A wait is read for what it plainly asks: zero or less is no timeout given
+    // (the default), a fraction rounds, and past either end is held to it.
     let timeout_seconds = match input.get("timeout_seconds") {
         None | Some(Value::Null) => WAIT_DEFAULT_TIMEOUT_SECONDS,
         Some(value) => {
             let seconds = value
-                .as_u64()
-                .or_else(|| {
-                    value
-                        .as_f64()
-                        .filter(|seconds| seconds.fract() == 0.0 && *seconds >= 0.0)
-                        .map(|seconds| seconds as u64)
-                })
-                .ok_or_else(|| "timeout_seconds must be an integer number of seconds".to_owned())?;
-            if !(WAIT_MIN_TIMEOUT_SECONDS..=WAIT_MAX_TIMEOUT_SECONDS).contains(&seconds) {
-                return Err(format!(
-                    "timeout_seconds must be between {WAIT_MIN_TIMEOUT_SECONDS} and {WAIT_MAX_TIMEOUT_SECONDS} seconds"
-                ));
+                .as_f64()
+                .filter(|seconds| seconds.is_finite())
+                .ok_or_else(|| "timeout_seconds must be a number of seconds".to_owned())?;
+            if seconds <= 0.0 {
+                WAIT_DEFAULT_TIMEOUT_SECONDS
+            } else {
+                (seconds.round() as u64).clamp(WAIT_MIN_TIMEOUT_SECONDS, WAIT_MAX_TIMEOUT_SECONDS)
             }
-            seconds
         }
     };
     Ok(TaskWaitSpec {
@@ -824,22 +791,58 @@ fn format_result_envelope_body(
     status: SubagentRunStatus,
     profile: &PromptProfile,
 ) -> String {
-    let content = if envelope.content.trim().is_empty() {
+    format_result_body(
+        &envelope.agent,
+        status,
+        &envelope.content,
+        envelope.structured_output.as_ref(),
+        profile,
+    )
+}
+
+fn format_result_body(
+    agent: &str,
+    status: SubagentRunStatus,
+    content: &str,
+    structured_output: Option<&Value>,
+    profile: &PromptProfile,
+) -> String {
+    let content = if content.trim().is_empty() {
         profile.text(PromptKey::TaskNoTextResult)
     } else {
-        envelope.content.trim()
+        content.trim()
     };
     let mut output = format!(
         "[{} · {}]\n{}",
-        envelope.agent,
+        agent,
         profile.text(persisted_status_key(status)),
         content
     );
-    if let Some(structured) = envelope.structured_output.as_ref() {
+    if let Some(structured) = structured_output {
         output.push('\n');
         output.push_str(&format_structured_output(structured, profile));
     }
     output
+}
+
+/// The notification a recovered final reply is delivered with: the one a fold of the same
+/// completed result would have carried, without the cost the previous process took with it.
+pub fn format_recovered_result_notification(
+    agent: &str,
+    content: &str,
+    structured_output: Option<&Value>,
+    profile: &PromptProfile,
+) -> String {
+    truncate_agent_output(
+        &format_result_body(
+            agent,
+            SubagentRunStatus::Completed,
+            content,
+            structured_output,
+            profile,
+        ),
+        profile,
+    )
 }
 
 /// One `[name · status]` result section: body, optional structured fence,
@@ -871,12 +874,6 @@ pub fn task_status_wire(status: SubagentRunStatus) -> &'static str {
         SubagentRunStatus::RoundLimit => "roundLimit",
     }
 }
-
-/// `<status>` of a notification that carries a message rather than a task
-/// outcome. Deliberately not one of the `SubagentRunStatus` wire strings: the
-/// sender is still running, and reporting a lifecycle it has not reached would
-/// tell the main agent the task is over.
-pub const TASK_MESSAGE_STATUS_WIRE: &str = "message";
 
 /// The one-line `<summary>` of a background-task completion. Mirrors upstream
 /// Claude Code's `Agent "…" finished` / `… failed` shape, with the task address
@@ -935,14 +932,12 @@ pub fn format_undrained_result_notification(
     )
 }
 
-/// One row of `task_list`. Agents carry `continuable`; a terminal or dev
-/// server never does, because `followup_task` addresses agents only.
+/// One row of `task_list`.
 pub struct TaskListRow {
     /// Wire address `task_wait` accepts back.
     pub task: String,
     pub label: String,
     pub status_label: String,
-    pub continuable: bool,
     /// The agent's task text, the terminal's cwd, or the page URL.
     pub detail: String,
     pub latest_update: Option<String>,
@@ -975,11 +970,6 @@ pub fn format_task_list(groups: &[TaskListGroup], profile: &PromptProfile) -> St
                 output.push_str(
                     &profile.render(PromptKey::TaskListRowLabel, &[("label", &row.label)]),
                 );
-            }
-            if row.continuable {
-                // Marking an agent continuable is factual; continuation mechanics
-                // belong to the tool description.
-                output.push_str(profile.text(PromptKey::TaskListContinuable));
             }
             if !detail_preview.is_empty() {
                 output.push_str(&format!("\n  {detail_preview}"));
@@ -1031,741 +1021,26 @@ fn truncate_to(output: &str, budget: usize, profile: &PromptProfile) -> String {
     )
 }
 
-/// Parsed for validation only; the renderer reads the questions and options
-/// straight from the persisted tool input, so Rust never displays them.
+/// A validated `ask_user` call: what the question card shows and what the
+/// answers are matched against when the result is worded.
+#[derive(Debug)]
 pub struct QuestionItemSpec {
-    #[allow(dead_code)]
     pub question: String,
-    #[allow(dead_code)]
     pub header: String,
-    #[allow(dead_code)]
     pub options: Vec<QuestionOptionSpec>,
-    #[allow(dead_code)]
     pub multi_select: bool,
 }
 
+#[derive(Debug)]
 pub struct QuestionOptionSpec {
-    #[allow(dead_code)]
     pub label: String,
-    #[allow(dead_code)]
     pub description: String,
-    #[allow(dead_code)]
     pub preview: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct QuestionSpec {
-    #[allow(dead_code)]
     pub questions: Vec<QuestionItemSpec>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct TaskRecord {
-    id: String,
-    subject: String,
-    description: String,
-    status: TaskStatus,
-    active_form: Option<String>,
-    owner: Option<String>,
-    blocks: Vec<String>,
-    blocked_by: Vec<String>,
-    metadata: JsonObject,
-}
-
-#[derive(Clone, Debug)]
-struct TaskCreateSpec {
-    subject: String,
-    description: String,
-    active_form: Option<String>,
-    metadata: JsonObject,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TaskUpdateStatus {
-    Persistent(TaskStatus),
-    Deleted,
-}
-
-#[derive(Clone, Debug)]
-struct TaskUpdateSpec {
-    task_id: String,
-    status: Option<TaskUpdateStatus>,
-    subject: Option<String>,
-    description: Option<String>,
-    active_form: Option<String>,
-    add_blocks: Option<Vec<String>>,
-    add_blocked_by: Option<Vec<String>>,
-    owner: Option<String>,
-    metadata: Option<JsonObject>,
-    updated_fields: Vec<&'static str>,
-}
-
-/// Replayable, turn-local task state. Persisted successful Task tool contexts
-/// seed it at the beginning of a model run; calls in that run mutate the same
-/// instance in provider order.
-#[derive(Clone, Debug)]
-pub struct TaskTurnState {
-    tasks: BTreeMap<String, TaskRecord>,
-    next_task_number: u64,
-}
-
-impl Default for TaskTurnState {
-    fn default() -> Self {
-        Self {
-            tasks: BTreeMap::new(),
-            next_task_number: 1,
-        }
-    }
-}
-
-impl TaskTurnState {
-    pub fn from_contexts(contexts: &[ContextItem]) -> Self {
-        let mut state = Self::default();
-        replay_task_contexts(contexts, &mut state);
-        state
-    }
-
-    pub fn execute(&mut self, tool_name: &str, input: &JsonObject) -> Result<String, String> {
-        if tool_name != TODO_TOOL {
-            return Err(format!("unknown task tool: {tool_name}"));
-        }
-        match required_action(input, TODO_TOOL, TODO_ACTIONS)? {
-            "create" => self.create(input),
-            "update" => self.update(input),
-            "get" => self.get(input),
-            _ => self.list(input),
-        }
-    }
-
-    fn create(&mut self, input: &JsonObject) -> Result<String, String> {
-        let spec = parse_task_create(input)?;
-        if self.tasks.len() >= MAX_TASKS {
-            return Err(format!(
-                "task list must not contain more than {MAX_TASKS} items"
-            ));
-        }
-        let id = self.next_task_id()?;
-        self.insert_task(id.clone(), spec);
-        encode_json(&json!({
-            "task": {
-                "id": id,
-                "subject": self.tasks[&id].subject,
-            }
-        }))
-    }
-
-    fn update(&mut self, input: &JsonObject) -> Result<String, String> {
-        let spec = parse_task_update(input)?;
-        self.apply_update(spec, true)
-    }
-
-    fn replay_update(&mut self, input: &JsonObject) {
-        let Ok(mut spec) = parse_task_update(input) else {
-            return;
-        };
-        if spec.status != Some(TaskUpdateStatus::Deleted) {
-            let task_id = spec.task_id.as_str();
-            spec.add_blocks = spec.add_blocks.map(|relations| {
-                relations
-                    .into_iter()
-                    .filter(|relation| relation != task_id && self.tasks.contains_key(relation))
-                    .collect()
-            });
-            spec.add_blocked_by = spec.add_blocked_by.map(|relations| {
-                relations
-                    .into_iter()
-                    .filter(|relation| relation != task_id && self.tasks.contains_key(relation))
-                    .collect()
-            });
-        }
-        // A persisted successful event already passed execution-time guards.
-        // When an earlier message is deleted, apply each surviving patch
-        // exactly instead of silently dropping a later event whose precondition
-        // would no longer pass as a fresh call.
-        let _ = self.apply_update(spec, false);
-    }
-
-    fn apply_update(
-        &mut self,
-        spec: TaskUpdateSpec,
-        enforce_execution_guards: bool,
-    ) -> Result<String, String> {
-        let current = self
-            .tasks
-            .get(&spec.task_id)
-            .cloned()
-            .ok_or_else(|| format!("task {} does not exist", spec.task_id))?;
-
-        if enforce_execution_guards {
-            validate_task_relations(self, &spec.task_id, spec.add_blocks.as_deref())?;
-            validate_task_relations(self, &spec.task_id, spec.add_blocked_by.as_deref())?;
-        }
-
-        if spec.status == Some(TaskUpdateStatus::Deleted) {
-            self.tasks.remove(&spec.task_id);
-            self.remove_task_references(&spec.task_id);
-            let mut output = json!({
-                "success": true,
-                "taskId": spec.task_id,
-                "updatedFields": spec.updated_fields,
-            });
-            output["statusChange"] = json!({
-                "from": current.status,
-                "to": "deleted",
-            });
-            return encode_json(&output);
-        }
-
-        let mut candidate = self.tasks.clone();
-        let mut next = current.clone();
-        if let Some(subject) = &spec.subject {
-            next.subject = subject.clone();
-        }
-        if let Some(description) = &spec.description {
-            next.description = description.clone();
-        }
-        if let Some(active_form) = &spec.active_form {
-            next.active_form = Some(active_form.clone());
-        }
-        if let Some(owner) = &spec.owner {
-            next.owner = Some(owner.clone());
-        }
-        if let Some(additions) = &spec.add_blocks {
-            add_unique(&mut next.blocks, additions);
-        }
-        if let Some(additions) = &spec.add_blocked_by {
-            add_unique(&mut next.blocked_by, additions);
-        }
-        if let Some(patch) = &spec.metadata {
-            merge_metadata(&mut next.metadata, patch.clone());
-        }
-        let status_change = spec.status.and_then(|status| match status {
-            TaskUpdateStatus::Persistent(status) if status != current.status => {
-                Some((current.status, status))
-            }
-            _ => None,
-        });
-        if let Some(TaskUpdateStatus::Persistent(status)) = spec.status {
-            next.status = status;
-        }
-
-        candidate.insert(spec.task_id.clone(), next);
-        for blocked_id in spec.add_blocks.as_deref().unwrap_or_default() {
-            if let Some(blocked) = candidate.get_mut(blocked_id) {
-                add_unique(&mut blocked.blocked_by, std::slice::from_ref(&spec.task_id));
-            }
-        }
-        for blocker_id in spec.add_blocked_by.as_deref().unwrap_or_default() {
-            if let Some(blocker) = candidate.get_mut(blocker_id) {
-                add_unique(&mut blocker.blocks, std::slice::from_ref(&spec.task_id));
-            }
-        }
-        if enforce_execution_guards {
-            validate_task_graph(&candidate)?;
-        }
-        self.tasks = candidate;
-
-        let mut output = json!({
-            "success": true,
-            "taskId": spec.task_id,
-            "updatedFields": spec.updated_fields,
-        });
-        if let Some((from, to)) = status_change {
-            output["statusChange"] = json!({"from": from, "to": to});
-        }
-        encode_json(&output)
-    }
-
-    fn get(&self, input: &JsonObject) -> Result<String, String> {
-        ensure_only_keys(input, &["action", "taskId"], "todo get")?;
-        let task_id = required_string(input, "taskId", MAX_TASK_ID_CHARS)?;
-        let task = self.tasks.get(&task_id).map(task_get_projection);
-        encode_json(&json!({"task": task}))
-    }
-
-    fn list(&self, input: &JsonObject) -> Result<String, String> {
-        ensure_only_keys(input, &["action"], "todo list")?;
-        let mut tasks = self.tasks.values().collect::<Vec<_>>();
-        tasks.sort_by(|left, right| compare_generated_ids(&left.id, &right.id, "task-"));
-        let tasks = tasks
-            .into_iter()
-            .map(task_list_projection)
-            .collect::<Vec<_>>();
-        encode_json(&json!({"tasks": tasks}))
-    }
-
-    fn insert_task(&mut self, id: String, spec: TaskCreateSpec) {
-        self.note_task_id(&id);
-        self.tasks.insert(
-            id.clone(),
-            TaskRecord {
-                id,
-                subject: spec.subject,
-                description: spec.description,
-                status: TaskStatus::Pending,
-                active_form: spec.active_form,
-                owner: None,
-                blocks: Vec::new(),
-                blocked_by: Vec::new(),
-                metadata: spec.metadata,
-            },
-        );
-    }
-
-    fn next_task_id(&mut self) -> Result<String, String> {
-        loop {
-            let number = self.next_task_number;
-            self.next_task_number = number
-                .checked_add(1)
-                .ok_or_else(|| "task ID limit has been reached".to_owned())?;
-            let candidate = format!("task-{number}");
-            if !self.tasks.contains_key(&candidate) {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    fn note_task_id(&mut self, id: &str) {
-        if let Some(number) = generated_id_number(id, "task-") {
-            self.next_task_number = self.next_task_number.max(number.saturating_add(1));
-        }
-    }
-
-    fn remove_task_references(&mut self, task_id: &str) {
-        for task in self.tasks.values_mut() {
-            task.blocks.retain(|candidate| candidate != task_id);
-            task.blocked_by.retain(|candidate| candidate != task_id);
-        }
-    }
-}
-
-/// Name of the consolidated task-status tool. `action` is its only operation
-/// selector: the catalog exposes one tool and the host dispatches by action.
-pub const TODO_TOOL: &str = "todo";
-pub const TODO_ACTIONS: &[&str] = &["create", "update", "get", "list"];
-
-pub fn is_task_state_tool(name: &str) -> bool {
-    name == TODO_TOOL
-}
-
-pub fn is_state_tool(name: &str) -> bool {
-    is_task_state_tool(name)
-}
-
-/// Reads and validates the discriminating `action` of a merged state tool.
-///
-/// Returns the borrowed canonical spelling from `allowed`, so every caller
-/// matches on `&'static str` rather than on renderer-supplied text.
-fn required_action(
-    input: &JsonObject,
-    tool_name: &str,
-    allowed: &'static [&'static str],
-) -> Result<&'static str, String> {
-    let action = match input.get("action") {
-        Some(Value::String(action)) => action.as_str(),
-        Some(_) => return Err(format!("{tool_name} argument action must be a string")),
-        None => return Err(format!("{tool_name} is missing required argument action")),
-    };
-    allowed
-        .iter()
-        .copied()
-        .find(|candidate| *candidate == action)
-        .ok_or_else(|| {
-            format!(
-                "{tool_name} action is invalid: {action}; allowed values: {}",
-                allowed.join(", ")
-            )
-        })
-}
-
-fn parse_task_create(input: &JsonObject) -> Result<TaskCreateSpec, String> {
-    ensure_only_keys(
-        input,
-        &["action", "subject", "description", "activeForm", "metadata"],
-        "todo create",
-    )?;
-    Ok(TaskCreateSpec {
-        subject: required_string(input, "subject", MAX_TASK_SUBJECT_CHARS)?,
-        description: required_string(input, "description", MAX_TASK_DESCRIPTION_CHARS)?,
-        active_form: strict_optional_string(input, "activeForm", MAX_TASK_ACTIVE_FORM_CHARS)?,
-        metadata: strict_optional_object(input, "metadata")?.unwrap_or_default(),
-    })
-}
-
-fn parse_task_update(input: &JsonObject) -> Result<TaskUpdateSpec, String> {
-    const PATCH_FIELDS: &[&str] = &[
-        "status",
-        "subject",
-        "description",
-        "activeForm",
-        "addBlocks",
-        "addBlockedBy",
-        "owner",
-        "metadata",
-    ];
-    ensure_only_keys(
-        input,
-        &[
-            "action",
-            "taskId",
-            "status",
-            "subject",
-            "description",
-            "activeForm",
-            "addBlocks",
-            "addBlockedBy",
-            "owner",
-            "metadata",
-        ],
-        "todo update",
-    )?;
-    let task_id = required_string(input, "taskId", MAX_TASK_ID_CHARS)?;
-    let updated_fields = PATCH_FIELDS
-        .iter()
-        .copied()
-        .filter(|field| input.contains_key(*field))
-        .collect::<Vec<_>>();
-    if updated_fields.is_empty() {
-        return Err("todo update requires at least one field to update".into());
-    }
-    let status = match input.get("status") {
-        None => None,
-        Some(Value::String(status)) => Some(match status.as_str() {
-            "pending" => TaskUpdateStatus::Persistent(TaskStatus::Pending),
-            "in_progress" => TaskUpdateStatus::Persistent(TaskStatus::InProgress),
-            "completed" => TaskUpdateStatus::Persistent(TaskStatus::Completed),
-            "deleted" => TaskUpdateStatus::Deleted,
-            other => {
-                return Err(format!(
-                    "invalid status argument: {other}; allowed values: pending, in_progress, completed, deleted"
-                ))
-            }
-        }),
-        Some(_) => return Err("status argument must be a string".into()),
-    };
-    Ok(TaskUpdateSpec {
-        task_id,
-        status,
-        subject: strict_optional_string(input, "subject", MAX_TASK_SUBJECT_CHARS)?,
-        description: strict_optional_string(input, "description", MAX_TASK_DESCRIPTION_CHARS)?,
-        active_form: strict_optional_string(input, "activeForm", MAX_TASK_ACTIVE_FORM_CHARS)?,
-        add_blocks: strict_optional_string_array(input, "addBlocks")?,
-        add_blocked_by: strict_optional_string_array(input, "addBlockedBy")?,
-        owner: strict_optional_string(input, "owner", MAX_TASK_OWNER_CHARS)?,
-        metadata: strict_optional_object(input, "metadata")?,
-        updated_fields,
-    })
-}
-
-fn strict_optional_string(
-    input: &JsonObject,
-    key: &str,
-    max_chars: usize,
-) -> Result<Option<String>, String> {
-    match input.get(key) {
-        None => Ok(None),
-        Some(_) => required_string(input, key, max_chars).map(Some),
-    }
-}
-
-fn strict_optional_string_array(
-    input: &JsonObject,
-    key: &str,
-) -> Result<Option<Vec<String>>, String> {
-    let Some(value) = input.get(key) else {
-        return Ok(None);
-    };
-    let values = value
-        .as_array()
-        .ok_or_else(|| format!("argument {key} must be an array of strings"))?;
-    if values.len() > MAX_TASK_RELATIONS {
-        return Err(format!(
-            "argument {key} must not contain more than {MAX_TASK_RELATIONS} items"
-        ));
-    }
-    let mut result = Vec::with_capacity(values.len());
-    for value in values {
-        let task_id = value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("each {key} item must be a non-empty string"))?;
-        if task_id.chars().count() > MAX_TASK_ID_CHARS {
-            return Err(format!(
-                "task ID in argument {key} exceeds length limit {MAX_TASK_ID_CHARS}"
-            ));
-        }
-        if !result.iter().any(|existing| existing == task_id) {
-            result.push(task_id.to_owned());
-        }
-    }
-    Ok(Some(result))
-}
-
-fn strict_optional_object(input: &JsonObject, key: &str) -> Result<Option<JsonObject>, String> {
-    let Some(value) = input.get(key) else {
-        return Ok(None);
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("argument {key} must be a JSON object"))?;
-    if object.len() > MAX_TASK_METADATA_FIELDS {
-        return Err(format!(
-            "argument {key} must not contain more than {MAX_TASK_METADATA_FIELDS} fields"
-        ));
-    }
-    let encoded = serde_json::to_vec(object)
-        .map_err(|error| format!("could not encode argument {key}: {error}"))?;
-    if encoded.len() > MAX_TASK_METADATA_BYTES {
-        return Err(format!(
-            "argument {key} must not exceed {MAX_TASK_METADATA_BYTES} bytes"
-        ));
-    }
-    Ok(Some(object.clone()))
-}
-
-fn ensure_only_keys(input: &JsonObject, allowed: &[&str], tool_name: &str) -> Result<(), String> {
-    if let Some(key) = input
-        .keys()
-        .find(|key| !allowed.iter().any(|allowed| key == allowed))
-    {
-        return Err(format!("{tool_name} does not accept argument {key}"));
-    }
-    Ok(())
-}
-
-fn validate_task_relations(
-    state: &TaskTurnState,
-    task_id: &str,
-    relations: Option<&[String]>,
-) -> Result<(), String> {
-    for relation in relations.unwrap_or_default() {
-        if relation == task_id {
-            return Err(format!("task {task_id} cannot depend on or block itself"));
-        }
-        if !state.tasks.contains_key(relation) {
-            return Err(format!("related task {relation} does not exist"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_task_graph(tasks: &BTreeMap<String, TaskRecord>) -> Result<(), String> {
-    // Blocking must prevent both starting and completing a task. Guarding only
-    // `InProgress` lets a blocked task jump from pending to completed and falsely
-    // unlock its dependents. `Pending` remains valid while blocked.
-    for task in tasks
-        .values()
-        .filter(|task| matches!(task.status, TaskStatus::InProgress | TaskStatus::Completed))
-    {
-        let unresolved = task
-            .blocked_by
-            .iter()
-            .filter(|id| {
-                tasks
-                    .get(*id)
-                    .is_none_or(|blocker| blocker.status != TaskStatus::Completed)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unresolved.is_empty() {
-            return Err(format!(
-                "task {} is still blocked by incomplete tasks: {}",
-                task.id,
-                unresolved.join(", ")
-            ));
-        }
-    }
-
-    let mut indegree = tasks
-        .keys()
-        .map(|id| (id.clone(), 0usize))
-        .collect::<BTreeMap<_, _>>();
-    let mut outgoing = tasks
-        .keys()
-        .map(|id| (id.clone(), Vec::<String>::new()))
-        .collect::<BTreeMap<_, _>>();
-    for task in tasks.values() {
-        for blocker in &task.blocked_by {
-            if let Some(degree) = indegree.get_mut(&task.id) {
-                *degree = degree.saturating_add(1);
-            }
-            if let Some(blocked) = outgoing.get_mut(blocker) {
-                blocked.push(task.id.clone());
-            }
-        }
-    }
-    let mut ready = indegree
-        .iter()
-        .filter_map(|(id, degree)| (*degree == 0).then_some(id.clone()))
-        .collect::<Vec<_>>();
-    let mut visited = 0usize;
-    while let Some(id) = ready.pop() {
-        visited += 1;
-        for blocked in outgoing.get(&id).into_iter().flatten() {
-            let Some(degree) = indegree.get_mut(blocked) else {
-                continue;
-            };
-            *degree = degree.saturating_sub(1);
-            if *degree == 0 {
-                ready.push(blocked.clone());
-            }
-        }
-    }
-    if visited != tasks.len() {
-        return Err("task dependencies must not form a cycle".into());
-    }
-    Ok(())
-}
-
-fn add_unique(target: &mut Vec<String>, additions: &[String]) {
-    for addition in additions {
-        if !target.iter().any(|existing| existing == addition) {
-            target.push(addition.clone());
-        }
-    }
-}
-
-fn merge_metadata(target: &mut JsonObject, patch: JsonObject) {
-    for (key, value) in patch {
-        if value.is_null() {
-            target.remove(&key);
-        } else {
-            target.insert(key, value);
-        }
-    }
-}
-
-fn task_get_projection(task: &TaskRecord) -> Value {
-    json!({
-        "id": task.id,
-        "subject": task.subject,
-        "description": task.description,
-        "status": task.status,
-        "blocks": task.blocks,
-        "blockedBy": task.blocked_by,
-    })
-}
-
-fn task_list_projection(task: &TaskRecord) -> Value {
-    let mut value = json!({
-        "id": task.id,
-        "subject": task.subject,
-        "status": task.status,
-        "blockedBy": task.blocked_by,
-    });
-    if let Some(owner) = &task.owner {
-        value["owner"] = Value::String(owner.clone());
-    }
-    value
-}
-
-fn encode_json(value: &Value) -> Result<String, String> {
-    serde_json::to_string(value).map_err(|error| format!("could not encode tool result: {error}"))
-}
-
-fn generated_id_number(id: &str, prefix: &str) -> Option<u64> {
-    id.strip_prefix(prefix)?
-        .parse::<u64>()
-        .ok()
-        .filter(|id| *id > 0)
-}
-
-fn compare_generated_ids(left: &str, right: &str, prefix: &str) -> std::cmp::Ordering {
-    match (
-        generated_id_number(left, prefix),
-        generated_id_number(right, prefix),
-    ) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.cmp(right),
-    }
-}
-
-/// Whether a settled tool context is one merged state tool's given action.
-///
-/// The tool name alone no longer identifies the operation, so replay has to
-/// read the same `action` discriminator the executor dispatched on.
-fn is_state_tool_action(tool_name: &str, input: &JsonObject, tool: &str, action: &str) -> bool {
-    tool_name == tool && input.get("action").and_then(Value::as_str) == Some(action)
-}
-
-fn replay_task_contexts(contexts: &[ContextItem], state: &mut TaskTurnState) {
-    for context in contexts {
-        match context {
-            ContextItem::Tool {
-                tool_name,
-                input,
-                result,
-                ..
-            } if result.success && is_state_tool_action(tool_name, input, TODO_TOOL, "create") => {
-                let Some((id, subject)) = parse_task_create_output(&result.output) else {
-                    continue;
-                };
-                let Ok(spec) = parse_task_create(input) else {
-                    continue;
-                };
-                if spec.subject != subject
-                    || state.tasks.contains_key(&id)
-                    || state.tasks.len() >= MAX_TASKS
-                {
-                    continue;
-                }
-                state.insert_task(id, spec);
-            }
-            ContextItem::Tool {
-                tool_name,
-                input,
-                result,
-                ..
-            } if result.success && is_state_tool_action(tool_name, input, TODO_TOOL, "update") => {
-                if valid_task_update_output(&result.output, input) {
-                    state.replay_update(input);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn parse_task_create_output(output: &str) -> Option<(String, String)> {
-    let value: Value = serde_json::from_str(output).ok()?;
-    let task = value.get("task")?.as_object()?;
-    let id = task.get("id")?.as_str()?.trim();
-    let subject = task.get("subject")?.as_str()?.trim();
-    if id.is_empty()
-        || subject.is_empty()
-        || id.chars().count() > MAX_TASK_ID_CHARS
-        || subject.chars().count() > MAX_TASK_SUBJECT_CHARS
-    {
-        return None;
-    }
-    Some((id.to_owned(), subject.to_owned()))
-}
-
-fn valid_task_update_output(output: &str, input: &JsonObject) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(output) else {
-        return false;
-    };
-    let Some(task_id) = input.get("taskId").and_then(Value::as_str) else {
-        return false;
-    };
-    let task_id = task_id.trim();
-    value.get("success").and_then(Value::as_bool) == Some(true)
-        && value
-            .get("taskId")
-            .and_then(Value::as_str)
-            .is_some_and(|output_id| output_id.trim() == task_id)
-        && value
-            .get("updatedFields")
-            .and_then(Value::as_array)
-            .is_some_and(|fields| fields.iter().all(Value::is_string))
 }
 
 fn parse_question_item(value: &Value, index: usize) -> Result<QuestionItemSpec, String> {
@@ -1778,15 +1053,16 @@ fn parse_question_item(value: &Value, index: usize) -> Result<QuestionItemSpec, 
         .map_err(|error| format!("questions item {}: {error}", index + 1))?;
     let options = parse_question_options(object.get("options"))
         .map_err(|error| format!("questions item {}: {error}", index + 1))?;
-    let multi_select = object
-        .get("multiSelect")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
+    // Claude Code's schema defaults a missing `multiSelect` to false.
+    let multi_select = match object.get("multiSelect") {
+        None | Some(Value::Null) => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
             format!(
                 "questions item {}: multiSelect must be a boolean",
                 index + 1
             )
-        })?;
+        })?,
+    };
     Ok(QuestionItemSpec {
         question,
         header,
@@ -1827,6 +1103,10 @@ fn parse_question_options(value: Option<&Value>) -> Result<Vec<QuestionOptionSpe
     }
 }
 
+/// Claude Code's steer for a call with a question that offers fewer than two
+/// options, verbatim.
+const FEWER_THAN_TWO_OPTIONS: &str = "This call included a question with fewer than 2 options, so it was rejected and the person never saw it. A question with a single option has no decision in it. Do not retry this call and do not invent a filler second option. Instead, state the one path you were going to offer as the approach you are taking, then continue with the task. If this call also contained questions with 2 to 4 options (each with distinct labels), you may re-ask those questions alone in a new call. Ask a question only when the person has at least two genuinely distinct choices.";
+
 pub fn parse_question(input: &JsonObject) -> Result<QuestionSpec, String> {
     if let Some(value) = input.get("questions") {
         let values = value
@@ -1840,11 +1120,41 @@ pub fn parse_question(input: &JsonObject) -> Result<QuestionSpec, String> {
                 "questions must not contain more than {MAX_QUESTIONS} items"
             ));
         }
+        // Claude Code rejects a call with a one-option question before the
+        // user sees it, and tells the model not to pad it with a filler.
+        let too_few_options = values.iter().any(|value| {
+            value
+                .get("options")
+                .and_then(Value::as_array)
+                .is_some_and(|options| options.len() < MIN_OPTIONS)
+        });
         let questions = values
             .iter()
             .enumerate()
             .map(|(index, value)| parse_question_item(value, index))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                if too_few_options {
+                    format!("{FEWER_THAN_TWO_OPTIONS}\n\n{error}")
+                } else {
+                    error
+                }
+            })?;
+        let mut seen_questions = std::collections::HashSet::new();
+        let unique = questions.iter().all(|question| {
+            let mut labels = std::collections::HashSet::new();
+            seen_questions.insert(question.question.as_str())
+                && question
+                    .options
+                    .iter()
+                    .all(|option| labels.insert(option.label.as_str()))
+        });
+        if !unique {
+            return Err(
+                "Question texts must be unique, option labels must be unique within each question"
+                    .into(),
+            );
+        }
         return Ok(QuestionSpec { questions });
     }
 
@@ -1949,6 +1259,8 @@ fn required_string(input: &JsonObject, key: &str, max_chars: usize) -> Result<St
     Ok(value.to_owned())
 }
 
+/// An optional argument; absent, `null` and blank all mean it was left out.
+/// Models that fill every optional parameter send `""` for those.
 fn optional_string(
     input: &JsonObject,
     key: &str,
@@ -1956,6 +1268,7 @@ fn optional_string(
 ) -> Result<Option<String>, String> {
     match input.get(key) {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
         Some(_) => required_string(input, key, max_chars).map(Some),
     }
 }
@@ -1963,7 +1276,6 @@ fn optional_string(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ToolResult;
     use serde_json::json;
 
     fn object(value: Value) -> JsonObject {
@@ -2080,587 +1392,6 @@ mod tests {
             &profile,
         );
         assert!(!legacy.contains("This turn's cost"), "{legacy}");
-    }
-
-    fn tool_context(
-        id: &str,
-        tool_name: &str,
-        input: Value,
-        output: Value,
-        success: bool,
-    ) -> ContextItem {
-        ContextItem::Tool {
-            id: id.into(),
-            tool_name: tool_name.into(),
-            round: None,
-            model_turn_id: None,
-            provider_call_id: None,
-            requested_input: None,
-            input: object(input),
-            result: ToolResult {
-                success,
-                output: serde_json::to_string(&output).unwrap(),
-                images: Vec::new(),
-                diff: None,
-                executed_at: "2026-07-24T00:00:00Z".into(),
-                duration_ms: 0,
-            },
-            subagent: None,
-            attestation: String::new(),
-            created_at: "2026-07-24T00:00:00Z".into(),
-        }
-    }
-
-    fn parsed(output: &str) -> Value {
-        serde_json::from_str(output).unwrap()
-    }
-
-    fn action_input(action: &str, mut input: Value) -> Value {
-        input
-            .as_object_mut()
-            .expect("test inputs must be JSON objects")
-            .insert("action".into(), Value::String(action.into()));
-        input
-    }
-
-    #[test]
-    fn task_tools_share_incremental_state_and_use_official_json_shapes() {
-        let mut state = TaskTurnState::default();
-        let first = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "create",
-                        json!({
-                            "subject": "design interface",
-                            "description": "determine request and response",
-                            "metadata": {"area": "api"}
-                        }),
-                    )),
-                )
-                .unwrap(),
-        );
-        assert_eq!(
-            first,
-            json!({"task":{"id":"task-1","subject":"design interface"}})
-        );
-
-        let second = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "create",
-                        json!({
-                            "subject": "implement interface",
-                            "description": "write implementation and tests",
-                            "activeForm": "implementing interface"
-                        }),
-                    )),
-                )
-                .unwrap(),
-        );
-        assert_eq!(second["task"]["id"], "task-2");
-
-        let dependency = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "update",
-                        json!({
-                            "taskId": "task-2",
-                            "addBlockedBy": ["task-1"],
-                            "owner": "backend"
-                        }),
-                    )),
-                )
-                .unwrap(),
-        );
-        assert_eq!(dependency["success"], true);
-        assert_eq!(
-            dependency["updatedFields"],
-            json!(["addBlockedBy", "owner"])
-        );
-        assert!(state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","status":"in_progress"})
-                )),
-            )
-            .unwrap_err()
-            .contains("is still blocked by incomplete tasks"));
-
-        let completed = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "update",
-                        json!({"taskId":"task-1","status":"completed"}),
-                    )),
-                )
-                .unwrap(),
-        );
-        assert_eq!(
-            completed["statusChange"],
-            json!({"from":"pending","to":"completed"})
-        );
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({
-                        "taskId": "task-2",
-                        "status": "in_progress",
-                        "metadata": {"area": "runtime", "obsolete": null}
-                    }),
-                )),
-            )
-            .unwrap();
-
-        let task = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input("get", json!({"taskId":"task-2"}))),
-                )
-                .unwrap(),
-        );
-        assert_eq!(
-            task,
-            json!({"task":{
-                "id":"task-2",
-                "subject":"implement interface",
-                "description":"write implementation and tests",
-                "status":"in_progress",
-                "blocks":[],
-                "blockedBy":["task-1"]
-            }})
-        );
-        let list = parsed(
-            &state
-                .execute("todo", &object(action_input("list", json!({}))))
-                .unwrap(),
-        );
-        assert_eq!(list["tasks"][1]["owner"], "backend");
-        assert_eq!(state.tasks["task-1"].blocks, vec!["task-2"]);
-        assert_eq!(state.tasks["task-2"].metadata["area"], "runtime");
-
-        let deleted = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "update",
-                        json!({"taskId":"task-1","status":"deleted"}),
-                    )),
-                )
-                .unwrap(),
-        );
-        assert_eq!(
-            deleted["statusChange"],
-            json!({"from":"completed","to":"deleted"})
-        );
-        assert!(state.tasks["task-2"].blocked_by.is_empty());
-        assert_eq!(
-            parsed(
-                &state
-                    .execute(
-                        "todo",
-                        &object(action_input("get", json!({"taskId":"task-1"})))
-                    )
-                    .unwrap()
-            ),
-            json!({"task":null})
-        );
-    }
-
-    #[test]
-    fn task_state_replays_only_successful_structured_events_and_advances_ids() {
-        let malformed_high_id = tool_context(
-            "malformed-high-id",
-            "todo",
-            action_input(
-                "create",
-                json!({"subject":"actual title","description":"details"}),
-            ),
-            json!({"task":{"id":"task-99","subject":"mismatched title"}}),
-            true,
-        );
-        let create = tool_context(
-            "create",
-            "todo",
-            action_input(
-                "create",
-                json!({"subject":"historical task","description":"details"}),
-            ),
-            json!({"task":{"id":"task-7","subject":"historical task"}}),
-            true,
-        );
-        let update = tool_context(
-            "update",
-            "todo",
-            action_input("update", json!({"taskId":"task-7","status":"completed"})),
-            json!({
-                "success":true,
-                "taskId":"task-7",
-                "updatedFields":["status"],
-                "statusChange":{"from":"pending","to":"completed"}
-            }),
-            true,
-        );
-        let ignored = tool_context(
-            "failed",
-            "todo",
-            action_input(
-                "create",
-                json!({"subject":"must not appear","description":"details"}),
-            ),
-            json!({"task":{"id":"task-99","subject":"must not appear"}}),
-            false,
-        );
-        let mut state = TaskTurnState::from_contexts(&[malformed_high_id, create, update, ignored]);
-        let task = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input("get", json!({"taskId":"task-7"}))),
-                )
-                .unwrap(),
-        );
-        assert_eq!(task["task"]["status"], "completed");
-        let created = parsed(
-            &state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "create",
-                        json!({"subject":"next item","description":"details"}),
-                    )),
-                )
-                .unwrap(),
-        );
-        assert_eq!(created["task"]["id"], "task-8");
-    }
-
-    #[test]
-    fn task_graph_updates_are_atomic_and_reject_cycles_or_new_blockers_for_active_work() {
-        let mut state = TaskTurnState::default();
-        for subject in ["A", "B"] {
-            state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "create",
-                        json!({"subject":subject,"description":"details"}),
-                    )),
-                )
-                .unwrap();
-        }
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","status":"in_progress"}),
-                )),
-            )
-            .unwrap();
-        let before_block = state.tasks.clone();
-        assert!(state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","addBlocks":["task-2"]})
-                )),
-            )
-            .unwrap_err()
-            .contains("is still blocked by incomplete tasks"));
-        assert_eq!(state.tasks, before_block);
-
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","status":"pending"}),
-                )),
-            )
-            .unwrap();
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","addBlocks":["task-2"]}),
-                )),
-            )
-            .unwrap();
-        let before_cycle = state.tasks.clone();
-        assert!(state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","addBlocks":["task-1"]})
-                )),
-            )
-            .unwrap_err()
-            .contains("task dependencies must not form a cycle"));
-        assert_eq!(state.tasks, before_cycle);
-
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","status":"completed"}),
-                )),
-            )
-            .unwrap();
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","status":"in_progress"}),
-                )),
-            )
-            .unwrap();
-        let before_reopen = state.tasks.clone();
-        assert!(state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","status":"pending"})
-                )),
-            )
-            .unwrap_err()
-            .contains("is still blocked by incomplete tasks"));
-        assert_eq!(state.tasks, before_reopen);
-    }
-
-    #[test]
-    fn a_blocked_task_cannot_be_completed_or_have_its_blocker_reopened() {
-        // Blocking prevents completion as well as starting. Otherwise a blocked
-        // task can jump from pending to completed and falsely unlock dependents.
-        let mut state = TaskTurnState::default();
-        for subject in ["prerequisite", "successor"] {
-            state
-                .execute(
-                    "todo",
-                    &object(action_input(
-                        "create",
-                        json!({"subject":subject,"description":"details"}),
-                    )),
-                )
-                .unwrap();
-        }
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","addBlockedBy":["task-1"]}),
-                )),
-            )
-            .unwrap();
-
-        // A blocked task may remain Pending.
-        let blocked = state.tasks.clone();
-        assert!(state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","status":"completed"})
-                )),
-            )
-            .unwrap_err()
-            .contains("is still blocked by incomplete tasks"));
-        assert_eq!(
-            state.tasks, blocked,
-            "the rejected update must roll back entirely"
-        );
-
-        // A successor may complete only after its prerequisite completes.
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","status":"completed"}),
-                )),
-            )
-            .unwrap();
-        state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-2","status":"completed"}),
-                )),
-            )
-            .unwrap();
-
-        // A completed successor must not be invalidated by reopening its
-        // prerequisite.
-        let settled = state.tasks.clone();
-        assert!(state
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","status":"pending"})
-                )),
-            )
-            .unwrap_err()
-            .contains("is still blocked by incomplete tasks"));
-        assert_eq!(state.tasks, settled);
-    }
-
-    #[test]
-    fn replay_keeps_later_successful_task_patch_after_earlier_status_is_deleted() {
-        let contexts = vec![
-            tool_context(
-                "create-a",
-                "todo",
-                action_input("create", json!({"subject":"A","description":"details"})),
-                json!({"task":{"id":"task-1","subject":"A"}}),
-                true,
-            ),
-            tool_context(
-                "create-b",
-                "todo",
-                action_input("create", json!({"subject":"B","description":"details"})),
-                json!({"task":{"id":"task-2","subject":"B"}}),
-                true,
-            ),
-            tool_context(
-                "dependency",
-                "todo",
-                action_input(
-                    "update",
-                    json!({"taskId":"task-2","addBlockedBy":["task-1"]}),
-                ),
-                json!({
-                    "success":true,
-                    "taskId":"task-2",
-                    "updatedFields":["addBlockedBy"]
-                }),
-                true,
-            ),
-            // The original timeline had a successful task-1 completion here.
-            // Simulate deleting that message while retaining the later,
-            // already-successful task-2 claim.
-            tool_context(
-                "claim-b",
-                "todo",
-                action_input("update", json!({"taskId":"task-2","status":"in_progress"})),
-                json!({
-                    "success":true,
-                    "taskId":"task-2",
-                    "updatedFields":["status"],
-                    "statusChange":{"from":"pending","to":"in_progress"}
-                }),
-                true,
-            ),
-        ];
-        let state = TaskTurnState::from_contexts(&contexts);
-        assert_eq!(state.tasks["task-1"].status, TaskStatus::Pending);
-        assert_eq!(state.tasks["task-2"].status, TaskStatus::InProgress);
-        assert_eq!(state.tasks["task-2"].blocked_by, vec!["task-1"]);
-    }
-
-    #[test]
-    fn task_inputs_reject_unknown_or_ambiguous_fields_atomically() {
-        let mut tasks = TaskTurnState::default();
-        tasks
-            .execute(
-                "todo",
-                &object(action_input(
-                    "create",
-                    json!({"subject":"task","description":"details"}),
-                )),
-            )
-            .unwrap();
-        let before = tasks.clone();
-        assert!(tasks
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","status":"done"})
-                )),
-            )
-            .is_err());
-        assert!(tasks
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","owner":null})
-                )),
-            )
-            .is_err());
-        assert!(tasks
-            .execute(
-                "todo",
-                &object(action_input(
-                    "update",
-                    json!({"taskId":"task-1","unexpected":true})
-                )),
-            )
-            .is_err());
-        assert_eq!(tasks.tasks, before.tasks);
-    }
-
-    /// `action` is the whole basis of the merge: without it the executor cannot
-    /// tell a create from a list, and a call that silently defaulted would write
-    /// state the model never asked for. Both directions are checked — an absent
-    /// discriminator and an unknown one — and neither may touch the state it
-    /// failed to address.
-    #[test]
-    fn merged_state_tools_reject_a_missing_or_unknown_action() {
-        let mut tasks = TaskTurnState::default();
-        tasks
-            .execute(
-                "todo",
-                &object(action_input(
-                    "create",
-                    json!({"subject":"task","description":"details"}),
-                )),
-            )
-            .unwrap();
-        let before = tasks.clone();
-
-        for input in [
-            json!({"subject":"no action","description":"details"}),
-            json!({}),
-            json!({"action":"delete","taskId":"task-1"}),
-            json!({"action":123,"taskId":"task-1"}),
-            json!({"action":"Create","subject":"capitalized","description":"details"}),
-        ] {
-            let error = tasks.execute("todo", &object(input.clone())).unwrap_err();
-            assert!(error.contains("action"), "{input}: {error}");
-        }
-        assert_eq!(tasks.tasks, before.tasks);
-
-        // The tool NAME is still checked before the action: a stale catalog
-        // entry must not reach the task dispatcher under another tool's name.
-        assert!(tasks
-            .execute(
-                "retired_state_tool",
-                &object(action_input("list", json!({})))
-            )
-            .is_err());
     }
 
     #[test]
@@ -2960,18 +1691,27 @@ mod tests {
         assert_eq!(spec.agent_type.as_deref(), Some("code-reviewer"));
         assert_eq!(spec.context, SpawnContextMode::None);
 
-        // `context` is absent from this round's schema, so reject even
-        // `context: "none"` rather than granting a value-based exception.
-        for context in ["conversation", "none"] {
-            let error = required(json!({
+        // `context` is absent from this round's schema. A fork is refused —
+        // it cannot carry a role — but the default it would otherwise take,
+        // spelled out or left blank, changes nothing and is ignored.
+        let error = required(json!({
+            "prompt": "x",
+            "name": "role-check",
+            "agent_type": "code-reviewer",
+            "context": "conversation"
+        }))
+        .err()
+        .unwrap();
+        assert!(error.contains("context"), "{error}");
+        for context in [json!("none"), json!(""), Value::Null] {
+            let spec = required(json!({
                 "prompt": "x",
                 "name": "role-check",
                 "agent_type": "code-reviewer",
                 "context": context
             }))
-            .err()
             .unwrap();
-            assert!(error.contains("context"), "{context}: {error}");
+            assert_eq!(spec.context, SpawnContextMode::None, "{context}");
         }
 
         // In fallback mode a role remains optional and forking still works.
@@ -3017,8 +1757,9 @@ mod tests {
 
         // What is still refused is what cannot name anything at all. Every case
         // includes a valid `name` so `is_err()` exercises the agent_type rather
-        // than the missing-name validation.
-        for invalid in ["", "review\ner", &"x".repeat(MAX_AGENT_TYPE_CHARS + 1)] {
+        // than the missing-name validation. A blank one is not among them: it
+        // is the field left out.
+        for invalid in ["review\ner", &"x".repeat(MAX_AGENT_TYPE_CHARS + 1)] {
             assert!(parse_fallback(&object(json!({
                 "prompt": "x",
                 "name": "review-api",
@@ -3056,16 +1797,16 @@ mod tests {
                 .unwrap()
                 .contains("host-resolved"));
         }
-    }
-
-    #[test]
-    fn agent_messages_require_a_valid_target() {
-        let spec =
-            parse_agent_message(&object(json!({"target":"a1","message":"Continue"}))).unwrap();
-        assert_eq!(spec.target, "a1");
-        assert_eq!(spec.message, "Continue");
-        assert!(parse_agent_message(&object(json!({"target":"a1"}))).is_err());
-        assert!(parse_agent_message(&object(json!({"target":"A1","message":"x"}))).is_err());
+        // A host-owned field left `null` or blank is no override at all, and an
+        // empty `schema` constrains nothing; neither is refused.
+        let spec = parse_fallback(&object(json!({
+            "prompt": "x", "name": "review-api", "label": "", "agent_type": "",
+            "model_id": null, "effort": "", "schema": {}
+        })))
+        .unwrap();
+        assert_eq!(spec.label, None);
+        assert_eq!(spec.agent_type, None);
+        assert!(spec.output_schema.is_none());
     }
 
     /// A bare address is an agent name so every existing `a1` keeps working;
@@ -3141,9 +1882,22 @@ mod tests {
         );
         assert_eq!(spec.timeout_seconds, 30);
 
-        assert!(parse_task_wait(&object(json!({"timeout_seconds": 1}))).is_err());
-        assert!(parse_task_wait(&object(json!({"timeout_seconds": 601}))).is_err());
-        assert!(parse_task_wait(&object(json!({"timeout_seconds": 30.5}))).is_err());
+        // A timeout is held to the range, a fraction rounds, zero is the default,
+        // and a blank task entry is skipped.
+        let timeout = |value: Value| {
+            parse_task_wait(&object(json!({"timeout_seconds": value})))
+                .unwrap()
+                .timeout_seconds
+        };
+        assert_eq!(timeout(json!(1)), WAIT_MIN_TIMEOUT_SECONDS);
+        assert_eq!(timeout(json!(601)), WAIT_MAX_TIMEOUT_SECONDS);
+        assert_eq!(timeout(json!(30.5)), 31);
+        assert_eq!(timeout(json!(0)), WAIT_DEFAULT_TIMEOUT_SECONDS);
+        assert!(parse_task_wait(&object(json!({"timeout_seconds": "soon"}))).is_err());
+        assert_eq!(
+            parse_task_wait(&object(json!({"tasks": ["", " a1 "]}))).unwrap().tasks,
+            vec![TaskRef::Agent("a1".into())]
+        );
         assert!(parse_task_wait(&object(json!({"tasks": "a1"}))).is_err());
         // A retired address must receive its specific error, not agent-name
         // validation, because models can copy it from historical timelines.
@@ -3389,7 +2143,6 @@ mod tests {
                     task: "a1".into(),
                     label: "review".into(),
                     status_label: "interrupted".into(),
-                    continuable: true,
                     detail: "review   src directory\nand report results".into(),
                     latest_update: Some("half complete".into()),
                 }],
@@ -3400,7 +2153,6 @@ mod tests {
                     task: "terminal:t1".into(),
                     label: "build".into(),
                     status_label: "running".into(),
-                    continuable: false,
                     detail: "C:/work".into(),
                     latest_update: None,
                 }],
@@ -3409,7 +2161,7 @@ mod tests {
         let output = format_task_list(&groups, &profile);
         assert!(output.contains("2 tasks in total"), "{output}");
         assert!(
-            output.contains("- a1 · interrupted (review) (resumable)"),
+            output.contains("- a1 · interrupted (review)"),
             "{output}"
         );
         assert!(
@@ -3422,8 +2174,6 @@ mod tests {
             output.contains("- terminal:t1 · running (build)"),
             "{output}"
         );
-        // Only agents are continuable; a terminal must not carry the marker.
-        assert!(!output.contains("running (build) (resumable)"), "{output}");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-`ask_user` stops the turn and puts a multiple-choice card above the composer. The model reaches for it when it has hit a fork it should not pick for you — which of two approaches, which of three files is the right one, whether to include a migration — and each option carries a short line saying what choosing it means. Your answer arrives as the next user message, which starts the next turn.
+`ask_user` puts a multiple-choice card above the composer and waits on it. The model reaches for it when it has hit a fork it should not pick for you — which of two approaches, which of three files is the right one, whether to include a migration — and each option carries a short line saying what choosing it means. The call blocks until you answer, and your answer comes back as the result of that same call, so the model carries on inside the same turn.
 
 ## Approval
 
@@ -6,7 +6,15 @@ No security level asks, and no approval card is involved: the tool is itself the
 
 ## Behavior and limits
 
-One call carries up to four questions, each with two to four options; an **Other** free-text choice is added to every question by the card, so you are never boxed into the offered answers, and a question marked multi-select accepts several. An option may carry preview text, shown while that option is focused or hovered. A valid call ends the turn with no further request to the provider, and any other tool calls the model emitted in the same round are skipped rather than run. The card stays above the composer until answered, with header buttons to edit the questions or delete them. Answering sends an ordinary user message pairing each question with the answer you gave, so the model reads it as your words — and you can ignore the card and type something else, which closes the question and goes to the model as that message instead. An answer given while a run is still settling is held and sent once the conversation is idle.
+The card follows Claude Code's AskUserQuestion. One call carries up to four questions, each with two to four options and a tab of its own; an **Other** row lets you type your own answer, and a question marked multi-select accepts several. Picking an option in a single-select question moves on to the next one, and a card with a single single-select question is answered the moment you pick. Cards with more questions end on a review tab where you submit what you answered — unanswered questions may stay blank. Options with preview text switch the question to a side-by-side layout with the preview on the right and a notes line below it (press `n`). **Chat about this** declines the questions, hands back whatever you had answered, and asks the model to talk them over with you.
+
+Three ways out do not answer the card:
+
+- **Closing it** — the close button, `Esc`, or Cancel on the review tab — returns a result saying you closed the card, and the turn ends there without asking the model anything more.
+- **Sending a message from the composer** while the card is up hands back whatever you had filled in (or that you closed the card, if nothing), and your message follows that result, so the model reads both in the same turn.
+- **Stopping the run** retracts the card along with the run.
+
+Answers are recorded with the call, keyed by question text, and the timeline card shows them afterwards.
 
 ## Related
 

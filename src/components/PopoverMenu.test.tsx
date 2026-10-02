@@ -146,12 +146,45 @@ describe("PopoverMenu", () => {
 
     expect(native).toHaveAttribute("aria-expanded", "true");
     const nested = screen.getByRole("menu", { name: "原生" });
-    expect(nested).toHaveClass("popover-menu__submenu--flyout");
-    // The row that owns the flyout is its positioning context; without it the
-    // panel would be placed against the window instead of beside the row.
-    expect(nested.parentElement).toHaveClass("popover-menu__row--branch");
-    expect(within(nested).getByRole("menuitemradio", { name: "web_search_20250305" }))
-      .toBeInTheDocument();
+    // A panel of its own beside the menu, not a box inside it.
+    expect(nested).toHaveClass("popover-menu__panel", "popover-menu__flyout");
+    expect(panel).not.toContainElement(nested);
+    expect(nested.parentElement).toBe(panel.parentElement);
+    await user.click(within(nested).getByRole("menuitemradio", { name: "web_search_20250305" }));
+    // A press in the submenu is a press in the menu: the row was chosen, and the menu closed after.
+    expect(screen.queryByRole("menu", { name: "后端" })).not.toBeInTheDocument();
+  });
+
+  it("walks into a submenu with the right arrow and back out with the left", async () => {
+    const user = userEvent.setup();
+    render(
+      <PopoverMenu
+        trigger={<span>后端</span>}
+        triggerLabel="后端"
+        menuLabel="后端"
+        submenu="flyout"
+        sections={[{
+          id: "backends",
+          items: [
+            { id: "native", label: "原生", children: [{ id: "v1", label: "第一版" }, { id: "v2", label: "第二版" }] },
+            { id: "provider", label: "提供商" }
+          ]
+        }]}
+      />
+    );
+    await user.click(screen.getByRole("button", { name: "后端" }));
+    const native = screen.getByRole("menuitem", { name: "原生" });
+    native.focus();
+
+    await user.keyboard("{ArrowRight}");
+    expect(native).toHaveAttribute("aria-expanded", "true");
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "第一版" }));
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "第二版" }));
+
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.queryByRole("menu", { name: "原生" })).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(native);
   });
 
   it("nests inline by default, so an ordinary menu keeps one scrolling list", async () => {

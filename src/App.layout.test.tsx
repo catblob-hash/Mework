@@ -559,7 +559,9 @@ describe("App model run flow — layout", () => {
       y: 88,
       width: 592,
       height: 650,
-      visible: true
+      visible: true,
+      // jsdom applies no stylesheet, so the pane has no rounding for the page to follow.
+      bottomCornerRadius: 0
     }));
   });
 
@@ -661,10 +663,12 @@ describe("App model run flow — layout", () => {
     await user.click(screen.getByRole("button", { name: "更多选项" }));
     await user.click(await screen.findByRole("menuitemradio", { name: "对话设置" }));
     const settings = await screen.findByRole("region", { name: "对话设置" });
-    // A third track, not a cover: the two below it keep their boxes.
+    // Not a cover: the first two already pair up in one column, so the third opens its own
+    // column beside them and both keep their boxes.
     expect(tasks).toBeInTheDocument();
     expect(files).toBeInTheDocument();
-    expect(screen.getAllByRole("separator", { name: "调整面板高度" })).toHaveLength(2);
+    expect(screen.getAllByRole("separator", { name: "调整面板高度" })).toHaveLength(1);
+    expect(screen.getAllByRole("separator", { name: "调整列宽度" })).toHaveLength(1);
     // Its own page list is the pane's navigation, mirroring the global settings page.
     expect(within(settings).getByRole("navigation", { name: "对话设置分类" })).toBeInTheDocument();
 

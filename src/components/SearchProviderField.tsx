@@ -3,6 +3,7 @@ import { useI18n } from "../i18n";
 import { SEARCH_PROVIDERS } from "../lib/searchProviders";
 import type { NativeSearchTool, SearchProviderSelection, WebSearchAssets } from "../types";
 import { Field } from "./Common";
+import { LockMark, lockedFieldHint, lockToneClass, type BackendLock } from "./LockTone";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuItem, PopoverMenuSection } from "./PopoverMenu";
 
@@ -33,10 +34,12 @@ interface SearchProviderFieldProps {
   /** Whether to offer the parent-selection option. Conversations have no parent, so this defaults to false. */
   inheritOption?: boolean;
   hint?: string;
-  /** Draws the selection as settled rather than removable. */
-  disabled?: boolean;
-  /** Replaces the standing advice while disabled, to say why it cannot move. */
-  disabledHint?: string;
+  /**
+   * How the conversation's lock draws this selector: gray cannot move, and its
+   * note replaces the standing advice to say why; orange moves, and its note
+   * says what moving it costs.
+   */
+  lock?: BackendLock | null;
   /** Opens the native row into a second step naming the wire tool version. */
   nativeToolChoice?: NativeSearchToolChoice;
 }
@@ -61,8 +64,7 @@ export function SearchProviderField({
   webSearchAssets,
   inheritOption = false,
   hint,
-  disabled = false,
-  disabledHint,
+  lock,
   nativeToolChoice
 }: SearchProviderFieldProps) {
   const { t } = useI18n();
@@ -138,21 +140,21 @@ export function SearchProviderField({
     ]
   }];
 
+  const disabled = lock?.tone === "hard";
   return <Field
     label={t("搜索提供商", "Search provider")}
-    hint={disabled && disabledHint
-      ? disabledHint
-      : unavailable
-        ? t("已选提供商不可用或未启用，联网搜索当前无法执行。请选择原生或一个已启用的提供商；旧选择不会被静默恢复。", "The selected provider is unavailable or disabled, so web search cannot run. Choose native or an enabled provider; the old selection is not silently restored.")
-        : hint ?? t("原生表示由当前对话的模型用它自己的联网搜索工具检索，返回的是一段带引用的报告；选一家提供商则由应用自己去检索，返回的是标题、网址与正文摘要。选「不启用」则模型看不到联网搜索这个工具，但仍可以用抓取网页。提供商及其凭据在全局设置中管理。", "Native means the conversation's own model searches with its own built-in tool and returns a written report; picking a provider means the app searches itself and returns titles, URLs and snippets. Choose “Off” and the model sees no web-search tool, though it may still fetch pages. Providers and their credentials are managed in global settings.")}
+    hint={lockedFieldHint(lock, unavailable
+      ? t("已选提供商不可用或未启用，联网搜索当前无法执行。请选择原生或一个已启用的提供商；旧选择不会被静默恢复。", "The selected provider is unavailable or disabled, so web search cannot run. Choose native or an enabled provider; the old selection is not silently restored.")
+      : hint ?? t("原生表示由当前对话的模型用它自己的联网搜索工具检索，返回的是一段带引用的报告；选一家提供商则由应用自己去检索，返回的是标题、网址与正文摘要。选「不启用」则模型看不到联网搜索这个工具，但仍可以用抓取网页。提供商及其凭据在全局设置中管理。", "Native means the conversation's own model searches with its own built-in tool and returns a written report; picking a provider means the app searches itself and returns titles, URLs and snippets. Choose “Off” and the model sees no web-search tool, though it may still fetch pages. Providers and their credentials are managed in global settings."))}
   >
     <PopoverMenu
       rootClassName="popover-select"
-      triggerClassName={`input popover-select__trigger${unavailable ? " input--error" : ""}`}
+      triggerClassName={`input popover-select__trigger${unavailable ? " input--error" : ""}${lockToneClass("popover-select__trigger", lock?.tone)}`}
       triggerLabel={t("搜索提供商：{value}", "Search provider: {value}", { value: triggerLabel })}
       trigger={<>
         <span className="popover-select__value">{triggerLabel}</span>
         {triggerVersion && <span className="popover-select__note">{triggerVersion}</span>}
+        <LockMark tone={lock?.tone} />
         <ChevronDown size={14} className="popover-select__chevron" aria-hidden="true" />
       </>}
       disabled={disabled}

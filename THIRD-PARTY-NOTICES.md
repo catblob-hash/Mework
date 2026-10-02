@@ -48,14 +48,25 @@ folded into one file and given a stop switch for shutdown.
 
 ## `ggml-org/llama.cpp` — MIT (Windows and Linux builds)
 
-**Linked into:** `mework.exe` / `mework` on Windows and Linux, through the
-[`llama-cpp-sys-2`](https://crates.io/crates/llama-cpp-sys-2) crate, which compiles
-the llama.cpp and ggml sources it bundles. It runs the optional local helper model
-(conversation titles, shell command explanations); macOS builds use Core ML or MLX
-instead and do not contain it.
+**Not in the app; downloaded with the local helper model.** On Windows and Linux the
+optional local helper model (conversation titles, shell command explanations) runs on
+llama.cpp's own release build, [release `b11074`](https://github.com/ggml-org/llama.cpp/releases/tag/b11074)
+as llama.cpp publishes it (the Vulkan build on x64, which carries every CPU variant as
+well). When the user picks that build of the model, the app downloads the release
+archive, checks it against its pinned SHA-256 and keeps only its libraries (`llama`,
+`ggml`, `ggml-base`, the `ggml-cpu-*` variants, `ggml-vulkan` and, on Windows, LLVM's
+OpenMP runtime `libomp.dll`, Apache-2.0 WITH LLVM-exception), which it loads at run
+time. Nothing of llama.cpp is compiled into `mework.exe` / `mework`; macOS builds use
+Core ML or MLX instead.
 
 llama.cpp is MIT: Copyright (c) 2023-2026 The ggml authors. The MIT text is in
 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).
+
+On Windows x64 the same download includes LunarG's Vulkan Runtime Components
+1.4.357.0, from which the app keeps the Khronos Vulkan loader (`vulkan-1.dll`,
+Apache-2.0, Copyright (c) 2015-2026 The Khronos Group Inc., LunarG, Inc. and Valve
+Corporation). It is used only on a system whose GPU driver installed no Vulkan loader
+of its own; GPU drivers normally do.
 
 The model (Qwen3.5-0.8B, Apache-2.0) is not in the app. When the user turns the
 feature on and picks a build, the app downloads that build, converted from the official
@@ -117,118 +128,6 @@ closed but for a short list, pseudo terminals are not allowed, and the protected
 the bare-repository rule and the hard-link denials are Mework's. The Linux side
 (bubblewrap arguments, the seccomp filter) follows the same project's approach without
 taking its code.
-
----
-
-## `obra/superpowers` — MIT
-
-**Vendored files:**
-[`src-tauri/resources/builtin-skills/systematic-debugging/SKILL.md`](src-tauri/resources/builtin-skills/systematic-debugging/SKILL.md),
-[`src-tauri/resources/builtin-skills/verification-before-completion/SKILL.md`](src-tauri/resources/builtin-skills/verification-before-completion/SKILL.md)
-
-Adapted from `skills/systematic-debugging/SKILL.md` and
-`skills/verification-before-completion/SKILL.md` in the
-[superpowers](https://github.com/obra/superpowers) repository, at commit
-`b36e0829c6d0140e93cfef2ca599b1b07d4a7797` (2026-09-17). The bodies are verbatim
-apart from the removals recorded in
-[`src-tauri/resources/builtin-skills/README.md`](src-tauri/resources/builtin-skills/README.md);
-the frontmatter is rewritten into the flat `key: value` form this host parses.
-
-```
-MIT License
-
-Copyright (c) 2025 Jesse Vincent
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
----
-
-## `addyosmani/agent-skills` — MIT
-
-**Vendored files:**
-[`src-tauri/resources/builtin-skills/code-review-and-quality/SKILL.md`](src-tauri/resources/builtin-skills/code-review-and-quality/SKILL.md),
-[`src-tauri/resources/builtin-skills/git-workflow-and-versioning/SKILL.md`](src-tauri/resources/builtin-skills/git-workflow-and-versioning/SKILL.md)
-
-Adapted from `skills/code-review-and-quality/SKILL.md` and
-`skills/git-workflow-and-versioning/SKILL.md` in the
-[agent-skills](https://github.com/addyosmani/agent-skills) repository, at commit
-`be4e44a9` (2026-09-17), with the same treatment as above.
-
-```
-MIT License
-
-Copyright (c) 2025 Addy Osmani
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
----
-
-## `mattpocock/skills` — MIT
-
-**Vendored file:**
-[`src-tauri/resources/builtin-skills/resolving-merge-conflicts/SKILL.md`](src-tauri/resources/builtin-skills/resolving-merge-conflicts/SKILL.md)
-
-Adapted from `skills/engineering/resolving-merge-conflicts/SKILL.md` in the
-[skills](https://github.com/mattpocock/skills) repository, at commit
-`959a8e9f` (2026-09-17), with the same treatment as above.
-
-```
-MIT License
-
-Copyright (c) 2026 Matt Pocock
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
 
 ---
 

@@ -23,7 +23,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt as _;
 
 use crate::host_platform::host_platform;
-use crate::model::{ApiProvider, ProviderFamily};
+use crate::model::{ApiProvider, ModelCapability, ModelProfile, ProviderFamily};
 
 use super::protocol::AgentSession;
 
@@ -267,6 +267,8 @@ pub(crate) fn session_for(
         executable: executable.to_string_lossy().into_owned(),
         cwd: cwd.to_string_lossy().into_owned(),
         env,
+        // Per step: `SessionLease::session` sets it for the step's model.
+        tool_changes: false,
     }))
 }
 
@@ -749,10 +751,15 @@ impl SessionLease {
         })
     }
 
-    /// The session block to attach to each step of this run; `None` for
-    /// families without one.
-    pub(crate) fn session(&self) -> Option<AgentSession> {
-        self.session.clone()
+    /// The session block to attach to a step of this run on `model`; `None`
+    /// for families without one. Whether the CLI takes tool changes is the
+    /// model's declared `ToolAppend` capability, which Mework fills in from
+    /// the bundled CLI's own catalogue (`tool_append::known`).
+    pub(crate) fn session(&self, model: &ModelProfile) -> Option<AgentSession> {
+        self.session.clone().map(|session| AgentSession {
+            tool_changes: model.has(ModelCapability::ToolAppend),
+            ..session
+        })
     }
 }
 
@@ -767,7 +774,6 @@ impl Drop for SessionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelProfile;
 
     fn provider(family: ProviderFamily) -> ApiProvider {
         ApiProvider {
@@ -788,6 +794,38 @@ mod tests {
     fn other_families_get_no_session_block() {
         let session = session_for(&provider(ProviderFamily::Anthropic), "").unwrap();
         assert!(session.is_none());
+    }
+
+    /// A run keeps one session but may switch models between steps, so whether
+    /// the CLI takes tool changes is decided per step, by the host's own rule.
+    #[test]
+    fn each_step_says_whether_its_model_takes_tool_changes() {
+        let lease = SessionLease {
+            session: Some(AgentSession {
+                session: "run-1".into(),
+                executable: "claude".into(),
+                cwd: "cwd".into(),
+                env: BTreeMap::new(),
+                tool_changes: false,
+            }),
+        };
+        let model = |id: &str| {
+            let mut profile = crate::model_discovery::claude_agent_seed_models(&provider(ProviderFamily::ClaudeAgent))
+                .into_iter()
+                .next()
+                .unwrap();
+            profile.id = id.into();
+            profile.set_capability(
+                ModelCapability::ToolAppend,
+                crate::tool_append::known(ProviderFamily::ClaudeAgent, "", id) == Some(true),
+            );
+            profile
+        };
+        let opus = lease.session(&model("claude-opus-5-5")).unwrap();
+        assert!(opus.tool_changes);
+        assert_eq!(opus.session, "run-1");
+        assert!(!lease.session(&model("claude-sonnet-5-5")).unwrap().tool_changes);
+        assert!(SessionLease { session: None }.session(&model("claude-opus-5-5")).is_none());
     }
 
     /// The version lock, end to end: whatever this build resolves as *the*

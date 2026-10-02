@@ -26,7 +26,10 @@ use std::{
 };
 
 use cef::*;
-use objc2::{msg_send, runtime::AnyClass};
+use objc2::{
+    msg_send,
+    runtime::{AnyClass, AnyObject},
+};
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSView, NSWindowOrderingMode};
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 use serde_json::{json, Value};
@@ -198,6 +201,9 @@ struct PageShared {
     window: Window,
     callbacks: MainOnly<PageCallbacks>,
     frame: Mutex<LogicalFrame>,
+    /// The bottom-corner radius last applied to the view, so a frame-by-frame resize does not
+    /// post a main-thread task for a rounding that has not changed.
+    bottom_corner_radius: Mutex<Option<f64>>,
     closed: AtomicBool,
     pending: Mutex<HashMap<i32, CdpCompletion>>,
     listeners: Mutex<Vec<EventListener>>,
@@ -208,6 +214,12 @@ struct PageShared {
     /// Set when [`add_child`] gave up waiting; a browser created after that is closed at once.
     abandoned: AtomicBool,
 }
+
+/// `CACornerMask` bits, by the corner of the layer's bounds each one rounds.
+const CA_CORNER_MIN_X_MIN_Y: usize = 1;
+const CA_CORNER_MAX_X_MIN_Y: usize = 2;
+const CA_CORNER_MIN_X_MAX_Y: usize = 4;
+const CA_CORNER_MAX_X_MAX_Y: usize = 8;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -537,11 +549,26 @@ impl CefWebview {
     /// geometry or visibility. The trusted React WKWebView is a sibling covering the whole
     /// window, so a page at the bottom is entirely covered and takes no pointer input, while
     /// it keeps compositing because its window is still on screen.
+    ///
+    /// A view already where it belongs is left in place. Re-adding a subview removes it from its
+    /// superview first, which takes the keyboard from a page the user is typing into — and the
+    /// stacking is re-asserted with every geometry update, which arrives every frame while the
+    /// pane is being resized.
     pub(crate) fn set_stacking(&self, parked: bool) -> Result<(), String> {
         self.with_native("调整浏览器页面层级", move |_, _, view| {
             let Some(parent) = (unsafe { view.superview() }) else {
                 return Err("浏览器页面不在任何窗口中".into());
             };
+            let siblings = parent.subviews();
+            let in_place = if parked {
+                siblings.firstObject()
+            } else {
+                siblings.lastObject()
+            }
+            .is_some_and(|edge| std::ptr::eq(&*edge, view));
+            if in_place {
+                return Ok(());
+            }
             let ordering = if parked {
                 NSWindowOrderingMode::Below
             } else {
@@ -557,6 +584,42 @@ impl CefWebview {
             }
             Ok(())
         })
+    }
+
+    /// Rounds the page's two bottom corners to `radius` and clips the page to its own frame.
+    ///
+    /// The pane rounds the bottom of the page area, but the page is a native view above every
+    /// HTML layer, out of reach of the pane's clip, so the view rounds itself. The clip matters at
+    /// zero radius too: when the view shrinks, Chromium goes on showing the frame it painted for
+    /// the larger size until it has painted the next one, and unclipped that frame spills over
+    /// whatever lies beside the pane.
+    pub(crate) fn set_bottom_corner_radius(&self, radius: f64) -> Result<(), String> {
+        if *lock(&self.shared.bottom_corner_radius) == Some(radius) {
+            return Ok(());
+        }
+        self.with_native("设置浏览器页面圆角", move |_, _, view| {
+            view.setWantsLayer(true);
+            let layer: *mut AnyObject = unsafe { msg_send![view, layer] };
+            if layer.is_null() {
+                return Err("浏览器页面没有图层".into());
+            }
+            // Which edge is the bottom depends on whether the layer is drawn flipped, which an
+            // AppKit backing layer is or is not depending on its view and its ancestors.
+            let flipped: bool = unsafe { msg_send![layer, contentsAreFlipped] };
+            let bottom: usize = if flipped {
+                CA_CORNER_MIN_X_MAX_Y | CA_CORNER_MAX_X_MAX_Y
+            } else {
+                CA_CORNER_MIN_X_MIN_Y | CA_CORNER_MAX_X_MIN_Y
+            };
+            unsafe {
+                let _: () = msg_send![layer, setMasksToBounds: true];
+                let _: () = msg_send![layer, setCornerRadius: radius];
+                let _: () = msg_send![layer, setMaskedCorners: bottom];
+            }
+            Ok(())
+        })?;
+        *lock(&self.shared.bottom_corner_radius) = Some(radius);
+        Ok(())
     }
 
     /// Tells Chromium the page is (not) being shown, which throttles its renderer the way a
@@ -946,6 +1009,7 @@ pub(crate) fn add_child(
             width: size.width,
             height: size.height,
         }),
+        bottom_corner_radius: Mutex::new(None),
         closed: AtomicBool::new(false),
         pending: Mutex::new(HashMap::new()),
         listeners: Mutex::new(Vec::new()),

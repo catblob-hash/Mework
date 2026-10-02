@@ -28,6 +28,7 @@ import { convertChatUsage } from "./chat-usage.js";
 import { codexDialectFetch } from "./codex-dialect.js";
 import type { ProviderFamily } from "./protocol.js";
 import { plaintextReasoningFetch } from "./responses-dialect.js";
+import { toolAppendResponsesFetch } from "./tool-append.js";
 
 interface ProviderTarget {
   family: ProviderFamily;
@@ -44,6 +45,8 @@ interface ProviderTarget {
   reasoningContent?: "plaintext" | "encrypted";
   /** The model's prompt-cache attribute; `false` turns Anthropic breakpoints off. */
   promptCache?: boolean;
+  /** Whether this model at this endpoint takes a tool appended mid-conversation. */
+  toolAppend?: boolean;
   /** The per-step system-prompt tail, the Anthropic dialect's cache boundary. */
   systemDynamic?: string;
 }
@@ -67,9 +70,14 @@ export function resolveModel(target: ProviderTarget): ResolvedModel {
   const base = baseURL && baseURL.length > 0 ? baseURL : undefined;
   // Plaintext models may use DeepSeek's reasoning_text response dialect.
   // Encrypted replay includes are retained independently of presentation mode.
-  const responsesFetch = target.reasoningContent === "plaintext"
+  // Every Responses family also takes the host's tool additions as
+  // `additional_tools` items (`tool-append.ts`) where the host says the model
+  // does; the wrapper is outermost so the dialects below see the request it
+  // actually sends.
+  const toolAppend = target.toolAppend === true;
+  const responsesFetch = toolAppendResponsesFetch(target.reasoningContent === "plaintext"
     ? plaintextReasoningFetch()
-    : undefined;
+    : globalThis.fetch, toolAppend);
 
   switch (target.family) {
     case "openai-responses": {
@@ -84,7 +92,7 @@ export function resolveModel(target: ProviderTarget): ResolvedModel {
         baseURL: base ?? "https://chatgpt.com/backend-api/codex",
         apiKey,
         headers,
-        fetch: codexDialectFetch(),
+        fetch: toolAppendResponsesFetch(codexDialectFetch(), toolAppend),
       });
       return { model: provider.responses(modelId), provider };
     }
@@ -119,7 +127,7 @@ export function resolveModel(target: ProviderTarget): ResolvedModel {
         fetch: anthropicDialectFetch(base, globalThis.fetch, {
           enabled: target.promptCache,
           systemDynamic: target.systemDynamic,
-        }),
+        }, toolAppend),
       });
       return { model: provider(modelId), provider };
     }

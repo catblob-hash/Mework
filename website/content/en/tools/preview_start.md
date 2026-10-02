@@ -2,7 +2,7 @@
 
 ## Approval
 
-Running a command the project's `launch.json` names is an unbounded action (`tool.unbounded`, high risk): Manual approval, Accept edits and Plan mode raise a card, Full access does not. **Always allow** can answer it, remembering the decision for this tool in this conversation. A missing, blank, or non-string `name` is refused before any card is drawn.
+Running a command the project's `launch.json` names is an unbounded action (`tool.unbounded`, high risk): Manual approval and Accept edits raise a card, Full access does not. **Always allow** can answer it, remembering the decision for this tool in this conversation. A missing, blank, or non-string `name` is refused before any card is drawn.
 
 ## Behavior and limits
 

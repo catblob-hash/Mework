@@ -4,11 +4,10 @@ import type {
   ConversationPresetSettings,
   ConversationSettings,
   ConversationWebSearchSettings,
-  GlobalSettings,
-  SandboxSettings
+  GlobalSettings
 } from "../types";
 import { BUILTIN_PRESET_ID } from "../seed";
-import { defaultConversationWebSearchSettings, defaultSandboxSettings } from "./runtime";
+import { defaultConversationWebSearchSettings } from "./runtime";
 import { isHostDerivedToolName } from "./taskTools";
 import { toolLockOf } from "./toolLock";
 
@@ -79,25 +78,6 @@ function copyWebSearchSettings(
   };
 }
 
-/** Deep-copies a sandbox so presets and conversations do not share its lists. */
-function copySandboxSettings(settings: SandboxSettings): SandboxSettings {
-  return {
-    ...settings,
-    network: {
-      ...settings.network,
-      allow: [...settings.network.allow],
-      deny: [...settings.network.deny]
-    },
-    writable: [...settings.writable],
-    denyRead: [...settings.denyRead]
-  };
-}
-
-/** A body's sandbox as a field, left out when the body states none — which reads as off. */
-function sandboxField(settings: SandboxSettings | undefined): { sandbox?: SandboxSettings } {
-  return settings ? { sandbox: copySandboxSettings(settings) } : {};
-}
-
 /** Captures the reusable preset subset of current conversation settings. Resource
  * IDs are copied directly and may be dangling. */
 export function captureConversationPresetSettings(
@@ -117,8 +97,7 @@ export function captureConversationPresetSettings(
     globalMemoryEnabled: settings.globalMemoryEnabled,
     projectMemoryEnabled: settings.projectMemoryEnabled,
     skillToolEnabled: settings.skillToolEnabled === true,
-    mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled === true,
-    ...sandboxField(settings.sandbox)
+    mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled === true
   };
 }
 
@@ -166,10 +145,7 @@ export function sameConversationPresetSettings(
     && sameIdSet(a.skillIds, b.skillIds)
     && sameIdSet(a.mcpIds, b.mcpIds)
     && equalValues(a.agentDefinitions, b.agentDefinitions)
-    && equalValues(a.webSearch, b.webSearch)
-    /* An unstated sandbox is the default one, so leaving it out and writing it
-       out in full say the same thing. */
-    && equalValues(a.sandbox ?? defaultSandboxSettings(), b.sandbox ?? defaultSandboxSettings());
+    && equalValues(a.webSearch, b.webSearch);
 }
 
 /**
@@ -220,11 +196,11 @@ export function cloneConversationSettings(
     webSearchEnabled: snapshot.webSearchEnabled === true,
     reasoningEffort: snapshot.reasoningEffort,
     securityLevel: snapshot.securityLevel,
+    planModeEnabled: snapshot.planModeEnabled === true,
     globalMemoryEnabled: snapshot.globalMemoryEnabled === true,
     projectMemoryEnabled: snapshot.projectMemoryEnabled === true,
     skillToolEnabled: snapshot.skillToolEnabled === true,
-    mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true,
-    ...sandboxField(snapshot.sandbox)
+    mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true
     // `toolLock` is deliberately absent: the new conversation has run nothing
     // yet, so it has exposed nothing and every setting is still free to move.
   };
@@ -232,11 +208,12 @@ export function cloneConversationSettings(
 
 /** Applies a preset as a complete overlay for preset-owned fields. Conversation-
  * specific reasoning effort and app-data path remain unchanged; host-derived
- * memory tools are excluded because layer switches derive them. Tool-bearing
- * fields keep the locked floor underneath: an overlay may widen what the model
- * can call but never takes back what a run already showed it, and it cannot
- * move a pin — a preset naming another search backend applies everything else
- * and leaves that one field where the transcript put it. */
+ * memory tools are excluded because layer switches derive them. The one thing
+ * a preset cannot move is a pin: a preset naming another backend where a
+ * native one has already run applies everything else and leaves that one field
+ * where the transcript put it. A host-run backend is not pinned and moves with
+ * the preset. Whether the tool surface may move at all is the model's
+ * question, not the preset's — the caller asks it (`restoreLockedSettings`). */
 export function applyConversationPresetSettings(
   current: ConversationSettings,
   preset: ConversationPresetSettings,
@@ -244,7 +221,7 @@ export function applyConversationPresetSettings(
 ): ConversationSettings {
   const lock = toolLockOf(current);
   const webSearch = copyWebSearchSettings(preset.webSearch);
-  const enabledTools = Array.from(new Set([...lock.tools, ...preset.enabledTools])).filter(
+  const enabledTools = Array.from(new Set(preset.enabledTools)).filter(
     (name) => (!knownToolNames || knownToolNames.has(name)) && !isHostDerivedToolName(name)
   );
   return {
@@ -254,32 +231,18 @@ export function applyConversationPresetSettings(
     agentDefinitions: copyAgentDefinitions(preset.agentDefinitions),
     allowRolelessSubagents: preset.allowRolelessSubagents === true,
     hookIds: [...new Set(preset.hookIds)],
-    skillIds: [...new Set([...lock.skillIds, ...preset.skillIds])],
-    mcpIds: [...new Set([...lock.mcpIds, ...preset.mcpIds])],
+    skillIds: [...new Set(preset.skillIds)],
+    mcpIds: [...new Set(preset.mcpIds)],
     webSearch: {
       ...webSearch,
       provider: lock.searchProvider ?? webSearch.provider,
       fetchProvider: lock.fetchProvider ?? webSearch.fetchProvider
     },
-    webSearchEnabled: preset.webSearchEnabled === true || lock.webSearch,
+    webSearchEnabled: preset.webSearchEnabled === true,
     securityLevel: preset.securityLevel,
-    globalMemoryEnabled: preset.globalMemoryEnabled === true || lock.globalMemory,
-    projectMemoryEnabled: preset.projectMemoryEnabled === true || lock.projectMemory,
-    /* Once skills have gone out, how they go out is settled: the preset's own
-       answer would either repeat what the transcript holds or point at a tool
-       the earlier rounds never had. */
-    skillToolEnabled: lock.skillIds.length
-      ? lock.skillTool
-      : preset.skillToolEnabled === true || lock.skillTool,
-    /* Same settlement over MCP: once this conversation's servers have been
-       dialed, whether their schemas went on the wire is a fact about the
-       transcript, not a preference a preset may restate. */
-    mcpToolDiscoveryEnabled: lock.mcpIds.length
-      ? lock.mcpToolDiscovery
-      : preset.mcpToolDiscoveryEnabled === true || lock.mcpToolDiscovery,
-    /* No lock reaches the sandbox: it confines what later commands can do and
-       puts nothing in front of the model, so the preset's answer applies as it
-       is — including none, which is off. */
-    sandbox: preset.sandbox ? copySandboxSettings(preset.sandbox) : undefined
+    globalMemoryEnabled: preset.globalMemoryEnabled === true,
+    projectMemoryEnabled: preset.projectMemoryEnabled === true,
+    skillToolEnabled: preset.skillToolEnabled === true,
+    mcpToolDiscoveryEnabled: preset.mcpToolDiscoveryEnabled === true
   };
 }

@@ -2,7 +2,7 @@ Returns what the conversation's preview page printed to its own console — `con
 
 ## Approval
 
-Classified as a sensitive browser observation (`browser.sensitive_observation`, high risk, unbounded effect), because console text carries tokens and error context from whatever the page is signed in to. Manual, Accept edits and Plan mode all ask; Full access does not. **Always allow** never covers it: no `preview_*` page tool can carry a standing allowance, so every card is answered on its own and an allowance recorded elsewhere cannot answer one here. If you signed into the page yourself, the host asks separately for authorization to act on that tab — a confirmation no security level and no hook turns off.
+Classified as a sensitive browser observation (`browser.sensitive_observation`, high risk, unbounded effect), because console text carries tokens and error context from whatever the page is signed in to. Manual and Accept edits both ask; Full access does not. **Always allow** never covers it: no `preview_*` page tool can carry a standing allowance, so every card is answered on its own and an allowance recorded elsewhere cannot answer one here. If you signed into the page yourself, the host asks separately for authorization to act on that tab — a confirmation no security level and no hook turns off.
 
 ## Behavior and limits
 

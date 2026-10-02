@@ -44,7 +44,7 @@ describe("PlanPane", () => {
   it("reports the status a pane header shows, with the pending card outranking the stored one", () => {
     expect(planStatusLabel(plan(), true, t)).toBe("待批准");
     expect(planStatusLabel(plan({ status: "approved" }), false, t)).toBe("已批准");
-    expect(planStatusLabel(plan({ status: "rejected" }), false, t)).toBe("已退回");
+    expect(planStatusLabel(plan({ status: "rejected" }), false, t)).toBe("待修改");
     expect(planStatusLabel(plan(), false, t)).toBe("撰写中");
     expect(planStatusLabel(null, false, t)).toBe("撰写中");
   });

@@ -34,6 +34,11 @@ function extendedColour(index: number): number | string | null {
   return null;
 }
 
+/** `input` with every escape sequence removed, colours included. */
+export function stripAnsi(input: string): string {
+  return input.replace(ESCAPE, "");
+}
+
 export function parseAnsi(input: string): AnsiRun[] {
   const runs: AnsiRun[] = [];
   let state: Omit<AnsiRun, "text"> = {

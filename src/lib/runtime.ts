@@ -19,6 +19,7 @@ import {
 } from "./agentDefinitions";
 import type { SandboxSettings, SandboxSupport, ShellBackend } from "../types";
 import type {
+  AutoCompactSettings,
   AgentDefinition,
   AppLanguage,
   AttachedWorkspace,
@@ -28,7 +29,9 @@ import type {
   AppUpdateDownloadEvent,
   AppUpdateInstallOutcome,
   AppVersionInfo,
+  LocalModelDefaultPrompts,
   LocalModelPromptReport,
+  LocalModelTask,
   LocalModelStatus,
   LocalModelVariantId,
   ProviderFamily,
@@ -86,6 +89,7 @@ import type {
   ToolExecutionResponse,
   ToolApprovalGrant,
   ToolPromptDecision,
+  QuestionResponse,
   WebSearchAssets,
   FamilySetting,
 } from "../types";
@@ -99,6 +103,7 @@ import {
   searchProviderSupports
 } from "./searchProviders";
 import {
+  knownAppendCapabilities,
   knownFamilySettings,
   normalizeCapabilities,
   normalizeEndpointTypes,
@@ -115,11 +120,12 @@ import { NATIVE_FETCH_TOOLS, NATIVE_SEARCH_TOOLS } from "../types";
 import { CLAUDE_AGENT_REGISTRY, ensureClaudeAgentProvider } from "./claudeAgentProvider";
 import { ensureCodexProvider } from "./codexProvider";
 import { estimateTokens } from "./contextTokens";
+import { normalizeAutoCompactSettings } from "./autoCompact";
+import { normalizeReasoningEffort, parseReasoningEffort } from "./reasoningEffort";
 import {
   MAX_FILE_ATTACHMENT_PDF_BYTES,
   MAX_FILE_ATTACHMENT_TEXT_BYTES,
   MAX_FILE_ATTACHMENT_TOKENS,
-  MAX_MESSAGE_FILES,
   MAX_PDF_PAGES
 } from "./fileBudget";
 
@@ -148,13 +154,12 @@ const API_FORMATS = new Set<ProviderFamily>([
   "vertex",
   "openai_compatible",
 ]);
-const REASONING_EFFORTS = new Set<ReasoningEffort>(["disabled", "low", "medium", "high", "xhigh"]);
 type PreviewRunControl = {
   cancelled: boolean;
   steers: QueuedMessage[];
 };
 const previewRunCancellations = new Map<string, PreviewRunControl>();
-const SECURITY_LEVELS = new Set<SecurityLevel>(["request_approval", "allow_edits", "plan", "full_access"]);
+const SECURITY_LEVELS = new Set<SecurityLevel>(["request_approval", "allow_edits", "full_access"]);
 const APP_LANGUAGES = new Set<AppLanguage>(["auto", "zh-CN", "en-US"]);
 const RESOLVED_APP_LANGUAGES = new Set<ResolvedAppLanguage>(["zh-CN", "en-US"]);
 const THEME_PREFERENCES = new Set<ThemePreference>(["day", "night", "system"]);
@@ -204,21 +209,16 @@ function normalizeConversationPresetSettings(
     // Same migration as conversations: a preset written when web access was two
     // checkboxes said so by naming a web tool, and that name is stripped below.
     webSearchEnabled: input.webSearchEnabled === true || rawEnabledTools.some(isWebToolName),
+    // A preset written when plan mode was part of one keeps the key on disk;
+    // it is not read. Plan mode is a composer switch a conversation starts off.
     securityLevel: normalizeSecurityLevel(input.securityLevel, fallback.securityLevel),
     // Absent means off for both tiers. Memory reads and writes files on disk,
     // so an unstated preset opts in to nothing.
     globalMemoryEnabled: input.globalMemoryEnabled === true,
     projectMemoryEnabled: input.projectMemoryEnabled === true,
     skillToolEnabled: input.skillToolEnabled === true,
-    mcpToolDiscoveryEnabled: input.mcpToolDiscoveryEnabled === true,
-    ...sandboxField(input.sandbox)
+    mcpToolDiscoveryEnabled: input.mcpToolDiscoveryEnabled === true
   };
-}
-
-/** A settings body's sandbox, left out when unstated — which reads as off. */
-function sandboxField(value: unknown): { sandbox?: SandboxSettings } {
-  const sandbox = normalizeSandboxSettings(value);
-  return sandbox ? { sandbox } : {};
 }
 
 function normalizeConversationPreset(
@@ -339,21 +339,49 @@ function normalizeFileAttachments(value: unknown): FileAttachment[] | undefined 
       tokens,
       ...(format === "pdf" ? { pages } : {})
     } as FileAttachment];
-  }).filter((file, index, all) => all.findIndex((candidate) => candidate.id === file.id) === index)
-    .slice(0, MAX_MESSAGE_FILES);
+  }).filter((file, index, all) => all.findIndex((candidate) => candidate.id === file.id) === index);
   return files.length ? files : undefined;
-}
-
-function normalizeReasoningEffort(value: unknown, fallback: ReasoningEffort = "disabled"): ReasoningEffort {
-  return typeof value === "string" && REASONING_EFFORTS.has(value as ReasoningEffort)
-    ? value as ReasoningEffort
-    : fallback;
 }
 
 function normalizeSecurityLevel(value: unknown, fallback: SecurityLevel = "request_approval"): SecurityLevel {
   return typeof value === "string" && SECURITY_LEVELS.has(value as SecurityLevel)
     ? value as SecurityLevel
     : fallback;
+}
+
+/** Which model a conversation's last request used, when all three parts are readable. */
+function normalizeToolLockRequest(value: unknown): ConversationToolLock["lastRequest"] {
+  const input = record(value);
+  if (!input) return null;
+  const { providerId, modelId, at } = input;
+  return typeof providerId === "string" && providerId
+    && typeof modelId === "string" && modelId
+    && typeof at === "string" && at
+    ? { providerId, modelId, at }
+    : null;
+}
+
+/** Each model's latest request, unreadable entries dropped and one kept per model — the last written. */
+function normalizeToolLockModelRequests(value: unknown): ConversationToolLock["modelRequests"] {
+  if (!Array.isArray(value)) return [];
+  const byModel = new Map<string, NonNullable<ConversationToolLock["lastRequest"]>>();
+  for (const item of value) {
+    const request = normalizeToolLockRequest(item);
+    if (!request) continue;
+    const key = JSON.stringify([request.providerId, request.modelId]);
+    byModel.delete(key);
+    byModel.set(key, request);
+  }
+  return [...byModel.values()];
+}
+
+/**
+ * Plan mode used to be the security level `plan`; settings written then keep
+ * their intent as the plan-mode switch (the host's `migrate_legacy_plan_level`
+ * does the same on its side).
+ */
+function normalizePlanMode(input: { planModeEnabled?: unknown; securityLevel?: unknown }): boolean {
+  return input.planModeEnabled === true || input.securityLevel === "plan";
 }
 
 /**
@@ -539,6 +567,14 @@ function normalizeExecutionEnvironments(
       envVars: Object.fromEntries(
         Object.entries(fallback.envVars).map(([key, table]) => [key, { ...table }])
       ),
+      ...(fallback.sandboxes
+        ? {
+          sandboxes: Object.fromEntries(Object.entries(fallback.sandboxes).map(([key, sandbox]) => [
+            key,
+            normalizeSandboxSettings(sandbox) ?? defaultSandboxSettings()
+          ]))
+        }
+        : {}),
       ...(fallback.wslAgentShells ? { wslAgentShells: { ...fallback.wslAgentShells } } : {})
     };
   }
@@ -609,6 +645,18 @@ function normalizeExecutionEnvironments(
     }
     envVars[key] = normalized;
   }
+  // A sandbox belongs to a workspace, so only a workspace key names one.
+  const sandboxes: Record<string, SandboxSettings> = {};
+  for (const [key, value] of Object.entries(record(input.sandboxes) ?? {}).slice(0, MAX_ENV_TABLES)) {
+    const separator = key.indexOf("|");
+    const path = separator < 0 ? "" : key.slice(separator + 1);
+    if (
+      separator < 0 || !isMachineEnvKey(key.slice(0, separator))
+      || !path.trim() || path.length > 4096 || controlChars.test(path)
+    ) continue;
+    const sandbox = normalizeSandboxSettings(value);
+    if (sandbox) sandboxes[key] = sandbox;
+  }
   // Mirrors host validation: a WSL agent shell is one of WSL's registered backends.
   const wslAgentShells: Record<string, ShellBackend> = {};
   for (const [distro, backend] of Object.entries(record(input.wslAgentShells) ?? {}).slice(0, 256)) {
@@ -618,6 +666,7 @@ function normalizeExecutionEnvironments(
   return {
     sshMachines,
     envVars,
+    ...(Object.keys(sandboxes).length ? { sandboxes } : {}),
     ...(Object.keys(wslAgentShells).length ? { wslAgentShells } : {})
   };
 }
@@ -671,7 +720,7 @@ export function defaultSandboxSettings(): SandboxSettings {
 }
 
 /** Mirrors host validation of the sandbox's lists: bounded, no blanks or control characters. */
-export function normalizeSandboxSettings(value: unknown): SandboxSettings | null {
+function normalizeSandboxSettings(value: unknown): SandboxSettings | null {
   const input = record(value);
   if (!input) return null;
   const controlChars = /[\u0000-\u001f\u007f]/;
@@ -735,7 +784,10 @@ function normalizeModel(value: unknown, family: ProviderFamily): ModelProfile | 
     maxOutputTokens: optionalPositiveInteger(input.maxOutputTokens),
     capabilities: normalizeCapabilities(Array.isArray(input.capabilities) ? input.capabilities : []),
     reasoningContent: normalizeReasoningContent(input.reasoningContent, family),
-    promptCache: normalizePromptCache(input.promptCache)
+    promptCache: normalizePromptCache(input.promptCache),
+    ...(optionalPositiveInteger(input.cacheTtlMinutes) === undefined
+      ? {}
+      : { cacheTtlMinutes: optionalPositiveInteger(input.cacheTtlMinutes) })
   };
 }
 
@@ -1091,11 +1143,10 @@ function normalizeAgentDefinitions(
     // supported. A stale key in an older document is ignored rather than
     // rejected, because it never granted anything — it could only ever tighten
     // a limit that does not exist.
-    if (input.effort !== undefined && input.effort !== null
-      && !(typeof input.effort === "string"
-        && REASONING_EFFORTS.has(input.effort as ReasoningEffort))) continue;
-    const effort =
-      input.effort === undefined || input.effort === null ? null : (input.effort as ReasoningEffort);
+    const effort = input.effort === undefined || input.effort === null
+      ? null
+      : parseReasoningEffort(input.effort);
+    if (effort === null && input.effort !== undefined && input.effort !== null) continue;
     const toolsInput = input.tools;
     if (toolsInput !== undefined && toolsInput !== null && !isAgentToolNameList(toolsInput)) continue;
     const tools =
@@ -1289,8 +1340,11 @@ function normalizeLocalModelPreferences(value: unknown): AppearancePreferences["
   return {
     titles: input.titles === true,
     shellExplanations: input.shellExplanations === true,
+    errorExplanations: input.errorExplanations === true,
+    subagents: input.subagents === true,
     titlePrompt: typeof input.titlePrompt === "string" ? input.titlePrompt : "",
-    shellPrompt: typeof input.shellPrompt === "string" ? input.shellPrompt : ""
+    shellPrompt: typeof input.shellPrompt === "string" ? input.shellPrompt : "",
+    errorPrompt: typeof input.errorPrompt === "string" ? input.errorPrompt : ""
   };
 }
 
@@ -1385,7 +1439,8 @@ function normalizeGlobalSettings(
     environmentTools: normalizeEnvironmentTools(input.environmentTools, fallback.environmentTools),
     executionEnvironments: normalizeExecutionEnvironments(
       input.executionEnvironments, fallback.executionEnvironments
-    )
+    ),
+    autoCompact: normalizeAutoCompactSettings(input.autoCompact, fallback.autoCompact)
   };
 }
 
@@ -1415,18 +1470,7 @@ function normalizeContextItem(value: unknown): ContextItem | null {
         ...(subagent as unknown as NonNullable<Extract<ContextItem, { kind: "tool" }>["subagent"]>),
         contexts: Array.isArray(subagent.contexts)
           ? normalizeContextItems(subagent.contexts)
-          : [],
-        ...(() => {
-          const queuedMessages = Array.isArray(subagent.queuedMessages)
-            ? subagent.queuedMessages.flatMap((value) => {
-                const message = record(value);
-                return message && typeof message.content === "string" && message.content.trim()
-                  ? [{ content: message.content, triggerTurn: message.triggerTurn === true }]
-                  : [];
-              })
-            : [];
-          return queuedMessages.length ? { queuedMessages } : {};
-        })()
+          : []
       } : undefined
     } satisfies Extract<ContextItem, { kind: "tool" }>;
     return context;
@@ -1504,6 +1548,7 @@ export function normalizeDocument(value: unknown): AppDocument {
       skillTool: lockInput.skillTool === true,
       mcpToolDiscovery: lockInput.mcpToolDiscovery === true,
       webSearch: lockInput.webSearch === true,
+      planMode: lockInput.planMode === true,
       // A skill id is never dropped even when discovery no longer finds it: the
       // body it stood for is in the transcript regardless of what is on disk
       // now, and forgetting the id would offer the user a removal that cannot
@@ -1516,6 +1561,16 @@ export function normalizeDocument(value: unknown): AppDocument {
       promptSkillIds: Array.isArray(lockInput.promptSkillIds)
         ? uniqueStringIds(lockInput.promptSkillIds)
         : null,
+      searchBackend: lockInput.searchBackend === undefined || lockInput.searchBackend === null
+        ? null
+        : normalizeSearchProviderSelection(lockInput.searchBackend),
+      fetchBackend: lockInput.fetchBackend === undefined || lockInput.fetchBackend === null
+        ? null
+        : normalizeFetchProviderSelection(
+          lockInput.fetchBackend,
+          normalizeSearchProviderSelection(lockInput.searchBackend)
+        ),
+      webFetch: lockInput.webFetch === true,
       searchProvider: lockInput.searchProvider === undefined
         || lockInput.searchProvider === null
         ? null
@@ -1530,7 +1585,9 @@ export function normalizeDocument(value: unknown): AppDocument {
         : normalizeFetchProviderSelection(
           lockInput.fetchProvider,
           normalizeSearchProviderSelection(lockInput.searchProvider)
-        )
+        ),
+      lastRequest: normalizeToolLockRequest(lockInput.lastRequest),
+      modelRequests: normalizeToolLockModelRequests(lockInput.modelRequests)
     };
   };
   const normalizeConversationSettingsValue = (value: unknown): ConversationSettings => {
@@ -1569,6 +1626,7 @@ export function normalizeDocument(value: unknown): AppDocument {
       ),
       // No global default is inherited; absent values use the most cautious level.
       securityLevel: normalizeSecurityLevel(settingsInput.securityLevel, "request_approval"),
+      planModeEnabled: normalizePlanMode(settingsInput),
       // The two tiers are independent switches, and both default OFF: memory
       // reads and writes files the user may not expect a conversation to
       // touch, so turning a tier on is an explicit choice. The built-in
@@ -1579,7 +1637,6 @@ export function normalizeDocument(value: unknown): AppDocument {
       // Absence means false, preserving inline skill content for older conversations.
       skillToolEnabled: settingsInput.skillToolEnabled === true,
       mcpToolDiscoveryEnabled: settingsInput.mcpToolDiscoveryEnabled === true,
-      sandbox: normalizeSandboxSettings(settingsInput.sandbox) ?? undefined,
       // Absent until this conversation's first run has exposed something.
       toolLock: normalizeToolLockValue(settingsInput.toolLock)
     };
@@ -2005,14 +2062,76 @@ export async function updateConversationTemplate(
   });
 }
 
+/**
+ * Saves a conversation's history as a new template under `templateId`.
+ *
+ * Like `forkConversationContexts`, this names what to copy and sends no body:
+ * the host reads the conversation from its own store, so every tool card keeps
+ * the result this application really produced. The id must be one nothing has
+ * been written under yet.
+ */
+export async function captureConversationTemplate(request: {
+  workspaceId: string;
+  conversationId: string;
+  templateId: string;
+}): Promise<ConversationTemplateSummary> {
+  if (!hasBackendRuntime()) throw new Error(NO_TEMPLATE_STORE);
+  return invoke<ConversationTemplateSummary>("capture_conversation_template", {
+    workspaceId: request.workspaceId,
+    conversationId: request.conversationId,
+    templateId: request.templateId
+  });
+}
+
 export async function deleteConversationTemplate(templateId: string): Promise<void> {
   if (!hasBackendRuntime()) throw new Error(NO_TEMPLATE_STORE);
   await invoke("delete_conversation_template", { templateId });
 }
 
+/** Whether the host's last `load_document` said this process started on a brand-new install. */
+let freshInstall = false;
+
 export async function loadDocument(): Promise<AppDocument> {
-  if (hasBackendRuntime()) return normalizeDocument(await invoke<unknown>("load_document"));
+  if (hasBackendRuntime()) {
+    const loaded = await invoke<unknown>("load_document");
+    freshInstall = record(loaded)?.freshInstall === true;
+    return withUnloadedBodies(normalizeDocument(loaded), record(loaded)?.unloadedConversationIds);
+  }
   return browserLoad();
+}
+
+/**
+ * Whether the app started on a brand-new install, as the document load reported
+ * it: the host seeded the document this process. The browser preview never does.
+ */
+export function startedOnFreshInstall(): boolean {
+  return freshInstall;
+}
+
+/**
+ * Marks the conversations the host sent without their bodies. The host loads a
+ * document with no contexts at all and names the conversations that have
+ * some; each is fetched when it is opened (`lib/conversationBodies.ts`).
+ */
+function withUnloadedBodies(document: AppDocument, ids: unknown): AppDocument {
+  const unloaded = new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []);
+  if (unloaded.size === 0) return document;
+  return {
+    ...document,
+    workspaces: document.workspaces.map((workspace) => ({
+      ...workspace,
+      conversations: workspace.conversations.map((conversation) => (
+        unloaded.has(conversation.id) ? { ...conversation, bodyUnloaded: true } : conversation
+      ))
+    }))
+  };
+}
+
+/** A conversation as the host takes it: the renderer's own bookkeeping stays behind. */
+function conversationForHost(conversation: Conversation): Conversation {
+  if (conversation.bodyUnloaded === undefined) return conversation;
+  const { bodyUnloaded: _unloaded, ...rest } = conversation;
+  return rest;
 }
 
 /**
@@ -2029,7 +2148,10 @@ export async function createConversationRemote(
   conversation: Conversation
 ): Promise<Conversation | null> {
   if (!hasBackendRuntime()) return null;
-  return invoke<Conversation>("create_conversation", { workspaceId, conversation });
+  return invoke<Conversation>("create_conversation", {
+    workspaceId,
+    conversation: conversationForHost(conversation)
+  });
 }
 
 export async function deleteConversationRemote(
@@ -2048,7 +2170,7 @@ export async function updateConversationRemote(
   if (!hasBackendRuntime()) return null;
   return invoke<Conversation>("update_conversation", {
     workspaceId,
-    conversation,
+    conversation: conversationForHost(conversation),
     expectedContextIds
   });
 }
@@ -2069,17 +2191,24 @@ export async function loadConversationRemote(
 }
 
 /** What a recorded request was: a conversation round, or a host-minted one-shot. */
-export type WireRequestKind = "model" | "search" | "fetch";
+export type HistoryRequestKind = "model" | "search" | "fetch";
 
 /** The four things a request carries, in the order it carries them. */
-export type WirePartKind = "system" | "systemDynamic" | "tools" | "message";
+export type HistoryPartKind = "system" | "systemDynamic" | "tools" | "message";
 
 /**
- * Provider-reported usage for one recorded request. Every field is optional
- * because providers disclose different subsets, and an absent counter has to
- * read as absent rather than as zero.
+ * What the conversation's history holds, one kind per entry: a payload put on the
+ * wire, the response to it, a hook's decision, a call as it actually ran and what
+ * it returned, and a change to the timeline — the user's or a run's.
  */
-export interface WireUsage {
+export type HistoryEntryKind = "request" | "response" | "hook" | "tool" | "result" | "edit" | "run";
+
+/**
+ * Provider-reported usage. Every field is optional because providers disclose
+ * different subsets, and an absent counter has to read as absent rather than as
+ * zero.
+ */
+export interface HistoryUsage {
   inputTokens?: number;
   /** Cached reads included in `inputTokens`, on the same discipline as `ModelUsage`. */
   cachedInputTokens?: number;
@@ -2087,46 +2216,38 @@ export interface WireUsage {
 }
 
 /**
- * One payload this host handed to the model runner. A turn issues one of these
- * per round, and one more per retry of a round; each carries a longer history
- * than the last.
+ * One entry of the history the host keeps, without its body. Every kind shares one
+ * `seq` per conversation, so the list reads in the order things happened.
  */
-export interface WireRequestSummary {
+export interface HistoryEntry {
   seq: number;
   createdAt: string;
-  kind: WireRequestKind;
-  /** The run this belonged to; empty for host-minted one-shots. */
-  requestId: string;
-  round: number;
-  attempt: number;
-  providerName: string;
-  family: string;
-  modelId: string;
-  partCount: number;
-  /** Size of the parts as sent, not what deduplicating them cost to store. */
-  bytes: number;
-  /** What the response reported; absent on a request that never got one. */
-  usage?: WireUsage;
+  kind: HistoryEntryKind;
   /**
-   * Whole messages the user added and removed between the request before this
-   * one and this one, counted by the host when the row was written. Absent on
-   * rows recorded before the ledger counted them — which is not the same as
-   * zero, and must not be drawn as zero.
-   */
-  messagesAdded?: number;
-  messagesRemoved?: number;
-  /**
-   * Name of the child agent that issued this request, absent on the
-   * conversation's own trunk. One conversation holds one ledger per agent it
-   * spawned plus its own, because a child runs under the parent's conversation
-   * id and nothing else would keep the two apart.
+   * The child agent this entry belongs to, absent on the conversation's own. A
+   * child runs under the parent's conversation id, and nothing else keeps the two
+   * apart.
    */
   owner?: string;
+  /** The run it belongs to; absent on an edit. */
+  requestId?: string;
+  round?: number;
+  /** The call a tool entry, a result or a tool hook is about. */
+  callId?: string;
+  /** For a response: the request it answers. */
+  answers?: number;
+  /** Kind-specific metadata, as recorded; see `historyRecord.ts` for each kind's. */
+  detail: Record<string, unknown>;
+  /**
+   * A response's own usage; on a request, the usage of the response that answered
+   * it. Absent where nothing came back or nothing was disclosed.
+   */
+  usage?: HistoryUsage;
 }
 
-export interface WireRequestPart {
+export interface HistoryPart {
   ordinal: number;
-  kind: WirePartKind;
+  kind: HistoryPartKind;
   hash: string;
   /** Prompt text for the system parts; JSON text for the others. */
   body: string;
@@ -2135,38 +2256,58 @@ export interface WireRequestPart {
   truncated: boolean;
 }
 
-export interface WireRequestDetail {
-  summary: WireRequestSummary;
-  /** The request minus its parts and minus every credential-bearing field. */
-  envelope: unknown;
-  parts: WireRequestPart[];
+/** One step of a timeline change, with the row as it read before and after. */
+export interface HistoryOp {
+  ordinal: number;
+  op: "insert" | "remove" | "replace";
+  contextId: string;
+  position?: number;
+  /** The row after the change, as JSON text; absent on a removal. */
+  body?: string;
+  /** The row as the history last had it before the change. */
+  before?: string;
+}
+
+/** One entry in full, as a row reads it when it opens. */
+export interface HistoryEntryDetail {
+  entry: HistoryEntry;
+  /**
+   * JSON text of the entry's body: a request's envelope (minus its parts and every
+   * credential-bearing field), a response's message, a hook's decision, a call's
+   * input, a result's output.
+   */
+  body?: string;
+  truncated: boolean;
+  /** A request's parts, in wire order. */
+  parts?: HistoryPart[];
+  /** A timeline change's steps. */
+  ops?: HistoryOp[];
 }
 
 /**
- * One ledger's recorded requests. `owners` picks which: omitted is the
- * conversation's own trunk, and the ledger addresses of child agents are theirs
- * — a spawned agent's name, or the run-scoped address the host stamps on a
- * workflow step (`<run>/ws<n>`), read off `SubagentView.ledgerOwner`. An agent
- * whose address is not known has an empty list, which asks for nothing rather
- * than for the trunk.
+ * One owner's history. `owners` picks whose: omitted is the conversation's own
+ * trunk, and the addresses of child agents are theirs — a spawned agent's name,
+ * or the run-scoped address the host stamps on a workflow step (`<run>/ws<n>`),
+ * read off `SubagentView.ledgerOwner`. An agent whose address is not known has an
+ * empty list, which asks for nothing rather than for the trunk.
  */
-export async function listWireRequests(
+export async function listHistoryEntries(
   conversationId: string,
   owners?: readonly string[]
-): Promise<WireRequestSummary[]> {
+): Promise<HistoryEntry[]> {
   if (!hasBackendRuntime()) return [];
-  return invoke<WireRequestSummary[]>("list_wire_requests", {
+  return invoke<HistoryEntry[]>("list_history_entries", {
     conversationId,
     owners: owners ? [...owners] : null
   });
 }
 
-export async function loadWireRequest(
+export async function loadHistoryEntry(
   conversationId: string,
   seq: number
-): Promise<WireRequestDetail | null> {
+): Promise<HistoryEntryDetail | null> {
   if (!hasBackendRuntime()) return null;
-  return invoke<WireRequestDetail | null>("load_wire_request", { conversationId, seq });
+  return invoke<HistoryEntryDetail | null>("load_history_entry", { conversationId, seq });
 }
 
 let documentSaveTail: Promise<void> = Promise.resolve();
@@ -2223,6 +2364,7 @@ function contextForPersistence(context: ContextItem): ContextItem {
             contextInjected: context.hookExecution.contextInjected
           }
         } : {}),
+        ...(context.toolsAdded?.length ? { toolsAdded: [...context.toolsAdded] } : {}),
         createdAt: context.createdAt
       };
     case "user":
@@ -2339,12 +2481,6 @@ function contextForPersistence(context: ContextItem): ContextItem {
               content: update.content,
               createdAt: update.createdAt
             })),
-            ...(context.subagent.queuedMessages?.length ? {
-              queuedMessages: context.subagent.queuedMessages.map((message) => ({
-                content: message.content,
-                triggerTurn: message.triggerTurn
-              }))
-            } : {}),
             // This builder is an explicit allowlist, so a new SubagentRunRecord
             // field is dropped on every save until it is named here — with no
             // type error, because the object is built rather than spread.
@@ -2391,6 +2527,7 @@ interface PersistedAppDocument {
     shortcuts: GlobalSettings["shortcuts"];
     environmentTools: EnvironmentToolDefinition[];
     draftConversation?: DraftConversationSnapshot | null;
+    autoCompact: AutoCompactSettings;
   };
   assets: {
     apiProviders: AppDocument["globalSettings"]["apiProviders"];
@@ -2554,11 +2691,14 @@ export async function resolveToolPrompt(
   promptId: string,
   decision: ToolPromptDecision,
   /** Only a denied plan-exit card carries one: what the model should change. */
-  feedback?: string
+  feedback?: string,
+  /** Only a question card carries one: what the user did with its questions. */
+  question?: QuestionResponse
 ): Promise<ToolApprovalGrant> {
   if (hasBackendRuntime()) {
-    return invoke<ToolApprovalGrant>("resolve_tool_prompt", { promptId, decision, feedback });
+    return invoke<ToolApprovalGrant>("resolve_tool_prompt", { promptId, decision, feedback, question });
   }
+  if (question) return { nonce: createId("preview-approval"), expiresInMs: 90_000 };
   if (decision === "deny") throw new Error("用户拒绝了这次工具执行");
   return { nonce: createId("preview-approval"), expiresInMs: 90_000 };
 }
@@ -3041,6 +3181,16 @@ export async function webSourceIcon(url: string): Promise<string | null> {
 }
 
 /** Resolves one attachment to a displayable data URL without putting bytes in the document. */
+/**
+ * The small picture an image's timeline chip shows: the host's thumbnail, made
+ * on first request. Without a host there is no thumbnail and the chip shows the
+ * image itself.
+ */
+export async function imageAttachmentThumbnail(imageId: string): Promise<string> {
+  if (hasBackendRuntime()) return invoke<string>("image_attachment_thumbnail", { imageId });
+  return imageAttachmentData(imageId);
+}
+
 export async function imageAttachmentData(imageId: string): Promise<string> {
   if (hasBackendRuntime()) return invoke<string>("image_attachment_data", { imageId });
   const stored = window.localStorage.getItem(`${IMAGE_ATTACHMENT_STORAGE_PREFIX}${imageId}`);
@@ -3283,10 +3433,13 @@ export async function listWslDistros(): Promise<WslDistro[]> {
   return invoke<WslDistro[]>("list_wsl_distros");
 }
 
-/** Whether this computer can sandbox commands, from the agent Mework runs here. */
-export async function localSandboxSupport(): Promise<SandboxSupport | null> {
+/**
+ * Whether a machine (`null` is this one) can sandbox a workspace's commands, from the agent
+ * Mework runs there: the machine a workspace is on, not the one showing its settings.
+ */
+export async function machineSandboxSupport(machine: RunTarget | null): Promise<SandboxSupport | null> {
   if (!hasBackendRuntime()) return null;
-  return invoke<SandboxSupport>("local_sandbox_support");
+  return invoke<SandboxSupport>("machine_sandbox_support", { machine });
 }
 
 /** Sets this computer up for the sandbox (Windows: one administrator prompt); what it can do afterwards. */
@@ -3341,22 +3494,24 @@ export async function localModelRemove(variant: LocalModelVariantId): Promise<Lo
 }
 
 /**
- * Caches the prefix state (KV cache) of `prompt`, or of the prompt in effect for `task`,
- * and reports its token count and size. The first call may load the model, which on a
- * Mac can take minutes the first time.
+ * Reports the token count and prefix state (KV cache) size of `prompt`, or of the prompt in
+ * effect for `task`. A state already cached is read from disk without the model; otherwise
+ * only `build` caches one, which may load the model (minutes on a Mac when the system has
+ * no compiled copy of it).
  */
 export async function localModelPromptInfo(
-  task: "title" | "shell",
-  prompt?: string
+  task: LocalModelTask,
+  prompt?: string,
+  build = false
 ): Promise<LocalModelPromptReport> {
   if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
-  return invoke<LocalModelPromptReport>("local_model_prompt_info", { task, prompt: prompt ?? null });
+  return invoke<LocalModelPromptReport>("local_model_prompt_info", { task, prompt: prompt ?? null, build });
 }
 
 /** The built-in prompts in the app language. */
-export async function localModelDefaultPrompts(): Promise<{ title: string; shell: string }> {
+export async function localModelDefaultPrompts(): Promise<LocalModelDefaultPrompts> {
   if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
-  return invoke<{ title: string; shell: string }>("local_model_default_prompts");
+  return invoke<LocalModelDefaultPrompts>("local_model_default_prompts");
 }
 
 /** The user named the conversation: the local helper model must not rename it. */
@@ -3365,10 +3520,17 @@ export async function settleConversationTitle(conversationId: string): Promise<v
   await invoke<void>("settle_conversation_title", { conversationId });
 }
 
-/** One-line shell command descriptions by tool card id. */
-export async function getToolExplanations(conversationId: string): Promise<Record<string, string>> {
-  if (!hasBackendRuntime()) return {};
-  return invoke<Record<string, string>>("get_tool_explanations", { conversationId });
+/** What the local helper model wrote about a conversation's tool cards, by card id. */
+export interface ToolExplanations {
+  /** Shell command descriptions and subagent titles. */
+  explanations: Record<string, string>;
+  /** Why each failed call failed. */
+  errors: Record<string, string>;
+}
+
+export async function getToolExplanations(conversationId: string): Promise<ToolExplanations> {
+  if (!hasBackendRuntime()) return { explanations: {}, errors: {} };
+  return invoke<ToolExplanations>("get_tool_explanations", { conversationId });
 }
 
 export async function checkAppUpdate(): Promise<AppUpdateCheck> {
@@ -3513,7 +3675,15 @@ export async function fetchModels(provider: ApiProvider): Promise<ModelProfile[]
       .filter((model): model is ModelProfile => Boolean(model));
   }
   // Browser preview lacks host discovery policy and catalog. Its fixture must match
-  // the live shape, including `group`, so preview grouping matches desktop behavior.
+  // the live shape, including `group`, so preview grouping matches desktop behavior,
+  // and the append capabilities Mework knows, which the host's projection declares.
+  return previewModels(provider).map((model) => ({
+    ...model,
+    capabilities: normalizeCapabilities([...model.capabilities, ...knownAppendCapabilities(provider, model.id)])
+  }));
+}
+
+function previewModels(provider: ApiProvider): ModelProfile[] {
   const common = {
     reasoningContent: normalizeReasoningContent(undefined, provider.family),
     promptCache: true
@@ -3583,16 +3753,12 @@ export async function fetchModels(provider: ApiProvider): Promise<ModelProfile[]
   ];
 }
 
+/** The host reads the level as `thinkingEffort` (an alias of its `reasoning_effort`). */
 function modelRequestWithThinkingSelection<T extends { reasoningEffort: ReasoningEffort }>(
   request: T
-): Omit<T, "reasoningEffort"> & (
-  | { thinkingMode: "disabled" }
-  | { thinkingEffort: Exclude<ReasoningEffort, "disabled"> }
-) {
+): Omit<T, "reasoningEffort"> & { thinkingEffort: ReasoningEffort } {
   const { reasoningEffort, ...rest } = request;
-  return reasoningEffort === "disabled"
-    ? { ...rest, thinkingMode: "disabled" }
-    : { ...rest, thinkingEffort: reasoningEffort };
+  return { ...rest, thinkingEffort: reasoningEffort };
 }
 
 export async function runModel(
@@ -3627,9 +3793,7 @@ export async function runModel(
     const started = performance.now();
     const latestUser = [...request.contexts].reverse().find((context) => context.kind === "user");
     const text = latestUser && "content" in latestUser ? latestUser.content ?? "" : "";
-    const reasoning = request.reasoningEffort === "disabled"
-      ? ""
-      : `【浏览器预览】正在以 ${request.reasoningEffort} 程度检查当前对话与工作区上下文。`;
+    const reasoning = `【浏览器预览】正在以 ${request.reasoningEffort} 程度检查当前对话与工作区上下文。`;
     const output = `【浏览器预览】${request.provider.name} / ${request.model.id} 已接收请求。${text ? `\n\n用户输入：${text}` : ""}`;
     const ensureRunning = () => {
       if (cancellation.cancelled) throw new Error("模型运行已停止");

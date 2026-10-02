@@ -61,7 +61,7 @@ export type UsageRange = "all" | "30d" | "7d";
 export const USAGE_RANGES: UsageRange[] = ["all", "30d", "7d"];
 
 /** 热力图恒定覆盖最近 26 周，与上方指标的区间开关无关。 */
-export const HEATMAP_WEEKS = 26;
+const HEATMAP_WEEKS = 26;
 
 export interface ModelUsageRow {
   key: string;

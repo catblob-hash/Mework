@@ -126,6 +126,7 @@ function previewRowIsOpen(row: PreviewServerRow, url: string | null): boolean {
 
 export type PreviewBodyState =
   | { kind: "page" }
+  | { kind: "reading" }
   | { kind: "no-config" }
   | { kind: "start-page" }
   | { kind: "starting" }
@@ -142,10 +143,14 @@ export type PreviewBodyState =
  * The stopped card needs a page under it. Stopping a dev server now takes down the page it was
  * serving, so the common ending is no page at all — and what belongs there is the start page the
  * server can be run from again, not a card saying the thing you just closed is closed.
+ *
+ * `configurationCount` is `null` until `.mework/launch.json` has been read. The pane covers the
+ * page from the first frame regardless, but with nothing written on it: "no dev server" said
+ * before the file is read is a claim the server list then contradicts.
  */
 export function previewBodyState(input: {
   url: string;
-  configurationCount: number;
+  configurationCount: number | null;
   rows: PreviewServerRow[];
   pendingName: string | null;
   startError: { name: string; message: string } | null;
@@ -162,6 +167,7 @@ export function previewBodyState(input: {
     // address bar — so the card is the only thing that says the server behind it has gone.
     return input.stopped ? { kind: "stopped", label: input.stopped.label } : { kind: "page" };
   }
+  if (input.configurationCount === null) return { kind: "reading" };
   if (input.configurationCount === 0) return { kind: "no-config" };
   return { kind: "start-page" };
 }
@@ -197,6 +203,11 @@ export function PreviewIdlePage() {
       <p className="browser-panel__welcome-line">{t("没有开发服务器", "No dev server")}</p>
     </div>
   );
+}
+
+/** The standby's backdrop with nothing on it, while `.mework/launch.json` is still being read. */
+export function PreviewReadingPage() {
+  return <div className="browser-panel__welcome" role="status" aria-busy="true" />;
 }
 
 /** `Tf` — configurations exist, none of them is answering yet. */

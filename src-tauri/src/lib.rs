@@ -13,6 +13,7 @@ mod app_menu;
 mod app_tray;
 mod app_update;
 mod approval;
+mod attachment_refs;
 mod background_images;
 mod browser;
 #[cfg(all(feature = "browser-dev", not(test)))]
@@ -32,7 +33,6 @@ mod browser_window_region;
 mod builtin_schemas;
 mod cancel;
 mod capabilities;
-mod capability_seed;
 mod catalog;
 #[cfg(target_os = "macos")]
 mod cef_host;
@@ -54,10 +54,12 @@ mod environment_tools;
 mod external_open;
 mod favicon;
 mod file_attachments;
+mod file_browser;
 mod file_read_state;
 mod fork_requests;
 mod git;
 mod git_flight;
+mod handoff;
 mod helper_model;
 mod hooks;
 mod host_platform;
@@ -77,13 +79,16 @@ mod mcp;
 mod mcp_config;
 mod memory_archive_file;
 mod memory_locations;
+mod memory_pool;
 mod mework_memory;
 mod model;
 mod model_discovery;
 mod model_registry;
+mod open_with;
 mod operation_coordinator;
 mod orchestration;
 mod path_guard;
+mod ask_user;
 mod plan_mode;
 mod powershell_host;
 /// Resolves a `.mework/launch.json` entry into a running dev server.
@@ -121,23 +126,26 @@ mod shell_tasks;
 mod skills;
 mod state;
 mod storage;
+mod subagent_ledger;
 mod subagent_prompt;
 mod subagent_schema;
 mod terminal;
 mod terminal_lifecycle;
 mod token_ledger;
 mod token_statistics;
+mod host_append;
+mod system_append;
+mod tool_append;
 mod tool_attestation;
 mod tool_executor;
 mod tool_output;
 mod tool_prompt;
 mod web_search;
 mod wire_history;
-mod wire_ledger;
+mod history;
 mod workflow;
 mod workflow_store;
 mod workspace_dirs;
-mod workspace_files;
 mod workspace_lookup;
 mod workspace_set;
 
@@ -194,25 +202,41 @@ fn is_memory_tool_name(name: &str) -> bool {
     mework_memory::is_memory_tool(name)
 }
 
+/// The document a renderer loads: every conversation without its contexts,
+/// and which of them have contexts it has yet to load.
+///
+/// Bodies are data the shared memory pool manages, on both sides of the IPC:
+/// the renderer loads one when it opens the conversation (`load_conversation`,
+/// read through the host's pool) and may unload it again under its own cap. A
+/// conversation named in `unloaded_conversation_ids` is not empty, however it
+/// looks — the sidebar hides empty ones.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedDocument {
+    #[serde(flatten)]
+    document: std::sync::Arc<crate::model::AppDocument>,
+    unloaded_conversation_ids: Vec<String>,
+    /// This process started on a brand-new install (`DocumentStore::fresh_install`).
+    fresh_install: bool,
+}
+
 #[cfg(not(test))]
 #[tauri::command]
-fn load_document(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<std::sync::Arc<AppDocument>, String> {
+fn load_document(app: AppHandle, state: State<'_, AppState>) -> Result<LoadedDocument, String> {
     let _guard = state
         .storage_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = document_path(&app)?;
     let mut document = (*state.document_store.read(&path)?).clone();
-    // The snapshot the store serves carries the conversation bodies it had at
-    // the last conversation *command* — the user message that opened the round.
-    // Everything the run itself wrote went straight to the conversation store,
-    // so a renderer that reloads mid-session (a page refresh, or the authority
-    // fetch after a rejected save) would otherwise be handed a conversation
-    // whose last answer is missing, and would go on running from that body.
-    storage::refresh_conversation_bodies(&path, &mut document);
+    // Conversation lists, metadata and queues come from the store, not the
+    // snapshot: a run writes its rows, and drops the queued messages it took,
+    // straight to the store without committing a snapshot.
+    let mut unloaded_conversation_ids =
+        storage::refresh_conversation_shells(&path, &mut document)
+            .into_iter()
+            .collect::<Vec<_>>();
+    unloaded_conversation_ids.sort();
     apply_git_language(&document);
     let document = std::sync::Arc::new(document);
     let app_data = path
@@ -227,7 +251,11 @@ fn load_document(
     ) {
         eprintln!("加载文档时同步临时工作区失败，将在下次保存或加载时重试：{error}");
     }
-    Ok(document)
+    Ok(LoadedDocument {
+        document,
+        unloaded_conversation_ids,
+        fresh_install: state.document_store.fresh_install(),
+    })
 }
 
 /// Git's messages reach the renderer as they are (the review pane shows them verbatim), so
@@ -272,23 +300,31 @@ fn fork_conversation_contexts(
         .ok_or_else(|| format!("工作区 {workspace_id} 不存在"))?;
     // The renderer flushes the newly created branch before calling us, because
     // we copy from the committed document. So an existing-but-empty target is
-    // the expected state, not a duplicate-creation attempt.
-    conversation_fork::validate_fork_target(
-        workspace
-            .conversations
-            .iter()
-            .find(|candidate| candidate.id == target_conversation_id),
-        &target_conversation_id,
-    )?;
-    let source = workspace
+    // the expected state, not a duplicate-creation attempt. Whether it is empty
+    // is the store's to say: the snapshot carries no bodies.
+    let target = if workspace
         .conversations
         .iter()
-        .find(|candidate| candidate.id == source_conversation_id)
-        .ok_or_else(|| format!("源对话 {source_conversation_id} 不存在"))?;
-    // Use the same authoritative source as model runs. The fork point is a user
-    // message, so earlier contexts have already been committed to the snapshot.
-    let source_contexts =
-        authoritative_contexts(stored_conversation(&path, &source_conversation_id), source);
+        .any(|candidate| candidate.id == target_conversation_id)
+    {
+        conversations::load(&path, &target_conversation_id)?
+    } else {
+        None
+    };
+    conversation_fork::validate_fork_target(target.as_ref(), &target_conversation_id)?;
+    if !workspace
+        .conversations
+        .iter()
+        .any(|candidate| candidate.id == source_conversation_id)
+    {
+        return Err(format!("源对话 {source_conversation_id} 不存在"));
+    }
+    // Use the same authoritative source as model runs.
+    let source_contexts = authoritative_body(
+        conversations::load(&path, &source_conversation_id),
+        &source_conversation_id,
+    )?
+    .contexts;
 
     conversation_fork::fork_contexts(
         &state,
@@ -439,6 +475,62 @@ fn update_conversation_template(
     } else {
         store.put_template_contexts(&template_id, &contexts)
     }
+}
+
+/// Saves a conversation's history as a new template, under the id the renderer
+/// minted for the preset it is about to bind it to.
+///
+/// The body is read from the host's own committed conversation, never sent by
+/// the renderer: like [`fork_conversation_contexts`], the renderer only names
+/// what to copy. So unlike a body written through
+/// [`update_conversation_template`], nothing needs normalizing — every tool card
+/// is one this application ran, and keeps its real result, diff, images and
+/// duration. Applying the template later re-attests them for their new home.
+///
+/// The id must be unwritten: capture creates a template, it never overwrites
+/// one, so a mistaken id cannot replace a body some other owner opens with.
+#[cfg(not(test))]
+#[tauri::command]
+fn capture_conversation_template(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    workspace_id: String,
+    conversation_id: String,
+    template_id: String,
+) -> Result<crate::conversation_store::ConversationTemplateSummary, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    refuse_builtin_preset_template(&template_id)?;
+    if template_id.trim().is_empty() {
+        return Err("对话模板的 ID 不能为空".into());
+    }
+    let path = document_path(&app)?;
+    let document = state.document_store.read(&path)?;
+    let workspace = document
+        .workspaces
+        .iter()
+        .find(|candidate| candidate.id == workspace_id)
+        .ok_or_else(|| format!("工作区 {workspace_id} 不存在"))?;
+    if !workspace
+        .conversations
+        .iter()
+        .any(|candidate| candidate.id == conversation_id)
+    {
+        return Err(format!("对话 {conversation_id} 不存在"));
+    }
+    let source = authoritative_body(
+        conversations::load(&path, &conversation_id),
+        &conversation_id,
+    )?;
+    let contexts = conversation_template::capture(&source.contexts)?;
+    crate::storage::validate_template_contexts(&contexts)?;
+    let store = conversations::store(&path)?;
+    if !store.template_contexts(&template_id)?.is_empty() {
+        return Err(format!("对话模板 {template_id} 已存在"));
+    }
+    store.put_template(&template_id, "", &contexts)
 }
 
 /// Deletes a template. Citing ids are left to dangle, which everywhere resolves
@@ -602,44 +694,44 @@ fn load_conversation_plan(
     conversations::store(&path)?.conversation_plan(&conversation_id)
 }
 
-/// Lists one ledger's recorded outgoing requests, oldest first. One entry is one
-/// payload this host handed to the model runner — a round, a retry of a round, or
-/// a host-minted native web-tool call.
+/// Lists one owner's history entries, oldest first and without bodies: every request put on the
+/// wire, every response, hook decision, tool call and result, and — for the conversation's own
+/// trunk — every change to its timeline.
 ///
-/// `owners` picks the ledger: absent is the conversation's own trunk, and a list
-/// of child-agent names is those agents'.
+/// `owners` picks whose: absent is the conversation's own trunk, and a list of child-agent
+/// addresses is those agents'.
 #[cfg(not(test))]
 #[tauri::command]
-fn list_wire_requests(
+fn list_history_entries(
     app: AppHandle,
     state: State<'_, AppState>,
     conversation_id: String,
     owners: Option<Vec<String>>,
-) -> Result<Vec<conversation_store::WireRequestSummary>, String> {
+) -> Result<Vec<conversation_store::HistoryEntry>, String> {
     let _guard = state
         .storage_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = document_path(&app)?;
-    conversations::store(&path)?.wire_requests(&conversation_id, owners.as_deref())
+    conversations::store(&path)?.history_entries(&conversation_id, owners.as_deref())
 }
 
-/// Loads one recorded request: its envelope and every part it carried, in wire
-/// order.
+/// Loads one history entry with its body: a request's envelope and every part it carried in wire
+/// order, a trunk change's steps with each row before and after, any other entry's own body.
 #[cfg(not(test))]
 #[tauri::command]
-fn load_wire_request(
+fn load_history_entry(
     app: AppHandle,
     state: State<'_, AppState>,
     conversation_id: String,
     seq: i64,
-) -> Result<Option<conversation_store::WireRequestDetail>, String> {
+) -> Result<Option<conversation_store::HistoryEntryDetail>, String> {
     let _guard = state
         .storage_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = document_path(&app)?;
-    conversations::store(&path)?.wire_request(&conversation_id, seq)
+    conversations::store(&path)?.history_entry(&conversation_id, seq)
 }
 
 /// Returns built-in gateway usage statistics. Activity is aggregated from the
@@ -761,6 +853,9 @@ fn save_document_blocking(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = document_path(&app)?;
     let previous = state.document_store.read(&path)?;
+    // A save never carries bodies (the renderer sends none and the host keeps
+    // its own), so what the bodies reference is the same on both sides of it.
+    let (_, body_refs) = state.document_store.snapshot_with_refs(&path)?;
     let app_data = path
         .parent()
         .ok_or_else(|| "数据文档没有应用数据父目录".to_owned())?;
@@ -927,8 +1022,10 @@ fn save_document_blocking(
             eprintln!("文档已保存，但无法读取模板图片引用，本次不回收图片附件：{error}");
         }
         Ok(pinned) => {
+            let mut referenced = body_refs.image_ids(&canonical);
+            referenced.extend(pinned);
             if let Err(error) = image_attachments::ImageAttachmentStore::new(app_data)
-                .reconcile_transition(&previous, &canonical, &pinned)
+                .reconcile_referenced(&body_refs.image_ids(&previous), &referenced)
             {
                 eprintln!("文档已保存，但图片附件隔离回收将在下次保存或启动时重试：{error}");
             }
@@ -939,8 +1036,10 @@ fn save_document_blocking(
             eprintln!("文档已保存，但无法读取模板文件附件引用，本次不回收文件附件：{error}");
         }
         Ok(pinned) => {
+            let mut referenced = body_refs.file_ids(&canonical);
+            referenced.extend(pinned);
             if let Err(error) = file_attachments::FileAttachmentStore::new(app_data)
-                .reconcile_transition(&previous, &canonical, &pinned)
+                .reconcile_referenced(&body_refs.file_ids(&previous), &referenced)
             {
                 eprintln!("文档已保存，但文件附件隔离回收将在下次保存或启动时重试：{error}");
             }
@@ -1073,7 +1172,10 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = document_path(&app)?;
-    let previous = storage::read_document(&path).ok();
+    // Only its providers are read, so the bodies are not kept.
+    let previous = storage::read_document_scanned(&path)
+        .ok()
+        .map(|loaded| loaded.document);
     let app_data = path
         .parent()
         .ok_or_else(|| "数据文档没有应用数据父目录".to_owned())?;
@@ -1461,12 +1563,20 @@ async fn list_wsl_distros() -> Result<Vec<run_environment::WslDistro>, String> {
         .map_err(|error| format!("枚举 WSL 发行版的后台任务失败: {error}"))
 }
 
-/// Whether this computer can run conversations' commands in a sandbox, as the
-/// agent Mework runs here reports it; starting that agent if it is not running.
+/// Whether a machine — `None` for this one — can run a workspace's commands in
+/// a sandbox, as the agent Mework runs there reports it; starting or reaching
+/// that agent if it is not running. The machine is resolved from the saved
+/// catalog, like a probe of its shells.
 #[cfg(not(test))]
 #[tauri::command]
-async fn local_sandbox_support() -> Result<remote_agent::protocol::SandboxSupport, String> {
-    tauri::async_runtime::spawn_blocking(remote_link::local_sandbox_support)
+async fn machine_sandbox_support(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    machine: Option<model::RunTarget>,
+) -> Result<remote_agent::protocol::SandboxSupport, String> {
+    let assets = execution_environment_assets(&app, state.inner())?;
+    let runner = run_environment::resolve_shell_runner(&assets, machine.as_ref(), None)?;
+    tauri::async_runtime::spawn_blocking(move || remote_link::sandbox_support(&runner))
         .await
         .map_err(|error| format!("查询沙箱可用性的后台任务失败: {error}"))?
 }
@@ -1598,10 +1708,15 @@ fn current_global_settings(app: &AppHandle, state: &AppState) -> Result<model::G
     Ok(state.document_store.current_snapshot(&path)?.global_settings.clone())
 }
 
+/// Install and runtime status. Never waits for the model: the runtime's part
+/// is what its thread last published.
 #[cfg(not(test))]
 #[tauri::command]
-fn local_model_status(state: State<'_, AppState>) -> helper_model::Status {
-    state.helper_model.status()
+async fn local_model_status(state: State<'_, AppState>) -> Result<helper_model::Status, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.helper_model.status())
+        .await
+        .map_err(|error| format!("读取本地模型状态的后台任务失败: {error}"))
 }
 
 #[cfg(not(test))]
@@ -1614,30 +1729,47 @@ fn local_model_variant(variant: &str) -> Result<helper_model::VariantId, String>
 /// `localModelChanged` push events.
 #[cfg(not(test))]
 #[tauri::command]
-fn local_model_install(
+async fn local_model_install(
     app: AppHandle,
     state: State<'_, AppState>,
     variant: String,
     china_mirror: bool,
 ) -> Result<helper_model::Status, String> {
-    let settings = current_global_settings(&app, &state)?;
-    state.helper_model.install(local_model_variant(&variant)?, china_mirror, state.push_events.clone(), settings)?;
-    Ok(state.helper_model.status())
+    let variant = local_model_variant(&variant)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = current_global_settings(&app, &state)?;
+        state.helper_model.install(variant, china_mirror, state.push_events.clone(), settings)?;
+        Ok(state.helper_model.status())
+    })
+    .await
+    .map_err(|error| format!("开始下载本地模型的后台任务失败: {error}"))?
 }
 
 /// Switches the local helper model to another installed build.
 #[cfg(not(test))]
 #[tauri::command]
-fn local_model_activate(app: AppHandle, state: State<'_, AppState>, variant: String) -> Result<helper_model::Status, String> {
-    let settings = current_global_settings(&app, &state)?;
-    state.helper_model.activate(local_model_variant(&variant)?, state.push_events.clone(), settings)?;
-    Ok(state.helper_model.status())
+async fn local_model_activate(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    variant: String,
+) -> Result<helper_model::Status, String> {
+    let variant = local_model_variant(&variant)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = current_global_settings(&app, &state)?;
+        state.helper_model.activate(variant, state.push_events.clone(), settings)?;
+        Ok(state.helper_model.status())
+    })
+    .await
+    .map_err(|error| format!("切换本地模型的后台任务失败: {error}"))?
 }
 
 #[cfg(not(test))]
 #[tauri::command]
-fn local_model_cancel_install(state: State<'_, AppState>) {
+async fn local_model_cancel_install(state: State<'_, AppState>) -> Result<(), String> {
     state.helper_model.cancel_install();
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -1653,8 +1785,9 @@ async fn local_model_remove(state: State<'_, AppState>, variant: String) -> Resu
     .map_err(|error| format!("删除本地模型的后台任务失败: {error}"))?
 }
 
-/// Caches the prefix state of `prompt` (or of the prompt in effect for
-/// `task`) and reports its token count and size. May load the model first.
+/// Reports the token count and prefix state (KV cache) size of `prompt`, or
+/// of the prompt in effect for `task`. A state already cached is read from
+/// disk; otherwise only `build` caches one, which may load the model first.
 #[cfg(not(test))]
 #[tauri::command]
 async fn local_model_prompt_info(
@@ -1662,10 +1795,12 @@ async fn local_model_prompt_info(
     state: State<'_, AppState>,
     task: String,
     prompt: Option<String>,
+    build: Option<bool>,
 ) -> Result<helper_model::PromptReport, String> {
     let task = match task.as_str() {
         "title" => local_model::prompts::Task::Title,
         "shell" => local_model::prompts::Task::Shell,
+        "error" => local_model::prompts::Task::Error,
         _ => return Err("未知的本地模型用途".into()),
     };
     let settings = current_global_settings(&app, &state)?;
@@ -1673,11 +1808,12 @@ async fn local_model_prompt_info(
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| helper_model::prompt_for(&settings, task));
     let state = state.inner().clone();
+    let build = build.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
-        let report = state.helper_model.prompt_report(&prompt)?;
-        state.helper_model.prune_prompt_caches(&settings);
-        // The report may have loaded the model: let the renderer see where it runs.
-        state.helper_model.publish_with_runtime(&state.push_events);
+        let report = state.helper_model.prompt_report(&prompt, build)?;
+        if build {
+            state.helper_model.prune_prompt_caches(&settings);
+        }
         Ok(report)
     })
     .await
@@ -1686,8 +1822,14 @@ async fn local_model_prompt_info(
 
 #[cfg(not(test))]
 #[tauri::command]
-fn local_model_default_prompts(app: AppHandle, state: State<'_, AppState>) -> Result<helper_model::DefaultPrompts, String> {
-    Ok(helper_model::default_prompts(&current_global_settings(&app, &state)?))
+async fn local_model_default_prompts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<helper_model::DefaultPrompts, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || Ok(helper_model::default_prompts(&current_global_settings(&app, &state)?)))
+        .await
+        .map_err(|error| format!("读取默认提示词的后台任务失败: {error}"))?
 }
 
 /// The user named the conversation: its title is final and the local helper
@@ -1700,13 +1842,25 @@ fn settle_conversation_title(app: AppHandle, state: State<'_, AppState>, convers
     conversations::store(&path)?.set_title_settled(&conversation_id, true)
 }
 
+/// What the local helper model wrote about a conversation's tool cards.
+#[cfg(not(test))]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolExplanations {
+    /// Shell command descriptions and subagent titles, by tool card id.
+    explanations: std::collections::HashMap<String, String>,
+    /// Why each failed call failed, by tool card id.
+    errors: std::collections::HashMap<String, String>,
+}
+
 #[cfg(not(test))]
 #[tauri::command]
-fn get_tool_explanations(
-    app: AppHandle,
-    conversation_id: String,
-) -> Result<std::collections::HashMap<String, String>, String> {
-    conversations::store(&document_path(&app)?)?.tool_explanations(&conversation_id)
+fn get_tool_explanations(app: AppHandle, conversation_id: String) -> Result<ToolExplanations, String> {
+    let store = conversations::store(&document_path(&app)?)?;
+    Ok(ToolExplanations {
+        explanations: store.tool_explanations(&conversation_id)?,
+        errors: store.tool_error_explanations(&conversation_id)?,
+    })
 }
 
 #[cfg(not(test))]
@@ -1828,8 +1982,10 @@ fn open_external_url_in_background(url: String) {
 /// macOS keeps its traffic lights, over a transparent title bar the content runs under: they
 /// sit in the sidebar's first row, centred on its 44 px (`--topbar-height`), and the renderer
 /// leaves room for them (`--shell-nav-inset` in `chrome.css`). Windows drops the frame
-/// altogether and the renderer draws the caption buttons; the system still resizes the
-/// frameless window from its edges and keeps its shadow. Anywhere else the frame stays.
+/// altogether: the content runs to the top edge the same way, and the renderer draws the
+/// caption buttons over the top row's right end (`--window-caption-width`); the system still
+/// resizes the frameless window from its edges and keeps its shadow. Anywhere else the frame
+/// stays.
 fn main_window_chrome(
     #[allow(unused_mut)] mut config: tauri::utils::config::WindowConfig,
 ) -> tauri::utils::config::WindowConfig {
@@ -2172,6 +2328,7 @@ async fn request_tool_approval(
             allow_always_offered: !decision.mandatory_prompt
                 && !tool_prompt::never_blanket_allowed(&request.tool_name),
             mandatory: decision.mandatory_prompt,
+            questions: None,
         },
     ))
 }
@@ -2191,7 +2348,14 @@ fn resolve_tool_prompt(
     prompt_id: String,
     decision: tool_prompt::ToolPromptDecision,
     feedback: Option<String>,
+    question: Option<tool_prompt::QuestionResponse>,
 ) -> Result<approval::ToolApprovalGrant, String> {
+    // A question card's answers travel as a structured response; the worker
+    // blocked on it turns them into the tool result.
+    if let Some(response) = question {
+        state.tool_prompts().resolve_question(&prompt_id, response)?;
+        return Ok(approval::ToolApprovalGrant::not_required());
+    }
     let feedback = tool_prompt::sanitize_prompt_feedback(feedback);
     match state
         .tool_prompts()
@@ -2265,14 +2429,19 @@ async fn list_remote_directory(
 
 /// Every machine's last shell probe, keyed by its environment key (`local`,
 /// `wsl:<distro>`, `ssh:<id>`). This machine is probed first if nothing has
-/// asked yet, so the answer always covers it.
+/// asked yet, so the answer always covers it. An SSH machine's probe is left
+/// out once the catalog no longer has the machine at the address it was
+/// probed at.
 #[cfg(not(test))]
 #[tauri::command]
 async fn list_machine_shells(
+    app: AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<std::collections::BTreeMap<String, machine_shells::MachineShells>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    let assets = execution_environment_assets(&app, state.inner())?;
+    tauri::async_runtime::spawn_blocking(move || {
         machine_shells::local();
-        machine_shells::all()
+        machine_shells::all(&assets)
     })
     .await
     .map_err(|error| format!("读取机器的 shell 探测结果失败: {error}"))
@@ -2422,6 +2591,7 @@ mod approval_prompt_tests {
                 source_call_id: Some("call-7".into()),
                 allow_always_offered: true,
                 mandatory: false,
+                questions: None,
             },
         };
         let wire = serde_json::to_value(&entry).unwrap();
@@ -2854,9 +3024,9 @@ async fn run_model(
     // Keep approval behavior in `api::session_task_approval`, the shared command
     // and test implementation; this function is excluded from test builds.
 
-    // The level this run executes under, from here on. Plan approval and a
-    // renderer settings write both move it; every gate after this point reads
-    // the cell rather than the snapshot `trusted_run_request` took.
+    // The level this run executes under, from here on. A renderer settings
+    // write moves it, mid-turn included; every gate after this point reads the
+    // cell rather than the snapshot `trusted_run_request` took.
     let live_security_level =
         state.live_security_level_for_run(&request.conversation_id, request.security_level);
     request.live_security_level = Some(Arc::clone(&live_security_level));
@@ -3564,7 +3734,7 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
     }
     state
         .document_store
-        .initialize_with_startup_reconciliation(&path, |document| {
+        .initialize_with_startup_reconciliation(&path, |document, body_refs| {
             state.shell_tasks.try_forget_missing(
                 document
                     .workspaces
@@ -3580,7 +3750,9 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
                     eprintln!("启动时无法读取模板图片引用，本次不回收图片附件：{error}");
                 }
                 Ok(pinned) => {
-                    if let Err(error) = image_store.reconcile_startup(document, &pinned) {
+                    let mut referenced = body_refs.image_ids(document);
+                    referenced.extend(pinned);
+                    if let Err(error) = image_store.reconcile_startup_referenced(&referenced) {
                         // Attachment cleanup is recoverable; startup continues and the
                         // reconciliation retries on the next launch.
                         eprintln!("启动时未能回收图片附件，将在下次启动重试：{error}");
@@ -3592,7 +3764,9 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
                     eprintln!("启动时无法读取模板文件附件引用，本次不回收文件附件：{error}");
                 }
                 Ok(pinned) => {
-                    if let Err(error) = file_store.reconcile_startup(document, &pinned) {
+                    let mut referenced = body_refs.file_ids(document);
+                    referenced.extend(pinned);
+                    if let Err(error) = file_store.reconcile_startup_referenced(&referenced) {
                         eprintln!("启动时未能回收文件附件，将在下次启动重试：{error}");
                     }
                 }
@@ -3616,38 +3790,102 @@ fn reconcile_image_attachments_on_startup(app: &AppHandle) -> Result<(), String>
                 );
                 state.seed_workflow_restart_notices(interrupted);
             }
+            // Subagents whose worker died with the previous process before their result
+            // reached the model: tell it at the conversation's next run boundary, the same
+            // way. Their ledger entries stay until that delivery is confirmed.
+            //
+            // One whose final reply the history holds had finished: the reply goes
+            // back on its card now, before anything reads the conversation, and reaches the
+            // model as its completed result at the next run — without waking it.
+            let mut lost = subagent_ledger::sweep_lost_subagents(app_data, document);
+            if !lost.is_empty() {
+                let ledger = conversation_store::store_for(&path).ok();
+                let mut recovered = 0usize;
+                for agent in &mut lost {
+                    let Some(store) = ledger.as_deref() else {
+                        break;
+                    };
+                    agent.recovered = subagent_ledger::recover_final_reply(store, agent);
+                    if agent.recovered.is_some() {
+                        recovered += 1;
+                        if !api::reattach_recovered_subagent(store, &state, agent) {
+                            eprintln!(
+                                "子代理 {} 的最终回复已找回，但未能写回它的卡片",
+                                agent.name
+                            );
+                        }
+                    }
+                }
+                eprintln!(
+                    "发现 {} 个在应用退出时尚未交付结果的子代理（{recovered} 个已完成，最终回复已接回），已排队交付",
+                    lost.len()
+                );
+                state.seed_subagent_restart_notices(lost);
+            }
             Ok(())
         })?;
     Ok(())
 }
 
+/// Stores a picture attached to a message, shrunk the way Claude Code shrinks
+/// a prompt image (`image_attachments::ImageAttachmentStore::import_compressed`).
+///
+/// Decoding up to 64 megapixels and a JPEG quality search run on a blocking
+/// worker rather than on the thread the window's event loop lives on.
 #[cfg(not(test))]
 #[tauri::command]
-fn image_attachment_upload(
+async fn image_attachment_upload(
     app: AppHandle,
     name: String,
     data: String,
 ) -> Result<model::ImageAttachment, String> {
-    let max_encoded = image_attachments::MAX_IMAGE_ATTACHMENT_BYTES
-        .saturating_mul(4)
-        .div_ceil(3)
-        .saturating_add(4);
-    if data.len() > max_encoded {
-        return Err(format!(
-            "图片 base64 超过 {} MiB 原始字节限制",
-            image_attachments::MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
-        ));
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.as_bytes())
-        .map_err(|error| format!("图片 base64 无效: {error}"))?;
-    image_attachment_store(&app)?.import(&name, &bytes)
+    tauri::async_runtime::spawn_blocking(move || {
+        let max_encoded = image_attachments::MAX_IMAGE_UPLOAD_BYTES
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(4);
+        if data.len() > max_encoded {
+            return Err(format!(
+                "图片 base64 超过 {} MiB 原始字节限制",
+                image_attachments::MAX_IMAGE_UPLOAD_BYTES / 1024 / 1024
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .map_err(|error| format!("图片 base64 无效: {error}"))?;
+        image_attachment_store(&app)?.import_compressed(&name, &bytes)
+    })
+    .await
+    .map_err(|error| format!("图片上传任务失败: {error}"))?
 }
 
+/// An image attachment's full bytes, for the viewer: low-priority data in the
+/// shared memory pool. Verifying the digest and decoding runs on a blocking
+/// worker, off the window's event loop.
 #[cfg(not(test))]
 #[tauri::command]
-fn image_attachment_data(app: AppHandle, image_id: String) -> Result<String, String> {
-    image_attachment_store(&app)?.data_url_by_id(&image_id)
+async fn image_attachment_data(app: AppHandle, image_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        image_attachment_store(&app)?
+            .pooled_data_url_by_id(&image_id)
+            .map(|url| (*url).clone())
+    })
+    .await
+    .map_err(|error| format!("图片读取任务失败: {error}"))?
+}
+
+/// The small picture an image's timeline chip shows: high-priority data in the
+/// shared memory pool, made and stored on first request.
+#[cfg(not(test))]
+#[tauri::command]
+async fn image_attachment_thumbnail(app: AppHandle, image_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        image_attachment_store(&app)?
+            .pooled_thumbnail_data_url_by_id(&image_id)
+            .map(|url| (*url).clone())
+    })
+    .await
+    .map_err(|error| format!("缩略图读取任务失败: {error}"))?
 }
 
 /// Adds one tier of a background image being imported; see `background_images`.
@@ -3806,7 +4044,9 @@ fn import_file_attachment(
 #[tauri::command]
 async fn file_attachment_data(app: AppHandle, file_id: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        file_attachment_store(&app)?.data_url_by_id(&file_id)
+        file_attachment_store(&app)?
+            .pooled_data_url_by_id(&file_id)
+            .map(|url| (*url).clone())
     })
     .await
     .map_err(|error| format!("附件读取任务失败: {error}"))?
@@ -4285,6 +4525,15 @@ async fn browser_action(
                 &renderer_mount_id,
                 renderer_mount_generation,
                 || {
+                    // Ahead of the session lookup: a pane reopening a closed tab declares where
+                    // its page belongs before the open that lifts the close fence.
+                    if action == "project" {
+                        let projected = value
+                            .as_ref()
+                            .and_then(serde_json::Value::as_bool)
+                            .ok_or_else(|| "browser_action project 需要布尔 value".to_owned())?;
+                        return browser.set_projected(&session_id, projected);
+                    }
                     let runtime = browser.session(&session_id)?;
                     if matches!(action.as_str(), "back" | "forward" | "reload") {
                         return browser.navigate_history_as_user(&session_id, &action);
@@ -4373,15 +4622,6 @@ async fn browser_action(
                                         "browser_action occlude 需要布尔 value".to_owned()
                                     })?;
                                 return runtime.set_occluded(occluded);
-                            }
-                            "project" => {
-                                let projected = value
-                                    .as_ref()
-                                    .and_then(serde_json::Value::as_bool)
-                                    .ok_or_else(|| {
-                                        "browser_action project 需要布尔 value".to_owned()
-                                    })?;
-                                return runtime.set_projected(projected);
                             }
                             "theme" => {
                                 let theme = value
@@ -4656,101 +4896,202 @@ async fn get_git_diff(
     .map_err(|error| format!("读取 Git 差异的后台任务失败: {error}"))?
 }
 
+/// The machine a file pane request names. This computer needs nothing from the
+/// document; another machine is looked up in the persisted catalog, so the
+/// renderer cannot name an endpoint that is not registered.
+#[cfg(not(test))]
+fn browse_machine(
+    app: &AppHandle,
+    state: &AppState,
+    machine: Option<&model::RunTarget>,
+) -> Result<file_browser::Machine, String> {
+    match machine {
+        None => Ok(file_browser::Machine::Local),
+        Some(_) => file_browser::Machine::resolve(&execution_environment_assets(app, state)?, machine),
+    }
+}
+
+/// Runs one file pane request on a blocking thread: a remote one waits on its
+/// machine's link.
+#[cfg(not(test))]
+async fn browse_blocking<T: Send + 'static>(
+    app: AppHandle,
+    state: AppState,
+    machine: Option<model::RunTarget>,
+    work: impl FnOnce(&file_browser::Machine) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || work(&browse_machine(&app, &state, machine.as_ref())?))
+        .await
+        .map_err(|error| format!("读取文件的后台任务失败: {error}"))?
+}
+
+/// One directory on any machine the user can browse. The file pane is the
+/// user's own file manager, so this is not confined to a workspace; see
+/// `file_browser`.
 #[cfg(not(test))]
 #[tauri::command]
-async fn list_workspace_directory(
+async fn browse_list_directory(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
-    relative_path: String,
-) -> Result<workspace_files::WorkspaceDirectoryListing, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "文件浏览",
-            TrustedWorkspaceAccess::Shared,
-            None,
-        )?;
-        workspace_files::list_directory(&operation.workspace_path, &relative_path)
+    machine: Option<model::RunTarget>,
+    path: String,
+) -> Result<remote_agent::files::Listing, String> {
+    browse_blocking(app, state.inner().clone(), machine, move |machine| {
+        file_browser::list(machine, path)
     })
     .await
-    .map_err(|error| format!("读取工作区文件的后台任务失败: {error}"))?
 }
 
 #[cfg(not(test))]
 #[tauri::command]
-async fn read_workspace_file(
+async fn browse_read_file(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
-    relative_path: String,
-) -> Result<workspace_files::WorkspaceFileContent, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "文件浏览",
-            TrustedWorkspaceAccess::Shared,
-            None,
-        )?;
-        workspace_files::read_file(&operation.workspace_path, &relative_path)
+    machine: Option<model::RunTarget>,
+    path: String,
+) -> Result<remote_agent::files::TextFile, String> {
+    browse_blocking(app, state.inner().clone(), machine, move |machine| {
+        file_browser::read_text(machine, path)
     })
     .await
-    .map_err(|error| format!("读取工作区文件的后台任务失败: {error}"))?
 }
 
 #[cfg(not(test))]
 #[tauri::command]
-async fn read_workspace_file_bytes(
+async fn browse_read_file_bytes(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
-    relative_path: String,
-) -> Result<workspace_files::WorkspaceFileBytes, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "文件浏览",
-            TrustedWorkspaceAccess::Shared,
-            None,
-        )?;
-        workspace_files::read_file_bytes(&operation.workspace_path, &relative_path)
+    machine: Option<model::RunTarget>,
+    path: String,
+) -> Result<remote_agent::files::FileBytes, String> {
+    browse_blocking(app, state.inner().clone(), machine, move |machine| {
+        file_browser::read_bytes(machine, path)
     })
     .await
-    .map_err(|error| format!("读取工作区文件的后台任务失败: {error}"))?
 }
 
 #[cfg(not(test))]
 #[tauri::command]
-async fn search_workspace_files(
+async fn browse_search_files(
     app: AppHandle,
     state: State<'_, AppState>,
-    target: GitTarget,
+    machine: Option<model::RunTarget>,
+    root: String,
     query: String,
     limit: usize,
-) -> Result<workspace_files::WorkspaceSearchResults, String> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let operation = trusted_target_workspace_operation(
-            &app,
-            &state,
-            &target,
-            "文件浏览",
-            TrustedWorkspaceAccess::Shared,
-            None,
-        )?;
-        workspace_files::search_files(&operation.workspace_path, &query, limit)
+) -> Result<remote_agent::files::SearchResults, String> {
+    browse_blocking(app, state.inner().clone(), machine, move |machine| {
+        file_browser::search(machine, root, query, limit)
     })
     .await
-    .map_err(|error| format!("读取工作区文件的后台任务失败: {error}"))?
+}
+
+/// What is at each target, every machine asked at once: where a path the
+/// transcript names lives when the conversation has several workspaces.
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_probe_paths(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    targets: Vec<file_browser::ProbeTarget>,
+    patient: Option<bool>,
+) -> Result<Vec<file_browser::ProbeResult>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Probing this computer alone needs nothing from the document.
+        let assets = if targets.iter().any(|target| target.machine.is_some()) {
+            execution_environment_assets(&app, &state)?
+        } else {
+            model::ExecutionEnvironmentAssets::default()
+        };
+        file_browser::probe(&assets, targets, patient.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("查询文件位置的后台任务失败: {error}"))?
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_rename_path(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    machine: Option<model::RunTarget>,
+    path: String,
+    name: String,
+) -> Result<remote_agent::files::Changed, String> {
+    browse_blocking(app, state.inner().clone(), machine, move |machine| {
+        file_browser::rename(machine, path, name)
+    })
+    .await
+}
+
+/// Deletes from the file pane: to the Trash on this computer, for good on
+/// another machine (the pane says which before it asks).
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_delete_path(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    machine: Option<model::RunTarget>,
+    path: String,
+) -> Result<file_browser::Deleted, String> {
+    browse_blocking(app, state.inner().clone(), machine, move |machine| {
+        file_browser::delete(machine, path)
+    })
+    .await
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_create_directory(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    machine: Option<model::RunTarget>,
+    parent: String,
+    name: String,
+) -> Result<remote_agent::files::Changed, String> {
+    browse_blocking(app, state.inner().clone(), machine, move |machine| {
+        file_browser::create_directory(machine, parent, name)
+    })
+    .await
+}
+
+/// Shows a path on this computer in its file manager: a folder opened, a file
+/// selected in its folder.
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_open_in_file_manager(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || open_with::open_in_file_manager(&path))
+        .await
+        .map_err(|error| format!("打开文件位置的后台任务失败: {error}"))?
+}
+
+/// The programs this computer offers for a file, for the pane's "Open with".
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_open_with_choices(path: String) -> Result<open_with::OpenWithChoices, String> {
+    tauri::async_runtime::spawn_blocking(move || open_with::choices(&path))
+        .await
+        .map_err(|error| format!("读取打开方式的后台任务失败: {error}"))?
+}
+
+/// Opens a file on this computer in one of the programs the system offered for
+/// it, or in its default program when `app` is absent.
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_open_with(path: String, app: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || open_with::open_with(&path, app.as_deref()))
+        .await
+        .map_err(|error| format!("打开文件的后台任务失败: {error}"))?
+}
+
+/// The system's own "Open with" chooser for a file, where it has one.
+#[cfg(not(test))]
+#[tauri::command]
+async fn browse_open_with_chooser(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || open_with::choose(&path))
+        .await
+        .map_err(|error| format!("打开文件的后台任务失败: {error}"))?
 }
 
 /// Where a preview target's workspace is: a directory on this computer, held
@@ -6314,41 +6655,30 @@ mod prompt_tests {
     }
 }
 
-/// Returns conversation bodies for runs and forks. The conversation database is
-/// authoritative; the in-memory document snapshot is a fallback.
+/// The body a run or fork works from, as [`conversations::load`] reads it:
+/// from the shared memory pool, or from the database when the pool has
+/// unloaded it.
 ///
-/// Commands write SQLite then refresh the snapshot, but streaming writes occur
-/// directly through `api::ConversationSink` and cannot refresh it per increment.
-/// Wake runs therefore must read the database to include their preceding task
-/// dispatches. Settings remain in the snapshot because only commands modify them.
-fn authoritative_contexts(
-    stored: Option<crate::model::Conversation>,
-    snapshot: &crate::model::Conversation,
-) -> Vec<crate::model::ContextItem> {
+/// Streaming writes go straight to the database through
+/// `api::ConversationSink`, so this is also how a wake run sees the task
+/// dispatches that preceded it. Settings still come from the document snapshot,
+/// which only commands modify. The snapshot carries no bodies, so there is
+/// nothing to fall back to: a body that cannot be read stops the run rather
+/// than handing the model an empty history.
+fn authoritative_body(
+    stored: Result<Option<crate::model::Conversation>, String>,
+    conversation_id: &str,
+) -> Result<crate::model::Conversation, String> {
     match stored {
-        // Prefer the database because it is authoritative, not because it is
-        // longer; choosing the longer body would restore deleted contexts.
-        Some(stored) if stored.id == snapshot.id => stored.contexts,
-        _ => snapshot.contexts.clone(),
-    }
-}
-
-/// Falls back to the in-memory snapshot when the database read fails: a stale
-/// body is preferable to making the entire run fail.
-#[cfg(not(test))]
-fn stored_conversation(path: &Path, conversation_id: &str) -> Option<Conversation> {
-    match conversations::load(path, conversation_id) {
-        Ok(found) => found,
-        Err(error) => {
-            eprintln!("对话 {conversation_id} 的权威正文读取失败，本次改用内存快照：{error}");
-            None
-        }
+        Ok(Some(stored)) if stored.id == conversation_id => Ok(stored),
+        Ok(_) => Err(format!("对话 {conversation_id} 的正文不存在")),
+        Err(error) => Err(format!("对话 {conversation_id} 的正文读取失败：{error}")),
     }
 }
 
 #[cfg(test)]
-mod authoritative_contexts_tests {
-    use super::authoritative_contexts;
+mod authoritative_body_tests {
+    use super::authoritative_body;
     use crate::model::{ContextItem, Conversation};
 
     fn conversation(id: &str, contexts: Vec<ContextItem>) -> Conversation {
@@ -6370,6 +6700,7 @@ mod authoritative_contexts_tests {
             additional_directories: Vec::new(),
             parent_conversation_id: None,
             fork_of: None,
+            handoff_of: None,
             preset_id: String::new(),
             template_id: String::new(),
             attached_workspaces: Vec::new(),
@@ -6393,38 +6724,27 @@ mod authoritative_contexts_tests {
             .collect()
     }
 
-    /// Ensures the database's extra turn reaches a wake run's model request.
+    /// The stored body is the run's history, whatever its length.
     #[test]
-    fn the_store_wins_when_the_snapshot_is_a_round_behind() {
+    fn the_stored_body_is_the_history() {
         let stored = conversation("c1", vec![user("a"), user("b"), user("c")]);
-        let snapshot = conversation("c1", vec![user("a")]);
-        assert_eq!(
-            ids(&authoritative_contexts(Some(stored), &snapshot)),
-            ["a", "b", "c"]
-        );
+        let body = authoritative_body(Ok(Some(stored)), "c1").unwrap();
+        assert_eq!(ids(&body.contexts), ["a", "b", "c"]);
     }
 
-    /// Database authority, rather than body length, preserves deletions and
-    /// full replacements.
+    /// Nothing stands in for a body that cannot be read: an empty history
+    /// would have the model answer a conversation it cannot see.
     #[test]
-    fn the_store_wins_even_when_it_is_shorter() {
-        let stored = conversation("c1", vec![user("a")]);
-        let snapshot = conversation("c1", vec![user("a"), user("b")]);
-        assert_eq!(ids(&authoritative_contexts(Some(stored), &snapshot)), ["a"]);
+    fn a_missing_or_unreadable_body_stops_the_run() {
+        assert!(authoritative_body(Ok(None), "c1").is_err());
+        assert!(authoritative_body(Err("disk".into()), "c1").is_err());
     }
 
-    #[test]
-    fn a_missing_row_falls_back_to_the_snapshot() {
-        let snapshot = conversation("c1", vec![user("a"), user("b")]);
-        assert_eq!(ids(&authoritative_contexts(None, &snapshot)), ["a", "b"]);
-    }
-
-    /// A database result for another conversation must not replace the snapshot.
+    /// A body for another conversation never substitutes.
     #[test]
     fn a_row_for_another_conversation_never_substitutes() {
         let stored = conversation("other", vec![user("x")]);
-        let snapshot = conversation("c1", vec![user("a")]);
-        assert_eq!(ids(&authoritative_contexts(Some(stored), &snapshot)), ["a"]);
+        assert!(authoritative_body(Ok(Some(stored)), "c1").is_err());
     }
 }
 
@@ -6655,8 +6975,15 @@ fn trusted_run_request(
     request.inherits_parent_model_memory = false;
     request.fork_model_binding = None;
     request.subagent_execution_mode_receipt = None;
-    let mut reserved_subagent_names = api::subagent_names_in_contexts(&conversation.contexts);
-    for branch in &conversation.branches {
+    // Read bodies from the conversation store because streaming persistence
+    // bypasses command-layer snapshot refreshes, and the snapshot carries no
+    // bodies anyway; wake runs have no user turn to advance it.
+    let stored = authoritative_body(
+        conversations::load(&anchor, &request.conversation_id),
+        &request.conversation_id,
+    )?;
+    let mut reserved_subagent_names = api::subagent_names_in_contexts(&stored.contexts);
+    for branch in &stored.branches {
         reserved_subagent_names.extend(api::subagent_names_in_contexts(&branch.contexts));
     }
     request.subagent_reserved_names = reserved_subagent_names.into_iter().collect();
@@ -6715,12 +7042,17 @@ fn trusted_run_request(
         &request.web_search,
     );
     // Same rule for the plan tools, except that there is nothing to derive
-    // here: their availability follows the level in force at each step, so
-    // `aisdk::tools::enabled_tools` derives them per step and this list only
-    // has to stop carrying a stale name into a conversation whose level moved.
+    // here: their availability follows the plan-mode switch and the transcript
+    // (`plan_tools` below), so `aisdk::tools::enabled_tools` derives them per
+    // step and this list only has to stop carrying a stale name.
     request
         .enabled_tools
         .retain(|name| !plan_mode::is_plan_mode_tool_name(name));
+    // And for the handoff tools, which the run derives from the conversation's
+    // notebook and its threshold (`handoff::HandoffRun`).
+    request
+        .enabled_tools
+        .retain(|name| !handoff::is_handoff_tool_name(name));
     // Same rule again for `skill`, and it must run after the filter above:
     // `skill` IS in the catalog, so a stale persisted name would otherwise
     // survive `available_tool_names` into a conversation that turned the switch
@@ -6734,14 +7066,14 @@ fn trusted_run_request(
     request
         .enabled_tools
         .retain(|name| name != capabilities::TOOL_SEARCH_TOOL);
-    // Whether this run withholds MCP tool schemas. Floored by the lock the same
-    // way skill delivery is: once MCP tools have gone out one way, the other
-    // way would either redeclare what the transcript holds or point at a tool
-    // the earlier rounds never had.
-    request.mcp_tool_discovery = match conversation.settings.tool_lock.as_ref() {
-        Some(lock) if !lock.mcp_ids.is_empty() => lock.mcp_tool_discovery,
-        _ => conversation.settings.mcp_tool_discovery_enabled,
-    };
+    // Whether this run withholds MCP tool schemas: the conversation's switch,
+    // which the settings panel guards against rewriting a warm cache. Never on
+    // a model that cannot take a tool mid-conversation: a schema `tool_search`
+    // hands out joins the tool set mid-run, which such a model's protocol has
+    // no way to append (`tool_append::appends_tools`). Every MCP schema is
+    // declared up front there instead.
+    request.mcp_tool_discovery = conversation.settings.mcp_tool_discovery_enabled
+        && crate::tool_append::appends_tools(&request.provider, &request.model);
     // The file write guards are unconditional, so nothing is read from the
     // settings for them. What a run still resolves here is the read record it
     // consults: a top-level run's is the conversation's own scope.
@@ -6751,19 +7083,20 @@ fn trusted_run_request(
     };
     request.reasoning_effort = conversation.settings.reasoning_effort;
     request.security_level = conversation.settings.security_level;
+    let plan_mode = conversation.settings.plan_mode_enabled;
     // Conversation history is provider input, not presentation data. Bind the
     // run to the same committed snapshot that supplied provider, model,
     // workspace and approval policy. A compromised renderer may display or
     // propose edits, but it cannot inject an unsaved/forged tool success
     // receipt directly into the next provider request.
     //
-    // Read bodies from the conversation database because streaming persistence
-    // bypasses command-layer snapshot refreshes; wake runs have no user turn to
-    // advance the snapshot.
-    request.contexts = authoritative_contexts(
-        stored_conversation(&anchor, &request.conversation_id),
-        conversation,
-    );
+    request.contexts = stored.contexts;
+    // Plan mode as the switch stands now, in the cell every later boundary
+    // reads: the user may flip it mid-turn, and an approved plan turns it off.
+    // The pair is offered while it is on, and stays once the transcript has
+    // had it (`plan_mode::derived_tools`).
+    request.live_plan_mode = Some(state.live_plan_mode_for_run(&request.conversation_id, plan_mode));
+    request.plan_tools = plan_mode || plan_mode::transcript_offered_tools(&request.contexts);
     request.app_data_path = app_data_path;
     // The servers to dial were resolved with the skills and hooks above, from
     // the same workspace-scoped scan of `mcp.json`.
@@ -7216,7 +7549,7 @@ fn workspace_anchor_path(
 ///
 /// `anchor` is what [`effective_workspace_path`] returned. Every project
 /// workspace the conversation has a worktree of is that worktree, with the
-/// variables of the directory it was checked out from.
+/// variables and the sandbox of the directory it was checked out from.
 #[cfg(not(test))]
 fn conversation_workspace_set(
     document: &AppDocument,
@@ -7231,7 +7564,7 @@ fn conversation_workspace_set(
         &workspace.conversation_workspaces_after_primary(conversation),
         anchor,
     )?
-    .sandboxed(&conversation.settings.sandbox, &conversation.id))
+    .sandboxed(&document.assets.execution_environments, &conversation.id))
 }
 
 /// [`conversation_workspace_set`] with the workspaces after workspace 1 given
@@ -7358,9 +7691,18 @@ fn install_machine_links(app: &AppHandle, app_data: &Path) {
     // time this process reaches it, a WSL distribution the first time
     // something runs there.
     let shells_events = app.state::<AppState>().push_events.clone();
+    let shells_app = app.clone();
     machine_shells::install(
         app_data,
-        Some(Box::new(move |key, shells| {
+        Some(Box::new(move |key, endpoint, shells| {
+            // A probe that was still reaching an address the machine has since
+            // been moved off describes nothing the renderer shows.
+            if endpoint.is_some()
+                && !execution_environment_assets(&shells_app, shells_app.state::<AppState>().inner())
+                    .is_ok_and(|assets| machine_shells::describes(&assets, key, endpoint))
+            {
+                return;
+            }
             shells_events.publish(push_events::AppPushEvent::MachineShellsChanged {
                 key: key.to_owned(),
                 shells: shells.clone(),
@@ -8353,7 +8695,8 @@ pub fn run() {
             }
             reconcile_image_attachments_on_startup(app.handle()).map_err(std::io::Error::other)?;
             if let Ok(local_data) = app.path().app_local_data_dir() {
-                app.state::<AppState>().helper_model.initialize(helper_model::root_dir(&local_data));
+                let state = app.state::<AppState>();
+                state.helper_model.initialize(helper_model::root_dir(&local_data), state.push_events.clone());
             }
             install_background_write_failure_reporting(app.state::<AppState>().inner());
             app.state::<AppState>()
@@ -8547,9 +8890,10 @@ pub fn run() {
                 );
             }
             tauri::RunEvent::Exit => finalize_app_shutdown(app_handle, &exit_coordinator),
-            // Clicking the Dock icon of a running app is how macOS asks for its
-            // window back. Closing the window only hides it into the menu bar,
-            // so without this the Dock icon would do nothing at all.
+            // Opening a running app again — its pinned Dock icon, Finder,
+            // Launchpad, Spotlight — is how macOS asks for its window back.
+            // Closing the window only hides it into the menu bar, so without
+            // this all of those would do nothing at all.
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen {
                 has_visible_windows: false,
@@ -8600,6 +8944,13 @@ fn restrict_user_data_directory() {
 #[cfg(target_os = "macos")]
 pub fn cef_subprocess_main() -> Option<i32> {
     cef_host::subprocess_main()
+}
+
+/// Loads the built-in browser's Chromium framework before the application allocates anything;
+/// `main` calls it right after [`cef_subprocess_main`]. See `cef_host::preload_framework`.
+#[cfg(target_os = "macos")]
+pub fn cef_preload_framework() {
+    cef_host::preload_framework()
 }
 
 /// The whole of `Mework Helper`, the bundled Chromium subprocess executable on macOS.

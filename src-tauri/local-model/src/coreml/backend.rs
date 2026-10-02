@@ -13,9 +13,10 @@ use super::blob::read_record;
 use super::graph::{Shapes, MASK_OFF};
 use super::package::{EmbeddingLayout, PackagePlan, GRAPH_VERSION, HEAD};
 use super::runtime::{Function, State, Tensor16};
-use crate::engine::{Backend, Capacity, Logits, PrefixState};
+use crate::engine::{rope_tables, Backend, Capacity, Input, Layout, Logits, PrefixState, Segment};
 use crate::qwen35::{Config, LayerKind};
 use crate::safetensors::{f16_to_f32, f32_to_f16};
+use crate::vision::VisionTower;
 
 struct StateSpec {
     name: String,
@@ -35,10 +36,19 @@ pub struct AneBackend {
     prefill_states: Option<Vec<State>>,
     decode_states: Option<Vec<State>>,
     lens: Vec<usize>,
+    /// Per slot: rotary position minus sequence position (negative after an image).
+    deltas: Vec<i64>,
     embedding: Embedding,
+    vision: Option<VisionTower>,
     cos: Vec<u16>,
     sin: Vec<u16>,
     off: u16,
+}
+
+/// One position of a prefill: its input embedding and rotary position.
+struct Row {
+    embedding: Vec<u16>,
+    position: [u32; 3],
 }
 
 /// The embedding table read straight from the compiled model's weight file
@@ -121,9 +131,12 @@ impl AneBackend {
     /// Loads every function of the compiled package (`.mlmodelc`) for the
     /// Neural Engine. The first load of a new package makes Core ML compile it
     /// for the ANE, which takes a couple of minutes; later loads hit the
-    /// system's cache. Embedding lookups read `weight_file` at `layout`: the
-    /// compiled model's own `weights/weight.bin` (see `compiled_weights`), or
-    /// the package's copy of it.
+    /// system's cache (well under a second). That cache is kept per executable
+    /// and the system reclaims it when the disk runs low, so a new build of
+    /// the app, or a full disk, compiles again. Embedding lookups read
+    /// `weight_file` at `layout`: the compiled model's own
+    /// `weights/weight.bin` (see `compiled_weights`), or the package's copy
+    /// of it.
     pub fn load(
         compiled: &Path,
         weight_file: &Path,
@@ -155,7 +168,7 @@ impl AneBackend {
         if embedding.hidden != config.hidden_size {
             return Err("词嵌入宽度与模型配置不符".into());
         }
-        let (cos, sin) = rope_table(&config, plan.shapes.context);
+        let (cos, sin) = rope_tables(&config, plan.shapes.context, f32_to_f16);
         let specs = plan.parts.iter().map(|range| specs_for(&config, plan.shapes, range.clone())).collect();
         let mut backend = Self {
             shapes: plan.shapes,
@@ -166,7 +179,9 @@ impl AneBackend {
             prefill_states: None,
             decode_states: None,
             lens: vec![0; plan.shapes.slots],
+            deltas: vec![0; plan.shapes.slots],
             embedding,
+            vision: None,
             cos,
             sin,
             off: f32_to_f16(MASK_OFF),
@@ -176,13 +191,37 @@ impl AneBackend {
         Ok(backend)
     }
 
+    /// Lets requests carry images, encoded by `tower`.
+    pub fn with_vision(mut self, tower: VisionTower) -> Self {
+        self.vision = Some(tower);
+        self
+    }
+
     /// The first prediction of each function pays for loading its program
     /// onto the ANE (about half a second); pay it now, not in a request.
     fn warm_up(&mut self) -> Result<(), String> {
         self.ensure_states();
-        let result = self.prefill_chunk(&[0], 0).map(|_| ()).and_then(|_| self.decode_step(&[(0, 0)]).map(|_| ()));
+        let result = self
+            .token_rows(&[0], 0)
+            .and_then(|rows| self.prefill_chunk(&rows, 0))
+            .map(|_| ())
+            .and_then(|_| self.decode_step(&[(0, 0)]).map(|_| ()));
         self.trim();
         result
+    }
+
+    /// Rows of plain `tokens` from sequence position `start`.
+    fn token_rows(&self, tokens: &[u32], start: usize) -> Result<Vec<Row>, String> {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(i, token)| Ok(Row { embedding: self.embedding(*token)?, position: [(start + i) as u32; 3] }))
+            .collect()
+    }
+
+    fn rotary(&self, position: [u32; 3], cos: &mut [u16], sin: &mut [u16]) {
+        self.config.rotary_row(&self.cos, position, cos);
+        self.config.rotary_row(&self.sin, position, sin);
     }
 
     fn ensure_states(&mut self) {
@@ -198,12 +237,13 @@ impl AneBackend {
         self.embedding.row(token)
     }
 
-    /// Runs `tokens` (at most one chunk) at positions `start..` through the
-    /// prefill functions; returns the final hidden states `[1, H, 1, T]`.
-    fn prefill_chunk(&mut self, tokens: &[u32], start: usize) -> Result<Tensor16, String> {
+    /// Runs `rows` (at most one chunk) at sequence positions `start..`
+    /// through the prefill functions; returns the final hidden states
+    /// `[1, H, 1, T]`.
+    fn prefill_chunk(&mut self, rows: &[Row], start: usize) -> Result<Tensor16, String> {
         let (t, ctx, h, rot) = (self.shapes.chunk, self.shapes.context, self.config.hidden_size, self.config.rotary_dim);
         let kc = self.config.linear_conv_kernel_dim;
-        let n = tokens.len();
+        let n = rows.len();
         assert!(n >= 1 && n <= t && start + n <= ctx);
         let one = f32_to_f16(1.0);
         let mut x = Tensor16::zeros(&[1, h, 1, t]);
@@ -214,14 +254,12 @@ impl AneBackend {
         let mut mask = Tensor16::filled(&[1, 1, t, ctx], self.off);
         let mut valid = Tensor16::zeros(&[1, 1, 1, t]);
         let mut csel = Tensor16::zeros(&[1, 1, kc, t + kc - 1]);
-        for (j, token) in tokens.iter().enumerate() {
-            let e = self.embedding(*token)?;
-            for (c, value) in e.iter().enumerate() {
+        for (j, row) in rows.iter().enumerate() {
+            for (c, value) in row.embedding.iter().enumerate() {
                 x.data[c * t + j] = *value;
             }
             let pos = start + j;
-            cos.data[j * rot..(j + 1) * rot].copy_from_slice(&self.cos[pos * rot..(pos + 1) * rot]);
-            sin.data[j * rot..(j + 1) * rot].copy_from_slice(&self.sin[pos * rot..(pos + 1) * rot]);
+            self.rotary(row.position, &mut cos.data[j * rot..(j + 1) * rot], &mut sin.data[j * rot..(j + 1) * rot]);
             scatter.data[pos * t + j] = one;
             keep.data[pos] = 0;
             valid.data[j] = one;
@@ -254,13 +292,13 @@ impl AneBackend {
         Ok(hidden)
     }
 
-    /// Runs prefill over `tokens` from position `start`; returns the last
-    /// token's final hidden state.
-    fn prefill_all(&mut self, tokens: &[u32], start: usize) -> Result<Vec<u16>, String> {
+    /// Runs prefill over `rows` from sequence position `start`; returns the
+    /// last one's final hidden state.
+    fn prefill_all(&mut self, rows: &[Row], start: usize) -> Result<Vec<u16>, String> {
         let t = self.shapes.chunk;
         let h = self.config.hidden_size;
         let mut last = vec![0u16; h];
-        for (i, chunk) in tokens.chunks(t).enumerate() {
+        for (i, chunk) in rows.chunks(t).enumerate() {
             let out = self.prefill_chunk(chunk, start + i * t)?;
             let j = chunk.len() - 1;
             for c in 0..h {
@@ -312,8 +350,10 @@ impl AneBackend {
             }
             let e = self.embedding(*token)?;
             x.data[slot * h..(slot + 1) * h].copy_from_slice(&e);
-            cos.data[slot * rot..(slot + 1) * rot].copy_from_slice(&self.cos[pos * rot..(pos + 1) * rot]);
-            sin.data[slot * rot..(slot + 1) * rot].copy_from_slice(&self.sin[pos * rot..(pos + 1) * rot]);
+            let rotary = (pos as i64 + self.deltas[*slot]) as u32;
+            let (c, s) = (&mut cos.data[slot * rot..(slot + 1) * rot], &mut sin.data[slot * rot..(slot + 1) * rot]);
+            self.config.rotary_row(&self.cos, [rotary; 3], c);
+            self.config.rotary_row(&self.sin, [rotary; 3], s);
             onehot.data[slot * ctx + pos] = one;
             keep.data[slot * ctx + pos] = 0;
             mask.data[slot * ctx..slot * ctx + pos + 1].fill(0);
@@ -334,25 +374,6 @@ impl AneBackend {
         }
         self.head_logits(&rows)
     }
-}
-
-fn rope_table(config: &Config, context: usize) -> (Vec<u16>, Vec<u16>) {
-    let rot = config.rotary_dim;
-    let half = rot / 2;
-    let mut cos = vec![0u16; context * rot];
-    let mut sin = vec![0u16; context * rot];
-    for pos in 0..context {
-        for i in 0..half {
-            let inv = config.rope_theta.powf(-(2.0 * i as f64) / rot as f64);
-            let angle = pos as f64 * inv;
-            let (s, c) = angle.sin_cos();
-            for j in [i, i + half] {
-                cos[pos * rot + j] = f32_to_f16(c as f32);
-                sin[pos * rot + j] = f32_to_f16(s as f32);
-            }
-        }
-    }
-    (cos, sin)
 }
 
 fn push_u16s(out: &mut Vec<u8>, values: &[u16]) {
@@ -381,7 +402,8 @@ impl Backend for AneBackend {
         }
         self.ensure_states();
         self.clear_prefill();
-        self.prefill_all(tokens, 0)?;
+        let rows = self.token_rows(tokens, 0)?;
+        self.prefill_all(&rows, 0)?;
         let states = self.prefill_states.as_ref().expect("states");
         let mut bytes = Vec::new();
         for (part, specs) in self.specs.iter().enumerate() {
@@ -394,13 +416,29 @@ impl Backend for AneBackend {
         Ok(PrefixState { tokens: tokens.len(), format: self.state_format(), bytes: bytes.into() })
     }
 
-    fn admit(&mut self, slot: usize, prefix: &PrefixState, tokens: &[u32]) -> Result<Logits, String> {
+    fn admit(&mut self, slot: usize, prefix: &PrefixState, input: &[Segment]) -> Result<Logits, String> {
         if prefix.format != self.state_format() {
             return Err("前置提示词缓存与模型不匹配".into());
         }
-        if tokens.is_empty() || prefix.tokens + tokens.len() >= self.shapes.context {
+        let layout = Layout::new(input, prefix.tokens, self.vision.as_ref())?;
+        if layout.inputs.is_empty() || prefix.tokens + layout.inputs.len() >= self.shapes.context {
             return Err("请求长度超出本地模型上下文".into());
         }
+        let rows = layout
+            .inputs
+            .iter()
+            .zip(&layout.positions)
+            .map(|(input, position)| {
+                let embedding = match input {
+                    Input::Token(token) => self.embedding(*token)?,
+                    Input::Feature(row) => layout.feature(*row).iter().map(|v| f32_to_f16(*v)).collect(),
+                };
+                if embedding.len() != self.config.hidden_size {
+                    return Err("图片特征宽度与模型不符".to_string());
+                }
+                Ok(Row { embedding, position: *position })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         self.ensure_states();
         // Restore the prefix into the prefill states.
         {
@@ -421,8 +459,8 @@ impl Backend for AneBackend {
                 return Err("前置提示词缓存已损坏".into());
             }
         }
-        let last = self.prefill_all(tokens, prefix.tokens)?;
-        let len = prefix.tokens + tokens.len();
+        let last = self.prefill_all(&rows, prefix.tokens)?;
+        let len = prefix.tokens + rows.len();
         // Move the sequence into its decode slot.
         {
             let prefill = self.prefill_states.as_ref().expect("states");
@@ -436,6 +474,7 @@ impl Backend for AneBackend {
             }
         }
         self.lens[slot] = len;
+        self.deltas[slot] = layout.delta(prefix.tokens);
         Ok(self.head_logits(&[(slot, last)])?.remove(0))
     }
 
@@ -446,12 +485,14 @@ impl Backend for AneBackend {
 
     fn release(&mut self, slot: usize) {
         self.lens[slot] = 0;
+        self.deltas[slot] = 0;
     }
 
     fn trim(&mut self) {
         self.prefill_states = None;
         self.decode_states = None;
         self.lens.iter_mut().for_each(|len| *len = 0);
+        self.deltas.iter_mut().for_each(|delta| *delta = 0);
     }
 }
 
@@ -463,6 +504,7 @@ mod tests {
     use crate::qwen35::model_tensor;
     use crate::safetensors::SafeTensors;
     use crate::tokenizer::Tokenizer;
+    use crate::vision::VisionTower;
     use std::sync::atomic::AtomicBool;
 
     /// Builds, compiles and runs the real model on the Neural Engine. Needs
@@ -511,7 +553,7 @@ mod tests {
         let mut alone = Vec::new();
         for prompt in prompts {
             let suffix = suffix_tokens(&tokenizer, &specials, prompt, 256);
-            let mut token = greedy(&backend.admit(0, &state, &suffix).unwrap(), &specials);
+            let mut token = greedy(&backend.admit_tokens(0, &state, &suffix).unwrap(), &specials);
             let mut out = vec![token];
             for _ in 0..14 {
                 token = greedy(&backend.step(&[(0, token)]).unwrap()[0], &specials);
@@ -524,8 +566,8 @@ mod tests {
         // Both at once, in slots 1 and 3.
         let s1 = suffix_tokens(&tokenizer, &specials, prompts[0], 256);
         let s3 = suffix_tokens(&tokenizer, &specials, prompts[1], 256);
-        let mut t1 = greedy(&backend.admit(1, &state, &s1).unwrap(), &specials);
-        let mut t3 = greedy(&backend.admit(3, &state, &s3).unwrap(), &specials);
+        let mut t1 = greedy(&backend.admit_tokens(1, &state, &s1).unwrap(), &specials);
+        let mut t3 = greedy(&backend.admit_tokens(3, &state, &s3).unwrap(), &specials);
         let (mut o1, mut o3) = (vec![t1], vec![t3]);
         let started = std::time::Instant::now();
         for _ in 0..14 {
@@ -538,6 +580,34 @@ mod tests {
         eprintln!("14 batched steps in {:?}", started.elapsed());
         assert_eq!(o1, alone[0]);
         assert_eq!(o3, alone[1]);
+        backend.trim();
+
+        // An image (`testdata/vision-golden.json`) in slot 2, beside a text
+        // request in slot 0.
+        let golden = crate::vision::tests::golden_request(&tokenizer);
+        let margins: Vec<f64> =
+            serde_json::from_value(crate::vision::tests::golden_json()["margins"].clone()).unwrap();
+        let vision = crate::vision::VisionConfig::load(&dir.join("config.json")).unwrap();
+        let tower = VisionTower::open(vision, &dir.join("model.safetensors")).unwrap();
+        let mut backend = backend.with_vision(tower);
+        let state = backend.prefix_state(&golden.prefix).unwrap();
+        let started = std::time::Instant::now();
+        let mut image = vec![greedy(&backend.admit(2, &state, &golden.input).unwrap(), &specials)];
+        eprintln!("image admitted in {:?}", started.elapsed());
+        let text = suffix_tokens(&tokenizer, &specials, prompts[0], 256);
+        let mut other = greedy(&backend.admit_tokens(0, &state, &text).unwrap(), &specials);
+        while image.len() < golden.expected.len() {
+            let logits = backend.step(&[(0, other), (2, *image.last().unwrap())]).unwrap();
+            other = greedy(&logits[0], &specials);
+            image.push(greedy(&logits[1], &specials));
+        }
+        eprintln!("image -> {:?}", tokenizer.decode(&image));
+        if let Some(k) = (0..image.len()).find(|k| image[*k] != golden.expected[*k]) {
+            eprintln!("image: matches transformers up to token {k} (its margin {:.3})", margins[k]);
+            assert!(margins[k] < 0.5, "image: differs from transformers at token {k} (margin {})", margins[k]);
+        } else {
+            eprintln!("image: matches transformers ({} tokens)", image.len());
+        }
         backend.trim();
     }
 }

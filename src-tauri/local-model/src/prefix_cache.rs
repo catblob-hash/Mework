@@ -66,6 +66,47 @@ fn store(path: &Path, state: &PrefixState) -> std::io::Result<()> {
     fs::rename(&temp, path)
 }
 
+/// The size of the state cached in `dir` for `tokens`, without a backend:
+/// each file names the backend build that wrote it, so the key is tried for
+/// every build found there. For reporting only; a state is used through
+/// `PrefixCache::get`, which checks it is this backend's.
+pub fn peek(dir: &Path, tokens: &[u32]) -> Option<u64> {
+    let mut formats: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some(EXTENSION) {
+            continue;
+        }
+        let Some(format) = header_format(&path) else { continue };
+        if formats.contains(&format) {
+            continue;
+        }
+        if let Some(state) = open(&dir.join(format!("{}.{EXTENSION}", key(&format, tokens))), &format) {
+            return Some(state.bytes.len() as u64);
+        }
+        formats.push(format);
+    }
+    None
+}
+
+/// The backend build a cache file was written for, from its header.
+fn header_format(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = File::open(path).ok()?;
+    let mut head = [0u8; 16];
+    file.read_exact(&mut head).ok()?;
+    if &head[..8] != MAGIC {
+        return None;
+    }
+    let len = u32::from_le_bytes(head[8..12].try_into().ok()?) as usize;
+    if len > 4096 {
+        return None;
+    }
+    let mut format = vec![0u8; len];
+    file.read_exact(&mut format).ok()?;
+    String::from_utf8(format).ok()
+}
+
 impl PrefixCache {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir, memory: HashMap::new() }
@@ -147,7 +188,7 @@ mod tests {
             let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
             Ok(PrefixState { tokens: tokens.len(), format: self.format.clone(), bytes: bytes.into() })
         }
-        fn admit(&mut self, _: usize, _: &PrefixState, _: &[u32]) -> Result<Logits, String> {
+        fn admit(&mut self, _: usize, _: &PrefixState, _: &[crate::engine::Segment]) -> Result<Logits, String> {
             unreachable!()
         }
         fn step(&mut self, _: &[(usize, u32)]) -> Result<Vec<Logits>, String> {
@@ -178,5 +219,17 @@ mod tests {
         cache.prune("b", &[vec![1, 2, 3]]);
         let files = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(files, 1, "only b's state is left");
+    }
+
+    #[test]
+    fn peeks_without_a_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(peek(dir.path(), &[1, 2, 3]), None);
+        let mut backend = Counting { computed: 0, format: "a".into() };
+        let mut cache = PrefixCache::new(dir.path().to_path_buf());
+        cache.get(&mut backend, &[1, 2, 3]).unwrap();
+        assert_eq!(peek(dir.path(), &[1, 2, 3]), Some(12));
+        assert_eq!(peek(dir.path(), &[1, 2]), None, "another prompt is not cached");
+        assert_eq!(peek(&dir.path().join("missing"), &[1, 2, 3]), None);
     }
 }

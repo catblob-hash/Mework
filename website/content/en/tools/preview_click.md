@@ -2,7 +2,7 @@ Clicks one element on the conversation's preview page. The model reaches for it 
 
 ## Approval
 
-The call is classified as an unbounded action (`tool.unbounded`, high risk), so `request_approval`, `allow_edits` and `plan` ask before it runs and `full_access` does not. **Always allow** is never offered for a page tool, so the next click asks again. Underneath that, a page you signed into yourself raises a takeover card first, naming the signed-in origin; no security level and no hook can answer that one for you, and the grant lapses as soon as the page leaves that origin.
+The call is classified as an unbounded action (`tool.unbounded`, high risk), so `request_approval` and `allow_edits` ask before it runs and `full_access` does not. **Always allow** is never offered for a page tool, so the next click asks again. Underneath that, a page you signed into yourself raises a takeover card first, naming the signed-in origin; no security level and no hook can answer that one for you, and the grant lapses as soon as the page leaves that origin.
 
 ## Behavior and limits
 

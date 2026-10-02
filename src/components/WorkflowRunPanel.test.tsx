@@ -105,13 +105,14 @@ describe("WorkflowRunPanel", () => {
     expect(screen.queryByText("legacy-driver-handle")).not.toBeInTheDocument();
   });
 
-  it("lists each agent by the role it was bound to, with its tokens and its time", () => {
+  it("titles each agent role:name over what it was asked, with its tokens and its time", () => {
     render(<WorkflowRunPanel view={runView(AUDIT_STEPS)} />);
 
-    const done = stepTile("audit:rust-path");
-    // The role, not the model: which model answers for a role is the user's
-    // configuration, and two roles on one model are still two different jobs.
-    expect(within(done).getByText("auditor")).toBeInTheDocument();
+    // The role, not the model, leads the title: which model answers for a role
+    // is the user's configuration, and two roles on one model are still two
+    // different jobs. The subtitle is the prompt the run gave the step.
+    const done = stepTile("auditor:audit:rust-path");
+    expect(within(done).getByText("执行 s0")).toBeInTheDocument();
     expect(within(done).queryByText("sonnet-5")).not.toBeInTheDocument();
     // The model stays reachable — it is the tile's tooltip.
     expect(done.querySelector(".workflow-step__main"))
@@ -121,16 +122,16 @@ describe("WorkflowRunPanel", () => {
 
     // Usage is only written when the host records the agent's turn, so a step
     // still in flight reports a dash rather than a zero it has not earned.
-    const running = stepTile("audit:renderer-path");
+    const running = stepTile("auditor:audit:renderer-path");
     expect(within(running).getAllByText("—")).toHaveLength(1);
     expect(within(running).getByText("20m 12s")).toBeInTheDocument();
   });
 
-  /** A plan may leave a step role-less, and then the model it inherits is the
-      only thing the tile has left to report. */
-  it("falls back to the model on a step that named no role", () => {
+  /** A plan may leave a step role-less: its title is then its name alone, and
+      a step with no prompt to show falls back to the model it answers on. */
+  it("titles a role-less step by its name, and falls back to the model without a prompt", () => {
     const view = runView([
-      { ...AUDIT_STEPS[0], label: "audit:no-role", role: null, modelId: "opus-5" }
+      { ...AUDIT_STEPS[0], label: "audit:no-role", role: null, modelId: "opus-5", task: "" }
     ]);
     render(<WorkflowRunPanel view={view} />);
 
@@ -151,7 +152,7 @@ describe("WorkflowRunPanel", () => {
     const onOpenAgent = vi.fn();
     render(<WorkflowRunPanel view={runView(AUDIT_STEPS)} onOpenAgent={onOpenAgent} />);
 
-    await userEvent.click(screen.getByRole("button", { name: "打开步骤 audit:rust-path" }));
+    await userEvent.click(screen.getByRole("button", { name: "打开步骤 auditor:audit:rust-path" }));
     expect(onOpenAgent).toHaveBeenCalledWith("s0");
     // The run is a script. There is no control anywhere in the panel that
     // claims otherwise.
@@ -184,8 +185,8 @@ describe("WorkflowRunPanel", () => {
 
     // Only a step still moving can be skipped: the scheduler never re-opens a
     // slot it has settled, so a Skip on a finished one would do nothing.
-    expect(screen.queryByRole("button", { name: "跳过 audit:rust-path" })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "跳过 audit:renderer-path" }));
+    expect(screen.queryByRole("button", { name: "跳过 auditor:audit:rust-path" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "跳过 auditor:audit:renderer-path" }));
     expect(onStepControl).toHaveBeenCalledWith("run-abc", 1);
   });
 
@@ -209,7 +210,7 @@ describe("WorkflowRunPanel", () => {
 
     expect(bar).not.toHaveAttribute("aria-expanded");
     expect(document.querySelector(".workflow-panel__body")).toBeInTheDocument();
-    expect(screen.getByText("audit:rust-path")).toBeInTheDocument();
+    expect(screen.getByText("auditor:audit:rust-path")).toBeInTheDocument();
     expect(within(bar).getByText("fetch-models-gate-audit")).toBeInTheDocument();
     expect(document.querySelector(".workflow-panel__meta")).toHaveTextContent("20m 12s");
   });
@@ -222,7 +223,7 @@ describe("WorkflowRunPanel", () => {
     expect(onStop).toHaveBeenCalledTimes(1);
     // Stopping must not hide the active body or steps.
     expect(document.querySelector(".workflow-panel__body")).toBeInTheDocument();
-    expect(screen.getByText("audit:rust-path")).toBeInTheDocument();
+    expect(screen.getByText("auditor:audit:rust-path")).toBeInTheDocument();
   });
 
   it("shows the run log only when the live ledger carried one", async () => {

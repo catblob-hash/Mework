@@ -1,4 +1,4 @@
-import { Paperclip, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import { useRef } from "react";
 import { useI18n } from "../i18n";
 import { PopoverMenu } from "./PopoverMenu";
@@ -54,7 +54,6 @@ export function ComposerAddFiles({
           items: [{
             id: "files",
             label: t("上传文件", "Upload files"),
-            icon: <Paperclip size={14} />,
             title: unavailableReason
               ?? (imageInput
                 ? t(

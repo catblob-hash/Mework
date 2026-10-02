@@ -2,8 +2,10 @@ import {
   Bot,
   BrainCircuit,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   CircleAlert,
   Copy,
   GitBranch,
@@ -14,7 +16,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
 import type { AssistantContext, ContextItem, FileAttachment, ImageAttachment, InsertableContextKind, JsonObject, SystemContext, ToolContext, ToolDescriptor, UserContext } from "../types";
@@ -24,7 +26,8 @@ import { turnAnchorIndex } from "../lib/conversationTurns";
 import type { ConversationTurn } from "../lib/conversationTurns";
 import type { WorkflowRunView } from "../lib/workflowRuns";
 import type { LiveReasoningView } from "../lib/runContexts";
-import { EmptyState, IconButton } from "./Common";
+import { CopyButton, EmptyState, IconButton } from "./Common";
+import { MenuFlyout, MenuSurfacesContext, createMenuSurfaces } from "./MenuFlyout";
 import { MeworkIcon } from "./MeworkIcon";
 import { buildContextRenderNodes, TimelineBlock, TimelineRow } from "./TimelineBlock";
 import type { ContextRenderNode } from "./TimelineBlock";
@@ -41,6 +44,8 @@ import { stepFollowGlide } from "../lib/followGlide";
 import type { FollowGlide } from "../lib/followGlide";
 import { MarkdownContent } from "./MarkdownContent";
 import { QuestionTimelineCard } from "./QuestionTimelineCard";
+import { TimelineSelectionContext, useTimelineSelected } from "./timelineSelection";
+import { timelineHistoryKey, timelineSelectionModifier } from "../lib/timelineHistory";
 import { StreamWaitingIndicator } from "./StreamWaitingIndicator";
 import { groupLabel, groupMeta } from "./ToolSelectionGroups";
 import type { ToolCategory } from "./ToolSelectionGroups";
@@ -131,8 +136,6 @@ export interface ContextStreamProps {
   runningTaskCount?: number;
   onOpenTasks?: () => void;
   ariaLabel?: string;
-  /** The `ask_user` tool context currently awaiting an answer, if any. */
-  pendingQuestionId?: string | null;
   onEdit?: (item: ContextItem) => void;
   onDelete?: (item: ContextItem) => void;
   /** Edits the projected ask_user tool and its paired answer as one message. */
@@ -163,6 +166,19 @@ export interface ContextStreamProps {
   branchSwitchDisabledReason?: string | null;
   /** Places a new context, naming the tool when a call is what is being placed. */
   onInsert?: (index: number, kind: InsertableContextKind, toolName?: string) => void;
+  /**
+   * Deletes every context a selection box picked out, as one edit. The box is
+   * drawn by dragging with Ctrl held (⌘ on a Mac), and only where this is given.
+   */
+  onDeleteContexts?: (ids: string[]) => void;
+  /**
+   * Reverts the last edit made on this timeline. Ctrl+Z (⌘Z on a Mac) asks for
+   * it, and only while focus is somewhere in the timeline: the same keys typed
+   * into a field undo the typing instead.
+   */
+  onUndo?: () => void;
+  /** Makes the last reverted edit again: Ctrl+X (⌘X), on the same terms. */
+  onRedo?: () => void;
   /** Opens a new conversation holding the contexts above the insertion line at `index`. */
   onForkAt?: (index: number) => void;
   forkDisabledReason?: string | null;
@@ -249,24 +265,39 @@ function firstProseLine(content: string): string | undefined {
   return content.split("\n").map((line) => line.trim()).find(Boolean);
 }
 
+/**
+ * A reply's controls. Copying changes nothing, so it stays on a timeline that is
+ * read-only or busy running; editing and deleting come only where they can land.
+ */
 function ContextActions({
+  copyText,
+  copyLabel,
+  copyDisabled = false,
   onEdit,
   onDelete,
-  disabled = false
+  mutationDisabled = false
 }: {
-  onEdit: () => void;
-  onDelete: () => void;
-  disabled?: boolean;
+  copyText?: string;
+  copyLabel: string;
+  copyDisabled?: boolean;
+  onEdit?: () => void;
+  onDelete?: () => void;
+  mutationDisabled?: boolean;
 }) {
   const { t } = useI18n();
   return (
     <div className="context-actions">
-      <IconButton label={t("编辑上下文", "Edit context")} onClick={onEdit} disabled={disabled}>
-        <Pencil size={14} />
-      </IconButton>
-      <IconButton label={t("删除上下文", "Delete context")} onClick={onDelete} disabled={disabled}>
-        <Trash2 size={14} />
-      </IconButton>
+      {copyText ? <CopyButton text={copyText} label={copyLabel} size={14} disabled={copyDisabled} /> : null}
+      {onEdit && (
+        <IconButton label={t("编辑上下文", "Edit context")} onClick={onEdit} disabled={mutationDisabled}>
+          <Pencil size={14} />
+        </IconButton>
+      )}
+      {onDelete && (
+        <IconButton label={t("删除上下文", "Delete context")} onClick={onDelete} disabled={mutationDisabled}>
+          <Trash2 size={14} />
+        </IconButton>
+      )}
     </div>
   );
 }
@@ -385,6 +416,81 @@ function UserMessageToolbar({
   );
 }
 
+/** How many lines a long message shows while folded (`.context-card__content--folded` agrees). */
+const FOLDED_USER_MESSAGE_LINES = 10;
+/** A message only this much longer than its folded height shows whole: folding would hide next to nothing. */
+const USER_MESSAGE_FOLD_SLACK_LINES = 3;
+
+function lineHeightOf(element: HTMLElement): number {
+  const style = window.getComputedStyle(element);
+  const lineHeight = Number.parseFloat(style.lineHeight);
+  if (style.lineHeight.endsWith("px") && lineHeight > 0) return lineHeight;
+  const fontSize = Number.parseFloat(style.fontSize);
+  return (style.fontSize.endsWith("px") && fontSize > 0 ? fontSize : 13)
+    * (lineHeight > 0 && lineHeight < 4 ? lineHeight : 1.58);
+}
+
+/**
+ * A user message's text. One long enough to push the conversation out of view
+ * waits folded to its first lines under "Show more", and "Show less" folds it
+ * again. Wrapping decides what is long, so it is measured, not counted.
+ */
+function FoldableUserText({ measureKey, children }: { measureKey: string; children: ReactNode }) {
+  const { t } = useI18n();
+  const contentRef = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const contentId = useId();
+  const [foldable, setFoldable] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `measureKey` is what changes the height `measure` reads.
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    // `scrollHeight` is the whole text's height even while folded, so folding
+    // never changes the answer and the observer cannot feed back on itself.
+    const measure = () => setFoldable(
+      content.scrollHeight > lineHeightOf(content) * (FOLDED_USER_MESSAGE_LINES + USER_MESSAGE_FOLD_SLACK_LINES)
+    );
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [measureKey]);
+
+  const folded = foldable && !expanded;
+  return (
+    <>
+      <div
+        ref={contentRef}
+        id={contentId}
+        className={`context-card__content${folded ? " context-card__content--folded" : ""}`}
+      >
+        {children}
+      </div>
+      {foldable && (
+        <button
+          ref={toggleRef}
+          type="button"
+          className="context-card__fold"
+          aria-expanded={expanded}
+          aria-controls={contentId}
+          onClick={() => {
+            setExpanded(!expanded);
+            // Folding a message read to its end leaves the reader below it;
+            // bring the toggle, and the message's end, back into view.
+            if (expanded) window.requestAnimationFrame(() => toggleRef.current?.scrollIntoView({ block: "nearest" }));
+          }}
+        >
+          {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+          <span>{expanded ? t("收起", "Show less") : t("展开", "Show more")}</span>
+        </button>
+      )}
+    </>
+  );
+}
+
 /**
  * Memoize cards so a stream flush rerenders only cards whose identity changed. Stable callbacks
  * and persisted `item` references preserve that boundary between flushes.
@@ -435,6 +541,8 @@ const ContextCard = memo(function ContextCard({
   // Markdown rendering is an appearance preference.
   const { renderUserMarkdown, collapseReasoning } = useAppearance();
   const promptCard = item.kind === "system";
+  // The system prompt's own row lights up for it, so the card around that row does not.
+  const selected = useTimelineSelected(item.id) && !promptCard;
   const [promptExpanded, setPromptExpanded] = useState(!collapseReasoning);
   const assistantStreaming = item.kind === "assistant" && item.streaming === true;
   const hasUserToolbar = item.kind === "user";
@@ -483,6 +591,7 @@ const ContextCard = memo(function ContextCard({
       tabIndex={mutationReadOnly ? undefined : 0}
       data-context-id={item.id}
       data-context-index={index}
+      data-timeline-selected={selected || undefined}
       aria-busy={assistantStreaming || undefined}
       onContextMenu={mutationReadOnly || editingInPlace ? undefined : (event) => {
         event.preventDefault();
@@ -514,16 +623,21 @@ const ContextCard = memo(function ContextCard({
               {t("仅本地", "Local only")}
             </span>
           ) : undefined}
-          actions={showMutationActions ? (
+          actions={promptEditing || (!showMutationActions && item.content.length === 0) ? undefined : (
             <>
-              <IconButton label={t("编辑上下文", "Edit context")} onClick={onEdit} disabled={mutationReadOnly}>
-                <Pencil size={13} />
-              </IconButton>
-              <IconButton label={t("删除上下文", "Delete context")} onClick={onDelete} disabled={mutationReadOnly}>
-                <Trash2 size={13} />
-              </IconButton>
+              {item.content.length > 0 && <CopyButton text={item.content} label={t("复制系统提示词", "Copy system prompt")} />}
+              {showMutationActions && (
+                <>
+                  <IconButton label={t("编辑上下文", "Edit context")} onClick={onEdit} disabled={mutationReadOnly}>
+                    <Pencil size={13} />
+                  </IconButton>
+                  <IconButton label={t("删除上下文", "Delete context")} onClick={onDelete} disabled={mutationReadOnly}>
+                    <Trash2 size={13} />
+                  </IconButton>
+                </>
+              )}
             </>
-          ) : undefined}
+          )}
           expandable={item.content.length > 0 || promptEditing}
           expanded={(item.content.length > 0 || promptEditing) && (promptExpanded || promptEditing)}
           onToggleExpanded={() => !promptEditing && setPromptExpanded((current) => !current)}
@@ -555,24 +669,35 @@ const ContextCard = memo(function ContextCard({
       {item.kind === "user" && !editingInPlace && (
         <ImageStrip images={item.images} files={item.files} className="context-card__images" />
       )}
-      {!editingInPlace && !promptCard && (item.kind === "assistant" || Boolean(displayContent)) && (
+      {!editingInPlace && item.kind === "assistant" && (
         <div className="context-card__content" aria-live={assistantStreaming ? "polite" : undefined}>
-          {item.kind === "assistant" || renderUserMarkdown
+          <MarkdownContent
+            content={displayContent}
+            deferOffscreen={deferOffscreen}
+            streaming={assistantStreaming}
+            linkifyPaths
+            renderHtml
+            pathBaseDir={pathBaseDir}
+          />
+        </div>
+      )}
+      {!editingInPlace && item.kind === "user" && Boolean(displayContent) && (
+        <FoldableUserText measureKey={`${renderUserMarkdown ? "md" : "text"}:${displayContent}`}>
+          {renderUserMarkdown
             ? (
+              // Only model output is scanned for paths and has its HTML
+              // rendered. User text keeps rendering exactly what was typed,
+              // Markdown preference or not.
               <MarkdownContent
                 content={displayContent}
                 deferOffscreen={deferOffscreen}
-                streaming={assistantStreaming}
-                // Only model output is scanned for paths and has its HTML
-                // rendered. User text keeps rendering exactly what was typed,
-                // Markdown preference or not.
-                linkifyPaths={item.kind === "assistant"}
-                renderHtml={item.kind === "assistant"}
+                linkifyPaths={false}
+                renderHtml={false}
                 pathBaseDir={pathBaseDir}
               />
             )
             : displayContent}
-        </div>
+        </FoldableUserText>
       )}
       {item.kind === "assistant" && !editingInPlace && (item.sources?.length ?? 0) > 0 && (
         <nav className="context-card__sources" aria-label={t("引用来源", "Cited sources")}>
@@ -603,12 +728,15 @@ const ContextCard = memo(function ContextCard({
       {/* A reply names itself by being a reply, so it carries no title. Its
           controls wait under the prose and only surface on hover, where they
           cannot cover a word of what was said. */}
-      {item.kind === "assistant" && !editingInPlace && showMutationActions && (
+      {item.kind === "assistant" && !editingInPlace && (showMutationActions || Boolean(item.content)) && (
         <div className="context-card__footer-actions">
           <ContextActions
-            onEdit={onEdit}
-            onDelete={onDelete}
-            disabled={mutationReadOnly || assistantStreaming}
+            copyText={item.content}
+            copyLabel={t("复制模型回复", "Copy model reply")}
+            copyDisabled={assistantStreaming}
+            onEdit={showMutationActions ? onEdit : undefined}
+            onDelete={showMutationActions ? onDelete : undefined}
+            mutationDisabled={mutationReadOnly || assistantStreaming}
           />
         </div>
       )}
@@ -661,51 +789,71 @@ interface ContextMenuState {
   trigger: HTMLElement | null;
   /**
    * Which panel the one menu is showing. Naming a tool is two choices deep, so
-   * that one opens beside the item rather than replacing what it came from.
+   * that one opens beside the item rather than replacing what it came from. A
+   * right-click while a selection box has picked contexts out offers only what
+   * can be done to all of them at once.
    */
-  view: { kind: "insert"; tools?: { category: ToolCategory | null } };
+  view: { kind: "insert"; tools?: { category: ToolCategory | null } } | { kind: "selection" };
+}
+
+const NO_SELECTION: ReadonlySet<string> = new Set();
+
+/** How close to the top or bottom edge a selection drag scrolls the timeline. */
+const MARQUEE_SCROLL_EDGE = 32;
+/** The most a selection drag scrolls the timeline per frame. */
+const MARQUEE_SCROLL_STEP = 18;
+
+/** A selection drag in progress: where it began, in the timeline's own coordinates, and where the pointer is. */
+interface MarqueeDrag {
+  pointerId: number;
+  startX: number;
+  /** Measured from the top of the scrolled content, so scrolling carries the box's far edge, not its start. */
+  startContentY: number;
+  x: number;
+  y: number;
+  frame: number | null;
+  /** Ends the drag and takes its listeners down. */
+  release?: () => void;
+}
+
+function sameIds(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  if (left.size !== right.size) return false;
+  for (const id of left) if (!right.has(id)) return false;
+  return true;
 }
 
 /**
- * A panel that opens beside the item that owns it.
- *
- * It measures itself once, where it was drawn, and moves only if it would leave
- * the window: to the other side of its item when the right edge is too close,
- * and upward by however much hangs below the bottom. Measuring again after
- * moving would let a flipped panel decide to flip back.
+ * A panel that opens beside the item that owns it: a panel of its own beside the menu
+ * (`MenuFlyout`), which moves to the other side of the menu, or up, rather than leave the
+ * window. The arrows move through it; Escape goes back a level through the menu's handler.
  */
 function ContextSubmenu({ label, scrollable = false, children }: {
   label: string;
-  /** Only a panel with nothing nested inside it may scroll; see the stylesheet. */
+  /** A long list scrolls; see the stylesheet. */
   scrollable?: boolean;
   children: ReactNode;
 }) {
-  const panelRef = useRef<HTMLDivElement>(null);
-  const [placement, setPlacement] = useState<{ flipped: boolean; shift: number }>({ flipped: false, shift: 0 });
-  useLayoutEffect(() => {
-    const panel = panelRef.current;
-    if (!panel) return;
-    // A window that reports no size — an unrendered preview — cannot say the
-    // panel has left it, and treating 0 as the edge throws it off screen.
-    if (!window.innerWidth || !window.innerHeight) return;
-    const box = panel.getBoundingClientRect();
-    const flipped = box.right > window.innerWidth - 8;
-    const shift = Math.min(0, window.innerHeight - 8 - box.bottom);
-    if (flipped || shift) setPlacement({ flipped, shift });
-  }, []);
-  useEffect(() => {
-    panelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
-  }, []);
   return (
-    <div
-      ref={panelRef}
+    <MenuFlyout
       role="menu"
       aria-label={label}
-      className={`context-menu__submenu${scrollable ? " context-menu__submenu--scroll" : ""}${placement.flipped ? " context-menu__submenu--flipped" : ""}`}
-      style={placement.shift ? { marginTop: placement.shift } : undefined}
+      className={`context-menu__submenu${scrollable ? " context-menu__submenu--scroll" : ""}`}
+      autoFocus
+      onKeyDown={(event) => {
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+        event.preventDefault();
+        event.stopPropagation();
+        // Its own rows, not a nested submenu's, which sits beside it and handles its own.
+        const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>(
+          ":scope > button:not(:disabled), :scope > .context-menu__branch > button:not(:disabled)"
+        ));
+        const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        buttons[(current + direction + buttons.length) % buttons.length]?.focus();
+      }}
     >
       {children}
-    </div>
+    </MenuFlyout>
   );
 }
 
@@ -834,10 +982,11 @@ function renderNodeContextIds(node: ContextRenderNode): string[] {
   return node.entries.map((entry) => entry.item.id);
 }
 
-export const ContextStream = memo(function ContextStream({ contexts, turns = [], changeSpans: changeSpansProp, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, runningTaskCount = 0, onOpenTasks, ariaLabel, pendingQuestionId, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onForkAt, forkDisabledReason = null, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
+export const ContextStream = memo(function ContextStream({ contexts, turns = [], changeSpans: changeSpansProp, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, runningTaskCount = 0, onOpenTasks, ariaLabel, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onDeleteContexts, onUndo, onRedo, onForkAt, forkDisabledReason = null, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
   const { t } = useI18n();
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const [menuSurfaces] = useState(createMenuSurfaces);
   const streamRef = useRef<HTMLDivElement>(null);
   const scrollPinnedRef = useRef(true);
   const scrollTopRef = useRef(0);
@@ -852,6 +1001,11 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     lastVisualLength: number;
   } | null>(null);
   const mutationReadOnly = readOnly || timelineMutationLocked;
+  const [selection, setSelection] = useState<ReadonlySet<string>>(NO_SELECTION);
+  /** The selection box as drawn: the drag's rectangle, clipped to the visible timeline. */
+  const [marquee, setMarquee] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const marqueeRef = useRef<MarqueeDrag | null>(null);
+  const selecting = Boolean(onDeleteContexts) && !mutationReadOnly;
 
   // This menu is fixed to the pointer and can reach past the chat column, where the built-in
   // browser's native page paints above every HTML layer. Registering it buys the same hole in
@@ -904,6 +1058,16 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     });
     return { nodesWithIds, nodeIndexByContextId };
   }, [renderNodes]);
+  /** An answered question is one card for two contexts, so picking the card picks both. */
+  const questionAnswerIds = useMemo(() => new Map(renderNodes.flatMap((node) => (
+    node.kind === "question" && node.answer ? [[node.entry.item.id, node.answer.item.id] as const] : []
+  ))), [renderNodes]);
+  /** The selection against the list as it is now: a context deleted from under it is no longer picked. */
+  const selectedIds = useMemo(() => {
+    if (!selection.size) return NO_SELECTION;
+    const live = new Set([...selection].filter((id) => contextIndexes.has(id)));
+    return live.size === selection.size ? selection : live;
+  }, [contextIndexes, selection]);
   /** The drawn node holding the newest of `ids`, which is where a span ends on screen. */
   const lastDrawnNodeOf = useCallback((ids: readonly string[]) => ids
     .flatMap((id) => {
@@ -1017,7 +1181,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     }
     return node.entries.map((entry) => entry.index);
   }).sort((left, right) => left - right), [renderNodes]);
-  const displayInsertionIndex = menu === null
+  const displayInsertionIndex = menu === null || menu.view.kind !== "insert"
     ? null
     : renderedContextIndexes.find((index) => index >= menu.index) ?? contexts.length;
   const editingContextId = !mutationReadOnly && editor?.mode === "edit" ? editor.item.id : null;
@@ -1056,7 +1220,8 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     // A long tool list scrolls inside the menu; only movement underneath it
     // means the anchor has left.
     const closeOnScroll = (event: Event) => {
-      if (event.target instanceof Node && menuRef.current?.contains(event.target)) return;
+      // A submenu is a panel of its own beside the menu, not inside it.
+      if (event.target instanceof Node && (menuRef.current?.contains(event.target) || menuSurfaces.contains(event.target))) return;
       setMenu(null);
     };
     window.addEventListener("pointerdown", close);
@@ -1067,7 +1232,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       window.removeEventListener("resize", close);
       window.removeEventListener("scroll", closeOnScroll, true);
     };
-  }, [menu, mutationReadOnly]);
+  }, [menu, menuSurfaces, mutationReadOnly]);
 
   // Which panel is on screen, so that opening a submenu does not pull focus back
   // to the row that opened it — the submenu takes focus from there itself.
@@ -1237,6 +1402,166 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     });
   }, [mutationReadOnly]);
 
+  /** The contexts whose cards or rows a rectangle in client coordinates touches. */
+  const idsInBox = (box: { left: number; top: number; right: number; bottom: number }): ReadonlySet<string> => {
+    const content = streamContentRef.current;
+    const ids = new Set<string>();
+    if (!content) return ids;
+    for (const element of content.querySelectorAll<HTMLElement>("[data-context-id]")) {
+      const id = element.dataset.contextId;
+      // A card still being placed has an id no context has yet.
+      if (!id || !contextIndexes.has(id)) continue;
+      const rect = element.getBoundingClientRect();
+      if (!rect.width && !rect.height) continue;
+      if (rect.right < box.left || rect.left > box.right || rect.bottom < box.top || rect.top > box.bottom) continue;
+      ids.add(id);
+      const answer = questionAnswerIds.get(id);
+      if (answer) ids.add(answer);
+    }
+    return ids;
+  };
+
+  /**
+   * Redraws the selection box from where the drag began to where the pointer is,
+   * and picks out what it touches. Held against the top or bottom edge, the drag
+   * scrolls the timeline on and keeps stepping each frame, so a box can reach
+   * past what was on screen when it began.
+   */
+  const stepMarquee = (final = false) => {
+    const drag = marqueeRef.current;
+    const scroller = streamRef.current;
+    if (!drag || !scroller) return;
+    drag.frame = null;
+    const bounds = scroller.getBoundingClientRect();
+    let scrolled = false;
+    if (!final) {
+      const step = drag.y < bounds.top + MARQUEE_SCROLL_EDGE
+        ? -Math.min(MARQUEE_SCROLL_STEP, bounds.top + MARQUEE_SCROLL_EDGE - drag.y)
+        : drag.y > bounds.bottom - MARQUEE_SCROLL_EDGE
+          ? Math.min(MARQUEE_SCROLL_STEP, drag.y - (bounds.bottom - MARQUEE_SCROLL_EDGE))
+          : 0;
+      if (step) {
+        const before = scroller.scrollTop;
+        scroller.scrollTop = before + step;
+        scrolled = scroller.scrollTop !== before;
+      }
+    }
+    const startY = drag.startContentY - scroller.scrollTop + bounds.top;
+    const box = {
+      left: Math.min(drag.startX, drag.x),
+      right: Math.max(drag.startX, drag.x),
+      top: Math.min(startY, drag.y),
+      bottom: Math.max(startY, drag.y)
+    };
+    const left = Math.max(box.left, bounds.left);
+    const top = Math.max(box.top, bounds.top);
+    setMarquee({
+      left,
+      top,
+      width: Math.max(0, Math.min(box.right, bounds.right) - left),
+      height: Math.max(0, Math.min(box.bottom, bounds.bottom) - top)
+    });
+    const picked = idsInBox(box);
+    setSelection((current) => (sameIds(current, picked) ? current : picked));
+    if (scrolled) drag.frame = window.requestAnimationFrame(() => stepMarqueeRef.current());
+  };
+  const stepMarqueeRef = useRef(stepMarquee);
+  stepMarqueeRef.current = stepMarquee;
+
+  /**
+   * Starts a selection box at a press with the selection modifier held. The
+   * press is the box's and nothing else's: it starts no text selection, no
+   * native drag, and the click it ends in reaches nothing underneath.
+   */
+  const beginMarquee = (event: React.PointerEvent<HTMLDivElement>) => {
+    const scroller = event.currentTarget;
+    const bounds = scroller.getBoundingClientRect();
+    // A press on the scrollbar is scrolling.
+    if (event.clientX - bounds.left - scroller.clientLeft >= scroller.clientWidth) return;
+    event.preventDefault();
+    marqueeRef.current?.release?.();
+    window.getSelection()?.removeAllRanges();
+    setMenu(null);
+    const drag: MarqueeDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startContentY: event.clientY - bounds.top + scroller.scrollTop,
+      x: event.clientX,
+      y: event.clientY,
+      frame: null
+    };
+    const schedule = () => {
+      if (drag.frame === null) drag.frame = window.requestAnimationFrame(() => stepMarqueeRef.current());
+    };
+    const move = (moved: PointerEvent) => {
+      if (moved.pointerId !== drag.pointerId) return;
+      drag.x = moved.clientX;
+      drag.y = moved.clientY;
+      schedule();
+    };
+    const finish = (ended: PointerEvent) => {
+      if (ended.pointerId !== drag.pointerId) return;
+      drag.x = ended.clientX;
+      drag.y = ended.clientY;
+      stepMarqueeRef.current(true);
+      drag.release?.();
+    };
+    const swallow = (swallowed: Event) => {
+      swallowed.preventDefault();
+      swallowed.stopPropagation();
+    };
+    const prevent = (prevented: Event) => prevented.preventDefault();
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", finish, true);
+    window.addEventListener("pointercancel", finish, true);
+    window.addEventListener("click", swallow, true);
+    window.addEventListener("selectstart", prevent, true);
+    window.addEventListener("dragstart", prevent, true);
+    drag.release = () => {
+      if (drag.frame !== null) window.cancelAnimationFrame(drag.frame);
+      drag.frame = null;
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", finish, true);
+      window.removeEventListener("pointercancel", finish, true);
+      window.removeEventListener("selectstart", prevent, true);
+      window.removeEventListener("dragstart", prevent, true);
+      // The click comes right after the release, in the same turn; nothing later is its.
+      window.setTimeout(() => window.removeEventListener("click", swallow, true), 0);
+      if (marqueeRef.current === drag) marqueeRef.current = null;
+      setMarquee(null);
+    };
+    marqueeRef.current = drag;
+    stepMarqueeRef.current(true);
+  };
+
+  useEffect(() => () => marqueeRef.current?.release?.(), []);
+
+  // A selection belongs to the timeline it was drawn on, and only lasts while it
+  // can still be acted on.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `timelineId` is the switch that ends the selection, though nothing here reads it.
+  useEffect(() => {
+    marqueeRef.current?.release?.();
+    setSelection(NO_SELECTION);
+  }, [timelineId]);
+  useEffect(() => {
+    if (selecting) return;
+    marqueeRef.current?.release?.();
+    setSelection(NO_SELECTION);
+  }, [selecting]);
+  useEffect(() => {
+    if (!selectedIds.size) setMenu((current) => (current?.view.kind === "selection" ? null : current));
+  }, [selectedIds]);
+
+  const openSelectionMenu = (event: React.MouseEvent) => {
+    setMenu({
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 150)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 60)),
+      index: 0,
+      trigger: event.target instanceof HTMLElement ? event.target : null,
+      view: { kind: "selection" }
+    });
+  };
+
   const renderTimelineNode = (node: ContextRenderNode): ReactNode => {
     if (node.kind === "block") {
       // A block draws several contexts as rows, so an insert index anywhere
@@ -1271,7 +1596,6 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     }
 
     if (node.kind === "question") {
-      if (node.entry.item.id === pendingQuestionId) return null;
       return (
         <div className="context-slot" key={node.key}>
           {insertEditorIndex === node.entry.index && insertEditor}
@@ -1354,23 +1678,58 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
   );
 
   return (
+    <TimelineSelectionContext.Provider value={selectedIds}>
     <div
       ref={streamRef}
       className="context-scroll"
       data-main-context-stream={!readOnly || undefined}
+      data-selecting={marquee ? "true" : undefined}
       role={ariaLabel ? "region" : undefined}
       aria-label={ariaLabel}
+      // Focus that lands on the timeline's own background — a click between
+      // cards — still has to be in the timeline for its undo keys to answer.
+      tabIndex={!readOnly && (onUndo || onRedo) ? -1 : undefined}
+      onPointerDownCapture={(event) => {
+        if (event.button !== 0) return;
+        if (selecting && timelineSelectionModifier(event) && !isEditableTarget(event.target)) {
+          beginMarquee(event);
+          return;
+        }
+        // A plain press anywhere but on the selection's own menu lets the selection go.
+        if (selection.size && !(event.target instanceof Node && menuRef.current?.contains(event.target))) {
+          setSelection(NO_SELECTION);
+        }
+      }}
+      onContextMenuCapture={selecting && selectedIds.size ? (event) => {
+        // With contexts picked out, a right-click anywhere is about them, not
+        // about inserting beside whatever is under the pointer.
+        event.preventDefault();
+        event.stopPropagation();
+        openSelectionMenu(event);
+      } : undefined}
       onWheel={(event) => {
         if (scrollPinnedRef.current && event.deltaY < 0 && upwardScrollMovesScroller(event.target, event.currentTarget)) {
           releaseBottom();
         }
       }}
       onKeyDown={(event) => {
+        if (event.defaultPrevented || isEditableTarget(event.target)) return;
+        const historyAction = readOnly ? null : timelineHistoryKey(event);
+        if (historyAction) {
+          const run = historyAction === "undo" ? onUndo : onRedo;
+          if (!run) return;
+          event.preventDefault();
+          run();
+          return;
+        }
+        if (event.key === "Escape" && selection.size && !menu) {
+          event.preventDefault();
+          setSelection(NO_SELECTION);
+          return;
+        }
         if (
           scrollPinnedRef.current
           && UPWARD_SCROLL_KEYS.has(event.key)
-          && !event.defaultPrevented
-          && !isEditableTarget(event.target)
           && upwardScrollMovesScroller(event.target, event.currentTarget)
         ) releaseBottom();
       }}
@@ -1441,157 +1800,201 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
         {!mutationReadOnly && displayInsertionIndex === contexts.length && renderNodes.length > 0 && <div className="insertion-line" />}
       </div>
 
-      {!mutationReadOnly && menu && (
+      {marquee && (
+        <div
+          className="timeline-marquee"
+          aria-hidden="true"
+          style={{ left: marquee.left, top: marquee.top, width: marquee.width, height: marquee.height }}
+        />
+      )}
+
+      {!mutationReadOnly && menu?.view.kind === "selection" && (
         <div
           ref={menuRef}
           className="context-menu"
           role="menu"
-          aria-label={t("添加上下文", "Add context")}
+          aria-label={t("所选消息", "Selected messages")}
           style={{ left: menu.x, top: menu.y }}
           onPointerDown={(event) => event.stopPropagation()}
           onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              event.preventDefault();
-              // One level at a time: a submenu opened by mistake is closed
-              // without losing the menu it was opened from.
-              const openTools = menu.view.kind === "insert" && menu.view.tools;
-              if (openTools) {
-                setMenu((current) => (current && current.view.kind === "insert"
-                  ? {
-                    ...current,
-                    view: openTools.category
-                      ? { kind: "insert", tools: { category: null } }
-                      : { kind: "insert" }
-                  }
-                  : current));
-                return;
-              }
-              const trigger = menu.trigger;
-              setMenu(null);
-              window.requestAnimationFrame(() => trigger?.focus());
-              return;
-            }
-            if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+            if (event.key !== "Escape") return;
             event.preventDefault();
-            const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
-            const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
-            const direction = event.key === "ArrowDown" ? 1 : -1;
-            buttons[(current + direction + buttons.length) % buttons.length]?.focus();
+            const trigger = menu.trigger;
+            setMenu(null);
+            window.requestAnimationFrame(() => trigger?.focus());
           }}
         >
-          {(Object.keys(contextMeta) as InsertableContextKind[]).map((kind) => {
-            const item = contextMeta[kind];
-            // A timeline with no way to commit a placed card does not offer
-            // to place one. Being unable to *execute* it is not that: a
-            // template has nothing to execute against and still holds calls.
-            if (kind === "tool" && !onSaveTool && !onSaveToolEdit) return null;
-            // A call is placed by naming the tool, which is one choice more
-            // than the other kinds need, so this row opens a list beside
-            // itself instead of acting.
-            if (kind !== "tool") {
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const ids = [...selectedIds].sort((left, right) => (
+                (contextIndexes.get(left) ?? 0) - (contextIndexes.get(right) ?? 0)
+              ));
+              setMenu(null);
+              setSelection(NO_SELECTION);
+              onDeleteContexts?.(ids);
+            }}
+          >
+            {t("删除", "Delete")}
+          </button>
+        </div>
+      )}
+
+      {!mutationReadOnly && menu?.view.kind === "insert" && (
+        <MenuSurfacesContext.Provider value={menuSurfaces}>
+          <div
+            ref={menuRef}
+            className="context-menu"
+            role="menu"
+            aria-label={t("添加上下文", "Add context")}
+            style={{ left: menu.x, top: menu.y }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                // One level at a time: a submenu opened by mistake is closed
+                // without losing the menu it was opened from.
+                const openTools = menu.view.kind === "insert" && menu.view.tools;
+                if (openTools) {
+                  setMenu((current) => (current && current.view.kind === "insert"
+                    ? {
+                      ...current,
+                      view: openTools.category
+                        ? { kind: "insert", tools: { category: null } }
+                        : { kind: "insert" }
+                    }
+                    : current));
+                  return;
+                }
+                const trigger = menu.trigger;
+                setMenu(null);
+                window.requestAnimationFrame(() => trigger?.focus());
+                return;
+              }
+              if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+              event.preventDefault();
+              const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+              const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+              const direction = event.key === "ArrowDown" ? 1 : -1;
+              buttons[(current + direction + buttons.length) % buttons.length]?.focus();
+            }}
+          >
+            {(Object.keys(contextMeta) as InsertableContextKind[]).map((kind) => {
+              const item = contextMeta[kind];
+              // A timeline with no way to commit a placed card does not offer
+              // to place one. Being unable to *execute* it is not that: a
+              // template has nothing to execute against and still holds calls.
+              if (kind === "tool" && !onSaveTool && !onSaveToolEdit) return null;
+              // A call is placed by naming the tool, which is one choice more
+              // than the other kinds need, so this row opens a list beside
+              // itself instead of acting.
+              if (kind !== "tool") {
+                return (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    key={kind}
+                    onClick={() => {
+                      onInsert?.(menu.index, kind);
+                      setMenu(null);
+                    }}
+                  >
+                    {item.label(t)}
+                  </button>
+                );
+              }
+              const openTools = menu.view.kind === "insert" ? menu.view.tools : undefined;
+              const disabled = insertableToolGroups.length === 0;
               return (
+                <div className="context-menu__branch" key={kind}>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={disabled}
+                    aria-haspopup="menu"
+                    aria-expanded={Boolean(openTools)}
+                    title={disabled ? t("当前对话没有启用工具", "No tools are enabled in this conversation") : undefined}
+                    onClick={() => setMenu((current) => (current && current.view.kind === "insert"
+                      ? {
+                        ...current,
+                        view: current.view.tools ? { kind: "insert" } : { kind: "insert", tools: { category: null } }
+                      }
+                      : current))}
+                  >
+                    {item.label(t)}
+                    <ChevronRight className="context-menu__more" size={12} aria-hidden="true" />
+                  </button>
+                  {openTools && (
+                    <ContextSubmenu label={t("工具调用", "Tool call")}>
+                      {insertableToolGroups.map((group) => {
+                        const label = groupLabel(group.category, t);
+                        const open = openTools.category === group.category;
+                        return (
+                          <div className="context-menu__branch" key={group.category}>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              aria-haspopup="menu"
+                              aria-expanded={open}
+                              onClick={() => setMenu((current) => (current && current.view.kind === "insert"
+                                ? {
+                                  ...current,
+                                  view: { kind: "insert", tools: { category: open ? null : group.category } }
+                                }
+                                : current))}
+                            >
+                              {label}
+                              <ChevronRight className="context-menu__more" size={12} aria-hidden="true" />
+                            </button>
+                            {open && (
+                              <ContextSubmenu label={label} scrollable>
+                                {group.tools.map((tool) => (
+                                  <button
+                                    type="button"
+                                    role="menuitem"
+                                    key={tool.name}
+                                    title={tool.name}
+                                    onClick={() => {
+                                      onInsert?.(menu.index, "tool", tool.name);
+                                      setMenu(null);
+                                    }}
+                                  >
+                                    {tool.label}
+                                  </button>
+                                ))}
+                              </ContextSubmenu>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </ContextSubmenu>
+                  )}
+                </div>
+              );
+            })}
+            {onForkAt && (
+              <>
+                <div className="context-menu__divider" role="separator" />
                 <button
                   type="button"
                   role="menuitem"
-                  key={kind}
+                  disabled={menu.index === 0 || Boolean(forkDisabledReason)}
+                  title={forkDisabledReason
+                    ?? (menu.index === 0 ? t("分割线上方没有可分叉的上下文", "There is nothing above the line to fork") : undefined)}
                   onClick={() => {
-                    onInsert?.(menu.index, kind);
+                    onForkAt(menu.index);
                     setMenu(null);
                   }}
                 >
-                  {item.label(t)}
+                  {t("分叉会话", "Fork conversation")}
                 </button>
-              );
-            }
-            const openTools = menu.view.kind === "insert" ? menu.view.tools : undefined;
-            const disabled = insertableToolGroups.length === 0;
-            return (
-              <div className="context-menu__branch" key={kind}>
-                <button
-                  type="button"
-                  role="menuitem"
-                  disabled={disabled}
-                  aria-haspopup="menu"
-                  aria-expanded={Boolean(openTools)}
-                  title={disabled ? t("当前对话没有启用工具", "No tools are enabled in this conversation") : undefined}
-                  onClick={() => setMenu((current) => (current && current.view.kind === "insert"
-                    ? {
-                      ...current,
-                      view: current.view.tools ? { kind: "insert" } : { kind: "insert", tools: { category: null } }
-                    }
-                    : current))}
-                >
-                  {item.label(t)}
-                  <ChevronRight className="context-menu__more" size={12} aria-hidden="true" />
-                </button>
-                {openTools && (
-                  <ContextSubmenu label={t("工具调用", "Tool call")}>
-                    {insertableToolGroups.map((group) => {
-                      const label = groupLabel(group.category, t);
-                      const open = openTools.category === group.category;
-                      return (
-                        <div className="context-menu__branch" key={group.category}>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            aria-haspopup="menu"
-                            aria-expanded={open}
-                            onClick={() => setMenu((current) => (current && current.view.kind === "insert"
-                              ? {
-                                ...current,
-                                view: { kind: "insert", tools: { category: open ? null : group.category } }
-                              }
-                              : current))}
-                          >
-                            {label}
-                            <ChevronRight className="context-menu__more" size={12} aria-hidden="true" />
-                          </button>
-                          {open && (
-                            <ContextSubmenu label={label} scrollable>
-                              {group.tools.map((tool) => (
-                                <button
-                                  type="button"
-                                  role="menuitem"
-                                  key={tool.name}
-                                  title={tool.name}
-                                  onClick={() => {
-                                    onInsert?.(menu.index, "tool", tool.name);
-                                    setMenu(null);
-                                  }}
-                                >
-                                  {tool.label}
-                                </button>
-                              ))}
-                            </ContextSubmenu>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </ContextSubmenu>
-                )}
-              </div>
-            );
-          })}
-          {onForkAt && (
-            <>
-              <div className="context-menu__divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                disabled={menu.index === 0 || Boolean(forkDisabledReason)}
-                title={forkDisabledReason
-                  ?? (menu.index === 0 ? t("分割线上方没有可分叉的上下文", "There is nothing above the line to fork") : undefined)}
-                onClick={() => {
-                  onForkAt(menu.index);
-                  setMenu(null);
-                }}
-              >
-                {t("分叉会话", "Fork conversation")}
-              </button>
-            </>
-          )}
-        </div>
+              </>
+            )}
+          </div>
+        </MenuSurfacesContext.Provider>
       )}
     </div>
+    </TimelineSelectionContext.Provider>
   );
 });

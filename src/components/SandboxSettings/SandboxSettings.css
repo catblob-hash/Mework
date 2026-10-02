@@ -1,9 +1,3 @@
-.sandbox-settings-page {
-  width: 100%;
-  max-width: 860px;
-  margin: 0 auto;
-}
-
 .sandbox-settings-page .settings-card:first-of-type { margin-top: 0; }
 
 .sandbox-settings-page__row {

@@ -34,6 +34,28 @@ vi.mock("./components/TerminalPanel", async () => (await import("./test/appMockI
 
 afterEach(() => configureI18n("zh-CN"));
 
+/** Past the 100 images, 5 MiB, one request was once allowed. */
+const PAST_THE_OLD_REQUEST_BUDGET = 120;
+
+/**
+ * `total` one-pixel images of history, twenty to a user message. The first
+ * message says `label`.
+ */
+function imageHistory(prefix: string, total: number, label: string): UserContext[] {
+  const messages: UserContext[] = [];
+  for (let start = 0; start < total; start += 20) {
+    const index = messages.length;
+    messages.push({
+      id: `${prefix}-${index}`,
+      kind: "user",
+      content: index === 0 ? label : `${label} ${index + 1}`,
+      images: budgetImages(`${prefix}-${index}`, Math.min(20, total - start)),
+      createdAt: `2026-07-24T00:00:${String(index).padStart(2, "0")}Z`
+    });
+  }
+  return messages;
+}
+
 describe("App model run flow — images", () => {
   beforeEach(resetAppMocks);
 
@@ -336,7 +358,11 @@ describe("App model run flow — images", () => {
       (saved as AppDocument).workspaces[0].conversations[0].contexts.length === 0
     ))).toBe(true));
 
-    await user.click(screen.getByRole("button", { name: "撤销删除上下文" }));
+    // The deleted card took the focused button with it; focus is back in the timeline,
+    // where the undo keys answer.
+    const timeline = window.document.querySelector<HTMLElement>(".conversation-pane__main .context-scroll");
+    await waitFor(() => expect(timeline).toHaveFocus());
+    await user.keyboard("{Control>}z{/Control}");
 
     expect(await screen.findByRole("img", { name: image.name })).toBeInTheDocument();
     await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some(([saved]) => {
@@ -406,7 +432,7 @@ describe("App model run flow — images", () => {
     expect(composer).toHaveValue("继续");
   });
 
-  it("caps one composer message before excess image bytes are uploaded", async () => {
+  it("takes more than twenty images into one composer message", async () => {
     const document = documentWithModel();
     document.globalSettings.apiProviders[0].models[0] = {
       ...document.globalSettings.apiProviders[0].models[0],
@@ -437,32 +463,59 @@ describe("App model run flow — images", () => {
 
     await user.upload(fileInput, files);
 
-    // Silently discard the 21st image before upload; the composer renders at most 20 thumbnails.
-    await waitFor(() => expect(runtimeMocks.prepareImageAttachment).toHaveBeenCalledTimes(20));
-    expect(await screen.findByRole("list", { name: "20 张图片" })).toBeInTheDocument();
-    expect(runtimeMocks.prepareImageAttachment).toHaveBeenCalledTimes(20);
+    // No count is budgeted: all 21 go up.
+    expect(await screen.findByRole("list", { name: "21 张图片" })).toBeInTheDocument();
+    expect(runtimeMocks.prepareImageAttachment).toHaveBeenCalledTimes(21);
   });
 
-  it("rejects an added image against the full visible history before writing the timeline", async () => {
+  it("turns away, and names, an image that would put one message past 32 MiB", async () => {
     const document = documentWithModel();
     document.globalSettings.apiProviders[0].models[0] = {
       ...document.globalSettings.apiProviders[0].models[0],
       capabilities: ["image_recognition"]
     };
-    document.workspaces[0].conversations[0].contexts = [{
-      id: "twenty-history-images",
-      kind: "user",
-      content: "历史图片",
-      images: Array.from({ length: 20 }, (_, index) => ({
-        id: `history-image-${index}`,
-        name: `history-${index}.png`,
-        mime: "image/png",
-        width: 1,
-        height: 1,
-        bytes: 1
-      })),
-      createdAt: "2026-07-24T00:00:00Z"
-    }];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.prepareImageAttachment.mockImplementation(async (name: string) => ({
+      id: `image-${name}`,
+      name,
+      mime: "image/png",
+      width: 1,
+      height: 1,
+      bytes: 1
+    }));
+
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const files = ["first.png", "second.png"].map((name, index) => {
+      const file = new File([new Uint8Array([index])], name, { type: "image/png" });
+      Object.defineProperty(file, "size", { value: 20 * 1024 * 1024 });
+      Object.defineProperty(file, "arrayBuffer", {
+        configurable: true,
+        value: async () => new Uint8Array([index]).buffer
+      });
+      return file;
+    });
+
+    await user.upload(fileInput, files);
+
+    const notice = await screen.findByRole("alert");
+    expect(notice).toHaveTextContent("1 项没有添加");
+    expect(notice).toHaveTextContent("second.png");
+    expect(notice).toHaveTextContent("一条消息的附件合计不能超过 32 MB");
+    expect(await screen.findByRole("img", { name: "first.png" })).toBeInTheDocument();
+    expect(runtimeMocks.prepareImageAttachment).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends an added image however many images the history already holds", async () => {
+    const document = documentWithModel();
+    document.globalSettings.apiProviders[0].models[0] = {
+      ...document.globalSettings.apiProviders[0].models[0],
+      capabilities: ["image_recognition"]
+    };
+    const history = imageHistory("history-image", PAST_THE_OLD_REQUEST_BUDGET, "历史图片");
+    document.workspaces[0].conversations[0].contexts = history;
     runtimeMocks.loadDocument.mockResolvedValue(document);
     runtimeMocks.prepareImageAttachment.mockResolvedValue({
       id: "extra-image",
@@ -490,94 +543,14 @@ describe("App model run flow — images", () => {
 
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    // A silent budget rejection sends no request, preserves the draft image, and leaves the timeline unchanged.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
-    expect(screen.getByRole("img", { name: "extra.png" })).toBeInTheDocument();
-    expect(runtimeMocks.saveDocument.mock.calls.every(([saved]) => (
-      (saved as AppDocument).workspaces[0].conversations[0].contexts.length === 1
-    ))).toBe(true);
-  });
-
-  it("rejects a pure-text send when several valid history items exceed the request image budget", async () => {
-    const document = documentWithModel();
-    document.globalSettings.apiProviders[0].models[0] = {
-      ...document.globalSettings.apiProviders[0].models[0],
-      capabilities: ["image_recognition"]
-    };
-    document.workspaces[0].conversations[0].contexts = [
-      {
-        id: "history-budget-a",
-        kind: "user",
-        content: "第一批图片",
-        images: budgetImages("history-a", 11),
-        createdAt: "2026-07-24T00:00:00Z"
-      },
-      {
-        id: "history-budget-b",
-        kind: "user",
-        content: "第二批图片",
-        images: budgetImages("history-b", 11),
-        createdAt: "2026-07-24T00:00:01Z"
-      }
-    ];
-    runtimeMocks.loadDocument.mockResolvedValue(document);
-
-    const user = userEvent.setup();
-    render(<App />);
-    const composer = await screen.findByLabelText("向 Agent 发送消息");
-    await user.type(composer, "只补充文字");
-    await user.click(screen.getByRole("button", { name: "发送" }));
-
-    // A silent budget rejection sends no request and preserves the draft.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
-    expect(composer).toHaveValue("只补充文字");
-  });
-
-  it("keeps a pure-text queue head when valid history items exceed the request image budget", async () => {
-    const document = documentWithModel();
-    document.globalSettings.apiProviders[0].models[0] = {
-      ...document.globalSettings.apiProviders[0].models[0],
-      capabilities: ["image_recognition"]
-    };
-    document.workspaces[0].conversations[0].contexts = [
-      {
-        id: "queued-history-budget-a",
-        kind: "user",
-        content: "第一批图片",
-        images: budgetImages("queued-history-a", 11),
-        createdAt: "2026-07-24T00:00:00Z"
-      },
-      {
-        id: "queued-history-budget-b",
-        kind: "user",
-        content: "第二批图片",
-        images: budgetImages("queued-history-b", 11),
-        createdAt: "2026-07-24T00:00:01Z"
-      }
-    ];
-    document.workspaces[0].conversations[0].queuedMessages = [{
-      id: "pure-text-over-budget-head",
-      content: "排队的纯文本",
-      createdAt: "2026-07-24T00:00:02Z"
-    }];
-    runtimeMocks.loadDocument.mockResolvedValue(document);
-
-    render(<App />);
-
-    // A budget-blocked automatic dispatch preserves its queue head and sends no request.
-    const queue = await screen.findByRole("region", { name: "排队消息" });
-    expect(within(queue).getByText("排队的纯文本")).toBeInTheDocument();
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
-    expect(within(queue).getByText("排队的纯文本")).toBeInTheDocument();
+    // No request budget holds the send back: the whole history and the new
+    // image go to the model.
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
+    const request = runtimeMocks.runModel.mock.calls[0][0] as { contexts: UserContext[] };
+    const images = request.contexts.flatMap((context) => context.images ?? []);
+    expect(images).toHaveLength(PAST_THE_OLD_REQUEST_BUDGET + 1);
+    expect(images.at(-1)).toMatchObject({ id: "extra-image" });
+    expect(screen.queryByText("消息没有发送")).not.toBeInTheDocument();
   });
 
   it("branches from an image-heavy message without assembling a request", async () => {
@@ -614,26 +587,13 @@ describe("App model run flow — images", () => {
     expect(runtimeMocks.runModel).not.toHaveBeenCalled();
   });
 
-  it("allows text at the image limit but rejects an image steer against the running context", async () => {
+  it("steers an image into a run however many images its context holds", async () => {
     const document = documentWithModel();
     document.globalSettings.apiProviders[0].models[0] = {
       ...document.globalSettings.apiProviders[0].models[0],
       capabilities: ["image_recognition"]
     };
-    document.workspaces[0].conversations[0].contexts = [{
-      id: "steer-budget-history",
-      kind: "user",
-      content: "",
-      images: Array.from({ length: 20 }, (_, index) => ({
-        id: `steer-history-${index}`,
-        name: `history-${index}.png`,
-        mime: "image/png",
-        width: 1,
-        height: 1,
-        bytes: 1
-      })),
-      createdAt: "2026-07-24T00:00:00Z"
-    }];
+    document.workspaces[0].conversations[0].contexts = imageHistory("steer-budget-history", PAST_THE_OLD_REQUEST_BUDGET, "");
     runtimeMocks.loadDocument.mockResolvedValue(document);
     runtimeMocks.prepareImageAttachment.mockResolvedValue({
       id: "steer-extra",
@@ -648,7 +608,7 @@ describe("App model run flow — images", () => {
     const user = userEvent.setup();
     render(<App />);
     const composer = await screen.findByLabelText("向 Agent 发送消息");
-    await user.type(composer, "纯文本仍可发送");
+    await user.type(composer, "先开始这一回合");
     await user.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
 
@@ -669,12 +629,11 @@ describe("App model run flow — images", () => {
       name: "将“[Image #1] · steer.png”引导到当前回合"
     }));
 
-    // A budget-blocked steer does not send input or remove the queued message.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    // No request budget holds the steer back.
+    await waitFor(() => expect(runtimeMocks.steerModelRun).toHaveBeenCalledTimes(1));
+    expect(runtimeMocks.steerModelRun.mock.calls[0][1]).toMatchObject({
+      images: [expect.objectContaining({ id: "steer-extra" })]
     });
-    expect(runtimeMocks.steerModelRun).not.toHaveBeenCalled();
-    expect(within(queue).getByText("1 张图片")).toBeInTheDocument();
   });
 
   it("serializes rapid image additions without dropping a later batch", async () => {
@@ -1165,29 +1124,15 @@ describe("App model run flow — images", () => {
     ))).toBe(true);
   });
 
-  it("keeps an over-budget image queue head intact before automatic dispatch", async () => {
+  it("dispatches an image queue head however many images the history holds", async () => {
     const document = documentWithModel();
     document.globalSettings.apiProviders[0].models[0] = {
       ...document.globalSettings.apiProviders[0].models[0],
       capabilities: ["image_recognition"]
     };
-    const historicalImages = Array.from({ length: 20 }, (_, index) => ({
-      id: `queued-history-${index}`,
-      name: `history-${index}.png`,
-      mime: "image/png",
-      width: 1,
-      height: 1,
-      bytes: 1
-    }));
-    document.workspaces[0].conversations[0].contexts = [{
-      id: "queued-budget-history",
-      kind: "user",
-      content: "",
-      images: historicalImages,
-      createdAt: "2026-07-24T00:00:00Z"
-    }];
+    document.workspaces[0].conversations[0].contexts = imageHistory("queued-budget-history", PAST_THE_OLD_REQUEST_BUDGET, "");
     document.workspaces[0].conversations[0].queuedMessages = [{
-      id: "over-budget-head",
+      id: "past-budget-head",
       content: "",
       images: [{
         id: "queued-extra",
@@ -1200,21 +1145,17 @@ describe("App model run flow — images", () => {
       createdAt: "2026-07-24T00:00:01Z"
     }];
     runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.runModel.mockImplementation(() => new Promise(() => undefined));
 
     render(<App />);
 
-    const queue = await screen.findByRole("region", { name: "排队消息" });
-    expect(within(queue).getByText("1 张图片")).toBeInTheDocument();
-    // A budget-blocked queue head is neither promoted nor discarded.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    // No request budget holds the queue head back: it is dispatched.
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
+    const request = runtimeMocks.runModel.mock.calls[0][0] as { contexts: UserContext[] };
+    expect(request.contexts.at(-1)).toMatchObject({
+      id: "past-budget-head",
+      images: [expect.objectContaining({ id: "queued-extra" })]
     });
-    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
-    expect(runtimeMocks.saveDocument.mock.calls.every(([saved]) => (
-      (saved as AppDocument).workspaces[0].conversations[0].queuedMessages.some(
-        (message) => message.id === "over-budget-head"
-      )
-    ))).toBe(true);
   });
 
   it("keeps new messages behind a blocked queue head and lets that head be deleted", async () => {

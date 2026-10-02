@@ -33,7 +33,8 @@ export function planStatusLabel(
 ): string {
   if (awaitingApproval) return t("待批准", "Awaiting approval");
   if (plan?.status === "approved") return t("已批准", "Approved");
-  if (plan?.status === "rejected") return t("已退回", "Sent back");
+  // "Rejected" is the stored word for a plan the user sent feedback on.
+  if (plan?.status === "rejected") return t("待修改", "Changes requested");
   return t("撰写中", "Drafting");
 }
 

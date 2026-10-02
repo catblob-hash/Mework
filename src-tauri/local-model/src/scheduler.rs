@@ -2,39 +2,64 @@
 //!
 //! Requests wait in a bounded queue and are admitted into free slots; all
 //! live slots then advance together, one token per step, so concurrent
-//! requests share each pass over the weights. Identical requests that are
-//! waiting or running are merged into one. When nothing is live the
+//! requests share each pass over the weights; how many run at once is the
+//! backend's slot count, which bounds the batch. Identical requests that are
+//! waiting or running are merged into one. Requests come in two lanes: the
+//! background (a subagent's) waits behind the foreground (the conversation
+//! itself) and gives way when the queue is full. When nothing is live the
 //! per-sequence buffers are dropped right away, and the weights after an idle
 //! period or when the system reports memory pressure; the next request loads
 //! them again.
+//!
+//! The thread publishes its status as it changes, so reading it never waits
+//! behind a load (which on the Neural Engine can take minutes) or a request.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::engine::{greedy, Backend, Capacity, Specials};
+use crate::engine::{greedy, Backend, Capacity, Segment, Specials};
 use crate::prefix_cache::PrefixCache;
 
 pub type Loader = Box<dyn FnMut() -> Result<Box<dyn Backend>, String> + Send>;
 pub type Reply<T> = Box<dyn FnOnce(Result<T, String>) + Send>;
+/// Told, on the scheduler thread, when the model starts or stops loading,
+/// loads, unloads or fails.
+pub type Observer = Arc<dyn Fn(&Status) + Send + Sync>;
 /// Called with the tokens generated so far; true ends the sequence.
 pub type StopWhen = Arc<dyn Fn(&[u32]) -> bool + Send + Sync>;
 
 pub const BUSY: &str = "本地模型繁忙，请稍后再试";
 
+/// Whom a request serves. The conversation in front of the user goes first;
+/// what its subagents ask for waits behind it, and is what a full queue
+/// refuses to make room.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Lane {
+    #[default]
+    Foreground,
+    Background,
+}
+
 pub struct Generate {
     /// The system prompt's tokens; its state comes from the prefix cache.
     pub prefix: Arc<Vec<u32>>,
-    pub tokens: Vec<u32>,
+    pub input: Arc<Vec<Segment>>,
+    /// Sequence positions `input` takes (`Segment::len`).
+    pub positions: usize,
+    /// Identifies the request: equal keys (and prefixes) are merged.
+    pub key: String,
     pub max_new: usize,
     pub stop_when: StopWhen,
+    pub lane: Lane,
     pub reply: Reply<Vec<u32>>,
 }
 
 pub struct Limits {
-    /// Requests waiting beyond this are refused.
+    /// Requests waiting beyond this are refused (a background one in a
+    /// foreground request's place).
     pub queue: usize,
     /// Unload the weights after this long with nothing to do.
     pub unload_after: Duration,
@@ -50,6 +75,9 @@ impl Default for Limits {
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub loaded: bool,
+    /// The weights are being loaded (on the Neural Engine, compiled first
+    /// when the system has no compiled copy for this app).
+    pub loading: bool,
     pub device: Option<String>,
     pub slots: usize,
     pub context: usize,
@@ -70,25 +98,38 @@ enum Message {
     Prefix { tokens: Vec<u32>, reply: Reply<PrefixSummary> },
     /// Delete cached prefix states other than these prompts'.
     Prune { keep: Vec<Vec<u32>> },
-    Status(Reply<Status>),
     /// Drop the weights as soon as nothing is running (memory pressure).
     Unload,
     Shutdown,
 }
 
+/// What the scheduler thread publishes for everyone else to read.
+#[derive(Default)]
+struct Shared {
+    status: Mutex<Status>,
+    observer: Mutex<Option<Observer>>,
+}
+
 pub struct Scheduler {
     sender: Sender<Message>,
+    shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Scheduler {
     pub fn start(loader: Loader, specials: Specials, limits: Limits, cache_dir: std::path::PathBuf) -> Self {
         let (sender, receiver) = channel();
+        let shared = Arc::new(Shared::default());
+        let worker_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("mework-local-model".into())
-            .spawn(move || Worker::new(loader, specials, limits, PrefixCache::new(cache_dir), receiver).run())
+            .spawn(move || {
+                Worker::new(loader, specials, limits, PrefixCache::new(cache_dir), receiver)
+                    .with_shared(worker_shared)
+                    .run()
+            })
             .expect("spawn local model thread");
-        Self { sender, thread: Some(thread) }
+        Self { sender, shared, thread: Some(thread) }
     }
 
     pub fn generate(&self, job: Generate) {
@@ -108,12 +149,15 @@ impl Scheduler {
         }
     }
 
-    pub fn status(&self, reply: Reply<Status>) {
-        if let Err(error) = self.sender.send(Message::Status(reply)) {
-            if let Message::Status(reply) = error.0 {
-                reply(Err("本地模型已停止".into()));
-            }
-        }
+    /// The status as the scheduler thread last published it; never waits.
+    pub fn status(&self) -> Status {
+        self.shared.status.lock().expect("local model status").clone()
+    }
+
+    /// Calls `observer` whenever the model starts or stops loading, loads,
+    /// unloads or records an error.
+    pub fn observe(&self, observer: Observer) {
+        *self.shared.observer.lock().expect("local model observer") = Some(observer);
     }
 
     pub fn unload(&self) {
@@ -136,15 +180,18 @@ impl Drop for Scheduler {
 
 struct Pending {
     prefix: Arc<Vec<u32>>,
-    tokens: Vec<u32>,
+    input: Arc<Vec<Segment>>,
+    positions: usize,
+    key: String,
     max_new: usize,
     stop_when: StopWhen,
+    lane: Lane,
     replies: Vec<Reply<Vec<u32>>>,
 }
 
 impl Pending {
     fn same_request(&self, job: &Generate) -> bool {
-        self.prefix == job.prefix && self.tokens == job.tokens && self.max_new == job.max_new
+        self.key == job.key && self.prefix == job.prefix && self.max_new == job.max_new
     }
 
     fn finish(self, result: Result<Vec<u32>, String>) {
@@ -173,6 +220,8 @@ struct Worker {
     trimmed: bool,
     unload_requested: bool,
     last_error: Option<String>,
+    loading: bool,
+    shared: Arc<Shared>,
 }
 
 impl Worker {
@@ -191,6 +240,47 @@ impl Worker {
             trimmed: true,
             unload_requested: false,
             last_error: None,
+            loading: false,
+            shared: Arc::default(),
+        }
+    }
+
+    fn with_shared(mut self, shared: Arc<Shared>) -> Self {
+        self.shared = shared;
+        self
+    }
+
+    fn snapshot(&self) -> Status {
+        Status {
+            loaded: self.backend.is_some(),
+            loading: self.loading,
+            device: self.backend.as_ref().map(|backend| backend.device()),
+            slots: self.capacity.slots,
+            context: self.capacity.context,
+            running: self.running(),
+            queued: self.queue.len(),
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    /// Publishes the status; tells the observer when more than the request
+    /// counts changed.
+    fn publish(&self) {
+        let status = self.snapshot();
+        let notable = {
+            let mut shared = self.shared.status.lock().expect("local model status");
+            let notable = shared.loaded != status.loaded
+                || shared.loading != status.loading
+                || shared.device != status.device
+                || shared.last_error != status.last_error;
+            *shared = status.clone();
+            notable
+        };
+        if notable {
+            let observer = self.shared.observer.lock().expect("local model observer").clone();
+            if let Some(observer) = observer {
+                observer(&status);
+            }
         }
     }
 
@@ -200,6 +290,7 @@ impl Worker {
 
     fn run(mut self) {
         loop {
+            self.publish();
             let busy = self.running() > 0 || !self.queue.is_empty();
             let message = if busy {
                 match self.receiver.try_recv() {
@@ -263,15 +354,6 @@ impl Worker {
                     self.cache.prune(&format, &keep);
                 }
             }
-            Message::Status(reply) => reply(Ok(Status {
-                loaded: self.backend.is_some(),
-                device: self.backend.as_ref().map(|backend| backend.device()),
-                slots: self.capacity.slots,
-                context: self.capacity.context,
-                running: self.running(),
-                queued: self.queue.len(),
-                last_error: self.last_error.clone(),
-            })),
             Message::Unload => {
                 self.unload_requested = true;
                 if self.running() == 0 && self.queue.is_empty() {
@@ -291,27 +373,55 @@ impl Worker {
         }
         if let Some(pending) = self.queue.iter_mut().find(|pending| pending.same_request(&job)) {
             pending.replies.push(job.reply);
+            // Someone in front is waiting on it now.
+            if job.lane == Lane::Foreground {
+                pending.lane = Lane::Foreground;
+            }
             return;
         }
         if self.queue.len() >= self.limits.queue {
-            (job.reply)(Err(BUSY.into()));
-            return;
+            // The newest background request gives its place to the foreground.
+            let evicted = match job.lane {
+                Lane::Foreground => self.queue.iter().rposition(|pending| pending.lane == Lane::Background),
+                Lane::Background => None,
+            };
+            match evicted.and_then(|index| self.queue.remove(index)) {
+                Some(pending) => pending.finish(Err(BUSY.into())),
+                None => {
+                    (job.reply)(Err(BUSY.into()));
+                    return;
+                }
+            }
         }
         self.queue.push_back(Pending {
             prefix: job.prefix,
-            tokens: job.tokens,
+            input: job.input,
+            positions: job.positions,
+            key: job.key,
             max_new: job.max_new,
             stop_when: job.stop_when,
+            lane: job.lane,
             replies: vec![job.reply],
         });
     }
 
+    /// The waiting request to admit next: the oldest in the foreground, else
+    /// the oldest.
+    fn next_waiting(&self) -> usize {
+        self.queue.iter().position(|pending| pending.lane == Lane::Foreground).unwrap_or(0)
+    }
+
     fn ensure_backend(&mut self) -> Result<&mut Box<dyn Backend>, String> {
         if self.backend.is_none() {
-            let backend = (self.loader)()?;
+            self.loading = true;
+            self.publish();
+            let loaded = (self.loader)();
+            self.loading = false;
+            let backend = loaded?;
             self.capacity = backend.capacity();
             self.slots = (0..self.capacity.slots).map(|_| None).collect();
             self.backend = Some(backend);
+            self.publish();
         }
         Ok(self.backend.as_mut().expect("backend"))
     }
@@ -336,9 +446,9 @@ impl Worker {
             return self.fail_all(error);
         }
         let Some(slot) = self.slots.iter().position(Option::is_none) else { return };
-        let request = self.queue.pop_front().expect("queued");
+        let request = self.queue.remove(self.next_waiting()).expect("queued");
         let capacity = self.capacity;
-        if request.prefix.len() + request.tokens.len() + request.max_new > capacity.context || request.tokens.is_empty() {
+        if request.prefix.len() + request.positions + request.max_new > capacity.context || request.positions == 0 {
             return request.finish(Err("请求超出本地模型上下文".into()));
         }
         self.trimmed = false;
@@ -350,7 +460,7 @@ impl Worker {
                 return request.finish(Err(error));
             }
         };
-        match backend.admit(slot, &prefix, &request.tokens) {
+        match backend.admit(slot, &prefix, &request.input) {
             Ok(logits) => {
                 let token = greedy(&logits, &self.specials);
                 self.slots[slot] = Some(Live { request, output: Vec::new() });
@@ -437,6 +547,7 @@ impl Worker {
     fn shutdown(mut self) {
         self.fail_all("本地模型已停止".into());
         self.backend = None;
+        self.publish();
     }
 }
 
@@ -473,8 +584,8 @@ mod tests {
         fn prefix_state(&mut self, tokens: &[u32]) -> Result<PrefixState, String> {
             Ok(PrefixState { tokens: tokens.len(), format: "fake".into(), bytes: Vec::new().into() })
         }
-        fn admit(&mut self, slot: usize, prefix: &PrefixState, tokens: &[u32]) -> Result<Logits, String> {
-            self.lens[slot] = prefix.tokens + tokens.len();
+        fn admit(&mut self, slot: usize, prefix: &PrefixState, input: &[Segment]) -> Result<Logits, String> {
+            self.lens[slot] = prefix.tokens + input.iter().map(|segment| segment.len(32)).sum::<usize>();
             Ok(logits_for(100 + self.lens[slot] as u32))
         }
         fn step(&mut self, batch: &[(usize, u32)]) -> Result<Vec<Logits>, String> {
@@ -514,9 +625,12 @@ mod tests {
             let tx = tx.clone();
             scheduler.generate(Generate {
                 prefix: prefix.clone(),
-                tokens,
+                positions: tokens.len(),
+                key: format!("{tokens:?}"),
+                input: Arc::new(vec![Segment::Tokens(tokens)]),
                 max_new: 10,
                 stop_when: never.clone(),
+                lane: Lane::Foreground,
                 reply: Box::new(move |result| tx.send(result).unwrap()),
             });
         }
@@ -527,11 +641,42 @@ mod tests {
         assert_eq!(results[1], vec![104, 105, 106, 107]);
         assert_eq!(results[2], vec![104, 105, 106, 107]); // merged duplicate
         assert!(steps.lock().unwrap().iter().any(|n| *n == 2), "two requests shared steps");
+        // The thread publishes once it has gone idle.
+        let started = Instant::now();
+        while scheduler.status().running != 0 || trims.load(Ordering::SeqCst) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(5), "never went idle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let status = scheduler.status();
+        assert!(status.loaded && !status.loading);
+        assert_eq!(status.device.as_deref(), Some("fake"));
+    }
+
+    #[test]
+    fn status_never_waits_for_a_load() {
+        let (release, gate) = channel::<()>();
+        let loader: Loader = Box::new(move || {
+            gate.recv().unwrap();
+            Ok(Box::new(Fake { lens: vec![0; 2], steps: Arc::default(), trims: Arc::default() }) as Box<dyn Backend>)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::start(loader, specials(), Limits::default(), dir.path().to_path_buf());
+        let (seen, observed) = channel();
+        scheduler.observe(Arc::new(move |status: &Status| {
+            let _ = seen.send((status.loading, status.loaded));
+        }));
         let (tx, rx) = channel();
-        scheduler.status(Box::new(move |status| tx.send(status).unwrap()));
-        let status = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        assert_eq!(status.running, 0);
-        assert!(trims.load(Ordering::SeqCst) >= 1, "idle backend trimmed");
+        scheduler.prefix(vec![9, 9], Box::new(move |result| tx.send(result.is_ok()).unwrap()));
+        // The loader is stuck; the status says so at once.
+        assert_eq!(observed.recv_timeout(Duration::from_secs(5)).unwrap(), (true, false));
+        let started = Instant::now();
+        let status = scheduler.status();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(status.loading && !status.loaded);
+        release.send(()).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(observed.recv_timeout(Duration::from_secs(5)).unwrap(), (false, true));
+        assert!(scheduler.status().loaded);
     }
 
     #[test]
@@ -545,11 +690,68 @@ mod tests {
         let (tx, rx) = channel();
         scheduler.generate(Generate {
             prefix,
-            tokens: vec![1, 2, 3],
+            input: Arc::new(vec![Segment::Tokens(vec![1, 2, 3])]),
+            positions: 3,
+            key: "k".into(),
             max_new: 15,
             stop_when: Arc::new(|_| false),
+            lane: Lane::Foreground,
             reply: Box::new(move |result| tx.send(result).unwrap()),
         });
         assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+    }
+
+    fn job(key: &str, lane: Lane, replies: &std::sync::mpsc::Sender<(String, bool)>) -> Generate {
+        let (key, tx) = (key.to_string(), replies.clone());
+        Generate {
+            prefix: Arc::new(vec![9]),
+            input: Arc::new(vec![Segment::Tokens(vec![1])]),
+            positions: 1,
+            key: key.clone(),
+            max_new: 4,
+            stop_when: Arc::new(|_| false),
+            lane,
+            reply: Box::new(move |result| tx.send((key, result.is_ok())).unwrap()),
+        }
+    }
+
+    #[test]
+    fn the_foreground_goes_first_and_the_background_gives_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sender, receiver) = channel();
+        let loader: Loader = Box::new(|| Err("unused".into()));
+        let limits = Limits { queue: 3, ..Limits::default() };
+        let mut worker = Worker::new(loader, specials(), limits, PrefixCache::new(dir.path().to_path_buf()), receiver);
+        let (tx, rx) = channel();
+        worker.enqueue(job("a", Lane::Background, &tx));
+        worker.enqueue(job("b", Lane::Background, &tx));
+        worker.enqueue(job("c", Lane::Foreground, &tx));
+        // Admitted before both subagent requests that came earlier.
+        assert_eq!(worker.queue[worker.next_waiting()].key, "c");
+        // A full queue: the foreground takes the newest background request's place.
+        worker.enqueue(job("d", Lane::Foreground, &tx));
+        assert_eq!(rx.try_recv().unwrap(), ("b".to_string(), false));
+        let keys: Vec<&str> = worker.queue.iter().map(|pending| pending.key.as_str()).collect();
+        assert_eq!(keys, ["a", "c", "d"]);
+        // A background request finds no room; the foreground is refused only once no background is left.
+        worker.enqueue(job("e", Lane::Background, &tx));
+        assert_eq!(rx.try_recv().unwrap(), ("e".to_string(), false));
+        worker.enqueue(job("f", Lane::Foreground, &tx));
+        assert_eq!(rx.try_recv().unwrap(), ("a".to_string(), false));
+        worker.enqueue(job("g", Lane::Foreground, &tx));
+        assert_eq!(rx.try_recv().unwrap(), ("g".to_string(), false));
+        // Asked for again by the conversation itself, a waiting background request moves up.
+        let mut worker = Worker::new(
+            Box::new(|| Err("unused".into())),
+            specials(),
+            Limits::default(),
+            PrefixCache::new(dir.path().to_path_buf()),
+            channel().1,
+        );
+        worker.enqueue(job("x", Lane::Background, &tx));
+        worker.enqueue(job("y", Lane::Background, &tx));
+        worker.enqueue(job("y", Lane::Foreground, &tx));
+        assert_eq!(worker.queue.len(), 2);
+        assert_eq!(worker.queue[worker.next_waiting()].key, "y");
     }
 }

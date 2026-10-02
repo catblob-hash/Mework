@@ -16,12 +16,14 @@ interface EditableField {
   required: boolean;
   /** How the typed text becomes JSON again. */
   decode: "string" | "number" | "boolean" | "json";
-  defaultValue?: JsonValue;
   /** Shown in the empty control; the descriptor's hint at what belongs there. */
   placeholder?: string;
 }
 
 function fieldFromParameter(parameter: ToolDescriptor["parameters"][number]): EditableField {
+  const defaultText = parameter.defaultValue === undefined || parameter.defaultValue === null
+    ? undefined
+    : typeof parameter.defaultValue === "string" ? parameter.defaultValue : JSON.stringify(parameter.defaultValue);
   return {
     name: parameter.name,
     label: `${parameter.label}${parameter.required ? " *" : ""}`,
@@ -31,8 +33,9 @@ function fieldFromParameter(parameter: ToolDescriptor["parameters"][number]): Ed
       : parameter.type === "boolean"
         ? "boolean"
         : parameter.type === "json" ? "json" : "string",
-    defaultValue: parameter.defaultValue,
-    placeholder: parameter.placeholder
+    // A declared default is only ever a hint in the empty control: the call
+    // carries what was written, and an argument left out stays left out.
+    placeholder: parameter.placeholder ?? defaultText
   };
 }
 
@@ -63,10 +66,15 @@ function recordedFields(input: JsonObject, descriptor?: ToolDescriptor): Editabl
   return fields;
 }
 
+/**
+ * The controls' text, from the arguments the call carries and nothing else.
+ * Filling a declared default in here would write it into the call on save — an
+ * argument the model never gave, replayed to it as if it had.
+ */
 function draftFromInput(fields: EditableField[], input?: JsonObject): Draft {
   return Object.fromEntries(
     fields.map((field) => {
-      const value = input?.[field.name] ?? field.defaultValue;
+      const value = input?.[field.name];
       if (value === undefined || value === null) return [field.name, ""];
       return [
         field.name,
@@ -79,11 +87,19 @@ function draftFromInput(fields: EditableField[], input?: JsonObject): Draft {
 function parseDraft(
   fields: EditableField[],
   draft: Draft,
-  messages: { required: string; number: string; boolean: string; json: string }
+  messages: { required: string; number: string; boolean: string; json: string },
+  recorded?: { input: JsonObject; draft: Draft }
 ): { input?: JsonObject; errors: Record<string, string> } {
   const input: JsonObject = {};
   const errors: Record<string, string> = {};
   fields.forEach((field) => {
+    // A control left as it was keeps the recorded value exactly — a `null`, an
+    // empty string, a number in a text field — rather than whatever the typed
+    // text would decode to. Only what was edited is read back from the text.
+    if (recorded && field.name in recorded.input && draft[field.name] === recorded.draft[field.name]) {
+      input[field.name] = recorded.input[field.name];
+      return;
+    }
     const raw = (draft[field.name] ?? "").trim();
     if (!raw) {
       if (field.required) errors[field.name] = messages.required;
@@ -100,10 +116,8 @@ function parseDraft(
         errors[field.name] = messages.boolean;
         return;
       }
-      // Omit optional booleans matching their declared defaults: absent values
-      // carry the default schema semantics and avoid recording untouched arguments.
-      const fallback = typeof field.defaultValue === "boolean" ? field.defaultValue : false;
-      if (!field.required && (raw === "true") === fallback) return;
+      // Written as typed, even when it equals the default: an explicit `false`
+      // the call carried is the call's, and an empty control already omits it.
       input[field.name] = raw === "true";
       return;
     }
@@ -212,8 +226,14 @@ export interface InlineToolEditorProps {
 export function InlineToolEditor({ item, descriptor, inserting = false, onCancel, onRun, onSave }: InlineToolEditorProps) {
   const { t } = useI18n();
   const rerunnable = !inserting && canRerunTool(item.toolName) && Boolean(descriptor);
-  const fields = useMemo(() => recordedFields(item.input, descriptor), [item.input, descriptor]);
-  const [draft, setDraft] = useState<Draft>(() => draftFromInput(fields, item.input));
+  // The call as the model made it. A hook may have run it with other
+  // arguments, but what the model is shown of its own call is what it wrote;
+  // editing the executed arguments instead would, on save, hand the model a
+  // rewrite as its own words even when nothing was changed.
+  const callInput = item.requestedInput ?? item.input;
+  const fields = useMemo(() => recordedFields(callInput, descriptor), [callInput, descriptor]);
+  const [initialDraft] = useState<Draft>(() => draftFromInput(fields, callInput));
+  const [draft, setDraft] = useState<Draft>(initialDraft);
   const [output, setOutput] = useState(item.result.output);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [images, setImages] = useState<ImageAttachment[]>(item.result.images ?? []);
@@ -226,7 +246,7 @@ export function InlineToolEditor({ item, descriptor, inserting = false, onCancel
       number: t("请输入有效数字", "Enter a valid number"),
       boolean: t("请输入 true 或 false", "Enter true or false"),
       json: t("JSON 格式不正确", "Invalid JSON")
-    });
+    }, { input: callInput, draft: initialDraft });
     setErrors(parsed.errors);
     setFailure(firstError(parsed.errors));
     return parsed.input;
@@ -254,7 +274,7 @@ export function InlineToolEditor({ item, descriptor, inserting = false, onCancel
         if (event.key === "Escape" && !busy) onCancel();
       }}
     >
-      <dl className="tool-kv tool-kv--plain">
+      <dl className="tool-kv">
         <ArgumentRows
           fields={fields}
           draft={draft}

@@ -62,6 +62,11 @@
 .subagent-status--roundLimit { color: var(--warning, var(--color-a56312)); background: var(--warning-soft, var(--color-fff5e5)); }
 .subagent-status__spinner { animation: subagent-spin 1s linear infinite; }
 
+/* A tab's status icon takes its badge's colour; done and stopped stay the tab's own muted ink. */
+.subagent-tab--running .page-tab__icon { color: var(--accent, var(--color-4d4d48)); }
+.subagent-tab--failed .page-tab__icon { color: var(--danger, var(--color-c43d3d)); }
+.subagent-tab--roundLimit .page-tab__icon { color: var(--warning, var(--color-a56312)); }
+
 @keyframes subagent-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   .subagent-status__spinner { animation-duration: .01ms; animation-iteration-count: 1; }

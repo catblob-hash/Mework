@@ -27,7 +27,7 @@
   max-height: min(440px, calc(100vh - var(--topbar-height, 56px) - 72px));
   visibility: hidden;
   pointer-events: none;
-  overflow: auto;
+  overflow: auto scroll;
   /* The same shell as the sidebar's dense popover menus (menus.css): a rounded panel whose rows are inset pills. */
   padding: 3px;
   border: 1px solid var(--border-strong);
@@ -41,9 +41,10 @@
   pointer-events: auto;
 }
 .git-status-card__heading { padding: 4px 7px 2px; color: var(--faint, var(--color-989892)); font-size: 10px; font-weight: 650; }
+/* Rows are text only, at every menu's row height (menus.css). */
 .git-status-card__row {
-  width: 100%; min-height: 30px; padding: 4px 7px; display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto auto; align-items: center; gap: 7px;
+  width: 100%; min-height: 24px; padding: 2px 7px; display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 7px;
   border: 0; border-radius: 5px; color: var(--text, var(--color-1b1b1a)); background: transparent; text-align: left;
 }
 .git-status-card__row:disabled { cursor: default; }
@@ -51,7 +52,6 @@
 .git-status-card__row:not(.git-status-card__row--static):not(:disabled):hover,
 .git-status-card__row:not(.git-status-card__row--static):focus-visible,
 .git-status-card__row--open { background: var(--hover); outline: 0; }
-.git-status-card__row > svg:first-child { color: var(--muted, var(--color-6b6b67)); }
 .git-status-card__row > svg:last-child { color: var(--faint, var(--color-989892)); }
 .git-status-card__row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 620; }
 .git-status-card__row small { color: var(--faint, var(--color-989892)); font-size: 9px; white-space: nowrap; }

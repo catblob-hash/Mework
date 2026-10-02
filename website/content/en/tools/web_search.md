@@ -2,7 +2,7 @@
 
 ## Approval
 
-A search is classified as an unbounded action with no path (rule `web.search`, high risk). `request_approval`, `allow_edits` and Plan mode ask; `full_access` does not. One card authorizes the entire call: the query, every page the backend opens for it, and everything that comes back. The prompt is not mandatory, so **Always allow** can remember it for that conversation. The query is checked before any card appears: 2 to 200 characters.
+A search is classified as an unbounded action with no path (rule `web.search`, high risk). `request_approval` and `allow_edits` ask; `full_access` does not. One card authorizes the entire call: the query, every page the backend opens for it, and everything that comes back. The prompt is not mandatory, so **Always allow** can remember it for that conversation. The query is checked before any card appears: 2 to 200 characters.
 
 ## Behavior and limits
 

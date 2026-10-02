@@ -3,7 +3,8 @@
 .topbar { height: var(--topbar-height); flex: 0 0 var(--topbar-height); padding: 0 12px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--color-f7f7f5-ap92); transition: padding-left var(--shell-collapse-duration, .24s) var(--shell-collapse-easing, ease); }
 /* With the sidebar closed, `ShellNav` floats over the bar's left end; the title starts after it. */
 .app-shell--sidebar-closed .topbar { padding-left: calc(var(--shell-nav-inset) + var(--shell-nav-closed-width) + 14px); }
-:root[data-window-chrome="windows"] .app-shell--sidebar-closed .topbar { padding-left: 16px; }
+/* The Windows caption buttons float over the bar's right end; the actions stop short of them. */
+:root[data-window-chrome="windows"] .topbar { padding-right: calc(var(--window-caption-width) + 6px); }
 .app-shell--resizing .topbar { transition: none; }
 .topbar__leading, .topbar__actions { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .topbar__leading { flex: 1 1 auto; }
@@ -34,11 +35,15 @@ button.conversation-title__name:disabled { opacity: 1; cursor: default; }
 .main-pane__subagent { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .main-pane__subagent > * { flex: 1; min-height: 0; }
 .conversation-view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+/* The body of the conversation on screen is still being fetched (`lib/conversationBodies.ts`). */
+.conversation-view__body-loading { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 24px; color: var(--muted); font-size: 13px; text-align: center; }
 
-.context-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative; }
-.context-stream { width: min(820px, calc(100% - 48px)); min-height: 100%; margin: 0 auto; padding: 24px 0 28px; display: flex; flex-direction: column; translate: 0 0; transition: translate .32s cubic-bezier(.2, .75, .25, 1); }
+/* The left padding matches the scrollbar's track on the right, so the column stays centred over
+   the composer below, which spans the whole pane; the column widens by both to keep its width. */
+.context-scroll { flex: 1; min-height: 0; padding-left: var(--scrollbar-size); overflow-y: scroll; overflow-x: hidden; position: relative; }
+.context-stream { width: min(820px, calc(100% - 48px + 2 * var(--scrollbar-size))); min-height: 100%; margin: 0 auto; padding: 24px 0 28px; display: flex; flex-direction: column; translate: 0 0; transition: translate .32s cubic-bezier(.2, .75, .25, 1); }
 /* Appearance settings are applied as data attributes; this is their sole CSS consumer. */
-:root[data-wide-messages="true"] .context-stream { width: min(1180px, calc(100% - 48px)); }
+:root[data-wide-messages="true"] .context-stream { width: min(1180px, calc(100% - 48px + 2 * var(--scrollbar-size))); }
 .context-slot { width: 100%; position: relative; content-visibility: auto; contain-intrinsic-size: auto 140px; }
 .context-slot + .context-slot { margin-top: 16px; }
 .context-card {
@@ -46,9 +51,25 @@ button.conversation-title__name:disabled { opacity: 1; cursor: default; }
   scroll-margin: 120px; transition: background .12s, border-color .12s, box-shadow .12s;
 }
 .context-card:focus-visible { outline-offset: 3px; }
+/* The timeline takes focus on its own background, because its undo keys answer only while focus
+   is somewhere in it; that focus is not a place to draw a ring around the whole pane. */
+.context-scroll:focus { outline: none; }
+/* A drag with Ctrl held (⌘ on a Mac) draws a box over the timeline, fixed to the window while the
+   drag lasts; every row and card it touches is picked out for the right-click menu. */
+.context-scroll[data-selecting] { cursor: crosshair; }
+.timeline-marquee { position: fixed; z-index: 900; pointer-events: none; border: 1px solid var(--color-315eae-ap35); border-radius: 3px; background: color-mix(in srgb, var(--color-cfdcff) 30%, transparent); }
+.context-stream [data-timeline-selected] { background-color: color-mix(in srgb, var(--color-cfdcff) 55%, transparent); box-shadow: 0 0 0 1px var(--color-315eae-ap35); }
+.context-stream .context-card--user[data-timeline-selected] { border-color: var(--color-315eae-ap35); background-color: var(--color-cfdcff); }
+.context-stream :is(.timeline-row, .question-history)[data-timeline-selected] { border-radius: 6px; }
 .context-actions { display: flex; gap: 1px; }
 .context-actions .icon-button { width: 24px; height: 22px; flex-basis: 24px; }
 .context-card__content { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* What can be selected in the timeline: a message's words, a reasoning or prompt body, a hook's
+   output, the detail of a failed turn, a file's lines. Each is a selection region of its own
+   (`base.css`), and the row headers, labels and controls around them are not text to select. */
+.context-card__content, .markdown-content, .timeline-row__output, .turn-error small, .diff-output__body {
+  -webkit-user-select: text; user-select: text;
+}
 .context-card__images { margin-bottom: 8px; }
 /* Citation chips from server-side retrieval or grounding under assistant content. */
 .context-card__sources { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
@@ -81,6 +102,17 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .context-card--assistant:focus-within .context-card__footer-actions { opacity: 1; transform: none; }
 .context-card--assistant .context-card__content { font-size: var(--message-font-size); font-family: var(--message-font-family); }
 .context-card--user .context-card__content { font-size: var(--message-font-size); font-family: var(--message-font-family); }
+/*
+ * A long message folds to its first ten lines (`FOLDED_USER_MESSAGE_LINES` in
+ * ContextStream.tsx) of the card's 1.58 line height, fading out at the cut.
+ */
+.context-card__content--folded {
+  max-height: 15.8em; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, var(--color-000000) calc(100% - 3.2em), transparent);
+  mask-image: linear-gradient(to bottom, var(--color-000000) calc(100% - 3.2em), transparent);
+}
+.context-card__fold { margin: 5px 0 0 -4px; padding: 1px 6px 1px 3px; display: inline-flex; align-items: center; gap: 3px; border-radius: 5px; background: transparent; color: var(--muted); font-size: 12px; line-height: 18px; }
+.context-card__fold:hover { background: var(--hover); color: var(--text); }
 .markdown-content { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 
 /*
@@ -386,6 +418,15 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
    had room to finish. */
 .timeline-row__summary:has(.timeline-row__line) .timeline-row__name { max-width: 40%; }
 .timeline-row__line { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font: 9.75px var(--mono); }
+/* A file a tool row names opens in the file pane; it shows it can only when the
+   pointer is on it, so a column of rows does not read as a column of links. */
+.timeline-row__file { cursor: pointer; text-underline-offset: 2px; }
+.timeline-row__file:hover { text-decoration: underline; }
+.timeline-row__code { font: 10.5px var(--mono); }
+/* Outside the name, so cutting a long file name short never takes the counts with it. */
+.timeline-row__figures { flex: 0 0 auto; display: inline-flex; align-items: baseline; gap: 4px; color: var(--faint); font: 9.75px var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timeline-row__figures b { color: var(--success); font-weight: 500; }
+.timeline-row__figures em { color: var(--danger); font-style: normal; }
 /*
  * Against the end of the row's own words, and lit for as long as the row is
  * open — the same rule the block's heading follows.
@@ -441,7 +482,7 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .timeline-row__prose .markdown-content h1, .timeline-row__prose .markdown-content h2,
 .timeline-row__prose .markdown-content h3, .timeline-row__prose .markdown-content h4,
 .timeline-row__prose .markdown-content h5, .timeline-row__prose .markdown-content h6 { color: var(--color-4d4d48); }
-.timeline-row__output { max-height: 240px; margin: 0; padding: 2px 0 4px 13px; overflow: auto; border-left: 1px solid var(--color-d4d4ce); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-5f5f5a); font: 11.5px/1.55 var(--mono); }
+.timeline-row__output { max-height: 240px; margin: 0; padding: 2px 0 4px 13px; overflow: auto scroll; border-left: 1px solid var(--color-d4d4ce); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-5f5f5a); font: 11.5px/1.55 var(--mono); }
 
 /* A run failure, read where it happened. Matches the composer failure notice so
    the same failure reads the same way wherever it lands. */
@@ -489,26 +530,17 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .tool-kv__key { max-width: 104px; padding-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font: 10px var(--mono); }
 .tool-kv__value { min-width: 0; margin: 0; padding: 3px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--color-ffffff); }
 .tool-kv__row--result .tool-kv__value { grid-column: 1 / -1; }
-.tool-kv__value > pre { margin: 0; max-height: 232px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.55 var(--mono); }
+.tool-kv__value > pre { margin: 0; max-height: 232px; overflow: auto scroll; white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.55 var(--mono); }
 .tool-kv__value:focus-within { border-color: var(--focus); }
 .tool-kv__value--invalid { border-color: var(--danger); }
-/* The box is the field's frame, so the field brings none of its own: a second
-   outline inside this one read as a control nested in a control. */
-.tool-kv:not(.tool-kv--plain) .tool-kv__value > .plain-field { border-radius: 0; font: 10.5px/1.55 var(--mono); }
-.tool-kv:not(.tool-kv--plain) .tool-kv__value > .plain-field:hover,
-.tool-kv:not(.tool-kv--plain) .tool-kv__value > .plain-field:focus-within,
-.tool-kv:not(.tool-kv--plain) .tool-kv__value > .plain-field--error { background: transparent; box-shadow: none; }
+/* Editing a card keeps the boxes it is read in. The box is the field's frame, so
+   the field brings none of its own: a second outline inside this one read as a
+   control nested in a control. Focus and errors colour the box instead. */
+.tool-kv__value > .plain-field { border-radius: 0; font: 10.5px/1.55 var(--mono); }
+.tool-kv__value > .plain-field:hover,
+.tool-kv__value > .plain-field:focus-within,
+.tool-kv__value > .plain-field--error { background: transparent; box-shadow: none; }
 .tool-kv__value > .plain-field > textarea, .tool-kv__value > .plain-field::after { padding: 0; }
-/* The editing card drops the boxed frame in favor of the bare text-editor
-   fields the think/system cards edit with: value cells lose their border and
-   fill, the field keeps its own hover and focus, and the mono/no-pad overrides
-   above do not apply to it. */
-.tool-kv--plain .tool-kv__value { padding: 0; border: 0; border-radius: 5px; background: transparent; }
-.tool-kv--plain .tool-kv__value:focus-within { border-color: transparent; }
-.tool-kv--plain .tool-kv__key { padding-top: 7px; }
-.tool-kv--plain .tool-kv__value > .plain-field { border-radius: 5px; }
-.tool-kv--plain .tool-kv__value > .plain-field > textarea,
-.tool-kv--plain .tool-kv__value > .plain-field::after { padding: 3px 5px; }
 .tool-renderer .tool-kv { padding: 9px 10px; }
 
 .inline-tool-editor { display: flex; flex-direction: column; gap: 5px; }
@@ -518,19 +550,21 @@ a.context-card__source:hover { background: var(--hover); color: var(--text); }
 .timeline-block__insertion { z-index: 3; }
 .diff-output { --diff-gutter: 2ch; margin: 6px 10px 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--color-ffffff); }
 .diff-output__header { min-height: 31px; padding: 5px 8px 5px 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); background: var(--color-fafaf8); }
-.diff-output__header code { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-4e4e49); font: 9.75px var(--mono); }
+.diff-output__header .diff-output__path { flex: 1; color: var(--color-4e4e49); font: 9.75px var(--mono); }
 .diff-output__stats { flex: 0 0 auto; display: inline-flex; gap: 4px; }
 .diff-output__stat { min-width: 25px; padding: 2px 5px; border-radius: 4px; font: 650 8.5px var(--mono); text-align: center; }
 .diff-output__stat--addition { color: var(--success); background: var(--success-soft); }
 .diff-output__stat--deletion { color: var(--danger); background: var(--danger-soft); }
-.diff-output__body { max-height: 240px; overflow: auto; background: var(--color-fdfdfc); }
-/* One gutter, sized to the widest number it holds, so the numbers sit at the
-   left edge instead of inside a column reserved for a longer file. */
-.diff-output__line { min-width: max-content; min-height: 20px; display: grid; grid-template-columns: calc(var(--diff-gutter) + 10px) minmax(220px, 1fr); font: 10px/20px var(--mono); color: var(--color-50504c); }
-.diff-output__line-number { padding: 0 6px 0 4px; border-right: 1px solid var(--color-000000-ap5); color: var(--color-a0a099); text-align: right; user-select: none; }
+.diff-output__body { max-height: 240px; overflow: auto scroll; background: var(--color-fdfdfc); }
+/* One gutter, exactly as wide as the widest number it holds (plus its 1px rule) and
+   unpadded, so the numbers sit at the left edge instead of inside a column reserved
+   for a longer file. */
+.diff-output__line { min-width: max-content; min-height: 20px; display: grid; grid-template-columns: calc(var(--diff-gutter) + 1px) minmax(220px, 1fr); font: 10px/20px var(--mono); color: var(--color-50504c); }
+.diff-output__line-number { padding: 0; border-right: 1px solid var(--color-000000-ap5); color: var(--color-a0a099); text-align: right; -webkit-user-select: none; user-select: none; }
 .diff-output__content { min-height: 20px; padding: 0 9px 0 3px; white-space: pre; }
-.diff-output__line--addition { color: var(--color-246b4e); background: var(--color-eaf7f0); }
-.diff-output__line--deletion { color: var(--color-994040); background: var(--color-fff0f0); }
+/* A change colours its line, not its number: the gutter stays the body's own surface. */
+.diff-output__line--addition .diff-output__content { color: var(--color-246b4e); background: var(--color-eaf7f0); }
+.diff-output__line--deletion .diff-output__content { color: var(--color-994040); background: var(--color-fff0f0); }
 .diff-output__line--meta { min-width: 100%; color: var(--color-8a7655); background: var(--color-fff9ec); font-style: italic; }
 .diff-output__line--meta .diff-output__line-number { display: none; }
 .diff-output__line--meta .diff-output__content { grid-column: 1 / -1; padding: 0 10px; }

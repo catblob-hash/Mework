@@ -49,6 +49,14 @@ export type StreamingHookState = {
   reason?: string;
   createdAt: string;
 };
+export type HostContextState = {
+  context: ContextItem;
+  /** How many of the round's steered inputs had arrived before it. The host
+   * sends both in transcript order, so this puts each back in its place: a
+   * Stop hook's continuation precedes the round's steering, the notices
+   * delivered at its boundary follow it. */
+  afterSteered: number;
+};
 export type ModelRunRetryState = {
   round: number;
   attempt: number;
@@ -83,6 +91,10 @@ export type ModelRunState = {
   streamedToolsByRound: Record<number, StreamingToolState[]>;
   streamedHooksByRound: Record<number, StreamingHookState[]>;
   steeredInputsByRound: Record<number, UserContext[]>;
+  /** Contexts the host added ahead of each round (`host_context_added`), in
+   * arrival order. Optional so fixtures need not spell it out; absent means
+   * empty. */
+  hostContextsByRound?: Record<number, HostContextState[]>;
   /** Provider-reported cumulative snapshots, isolated by backend request round. */
   usageByRound: Record<number, ModelUsage>;
   /** Nested agent usage snapshots, isolated by agent call and child request round. */
@@ -762,6 +774,11 @@ function applyNestedSubagentEvent(
         })
       ];
     }
+  } else if (event.type === "host_context_added") {
+    // A child's transcript is in arrival order, which is the host's order.
+    if (!contexts.some((context) => context.id === event.context.id)) {
+      contexts = [...contexts, event.context];
+    }
   } else if (event.type === "usage_updated") {
     // The child's own provider snapshot. Keyed by round and replaced rather
     // than accumulated: each snapshot is already cumulative for its round, so
@@ -1160,6 +1177,29 @@ export function reduceModelStreamEvent(
           }
         };
     return { run: next, effects };
+  }
+
+  if (event.type === "host_context_added") {
+    // Not reset by a retry: like a hook, it is the host's, and the retried
+    // request carries it too.
+    const known = Object.values(run.hostContextsByRound ?? {}).some((entries) =>
+      entries.some((entry) => entry.context.id === event.context.id)
+    );
+    if (known) return { run, effects };
+    const entry: HostContextState = {
+      context: event.context,
+      afterSteered: run.steeredInputsByRound[round]?.length ?? 0
+    };
+    return {
+      run: {
+        ...run,
+        hostContextsByRound: {
+          ...run.hostContextsByRound,
+          [round]: [...(run.hostContextsByRound?.[round] ?? []), entry]
+        }
+      },
+      effects
+    };
   }
 
   if (event.type === "stream_retry_scheduled") {

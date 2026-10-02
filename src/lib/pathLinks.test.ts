@@ -11,7 +11,16 @@ vi.mock("./backend", () => ({
 }));
 
 import { installExternalLinkInterceptor } from "./externalLinks";
-import { installPathLinkInterceptor, revealPath, setPathOpenHandler } from "./pathLinks";
+import {
+  installPathLinkInterceptor,
+  machineFromKey,
+  revealPath,
+  setPathOpenHandler,
+  setPathPrefetchHandler
+} from "./pathLinks";
+
+/** Where jsdom puts every box: nowhere. */
+const NO_BOX = { left: 0, top: 0, right: 0, bottom: 0 };
 
 function pathButton(path: string, baseDir?: string, line?: number): HTMLButtonElement {
   const host = document.createElement("div");
@@ -191,7 +200,7 @@ describe("setPathOpenHandler", () => {
     const event = clickEvent();
     pathButton("src/App.tsx", "C:\\work\\mework", 12).dispatchEvent(event);
 
-    expect(requests).toEqual([{ path: "src/App.tsx", baseDir: "C:\\work\\mework", line: 12 }]);
+    expect(requests).toEqual([{ path: "src/App.tsx", baseDir: "C:\\work\\mework", line: 12, anchor: NO_BOX }]);
     expect(revealed).toEqual([]);
     expect(event.defaultPrevented).toBe(true);
   });
@@ -215,8 +224,62 @@ describe("setPathOpenHandler", () => {
     const event = clickEvent();
     pathButton("src/App.tsx").dispatchEvent(event);
 
-    expect(requests).toEqual([{ path: "src/App.tsx", baseDir: null, line: null }]);
+    expect(requests).toEqual([{ path: "src/App.tsx", baseDir: null, line: null, anchor: NO_BOX }]);
     expect(event.defaultPrevented).toBe(true);
+  });
+
+  /** A document in the file pane says which machine its paths are on. */
+  it("carries the machine of the surface that showed the path", () => {
+    const requests: unknown[] = [];
+    unregister = setPathOpenHandler((request) => {
+      requests.push(request);
+      return true;
+    });
+    const button = pathButton("docs/x.md", "/srv/app");
+    button.parentElement!.setAttribute("data-mework-path-machine", "ssh:devbox");
+
+    button.dispatchEvent(clickEvent());
+
+    expect(requests).toEqual([{
+      path: "docs/x.md",
+      baseDir: "/srv/app",
+      line: null,
+      machine: { kind: "ssh", machineId: "devbox" },
+      anchor: NO_BOX
+    }]);
+    expect(machineFromKey("local")).toBeNull();
+    expect(machineFromKey("wsl:Ubuntu")).toEqual({ kind: "wsl", distro: "Ubuntu" });
+    expect(machineFromKey("elsewhere")).toBeUndefined();
+  });
+
+  /** The pointer resting on a path is the head start a probe of where it is needs. */
+  it("tells the prefetch handler once per link the pointer rests on", () => {
+    vi.useFakeTimers();
+    try {
+      const hovered: string[] = [];
+      const removePrefetch = setPathPrefetchHandler((request) => hovered.push(request.path));
+      const first = pathButton("src/a.ts");
+      const second = pathButton("src/b.ts");
+      const over = (element: HTMLElement) => element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+
+      over(first);
+      over(first);
+      vi.advanceTimersByTime(100);
+      // Passed over on the way to the next one: not looked up.
+      over(second);
+      vi.advanceTimersByTime(20);
+      over(document.body);
+      vi.advanceTimersByTime(100);
+      over(first);
+      vi.advanceTimersByTime(100);
+      removePrefetch();
+      over(second);
+      vi.advanceTimersByTime(100);
+
+      expect(hovered).toEqual(["src/a.ts", "src/a.ts"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stops being consulted once unregistered", () => {

@@ -101,6 +101,7 @@ const browserDevRustFingerprintEntries = [
   ".cargo/config.toml",
   "src/mework-icon-small.svg",
   "src/mework-icon.svg",
+  "src/mework-mark.svg",
   "src-tauri/Cargo.lock",
   "src-tauri/Cargo.toml",
   "src-tauri/app_commands.rs",

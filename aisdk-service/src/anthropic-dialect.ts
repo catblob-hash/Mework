@@ -487,8 +487,8 @@ function nonStreamingMessageAsSseFetch(inner: typeof globalThis.fetch): typeof g
  *
  * These mirror `DEFAULT_REASONING_BUDGET_PERCENTAGES` in `@ai-sdk/provider-utils`,
  * which the SDK itself applies to every model it believes cannot think adaptively.
- * `max` is the effort name the SDK substitutes for `xhigh` on models lacking that
- * level. `minimal` never appears here: the SDK maps it onto `low` before the request.
+ * `max` is the top level (`reasoning.ts` names it in provider options); a budget
+ * has nothing above `xhigh`'s share. `minimal` is never sent.
  */
 const EFFORT_BUDGET_SHARE: Record<string, number> = {
   low: 0.1,
@@ -673,6 +673,14 @@ function isStampable(block: unknown): block is JsonObject {
  */
 function tailStampable(message: unknown): boolean {
   if (!isObject(message)) return false;
+  // A mid-conversation system message that only hands over tools has no block
+  // a breakpoint can sit on; the search moves to the turn before it.
+  if (message.role === "system") {
+    const content = message.content;
+    if (!Array.isArray(content) || content.length === 0) return false;
+    const last = content[content.length - 1];
+    return isObject(last) && last.type === "text" && isStampable(last);
+  }
   if (message.role !== "assistant") return true;
   const content = message.content;
   if (typeof content === "string") return true;
@@ -778,6 +786,14 @@ function addCacheBreakpoints(body: JsonObject, options: PromptCacheOptions): boo
   return system || message;
 }
 
+/**
+ * Keys whose values are data rather than request structure: a tool call's
+ * arguments as the model wrote them, and a tool's parameter schema. A
+ * `cache_control` inside one is somebody's argument or property name, never a
+ * breakpoint, so the walks below leave them alone.
+ */
+const DATA_KEYS = new Set(["input", "input_schema"]);
+
 function stripCacheControl(value: unknown): boolean {
   let changed = false;
   if (Array.isArray(value)) {
@@ -789,7 +805,9 @@ function stripCacheControl(value: unknown): boolean {
     delete value.cache_control;
     changed = true;
   }
-  for (const entry of Object.values(value)) if (stripCacheControl(entry)) changed = true;
+  for (const [key, entry] of Object.entries(value)) {
+    if (!DATA_KEYS.has(key) && stripCacheControl(entry)) changed = true;
+  }
   return changed;
 }
 
@@ -797,7 +815,7 @@ function carriesCacheControl(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(carriesCacheControl);
   if (!isObject(value)) return false;
   if (value.cache_control !== undefined && value.cache_control !== null) return true;
-  return Object.values(value).some(carriesCacheControl);
+  return Object.entries(value).some(([key, entry]) => !DATA_KEYS.has(key) && carriesCacheControl(entry));
 }
 
 // ------------------------------------------------------------ Cache-coverage detector
@@ -906,6 +924,10 @@ interface HealLatch {
   noCacheControl?: boolean;
   /** The model's output ceiling as the server stated it in a rejection. */
   maxTokensCap?: number;
+  /** The endpoint refused a mid-conversation tool change for this model. */
+  noToolChanges?: boolean;
+  /** The endpoint refused a mid-conversation system message for this model. */
+  noSystemMessages?: boolean;
 }
 
 const healLatches = new Map<string, HealLatch>();
@@ -931,7 +953,87 @@ function latchFor(url: string, model: unknown): HealLatch {
   return latch;
 }
 
+/** The beta the SDK sends with any mid-conversation system message. */
+const MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07";
+
+/**
+ * Lifts the text of every mid-conversation system message into the top-level
+ * `system`, after what is there, and drops each message left empty; tool-change
+ * blocks stay where they are. The instruction then applies from the start of
+ * the conversation rather than from its point — the form every endpoint takes,
+ * and what `system-append.ts` does up front for one it already knows refuses.
+ */
+function liftSystemMessages(body: JsonObject, headers: Headers): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+  const lifted: JsonObject[] = [];
+  const kept = messages.flatMap((message) => {
+    if (!isObject(message) || message.role !== "system") return [message];
+    const content = typeof message.content === "string"
+      ? [{ type: "text", text: message.content }]
+      : Array.isArray(message.content) ? message.content : [];
+    const texts = content.filter((block) => isObject(block) && block.type === "text");
+    if (texts.length === 0) return [message];
+    for (const block of texts) {
+      if (isObject(block) && typeof block.text === "string" && block.text.length > 0) {
+        lifted.push({ type: "text", text: block.text });
+      }
+    }
+    const rest = content.filter((block) => !(isObject(block) && block.type === "text"));
+    return rest.length === 0 ? [] : [{ ...message, content: rest }];
+  });
+  if (kept.length === messages.length && lifted.length === 0) return false;
+  body.messages = kept;
+  const system = body.system;
+  if (typeof system === "string") body.system = [{ type: "text", text: system }, ...lifted];
+  else if (Array.isArray(system)) body.system = [...system, ...lifted];
+  else if (lifted.length > 0) body.system = lifted;
+  const systemLeft = kept.some((message) => isObject(message) && message.role === "system");
+  if (!systemLeft) setBetas(headers, betasOf(headers).filter((beta) => beta !== MID_CONVERSATION_SYSTEM_BETA));
+  return true;
+}
+
+/** The betas a tool change travels under (`tool-append.ts`). */
+const TOOL_CHANGE_BETAS = ["mid-conversation-tool-changes-2026-07-01", "mid-conversation-system-2026-04-07"];
+
+function isToolChange(block: unknown): boolean {
+  return isObject(block) && (block.type === "tool_addition" || block.type === "tool_removal");
+}
+
+function carriesToolChanges(body: JsonObject): boolean {
+  const messages = body.messages;
+  return Array.isArray(messages) && messages.some((message) =>
+    isObject(message) && message.role === "system" && Array.isArray(message.content)
+      && message.content.some(isToolChange));
+}
+
+/**
+ * Takes every mid-conversation tool change back out: its blocks leave their
+ * system messages (a message left empty goes too), each deferred tool is
+ * declared outright, and the betas that only a change needed are dropped. The
+ * tools are then simply in the declared list, the form every endpoint accepts.
+ */
+function stripToolChanges(body: JsonObject, headers: Headers): boolean {
+  if (!carriesToolChanges(body)) return false;
+  const messages = body.messages as unknown[];
+  body.messages = messages.flatMap((message) => {
+    if (!isObject(message) || message.role !== "system" || !Array.isArray(message.content)) return [message];
+    const kept = message.content.filter((block) => !isToolChange(block));
+    if (kept.length === message.content.length) return [message];
+    return kept.length === 0 ? [] : [{ ...message, content: kept }];
+  });
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) if (isObject(tool)) delete tool.defer_loading;
+  }
+  const systemLeft = (body.messages as unknown[]).some((message) => isObject(message) && message.role === "system");
+  setBetas(headers, betasOf(headers).filter((beta) =>
+    beta !== TOOL_CHANGE_BETAS[0] && (systemLeft || beta !== TOOL_CHANGE_BETAS[1])));
+  return true;
+}
+
 type HealClass =
+  | "tool-changes"
+  | "system-messages"
   | "thinking-signature"
   | "thinking-type"
   | "effort"
@@ -1065,9 +1167,21 @@ function prepareRequest(
   headers: Headers,
   latch: HealLatch,
   cache: PromptCacheOptions,
+  toolChanges: boolean,
 ): { body: boolean; headers: boolean } {
   let bodyChanged = false;
   let headersChanged = false;
+  // A relay may take the deferred declaration and drop the change that would
+  // have surfaced it, which loses the tool without a word; only Anthropic
+  // itself gets tool changes, and only until it refuses one for this model.
+  if ((!toolChanges || latch.noToolChanges) && stripToolChanges(body, headers)) {
+    bodyChanged = true;
+    headersChanged = true;
+  }
+  if (latch.noSystemMessages && liftSystemMessages(body, headers)) {
+    bodyChanged = true;
+    headersChanged = true;
+  }
   if (latch.stripThinking && stripThinkingBlocks(body)) bodyChanged = true;
   if (latch.thinkingType && applyThinkingType(body, latch.thinkingType)) bodyChanged = true;
   if (latch.dropEffort && dropEffort(body)) bodyChanged = true;
@@ -1144,6 +1258,19 @@ function heal(body: JsonObject, headers: Headers, latch: HealLatch, message: str
     latch.noCacheControl = true;
     return "cache-control";
   }
+  // Last, and for any other 400: a model without tool changes refuses the
+  // system message, the deferred declaration or the beta in words that vary,
+  // and the request is valid without the change.
+  if (stripToolChanges(body, headers)) {
+    latch.noToolChanges = true;
+    return "tool-changes";
+  }
+  // Then the system message itself, which a model or an endpoint without
+  // mid-conversation system messages refuses in words that vary as well.
+  if (liftSystemMessages(body, headers)) {
+    latch.noSystemMessages = true;
+    return "system-messages";
+  }
   return null;
 }
 
@@ -1163,6 +1290,7 @@ function anthropicSelfHealFetch(
   inner: typeof globalThis.fetch = globalThis.fetch,
   cache: PromptCacheOptions = {},
   onWire?: (context: { key: string; breakpoints: boolean }) => void,
+  toolChanges = true,
 ): typeof globalThis.fetch {
   return async (input, init) => {
     const text = init && typeof init.body === "string" ? init.body : null;
@@ -1176,7 +1304,7 @@ function anthropicSelfHealFetch(
     const url = requestUrlOf(input);
     const latch = latchFor(url, body.model);
     const headers = new Headers(init?.headers);
-    prepareRequest(body, headers, latch, cache);
+    prepareRequest(body, headers, latch, cache, toolChanges);
     const applied = new Set<HealClass>();
     for (;;) {
       onWire?.({ key: `${url}|${typeof body.model === "string" ? body.model : ""}`, breakpoints: carriesCacheControl(body) });
@@ -1208,11 +1336,16 @@ function anthropicSelfHealFetch(
  * implements adaptive thinking and must receive the SDK's thinking form unchanged.
  * It also decides whether cache coverage is watched: only a custom endpoint can
  * silently strip markers.
+ *
+ * `toolChanges` is the host's word that this model at this endpoint takes a
+ * mid-conversation tool change (`StepRequest.toolAppend`); off, any that
+ * reached the body are stripped and the tools declared.
  */
 export function anthropicDialectFetch(
   baseURL: string | undefined,
   inner: typeof globalThis.fetch = globalThis.fetch,
   cache: PromptCacheOptions = {},
+  toolChanges = false,
 ): typeof globalThis.fetch {
   const official = isOfficialAnthropicEndpoint(baseURL);
   const patchRequest = official ? undefined : rewriteAdaptiveThinkingBody;
@@ -1228,6 +1361,6 @@ export function anthropicDialectFetch(
   return sseDialectFetch(
     () => makeAnthropicLineRewriter((usage) => observeCoverage(context, usage)),
     patchRequest,
-    nonStreamingMessageAsSseFetch(anthropicSelfHealFetch(inner, cache, onWire)),
+    nonStreamingMessageAsSseFetch(anthropicSelfHealFetch(inner, cache, onWire, toolChanges)),
   );
 }

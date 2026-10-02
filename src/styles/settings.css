@@ -1,5 +1,5 @@
-/* Global settings */
-.global-settings-layout { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-columns: 190px minmax(0, 1fr); }
+/* Settings windows: global settings, a preset's window and a role's window (`SettingsLayout.tsx`). */
+.settings-layout { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-columns: 190px minmax(0, 1fr); }
 .settings-nav { padding: 11px 9px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--border); background: var(--color-f6f6f3); }
 /* Group titles are non-interactive and non-collapsible, with no separators between groups. The first title has no top padding so it aligns with subsequent groups. */
 .settings-nav__group-title { padding: 9px 9px 2px; color: var(--faint); font-size: 9.5px; }
@@ -8,14 +8,33 @@
 .settings-nav__item span { flex: 1; }
 .settings-nav__item:hover { background: var(--hover); }
 .settings-nav__item--active { background: var(--color-e5e5e0); color: var(--text); font-weight: 600; }
-.global-settings-content { min-width: 0; min-height: 0; overflow: auto; }
+/* How many things a page holds, where a rail says so: a zero reads as "none selected". */
+.settings-nav__count { flex: 0 0 auto; color: var(--faint); font-size: 9.5px; font-weight: 400; font-variant-numeric: tabular-nums; }
+/* The foot of the rail: what belongs to the whole window (a preset's or a role's save), below the pages, as the
+   conversation-settings pane keeps it. */
+.settings-nav__footer { margin-top: auto; padding-top: 9px; display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); }
+.settings-nav__action { width: 100%; min-height: 32px; padding: 0 9px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 7px; background: var(--color-fafaf8); color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.settings-nav__action:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.settings-nav__error { margin: 0; padding: 0 2px; color: var(--danger); font-size: 9.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.settings-layout__content { min-width: 0; min-height: 0; overflow: auto scroll; }
+/* A page that scrolls itself fills the box, which then never scrolls, so the box keeps no track of its own. */
+.settings-layout__content:has(> .settings-editor-page) { overflow-y: auto; }
 .settings-page { min-height: 100%; padding: 21px 22px 30px; }
 .settings-editor-page { height: 100%; min-height: 0; padding-bottom: 0; display: flex; flex-direction: column; overflow: hidden; }
 .settings-editor-page > .settings-page-heading { flex: 0 0 auto; }
 .settings-page-heading { min-height: 54px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .settings-page-heading h3 { margin: 0; font-size: 14px; }
 .settings-page-heading p { margin: 3px 0 0; color: var(--muted); font-size: 10.5px; }
-.settings-page-heading__actions { display: flex; align-items: center; gap: 6px; }
+/* The description alone: its first line keeps the titled heading's top, and the page starts the same distance below it. */
+.settings-page-heading--untitled { min-height: 0; padding-bottom: 16px; }
+.settings-page-heading--untitled p { line-height: 1.45; }
+/* The actions keep their own width, so a long description wraps beside them instead of folding the buttons' labels. */
+.settings-page-heading__actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+/* A documentation link ends the description's first line, on its baseline. */
+.settings-page-heading:has(> .docs-link) { align-items: baseline; }
+/* A line under the heading about the whole page: why it cannot change, or what a save refused. */
+.settings-page__note { flex: 0 0 auto; margin: 0 0 12px; color: var(--muted); font-size: 10.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.settings-page__note--error { color: var(--danger); }
 .settings-card { margin-top: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
 .settings-card__heading { min-height: 39px; display: flex; align-items: flex-start; justify-content: space-between; }
 .settings-card__heading > div { display: flex; gap: 8px; }
@@ -30,7 +49,7 @@
 .model-editor-dialog__header { min-height: 0; padding: 9px 10px 8px 16px; display: flex; align-items: center; gap: 12px; }
 .model-editor-dialog__header h3 { flex: 1; min-width: 0; margin: 0; font-size: 13px; line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-editor-dialog__lede { margin: 0 0 12px; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
-.model-editor-dialog__body { padding: 4px 18px 8px; overflow: auto; }
+.model-editor-dialog__body { padding: 4px 18px 8px; overflow: auto scroll; }
 .model-editor-dialog__body .field { margin-bottom: 12px; }
 .model-editor-dialog__footer { min-height: 0; padding: 6px 12px 12px; display: flex; justify-content: flex-end; align-items: center; gap: 7px; }
 .model-editor-dialog__footer .button { min-height: 28px; padding: 0 12px; font-size: 12px; }

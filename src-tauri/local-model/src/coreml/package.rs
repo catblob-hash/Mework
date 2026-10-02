@@ -15,8 +15,9 @@ use crate::qwen35::Config;
 use crate::safetensors::SafeTensors;
 
 /// Bumped whenever the graph or its inputs change, so installed packages are
-/// rebuilt instead of being fed inputs they were not built for.
-pub const GRAPH_VERSION: &str = "qwen35-ane-1";
+/// rebuilt instead of being fed inputs they were not built for. 2: 5,120
+/// positions (was 1,024).
+pub const GRAPH_VERSION: &str = "qwen35-ane-2";
 
 #[derive(Clone, Debug)]
 pub struct PackagePlan {

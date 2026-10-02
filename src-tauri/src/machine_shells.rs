@@ -20,7 +20,12 @@
 //!   workspace on it, and from its settings.
 //!
 //! Entries are keyed by [`crate::run_environment::env_key`]: `local`,
-//! `wsl:<distro>`, `ssh:<machine id>`.
+//! `wsl:<distro>`, `ssh:<machine id>`. An SSH machine keeps its id when its
+//! address is edited, so its answer also records the [`Endpoint`] it was
+//! taken from, and is used only while the machine still has that endpoint.
+//! Otherwise a probe of the new address that fails (the machine is offline,
+//! or the app restarts) would leave the old machine's OS and shell paths in
+//! force for the new one.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,7 +35,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::CancelSignal;
-use crate::model::RunTarget;
+use crate::model::{ExecutionEnvironmentAssets, RunTarget, SshMachineConfig};
 use crate::run_environment::{self, ShellRunner};
 use crate::shell_backend::{backends_for, probe_names, MachineOs, ShellBackend};
 
@@ -84,14 +89,66 @@ impl MachineShells {
     }
 }
 
-/// Told about every recorded probe, with the machine's key.
-pub type Observer = Box<dyn Fn(&str, &MachineShells) + Send + Sync>;
+/// The account and address an SSH machine's answer came from: what the probe
+/// logged in with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+    pub identity_file: String,
+}
+
+impl Endpoint {
+    /// The endpoint `runner` logs in to. `None` for this machine and a WSL
+    /// distribution, which their keys already name.
+    pub fn of(runner: &ShellRunner) -> Option<Self> {
+        match runner {
+            ShellRunner::Ssh {
+                host,
+                port,
+                identity_file,
+                ..
+            } => Some(Self {
+                host: host.clone(),
+                port: *port,
+                identity_file: identity_file.clone(),
+            }),
+            ShellRunner::Local { .. } | ShellRunner::Wsl { .. } => None,
+        }
+    }
+
+    /// The endpoint the catalog has `machine` at.
+    pub fn of_machine(machine: &SshMachineConfig) -> Self {
+        Self {
+            host: machine.host.clone(),
+            port: machine.port,
+            identity_file: machine.identity_file.clone(),
+        }
+    }
+}
+
+/// One kept answer and where it came from, as `machine-shells.json` holds it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Recorded {
+    #[serde(flatten)]
+    shells: MachineShells,
+    /// `None` for this machine and WSL. An SSH answer written before answers
+    /// recorded their endpoint has none either, and describes no endpoint
+    /// anyone can vouch for, so it is never used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<Endpoint>,
+}
+
+/// Told about every recorded probe, with the machine's key and the endpoint
+/// the answer came from.
+pub type Observer = Box<dyn Fn(&str, Option<&Endpoint>, &MachineShells) + Send + Sync>;
 
 #[derive(Default)]
 struct Store {
     /// `machine-shells.json`, once [`install`] has named it.
     file: Option<PathBuf>,
-    entries: BTreeMap<String, MachineShells>,
+    entries: BTreeMap<String, Recorded>,
     /// Machines probed since this process started. A persisted answer from an
     /// earlier session is used, and refreshed once.
     fresh: HashSet<String>,
@@ -115,7 +172,7 @@ pub fn install(app_data: &Path, observer: Option<Observer>) {
     let file = app_data.join("machine-shells.json");
     let entries = std::fs::read(&file)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, MachineShells>>(&bytes).ok())
+        .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, Recorded>>(&bytes).ok())
         .unwrap_or_default();
     {
         let mut store = store();
@@ -129,14 +186,40 @@ pub fn install(app_data: &Path, observer: Option<Observer>) {
     }
 }
 
-/// The last answer for a machine, from this session or an earlier one.
-pub fn get(key: &str) -> Option<MachineShells> {
-    store().entries.get(key).cloned()
+/// The last answer for a machine, from this session or an earlier one, when it
+/// was taken at `endpoint`: the one the machine has now ([`Endpoint::of`] its
+/// runner).
+pub fn get(key: &str, endpoint: Option<&Endpoint>) -> Option<MachineShells> {
+    store()
+        .entries
+        .get(key)
+        .filter(|recorded| recorded.endpoint.as_ref() == endpoint)
+        .map(|recorded| recorded.shells.clone())
 }
 
-/// Every machine's last answer.
-pub fn all() -> BTreeMap<String, MachineShells> {
-    store().entries.clone()
+/// Every machine's last answer that still [`describes`] it.
+pub fn all(assets: &ExecutionEnvironmentAssets) -> BTreeMap<String, MachineShells> {
+    store()
+        .entries
+        .iter()
+        .filter(|(key, recorded)| describes(assets, key, recorded.endpoint.as_ref()))
+        .map(|(key, recorded)| (key.clone(), recorded.shells.clone()))
+        .collect()
+}
+
+/// Whether an answer taken at `endpoint` describes the machine `key` names in
+/// `assets`: this machine's and a WSL distribution's always, an SSH machine's
+/// while the catalog has the machine at that endpoint.
+pub fn describes(assets: &ExecutionEnvironmentAssets, key: &str, endpoint: Option<&Endpoint>) -> bool {
+    match key.strip_prefix("ssh:") {
+        Some(id) => endpoint.is_some_and(|endpoint| {
+            assets
+                .ssh_machines
+                .iter()
+                .any(|machine| machine.id == id && Endpoint::of_machine(machine) == *endpoint)
+        }),
+        None => endpoint.is_none(),
+    }
 }
 
 /// Whether the machine has been probed since this process started.
@@ -144,11 +227,18 @@ pub fn fresh(key: &str) -> bool {
     store().fresh.contains(key)
 }
 
-/// Keeps an answer, writes the file, and tells the observer.
-pub fn record(key: &str, shells: MachineShells) {
+/// Keeps an answer taken at `endpoint`, writes the file, and tells the
+/// observer.
+fn record(key: &str, endpoint: Option<Endpoint>, shells: MachineShells) {
     let (file, snapshot) = {
         let mut store = store();
-        store.entries.insert(key.to_owned(), shells.clone());
+        store.entries.insert(
+            key.to_owned(),
+            Recorded {
+                shells: shells.clone(),
+                endpoint: endpoint.clone(),
+            },
+        );
         store.fresh.insert(key.to_owned());
         (store.file.clone(), store.entries.clone())
     };
@@ -161,7 +251,7 @@ pub fn record(key: &str, shells: MachineShells) {
         }
     }
     if let Some(observer) = OBSERVER.get() {
-        observer(key, &shells);
+        observer(key, endpoint.as_ref(), &shells);
     }
 }
 
@@ -169,13 +259,13 @@ pub fn record(key: &str, shells: MachineShells) {
 /// few names on `PATH` is cheap enough to do inline.
 pub fn local() -> MachineShells {
     let key = run_environment::env_key(None);
-    if let Some(shells) = get(&key) {
+    if let Some(shells) = get(&key, None) {
         if fresh(&key) {
             return shells;
         }
     }
     let shells = probe_local();
-    record(&key, shells.clone());
+    record(&key, None, shells.clone());
     shells
 }
 
@@ -197,13 +287,14 @@ pub fn assumed(target: Option<&RunTarget>) -> (Option<MachineOs>, Vec<DetectedSh
     }
 }
 
-/// A machine's OS and shells as far as they are known: the last probe, or
+/// A machine's OS and shells as far as they are known: the last probe of it at
+/// the endpoint `runner` (its own, resolved from `target`) logs in to, or
 /// [`assumed`] when there has been none.
-pub fn known(target: Option<&RunTarget>) -> (Option<MachineOs>, Vec<DetectedShell>) {
+pub fn known(target: Option<&RunTarget>, runner: &ShellRunner) -> (Option<MachineOs>, Vec<DetectedShell>) {
     if target.is_none() {
         return assumed(None);
     }
-    match get(&run_environment::env_key(target)) {
+    match get(&run_environment::env_key(target), Endpoint::of(runner).as_ref()) {
         Some(shells) => (Some(shells.os), shells.shells),
         None => assumed(target),
     }
@@ -225,7 +316,7 @@ pub fn probe(target: Option<&RunTarget>, runner: &ShellRunner) -> Result<Machine
         ShellRunner::Local { .. } => probe_local(),
         _ => probe_remote(runner, &CancelSignal::default())?,
     };
-    record(&key, shells.clone());
+    record(&key, Endpoint::of(runner), shells.clone());
     Ok(shells)
 }
 
@@ -407,9 +498,9 @@ fn failure_text(output: &run_environment::RemoteCommandOutput) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn seed_for_test(key: &str, shells: MachineShells) {
+pub(crate) fn seed_for_test(key: &str, endpoint: Option<Endpoint>, shells: MachineShells) {
     let mut store = store();
-    store.entries.insert(key.to_owned(), shells);
+    store.entries.insert(key.to_owned(), Recorded { shells, endpoint });
     store.fresh.insert(key.to_owned());
 }
 
@@ -458,6 +549,92 @@ mod tests {
         let script = posix_probe_script(&["bash", "zsh"]);
         assert!(script.starts_with("uname -s"));
         assert!(script.contains("for s in 'bash' 'zsh'"));
+    }
+
+    fn bash_on_linux() -> MachineShells {
+        MachineShells {
+            os: MachineOs::Linux,
+            shells: vec![DetectedShell {
+                backend: ShellBackend::Bash,
+                path: "/usr/bin/bash".into(),
+            }],
+            probed_at: String::new(),
+        }
+    }
+
+    /// A machine edited to another address keeps its id, and the old
+    /// address's answer must not describe the new one: not to the host, which
+    /// would run the old machine's shell paths there, and not to the renderer.
+    /// That holds until the new address answers, however long its probe fails.
+    #[test]
+    fn an_ssh_answer_describes_only_the_endpoint_it_came_from() {
+        let id = "endpoint-moved";
+        let key = format!("ssh:{id}");
+        let target = RunTarget::Ssh {
+            machine_id: id.into(),
+        };
+        let catalog = |host: &str| ExecutionEnvironmentAssets {
+            ssh_machines: vec![SshMachineConfig {
+                id: id.into(),
+                name: "office".into(),
+                host: host.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let before = catalog("dev@linux-box");
+        seed_for_test(
+            &key,
+            Some(Endpoint::of_machine(&before.ssh_machines[0])),
+            bash_on_linux(),
+        );
+        let runner = run_environment::resolve_shell_runner(&before, Some(&target), None).unwrap();
+        assert_eq!(known(Some(&target), &runner).0, Some(MachineOs::Linux));
+        assert_eq!(runner.agent_shell().unwrap().program, "/usr/bin/bash");
+        assert_eq!(all(&before).get(&key), Some(&bash_on_linux()));
+
+        let after = catalog("dev@windows-box");
+        let runner = run_environment::resolve_shell_runner(&after, Some(&target), None).unwrap();
+        assert_eq!(known(Some(&target), &runner), assumed(Some(&target)));
+        assert_eq!(runner.agent_shell().unwrap(), &crate::shell_backend::AgentShell::default());
+        assert!(!all(&after).contains_key(&key));
+        // A deleted machine's answer is not listed either.
+        assert!(!all(&ExecutionEnvironmentAssets::default()).contains_key(&key));
+    }
+
+    /// `machine-shells.json` from before answers recorded their endpoint
+    /// still loads; its SSH answers are simply never used, and the next probe
+    /// replaces them.
+    #[test]
+    fn an_ssh_answer_kept_without_an_endpoint_is_not_used() {
+        let file: BTreeMap<String, Recorded> = serde_json::from_str(
+            r#"{
+                "local": {"os": "macos", "shells": [{"backend": "zsh", "path": "/bin/zsh"}], "probedAt": "2026-09-28T13:22:54Z"},
+                "ssh:endpoint-legacy": {"os": "linux", "shells": [{"backend": "bash", "path": "/usr/bin/bash"}], "probedAt": "2026-09-28T13:22:54Z"}
+            }"#,
+        )
+        .unwrap();
+        let legacy = file["ssh:endpoint-legacy"].clone();
+        assert!(file["local"].endpoint.is_none() && legacy.endpoint.is_none());
+        seed_for_test("ssh:endpoint-legacy", legacy.endpoint, legacy.shells);
+        let endpoint = Endpoint {
+            host: "dev@box".into(),
+            port: 0,
+            identity_file: String::new(),
+        };
+        assert_eq!(get("ssh:endpoint-legacy", Some(&endpoint)), None);
+
+        // What is written now carries the endpoint beside the answer's own fields.
+        let json = serde_json::to_value(Recorded {
+            shells: bash_on_linux(),
+            endpoint: Some(endpoint),
+        })
+        .unwrap();
+        assert_eq!(json["os"], "linux");
+        assert_eq!(json["endpoint"]["host"], "dev@box");
+        assert_eq!(json["endpoint"]["identityFile"], "");
+        let local = serde_json::to_value(file["local"].clone()).unwrap();
+        assert!(local.get("endpoint").is_none(), "{local}");
     }
 
     /// The probe script is itself POSIX, and every shell the table registers

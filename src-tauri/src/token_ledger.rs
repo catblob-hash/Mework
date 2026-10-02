@@ -411,6 +411,26 @@ impl TokenLedger {
         Ok(written)
     }
 
+    /// The context the conversation's latest top-level request carried — its
+    /// input plus its output, which the next request resends. Live gateway rows
+    /// only: a backfilled row sums a whole turn and would overstate it. `None`
+    /// before the conversation's first recorded request.
+    pub fn last_conversation_context(&self, conversation_id: &str) -> Result<Option<u64>, String> {
+        let conn = self.lock()?;
+        let tokens = conn.query_row(
+            "SELECT input_tokens + output_tokens FROM usage_event
+             WHERE conversation_id = ?1 AND origin = 'conversation' AND id NOT LIKE 'turn:%'
+             ORDER BY occurred_at_ms DESC LIMIT 1",
+            rusqlite::params![conversation_id],
+            |row| row.get::<_, i64>(0),
+        );
+        match tokens {
+            Ok(tokens) => Ok(Some(tokens.max(0) as u64)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(format!("无法读取对话用量：{error}")),
+        }
+    }
+
     /// Aggregates all records by UTC hour, provider, model, and origin. The expected
     /// desktop data volume is small, so the UI can apply its All/30d/7d filters locally.
     pub fn buckets(&self) -> Result<Vec<UsageBucket>, String> {

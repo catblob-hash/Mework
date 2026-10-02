@@ -994,7 +994,7 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     true,
                     None,
                     Some("review-api"),
-                    Some("必填。用于 send_message / followup_task / task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名"),
+                    Some("必填。用于 task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名"),
                 ),
                 parameter(
                     "label",
@@ -1023,44 +1023,6 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     Some(r#"{"type":"object","properties":{"verdict":{"type":"string"}},"required":["verdict"]}"#),
                     Some("可选的 JSON Schema 子集；给出后子代理必须调用 structured_output 交回符合该模式的结果，返回值会随 task_wait 一起回来。顶层必须是 type 为 object 的对象模式；支持 type、properties、required、items、enum、const、additionalProperties、minItems/maxItems、minLength/maxLength、minimum/maximum，其余关键字会被当场拒绝"),
                 ),
-            ],
-        ),
-        descriptor(
-            "send_message",
-            "发送消息",
-            "",
-            ToolCategory::Orchestration,
-            false,
-            vec![
-                parameter(
-                    "target",
-                    "子代理",
-                    StringType,
-                    true,
-                    None,
-                    Some("a1"),
-                    Some("agent_spawn 返回的名称"),
-                ),
-                parameter("message", "消息", Multiline, true, None, None, None),
-            ],
-        ),
-        descriptor(
-            "followup_task",
-            "追加任务",
-            "",
-            ToolCategory::Orchestration,
-            false,
-            vec![
-                parameter(
-                    "target",
-                    "子代理",
-                    StringType,
-                    true,
-                    None,
-                    Some("a1"),
-                    Some("agent_spawn 返回的名称"),
-                ),
-                parameter("message", "消息", Multiline, true, None, None, None),
             ],
         ),
         descriptor(
@@ -1104,7 +1066,15 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
             "",
             ToolCategory::Orchestration,
             false,
-            vec![],
+            vec![parameter(
+                "none",
+                "空参数",
+                Json,
+                true,
+                None,
+                Some("[]"),
+                Some("始终为空数组"),
+            )],
         ),
         // The skill tool is host-only, has no file scope or approval, and does not
         // appear in the picker because its name derives from the conversation's
@@ -1399,106 +1369,7 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     false,
                     None,
                     Some("run0a1b2c3d"),
-                    Some("上一次同脚本运行报出的运行 ID；已入日志的步骤即时重放，其余步骤重跑。脚本正文必须与获批时逐字一致"),
-                ),
-            ],
-        ),
-        descriptor(
-            "todo",
-            "待办事项",
-            "",
-            ToolCategory::Orchestration,
-            false,
-            vec![
-                parameter(
-                    "action",
-                    "动作",
-                    StringType,
-                    true,
-                    None,
-                    Some("create"),
-                    Some("选择操作：create、update、get、list"),
-                ),
-                parameter(
-                    "taskId",
-                    "任务 ID",
-                    StringType,
-                    false,
-                    None,
-                    Some("task-1"),
-                    Some("用于 update、get；create 返回的不透明 ID"),
-                ),
-                parameter(
-                    "subject",
-                    "任务标题",
-                    StringType,
-                    false,
-                    None,
-                    Some("补全用户认证"),
-                    Some("create 必填；update 可选"),
-                ),
-                parameter(
-                    "description",
-                    "任务说明",
-                    Multiline,
-                    false,
-                    None,
-                    Some("实现登录与注册接口，并补齐测试。"),
-                    Some("create 必填；update 可选"),
-                ),
-                parameter(
-                    "activeForm",
-                    "进行中文案",
-                    StringType,
-                    false,
-                    None,
-                    Some("正在补全用户认证"),
-                    Some("create、update；任务处于 in_progress 时显示的简短进行时文案"),
-                ),
-                parameter(
-                    "status",
-                    "状态",
-                    StringType,
-                    false,
-                    None,
-                    Some("in_progress"),
-                    Some("用于 update；pending | in_progress | completed | deleted"),
-                ),
-                parameter(
-                    "owner",
-                    "负责人",
-                    StringType,
-                    false,
-                    None,
-                    None,
-                    Some("仅用于 update"),
-                ),
-                parameter(
-                    "addBlocks",
-                    "新增被阻塞任务",
-                    Json,
-                    false,
-                    None,
-                    None,
-                    Some("用于 update；由本任务阻塞的 task ID 数组"),
-                ),
-                parameter(
-                    "addBlockedBy",
-                    "新增前置任务",
-                    Json,
-                    false,
-                    None,
-                    None,
-                    Some("用于 update；阻塞本任务的 task ID 数组"),
-                ),
-                parameter(
-                    "metadata",
-                    "元数据",
-                    Json,
-                    false,
-                    None,
-                    None,
-                    Some("create 整体写入；update 按 key 合并，值为 null 时删除该 key"),
+                    Some("上一次运行报出的运行 ID；提示词与选项没变的步骤即时重放，上次停下时还在跑的步骤单独重跑，从第一个改动或失败的步骤起其余全部重跑。可省略脚本与 args 沿用上次的；传入改过的脚本会重新审批"),
                 ),
             ],
         ),
@@ -1568,6 +1439,114 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
         descriptor(
             "exit_plan_mode",
             "退出计划模式",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![],
+        ),
+        // The handoff tools are derived by the host once the conversation's
+        // context crosses the auto-compact threshold (`handoff.rs`); like the
+        // plan tools, no picker offers them.
+        descriptor(
+            "read_handoff_note",
+            "读取交接文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![parameter(
+                "name",
+                "文档名",
+                StringType,
+                true,
+                None,
+                Some("当前进度"),
+                Some("交接索引里列出的文档名，.md 后缀可写可不写"),
+            )],
+        ),
+        descriptor(
+            "create_handoff_note",
+            "写交接文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("当前进度"),
+                    Some("交接文档名，不能包含路径分隔符；.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "content",
+                    "文档内容",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("交接文档的完整 Markdown 正文"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("任务目标、已完成的工作与下一步"),
+                    Some("一句话说明这份交接文档写了什么，会写进交接索引"),
+                ),
+            ],
+        ),
+        descriptor(
+            "edit_handoff_note",
+            "修改交接文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("当前进度"),
+                    Some("要修改的交接文档名，.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "old_text",
+                    "原文",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("文档中要被替换的原文，必须唯一匹配；不唯一时请提供更长的片段"),
+                ),
+                parameter(
+                    "new_text",
+                    "新文本",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("替换后的文本；留空表示删除这段内容"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("任务目标、已完成的工作与下一步"),
+                    Some("修改后这份交接文档的一句话说明，会刷新交接索引里的对应条目"),
+                ),
+            ],
+        ),
+        descriptor(
+            "handoff",
+            "交接",
             "",
             ToolCategory::Orchestration,
             false,
@@ -1677,8 +1656,6 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
         "preview_upload_image" => "Upload image",
         "preview_dialog" => "Answer dialog",
         "agent_spawn" => "Subagent",
-        "send_message" => "Send message",
-        "followup_task" => "Follow up",
         "task_wait" => "Wait for tasks",
         "task_list" => "List tasks",
         "box" => "Background result",
@@ -1689,13 +1666,16 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
         "edit_global_memory" => "Edit global memory",
         "edit_project_memory" => "Edit project memory",
         "ask_user" => "Ask user",
-        "todo" => "Todo",
         "workflow" => "Workflow",
         "skill" => "Skill",
         "tool_search" => "Tool discovery",
         "fork" => "Fork conversation",
         "plan" => "Plan document",
         "exit_plan_mode" => "Exit plan mode",
+        "read_handoff_note" => "Read handoff note",
+        "create_handoff_note" => "Write handoff note",
+        "edit_handoff_note" => "Edit handoff note",
+        "handoff" => "Hand off",
         _ => return None,
     })
 }
@@ -1704,9 +1684,6 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
     Some(match name {
         "accept" => "Accept",
         "action" => "Action",
-        "activeForm" => "Active form",
-        "addBlockedBy" => "Add blockers",
-        "addBlocks" => "Add blocked tasks",
         "agent_type" => "Named agent type",
         "args" => "Arguments",
         "case_sensitive" => "Case sensitive",
@@ -1733,13 +1710,11 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "lines" => "Line limit",
         "operation" => "Operation",
         "max_results" => "Maximum results",
-        "message" => "Message",
-        "metadata" => "Metadata",
         "name" => "Name",
         "new_text" => "New text",
+        "none" => "Empty argument",
         "offset" => "Offset",
         "old_text" => "Original text",
-        "owner" => "Owner",
         "path" => "Path",
         "pattern" => "Search pattern",
         "preset" => "Device preset",
@@ -1757,15 +1732,11 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "selector" => "CSS selector",
         "serverId" => "Server ID",
         "start_line" => "Start line",
-        "status" => "Status",
         "styles" => "CSS properties",
-        "subject" => "Task subject",
-        "taskId" => "Task ID",
         "tasks" => "Tasks",
         "timeout" => "Timeout (ms)",
         "timeout_seconds" => "Timeout (seconds)",
         "token_budget" => "Token budget",
-        "target" => "Child agent",
         "value" => "Value",
         "width" => "Width",
         "urls" => "URLs",
@@ -1817,7 +1788,7 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
             "Hard token ceiling for this run, readable as budget in the script; once exhausted, further agent() calls throw."
         }
         ("workflow", "resume_run_id") => {
-            "Run id from a previous run of this same script; journaled steps replay, the first unjournaled one and everything after it re-runs."
+            "Run id from a previous run; steps whose prompt and options are unchanged replay, a step the last attempt left running re-runs alone, and everything from the first changed or failed step re-runs. script and args may be omitted to reuse the last ones; an edited script is approved again."
         }
         ("preview_start", "name") => "Server name from .mework/launch.json.",
         ("preview_stop", "serverId") => "Server ID to stop",
@@ -1901,7 +1872,7 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
             "Optional trusted definition name; the available names and what each is for are listed in this turn's available-agents context. Copy one of those names — the host resolves it, and matches case- and separator-insensitively when that is unambiguous. Cannot be combined with context=conversation."
         }
         ("agent_spawn", "name") => {
-            "Required. Name the child yourself: it is the address send_message / followup_task / task_wait take, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree."
+            "Required. Name the child yourself: it is the address task_wait takes, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree."
         }
         ("agent_spawn", "label") => "Short name shown in the timeline.",
         ("agent_spawn", "context") => {
@@ -1910,13 +1881,11 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         ("agent_spawn", "schema") => {
             "Optional JSON Schema subset. When set, the child must call structured_output with a result matching it, and that value comes back with task_wait. The top level must be an object schema; type, properties, required, items, enum, const, additionalProperties, minItems/maxItems, minLength/maxLength and minimum/maximum are supported and every other keyword is rejected on the spot."
         }
-        ("send_message", "target") | ("followup_task", "target") => {
-            "Name returned by agent_spawn."
-        }
         ("task_wait", "tasks") => {
             "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a dev server as preview:<serverId> (preview:<serverId>@<workspace> when the conversation has several workspaces). The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and dev servers excluded)."
         }
         ("task_wait", "timeout_seconds") => "5-600 seconds; default: 60.",
+        ("box", "none") => "Always an empty list.",
         ("read_global_memory", "name") | ("read_project_memory", "name") => {
             "A document name listed in the memory index. The .md suffix is optional."
         }
@@ -1945,21 +1914,6 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         ("ask_user", "questions") => {
             "Claude Code AskUserQuestion format: 1-4 questions, each with header, question, 2-4 label/description options, and multiSelect. Do not add Other."
         }
-        ("todo", "action") => "create, update, get, list.",
-        ("todo", "taskId") => "update, get; the opaque ID returned by create.",
-        ("todo", "subject") | ("todo", "description") => {
-            "Required by create; optional patch field for update."
-        }
-        ("todo", "activeForm") => {
-            "create, update; short present-continuous text shown while the task is in_progress."
-        }
-        ("todo", "status") => "update; pending | in_progress | completed | deleted",
-        ("todo", "owner") => "update.",
-        ("todo", "addBlocks") => "update; array of task IDs that this task blocks.",
-        ("todo", "addBlockedBy") => "update; array of task IDs that block this task.",
-        ("todo", "metadata") => {
-            "create writes the whole object; update merges keys, and a null value removes that key."
-        }
         ("fork", "prompt") => {
             "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs"
         }
@@ -1968,6 +1922,26 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         }
         ("plan", "content") => {
             "Required for write; the plan's Markdown body, which replaces the previous one in full."
+        }
+        ("read_handoff_note", "name") => {
+            "A note name listed in the handoff index. The .md suffix is optional."
+        }
+        ("create_handoff_note", "name") => {
+            "The handoff note's name. Path separators are forbidden; the .md suffix is optional."
+        }
+        ("edit_handoff_note", "name") => "The handoff note to modify. The .md suffix is optional.",
+        ("create_handoff_note", "content") => "The note's complete Markdown body.",
+        ("edit_handoff_note", "old_text") => {
+            "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        }
+        ("edit_handoff_note", "new_text") => {
+            "The replacement text. Leave it empty to delete the passage."
+        }
+        ("create_handoff_note", "description") => {
+            "One sentence describing what this handoff note holds. It is written into the handoff index."
+        }
+        ("edit_handoff_note", "description") => {
+            "One sentence describing this handoff note after the change. It refreshes the note's entry in the handoff index."
         }
         _ => return None,
     })
@@ -1996,10 +1970,13 @@ fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static
         ("ask_user", "questions") => {
             r#"[{"question":"Which approach should I use?","header":"Approach","options":[{"label":"Approach A","description":"Keep the change small"},{"label":"Approach B","description":"Perform a full rewrite"}],"multiSelect":false}]"#
         }
-        ("todo", "subject") => "Implement user authentication",
-        ("todo", "description") => "Add login and signup endpoints and cover them with tests.",
-        ("todo", "activeForm") => "Implementing user authentication",
         ("fork", "prompt") => "The task to complete in the forked conversation",
+        ("read_handoff_note", "name")
+        | ("create_handoff_note", "name")
+        | ("edit_handoff_note", "name") => "current-state",
+        ("create_handoff_note", "description") | ("edit_handoff_note", "description") => {
+            "The goal, the work done and the next step"
+        }
         _ => return None,
     })
 }
@@ -2165,33 +2142,39 @@ pub(crate) const BUILTIN_PRESET_PROMPT: &str = "\
 /// Each role is bound to one model, and the binding is kept while that model
 /// does not exist yet — Codex lists nothing until the user signs in — so the
 /// role starts working the moment its model shows up. The descriptions reach
-/// the model as the role listing on `agent_spawn`/`workflow`, so they say when
-/// to pick each role, following how its maker positions the model.
+/// the model as the role listing on `agent_spawn`/`workflow`, so they say what
+/// each model is good and bad at and when to pick it.
 const BUILTIN_ROLES: &[(&str, ProviderFamily, &str, &str)] = &[
     (
         "Opus",
         ProviderFamily::ClaudeAgent,
         "claude-opus-5-5",
-        "Claude Opus 5.5 (Anthropic). Strongest at long, sprawling engineering work: codebase-wide migrations and audits, hard debugging, and changes that need careful judgement and checking its own work. Pick it for the largest and hardest tasks.",
+        "Claude Opus 5.5 (Anthropic). Excellent judgement and taste. Takes on ambiguous, open-ended and hard problems, including ones where it is not yet clear what the problem is, and its conclusions can be relied on. Pick it for the hardest work and for anything that needs sound judgement across a wide area: design, diagnosis, review and deciding what to do.",
+    ),
+    (
+        "Sonnet",
+        ProviderFamily::ClaudeAgent,
+        "claude-sonnet-5-5",
+        "Claude Sonnet 5.5 (Anthropic). Has the strengths of Opus in a lighter form: good judgement and able to work through ambiguous problems, though less reliably on the hardest ones, and at a lower cost. Pick it for work that needs judgement but not Opus's full depth.",
     ),
     (
         "Sol",
         ProviderFamily::OpenaiCodex,
-        "gpt-6-sol",
-        "GPT-6 Sol (OpenAI). Built for complex coding and agentic workflows that need strong reasoning: multi-step implementation, refactoring and debugging across several files. Pick it for demanding coding tasks.",
+        "gpt-6.1-sol",
+        "GPT-6.1 Sol (OpenAI). Rigorous, precise reasoning that very rarely makes a mistake, but weak judgement: it does poorly on vague tasks and on ones that call for weighing many things across a wide area, and is at its best on a focused, local problem. Pick it for clearly specified, verifiable work where correctness matters most; give it the exact goal and how to check the result, and keep open-ended decisions away from it.",
     ),
     (
         "Luna",
         ProviderFamily::OpenaiCodex,
         "gpt-6-luna",
-        "GPT-6 Luna (OpenAI). Fast and low-cost, for focused, high-volume work: well-scoped edits, searches and lookups, running tests and summarizing their output. Pick it for repeatable tasks at scale and for many parallel workers.",
+        "GPT-6 Luna (OpenAI). Very cheap, with limited reasoning: don't ask it to make judgement calls or to verify anything that is hard to check. Pick it for simple, mechanical, easily checked chores in bulk, such as repetitive edits, searches and lookups, and collecting or summarizing output, and for many parallel workers.",
     ),
 ];
 
 /// One role of the built-in preset: everything on and thinking on.
 ///
 /// `tools: None` rather than an explicit allowlist, so the role tracks whatever
-/// the preset enables instead of freezing today's catalog into three copies.
+/// the preset enables instead of freezing today's catalog into a copy per role.
 fn builtin_role(name: &str, provider_id: &str, model_id: &str, description: &str) -> AgentDefinition {
     AgentDefinition {
         enabled: true,
@@ -2233,8 +2216,9 @@ fn builtin_role(name: &str, provider_id: &str, model_id: &str, description: &str
 ///
 /// The memory tools follow the two memory switches, `skill` follows
 /// `skill_tool_enabled`, `tool_search` follows `mcp_tool_discovery_enabled`,
-/// the task-runtime tools appear only once something can produce a task, and
-/// the plan tools follow the security level. Listing any of them here would be
+/// the task-runtime tools appear only once something can produce a task, the
+/// plan tools follow the security level, and the handoff tools follow the
+/// conversation's context. Listing any of them here would be
 /// inert at best: the renderer strips them again when the preset is applied.
 /// Mirrors the renderer's `isHostDerivedToolName` and `seedPresetEnabledTools`.
 pub(crate) fn builtin_preset_enabled_tools(
@@ -2253,6 +2237,7 @@ pub(crate) fn builtin_preset_enabled_tools(
                 && !crate::mework_memory::is_memory_tool(name)
                 && !crate::agents::is_task_runtime_tool_name(name)
                 && !crate::plan_mode::is_plan_mode_tool_name(name)
+                && !crate::handoff::is_handoff_tool_name(name)
                 && *name != crate::capabilities::SKILL_TOOL
                 && *name != crate::capabilities::TOOL_SEARCH_TOOL
                 && match crate::shell_backend::ShellBackend::of_tool(name) {
@@ -2267,12 +2252,10 @@ pub(crate) fn builtin_preset_enabled_tools(
 /// The built-in preset as this build defines it, against the providers and the
 /// tool catalog of the document it goes into.
 ///
-/// Two parts are this machine's and are filled in by storage instead: the
-/// built-in skill and MCP ids, which hash absolute paths
-/// (`capability_seed`), and the one shell, which takes a probe. A role whose
-/// provider row the document lacks is left out rather than bound to nothing —
-/// validation refuses an empty provider id — and returns on the first start
-/// after the renderer puts the row back.
+/// The one shell is this machine's and is chosen by storage, which takes a
+/// probe. A role whose provider row the document lacks is left out rather than
+/// bound to nothing — validation refuses an empty provider id — and returns on
+/// the first start after the renderer puts the row back.
 pub(crate) fn builtin_preset(
     providers: &[ApiProvider],
     tools: &[ToolDescriptor],
@@ -2299,9 +2282,8 @@ pub(crate) fn builtin_preset(
             // Every child is one of the named roles, so the model cannot route
             // around them by spawning an anonymous one.
             allow_roleless_subagents: false,
-            // Filled in by storage; see above. Hooks stay unselected on purpose:
-            // a dangling hook id fails every run closed, and the built-in hooks
-            // are meant to be deletable.
+            // Nothing is selected: skills, MCP servers and hooks are opt-in per
+            // conversation, and that includes the built-in Mework SDK skill.
             hook_ids: Vec::new(),
             skill_ids: Vec::new(),
             mcp_ids: Vec::new(),
@@ -2334,7 +2316,6 @@ pub(crate) fn builtin_preset(
             // selected body and every MCP schema into the system prompt.
             skill_tool_enabled: true,
             mcp_tool_discovery_enabled: true,
-            sandbox: Default::default(),
         },
     }
 }
@@ -2374,6 +2355,7 @@ pub(crate) fn product_default_document() -> AppDocument {
             shortcuts: Default::default(),
             environment_tools: Vec::new(),
             draft_conversation: None,
+            auto_compact: Default::default(),
         },
         assets: crate::model::AssetLibrary {
             api_providers,
@@ -2466,7 +2448,6 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
             project_memory_enabled: false,
             skill_tool_enabled: false,
             mcp_tool_discovery_enabled: false,
-            sandbox: Default::default(),
         },
     }];
     document.presets.default_conversation_preset_id = "conversation_default".into();
@@ -2505,11 +2486,12 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                     web_search: Default::default(),
                     reasoning_effort: Default::default(),
                     security_level: Default::default(),
+                    plan_mode_enabled: false,
                     global_memory_enabled: false,
                     project_memory_enabled: false,
                     skill_tool_enabled: false,
                     mcp_tool_discovery_enabled: false,
-                    sandbox: Default::default(),
+                    legacy_sandbox: Default::default(),
                     tool_lock: None,
                 },
                 contexts: Vec::new(),
@@ -2521,6 +2503,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                 additional_directories: Vec::new(),
                 parent_conversation_id: None,
                 fork_of: None,
+                handoff_of: None,
                 preset_id: String::new(),
                 template_id: String::new(),
                 attached_workspaces: Vec::new(),
@@ -2541,6 +2524,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                 content: "测试对话已创建。".into(),
                 local_only: false,
                 hook_execution: None,
+                tools_added: Vec::new(),
                 created_at: timestamp(4),
             },
             ContextItem::User {
@@ -2580,6 +2564,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                     duration_ms: 0,
                 },
                 subagent: None,
+                notice: None,
                 attestation: String::new(),
                 created_at: timestamp(1),
             },
@@ -2606,7 +2591,7 @@ mod tests {
         let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
         let chinese_after = tool_catalog_for_language(ResolvedLanguage::ZhCn);
 
-        assert_eq!(chinese.len(), 48);
+        assert_eq!(chinese.len(), 49);
         assert_eq!(english.len(), chinese.len());
         assert_eq!(chinese_after, chinese);
         for (localized, canonical) in english.iter().zip(&chinese) {

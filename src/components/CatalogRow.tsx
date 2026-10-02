@@ -1,6 +1,8 @@
 import type { KeyboardEvent, ReactNode } from "react";
 import { useI18n } from "../i18n";
+import type { LockTone } from "../lib/toolLock";
 import { Switch } from "./Common";
+import { LockMark } from "./LockTone";
 import { findReorderDropTarget, usePointerDrag } from "./usePointerDrag";
 import type { ReorderDropTarget } from "./usePointerDrag";
 import "./CatalogRow.css";
@@ -73,6 +75,7 @@ export function CatalogToggleRow({
   actions,
   checked,
   disabled = false,
+  tone = null,
   onChange,
   sort
 }: {
@@ -86,6 +89,8 @@ export function CatalogToggleRow({
   actions?: ReactNode;
   checked: boolean;
   disabled?: boolean;
+  /** How the conversation's lock draws the row (`LockTone.tsx`): gray cannot move, orange warns first. */
+  tone?: LockTone | null;
   onChange: (checked: boolean) => void;
   sort?: CatalogSort;
 }) {
@@ -95,12 +100,14 @@ export function CatalogToggleRow({
       name={name}
       detail={detail}
       badge={badge}
-      actions={actions}
+      actions={tone ? <><LockMark tone={tone} className="catalog-row__lock" />{actions}</> : actions}
+      tone={tone}
       sort={sort}
       lead={(
         <Switch
           checked={checked}
-          disabled={disabled}
+          disabled={disabled || tone === "hard"}
+          tone={tone === "cache" ? "cache" : undefined}
           label={name}
           onChange={onChange}
         />
@@ -127,6 +134,7 @@ export function CatalogRow({
   actions,
   nameEditor,
   on = false,
+  tone = null,
   sort
 }: {
   /** Identity for drag-sorting. Omitted for rows that cannot be arranged. */
@@ -150,6 +158,7 @@ export function CatalogRow({
   nameEditor?: ReactNode;
   /** The entry this conversation currently carries, marked rather than framed. */
   on?: boolean;
+  tone?: LockTone | null;
   sort?: CatalogSort;
 }) {
   const { t } = useI18n();
@@ -181,6 +190,7 @@ export function CatalogRow({
       className={[
         "catalog-row",
         on ? "catalog-row--on" : "",
+        tone ? `catalog-row--${tone}` : "",
         nameEditor ? "catalog-row--editing" : "",
         sortable ? "sortable-surface" : "",
         dragging ? "sortable-surface--dragging" : ""

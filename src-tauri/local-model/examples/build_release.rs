@@ -3,9 +3,11 @@
 //!
 //! ```text
 //! <out>/ane/<GRAPH_VERSION>/     config.json, tokenizer.json, embedding.json, model.mlpackage/…
+//! <out>/vision/<VISION_VERSION>/ vision.safetensors (the vision tower, for both Apple builds)
 //! <out>/mlx/<FORMAT>/            config.json, tokenizer.json, weights.json, weights.bin
 //! <out>/mlx/runtime/<MLX>/       mlx.metallib (the kernels of the MLX the app links)
 //! <out>/llama/<GGUF_VERSION>/    config.json, tokenizer.json, qwen3.5-0.8b-f16.gguf
+//! <out>/llama/<MMPROJ_VERSION>/  mmproj-qwen3.5-0.8b-f16.gguf (the vision projector)
 //! ```
 //!
 //! and the catalog the app pins them with (paths, sizes, SHA-256), which goes
@@ -25,17 +27,19 @@ use sha2::{Digest, Sha256};
 
 use local_model::coreml::graph::Shapes;
 use local_model::coreml::package::{write_package, PackagePlan, EMBEDDING_FILE, GRAPH_VERSION};
-use local_model::gguf::{convert_qwen35_to_gguf, GGUF_FILE, GGUF_VERSION};
+use local_model::gguf::{convert_qwen35_mmproj_to_gguf, convert_qwen35_to_gguf, GGUF_FILE, GGUF_VERSION, MMPROJ_FILE, MMPROJ_VERSION};
 use local_model::mlx::weights::{convert, FORMAT, INDEX_FILE, WEIGHTS_FILE};
 use local_model::mlx::{shim_path, METALLIB_FILE, MLX_VERSION};
 use local_model::qwen35::Config;
 use local_model::safetensors::SafeTensors;
+use local_model::service::CONTEXT;
+use local_model::vision::{write_weights, VISION_FILE, VISION_VERSION};
 
 /// The shapes the app runs the Neural Engine build with.
-const SHAPES: Shapes = Shapes { slots: 4, chunk: 16, context: 1024 };
+const SHAPES: Shapes = Shapes { slots: 4, chunk: 16, context: CONTEXT };
 const PACKAGE: &str = "model.mlpackage";
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct File {
     /// Path in the published repository.
     remote: String,
@@ -112,6 +116,15 @@ fn main() -> Result<(), String> {
     let cancel = AtomicBool::new(false);
     let mut variants = BTreeMap::new();
 
+    // The vision tower, as the checkpoint has it, for both Apple builds.
+    let vision = format!("vision/{VISION_VERSION}");
+    let vision_dir = out.join(&vision);
+    let _ = fs::remove_dir_all(&vision_dir);
+    fs::create_dir_all(&vision_dir).map_err(|e| e.to_string())?;
+    eprintln!("writing {vision}");
+    write_weights(&checkpoint, &vision_dir.join(VISION_FILE))?;
+    let vision_files = entries(out, &vision, &vision_dir)?;
+
     // Neural Engine: the Core ML package, compiled on the device after download.
     let ane = format!("ane/{GRAPH_VERSION}");
     let dir = out.join(&ane);
@@ -124,8 +137,9 @@ fn main() -> Result<(), String> {
     for name in ["config.json", "tokenizer.json"] {
         copy(&official.join(name), &dir.join(name))?;
     }
-    let files = entries(out, &ane, &dir)?;
-    variants.insert("ane".to_string(), Variant { version: GRAPH_VERSION.to_string(), files });
+    let mut files = entries(out, &ane, &dir)?;
+    files.extend(vision_files.iter().cloned());
+    variants.insert("ane".to_string(), Variant { version: format!("{GRAPH_VERSION}+{VISION_VERSION}"), files });
 
     // MLX: page-aligned float16 weights, plus the kernels of the MLX the app links.
     let mlx = format!("mlx/{FORMAT}");
@@ -143,10 +157,14 @@ fn main() -> Result<(), String> {
     copy(&metallib, &runtime_dir.join(METALLIB_FILE))?;
     let mut files = entries(out, &mlx, &dir)?;
     files.extend(entries(out, &runtime, &runtime_dir)?);
-    for required in [INDEX_FILE, WEIGHTS_FILE, METALLIB_FILE] {
+    files.extend(vision_files.iter().cloned());
+    for required in [INDEX_FILE, WEIGHTS_FILE, METALLIB_FILE, VISION_FILE] {
         assert!(files.iter().any(|file| file.local == required), "{required} missing");
     }
-    variants.insert("mlx".to_string(), Variant { version: format!("{FORMAT}+mlx-{MLX_VERSION}"), files });
+    variants.insert(
+        "mlx".to_string(),
+        Variant { version: format!("{FORMAT}+{VISION_VERSION}+mlx-{MLX_VERSION}"), files },
+    );
 
     // llama.cpp (Windows and Linux): the GGUF llama.cpp's own converter writes.
     let llama = format!("llama/{GGUF_VERSION}");
@@ -158,8 +176,15 @@ fn main() -> Result<(), String> {
     for name in ["config.json", "tokenizer.json"] {
         copy(&official.join(name), &dir.join(name))?;
     }
-    let files = entries(out, &llama, &dir)?;
-    variants.insert("llama".to_string(), Variant { version: GGUF_VERSION.to_string(), files });
+    let mut files = entries(out, &llama, &dir)?;
+    let mmproj = format!("llama/{MMPROJ_VERSION}");
+    let mmproj_dir = out.join(&mmproj);
+    let _ = fs::remove_dir_all(&mmproj_dir);
+    fs::create_dir_all(&mmproj_dir).map_err(|e| e.to_string())?;
+    eprintln!("writing {mmproj}");
+    convert_qwen35_mmproj_to_gguf(official, &mmproj_dir.join(MMPROJ_FILE), &cancel, &mut |_| {})?;
+    files.extend(entries(out, &mmproj, &mmproj_dir)?);
+    variants.insert("llama".to_string(), Variant { version: format!("{GGUF_VERSION}+{MMPROJ_VERSION}"), files });
 
     let catalog = Catalog {
         source: "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17".to_string(),

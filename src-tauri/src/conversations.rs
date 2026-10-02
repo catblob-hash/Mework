@@ -8,12 +8,18 @@
 //! Every command follows this fixed order:
 //! 1. Write SQLite (`conversation_store`) so data is durable on return.
 //! 2. Update the `DocumentStore` memory snapshot from the database's authoritative
-//!    result so host readers and the renderer observe the same state.
+//!    result so host readers and the renderer observe the same state. The
+//!    snapshot keeps the conversation's metadata and settings; its body is
+//!    recorded for attachment reclamation and stripped (`attachment_refs`).
+//!
+//! Bodies are read with [`load`], which serves them from the shared memory pool
+//! and falls back to the database when the pool has unloaded them.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use crate::{
+    attachment_refs::AttachmentRefs,
     conversation_store::{self, ConversationStore},
     model::{AppDocument, Conversation},
     state::AppState,
@@ -33,13 +39,26 @@ pub(crate) fn sync_snapshot(
     conversation_id: &str,
     conversation: Option<Conversation>,
 ) -> Result<(), String> {
-    let current = state.document_store.current_snapshot(path)?;
+    let (current, current_refs) = state.document_store.snapshot_with_refs(path)?;
     let mut document = (*current).clone();
+    let mut refs = (*current_refs).clone();
+    // The database's body is authoritative even when empty, which a stripped
+    // conversation could not say for itself.
+    let has_conversation = conversation.is_some();
+    if let Some(conversation) = &conversation {
+        refs.record(conversation);
+    }
     patch_conversation(&mut document, workspace_id, conversation_id, conversation);
-    reconcile_conversation_subdata(path, &current, &document);
+    refs.hollow(&mut document);
+    reconcile_conversation_subdata(path, (&current, &current_refs), (&document, &refs));
     let rebound = crate::terminal_lifecycle::invalidated_conversations(&current, &document);
-    state.document_store.commit(path, document)?;
+    let stored = has_conversation;
+    state.document_store.commit_with_refs(path, document, refs)?;
     invalidate_rebound_conversations(state, &rebound);
+    if stored {
+        // A hand edit lands here; mirror it into the conversation's projection.
+        crate::wire_history::on_conversation_committed(path, conversation_id);
+    }
     Ok(())
 }
 
@@ -64,7 +83,11 @@ fn invalidate_rebound_conversations(state: &AppState, rebound: &HashSet<String>)
 /// Reclaims conversation-owned image and file attachments and workflow run
 /// directories. It must run at conversation write boundaries so deleted
 /// conversations do not retain their attachments or run records.
-fn reconcile_conversation_subdata(path: &Path, previous: &AppDocument, next: &AppDocument) {
+fn reconcile_conversation_subdata(
+    path: &Path,
+    (previous, previous_refs): (&AppDocument, &AttachmentRefs),
+    (next, next_refs): (&AppDocument, &AttachmentRefs),
+) {
     let Some(app_data) = path.parent() else {
         return;
     };
@@ -75,8 +98,10 @@ fn reconcile_conversation_subdata(path: &Path, previous: &AppDocument, next: &Ap
             eprintln!("对话已更新，但无法读取模板图片引用，本次不回收图片附件：{error}");
         }
         Ok(pinned) => {
+            let mut referenced = next_refs.image_ids(next);
+            referenced.extend(pinned);
             if let Err(error) = crate::image_attachments::ImageAttachmentStore::new(app_data)
-                .reconcile_transition(previous, next, &pinned)
+                .reconcile_referenced(&previous_refs.image_ids(previous), &referenced)
             {
                 eprintln!("对话已更新，但图片附件隔离回收将在下次保存或启动时重试：{error}");
             }
@@ -87,8 +112,10 @@ fn reconcile_conversation_subdata(path: &Path, previous: &AppDocument, next: &Ap
             eprintln!("对话已更新，但无法读取模板文件附件引用，本次不回收文件附件：{error}");
         }
         Ok(pinned) => {
+            let mut referenced = next_refs.file_ids(next);
+            referenced.extend(pinned);
             if let Err(error) = crate::file_attachments::FileAttachmentStore::new(app_data)
-                .reconcile_transition(previous, next, &pinned)
+                .reconcile_referenced(&previous_refs.file_ids(previous), &referenced)
             {
                 eprintln!("对话已更新，但文件附件隔离回收将在下次保存或启动时重试：{error}");
             }
@@ -137,7 +164,9 @@ fn patch_conversation(
 /// database order.
 fn resync_workspace(state: &AppState, path: &Path, workspace_id: &str) -> Result<(), String> {
     let store = store(path)?;
-    let conversations = store.workspace_conversations(workspace_id)?;
+    // Shells: a reorder or deletion changes ownership and parent pointers, not
+    // bodies, and the snapshot keeps no bodies anyway.
+    let conversations = store.workspace_conversation_shells(workspace_id)?;
     let current = state.document_store.current_snapshot(path)?;
     let mut document = (*current).clone();
     let moved = conversations
@@ -153,7 +182,7 @@ fn resync_workspace(state: &AppState, path: &Path, workspace_id: &str) -> Result
             .iter()
             .any(|conversation| moved.contains(&conversation.id))
         {
-            workspace.conversations = store.workspace_conversations(&workspace.id)?;
+            workspace.conversations = store.workspace_conversation_shells(&workspace.id)?;
         }
     }
     if let Some(workspace) = document
@@ -193,7 +222,7 @@ pub(crate) fn create_with_fork_start(
         return Err(format!("对话 {} 已存在", conversation.id));
     }
     let mut next = conversation.clone();
-    validate_incoming(state, path, workspace_id, &mut next)?;
+    validate_incoming(state, path, workspace_id, &mut next, None)?;
     if let Some(prompt_context_id) = prompt_context_id {
         store.put_fork_conversation(workspace_id, &next, prompt_context_id)?;
     } else {
@@ -229,6 +258,9 @@ pub(crate) fn delete(
     let store = store(path)?;
     store.delete_conversation(conversation_id)?;
     state.retire_conversation_tasks(conversation_id);
+    if let Some(app_data) = path.parent() {
+        crate::handoff::remove_notebook(app_data, conversation_id);
+    }
     sync_snapshot(state, path, workspace_id, conversation_id, None)?;
     resync_workspace(state, path, workspace_id)
 }
@@ -276,14 +308,7 @@ pub(crate) fn update(
         next.contexts = current.contexts.clone();
         next.branches = current.branches.clone();
     }
-    if run_active {
-        // While a run owns the conversation the host owns its level too: the
-        // composer's level menu is disabled for the duration, so a proposal
-        // carrying a different value is a commit debounced from before a plan
-        // card moved the level, not a choice the user just made.
-        next.settings.security_level = current.settings.security_level;
-    }
-    validate_incoming(state, path, workspace_id, &mut next)?;
+    validate_incoming(state, path, workspace_id, &mut next, Some(&current))?;
     let definitions_changed =
         crate::storage::conversation_agent_definitions_differ(Some(&current), &next);
     if in_sync {
@@ -300,15 +325,27 @@ pub(crate) fn update(
     let stored = store
         .conversation(&next.id)?
         .ok_or_else(|| format!("对话 {} 写入后读不回来", next.id))?;
-    // The conversation's live cell outlives any one run so that workers still
-    // running from an earlier turn follow the level the user chose since. Under
-    // a run the level above was the host's own, so there is nothing to move.
-    if !run_active {
-        if let Some(live) = state.live_security_level(&next.id) {
-            if live.get() != stored.settings.security_level {
-                live.set(stored.settings.security_level);
+    // The user may pick another level at any time — while a turn streams and
+    // while an approval card waits included — and it takes effect at once: the
+    // conversation's live cell is what the running turn, its children and any
+    // worker left from an earlier turn read. The browser session caches the
+    // level for its navigation callbacks; the next preview call refreshes it
+    // anyway, so a conversation with no page is not an error.
+    if let Some(live) = state.live_security_level(&next.id) {
+        if live.get() != stored.settings.security_level {
+            live.set(stored.settings.security_level);
+            if let Ok(session_id) = crate::browser::preview_page_session_id(&next.id) {
+                state
+                    .browser
+                    .set_session_security_level(&session_id, stored.settings.security_level);
             }
         }
+    }
+    // The plan-mode switch on the same terms: switched on or off mid-turn, the
+    // next round boundary appends the guidance or the note that it ended, and
+    // `exit_plan_mode` answers by the switch as it stands.
+    if let Some(live) = state.live_plan_mode(&next.id) {
+        live.set(stored.settings.plan_mode_enabled);
     }
     sync_snapshot(state, path, workspace_id, &next.id, Some(stored.clone()))?;
     Ok(stored)
@@ -481,8 +518,9 @@ pub(crate) fn attest_inserted_tool_context(
     })
 }
 
-/// Reads authoritative conversation prose. The renderer aligns its read model
-/// after every completed turn so persisted content is always visible.
+/// Reads authoritative conversation prose: from memory when the shared pool
+/// holds the body, otherwise from the database. The renderer aligns its read
+/// model after every completed turn so persisted content is always visible.
 pub(crate) fn load(path: &Path, conversation_id: &str) -> Result<Option<Conversation>, String> {
     store(path)?.conversation(conversation_id)
 }
@@ -490,15 +528,26 @@ pub(crate) fn load(path: &Path, conversation_id: &str) -> Result<Option<Conversa
 /// Validates a renderer-proposed conversation before writing. Host-produced
 /// prose is already valid; this gate rejects invalid IDs, out-of-catalog tools,
 /// and forged tool cards from renderer proposals.
+///
+/// `previous` is the conversation's stored body when it has one: the snapshot
+/// carries no bodies, and the tool-card check compares against the cards
+/// already stored.
 fn validate_incoming(
     state: &AppState,
     path: &Path,
     workspace_id: &str,
     conversation: &mut Conversation,
+    previous: Option<&Conversation>,
 ) -> Result<(), String> {
     let current = state.document_store.current_snapshot(path)?;
     normalize_parent_pointer(&current, workspace_id, conversation);
-    crate::storage::validate_incoming_conversation(&current, workspace_id, conversation, state)
+    crate::storage::validate_incoming_conversation(
+        &current,
+        workspace_id,
+        conversation,
+        previous,
+        state,
+    )
 }
 
 /// A parent pointer is a sidebar hint, not authority, so a bad one is dropped
@@ -903,15 +952,15 @@ mod tests {
         state.finish_model_run("place-run", &cancel);
     }
 
-    /// While a run owns the conversation the host owns its level: a renderer
-    /// commit debounced from before a plan card moved the level must not revert
-    /// it. Once the run is over, the same write lands and reaches the cell, so
-    /// workers that outlived the turn follow the user's later choice.
+    /// The user may move the level at any time: a write during a run lands at
+    /// once and reaches the cell the running turn and its children read, and a
+    /// write after it reaches workers that outlived the turn.
     #[test]
-    fn a_settings_write_moves_the_level_only_between_runs() {
+    fn a_settings_write_moves_the_level_during_and_between_runs() {
         let directory = tempfile::tempdir().unwrap();
         let (state, anchor, workspace_id, stored) = seeded(directory.path());
-        let cell = state.live_security_level_for_run(&stored.id, crate::model::SecurityLevel::Plan);
+        let cell = state
+            .live_security_level_for_run(&stored.id, crate::model::SecurityLevel::RequestApproval);
         let (cancel, _) = state.begin_model_run("run-level", &stored.id).unwrap();
 
         let mut proposal = stored.clone();
@@ -919,17 +968,18 @@ mod tests {
         let written = update(&state, &anchor, &workspace_id, &proposal, &[]).unwrap();
         assert_eq!(
             written.settings.security_level,
-            stored.settings.security_level
-        );
-        assert_eq!(cell.get(), crate::model::SecurityLevel::Plan);
-
-        state.finish_model_run("run-level", &cancel);
-        let written = update(&state, &anchor, &workspace_id, &proposal, &[]).unwrap();
-        assert_eq!(
-            written.settings.security_level,
             crate::model::SecurityLevel::AllowEdits
         );
         assert_eq!(cell.get(), crate::model::SecurityLevel::AllowEdits);
+
+        state.finish_model_run("run-level", &cancel);
+        proposal.settings.security_level = crate::model::SecurityLevel::FullAccess;
+        let written = update(&state, &anchor, &workspace_id, &proposal, &[]).unwrap();
+        assert_eq!(
+            written.settings.security_level,
+            crate::model::SecurityLevel::FullAccess
+        );
+        assert_eq!(cell.get(), crate::model::SecurityLevel::FullAccess);
     }
 
     #[test]
@@ -1074,7 +1124,8 @@ mod tests {
         // and, with it, the run's claim to replace it in place or mark it
         // interrupted. Its status is what tells the two writes apart.
         assert_eq!(store.reconcile_streaming_in(&stored.id).unwrap(), 1);
-        // The snapshot the renderer reads carries the same timeline.
+        // The snapshot carries the new metadata and no body; the body the
+        // renderer loads carries the same timeline.
         let snapshot = state.document_store.current_snapshot(&anchor).unwrap();
         let mirrored = snapshot
             .workspaces
@@ -1082,8 +1133,10 @@ mod tests {
             .flat_map(|workspace| workspace.conversations.iter())
             .find(|conversation| conversation.id == stored.id)
             .unwrap();
-        assert_eq!(context_ids(mirrored), expected);
+        assert!(mirrored.contexts.is_empty());
         assert_eq!(mirrored.title, "renamed mid-run");
+        let loaded = load(&anchor, &stored.id).unwrap().unwrap();
+        assert_eq!(context_ids(&loaded), expected);
     }
 
     /// With no run active and the renderer's view of the timeline current, an

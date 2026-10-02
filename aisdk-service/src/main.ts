@@ -33,6 +33,7 @@ import {
 } from "./protocol.js";
 import { redactError, redactSecrets, secretsOf } from "./error-redaction.js";
 import { resolveModel } from "./providers.js";
+import { mergeProviderOptions, planReasoning } from "./reasoning.js";
 import {
   dropForeignSignedReasoning,
   dropUnsignedReasoning,
@@ -40,6 +41,8 @@ import {
 } from "./anthropic-dialect.js";
 import { nativeFetchTool, nativeSearchTool } from "./search.js";
 import { createClaudeAgentRuntime } from "./claude-agent.js";
+import { applySystemAppend } from "./system-append.js";
+import { prepareToolAppend } from "./tool-append.js";
 
 // ---------------------------------------------------------------- stdout integrity
 //
@@ -324,14 +327,27 @@ function hasEncryptedReasoning(metadata: Record<string, unknown> | undefined): b
   });
 }
 
-function buildTools(request: StepRequest, provider: unknown): ToolSet {
+function buildTools(request: StepRequest, provider: unknown, deferred: ReadonlySet<string>): ToolSet {
   const tools: ToolSet = {};
+  // A Responses function tool that omits `strict` is put through strict-mode
+  // normalization upstream, which makes every optional parameter required: the
+  // model is then forced to fill `start_line` on an image read or `workspace`
+  // on every call. Saying `false` keeps the host schema's optional parameters
+  // optional. xAI's provider speaks the same Responses protocol. Chat
+  // Completions, Anthropic and the rest are non-strict when the field is
+  // absent, so they are left as they were.
+  const nonStrict = ["openai-responses", "openai-codex", "azure", "xai"].includes(request.family);
   for (const spec of request.tools ?? []) {
     // `inputSchema` is authoritative host data from builtin schemas and descriptors;
     // do not rederive it in the sidecar.
     tools[spec.name] = tool({
       description: spec.description,
       inputSchema: jsonSchema(spec.inputSchema as Parameters<typeof jsonSchema>[0]),
+      ...(nonStrict ? { strict: false } : {}),
+      // A tool that joined mid-conversation is declared deferred, which keeps it
+      // out of Anthropic's prompt-cache key until the `tool_addition` in the
+      // history hands it over (`tool-append.ts`).
+      ...(deferred.has(spec.name) ? { providerOptions: { anthropic: { deferLoading: true } } } : {}),
       // No `execute`: the host owns the tool loop.
     });
   }
@@ -512,6 +528,11 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
 
   try {
     const { model, provider } = resolveModel(request);
+    // Tools that joined mid-conversation reach the model through the family's
+    // own append interface, at the point the host marked, where the host says
+    // the model takes it; elsewhere they stay in the declared list.
+    const appended = prepareToolAppend(request.family, request.messages, request.tools ?? [], request.toolAppend === true);
+    request.messages = appended.messages;
     // History replays the provider's own signed reasoning parts, each tagged by
     // the host with the model that produced it. Anthropic binds a signature to
     // that model, so a switched conversation drops them the way Claude Code
@@ -525,7 +546,7 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
     if (request.family === "anthropic") {
       dropUnsignedReasoning(request.messages);
     }
-    const tools = buildTools(request, provider);
+    const tools = buildTools(request, provider, appended.deferred);
     const priorSearchIds = new Set<string>(request.nativeSearch?.previousCallIds ?? []);
     const searchIds = new Set<string>();
     const isSearchCall = (call: { toolName?: unknown; providerExecuted?: unknown; toolCallId?: unknown }) =>
@@ -543,10 +564,18 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
       }
     };
     const searchLimit = request.nativeSearch?.maxUses ?? 0;
+    const outputCeiling = request.maxOutputTokens ?? defaultOutputTokens(request.family);
+    // The level becomes this family's and this model's own controls (`reasoning.ts`).
+    const reasoningPlan = planReasoning(request.family, request.modelId, request.reasoning, outputCeiling);
     const result = streamText({
       model,
       system: fullSystemPrompt(request),
       messages: request.messages as ModelMessage[],
+      // Only a tool addition or an appended system prompt the protocol takes
+      // in place puts a system message among the messages.
+      allowSystemInMessages: appended.systemInMessages
+        || (request.messages as unknown[]).some((message) =>
+          typeof message === "object" && message !== null && (message as { role?: unknown }).role === "system"),
       tools,
       // prepareStep runs before tool serialization. Replace the provider tool in
       // this request-local ToolSet, not in the shared provider or SDK internals.
@@ -566,10 +595,10 @@ async function runStep(id: string, request: StepRequest): Promise<void> {
         for (const step of steps) for (const call of step.toolCalls) countSearch(call);
         return searchLimit > 0 && searchIds.size >= searchLimit;
       }],
-      maxOutputTokens: request.maxOutputTokens ?? defaultOutputTokens(request.family),
-      // Providers translate the shared reasoning profile to family-specific controls.
-      reasoning: request.reasoning,
-      providerOptions: request.providerOptions,
+      maxOutputTokens: reasoningPlan.maxOutputTokens ?? outputCeiling,
+      reasoning: reasoningPlan.reasoning,
+      providerOptions: mergeProviderOptions(request.providerOptions, reasoningPlan.providerOptions) as
+        typeof request.providerOptions,
       // Retrying is a host policy; retries on both sides multiply billable calls.
       maxRetries: 0,
       abortSignal: controller.signal,
@@ -851,6 +880,10 @@ function handleFrame(frame: HostFrame): void {
       });
       break;
     case "step":
+      // Appended system prompts first, for every family: each goes out as the
+      // protocol's own mid-conversation system message or joins the system
+      // prompt's tail, which `claude-agent` reads too.
+      applySystemAppend(frame.payload);
       if (frame.payload.family === "claude-agent") void claudeAgent.step(frame.id, frame.payload);
       else void runStep(frame.id, frame.payload);
       break;

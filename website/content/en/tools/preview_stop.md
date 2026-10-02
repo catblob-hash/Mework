@@ -2,7 +2,7 @@
 
 ## Approval
 
-Killing a process the project's `launch.json` described is an unbounded action (`tool.unbounded`, high risk): Manual approval, Accept edits and Plan mode ask, Full access does not. **Always allow** can answer the card, remembering the decision for this tool in this conversation. A missing, blank, or non-string `serverId` is refused before any card is drawn.
+Killing a process the project's `launch.json` described is an unbounded action (`tool.unbounded`, high risk): Manual approval and Accept edits ask, Full access does not. **Always allow** can answer the card, remembering the decision for this tool in this conversation. A missing, blank, or non-string `serverId` is refused before any card is drawn.
 
 ## Behavior and limits
 

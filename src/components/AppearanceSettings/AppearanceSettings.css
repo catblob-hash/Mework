@@ -365,13 +365,10 @@
 }
 .theme-sample .theme-sample__picture { position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: cover; }
 .theme-sample:is([data-glass], [data-picture]) span.theme-sample__tiles { background: transparent; }
-/* The glass's blur is the picture's own, drawn once more under the sidebar and the tiles,
-   rather than a backdrop filter on each pane: the samples sit on the settings window's
-   glass, and glass on glass is what left blocks of stale colour on screen. Everywhere but
-   the top bar is under glass (the gutters between tiles are a pixel or two), so the copy
-   is cut to that L. */
+/* The glass is baked, as the window's is (`lib/glassPlate.ts`): the picture blurred and
+   saturated once, drawn again under the sidebar and the tiles. Everywhere but the top bar is
+   under glass (the gutters between tiles are a pixel or two), so the copy is cut to that L. */
 .theme-sample .theme-sample__picture--frosted {
-  filter: blur(3px) saturate(130%);
   clip-path: polygon(0 0, 24% 0, 24% 12%, 100% 12%, 100% 100%, 0 100%);
 }
 /* The sidebar is the conversation's glass, against the window's edges, rimmed on its inner side. */

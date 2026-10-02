@@ -149,6 +149,27 @@ pub(crate) struct ParsedModelResponse {
     pub(crate) native_search_call_ids: Vec<String>,
 }
 
+/// A tool call's arguments as the dispatcher takes them, read for what the
+/// model meant without making anything up.
+///
+/// An object is the call. A string holding a JSON object — arguments encoded
+/// twice — is that object. Anything else (a string that does not parse, which
+/// is how malformed JSON arrives, or a bare number or array) is kept verbatim
+/// under `_raw`: the call is then refused as not being a JSON object, rather
+/// than run with no arguments and answered with a misleading "missing
+/// parameter" for arguments the model believes it gave.
+pub(crate) fn call_arguments(input: Value) -> crate::model::JsonObject {
+    match input {
+        Value::Object(object) => object,
+        Value::String(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(object)) => object,
+            _ => crate::model::JsonObject::from_iter([("_raw".to_owned(), Value::String(text))]),
+        },
+        Value::Null => crate::model::JsonObject::new(),
+        other => crate::model::JsonObject::from_iter([("_raw".to_owned(), other)]),
+    }
+}
+
 impl From<StepResult> for ParsedModelResponse {
     fn from(result: StepResult) -> Self {
         // The sidecar always announces a call before delivering its arguments, so
@@ -168,10 +189,7 @@ impl From<StepResult> for ParsedModelResponse {
                 .map(|call| ToolCall {
                     id: call.call_id,
                     name: call.tool_name,
-                    // Non-object arguments become an empty object because tool
-                    // dispatch expects `JsonObject` and the sidecar already bounds
-                    // argument size.
-                    input: call.input.as_object().cloned().unwrap_or_default(),
+                    input: call_arguments(call.input),
                 })
                 .collect(),
             announced_tool_calls,

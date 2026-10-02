@@ -2,7 +2,7 @@ Returns the full text of one document from the global memory directory, `~/.mewo
 
 ## Approval
 
-Classified as a read of host state (`host.read_or_coordinate`, low risk, read effect). No security level raises a card, plan mode included, so there is no **Always allow** to remember.
+Classified as a read of host state (`host.read_or_coordinate`, low risk, read effect). No security level raises a card, so there is no **Always allow** to remember.
 
 ## Behavior and limits
 
@@ -10,7 +10,7 @@ Classified as a read of host state (`host.read_or_coordinate`, low risk, read ef
 
 `MEMORY.md` is not addressable under any spelling: the host owns the index and rewrites it from the descriptions the create and edit tools carry.
 
-The file is opened through a no-follow handle — a symbolic link or reparse point at the path fails instead of being followed — and must be valid UTF-8 and at most 256 KiB; a larger document is refused, not truncated. The model receives the body verbatim; the timeline card, hook payloads and receipts keep only the operation, tier, name and a byte count. A missing document reports the tier searched, without disclosing a path. The tier is unavailable when the platform reports no home directory, and refused outright when the global memory switch is off.
+The file is opened through a no-follow handle — a symbolic link or reparse point at the path fails instead of being followed — and must be valid UTF-8 and at most 256 KiB; a larger document is refused, not truncated. The model receives the body verbatim, and like any other tool's result it stays on the timeline card and in the conversation the model is replayed. A missing document reports the tier searched, without disclosing a path. The tier is unavailable when the platform reports no home directory, and refused outright when the global memory switch is off.
 
 ## Related
 

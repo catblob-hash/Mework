@@ -124,10 +124,12 @@ describe("App fork requests", () => {
     expect(runtimeMocks.createConversationRemote).not.toHaveBeenCalled();
 
     const sidebar = within(window.document.querySelector(".workspace-list") as HTMLElement);
-    // The child is listed beside its source as an ordinary conversation of the project.
+    // The child is listed beside its source as an ordinary conversation of the project,
+    // at the top, where a conversation the user starts goes.
     const parentRow = sidebar.getByText(source.title).closest(".conversation-row") as HTMLElement;
     const childRow = sidebar.getByText("把测试也跑一遍").closest(".conversation-row") as HTMLElement;
     expect(childRow.parentElement).toBe(parentRow.parentElement);
+    expect(childRow.parentElement!.querySelector(".conversation-row")).toBe(childRow);
     // The user is not yanked into the child; the source stays active.
     expect(sidebar.getByText(source.title).closest(".conversation-row")).toHaveClass("conversation-row--active");
 
@@ -236,6 +238,9 @@ describe("App fork requests", () => {
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
     expect(runtimeMocks.runModel.mock.calls[0][0].contexts.filter((item: { id: string }) => item.id === "ctx_fork_prompt")).toHaveLength(1);
     expect(runtimeMocks.createConversationRemote).not.toHaveBeenCalled();
+    // Already listed after the reload, the child keeps the place the host gave it.
+    const rows = Array.from(window.document.querySelectorAll(".workspace-list .conversation-row"));
+    expect(rows.at(-1)).toHaveTextContent("重载窗口的首轮");
     await act(async () => release([]));
   });
 

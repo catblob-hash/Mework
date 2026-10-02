@@ -21,7 +21,8 @@ import { defaultConversationWebSearchSettings } from "./runtime";
  *
  * The two defaults that differ from the product's own are deliberate and belong to the harness:
  * `securityLevel: "full_access"` because no human is present to answer an approval prompt, and
- * `reasoningEffort: "disabled"` because a thinking budget makes the transcript non-deterministic.
+ * `reasoningEffort: "low"` because the more a model thinks, the less deterministic the transcript
+ * (there is no level without thinking).
  * Everything else starts from the most restrictive value, so a runner that needs a tool, a
  * memory tier or a skill has to name it.
  */
@@ -39,7 +40,7 @@ export function e2eConversationSettings(
     allowRolelessSubagents: false,
     webSearch: defaultConversationWebSearchSettings(),
     webSearchEnabled: false,
-    reasoningEffort: "disabled",
+    reasoningEffort: "low",
     securityLevel: "full_access",
     // Memory tools derive from these two switches rather than from `enabledTools`; leaving
     // either on would add three tools to every request and break exact-allowlist assertions.

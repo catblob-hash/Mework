@@ -7,6 +7,7 @@ import { prepareImageAttachment } from "../lib/runtime";
 import { toolCatalog } from "../seed";
 import type { ToolContext, ToolDescriptor } from "../types";
 import {
+  errorExcerpt,
   getToolPresentation,
   isMcpToolName,
   mcpToolNaming,
@@ -75,6 +76,47 @@ function mcpDescriptor(label: string, name = MCP_WIRE_NAME): ToolDescriptor {
   return { name, label, description: "", category: "mcp", dangerous: false, parameters: [] };
 }
 
+describe("handoff rows", () => {
+  const en = (zh: string, english: string, values?: Record<string, string | number>) =>
+    translate("en-US", zh, english, values);
+
+  it("names the host's handoff notice apart from a background result", () => {
+    const notice = {
+      ...tool(
+        "box",
+        { none: [] },
+        "<task-notification>\n<summary>past the threshold</summary>\n<result>\nHand this conversation off.\n</result>\n</task-notification>"
+      ),
+      notice: "handoff"
+    };
+    expect(getToolPresentation(notice, undefined, en).title)
+      .toBe("Context reached the auto-compact threshold; handoff requested");
+    const result = tool("box", { none: [] }, "<task-notification>\n<task-id>reviewer</task-id>\n</task-notification>");
+    expect(getToolPresentation(result, undefined, en).title).toBe("Delivered a background result");
+    // A card written before the card held the whole message named its kind in its input.
+    const legacy = tool(
+      "box",
+      { tasks: [], notification: { kind: "handoff", summary: "past the threshold" } },
+      "Hand this conversation off before its context runs out."
+    );
+    expect(getToolPresentation(legacy, undefined, en).title)
+      .toBe("Context reached the auto-compact threshold; handoff requested");
+  });
+
+  it("opens a written note onto its name, index line and body", () => {
+    const note = tool(
+      "create_handoff_note",
+      { name: "state", description: "where the work stands", content: "Step 2 of 3." },
+      "Created handoff note state.md and recorded it in the handoff index."
+    );
+    const presentation = getToolPresentation(note, undefined, en);
+    expect(presentation.title).toBe("Wrote handoff note");
+    expect(presentation.target).toBe("state");
+    expect(presentation.keys).toEqual(["name", "description", "content"]);
+    expect(toolSummaryKind(note)).toBe("handoff");
+  });
+});
+
 describe("shell command explanations", () => {
   const en = (zh: string, en: string, params?: Record<string, string | number>) => translate("en-US", zh, en, params);
   const zh = (zh: string, en: string, params?: Record<string, string | number>) => translate("zh-CN", zh, en, params);
@@ -92,7 +134,105 @@ describe("shell command explanations", () => {
     expect(getToolPresentation(item, undefined, en).title).toBe("zsh command failed");
     expect(getToolPresentation(item, undefined, en, "Run false").title).toBe("zsh: Run false (failed)");
     // Only shell tools take one.
-    expect(getToolPresentation(tool("read", { path: "a.txt" }, "x"), undefined, en, "ignored").title).toBe("Read file");
+    expect(getToolPresentation(tool("read", { path: "a.txt" }, "x"), undefined, en, "ignored").title).toBe("Read a.txt");
+  });
+});
+
+describe("tool titles that name their subject", () => {
+  const en = (zh: string, en: string, params?: Record<string, string | number>) => translate("en-US", zh, en, params);
+
+  it("names the file a call read or wrote, and the lines its change added and removed", () => {
+    const edited = tool("edit", { path: "src/components/App.tsx", find: "a", replace: "b" }, "ok", {
+      diff: "--- src/components/App.tsx\n+++ src/components/App.tsx\n@@ -1,2 +1,3 @@\n-a\n+b\n+c\n d\n"
+    });
+    expect(getToolPresentation(edited)).toMatchObject({
+      title: "已编辑：App.tsx",
+      subject: { before: "已编辑：", text: "App.tsx", after: "", path: "src/components/App.tsx" },
+      counts: { additions: 2, deletions: 1 }
+    });
+    expect(getToolPresentation(edited, undefined, en).subject).toMatchObject({ before: "Edited ", text: "App.tsx" });
+
+    const read = tool("read", { path: "C:\\work\\notes.md", start_line: 40 }, "line");
+    expect(getToolPresentation(read)).toMatchObject({
+      title: "已读取：notes.md",
+      subject: { text: "notes.md", path: "C:\\work\\notes.md", line: 40 }
+    });
+    expect(getToolPresentation(read).counts).toBeUndefined();
+    // Read from the top, the file opens at its top.
+    expect(getToolPresentation(tool("read", { path: "a.txt" }, "x")).subject?.line).toBeUndefined();
+
+    const written = tool("write", { path: "README.md", content: "x" }, "ok", {
+      diff: "--- README.md\n+++ README.md\n@@ -1 +1 @@\n-old\n+x\n"
+    });
+    expect(getToolPresentation(written, undefined, en).title).toBe("Wrote README.md");
+
+    // Still running or failed, the phrase stays: there is nothing yet to name.
+    const running = { ...edited, streaming: true, streamStatus: "running" as const };
+    expect(getToolPresentation(running).title).toBe("正在编辑文件");
+    expect(getToolPresentation(running).subject).toBeUndefined();
+  });
+
+  it("names what a search looked for, set as code, and how much it found", () => {
+    const found = tool("find", { query: "*.tsx", path: "src" }, [
+      "src/App.tsx",
+      "src/main.tsx",
+      "dist/x.tsx (ignored)",
+      "(Showing 3 of 9 matches. Narrow the pattern or path to see the rest.)",
+      "(1 of the matches are in paths Git ignores.)"
+    ].join("\n"));
+    expect(getToolPresentation(found)).toMatchObject({
+      title: "已查找：*.tsx",
+      subject: { text: "*.tsx", code: true },
+      note: "3+ 个结果"
+    });
+    expect(getToolPresentation(tool("find", { query: "*.rs" }, "No matching files")).note).toBe("0 个结果");
+
+    const searched = tool("grep", { pattern: "TODO|FIXME" }, [
+      "src/a.ts:3:// TODO one",
+      "src/b.ts:10:// FIXME two",
+      "[skipped] src/c.bin: unreadable"
+    ].join("\n"));
+    expect(getToolPresentation(searched, undefined, en)).toMatchObject({
+      title: "Searched for TODO|FIXME",
+      subject: { text: "TODO|FIXME", code: true },
+      note: "2 matches"
+    });
+    expect(getToolPresentation(tool("grep", { pattern: "x" }, "src/a.ts:1:x\n… more matches follow.")).note)
+      .toBe("1+ 处匹配");
+  });
+});
+
+describe("failed tool titles", () => {
+  const en = (zh: string, en: string, params?: Record<string, string | number>) => translate("en-US", zh, en, params);
+
+  it("says why after what failed: the error's own line until the local model's reason replaces it", () => {
+    const edit = tool("edit", { path: "src/App.tsx" }, "The exact text to replace was not found", { success: false });
+    expect(getToolPresentation(edit).title).toBe("编辑文件失败：The exact text to replace was not found");
+    expect(getToolPresentation(edit, undefined, en).title).toBe("Failed to edit file: The exact text to replace was not found");
+    expect(getToolPresentation(edit, undefined, undefined, undefined, "找不到要替换的文本").title)
+      .toBe("编辑文件失败：找不到要替换的文本");
+    // What failed, without why: the body prints the whole error under it.
+    expect(getToolPresentation(edit).failure).toBe("编辑文件失败");
+    // A failed edit names no file and counts no lines.
+    expect(getToolPresentation(edit).subject).toBeUndefined();
+  });
+
+  it("reads past a command's exit code and its colours to the line that explains it", () => {
+    const failed = tool("bash", { command: "pnpm i" }, "Exit code 127\n\u001b[31mbash: pnpm: command not found\u001b[0m\nmore", {
+      success: false
+    });
+    expect(getToolPresentation(failed).title).toBe("Bash 命令失败：bash: pnpm: command not found");
+    // The reason outranks the command's description.
+    expect(getToolPresentation(failed, undefined, undefined, "安装依赖", "没有安装 pnpm").title).toBe("Bash 命令失败：没有安装 pnpm");
+    expect(errorExcerpt("Exit code 1")).toBe("Exit code 1");
+    expect(errorExcerpt("  \n ")).toBeUndefined();
+    expect(errorExcerpt("x".repeat(500))?.length).toBe(240);
+  });
+
+  it("keeps the phrase alone when the call returned nothing to quote", () => {
+    const silent = tool("zsh", { command: "false" }, "", { success: false });
+    expect(getToolPresentation(silent).title).toBe("zsh 命令失败");
+    expect(getToolPresentation(silent, undefined, en, "Run false").title).toBe("zsh: Run false (failed)");
   });
 });
 
@@ -121,17 +261,21 @@ describe("tool view registry", () => {
     // `structured_output` is deliberately NOT catalog-visible, so the loop
     // above cannot reach it; naming it here is what turns a forgotten
     // registry entry from a silently mis-rendered timeline into a failure.
-    for (const name of ["subagent", "subagent_update", "structured_output", "subagent_activity", "update"]) {
+    // The retired agent tools are not in the catalog either, and saved
+    // conversations still carry their cards.
+    for (const name of [
+      "subagent",
+      "subagent_update",
+      "structured_output",
+      "subagent_activity",
+      "update",
+      "agent_send",
+      "send_message",
+      "followup_task"
+    ]) {
       expect(TOOL_VIEW_REGISTRY).toHaveProperty(name);
       expect(toolSurfaceForName(name)).toBe("group");
     }
-    // Every task action is an ordinary row now — writes and reads alike —
-    // so the surface no longer depends on the call, only the detail family does.
-    expect(toolSurfaceForName("todo")).toBe("group");
-    expect(getToolPresentation(tool("todo", { action: "create", subject: "x", description: "y" }, "{}")).family).toBe("persistent");
-    expect(getToolPresentation(tool("todo", { action: "update", taskId: "task-1", status: "completed" }, "{}")).family).toBe("persistent");
-    expect(getToolPresentation(tool("todo", { action: "get", taskId: "task-1" }, "{}")).family).toBe("raw");
-    expect(getToolPresentation(tool("todo", { action: "list" }, "{}")).family).toBe("raw");
     expect(toolSurfaceForName("ask_user")).toBe("question");
     // A running workflow owns a progress card of its own; a workflow step is an
     // ordinary agent-run row, so the two workflow tools deliberately disagree.
@@ -154,9 +298,10 @@ describe("tool view registry", () => {
     }
     expect(getToolPresentation(tool("plan", { action: "read" }, "{}")).title).toBe("已读取计划");
     expect(getToolPresentation(tool("plan", { action: "write", content: "# x" }, "{}")).title).toBe("已更新计划");
-    // `send_message` carries two contracts under one wire name. The child form
-    // has no `target` because its one recipient is the main agent, so it is a
-    // note travelling upward rather than a row that opens a child transcript.
+    // A saved `send_message` carries two contracts under one wire name. The
+    // child form has no `target` because its one recipient was the main agent,
+    // so it is a note travelling upward rather than a row that opens a child
+    // transcript.
     const downward = getToolPresentation(tool("send_message", { target: "helper", message: "补充" }, "已排队"));
     expect(downward.family).toBe("agent-run");
     expect(downward.title).toBe("消息已加入子代理队列");
@@ -177,7 +322,8 @@ describe("tool view registry", () => {
     const browser = tool("preview_click", { selector: "button.primary" }, "Successfully clicked: button.primary");
 
     expect(getToolPresentation(created)).toMatchObject({
-      title: "创建了文件",
+      title: "已创建：new.ts",
+      counts: { additions: 1, deletions: 0 },
       target: "src/new.ts",
       stat: "+1 −0",
       family: "diff"
@@ -186,17 +332,12 @@ describe("tool view registry", () => {
     // order regardless of the order the block ran them in.
     expect(summarizeBlockKinds([created, shell, browser].map(toolSummaryKind)))
       .toBe("运行了 1 个命令，1 次文件操作，执行了 1 次浏览器操作");
-    // Agent and task-state calls are ordinary rows now, so they count toward
-    // the block summary instead of leaving it claiming there is nothing to show.
+    // Agent calls are ordinary rows now, so they count toward the block
+    // summary instead of leaving it claiming there is nothing to show.
     expect(summarizeBlockKinds([
-      tool(
-        "todo",
-        { action: "create", subject: "x", description: "y" },
-        JSON.stringify({ task: { id: "task-1", subject: "x" } })
-      ),
       tool("agent_spawn", { label: "审查" }, "已派生"),
       tool("read", { path: "src/a.ts" }, "内容")
-    ].map(toolSummaryKind))).toBe("调用了 1 个子代理，1 次状态变更，读取了 1 个文件");
+    ].map(toolSummaryKind))).toBe("调用了 1 个子代理，读取了 1 个文件");
     // Reasoning and hooks share the block, so they share its vocabulary even
     // though neither is a tool call with a registry entry.
     expect(summarizeBlockKinds(["reasoning", "hook", "fork", "skill"]))
@@ -220,11 +361,11 @@ describe("tool view registry", () => {
       ["workflow", { name: "release" }, "agents"],
       ["workflow_step", { label: "build" }, "agents"],
       ["agent_spawn", { name: "reviewer", prompt: "审查" }, "agents"],
+      // A retired child → main message, as saved conversations hold it.
       ["send_message", { message: "已定位" }, "agents"],
       // `fork` and `skill` each own a bucket rather than falling into `other`.
       ["fork", { prompt: "继续" }, "fork"],
       ["skill", { name: "pdf" }, "skill"],
-      ["todo", { action: "list" }, "state"],
       ["read_project_memory", { name: "build" }, "memory"],
       ["grep", { pattern: "TODO" }, "search"],
       ["web_search", { query: "tauri" }, "search"],
@@ -300,7 +441,8 @@ describe("tool view registry", () => {
     const running = { ...call, streaming: true, streamStatus: "running" as const };
     const failed = { ...call, result: { ...call.result, success: false } };
     expect(getToolPresentation(running).title).toBe("正在调用 MCP 工具 browser_click");
-    expect(getToolPresentation(failed).title).toBe("MCP 工具 browser_click 调用失败");
+    expect(getToolPresentation(failed).title).toBe(`MCP 工具 browser_click 调用失败：${call.result.output}`);
+    expect(getToolPresentation({ ...failed, result: { ...failed.result, output: "" } }).title).toBe("MCP 工具 browser_click 调用失败");
 
     const en = (zhCn: string, enUs: string, parameters?: Record<string, string | number>) => (
       translate("en-US", zhCn, enUs, parameters)
@@ -308,7 +450,7 @@ describe("tool view registry", () => {
     const notice = mcpDescriptor("MCP Playwright / browser_click (requires manual confirmation)");
     expect(getToolPresentation(call, notice, en).title).toBe("Called MCP tool browser_click");
     expect(getToolPresentation(running, notice, en).title).toBe("Calling MCP tool browser_click");
-    expect(getToolPresentation(failed, notice, en).title).toBe("MCP tool browser_click failed");
+    expect(getToolPresentation(failed, notice, en).title).toBe(`MCP tool browser_click failed: ${call.result.output}`);
 
     // Only `mcp__` names take that branch; other unregistered tools keep the
     // generic wrench so a plug never claims a server that does not exist.
@@ -316,33 +458,6 @@ describe("tool view registry", () => {
       ...mcpDescriptor("Future tool", "future_tool"),
       category: "shell"
     })).toMatchObject({ icon: Wrench, title: "使用了 Future tool" });
-  });
-
-  it("presents task-state reads as raw output and writes as structured state", () => {
-    expect(getToolPresentation(tool(
-      "todo",
-      { action: "update", taskId: "task-1", status: "in_progress" },
-      JSON.stringify({ success: true, taskId: "task-1", updatedFields: ["status"] })
-    ))).toMatchObject({
-      surface: "group",
-      family: "persistent",
-      title: "更新了任务",
-      target: "task-1",
-      stat: "进行中"
-    });
-    expect(getToolPresentation(tool(
-      "todo",
-      { action: "list" },
-      JSON.stringify({ tasks: [
-        { id: "task-1", subject: "实现", status: "pending", blockedBy: [] },
-        { id: "task-2", subject: "测试", status: "completed", blockedBy: [] }
-      ] })
-    ))).toMatchObject({
-      surface: "group",
-      family: "raw",
-      title: "列出了任务",
-      stat: "2 项"
-    });
   });
 
   it("localizes built-in titles, statistics, and summaries without translating tool payloads", () => {
@@ -703,7 +818,8 @@ describe("memory tool presentation", () => {
     (name, doneZh, runningZh, failedZh, doneEn, runningEn, failedEn) => {
       const item = tool(name, { name: "build" }, "记忆正文");
       const running = { ...item, streaming: true, streamStatus: "running" as const };
-      const failed = { ...item, result: { ...item.result, success: false } };
+      // Nothing to quote, so the title is the registered phrase alone.
+      const failed = { ...item, result: { ...item.result, success: false, output: "" } };
       expect(getToolPresentation(item).title).toBe(doneZh);
       expect(getToolPresentation(running).title).toBe(runningZh);
       expect(getToolPresentation(failed).title).toBe(failedZh);
@@ -741,19 +857,35 @@ describe("memory tool presentation", () => {
     expect(container).toHaveTextContent("测试要用项目自带环境");
   });
 
-  it("shows the index description a write recorded", () => {
+  it("shows what a write recorded: index description, body and raw data", () => {
     const { container } = render(
       <ToolDetailRenderer
         item={tool(
           "create_global_memory",
-          { name: "preferences", content: "正文", description: "用户长期偏好" },
+          { name: "preferences", content: "回答一律用中文", description: "用户长期偏好" },
           "已在全局记忆中创建 preferences.md，并写入索引描述。"
         )}
       />
     );
     expect(container).toHaveTextContent("全局记忆");
     expect(container).toHaveTextContent("用户长期偏好");
+    expect(container).toHaveTextContent("回答一律用中文");
     expect(container).toHaveTextContent("已在全局记忆中创建 preferences.md");
+    expect(screen.getByText("原始数据")).toBeInTheDocument();
+  });
+
+  it("shows the passage an edit replaced and what replaced it", () => {
+    const { container } = render(
+      <ToolDetailRenderer
+        item={tool(
+          "edit_project_memory",
+          { name: "build", old_text: "端口 3000", new_text: "端口 4000" },
+          "已在项目记忆中编辑 build.md。"
+        )}
+      />
+    );
+    expect(container).toHaveTextContent("端口 3000");
+    expect(container).toHaveTextContent("端口 4000");
   });
 
   it("surfaces a failed memory call with its reason", () => {
@@ -789,7 +921,7 @@ describe("memory tool presentation", () => {
   });
 });
 
-describe("agent and task-state detail views", () => {
+describe("agent detail views", () => {
   const runRecord = {
     name: "reviewer",
     label: "接口审查",
@@ -867,19 +999,6 @@ describe("agent and task-state detail views", () => {
 
     render(<ToolDetailRenderer item={tool("task_wait", {}, "")} />);
     expect(screen.getByText("等待已结束，没有可显示的更新")).toBeInTheDocument();
-  });
-
-  it("localizes task status instead of leaking the wire enum into copy", () => {
-    expect(getToolPresentation(tool("todo", { action: "update", taskId: "t", status: "deleted" }, "{}")).stat)
-      .toBe("已删除");
-    render(<ToolDetailRenderer item={tool(
-      "todo",
-      { action: "create", subject: "修复登录", description: "补上会话过期分支", status: "pending" },
-      JSON.stringify({ task: { id: "task-1", subject: "修复登录" } })
-    )} />);
-    expect(screen.getByText("修复登录")).toBeInTheDocument();
-    expect(screen.getByText("补上会话过期分支")).toBeInTheDocument();
-    expect(screen.getByText("待处理")).toBeInTheDocument();
   });
 
   it("shows a one-shot agent message in full and keeps its receipt beside it", () => {

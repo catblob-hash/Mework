@@ -18,6 +18,16 @@ const APP_ICON_SIZES: [u32; 6] = [16, 24, 32, 48, 128, 256];
 /// script, so both have to be registered in `browserDevRustFingerprintEntries`
 /// and in the Pages workflow's path filter.
 const APP_ICON_FULL_MIN_SIZE: u32 = 32;
+/// The bare mark, black on clear: the source of the macOS menu bar icon. An
+/// input to this build script like the two icons, so registered beside them in
+/// `browserDevRustFingerprintEntries`.
+const BRAND_MARK_SVG: &[u8] = include_bytes!("../src/mework-mark.svg");
+/// `tray-icon` draws a status item's image 18pt tall whatever its pixels, so
+/// the menu bar icon is that height at 2x, with the mark 15pt of it: 30px keeps
+/// the mark's 3:5 width a whole 18px, and the 1.5pt above and below sits it at
+/// the weight of the system's own menu bar glyphs.
+const TRAY_TEMPLATE_HEIGHT: u32 = 36;
+const TRAY_TEMPLATE_MARK_HEIGHT: u32 = 30;
 
 macro_rules! app_command_names {
     ($($command:ident),* $(,)?) => {
@@ -40,6 +50,7 @@ fn main() {
     ensure_remote_agents_dir();
     println!("cargo:rerun-if-changed=../src/mework-icon.svg");
     println!("cargo:rerun-if-changed=../src/mework-icon-small.svg");
+    println!("cargo:rerun-if-changed=../src/mework-mark.svg");
     // `generate_context!` embeds Info.plist (its privacy usage strings) into the macOS
     // binary, but the macro does not tell Cargo, so an edit would not reach a dev build.
     println!("cargo:rerun-if-changed=Info.plist");
@@ -57,6 +68,9 @@ fn main() {
         fs::write(&manifest_icon, &icon).expect("write generated application icon");
     }
     stage_non_windows_icons(manifest_icon.parent().expect("icon parent"));
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        write_if_changed(&output_dir.join("tray-template.png"), &render_tray_template_png());
+    }
 
     let windows = if embed_windows_manifest_for_all_link_targets(&output_dir) {
         // The Windows manifest is already linked into every executable (bins and every
@@ -456,6 +470,24 @@ fn render_icon_png(size: u32) -> Vec<u8> {
     );
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     pixmap.encode_png().expect("encode Mework icon PNG")
+}
+
+/// Renders the macOS menu bar icon: the mark alone, centred on a clear canvas
+/// as wide as the mark. It is a template image — only its alpha counts, and the
+/// menu bar paints it in whatever colour suits a light, dark or highlighted
+/// bar — so the app icon's coloured plate has no place in it.
+fn render_tray_template_png() -> Vec<u8> {
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(BRAND_MARK_SVG, &options)
+        .unwrap_or_else(|_| panic!("parse the Mework brand mark SVG"));
+    let scale = TRAY_TEMPLATE_MARK_HEIGHT as f32 / tree.size().height();
+    let width = (tree.size().width() * scale).round() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, TRAY_TEMPLATE_HEIGHT)
+        .expect("allocate the menu bar icon pixmap");
+    let top = (TRAY_TEMPLATE_HEIGHT - TRAY_TEMPLATE_MARK_HEIGHT) as f32 / 2.0;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(0.0, top);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().expect("encode the menu bar icon PNG")
 }
 
 /// Writes `bytes` to `path` unless it already holds exactly them, so an

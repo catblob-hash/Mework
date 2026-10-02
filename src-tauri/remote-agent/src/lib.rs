@@ -28,6 +28,7 @@
 //! back as a new process, the daemon ends the session's whole process group,
 //! and a daemon with nothing left to do exits by itself.
 
+pub mod files;
 pub mod protocol;
 pub mod ring;
 pub mod tunnel;

@@ -25,16 +25,36 @@
   flex: 1;
   min-height: 0;
   min-width: 0;
-  padding: 8px;
   overflow: hidden;
   background: transparent;
 }
+/* xterm 6 paints its theme ground on the grid alone, whole rows tall; the rest of a row's height
+   under it would show the pane's glass as a strip, so the box below wears the same ground. */
 .terminal-panel__viewport .xterm {
   height: 100%;
+  background: var(--color-e8e7e8);
 }
 /* The reference shell defeats xterm's own viewport paint so the pane surface shows through. */
 .terminal-panel__viewport .xterm .xterm-viewport {
   background: transparent;
+}
+
+/* xterm draws its own scrollbar, not the page's: a 14px strip whose square slider fills it. In
+   every terminal in the app the slider wears the page's thumb instead (`base.css`): a pill 3px in
+   from the strip's right edge, a little wider while hovered or dragged. xterm already keeps the
+   columns clear of the strip, so its room is reserved whether or not it shows. Each terminal
+   injects the slider's colours at four classes, and on hover and drag at five; these outrank them. */
+.xterm .xterm-scrollable-element > .scrollbar.vertical > .slider {
+  border: 3px solid transparent;
+  border-left-width: 7px;
+  border-radius: 99px;
+  background: var(--scrollbar-thumb);
+  background-clip: padding-box;
+}
+.xterm .xterm-scrollable-element > .scrollbar.vertical > .slider:is(:hover, .active) {
+  border-width: 2px 2px 2px 6px;
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
 }
 
 /* The cursor is the brand mark — the cell with cat's ears that the app icon puts after its

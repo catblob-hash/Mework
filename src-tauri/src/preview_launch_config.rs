@@ -75,7 +75,6 @@ pub struct ServerConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchConfigFile {
     pub servers: Vec<ServerConfig>,
-    pub auto_verify: bool,
 }
 
 /// An entry whose shape this build supports but whose fields are wrong.
@@ -269,17 +268,9 @@ impl LaunchConfigDiscovery {
             };
         }
 
-        // Only a literal `false` turns verification off.
-        let auto_verify = !matches!(
-            root.get("autoVerify").map(|entry| &entry.value),
-            Some(JsonValue::BooleanLit(literal)) if !literal.value
-        );
         let Some(name) = name else {
             return LaunchDiscovery::Ok {
-                config: LaunchConfigFile {
-                    servers,
-                    auto_verify,
-                },
+                config: LaunchConfigFile { servers },
                 malformed,
             };
         };
@@ -291,7 +282,6 @@ impl LaunchConfigDiscovery {
             Some(server) => LaunchDiscovery::Ok {
                 config: LaunchConfigFile {
                     servers: vec![server.clone()],
-                    auto_verify,
                 },
                 malformed,
             },
@@ -1295,21 +1285,6 @@ mod tests {
                 malformed: Vec::new()
             }
         );
-    }
-
-    #[test]
-    fn auto_verify_defaults_to_true_and_only_literal_false_disables_it() {
-        let entry = r#""configurations":[{"runtimeExecutable":"npm"}]"#;
-        let auto_verify = |prefix: &str| match discovery(&format!("{{{prefix}{entry}}}")) {
-            LaunchDiscovery::Ok { config, .. } => config.auto_verify,
-            other => panic!("expected a usable file, got {other:?}"),
-        };
-
-        assert!(auto_verify(""));
-        assert!(auto_verify("\"autoVerify\":true,"));
-        assert!(auto_verify("\"autoVerify\":\"no\","));
-        assert!(auto_verify("\"autoVerify\":null,"));
-        assert!(!auto_verify("\"autoVerify\":false,"));
     }
 
     #[test]

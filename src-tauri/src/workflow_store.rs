@@ -2,10 +2,13 @@
 //!
 //! Each run is stored in `<app_data_dir>/workflows/<conversationId>/<runId>/`:
 //!
-//! - `script.js`: the approved script body. Resume verifies its SHA-256 against the submitted body.
+//! - `script.js`: the approved script body of the latest attempt. A scriptless resume checks its
+//!   SHA-256 against the timeline; a resume with an edited, re-approved script replaces it.
+//! - `args.json`: the `args` of the latest attempt, so a resume may omit them.
 //! - `journal.jsonl`: append-only `started`, `result`, and diagnostic-only `settled` records.
 //! - `manifest.json`: run summary. A `running` status after restart identifies an interrupted run.
-//! - `steps/<index>.json`: complete records for individual steps.
+//! - `steps/<index>.json`: complete records for individual steps; `steps/<index>.key` names the
+//!   step that wrote each one.
 //!
 //! # Why artifacts stay on disk
 //!
@@ -34,6 +37,11 @@ use sha2::{Digest, Sha256};
 const RUNS_DIRECTORY: &str = "workflows";
 const JOURNAL_FILE: &str = "journal.jsonl";
 const SOURCE_FILE: &str = "script.js";
+/// The `args` the latest attempt ran with. Absent when that run was given none.
+const ARGS_FILE: &str = "args.json";
+/// Which `workflow` call supplied the current `script.js` and `args.json`, by provider call id.
+/// See [`RunStore::record_provenance`].
+const PROVENANCE_FILE: &str = "provenance.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const STEPS_DIRECTORY: &str = "steps";
 /// Driver liveness lock file. See [`acquire_driver_lock`].
@@ -49,7 +57,7 @@ const MAX_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// `conversation_id` and `run_id` become path components, so they must be opaque flat identifiers,
 /// not merely identifier-like values. Reject path traversal, separators, and platform-reserved forms.
-fn validate_path_component(kind: &str, value: &str) -> Result<(), String> {
+pub(crate) fn validate_path_component(kind: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{kind}不能为空"));
     }
@@ -110,6 +118,9 @@ pub struct Journal {
     started: HashMap<String, usize>,
     /// Keys with a no-value terminal record, indicating step failure rather than a host crash.
     settled: std::collections::HashSet<String>,
+    /// Keys whose latest record is `started`: the attempt that dispatched them ended before they
+    /// settled, so the script never received their outcome.
+    unsettled: std::collections::HashSet<String>,
     /// Number of malformed records skipped while loading.
     skipped_lines: usize,
 }
@@ -118,6 +129,21 @@ impl Journal {
     /// Returns whether this key has a reusable result.
     pub fn result(&self, key: &str) -> Option<&Value> {
         self.results.get(key)
+    }
+
+    /// Classifies a key for the cache chain.
+    ///
+    /// A result is reusable whenever it was written. Without one, a key whose latest record is
+    /// `started` is unsettled and reruns alone; anything else is a miss that latches the chain.
+    pub fn lookup(&self, key: &str) -> workflow_core::chain::JournalLookup {
+        use workflow_core::chain::JournalLookup;
+        if self.results.contains_key(key) {
+            JournalLookup::Hit
+        } else if self.unsettled.contains(key) {
+            JournalLookup::Unsettled
+        } else {
+            JournalLookup::Miss
+        }
     }
 
     /// Number of reusable results, used by recovery notifications.
@@ -206,9 +232,102 @@ impl RunStore {
         })
     }
 
-    /// Whether this `open` created a new run.
+    /// Opens a run that already exists, for a resume.
     ///
-    /// Recovery must reject a fresh directory rather than silently performing a full rerun.
+    /// Unlike [`Self::open`], this neither creates anything nor compares a submitted script: a
+    /// resume may carry an edited script that was approved again, and [`Self::replace_source`]
+    /// adopts it once the caller holds the driver lock. `Ok(None)` means there is no run to resume
+    /// — no directory, or no pinned script — and the caller must say so rather than start over.
+    pub fn open_existing(
+        app_data_path: &Path,
+        conversation_id: &str,
+        run_id: &str,
+    ) -> Result<Option<Self>, String> {
+        validate_path_component("会话 id", conversation_id)?;
+        validate_path_component("运行 id", run_id)?;
+        let directory = app_data_path
+            .join(RUNS_DIRECTORY)
+            .join(conversation_id)
+            .join(run_id);
+        let source = match fs::read(directory.join(SOURCE_FILE)) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("无法读取工作流正文：{error}")),
+        };
+        fs::create_dir_all(directory.join(STEPS_DIRECTORY))
+            .map_err(|error| format!("无法创建工作流运行目录：{error}"))?;
+        Ok(Some(Self {
+            directory,
+            source_digest: hex_digest(&source),
+            fresh: false,
+            journal_degraded: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    /// Pins the script this attempt runs, replacing the one an earlier attempt ran.
+    ///
+    /// Only a resume calls this, after the user approved the submitted script and while the caller
+    /// holds the driver lock, so no other driver can be reading or replacing it. The body is staged
+    /// and renamed into place: a crash leaves one whole script or the other, and a scriptless resume
+    /// then checks whichever it finds against the call [`Self::record_provenance`] names.
+    pub fn replace_source(&mut self, source: &[u8]) -> Result<(), String> {
+        let digest = hex_digest(source);
+        if digest == self.source_digest {
+            return Ok(());
+        }
+        write_private_atomic(&self.directory.join(SOURCE_FILE), source)
+            .map_err(|error| format!("无法写入工作流正文：{error}"))?;
+        self.source_digest = digest;
+        Ok(())
+    }
+
+    /// Saves the `args` this attempt runs with, so a resume that omits them runs with the same
+    /// values. The bytes are `serde_json::to_vec` of the value, as the resume check re-derives them
+    /// from the call that supplied it.
+    ///
+    /// A failed write only warns: the run itself does not depend on it, and a later resume that
+    /// finds a stale or missing file against that call refuses to guess.
+    pub fn write_args(&self, args: &Value) {
+        let Ok(body) = serde_json::to_vec(args) else {
+            eprintln!("工作流 args 无法序列化");
+            return;
+        };
+        if let Err(error) = write_private_atomic(&self.directory.join(ARGS_FILE), &body) {
+            eprintln!("工作流 args 写入失败（恢复时须重新提供 args）：{error}");
+        }
+    }
+
+    /// Records which approved `workflow` call supplied the files this attempt runs with: `script`
+    /// when it pinned `script.js`, `args` when it saved `args.json`. A value left `None` keeps the
+    /// call an earlier attempt recorded, which is what a resume that reused the file means.
+    ///
+    /// A resume checks each file against the input that call ran with, as the history recorded it
+    /// once every hook had had its say. The disk cannot vouch for its own contents, the timeline
+    /// is the user's to edit, and the call as it ran is the one record of the bytes the user was
+    /// asked to approve that neither of them wrote. This file only says which call to read; the bytes come from
+    /// the ledger. Called under the driver lock, after the files it describes are written. A
+    /// failed write only warns: the run does not depend on it, and a resume that cannot tell
+    /// which call supplied a file refuses to reuse it.
+    pub fn record_provenance(&self, script: Option<&str>, args: Option<&str>) {
+        let path = self.directory.join(PROVENANCE_FILE);
+        let mut provenance = read_provenance(&path).unwrap_or_default();
+        if let Some(call) = script {
+            provenance.script = Some(call.to_owned());
+        }
+        if let Some(call) = args {
+            provenance.args = Some(call.to_owned());
+        }
+        let body = serde_json::json!({
+            "script": provenance.script,
+            "args": provenance.args,
+        });
+        if let Err(error) = write_private_atomic(&path, body.to_string().as_bytes()) {
+            eprintln!("工作流来源记录写入失败（恢复时须重新提供脚本与 args）：{error}");
+        }
+    }
+
+    /// Whether this `open` created a new run.
+    #[cfg(test)]
     pub fn is_fresh(&self) -> bool {
         self.fresh
     }
@@ -255,31 +374,55 @@ impl RunStore {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Writes a complete step record. The result signals whether it reached disk so callers retain
-    /// inline timeline content when externalization fails.
-    pub fn write_step(&self, index: usize, record: &Value) -> bool {
-        let path = self
-            .directory
-            .join(STEPS_DIRECTORY)
-            .join(format!("{index}.json"));
+    /// Writes a complete step record, and beside it the cache key of the step that produced it.
+    /// The result signals whether the record reached disk so callers retain inline timeline
+    /// content when externalization fails.
+    ///
+    /// Records are addressed by index, and a later attempt that dispatches a different step at the
+    /// same index overwrites the file. The key file lets a replay tell its own record from one a
+    /// later attempt left there.
+    pub fn write_step(&self, index: usize, cache_key: &str, record: &Value) -> bool {
+        let steps = self.directory.join(STEPS_DIRECTORY);
         let Ok(body) = serde_json::to_vec(record) else {
             eprintln!("工作流步骤记录无法序列化：步骤 {index}");
             return false;
         };
-        if let Err(error) = write_private(&path, &body) {
+        // Drop the previous owner's key before touching the record, and write this step's key only
+        // once the record is whole. A crash in between leaves no key, which reads like a record
+        // from before key files — right for the step that just wrote it, the one a resume replays.
+        let key_path = steps.join(format!("{index}.key"));
+        match fs::remove_file(&key_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("工作流步骤键无法清除：{error}");
+                return false;
+            }
+        }
+        if let Err(error) = write_private(&steps.join(format!("{index}.json")), &body) {
             eprintln!("工作流步骤记录写入失败：{error}");
+            return false;
+        }
+        if let Err(error) = write_private(&key_path, cache_key.as_bytes()) {
+            eprintln!("工作流步骤键写入失败：{error}");
             return false;
         }
         true
     }
 
-    /// Whether a step record exists on disk. Replay must confirm an earlier record survives before
-    /// externalizing timeline content.
-    pub fn step_exists(&self, index: usize) -> bool {
-        self.directory
-            .join(STEPS_DIRECTORY)
-            .join(format!("{index}.json"))
-            .is_file()
+    /// Whether the record on disk at `index` is the one the step with `cache_key` wrote. Replay
+    /// must confirm its own record survives before externalizing timeline content.
+    ///
+    /// A record from before key files existed has none and is accepted as it always was.
+    pub fn step_matches(&self, index: usize, cache_key: &str) -> bool {
+        let steps = self.directory.join(STEPS_DIRECTORY);
+        if !steps.join(format!("{index}.json")).is_file() {
+            return false;
+        }
+        match fs::read(steps.join(format!("{index}.key"))) {
+            Ok(stored) => stored == cache_key.as_bytes(),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
     }
 
     /// Writes the run manifest. Failures are non-fatal.
@@ -337,12 +480,11 @@ fn is_reserved_device_name(value: &str) -> bool {
 
 /// Driver liveness lock for a run: holding it means this process drives that run.
 ///
-/// On Windows, `share_mode(0)` opens `driver.lock` exclusively. A live handle prevents another
-/// process from opening it; the OS releases it after a crash. Recovery must acquire this lock before
-/// claiming a `status:"running"` run, otherwise a live second instance could be misclassified.
-///
-/// Other platforms use a normal open because no equivalent zero-dependency crash-safe primitive is
-/// available; the application is currently released only for Windows.
+/// An exclusive OS file lock on `driver.lock` (`flock` on Unix, `LockFileEx` on Windows). The OS
+/// releases it when the process dies, so a crash never leaves a run looking driven. Recovery must
+/// acquire this lock before claiming a `status:"running"` run, otherwise a live second instance
+/// could be misclassified. The lock belongs to the open file, so a second acquisition fails inside
+/// the same process too — a driver that outlived its task's forced settlement still holds it.
 #[derive(Debug)]
 pub struct RunDriverLock {
     _file: File,
@@ -361,17 +503,20 @@ pub fn acquire_driver_lock(
         .join(conversation_id)
         .join(run_id)
         .join(DRIVER_LOCK_FILE);
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(0);
-    }
-    match options.open(&path) {
-        Ok(file) => Ok(RunDriverLock { _file: file }),
-        Err(error) => Err(format!(
-            "运行 {run_id} 的驱动器锁不可用（另一个实例可能正在驱动它）：{error}"
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("运行 {run_id} 的驱动器锁无法打开：{error}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(RunDriverLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "运行 {run_id} 仍由另一个驱动器持有（它可能还在运行），不能同时驱动"
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(format!(
+            "运行 {run_id} 的驱动器锁不可用：{error}"
         )),
     }
 }
@@ -404,7 +549,7 @@ fn restrict_directory(_path: &Path) {
 }
 
 /// Overwrites a file readable only by the current user.
-fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     write_private_with_sync(path, body, File::sync_all)
 }
 
@@ -424,6 +569,16 @@ fn write_private_with_sync(
     file.write_all(body)?;
     file.flush()?;
     sync(&file)
+}
+
+/// Replaces a private file through a staged copy and a rename, so a reader never sees a partial
+/// body: after a crash the file holds either the old content or the new.
+fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".staged");
+    let staged = PathBuf::from(staged);
+    write_private(&staged, body)?;
+    fs::rename(&staged, path)
 }
 
 fn append_line(path: &Path, line: &JournalLine) -> std::io::Result<()> {
@@ -483,12 +638,15 @@ fn load_journal(path: &Path) -> Journal {
         }
         match serde_json::from_slice::<JournalLine>(trimmed) {
             Ok(JournalLine::Started { key, .. }) => {
-                *journal.started.entry(key).or_insert(0) += 1;
+                *journal.started.entry(key.clone()).or_insert(0) += 1;
+                journal.unsettled.insert(key);
             }
             Ok(JournalLine::Result { key, result, .. }) => {
+                journal.unsettled.remove(&key);
                 journal.results.insert(key, result);
             }
             Ok(JournalLine::Settled { key, .. }) => {
+                journal.unsettled.remove(&key);
                 journal.settled.insert(key);
             }
             Err(_) => journal.skipped_lines += 1,
@@ -560,6 +718,68 @@ pub fn read_run_script(
         Err(error) => Err(format!("无法读取运行 {run_id} 保存的脚本：{error}")),
         Ok(bytes) => Ok(Some(bytes)),
     }
+}
+
+/// Reads the `args` bytes the run's latest attempt ran with, for a resume that omits them.
+///
+/// `Ok(None)` means that attempt had no `args`. The caller checks the bytes against the call that
+/// supplied them before trusting them, exactly as it does for `script.js`.
+pub fn read_run_args(
+    app_data_path: &Path,
+    conversation_id: &str,
+    run_id: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    validate_path_component("会话 id", conversation_id)?;
+    validate_path_component("运行 id", run_id)?;
+    let path = app_data_path
+        .join(RUNS_DIRECTORY)
+        .join(conversation_id)
+        .join(run_id)
+        .join(ARGS_FILE);
+    match fs::read(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("无法读取运行 {run_id} 保存的 args：{error}")),
+        Ok(bytes) => Ok(Some(bytes)),
+    }
+}
+
+/// Which provider calls supplied a run's current `script.js` and `args.json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunProvenance {
+    pub script: Option<String>,
+    pub args: Option<String>,
+}
+
+fn read_provenance(path: &Path) -> Option<RunProvenance> {
+    let body = serde_json::from_slice::<Value>(&fs::read(path).ok()?).ok()?;
+    let field = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    };
+    Some(RunProvenance {
+        script: field("script"),
+        args: field("args"),
+    })
+}
+
+/// Reads which calls supplied a run's files, for a resume that reuses them. `None` means no
+/// attempt recorded any — a run from before provenance was kept, or one whose write failed.
+pub fn read_run_provenance(
+    app_data_path: &Path,
+    conversation_id: &str,
+    run_id: &str,
+) -> Result<Option<RunProvenance>, String> {
+    validate_path_component("会话 id", conversation_id)?;
+    validate_path_component("运行 id", run_id)?;
+    Ok(read_provenance(
+        &app_data_path
+            .join(RUNS_DIRECTORY)
+            .join(conversation_id)
+            .join(run_id)
+            .join(PROVENANCE_FILE),
+    ))
 }
 
 /// Reads a complete step record on demand from `steps/<index>.json`.
@@ -691,7 +911,7 @@ pub fn reap_conversation_orphans(
     removed
 }
 
-fn document_conversation_ids(
+pub(crate) fn document_conversation_ids(
     document: &crate::model::AppDocument,
 ) -> std::collections::HashSet<&str> {
     document
@@ -1024,6 +1244,61 @@ mod tests {
         assert_eq!(journal.skipped_lines(), 0);
     }
 
+    /// The chain's three answers come from the latest record per key: a result is reusable
+    /// whenever it was written, a key last seen `started` is unsettled, and a key whose null the
+    /// plan consumed is a miss — until a later attempt starts it again and never settles it.
+    #[test]
+    fn a_key_reads_as_unsettled_while_its_latest_record_is_a_start() {
+        use workflow_core::chain::JournalLookup;
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path());
+        let started = |key: &str| {
+            store.append(&JournalLine::Started {
+                key: key.into(),
+                agent_id: "ws1".into(),
+            })
+        };
+        let settled = |key: &str| {
+            store.append(&JournalLine::Settled {
+                key: key.into(),
+                agent_id: "ws1".into(),
+                error: None,
+            })
+        };
+        started("mw1:done");
+        store.append(&JournalLine::Result {
+            key: "mw1:done".into(),
+            agent_id: "ws1".into(),
+            result: json!("value"),
+        });
+        started("mw1:crashed");
+        started("mw1:failed");
+        settled("mw1:failed");
+        started("mw1:failed-then-crashed");
+        settled("mw1:failed-then-crashed");
+        started("mw1:failed-then-crashed");
+        started("mw1:failed-then-done");
+        settled("mw1:failed-then-done");
+        started("mw1:failed-then-done");
+        store.append(&JournalLine::Result {
+            key: "mw1:failed-then-done".into(),
+            agent_id: "ws2".into(),
+            result: json!(1),
+        });
+
+        let journal = store.load_journal();
+        assert_eq!(journal.lookup("mw1:done"), JournalLookup::Hit);
+        assert_eq!(journal.lookup("mw1:crashed"), JournalLookup::Unsettled);
+        assert_eq!(journal.lookup("mw1:failed"), JournalLookup::Miss);
+        assert_eq!(
+            journal.lookup("mw1:failed-then-crashed"),
+            JournalLookup::Unsettled,
+            "最近一次尝试没结算，计划没收到它的结果"
+        );
+        assert_eq!(journal.lookup("mw1:failed-then-done"), JournalLookup::Hit);
+        assert_eq!(journal.lookup("mw1:never"), JournalLookup::Miss);
+    }
+
     /// A settled record distinguishes a failed step from a host crash and never creates a cache hit.
     #[test]
     fn a_settled_step_is_not_misdiagnosed_as_a_host_crash_and_never_caches() {
@@ -1142,6 +1417,8 @@ mod tests {
         assert!(journal.respawn_diagnostics().is_empty());
     }
 
+    /// `open` pins a fresh run's script; an edited script only enters through a resume's
+    /// `replace_source`, after that script was approved on its own.
     #[test]
     fn reopening_with_an_edited_body_refuses_to_resume_under_the_old_approval() {
         let directory = tempfile::tempdir().unwrap();
@@ -1151,6 +1428,88 @@ mod tests {
 
         let error = RunStore::open(directory.path(), "conv1", "run1", b"{\"a\":2}").unwrap_err();
         assert!(error.contains("脚本内容在批准后发生变化"), "{error}");
+    }
+
+    /// A resume opens the run it names without creating one, and adopts a re-approved script by
+    /// replacing the pinned one whole.
+    #[test]
+    fn a_resume_opens_only_an_existing_run_and_adopts_its_reapproved_script() {
+        let directory = tempfile::tempdir().unwrap();
+        let run_path = directory
+            .path()
+            .join(RUNS_DIRECTORY)
+            .join("conv1")
+            .join("run1");
+        assert!(RunStore::open_existing(directory.path(), "conv1", "run1")
+            .unwrap()
+            .is_none());
+        assert!(!run_path.exists(), "找不到的恢复不得建出运行目录");
+
+        let original = RunStore::open(directory.path(), "conv1", "run1", b"old").unwrap();
+        let original_digest = original.source_digest().to_owned();
+        drop(original);
+        let mut resumed = RunStore::open_existing(directory.path(), "conv1", "run1")
+            .unwrap()
+            .expect("既有运行可以恢复");
+        assert_eq!(resumed.source_digest(), original_digest);
+
+        resumed.replace_source(b"old").unwrap();
+        assert_eq!(resumed.source_digest(), original_digest, "同一脚本不重写");
+        resumed.replace_source(b"edited").unwrap();
+        assert_eq!(resumed.source_digest(), hex_digest(b"edited"));
+        assert_eq!(
+            read_run_script(directory.path(), "conv1", "run1").unwrap(),
+            Some(b"edited".to_vec())
+        );
+        assert!(
+            !run_path.join("script.js.staged").exists(),
+            "暂存文件改名后不得留下"
+        );
+        assert_eq!(
+            RunStore::open_existing(directory.path(), "conv1", "run1")
+                .unwrap()
+                .unwrap()
+                .source_digest(),
+            hex_digest(b"edited")
+        );
+    }
+
+    /// The args a run ran with are saved as the exact bytes the timeline fingerprints.
+    #[test]
+    fn saved_args_are_the_bytes_the_timeline_fingerprints() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path());
+        assert_eq!(read_run_args(directory.path(), "conv1", "run1").unwrap(), None);
+
+        let args = json!({"files": ["a.rs", "b.rs"], "depth": 2});
+        store.write_args(&args);
+        assert_eq!(
+            read_run_args(directory.path(), "conv1", "run1").unwrap(),
+            Some(serde_json::to_vec(&args).unwrap())
+        );
+        let replaced = json!(["c.rs"]);
+        store.write_args(&replaced);
+        assert_eq!(
+            read_run_args(directory.path(), "conv1", "run1").unwrap(),
+            Some(serde_json::to_vec(&replaced).unwrap())
+        );
+    }
+
+    /// A later attempt that runs a different step at an index overwrites that index's record; a
+    /// replay of the earlier step must not claim it. Records from before key files stay claimable.
+    #[test]
+    fn a_step_record_overwritten_by_another_step_is_not_claimed_by_the_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path());
+        assert!(store.write_step(0, "mw1:first", &json!({"task": "first"})));
+        assert!(store.step_matches(0, "mw1:first"));
+        assert!(store.write_step(0, "mw1:second", &json!({"task": "second"})));
+        assert!(!store.step_matches(0, "mw1:first"));
+        assert!(store.step_matches(0, "mw1:second"));
+
+        let steps = store.directory().join(STEPS_DIRECTORY);
+        fs::write(steps.join("1.json"), b"{}").unwrap();
+        assert!(store.step_matches(1, "mw1:anything"), "旧记录没有键文件，照旧认领");
     }
 
     /// Run records follow conversation deletion and cannot remove another conversation's records.
@@ -1262,7 +1621,6 @@ mod tests {
     /// A live driver lock prevents the sweep from claiming a running manifest. It may be claimed
     /// only after the lock releases. This test is Windows-only because `share_mode(0)` supplies the
     /// required zero-dependency liveness guarantee there.
-    #[cfg(windows)]
     #[test]
     fn a_live_driver_lock_shields_a_running_manifest_from_the_sweep() {
         let directory = tempfile::tempdir().unwrap();
@@ -1290,10 +1648,10 @@ mod tests {
     fn a_step_record_round_trips_and_a_missing_one_reads_as_none() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(directory.path());
-        assert!(!store.step_exists(0));
+        assert!(!store.step_matches(0, "mw1:a"));
         let record = json!({"task": "检查调度器", "status": "completed"});
-        assert!(store.write_step(0, &record));
-        assert!(store.step_exists(0));
+        assert!(store.write_step(0, "mw1:a", &record));
+        assert!(store.step_matches(0, "mw1:a"));
 
         assert_eq!(
             read_step_record(directory.path(), "conv1", "run1", 0).unwrap(),

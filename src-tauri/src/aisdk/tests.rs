@@ -145,6 +145,8 @@ fn request_for(upstream: &Upstream, model_id: &str) -> StepRequest {
         native_search: None,
         native_fetch: None,
         agent: None,
+        tool_append: false,
+        system_append: false,
     }
 }
 
@@ -1157,4 +1159,27 @@ pub(crate) fn failing_then_succeeding_upstream() -> Upstream {
         base_url: format!("http://127.0.0.1:{port}/v1"),
         seen: Arc::new(Mutex::new(None)),
     }
+}
+
+/// Arguments are read for what the model meant, never invented: an object is
+/// the call, a twice-encoded object is that object, and anything else is kept
+/// verbatim under `_raw` so the call is refused for what it is instead of
+/// running with no arguments at all.
+#[test]
+fn call_arguments_keep_what_the_model_sent() {
+    use super::call_arguments;
+    assert_eq!(
+        Value::Object(call_arguments(json!({"path": "a.txt"}))),
+        json!({"path": "a.txt"})
+    );
+    assert_eq!(
+        Value::Object(call_arguments(json!("{\"path\":\"a.txt\"}"))),
+        json!({"path": "a.txt"})
+    );
+    assert_eq!(
+        Value::Object(call_arguments(json!("{\"path\":\"a.t"))),
+        json!({"_raw": "{\"path\":\"a.t"})
+    );
+    assert_eq!(Value::Object(call_arguments(json!([1, 2]))), json!({"_raw": [1, 2]}));
+    assert_eq!(Value::Object(call_arguments(Value::Null)), json!({}));
 }

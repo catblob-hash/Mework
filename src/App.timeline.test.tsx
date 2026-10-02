@@ -9,7 +9,8 @@ import type {
   ModelRunRequest,
   ToolContext
 } from "./types";
-import { resetAppMocks, answeredQuestionPair, documentWithModel, openTasksPane, model, runtimeMocks, taskCreateContext, taskGetContext, taskListContext, taskUpdateContext } from "./test/appMocks";
+import { resetAppMocks, answeredQuestionPair, documentWithModel, model, runtimeMocks } from "./test/appMocks";
+import { EMPTY_TOOL_LOCK } from "./lib/toolLock";
 
 vi.mock("./lib/runtime", async (importOriginal) => {
   const { runtimeMocks } = await import("./test/appMockInstances");
@@ -31,6 +32,9 @@ vi.mock("./lib/git", async (importOriginal) => {
 vi.mock("./components/TerminalPanel", async () => (await import("./test/appMockInstances")).terminalPanelModuleMock());
 
 afterEach(() => configureI18n("zh-CN"));
+
+/** The main conversation's timeline, where the undo keys answer. */
+const mainTimeline = () => window.document.querySelector<HTMLElement>(".conversation-pane__main .context-scroll")!;
 
 describe("App model run flow — timeline", () => {
   beforeEach(resetAppMocks);
@@ -100,14 +104,14 @@ describe("App model run flow — timeline", () => {
       conversationId: document.workspaces[0].conversations[0].id,
       workspacePath: document.workspaces[0].path,
       model,
-      reasoningEffort: "disabled",
+      reasoningEffort: "low",
       contexts: [expect.objectContaining({ kind: "user", content: "请检查项目" })]
     }), expect.any(Function), expect.any(String));
     expect(await screen.findByText("模型已经回复")).toBeInTheDocument();
     expect(composer).toHaveValue("");
   });
 
-  it("closes a pending question by deleting its message and restores it with one undo", async () => {
+  it("deletes an unanswered question from before questions blocked, and restores it with one undo", async () => {
     const document = documentWithModel();
     const { ask } = answeredQuestionPair();
     document.workspaces[0].conversations[0].contexts = [ask];
@@ -115,18 +119,77 @@ describe("App model run flow — timeline", () => {
     const user = userEvent.setup();
 
     render(<App />);
-    expect(await screen.findByRole("dialog", { name: "需要你的回答" })).toBeInTheDocument();
-    expect(screen.getByLabelText("回答 Agent 的提问")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "关闭并删除提问" }));
+    // An old paused question has no card to answer: it sits in the timeline.
+    expect(await screen.findByText("采用哪个方案？")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "删除提问" }));
 
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "需要你的回答" })).not.toBeInTheDocument());
-    expect(screen.getByLabelText("向 Agent 发送消息")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("采用哪个方案？")).not.toBeInTheDocument());
     expect(runtimeMocks.runModel).not.toHaveBeenCalled();
+    // No undo control below the timeline: one line says what happened and which key takes it back.
+    expect(screen.queryByRole("button", { name: /撤销删除/ })).not.toBeInTheDocument();
+    const notice = screen.getByText("已删除 1 条消息").closest(".timeline-notice") as HTMLElement;
+    expect(within(notice).getByText("Ctrl+Z")).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "撤销删除提问消息" }));
-    expect(await screen.findByRole("dialog", { name: "需要你的回答" })).toBeInTheDocument();
-    expect(screen.getByText("采用哪个方案？")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "撤销删除提问消息" })).not.toBeInTheDocument();
+    await waitFor(() => expect(mainTimeline()).toHaveFocus());
+    await user.keyboard("{Control>}z{/Control}");
+    expect(await screen.findByText("采用哪个方案？")).toBeInTheDocument();
+    expect(screen.getByText("已撤回：删除提问消息")).toBeInTheDocument();
+  });
+
+  it("answers the undo keys only while focus is in the timeline, and redoes with Ctrl+X", async () => {
+    const document = documentWithModel();
+    const { ask } = answeredQuestionPair();
+    document.workspaces[0].conversations[0].contexts = [ask];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+
+    render(<App />);
+    expect(await screen.findByText("采用哪个方案？")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "删除提问" }));
+    await waitFor(() => expect(screen.queryByText("采用哪个方案？")).not.toBeInTheDocument());
+
+    // The composer's own Ctrl+Z belongs to its text.
+    await user.click(screen.getByLabelText("向 Agent 发送消息"));
+    await user.keyboard("{Control>}z{/Control}");
+    expect(screen.queryByText("采用哪个方案？")).not.toBeInTheDocument();
+
+    mainTimeline().focus();
+    await user.keyboard("{Control>}z{/Control}");
+    expect(await screen.findByText("采用哪个方案？")).toBeInTheDocument();
+    await user.keyboard("{Control>}x{/Control}");
+    await waitFor(() => expect(screen.queryByText("采用哪个方案？")).not.toBeInTheDocument());
+    expect(screen.getByText("已重做：删除提问消息")).toBeInTheDocument();
+    // Both directions are spent until something else happens.
+    await user.keyboard("{Control>}x{/Control}");
+    expect(screen.getByText("没有可重做的修改")).toBeInTheDocument();
+  });
+
+  it("keeps each conversation's undo history to itself", async () => {
+    const document = documentWithModel();
+    const [first] = document.workspaces[0].conversations;
+    first.contexts = [{ id: "first-reply", kind: "assistant", content: "第一段对话的回复", createdAt: "2026-07-24T00:00:00Z" }];
+    const second = {
+      ...structuredClone(first),
+      id: "conv_second",
+      title: "第二段对话",
+      contexts: [{ id: "second-reply", kind: "assistant" as const, content: "第二段对话的回复", createdAt: "2026-07-24T00:00:00Z" }]
+    };
+    document.workspaces[0].conversations.push(second);
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    const user = userEvent.setup();
+
+    render(<App />);
+    const firstReply = (await screen.findByText("第一段对话的回复")).closest("article") as HTMLElement;
+    await user.click(within(firstReply).getByRole("button", { name: "删除上下文" }));
+    await waitFor(() => expect(screen.queryByText("第一段对话的回复")).not.toBeInTheDocument());
+
+    await user.click(screen.getByText("第二段对话"));
+    expect(await screen.findByText("第二段对话的回复")).toBeInTheDocument();
+    mainTimeline().focus();
+    await user.keyboard("{Control>}z{/Control}");
+    expect(screen.getByText("没有可撤回的修改")).toBeInTheDocument();
+    expect(screen.getByText("第二段对话的回复")).toBeInTheDocument();
   });
 
   it("deletes and restores an answered question and answer as one timeline message", async () => {
@@ -146,208 +209,52 @@ describe("App model run flow — timeline", () => {
     await waitFor(() => expect(screen.queryByText("采用哪个方案？")).not.toBeInTheDocument());
     expect(screen.queryByText("方案 A")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "撤销删除整条提问消息" }));
+    await waitFor(() => expect(mainTimeline()).toHaveFocus());
+    await user.keyboard("{Control>}z{/Control}");
     const restored = (await screen.findByText("采用哪个方案？")).closest(".question-history") as HTMLElement;
     expect(within(restored).getByText("方案 A")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "需要你的回答" })).not.toBeInTheDocument();
   });
 
-  it("rolls a completed task card back when its todo update action is deleted", async () => {
+  it("deletes a tool call row and restores it from the undo entry", async () => {
     const appDocument = documentWithModel();
     const conversation = appDocument.workspaces[0].conversations[0];
-    conversation.contexts = [
-      taskCreateContext("task-rollback-create", "task-rollback", "回退任务"),
-      taskUpdateContext("task-rollback-start", "task-rollback", "in_progress"),
-      taskUpdateContext("task-rollback-complete", "task-rollback", "completed")
-    ];
+    const readCall = (id: string, path: string): ToolContext => ({
+      id,
+      kind: "tool",
+      toolName: "read",
+      round: 1,
+      input: { path },
+      result: { success: true, output: `${path} 的内容`, executedAt: "2026-07-24T00:00:00Z", durationMs: 1 },
+      createdAt: "2026-07-24T00:00:00Z"
+    });
+    conversation.contexts = [readCall("read-kept", "src/kept.ts"), readCall("read-deleted", "src/deleted.ts")];
     runtimeMocks.loadDocument.mockResolvedValue(appDocument);
     const user = userEvent.setup();
 
     render(<App />);
-    // The task surface is a side pane beside the conversation now, so the
-    // progress header is read inside that pane's region.
-    const taskStatus = await openTasksPane(user);
-    expect(within(taskStatus).getByLabelText("任务进度 1/1")).toBeInTheDocument();
-    // The localized phrase is visible on the row; wire name, task target, and
-    // completion state live in its title, which distinguishes these updates.
-    const completedUpdateRow = () => window.document
-      .querySelector<HTMLButtonElement>('[data-context-id="task-rollback-complete"] .timeline-row__summary');
-    const completedUpdate = await waitFor(() => {
-      const row = completedUpdateRow();
-      expect(row).not.toBeNull();
-      expect(row).toHaveAttribute("title", "todo · task-rollback · 完成");
-      expect(row).toHaveAccessibleName("更新了任务 · todo · task-rollback · 完成");
-      expect(row!.closest("article")).toHaveClass("timeline-row--success");
-      expect(row!.closest("article")?.querySelector(".timeline-row__line")).toBeNull();
-      return row!;
+    const deletedRow = () => window.document.querySelector<HTMLElement>('[data-context-id="read-deleted"]');
+    const row = await waitFor(() => {
+      expect(deletedRow()).not.toBeNull();
+      return deletedRow()!;
     });
-    // The compact state marker is gone: a task write is an ordinary tool row
-    // inside the block, addressed by the same data-context-id as before.
-    expect(completedUpdate.closest("[data-context-id]")).toHaveAttribute(
-      "data-context-id",
-      "task-rollback-complete"
-    );
 
     runtimeMocks.saveDocument.mockClear();
-    await user.click(within(completedUpdate.closest("[data-context-id]") as HTMLElement).getByRole("button", { name: "删除工具调用 更新了任务" }));
+    await user.click(within(row).getByRole("button", { name: "删除工具调用 已读取：deleted.ts" }));
 
-    await waitFor(() => {
-      expect(window.document.querySelector('[data-context-id="task-rollback-complete"]')).toBeNull();
-      expect(within(taskStatus).getByLabelText("任务进度 0/1")).toBeInTheDocument();
-      expect(within(taskStatus).getByText("正在回退任务")).toBeInTheDocument();
-    });
+    await waitFor(() => expect(deletedRow()).toBeNull());
     await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some(([saved]) => (
       saved.workspaces[0].conversations[0].contexts.map((context: { id: string }) => context.id).join(",")
-      === "task-rollback-create,task-rollback-start"
+      === "read-kept"
     ))).toBe(true));
 
-    await user.click(screen.getByRole("button", { name: "撤销删除工具调用" }));
-    await waitFor(() => expect(completedUpdateRow()).toBeDefined());
-    await waitFor(() => expect(within(taskStatus).getByLabelText("任务进度 1/1")).toBeInTheDocument());
-  });
-
-  it("deletes the first todo create action as one task-list cascade across inactive branches and restores it once", async () => {
-    const appDocument = documentWithModel();
-    const conversation = appDocument.workspaces[0].conversations[0];
-    conversation.contexts = [
-      taskCreateContext("task-list-root", "task-root", "主任务"),
-      taskUpdateContext("task-root-start", "task-root", "in_progress"),
-      taskCreateContext("task-list-second", "task-second", "第二任务"),
-      taskUpdateContext("task-second-complete", "task-second", "completed"),
-      taskGetContext("task-second-get", "task-second", "第二任务"),
-      taskListContext("task-list-main-read", ["task-root", "task-second"]),
-      {
-        id: "task-list-fork",
-        kind: "user",
-        content: "建立任务分支",
-        createdAt: "2026-07-24T00:00:00Z"
-      },
-      {
-        id: "task-list-survivor",
-        kind: "assistant",
-        content: "保留的普通消息",
-        createdAt: "2026-07-24T00:00:01Z"
-      }
-    ];
-    conversation.branches = [
-      {
-        id: "task-list-inactive",
-        forkContextId: "task-list-fork",
-        active: false,
-        contexts: [
-          taskUpdateContext("task-root-branch-update", "task-root", "completed"),
-          taskGetContext("task-root-branch-get", "task-root", "主任务"),
-          taskListContext("task-list-branch-read", ["task-root"])
-        ],
-        createdAt: "2026-07-24T00:00:02Z",
-        updatedAt: "2026-07-24T00:00:02Z"
-      },
-      {
-        id: "task-list-active",
-        forkContextId: "task-list-fork",
-        active: true,
-        contexts: [],
-        createdAt: "2026-07-24T00:00:03Z",
-        updatedAt: "2026-07-24T00:00:03Z"
-      }
-    ];
-    runtimeMocks.loadDocument.mockResolvedValue(appDocument);
-    const user = userEvent.setup();
-
-    render(<App />);
-    await openTasksPane(user);
-    expect(screen.getByRole("region", { name: "任务清单" })).toBeInTheDocument();
-    const rootCreate = window.document.querySelector<HTMLElement>('[data-context-id="task-list-root"]');
-    expect(rootCreate).not.toBeNull();
-
-    runtimeMocks.saveDocument.mockClear();
-    await user.click(within(rootCreate!).getByRole("button", { name: "删除工具调用 创建了任务" }));
-
-    await waitFor(() => expect(screen.queryByRole("region", { name: "任务清单" })).not.toBeInTheDocument());
-    await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some(([saved]) => {
-      const savedConversation = saved.workspaces[0].conversations[0];
-      const mainIds = savedConversation.contexts.map((context: { id: string }) => context.id);
-      const inactiveIds = savedConversation.branches
-        .find((branch: { id: string }) => branch.id === "task-list-inactive")
-        ?.contexts.map((context: { id: string }) => context.id);
-      const everyToolName = [
-        ...savedConversation.contexts,
-        ...savedConversation.branches.flatMap((branch: { contexts: ToolContext[] }) => branch.contexts)
-      ].flatMap((context: { kind: string; toolName?: string }) => (
-        context.kind === "tool" ? [context.toolName] : []
-      ));
-      return mainIds.join(",") === "task-list-fork,task-list-survivor"
-        && inactiveIds?.length === 0
-        && everyToolName.every((name: string | undefined) => name !== "todo");
-    })).toBe(true));
-
-    await user.click(screen.getByRole("button", { name: "撤销删除任务状态消息" }));
-
-    await openTasksPane(user);
-    expect(await screen.findByRole("region", { name: "任务清单" })).toBeInTheDocument();
-    await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some(([saved]) => {
-      const savedConversation = saved.workspaces[0].conversations[0];
-      const mainIds = savedConversation.contexts.map((context: { id: string }) => context.id);
-      const inactiveIds = savedConversation.branches
-        .find((branch: { id: string }) => branch.id === "task-list-inactive")
-        ?.contexts.map((context: { id: string }) => context.id);
-      return mainIds.join(",") === [
-        "task-list-root",
-        "task-root-start",
-        "task-list-second",
-        "task-second-complete",
-        "task-second-get",
-        "task-list-main-read",
-        "task-list-fork",
-        "task-list-survivor"
-      ].join(",")
-        && inactiveIds?.join(",") === [
-          "task-root-branch-update",
-          "task-root-branch-get",
-          "task-list-branch-read"
-        ].join(",");
-    })).toBe(true));
-  });
-
-  it("deletes only a later todo create action and its related updates and reads", async () => {
-    const appDocument = documentWithModel();
-    const conversation = appDocument.workspaces[0].conversations[0];
-    conversation.contexts = [
-      taskCreateContext("task-later-root", "task-first", "保留任务"),
-      taskUpdateContext("task-first-start", "task-first", "in_progress"),
-      taskGetContext("task-first-get", "task-first", "保留任务"),
-      taskCreateContext("task-later-create", "task-later", "后续任务"),
-      taskUpdateContext("task-later-update", "task-later", "completed"),
-      taskGetContext("task-later-get", "task-later", "后续任务"),
-      taskListContext("task-later-list", ["task-first", "task-later"])
-    ];
-    runtimeMocks.loadDocument.mockResolvedValue(appDocument);
-    const user = userEvent.setup();
-
-    render(<App />);
-    const taskStatus = await openTasksPane(user);
-    expect(within(taskStatus).getByLabelText("任务进度 1/2")).toBeInTheDocument();
-    const laterCreate = window.document.querySelector<HTMLElement>('[data-context-id="task-later-create"]');
-    expect(laterCreate).not.toBeNull();
-
-    runtimeMocks.saveDocument.mockClear();
-    await user.click(within(laterCreate!).getByRole("button", { name: "删除工具调用 创建了任务" }));
-
-    await waitFor(() => {
-      expect(within(taskStatus).getByLabelText("任务进度 0/1")).toBeInTheDocument();
-      expect(within(taskStatus).queryByText("后续任务")).not.toBeInTheDocument();
-      expect(within(taskStatus).getByText("正在保留任务")).toBeInTheDocument();
-    });
-    await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some(([saved]) => {
-      const ids = saved.workspaces[0].conversations[0].contexts
-        .map((context: { id: string }) => context.id);
-      return ids.join(",") === [
-        "task-later-root",
-        "task-first-start",
-        "task-first-get",
-        "task-later-list"
-      ].join(",");
-    })).toBe(true));
+    await waitFor(() => expect(mainTimeline()).toHaveFocus());
+    await user.keyboard("{Control>}z{/Control}");
+    await waitFor(() => expect(deletedRow()).not.toBeNull());
+    await waitFor(() => expect(runtimeMocks.saveDocument.mock.calls.some(([saved]) => (
+      saved.workspaces[0].conversations[0].contexts.map((context: { id: string }) => context.id).join(",")
+      === "read-kept,read-deleted"
+    ))).toBe(true));
   });
 
   it("edits an answered question and its mapped answer in one fixed-count editor", async () => {
@@ -497,6 +404,15 @@ describe("App model run flow — timeline", () => {
     const conversation = document.workspaces[0].conversations[0];
     conversation.title = "修复登录";
     conversation.settings.enabledTools = ["read"];
+    const sentAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const lastRequest = { providerId: document.globalSettings.apiProviders[0].id, modelId: "test-model", at: sentAt };
+    conversation.settings.toolLock = {
+      ...EMPTY_TOOL_LOCK,
+      tools: ["read"],
+      promptSkillIds: [],
+      lastRequest,
+      modelRequests: [lastRequest]
+    };
     conversation.contexts = [
       { id: "fork-u1", kind: "user", content: "第一问", createdAt: "2026-07-20T00:00:01Z" },
       { id: "fork-a1", kind: "assistant", content: "第一答", createdAt: "2026-07-20T00:00:02Z" },
@@ -536,6 +452,11 @@ describe("App model run flow — timeline", () => {
     expect(first.forkOf).toEqual({ conversationId: conversation.id, number: 1 });
     // It carries on the source's work, so it keeps the source's settings.
     expect(first.settings.enabledTools).toEqual(["read"]);
+    // And the source's cache: the same lock, down to the moment it was sent,
+    // so it runs out when the source's does rather than starting over.
+    expect(first.settings.toolLock?.lastRequest).toEqual(lastRequest);
+    expect(first.settings.toolLock?.modelRequests).toEqual([lastRequest]);
+    expect(first.settings.toolLock?.tools).toEqual(["read"]);
     // Nothing is handed to the composer, and the source keeps its whole timeline.
     expect(screen.getByRole("textbox", { name: "向 Agent 发送消息" })).toHaveValue("");
     expect(saved().find((candidate) => candidate.id === conversation.id)?.contexts).toHaveLength(3);
@@ -579,5 +500,45 @@ describe("App model run flow — timeline", () => {
     await waitFor(() => expect(composer).toHaveValue("唯一的问题"));
     // There is nothing before the branch point, so the host is never asked.
     expect(runtimeMocks.forkConversationContexts).not.toHaveBeenCalled();
+  });
+
+  it("carries the source's lock into a branch that copies history, and none into one that does not", async () => {
+    const document = documentWithModel();
+    const conversation = document.workspaces[0].conversations[0];
+    const lastRequest = {
+      providerId: document.globalSettings.apiProviders[0].id,
+      modelId: "test-model",
+      at: new Date(Date.now() - 5 * 60_000).toISOString()
+    };
+    conversation.settings.toolLock = { ...EMPTY_TOOL_LOCK, promptSkillIds: [], lastRequest, modelRequests: [lastRequest] };
+    conversation.contexts = [
+      { id: "lock-u1", kind: "user", content: "第一问", createdAt: "2026-07-20T00:00:01Z" },
+      { id: "lock-a1", kind: "assistant", content: "第一答", createdAt: "2026-07-20T00:00:02Z" },
+      { id: "lock-u2", kind: "user", content: "第二问", createdAt: "2026-07-20T00:00:03Z" }
+    ];
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.forkConversationContexts.mockImplementation(async ({ sourceContexts, throughContextId }: {
+      sourceContexts: ContextItem[];
+      throughContextId: string;
+    }) => sourceContexts
+      .slice(0, sourceContexts.findIndex((context) => context.id === throughContextId) + 1)
+      .map((context) => ({ ...context, id: `${context.id}-copy` })));
+    const branches = () => (runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined)
+      ?.workspaces[0].conversations.filter((candidate) => candidate.parentConversationId === conversation.id) ?? [];
+
+    const user = userEvent.setup();
+    render(<App />);
+    const secondQuestion = (await screen.findByText("第二问")).closest("article")!;
+    await user.click(within(secondQuestion).getByRole("button", { name: "从此消息分支" }));
+    await waitFor(() => expect(branches()).toHaveLength(1));
+    expect(branches()[0].settings.toolLock?.lastRequest).toEqual(lastRequest);
+
+    const originRow = window.document.querySelector<HTMLElement>(`[data-conversation-id="${conversation.id}"]`)!;
+    await user.click(within(originRow).getByText(conversation.title));
+    const firstQuestion = (await screen.findByText("第一问")).closest("article")!;
+    await user.click(within(firstQuestion).getByRole("button", { name: "从此消息分支" }));
+    await waitFor(() => expect(branches()).toHaveLength(2));
+    const empty = branches().find((candidate) => candidate.contexts.length === 0);
+    expect(empty?.settings.toolLock).toBeUndefined();
   });
 });

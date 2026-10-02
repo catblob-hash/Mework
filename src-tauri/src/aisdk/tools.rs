@@ -18,11 +18,12 @@ use crate::prompt_profile::PromptProfile;
 pub(crate) fn enabled_tools(request: &RunModelRequest) -> Vec<&ToolDescriptor> {
     let enabled = request.enabled_tools.iter().collect::<HashSet<_>>();
     let supports_vision = request.model.supports_vision();
-    // Derived here rather than read from `enabled_tools` because the security
-    // level moves mid-turn: the step after plan approval must no longer
-    // advertise `plan` or `exit_plan_mode`.
-    let plan_tools =
-        crate::plan_mode::derived_tools(request.effective_security_level(), request.subagent_depth);
+    // Derived here rather than read from `enabled_tools`: the plan pair follows
+    // the conversation's plan-mode switch, never a name the renderer wrote.
+    let plan_tools = crate::plan_mode::derived_tools(request.plan_tools, request.subagent_depth);
+    // Same for the handoff tools, which the run arms mid-turn once the context
+    // crosses the auto-compact threshold.
+    let handoff_tools = crate::handoff::derived_tools(request);
     request
         .tools
         .iter()
@@ -30,7 +31,11 @@ pub(crate) fn enabled_tools(request: &RunModelRequest) -> Vec<&ToolDescriptor> {
         // native approval callback before execution. Orchestration tools are advertised
         // too: the run loop executes them itself (subagent/ask_user) or via the pure
         // host-side executor (Task*); subagent runs exclude them from this list.
-        .filter(|tool| enabled.contains(&tool.name) || plan_tools.contains(&tool.name.as_str()))
+        .filter(|tool| {
+            enabled.contains(&tool.name)
+                || plan_tools.contains(&tool.name.as_str())
+                || handoff_tools.contains(&tool.name.as_str())
+        })
         .filter(|tool| supports_vision || is_usable_without_vision(&tool.name))
         // A shell tool is advertised only where its shell is: the tool list a
         // conversation shows is the union of its machines' backends, and a

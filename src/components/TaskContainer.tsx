@@ -11,16 +11,16 @@ import {
   Terminal,
   Workflow as WorkflowIcon
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useI18n } from "../i18n";
 import {
   deriveTaskItems,
   finishedTaskItems,
-  runningTaskItems
+  runningTaskItems,
+  shellTaskDirectory
 } from "../lib/taskContainer";
 import type { TaskContainerMessages, TaskItem } from "../lib/taskContainer";
-import type { AgentStatus, TodoItemView } from "../lib/orchestration";
 import type { ConversationPlan, ForkDecisionRecord, UserAbortedTaskRecord } from "../types";
 import type { SubagentView } from "../lib/subagents";
 import type { TerminalSessionState } from "../lib/terminal";
@@ -29,7 +29,9 @@ import type { BrowserStatus } from "../lib/browser";
 import type { PreviewServerSnapshot } from "../lib/preview";
 import type { WorkflowProgressView } from "../lib/workflowProgress";
 import { deriveWorkflowRun } from "../lib/workflowRuns";
+import { subscribeToolExplanations, toolExplanation, toolExplanationVersion } from "../lib/localModel";
 import { IconButton } from "./Common";
+import { PathText } from "./PathText";
 import { RollingNumber } from "./RollingNumber";
 import { WorkflowRunPanel } from "./WorkflowRunPanel";
 import "./TaskContainer.css";
@@ -69,13 +71,6 @@ export interface TasksPaneProps {
    * own. A role-less child runs on exactly this; its record cannot say so.
    */
   inheritedModelId?: string | null;
-  /**
-   * Whether the conversation has more than one workspace, which is when a shell
-   * row names the workspace its command ran in.
-   */
-  multipleWorkspaces?: boolean;
-  /** Todo plan, shown above the list as the run's own summary. */
-  status?: AgentStatus;
   /** Agent view currently shown in the main area, so its row reads as selected. */
   selectedAgentId: string | null;
   /**
@@ -250,6 +245,8 @@ function TaskRow({
       : agentRow && item.agent.id === selectedAgentId
   );
   const stopping = stoppingIds.has(item.id);
+  const labelClass = `task-row__label${item.state === "running" ? " pulse-text" : ""}`;
+  const shellDirectory = item.kind === "shell" ? shellTaskDirectory(item.shell) : null;
 
   const activate = () => {
     if (agentRow) onSelectAgent(item.agent.id);
@@ -285,8 +282,19 @@ function TaskRow({
         <span className="task-row__copy">
           {/* A running row's title carries the same left-to-right sweep the
               stream indicator uses, so "still working" reads the same way
-              wherever it appears. */}
-          <span className={`task-row__label${item.state === "running" ? " pulse-text" : ""}`}>{item.label}</span>
+              wherever it appears. A shell's title is a path, so it gives way
+              in the middle like every other path; a failed one keeps the
+              row's error as its hover text. */}
+          {shellDirectory !== null && item.kind === "shell" ? (
+            <PathText
+              className={labelClass}
+              prefix={`${item.shell.toolName}:`}
+              path={shellDirectory}
+              title={item.error ? null : undefined}
+            />
+          ) : (
+            <span className={labelClass}>{item.label}</span>
+          )}
           <span className="task-row__detail">{item.detail}</span>
         </span>
         <TaskMetricColumns item={item} />
@@ -321,88 +329,6 @@ function TaskRow({
 }
 
 /**
- * The run's todo plan, at the top of the task sidebar.
- * The plan collapses because it can run to a dozen entries and the tasks below
- * it are what the panel is for; the progress bar keeps it legible while closed.
- */
-function TaskStatusHeader({ status }: { status: AgentStatus }) {
-  const { t } = useI18n();
-  const [planOpen, setPlanOpen] = useState(false);
-  const todo: TodoItemView[] = status.todo ?? [];
-  const done = todo.filter((item) => item.status === "completed").length;
-  const active = todo.find((item) => item.status === "in_progress");
-  // A todo may name a dependency that is itself still open, which is the one
-  // reason an entry can be pending while nothing blocks the rest of the plan.
-  const completedIds = new Set(todo.flatMap((item) => (
-    item.id && item.status === "completed" ? [item.id] : []
-  )));
-  if (!todo.length) return null;
-  return (
-    <section className="task-status" aria-label={t("计划", "Plan")}>
-      {todo.length > 0 && (
-        <div role="region" aria-label={t("任务清单", "Task list")}>
-          <button
-            type="button"
-            className="task-status__toggle"
-            aria-expanded={planOpen}
-            onClick={() => setPlanOpen((current) => !current)}
-          >
-            <ChevronRight
-              size={12}
-              aria-hidden="true"
-              className={`task-status__chevron${planOpen ? " task-status__chevron--open" : ""}`}
-            />
-            <span className="task-status__summary">
-              {active?.activeForm || active?.content || t("计划", "Plan")}
-            </span>
-            <span className="task-status__count">{done}/{todo.length}</span>
-          </button>
-          <div
-            className="task-status__progress"
-            aria-label={t(
-              "任务进度 {completed}/{total}",
-              "Task progress {completed}/{total}",
-              { completed: done, total: todo.length }
-            )}
-          >
-            <span style={{ width: `${Math.round((done / todo.length) * 100)}%` }} />
-          </div>
-          {planOpen && (
-            <ul className="task-status__todo">
-              {todo.map((item, index) => {
-                const blocked = item.blockedBy?.filter((id) => !completedIds.has(id)).length ?? 0;
-                return (
-                  <li
-                    key={item.id ?? `${index}-${item.content}`}
-                    className={`task-status__todo-item task-status__todo-item--${item.status}`}
-                    title={item.description}
-                  >
-                    <span className="task-status__todo-marker" aria-hidden="true" />
-                    <span className="task-status__todo-copy">
-                      <span>{item.content}</span>
-                      {blocked > 0 && (
-                        <small>{t(
-                          "等待 {count} 个前置任务",
-                          "Waiting for {count} dependencies",
-                          { count: blocked }
-                        )}</small>
-                      )}
-                      {blocked === 0 && item.owner && (
-                        <small>{t("负责人：{owner}", "Owner: {owner}", { owner: item.owner })}</small>
-                      )}
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </div>
-      )}
-    </section>
-  );
-}
-
-/**
  * Localized task-row copy.
  *
  * Shared with the message stream, which derives the same workflow runs this
@@ -421,11 +347,8 @@ export function taskContainerMessages(t: ReturnType<typeof useI18n>["t"]): TaskC
     terminalIdle: t("空闲", "Idle"),
     terminalBusy: t("正在执行命令", "Running a command"),
     shellRunning: t("正在运行", "Running"),
-    shellStopping: t("正在中止", "Stopping"),
     shellExited: (code) => t("已失败（退出码 {code}）", "Failed (exit {code})", { code }),
-    shellFinished: t("已完成", "Finished"),
     shellFailed: t("已失败", "Failed"),
-    shellStopped: t("已中止", "Stopped"),
     previewLabel: t("开发服务器", "Dev server"),
     previewStarting: t("启动中", "Starting"),
     previewRunning: t("运行中", "Running"),
@@ -434,7 +357,6 @@ export function taskContainerMessages(t: ReturnType<typeof useI18n>["t"]): TaskC
     browserSuspended: t("已挂起", "Suspended"),
     browserIdle: t("已就绪", "Ready"),
     browserAutomation: (tool) => t("模型正在操作：{tool}", "Model is driving: {tool}", { tool }),
-    // Not just "计划": the todo checklist above the list already owns that word.
     planLabel: t("实施计划", "Implementation plan"),
     planDrafting: t("撰写中", "Drafting"),
     planAwaitingApproval: t("待批准", "Awaiting approval"),
@@ -461,8 +383,10 @@ export function taskContainerMessages(t: ReturnType<typeof useI18n>["t"]): TaskC
 /**
  * The conversation's running work as one tree: every subagent, workflow,
  * terminal, shell command, web search and dev server is a row. Children sit at the same left
- * edge as their parents and are collapsed until asked for. Finished rows
- * collapse behind a single "finish" disclosure so the list stays about now.
+ * edge as their parents and are collapsed until asked for. Finished rows of
+ * every kind share one list under a single "finish" disclosure — open until
+ * the user folds it, latest to finish first — so what just ended sits right
+ * under what is still running.
  *
  * A preview page is the one thing here that is not work: it is a view of a dev
  * server, so it earns a row only when no server accounts for it — and then only
@@ -485,8 +409,7 @@ export function TasksPane({
   planAwaitingApproval = false,
   planDrafting = false,
   forkDecisions,
-  multipleWorkspaces = false,
-  status = { todo: null },
+  inheritedModelId = null,
   selectedAgentId,
   selectedRowId = null,
   stoppingIds = [],
@@ -498,7 +421,7 @@ export function TasksPane({
   onStopItem
 }: TasksPaneProps) {
   const { t } = useI18n();
-  const [finishedOpen, setFinishedOpen] = useState(false);
+  const [finishedOpen, setFinishedOpen] = useState(true);
   const [now, setNow] = useState(() => Date.now());
   const stopping = useMemo(() => new Set(stoppingIds), [stoppingIds]);
 
@@ -518,6 +441,11 @@ export function TasksPane({
     return () => window.clearInterval(timer);
   }, [backgroundTaskRunning]);
 
+  // A child's subtitle turns into the local helper model's title for its task
+  // when that arrives, so the rows are derived again on every arrival.
+  const explanationVersion = useSyncExternalStore(subscribeToolExplanations, toolExplanationVersion);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `explanationVersion` is the moment `toolExplanation` reads something new, though nothing here reads the version.
   const items = useMemo(() => deriveTaskItems({
     conversationId,
     agents,
@@ -535,7 +463,8 @@ export function TasksPane({
     planAwaitingApproval,
     planDrafting,
     forkDecisions,
-    multipleWorkspaces,
+    inheritedModelId,
+    toolExplanation,
     now
   }, taskContainerMessages(t)), [
     conversationId,
@@ -545,9 +474,10 @@ export function TasksPane({
     browserAutomationTool,
     browserSessionId,
     browserSessions,
+    explanationVersion,
     forkDecisions,
+    inheritedModelId,
     modelRequestId,
-    multipleWorkspaces,
     now,
     plan,
     planAwaitingApproval,
@@ -602,7 +532,6 @@ export function TasksPane({
 
   return (
     <div className="tasks-pane">
-      <TaskStatusHeader status={status} />
       {!items.length && (
         <p className="task-container__empty">{t("还没有任务", "No tasks yet")}</p>
       )}

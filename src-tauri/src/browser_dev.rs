@@ -125,9 +125,8 @@ pub(super) fn run() -> i32 {
                 super::install_machine_links(app.handle(), app_data);
             }
             if let Ok(local_data) = app.path().app_local_data_dir() {
-                app.state::<AppState>()
-                    .helper_model
-                    .initialize(super::helper_model::root_dir(&local_data));
+                let state = app.state::<AppState>();
+                state.helper_model.initialize(super::helper_model::root_dir(&local_data), state.push_events.clone());
             }
             super::install_background_write_failure_reporting(app.state::<AppState>().inner());
             app.state::<AppState>()
@@ -641,13 +640,13 @@ async fn dispatch(
             app.state::<AppState>(),
             arg(args, "conversationId")?,
         )),
-        "list_wire_requests" => result_value(super::list_wire_requests(
+        "list_history_entries" => result_value(super::list_history_entries(
             app.clone(),
             app.state::<AppState>(),
             arg(args, "conversationId")?,
             optional_arg(args, "owners")?,
         )),
-        "load_wire_request" => result_value(super::load_wire_request(
+        "load_history_entry" => result_value(super::load_history_entry(
             app.clone(),
             app.state::<AppState>(),
             arg(args, "conversationId")?,
@@ -684,6 +683,13 @@ async fn dispatch(
             app.state::<AppState>(),
             arg(args, "templateId")?,
             arg(args, "contexts")?,
+        )),
+        "capture_conversation_template" => result_value(super::capture_conversation_template(
+            app.clone(),
+            app.state::<AppState>(),
+            arg(args, "workspaceId")?,
+            arg(args, "conversationId")?,
+            arg(args, "templateId")?,
         )),
         "delete_conversation_template" => result_value(super::delete_conversation_template(
             app.clone(),
@@ -737,7 +743,14 @@ async fn dispatch(
             .await,
         ),
         "list_wsl_distros" => result_value(super::list_wsl_distros().await),
-        "local_sandbox_support" => result_value(super::local_sandbox_support().await),
+        "machine_sandbox_support" => result_value(
+            super::machine_sandbox_support(
+                app.clone(),
+                app.state::<AppState>(),
+                optional_arg(args, "machine")?,
+            )
+            .await,
+        ),
         "setup_local_sandbox" => result_value(super::setup_local_sandbox().await),
         "reveal_path_in_file_manager" => result_value(
             super::reveal_path_in_file_manager(arg(args, "path")?, optional_arg(args, "baseDir")?)
@@ -765,20 +778,21 @@ async fn dispatch(
         "cancel_app_update_download" => {
             result_value(super::cancel_app_update_download(app.state::<AppState>()))
         }
-        "local_model_status" => result_value(Ok(super::local_model_status(app.state::<AppState>()))),
-        "local_model_install" => {
-            result_value(super::local_model_install(
+        "local_model_status" => result_value(super::local_model_status(app.state::<AppState>()).await),
+        "local_model_install" => result_value(
+            super::local_model_install(
                 app.clone(),
                 app.state::<AppState>(),
                 arg(args, "variant")?,
                 arg(args, "chinaMirror")?,
-            ))
-        }
-        "local_model_activate" => {
-            result_value(super::local_model_activate(app.clone(), app.state::<AppState>(), arg(args, "variant")?))
-        }
+            )
+            .await,
+        ),
+        "local_model_activate" => result_value(
+            super::local_model_activate(app.clone(), app.state::<AppState>(), arg(args, "variant")?).await,
+        ),
         "local_model_cancel_install" => {
-            result_value(Ok(super::local_model_cancel_install(app.state::<AppState>())))
+            result_value(super::local_model_cancel_install(app.state::<AppState>()).await)
         }
         "local_model_remove" => {
             result_value(super::local_model_remove(app.state::<AppState>(), arg(args, "variant")?).await)
@@ -789,11 +803,12 @@ async fn dispatch(
                 app.state::<AppState>(),
                 arg(args, "task")?,
                 optional_arg(args, "prompt")?,
+                optional_arg(args, "build")?,
             )
             .await,
         ),
         "local_model_default_prompts" => {
-            result_value(super::local_model_default_prompts(app.clone(), app.state::<AppState>()))
+            result_value(super::local_model_default_prompts(app.clone(), app.state::<AppState>()).await)
         }
         "settle_conversation_title" => result_value(super::settle_conversation_title(
             app.clone(),
@@ -830,6 +845,7 @@ async fn dispatch(
             arg(args, "promptId")?,
             arg(args, "decision")?,
             optional_arg(args, "feedback")?,
+            optional_arg(args, "question")?,
         )),
         "pick_workspace_directory" => {
             if let Some(fixture) = memory_workspace_fixture.as_ref() {
@@ -843,7 +859,9 @@ async fn dispatch(
                 )
             }
         }
-        "list_machine_shells" => result_value(super::list_machine_shells().await),
+        "list_machine_shells" => result_value(
+            super::list_machine_shells(app.clone(), app.state::<AppState>()).await,
+        ),
         "probe_machine_shells" => result_value(
             super::probe_machine_shells(
                 app.clone(),
@@ -1026,15 +1044,16 @@ async fn dispatch(
             arg(args, "runId")?,
             arg(args, "stepIndex")?,
         )),
-        "image_attachment_upload" => result_value(super::image_attachment_upload(
-            app.clone(),
-            arg(args, "name")?,
-            arg(args, "data")?,
-        )),
-        "image_attachment_data" => result_value(super::image_attachment_data(
-            app.clone(),
-            arg(args, "imageId")?,
-        )),
+        "image_attachment_upload" => result_value(
+            super::image_attachment_upload(app.clone(), arg(args, "name")?, arg(args, "data")?)
+                .await,
+        ),
+        "image_attachment_data" => result_value(
+            super::image_attachment_data(app.clone(), arg(args, "imageId")?).await,
+        ),
+        "image_attachment_thumbnail" => result_value(
+            super::image_attachment_thumbnail(app.clone(), arg(args, "imageId")?).await,
+        ),
         "background_image_put" => result_value(
             super::background_image_put(
                 app.clone(),
@@ -1236,43 +1255,94 @@ async fn dispatch(
             super::get_git_branches(app.clone(), app.state::<AppState>(), arg(args, "target")?)
                 .await,
         ),
-        "list_workspace_directory" => result_value(
-            super::list_workspace_directory(
+        "browse_list_directory" => result_value(
+            super::browse_list_directory(
                 app.clone(),
                 app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "relativePath")?,
+                optional_arg(args, "machine")?,
+                arg(args, "path")?,
             )
             .await,
         ),
-        "read_workspace_file" => result_value(
-            super::read_workspace_file(
+        "browse_read_file" => result_value(
+            super::browse_read_file(
                 app.clone(),
                 app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "relativePath")?,
+                optional_arg(args, "machine")?,
+                arg(args, "path")?,
             )
             .await,
         ),
-        "read_workspace_file_bytes" => result_value(
-            super::read_workspace_file_bytes(
+        "browse_read_file_bytes" => result_value(
+            super::browse_read_file_bytes(
                 app.clone(),
                 app.state::<AppState>(),
-                arg(args, "target")?,
-                arg(args, "relativePath")?,
+                optional_arg(args, "machine")?,
+                arg(args, "path")?,
             )
             .await,
         ),
-        "search_workspace_files" => result_value(
-            super::search_workspace_files(
+        "browse_search_files" => result_value(
+            super::browse_search_files(
                 app.clone(),
                 app.state::<AppState>(),
-                arg(args, "target")?,
+                optional_arg(args, "machine")?,
+                arg(args, "root")?,
                 arg(args, "query")?,
                 arg(args, "limit")?,
             )
             .await,
         ),
+        "browse_probe_paths" => result_value(
+            super::browse_probe_paths(
+                app.clone(),
+                app.state::<AppState>(),
+                arg(args, "targets")?,
+                optional_arg(args, "patient")?,
+            )
+            .await,
+        ),
+        "browse_rename_path" => result_value(
+            super::browse_rename_path(
+                app.clone(),
+                app.state::<AppState>(),
+                optional_arg(args, "machine")?,
+                arg(args, "path")?,
+                arg(args, "name")?,
+            )
+            .await,
+        ),
+        "browse_delete_path" => result_value(
+            super::browse_delete_path(
+                app.clone(),
+                app.state::<AppState>(),
+                optional_arg(args, "machine")?,
+                arg(args, "path")?,
+            )
+            .await,
+        ),
+        "browse_create_directory" => result_value(
+            super::browse_create_directory(
+                app.clone(),
+                app.state::<AppState>(),
+                optional_arg(args, "machine")?,
+                arg(args, "parent")?,
+                arg(args, "name")?,
+            )
+            .await,
+        ),
+        "browse_open_in_file_manager" => {
+            result_value(super::browse_open_in_file_manager(arg(args, "path")?).await)
+        }
+        "browse_open_with_choices" => {
+            result_value(super::browse_open_with_choices(arg(args, "path")?).await)
+        }
+        "browse_open_with" => result_value(
+            super::browse_open_with(arg(args, "path")?, optional_arg(args, "app")?).await,
+        ),
+        "browse_open_with_chooser" => {
+            result_value(super::browse_open_with_chooser(arg(args, "path")?).await)
+        }
         "preview_list_configurations" => result_value(
             super::preview_list_configurations(
                 app.clone(),

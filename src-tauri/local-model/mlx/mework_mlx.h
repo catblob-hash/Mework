@@ -33,6 +33,10 @@ typedef struct mwx_config {
   // RoPE tables `[context, rotary_dim]`, both halves filled (NeoX layout).
   const float* cos;
   const float* sin;
+  // `rotary_dim / 2` bytes: the position axis (0 temporal, 1 height, 2 width)
+  // that turns each frequency. Text has one position on all three; image
+  // tokens have their own row and column.
+  const uint8_t* axes;
 } mwx_config;
 
 enum { MWX_F16 = 0, MWX_F32 = 1 };
@@ -66,7 +70,12 @@ int mwx_prefix(mwx_model* model, const uint32_t* tokens, size_t n, uint8_t** out
 void mwx_free_bytes(uint8_t* bytes);
 
 // Starts `slot` from a state `mwx_prefix` wrote for `prefix_tokens` tokens,
-// followed by `tokens`; writes the next-token logits (`vocab` floats).
+// followed by `n` positions; writes the next-token logits (`vocab` floats).
+// Position `i` reads the embedding of `tokens[i]`, or, when `rows[i]` is not
+// -1, row `rows[i]` of `features` (`hidden` floats per row: an image's
+// features). It turns at rotary position `positions[3 i .. 3 i + 3]`
+// (temporal, height, width). Decoding then continues at rotary position
+// sequence position + `delta`.
 int mwx_admit(
     mwx_model* model,
     int32_t slot,
@@ -74,7 +83,12 @@ int mwx_admit(
     size_t prefix_len,
     int32_t prefix_tokens,
     const uint32_t* tokens,
+    const int32_t* rows,
+    const float* features,
+    size_t feature_rows,
+    const int32_t* positions,
     size_t n,
+    int32_t delta,
     float* logits);
 
 // Appends `tokens[i]` to `slots[i]`; writes `n * vocab` logits.

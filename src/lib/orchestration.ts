@@ -1,20 +1,5 @@
 import type { ContextItem, JsonObject, JsonValue, ToolContext } from "../types";
 
-export type TodoStatus = "pending" | "in_progress" | "completed";
-
-export interface TodoItemView {
-  /** Stable Claude task id. Legacy `todo` snapshots do not have one. */
-  id?: string;
-  content: string;
-  status: TodoStatus;
-  description?: string;
-  activeForm?: string;
-  blocks?: string[];
-  blockedBy?: string[];
-  owner?: string;
-  metadata?: JsonObject;
-}
-
 export interface QuestionItemView {
   question: string;
   header: string;
@@ -26,244 +11,6 @@ export interface QuestionOptionView {
   label: string;
   description: string;
   preview?: string;
-}
-
-export interface PendingQuestion {
-  context: ToolContext;
-  questions: QuestionItemView[];
-  /** Legacy convenience fields for callers that only need the first question. */
-  question: string;
-  options: QuestionOptionView[];
-}
-
-export interface AgentStatus {
-  todo: TodoItemView[] | null;
-}
-
-type UnknownRecord = Record<string, unknown>;
-
-interface ParsedTaskCreate {
-  id: string;
-  subject: string;
-}
-
-const TASK_UPDATE_PATCH_FIELDS = [
-  "status",
-  "subject",
-  "description",
-  "activeForm",
-  "addBlocks",
-  "addBlockedBy",
-  "owner",
-  "metadata"
-] as const;
-
-function record(value: unknown): UnknownRecord | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as UnknownRecord
-    : null;
-}
-
-function parsedResult(item: ToolContext): UnknownRecord | null {
-  try {
-    return record(JSON.parse(item.result.output));
-  } catch {
-    return null;
-  }
-}
-
-function isSettledSuccessfulTool(
-  context: ContextItem,
-  toolName: string
-): context is ToolContext {
-  return context.kind === "tool"
-    && context.toolName === toolName
-    && context.result.success
-    && (!context.streaming || context.streamStatus === "completed");
-}
-
-/**
- * A settled, successful call of the merged state tool's given action.
- *
- * The tool name alone does not identify the operation: `todo` multiplexes on a
- * required `action`. Every replay predicate below reads the same discriminator
- * the host executor dispatched on.
- */
-function isStateToolAction(
-  context: ContextItem,
-  toolName: "todo",
-  action: string
-): context is ToolContext {
-  return isSettledSuccessfulTool(context, toolName) && context.input.action === action;
-}
-
-function parsedTaskCreate(context: ContextItem): ParsedTaskCreate | null {
-  if (!isStateToolAction(context, "todo", "create")) return null;
-  const task = record(parsedResult(context)?.task);
-  const id = typeof task?.id === "string" ? task.id.trim() : "";
-  const subject = typeof task?.subject === "string" ? task.subject.trim() : "";
-  return id && subject ? { id, subject } : null;
-}
-
-/** Stable task id returned by a successful, settled `todo create` call. */
-export function taskIdFromTaskCreate(context: ContextItem): string | null {
-  return parsedTaskCreate(context)?.id ?? null;
-}
-
-/** Whether a timeline item is a `todo update` directed at the given task. */
-export function isTaskUpdateFor(context: ContextItem, taskId: string): boolean {
-  return context.kind === "tool"
-    && context.toolName === "todo"
-    && context.input.action === "update"
-    && typeof context.input.taskId === "string"
-    && context.input.taskId.trim() === taskId;
-}
-
-function stringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return [...new Set(value.flatMap((entry) => (
-    typeof entry === "string" && entry.trim() ? [entry.trim()] : []
-  )))];
-}
-
-function jsonObject(value: unknown): JsonObject | null {
-  const object = record(value);
-  return object ? object as JsonObject : null;
-}
-
-function taskUpdateTarget(context: ContextItem): string | null {
-  if (!isStateToolAction(context, "todo", "update")) return null;
-  const taskId = typeof context.input.taskId === "string" ? context.input.taskId.trim() : "";
-  const output = parsedResult(context);
-  const outputTaskId = typeof output?.taskId === "string" ? output.taskId.trim() : "";
-  if (!taskId || output?.success !== true || outputTaskId !== taskId) return null;
-  const expectedFields = TASK_UPDATE_PATCH_FIELDS.filter((field) => (
-    Object.hasOwn(context.input, field)
-  ));
-  if (!expectedFields.length || !Array.isArray(output.updatedFields)) return null;
-  const outputFields = output.updatedFields;
-  if (
-    outputFields.some((field) => typeof field !== "string")
-    || new Set(outputFields).size !== outputFields.length
-    || outputFields.length !== expectedFields.length
-    || expectedFields.some((field) => !outputFields.includes(field))
-  ) return null;
-  return taskId;
-}
-
-function mergeMetadata(current: JsonObject | undefined, patch: JsonObject): JsonObject {
-  const next: JsonObject = { ...(current ?? {}) };
-  for (const [key, value] of Object.entries(patch)) {
-    if (value === null) delete next[key];
-    else next[key] = value as JsonValue;
-  }
-  return next;
-}
-
-function addUnique(current: string[] | undefined, additions: string[]): string[] {
-  return [...new Set([...(current ?? []), ...additions])];
-}
-
-function removeTaskReferences(tasks: Map<string, TodoItemView>, taskId: string): void {
-  for (const [id, task] of tasks) {
-    const blocks = task.blocks?.filter((candidate) => candidate !== taskId);
-    const blockedBy = task.blockedBy?.filter((candidate) => candidate !== taskId);
-    if (
-      blocks?.length === task.blocks?.length
-      && blockedBy?.length === task.blockedBy?.length
-    ) continue;
-    tasks.set(id, { ...task, blocks, blockedBy });
-  }
-}
-
-function applyTaskUpdate(tasks: Map<string, TodoItemView>, context: ToolContext): void {
-  const taskId = taskUpdateTarget(context);
-  if (!taskId) return;
-  const current = tasks.get(taskId);
-  if (!current) return;
-
-  const status = context.input.status;
-  if (
-    status !== undefined
-    && status !== "pending"
-    && status !== "in_progress"
-    && status !== "completed"
-    && status !== "deleted"
-  ) return;
-
-  for (const field of ["subject", "description", "activeForm", "owner"] as const) {
-    if (
-      Object.hasOwn(context.input, field)
-      && (
-        typeof context.input[field] !== "string"
-        || !context.input[field].trim()
-      )
-    ) return;
-  }
-  for (const field of ["addBlocks", "addBlockedBy"] as const) {
-    if (
-      Object.hasOwn(context.input, field)
-      && (
-        !Array.isArray(context.input[field])
-        || context.input[field].some((id) => typeof id !== "string" || !id.trim())
-      )
-    ) return;
-  }
-  if (
-    Object.hasOwn(context.input, "metadata")
-    && !jsonObject(context.input.metadata)
-  ) return;
-
-  if (status === "deleted") {
-    tasks.delete(taskId);
-    removeTaskReferences(tasks, taskId);
-    return;
-  }
-
-  const addBlocks = stringArray(context.input.addBlocks)
-    .filter((id) => id !== taskId && tasks.has(id));
-  const addBlockedBy = stringArray(context.input.addBlockedBy)
-    .filter((id) => id !== taskId && tasks.has(id));
-  const metadataPatch = jsonObject(context.input.metadata);
-  const next: TodoItemView = {
-    ...current,
-    ...(typeof context.input.subject === "string"
-      ? { content: context.input.subject.trim() }
-      : {}),
-    ...(typeof context.input.description === "string"
-      ? { description: context.input.description.trim() }
-      : {}),
-    ...(typeof context.input.activeForm === "string"
-      ? { activeForm: context.input.activeForm.trim() }
-      : {}),
-    ...(typeof context.input.owner === "string"
-      ? { owner: context.input.owner.trim() }
-      : {}),
-    ...(status ? { status } : {}),
-    ...(addBlocks.length ? { blocks: addUnique(current.blocks, addBlocks) } : {}),
-    ...(addBlockedBy.length ? { blockedBy: addUnique(current.blockedBy, addBlockedBy) } : {}),
-    ...(metadataPatch ? { metadata: mergeMetadata(current.metadata, metadataPatch) } : {})
-  };
-  tasks.set(taskId, next);
-
-  for (const blockedId of addBlocks) {
-    const blocked = tasks.get(blockedId);
-    if (blocked) {
-      tasks.set(blockedId, {
-        ...blocked,
-        blockedBy: addUnique(blocked.blockedBy, [taskId])
-      });
-    }
-  }
-  for (const blockerId of addBlockedBy) {
-    const blocker = tasks.get(blockerId);
-    if (blocker) {
-      tasks.set(blockerId, {
-        ...blocker,
-        blocks: addUnique(blocker.blocks, [taskId])
-      });
-    }
-  }
 }
 
 function optionsFromValue(value: unknown): QuestionOptionView[] {
@@ -467,88 +214,88 @@ export function isHostAuthoredUserContext(context: ContextItem): boolean {
   );
 }
 
-function isAnsweredBoundary(context: ContextItem): boolean {
-  // Only a real user reply closes a pending question; assistant replies and
-  // host-authored user contexts do not form an answer boundary.
-  return context.kind === "user" && !isHostAuthoredUserContext(context);
-}
+/** The result of a question card the user closed without answering (host `ask_user.rs`). */
+export const ASK_USER_CLOSED_OUTPUT = "The user closed the question card without answering.";
+/** Claude Code's result for a card submitted with nothing answered. */
+export const ASK_USER_NO_ANSWER_OUTPUT = "The user did not answer the questions.";
+const ASK_USER_ANSWERED_PREFIXES = [
+  "Your questions have been answered: ",
+  "The user answered: "
+] as const;
+const ASK_USER_DECLINED_PREFIX = "The user doesn't want to proceed with this tool use.";
 
 /**
- * The pending question is the trailing successful `ask_user` call with no real
- * user reply after it. A successful `ask_user` result is by construction the
- * host's "asked, paused" receipt (a rejected question fails), so the marker text
- * itself — which follows the prompt profile — is not matched. Skip same-round
- * leftovers, task-result folds, and assistant replies because none constitutes
- * an answer.
- */
-export function findPendingQuestion(contexts: ContextItem[]): PendingQuestion | null {
-  for (let index = contexts.length - 1; index >= 0; index -= 1) {
-    const context = contexts[index];
-    if (context.kind === "system" || context.kind === "reasoning" || context.kind === "assistant") continue;
-    if (context.kind === "tool") {
-      if (context.toolName === "ask_user" && context.result.success) {
-        const questions = questionsFromInput(context.input);
-        const first = questions[0] ?? {
-          question: "",
-          header: "Question",
-          options: [],
-          multiSelect: false
-        };
-        return { context, questions, ...first };
-      }
-      continue;
-    }
-    if (isAnsweredBoundary(context)) return null;
-  }
-  return null;
-}
-
-/**
- * Replays the host-owned task event log in timeline order.
+ * How an `ask_user` call ended.
  *
- * `todo create` obtains its stable id from structured tool
- * results. Updates are patches, so removing any update context and replaying
- * naturally restores the state immediately before that message.
+ * `legacy` is a call from before questions blocked: its result is only the
+ * "asked, paused" receipt, and the answer — if any — is the next real user
+ * message. Every newer call carries its outcome in its own result.
  */
-export function deriveAgentStatus(contexts: ContextItem[]): AgentStatus {
-  const tasks = new Map<string, TodoItemView>();
-  let taskStateSeen = false;
+export type QuestionOutcome = "answered" | "unanswered" | "closed" | "declined" | "failed" | "legacy";
 
-  for (const context of contexts) {
-    if (context.kind !== "tool") continue;
-    if (!context.result.success) continue;
-    if (context.streaming && context.streamStatus !== "completed") continue;
-    if (context.toolName !== "todo") continue;
-    const action = context.input.action;
-
-    if (context.toolName === "todo" && action === "create") {
-      const created = parsedTaskCreate(context);
-      if (!created || tasks.has(created.id)) continue;
-      const metadata = jsonObject(context.input.metadata);
-      taskStateSeen = true;
-      tasks.set(created.id, {
-        id: created.id,
-        content: created.subject,
-        status: "pending",
-        description: typeof context.input.description === "string"
-          ? context.input.description
-          : "",
-        ...(typeof context.input.activeForm === "string" && context.input.activeForm.trim()
-          ? { activeForm: context.input.activeForm.trim() }
-          : {}),
-        blocks: [],
-        blockedBy: [],
-        ...(metadata ? { metadata: { ...metadata } } : {})
-      });
-      continue;
-    }
-
-    if (context.toolName === "todo" && action === "update") {
-      applyTaskUpdate(tasks, context);
-    }
+export function questionOutcome(context: ToolContext): QuestionOutcome {
+  const output = context.result.output;
+  if (!context.result.success) {
+    return output.startsWith(ASK_USER_DECLINED_PREFIX) ? "declined" : "failed";
   }
+  if (output === ASK_USER_CLOSED_OUTPUT) return "closed";
+  if (output === ASK_USER_NO_ANSWER_OUTPUT) return "unanswered";
+  if (
+    isJsonRecord(context.input.answers)
+    || ASK_USER_ANSWERED_PREFIXES.some((prefix) => output.startsWith(prefix))
+  ) {
+    return "answered";
+  }
+  return "legacy";
+}
 
-  return {
-    todo: taskStateSeen ? [...tasks.values()] : null
-  };
+/** A settled pre-blocking `ask_user` receipt, whose answer is the next user message. */
+export function isLegacyPausedQuestion(context: ContextItem): context is ToolContext {
+  return context.kind === "tool"
+    && context.toolName === "ask_user"
+    && !context.streaming
+    && questionOutcome(context) === "legacy";
+}
+
+export interface QuestionAnswerView {
+  answer?: string;
+  notes?: string;
+}
+
+/**
+ * The answers a blocking `ask_user` call ran with, read from the `answers` and
+ * `annotations` the host merged into its input (keyed by question text, as in
+ * Claude Code), one slot per question.
+ */
+export function questionAnswersFromInput(
+  input: JsonObject,
+  questions: QuestionItemView[]
+): QuestionAnswerView[] {
+  const answers = isJsonRecord(input.answers) ? input.answers : {};
+  const annotations = isJsonRecord(input.annotations) ? input.annotations : {};
+  return questions.map((question) => {
+    const answer = answers[question.question];
+    const annotation = annotations[question.question];
+    const notes = isJsonRecord(annotation) && typeof annotation.notes === "string"
+      ? annotation.notes
+      : undefined;
+    return {
+      ...(typeof answer === "string" && answer ? { answer } : {}),
+      ...(notes ? { notes } : {})
+    };
+  });
+}
+
+/**
+ * Claude Code's multi-select join: an item containing `", "` or a quote is
+ * written as a JSON string, the rest verbatim.
+ */
+export function joinMultiSelectAnswer(items: string[]): string {
+  return items
+    .map((item) => (item.includes(", ") || item.includes('"') ? JSON.stringify(item) : item))
+    .join(", ");
+}
+
+function isJsonRecord(value: JsonValue | undefined): value is JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

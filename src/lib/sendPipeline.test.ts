@@ -81,7 +81,5 @@ describe("send-path element picks", () => {
   it("expands the picks into the outgoing text rather than into the persisted attachment", () => {
     expect(sendPipelineSource)
       .toContain("withImagePlaceholders(withSelectedElements(typed, elementPicks), images)");
-    // An answer to a pending question is not a new user message and carries no chips.
-    expect(sendPipelineSource).toContain("overrideText === undefined");
   });
 });

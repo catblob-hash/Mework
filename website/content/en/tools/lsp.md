@@ -2,7 +2,7 @@ The `lsp` tool asks a language server about **symbols** instead of text: where a
 
 ## Approval
 
-An ordinary call is classified as a **read** of `filePath`: it passes at every level inside the workspace, and asks at Manual approval and Plan mode when the file sits outside it. If the workspace ships its own `.mework/lsp.json`, every call is classified as an **unbounded action** instead and asks at every level below Full access — that file names the command Mework launches, and only its existence is checked, never its contents. Where the workspace has no such file, a server from `~/.mework/lsp.json` or a built-in preset raises nothing. **Always allow** remembers the answer for that conversation, capped at the risk of the card you answered. An `operation` missing, empty or over 64 characters is refused before any path work.
+An ordinary call is classified as a **read** of `filePath`: it passes at every level inside the workspace, and asks at Manual approval when the file sits outside it. If the workspace ships its own `.mework/lsp.json`, every call is classified as an **unbounded action** instead and asks at every level below Full access — that file names the command Mework launches, and only its existence is checked, never its contents. Where the workspace has no such file, a server from `~/.mework/lsp.json` or a built-in preset raises nothing. **Always allow** remembers the answer for that conversation, capped at the risk of the card you answered. An `operation` missing, empty or over 64 characters is refused before any path work.
 
 ## Behavior and limits
 

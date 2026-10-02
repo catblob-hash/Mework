@@ -16,7 +16,7 @@
 
 .agent-definitions__list {
   min-height: 0;
-  overflow: auto;
+  overflow: auto scroll;
 }
 
 /* Always the last row of the list, one row below the final role. */
@@ -44,84 +44,9 @@
 
 /* ---- The role editor ----
 
-   The window is the conversation-settings pane itself (`.conversation-settings`),
-   laid out as a preset's window is. These rules add only what a role's window
-   has and a preset's does not. */
-
-/* The three pages keep their own height, so the preset list that slides in
-   under them takes the space between the pages and the save — and scrolls in
-   it — rather than squeezing the pages. */
-.agent-definition-editor__nav .conversation-settings__nav-items { flex: 1 0 auto; }
-
-/* Drawn only while the template page is open, and it arrives from below: it is
-   the page's companion, not a fourth page. */
-.agent-definition-editor__presets {
-  flex: 0 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-  animation: agent-definition-presets-in .2s cubic-bezier(.2, .8, .2, 1);
-}
-
-@keyframes agent-definition-presets-in { from { opacity: 0; transform: translateY(12px); } }
-
-.agent-definition-editor__presets-label {
-  flex: 0 0 auto;
-  padding: 0 7px;
-  color: var(--faint);
-  font-size: 8.5px;
-}
-
-.agent-definition-editor__presets-list {
-  flex: 0 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  overflow-y: auto;
-}
-
-.agent-definition-editor__presets-empty {
-  margin: 0;
-  padding: 0 7px;
-  color: var(--faint);
-  font-size: 8.5px;
-  line-height: 1.45;
-}
-
-/* One line per preset, the whole line the button: the name on the left, the
-   arrow on the right pointing at the body it would replace. Metrics follow the
-   rail's own page entries so the two read as one column. */
-.agent-definition-editor__preset {
-  flex: 0 0 auto;
-  height: 28px;
-  padding: 0 7px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--muted);
-  font-size: 10.5px;
-  text-align: left;
-}
-
-.agent-definition-editor__preset span {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-definition-editor__preset svg { flex: 0 0 auto; color: var(--faint); transition: transform .12s; }
-.agent-definition-editor__preset:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-.agent-definition-editor__preset:hover:not(:disabled) svg { color: var(--text); transform: translateX(2px); }
-.agent-definition-editor__preset:disabled { opacity: .45; }
+   The window takes the settings windows' shared layout (`SettingsLayout`), and
+   its pages are drawn with the conversation-settings pane's page rules. These
+   rules add only what a role's pages have and a preset's do not. */
 
 /* The name and the description are stacked fields, not rows: both take prose
    wider than a row's control slot. The page stack already spaces sections, so
@@ -132,13 +57,10 @@
 /* The rows share one left edge with the stacked fields above them. */
 .agent-definition-editor__rows { padding: 0; }
 
-.agent-definition-editor__warning,
-.agent-definition-editor__error {
+.agent-definition-editor__warning {
   margin: 0;
+  color: var(--warning);
   font-size: 9px;
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
-
-.agent-definition-editor__warning { color: var(--warning); }
-.agent-definition-editor__error { color: var(--danger); }

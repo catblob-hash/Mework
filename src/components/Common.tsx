@@ -1,8 +1,9 @@
-import { Trash2, X } from "lucide-react";
-import type { PropsWithChildren, ReactNode } from "react";
+import { Check, Copy, Trash2, X } from "lucide-react";
+import type { PropsWithChildren, ReactNode, Ref } from "react";
 import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
+import { writeClipboardText } from "../lib/clipboard";
 import { useFloatingSurface } from "../lib/floatingSurfaces";
 
 export function IconButton({
@@ -15,6 +16,51 @@ export function IconButton({
     <button type="button" className={`icon-button ${className}`} aria-label={label} title={label} data-drag-exclude {...props}>
       {children}
     </button>
+  );
+}
+
+/**
+ * Copies `text` whole, and for a moment says whether it did. The outcome replaces
+ * the button's name rather than appearing beside it, so a screen reader hears it
+ * and the row the button sits in never reflows.
+ */
+export function CopyButton({
+  text,
+  label,
+  className = "",
+  size = 13,
+  disabled = false
+}: {
+  text: string;
+  label: string;
+  className?: string;
+  size?: number;
+  disabled?: boolean;
+}) {
+  const { t } = useI18n();
+  const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
+  const resetTimer = useRef<number | null>(null);
+
+  useEffect(() => () => {
+    if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
+  }, []);
+
+  const shownLabel = status === "success" ? t("已复制", "Copied") : status === "error" ? t("复制失败", "Copy failed") : label;
+  return (
+    <IconButton
+      className={className}
+      label={shownLabel}
+      aria-live="polite"
+      disabled={disabled}
+      onClick={async () => {
+        const copied = await writeClipboardText(text);
+        setStatus(copied ? "success" : "error");
+        if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
+        resetTimer.current = window.setTimeout(() => setStatus("idle"), 1600);
+      }}
+    >
+      {status === "success" ? <Check size={size} aria-hidden="true" /> : <Copy size={size} aria-hidden="true" />}
+    </IconButton>
   );
 }
 
@@ -96,7 +142,9 @@ export function PlainField({
   invalid = false,
   className = "",
   onKeyDown,
-  onPaste
+  onPaste,
+  textareaRef,
+  pasteLayer
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -108,10 +156,21 @@ export function PlainField({
   className?: string;
   onKeyDown?: React.KeyboardEventHandler<HTMLTextAreaElement>;
   onPaste?: React.ClipboardEventHandler<HTMLTextAreaElement>;
+  textareaRef?: Ref<HTMLTextAreaElement>;
+  /**
+   * The layer that draws folded pastes as tags (`PastedTextTags.tsx`), for a
+   * field that takes them; it shares the textarea's cell, underneath it.
+   */
+  pasteLayer?: ReactNode;
 }) {
   return (
-    <div className={`plain-field ${invalid ? "plain-field--error" : ""} ${className}`} data-value={value}>
+    <div
+      className={`plain-field ${pasteLayer !== undefined ? "pasted-text-host" : ""} ${invalid ? "plain-field--error" : ""} ${className}`}
+      data-value={value}
+    >
+      {pasteLayer}
       <textarea
+        ref={textareaRef}
         rows={1}
         value={value}
         aria-label={label}
@@ -127,7 +186,20 @@ export function PlainField({
   );
 }
 
-export function Switch({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
+export function Switch({
+  checked,
+  onChange,
+  label,
+  disabled = false,
+  tone
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+  disabled?: boolean;
+  /** Drawn orange: moving it throws a warm prompt cache away (`LockTone.tsx`). */
+  tone?: "cache";
+}) {
   return (
     <button
       type="button"
@@ -136,7 +208,7 @@ export function Switch({ checked, onChange, label, disabled = false }: { checked
       aria-checked={checked}
       aria-label={label}
       disabled={disabled}
-      className={`switch ${checked ? "switch--on" : ""}`}
+      className={`switch ${checked ? "switch--on" : ""}${tone ? ` switch--${tone}` : ""}`}
       onClick={() => onChange(!checked)}
     >
       <span />
@@ -323,7 +395,7 @@ export function EmptyState({ icon, title, description }: { icon: ReactNode; titl
 
 export function Field({ label, hint, hintIsError = false, children }: PropsWithChildren<{
   label: string;
-  hint?: string;
+  hint?: ReactNode;
   /** Colours the hint as a complaint. For a field whose only remaining line under
    * it is the reason a save was refused, rather than standing advice. */
   hintIsError?: boolean;

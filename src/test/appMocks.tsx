@@ -43,12 +43,13 @@ export {
 } from "./appMockInstances";
 
 // The seed document's first provider is the Responses family, so `encrypted` is
-// the form that family resolves to.
+// the form that family resolves to, and both appends are what a fetch from it
+// declares.
 export const model: ModelProfile = {
   id: "test-model",
   name: "",
   group: "",
-  capabilities: [],
+  capabilities: ["tool_append", "system_append"],
   reasoningContent: "encrypted",
   promptCache: true
 };
@@ -124,63 +125,6 @@ export function answeredQuestionPair(): { ask: ToolContext; answer: UserContext 
     createdAt: "2026-07-23T00:00:01Z"
   };
   return { ask, answer };
-}
-
-export function settledStateTool(
-  id: string,
-  toolName: string,
-  input: ToolContext["input"],
-  output: unknown
-): ToolContext {
-  return {
-    id,
-    kind: "tool",
-    toolName,
-    round: 1,
-    input,
-    result: {
-      success: true,
-      output: JSON.stringify(output),
-      executedAt: "2026-07-24T00:00:00Z",
-      durationMs: 1
-    },
-    createdAt: "2026-07-24T00:00:00Z"
-  };
-}
-
-export function taskCreateContext(id: string, taskId: string, subject: string): ToolContext {
-  return settledStateTool(id, "todo", {
-    action: "create",
-    subject,
-    description: `${subject}的详细说明`,
-    activeForm: `正在${subject}`
-  }, {
-    task: { id: taskId, subject }
-  });
-}
-
-export function taskUpdateContext(
-  id: string,
-  taskId: string,
-  status: "pending" | "in_progress" | "completed" | "deleted"
-): ToolContext {
-  return settledStateTool(id, "todo", { action: "update", taskId, status }, {
-    success: true,
-    taskId,
-    updatedFields: ["status"]
-  });
-}
-
-export function taskGetContext(id: string, taskId: string, subject: string): ToolContext {
-  return settledStateTool(id, "todo", { action: "get", taskId }, {
-    task: { id: taskId, subject, status: "pending" }
-  });
-}
-
-export function taskListContext(id: string, taskIds: string[]): ToolContext {
-  return settledStateTool(id, "todo", { action: "list" }, {
-    tasks: taskIds.map((taskId) => ({ id: taskId, subject: taskId, status: "pending" }))
-  });
 }
 
 /** Opens the overview's Git card. Only present when the workspace is a repo. */
@@ -356,6 +300,12 @@ export function resetAppMocks() {
   runtimeMocks.cancelModelRun.mockReset().mockResolvedValue(true);
   runtimeMocks.listResumableRuns.mockReset().mockResolvedValue([]);
   runtimeMocks.listWslDistros.mockReset().mockResolvedValue([]);
+  runtimeMocks.machineSandboxSupport.mockReset().mockResolvedValue({
+    backend: "seatbelt",
+    available: true,
+    detail: "",
+    setup: false
+  });
   runtimeMocks.listWakePendingConversations.mockReset().mockResolvedValue([]);
   runtimeMocks.listPendingToolPrompts.mockReset().mockResolvedValue([]);
   runtimeMocks.listPendingForkRequests.mockReset().mockResolvedValue([]);
@@ -374,6 +324,7 @@ export function resetAppMocks() {
   runtimeMocks.revealApiKey.mockReset().mockResolvedValue("test-secret");
   runtimeMocks.loadDocument.mockReset();
   runtimeMocks.imageAttachmentData.mockReset().mockResolvedValue("data:image/png;base64,AAAA");
+  runtimeMocks.imageAttachmentThumbnail.mockReset().mockResolvedValue("data:image/png;base64,AAAA");
   runtimeMocks.prepareImageAttachment.mockReset();
   runtimeMocks.fileAttachmentData.mockReset().mockResolvedValue("data:text/plain;charset=utf-8;base64,aGVsbG8=");
   // Stands in for the host's store: an id per name, sized by the bytes it was handed.

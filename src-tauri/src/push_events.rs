@@ -181,13 +181,15 @@ pub enum AppPushEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decision: Option<crate::fork_requests::ForkDecisionRecord>,
     },
-    /// The host moved a conversation to a different security level — plan
-    /// approval is the only source today. The renderer's composer menu shows a
-    /// level the user chose, so it has to hear about the ones it did not.
+    /// The model called `handoff`: the conversation now continues in
+    /// `child_conversation_id`, a fork whose first run is armed on the host's
+    /// opening message. The renderer loads the child, starts that run, and
+    /// follows it there when the source is the conversation on screen.
     #[serde(rename_all = "camelCase")]
-    ConversationSecurityLevelChanged {
-        conversation_id: String,
-        security_level: crate::model::SecurityLevel,
+    ConversationHandedOff {
+        workspace_id: String,
+        source_conversation_id: String,
+        child_conversation_id: String,
     },
     /// The conversation's plan document changed, or was never written. The plan
     /// panel is open while the model is writing it, so the document is pushed
@@ -197,6 +199,13 @@ pub enum AppPushEvent {
         conversation_id: String,
         plan: Option<crate::model::ConversationPlan>,
     },
+    /// The host moved a conversation's plan-mode switch: an approved plan
+    /// turned it off. Already persisted; the renderer mirrors it.
+    #[serde(rename_all = "camelCase")]
+    ConversationPlanModeChanged {
+        conversation_id: String,
+        enabled: bool,
+    },
     /// The host wrote a conversation's title: the chosen message as a
     /// placeholder, then the local helper model's title (`settled`).
     #[serde(rename_all = "camelCase")]
@@ -205,14 +214,17 @@ pub enum AppPushEvent {
         title: String,
         settled: bool,
     },
-    /// The local helper model described a shell command. `context_id` is the
-    /// tool card's id (which may not be saved yet); `call_id` the provider's.
+    /// The local helper model described a shell command (or titled a
+    /// subagent), or with `error` said why a failed call failed. `context_id`
+    /// is the tool card's id (which may not be saved yet); `call_id` the
+    /// provider's.
     #[serde(rename_all = "camelCase")]
     ToolExplained {
         conversation_id: String,
         context_id: String,
         call_id: String,
         text: String,
+        error: bool,
     },
     /// The local helper model's install or runtime status changed
     /// (`helper_model::Status`).
@@ -237,10 +249,10 @@ impl AppPushEvent {
             | AppPushEvent::ToolApprovalResolved {
                 conversation_id, ..
             }
-            | AppPushEvent::ConversationSecurityLevelChanged {
+            | AppPushEvent::ConversationPlanUpdated {
                 conversation_id, ..
             }
-            | AppPushEvent::ConversationPlanUpdated {
+            | AppPushEvent::ConversationPlanModeChanged {
                 conversation_id, ..
             }
             | AppPushEvent::ConversationTitleChanged {
@@ -251,6 +263,10 @@ impl AppPushEvent {
             } => Some(conversation_id),
             AppPushEvent::ForkRequested { request } => Some(&request.source_conversation_id),
             AppPushEvent::ForkResolved {
+                source_conversation_id,
+                ..
+            }
+            | AppPushEvent::ConversationHandedOff {
                 source_conversation_id,
                 ..
             } => Some(source_conversation_id),
@@ -391,6 +407,7 @@ mod tests {
             content: "quarantined".into(),
             local_only: true,
             hook_execution: None,
+            tools_added: Vec::new(),
             created_at: "2026-08-24T00:00:00.000Z".into(),
         };
         let event = AppPushEvent::ToolContextsQuarantined {
@@ -588,6 +605,7 @@ mod tests {
                 source_call_id: Some("call-7".into()),
                 allow_always_offered: true,
                 mandatory: false,
+                questions: None,
             },
         };
         let wire = serde_json::to_value(&event).unwrap();

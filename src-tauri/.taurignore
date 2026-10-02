@@ -1,0 +1,12 @@
+# What `tauri dev` must not restart the app for. Its watcher leaves out
+# .gitignore'd entries only at the top of src-tauri; below that, only this file
+# filters (and, once it exists, the CLI's own list: node_modules/, target/,
+# gen/, Cargo.lock).
+#
+# A development host builds a remote agent on demand when it connects to a
+# machine that has none of its build (`remote_link::build_locally`). srt-win,
+# which travels with a Windows build, is built in its own crate directory, so
+# its cargo output would restart the app halfway through the connection that
+# asked for it.
+vendor/srt-win/target/
+remote-agents/

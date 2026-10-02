@@ -5,6 +5,7 @@ import {
   finishedTaskItems,
   flattenTaskItems,
   runningTaskItems,
+  shellTaskTitle,
   taskStateForStatus
 } from "./taskContainer";
 import type { TaskContainerMessages } from "./taskContainer";
@@ -48,11 +49,8 @@ const messages: TaskContainerMessages = {
   terminalIdle: "空闲",
   terminalBusy: "正在执行命令",
   shellRunning: "正在运行",
-  shellStopping: "正在中止",
   shellExited: (code) => `已失败（退出码 ${code}）`,
-  shellFinished: "已完成",
   shellFailed: "已失败",
-  shellStopped: "已中止",
   previewLabel: "开发服务器",
   previewStarting: "启动中",
   previewRunning: "运行中",
@@ -445,10 +443,12 @@ describe("deriveTaskItems", () => {
   });
 
   it("keeps a suspended browser page in the list rather than dropping it", () => {
+    // The host's shape for a sleeping page: no live surface, but suspended.
     const items = deriveTaskItems({
       agents: [],
       terminals: [],
-      browserSessionId: "conversation-1", browser: browser({ suspended: true, suspendedAtMs: Date.parse("2026-07-20T01:30:00Z") }),
+      browserSessionId: "conversation-1",
+      browser: browser({ hasPage: false, suspended: true, suspendedAtMs: Date.parse("2026-07-20T01:30:00Z") }),
       now: NOW
     }, messages);
 
@@ -707,7 +707,7 @@ describe("deriveTaskItems", () => {
     expect(finishedTaskItems(items)).toHaveLength(0);
   });
 
-  it("collapses a finished shell command into the finish list with how it went", () => {
+  it("collapses a finished shell command into the finish list, a failure told by its colour", () => {
     // The question after a build is "did it pass". A row that vanished at the
     // exact moment it could answer that — which is what this used to do — never
     // got to, and the user was left with an empty list and no idea.
@@ -733,12 +733,15 @@ describe("deriveTaskItems", () => {
 
     expect(runningTaskItems(items)).toHaveLength(0);
     expect(finishedTaskItems(items)).toHaveLength(2);
+    // No status word in the subtitle: the section says the row is done.
     expect(items[0]!.state).toBe("finished");
-    expect(items[0]!.detail).toBe("已完成 · npm install");
+    expect(items[0]!.detail).toBe("npm install");
+    expect(items[0]!.error).toBeNull();
     // A non-zero exit is the one shell state worth painting red, and the code is
-    // the first thing anyone asks about one.
+    // the first thing anyone asks about one — the hover text answers it.
     expect(items[1]!.state).toBe("failed");
-    expect(items[1]!.detail).toBe("已失败（退出码 1） · npm test");
+    expect(items[1]!.detail).toBe("npm test");
+    expect(items[1]!.error).toBe("已失败（退出码 1）");
   });
 
   it("keeps a stopped command neutral without a taskbar abort record", () => {
@@ -755,7 +758,7 @@ describe("deriveTaskItems", () => {
     }, messages);
 
     expect(item!.state).toBe("finished");
-    expect(item!.detail).toBe("已中止 · npm install");
+    expect(item!.detail).toBe("npm install");
     expect(item!.error).toBeNull();
   });
 
@@ -862,7 +865,7 @@ describe("deriveTaskItems", () => {
       .toBe(100_000);
   });
 
-  it("says a shell command is stopping without dropping its row", () => {
+  it("keeps a stopping shell command running and its row unchanged", () => {
     // Between the button press and the process actually dying the row has to
     // stay running: it is what holds the stop control and its pending spinner.
     const items = deriveTaskItems({
@@ -874,10 +877,9 @@ describe("deriveTaskItems", () => {
 
     expect(items).toHaveLength(1);
     expect(items[0]!.state).toBe("running");
-    expect(items[0]!.detail).toContain("正在中止");
-    // The command text survives alongside the status, so the row still says
-    // which command is the one being stopped.
-    expect(items[0]!.detail).toContain("npm install");
+    // The stop control's spinner says it is stopping; the subtitle stays the
+    // command, so the row still says which command is the one being stopped.
+    expect(items[0]!.detail).toBe("npm install");
   });
 
   it("reports how long a shell command has been running, measured from the host's start", () => {
@@ -928,20 +930,41 @@ describe("deriveTaskItems", () => {
     expect(running!.metrics.elapsedMs).toBe(90_000);
   });
 
-  it("names the workspace a shell command ran in once the conversation has more than one", () => {
+  it("titles a shell command by its shell and the directory it ran in", () => {
     const shellTasks = [
-      shellTask({ workspaceRoot: "/Users/me/web" }),
-      shellTask({ shellTaskId: "shell-2", toolName: "powershell", workspaceRoot: "~/src/api/" }),
-      // A row recorded before the host kept its workspace has nothing to name.
+      shellTask({ workspaceRoot: "/Users/me/web", cwd: "/Users/me/web/src" }),
+      // A row recorded before the host kept its directory falls back to the workspace root.
+      shellTask({ shellTaskId: "shell-2", toolName: "powershell", workspaceRoot: "C:\\src\\api" }),
+      // And one recorded before either has only its shell.
       shellTask({ shellTaskId: "shell-3", workspaceRoot: null })
     ];
-    const several = deriveTaskItems({ agents: [], terminals: [], shellTasks, multipleWorkspaces: true, now: NOW }, messages);
-    expect(several.map((item) => item.label)).toEqual(["bash · web", "powershell · api", "bash"]);
-    // The command stays the detail; the workspace belongs with the tool.
-    expect(several[0]!.detail).toBe("npm install");
-    // One workspace needs no telling apart.
-    const one = deriveTaskItems({ agents: [], terminals: [], shellTasks, now: NOW }, messages);
-    expect(one.map((item) => item.label)).toEqual(["bash", "powershell", "bash"]);
+    const items = deriveTaskItems({ agents: [], terminals: [], shellTasks, now: NOW }, messages);
+    expect(items.map((item) => item.label)).toEqual([
+      "bash:/Users/me/web/src",
+      "powershell:C:\\src\\api",
+      "bash"
+    ]);
+    expect(items.map((item) => item.kind === "shell" && shellTaskTitle(item.shell))).toEqual([
+      "bash:/Users/me/web/src",
+      "powershell:C:\\src\\api",
+      "bash"
+    ]);
+    // The command stays the detail.
+    expect(items[0]!.detail).toBe("npm install");
+  });
+
+  it("subtitles a shell command with the helper model's summary once it has one", () => {
+    const [explained, plain] = deriveTaskItems({
+      agents: [],
+      terminals: [],
+      shellTasks: [
+        shellTask({ explanation: "  安装项目依赖 " }),
+        shellTask({ shellTaskId: "shell-2", explanation: null })
+      ],
+      now: NOW
+    }, messages);
+    expect(explained!.detail).toBe("安装项目依赖");
+    expect(plain!.detail).toBe("npm install");
   });
 
   /**
@@ -1071,6 +1094,67 @@ describe("task item partitions", () => {
     expect(runningTaskItems(items).map((item) => item.id)).toEqual(["live"]);
     expect(finishedTaskItems(items).map((item) => item.id))
       .toEqual(["done", "broken", "terminal-1"]);
+  });
+
+  it("lists finished rows of every kind as one list, latest to finish first", () => {
+    const at = (secondsAgo: number) => new Date(NOW - secondsAgo * 1000).toISOString();
+    const items = deriveTaskItems({
+      agents: [
+        agent("early", { createdAt: at(600), completedAt: at(500) }),
+        agent("late", { createdAt: at(300), completedAt: at(20) })
+      ],
+      terminals: [terminal({ phase: "exited" })],
+      shellTasks: [
+        shellTask({ outcome: "succeeded", exitCode: 0, endedAt: at(100) }),
+        shellTask({ shellTaskId: "shell-2", outcome: "failed", exitCode: 2, endedAt: at(5) })
+      ],
+      now: NOW
+    }, messages);
+
+    // Kinds interleave by time; the exited terminal recorded no time and goes last.
+    expect(finishedTaskItems(items).map((item) => item.id))
+      .toEqual(["shell-2", "late", "shell-1", "early", "terminal-1"]);
+  });
+
+  it("titles a subagent row role:name and subtitles it with what it was asked", () => {
+    const [named, bare] = deriveTaskItems({
+      agents: [
+        agent("call-1", {
+          name: "reviewer-1",
+          role: { name: "reviewer", modelId: "claude-opus" },
+          task: "Review the auth\n  module for   races"
+        }),
+        agent("call-2", { name: "helper", task: "" })
+      ],
+      terminals: [],
+      inheritedModelId: "conversation-model",
+      now: NOW
+    }, messages);
+
+    expect(named!.label).toBe("reviewer:reviewer-1");
+    expect(named!.detail).toBe("Review the auth module for races");
+    // No role, no prefix; no task yet, the model it answers on.
+    expect(bare!.label).toBe("helper");
+    expect(bare!.detail).toBe("conversation-model");
+  });
+
+  it("swaps a subagent's task excerpt for the local model's title once it lands", () => {
+    const titles = new Map<string, string>();
+    const derive = () => deriveTaskItems({
+      agents: [
+        agent("reviewer-1", { name: "reviewer-1", callIds: ["ctx-spawn"], task: "Review the auth\n  module for   races" }),
+        agent("helper", { name: "helper", callIds: ["ctx-other"], task: "Run the tests" })
+      ],
+      terminals: [],
+      toolExplanation: (contextId) => titles.get(contextId),
+      now: NOW
+    }, messages).map((item) => item.detail);
+
+    expect(derive()).toEqual(["Review the auth module for races", "Run the tests"]);
+    titles.set("ctx-spawn", "  审查认证模块的竞态  ");
+    titles.set("ctx-other", "   ");
+    // The title is read off the spawn card the child carries; a blank one is no title.
+    expect(derive()).toEqual(["审查认证模块的竞态", "Run the tests"]);
   });
 
   it("counts running work without the plan, which sits in that list at every status", () => {

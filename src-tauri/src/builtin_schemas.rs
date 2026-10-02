@@ -76,122 +76,6 @@ fn named_server_id_prop(description: &str) -> Value {
     )
 }
 
-/// One closed variant of a merged tool's `oneOf`.
-///
-/// `action` is folded into each variant as a `const` and into its `required`, so the union stays
-/// discriminated: a model picking an action sees exactly that action's parameters, and every
-/// boundary keyword of the pre-merge per-operation schemas survives unchanged.
-fn action_variant(action: &str, description: &str, mut body: Value) -> Value {
-    let object = body.as_object_mut().expect("variant object");
-    object.insert("type".into(), json!("object"));
-    object.insert("description".into(), json!(description));
-    object.insert("additionalProperties".into(), json!(false));
-    let properties = object
-        .entry("properties")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .expect("variant properties");
-    properties.insert(
-        "action".into(),
-        json!({"const": action, "description": "Selects this operation."}),
-    );
-    let required = object
-        .entry("required")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .expect("variant required");
-    required.insert(0, json!("action"));
-    body
-}
-
-/// Every `todo` operation, in catalog order.
-///
-/// `action` is a `const` inside each variant, so the model that picks an action sees
-/// exactly that action's parameters and every boundary keyword of the pre-merge
-/// per-operation schemas survives — including `update`'s "at least one patch field"
-/// `anyOf`.
-fn todo_variants() -> Vec<Value> {
-    let task_id = || json!({"type": "string", "minLength": 1, "maxLength": 128});
-    let relation_ids = |description: &str| {
-        json!({
-            "type": "array",
-            "maxItems": 256,
-            "uniqueItems": true,
-            "items": {"type": "string", "minLength": 1, "maxLength": 128},
-            "description": description
-        })
-    };
-    vec![
-        action_variant(
-            "create",
-            "Create one pending task in this conversation's task list and return its stable task ID.",
-            json!({
-                "properties": {
-                    "subject": {"type": "string", "minLength": 1, "maxLength": 500},
-                    "description": {"type": "string", "minLength": 1, "maxLength": 32768},
-                    "activeForm": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 500,
-                        "description": "Present-continuous text shown while the task is in_progress."
-                    },
-                    "metadata": {"type": "object", "maxProperties": 256, "additionalProperties": true}
-                },
-                "required": ["subject", "description"]
-            }),
-        ),
-        action_variant(
-            "update",
-            "Patch one existing task by taskId: status, details, dependencies or metadata. status=deleted removes the task.",
-            json!({
-                "properties": {
-                    "taskId": task_id(),
-                    "status": {
-                        "type": "string",
-                        "enum": ["pending", "in_progress", "completed", "deleted"]
-                    },
-                    "subject": {"type": "string", "minLength": 1, "maxLength": 500},
-                    "description": {"type": "string", "minLength": 1, "maxLength": 32768},
-                    "activeForm": {"type": "string", "minLength": 1, "maxLength": 500},
-                    "addBlocks": relation_ids("Task IDs this task blocks."),
-                    "addBlockedBy": relation_ids("Task IDs that block this task."),
-                    "owner": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "metadata": {
-                        "type": "object",
-                        "maxProperties": 256,
-                        "additionalProperties": true,
-                        "description": "Keys merge into the task's metadata; a null value deletes that key."
-                    }
-                },
-                "required": ["taskId"],
-                "anyOf": [
-                    {"required": ["status"]},
-                    {"required": ["subject"]},
-                    {"required": ["description"]},
-                    {"required": ["activeForm"]},
-                    {"required": ["addBlocks"]},
-                    {"required": ["addBlockedBy"]},
-                    {"required": ["owner"]},
-                    {"required": ["metadata"]}
-                ]
-            }),
-        ),
-        action_variant(
-            "get",
-            "Read one task's full details, status and dependencies without changing the list.",
-            json!({
-                "properties": {"taskId": task_id()},
-                "required": ["taskId"]
-            }),
-        ),
-        action_variant(
-            "list",
-            "List every task in the task list with status, owner and unresolved dependencies.",
-            json!({"properties": {}}),
-        ),
-    ]
-}
-
 pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option<Value> {
     let schema = match name {
         // ---------------------------------------------------------------- Files
@@ -292,12 +176,12 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "integer",
                     "minimum": 1,
                     "default": 1,
-                    "description": "First line to return, 1-based. Text files only."
+                    "description": "First line to return, 1-based. Ignored for images."
                 },
                 "end_line": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Last line to return, inclusive; must not be smaller than start_line. Without it a read returns 2,000 lines. Text files only."
+                    "description": "Last line to return, inclusive; must not be smaller than start_line. Without it a read returns 2,000 lines. Ignored for images."
                 }
             },
             "required": ["path"],
@@ -707,7 +591,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                 ),
                 "filename": string_prop(
                     "The file name the page sees. Defaults to the attachment's own name.",
-                    256
+                    128
                 )
             },
             "required": ["image_id"],
@@ -733,44 +617,6 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "additionalProperties": false
         }),
         "agent_spawn" => agent_spawn_schema(None, false, profile),
-        "send_message" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolSendMessageDescription),
-            "properties": {
-                "target": {
-                    "type": "string",
-                    "pattern": "^[a-z][a-z0-9_-]{0,31}$",
-                    "description": "Child agent name returned by agent_spawn."
-                },
-                "message": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 32768,
-                    "description": "Message text."
-                }
-            },
-            "required": ["target", "message"],
-            "additionalProperties": false
-        }),
-        "followup_task" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolFollowupTaskDescription),
-            "properties": {
-                "target": {
-                    "type": "string",
-                    "pattern": "^[a-z][a-z0-9_-]{0,31}$",
-                    "description": "Child agent name returned by agent_spawn."
-                },
-                "message": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 32768,
-                    "description": "Instruction text."
-                }
-            },
-            "required": ["target", "message"],
-            "additionalProperties": false
-        }),
         "task_wait" => json!({
             "type": "object",
             "description": profile.text(PromptKey::ToolTaskWaitDescription),
@@ -803,10 +649,21 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "properties": {},
             "additionalProperties": false
         }),
+        // One argument, always empty: the host's fabricated calls carry it, so
+        // the call the model reads matches this schema, and an endpoint that
+        // mishandles a tool without parameters has one to see.
         "box" => json!({
             "type": "object",
             "description": profile.text(PromptKey::ToolBoxDescription),
-            "properties": {},
+            "properties": {
+                crate::wire_history::BOX_INPUT_KEY: {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": 0,
+                    "description": "Always an empty list."
+                }
+            },
+            "required": [crate::wire_history::BOX_INPUT_KEY],
             "additionalProperties": false
         }),
         // ---------------------------------------------------------- Long-term memory
@@ -832,49 +689,43 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
         "ask_user" => json!({
             "type": "object",
             "description": profile.text(PromptKey::ToolAskUserDescription),
+            // Claude Code's AskUserQuestion input schema, descriptions verbatim.
             "properties": {
                 "questions": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 4,
+                    "description": "Questions to ask the user (1-4 questions)",
                     "items": {
                         "type": "object",
                         "properties": {
                             "question": {
                                 "type": "string",
-                                "minLength": 1,
-                                "maxLength": 4000,
-                                "description": "The question shown to the user."
+                                "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark. Example: \"Which library should we use for date formatting?\" If multiSelect is true, phrase it accordingly, e.g. \"Which features do you want to enable?\""
                             },
                             "header": {
                                 "type": "string",
-                                "minLength": 1,
-                                "maxLength": 12,
-                                "description": "Chip/tag label for the question."
+                                "description": "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\"."
                             },
                             "options": {
                                 "type": "array",
                                 "minItems": 2,
                                 "maxItems": 4,
+                                "description": "The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
                                         "label": {
                                             "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 120,
-                                            "description": "Display text of this option."
+                                            "description": "The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice."
                                         },
                                         "description": {
                                             "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 1000,
-                                            "description": "What choosing this option means."
+                                            "description": "Explanation of what this option means or what will happen if chosen. Useful for providing context about trade-offs or implications."
                                         },
                                         "preview": {
                                             "type": "string",
-                                            "maxLength": 16384,
-                                            "description": "Preview content rendered while this option is focused."
+                                            "description": "Optional preview content rendered when this option is focused. Use for mockups, code snippets, or visual comparisons that help users compare options. See the tool description for the expected content format."
                                         }
                                     },
                                     "required": ["label", "description"],
@@ -883,7 +734,8 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                             },
                             "multiSelect": {
                                 "type": "boolean",
-                                "description": "Allow selecting multiple options."
+                                "default": false,
+                                "description": "Set to true to allow the user to select multiple options instead of just one. Use when choices are not mutually exclusive."
                             }
                         },
                         "required": ["question", "header", "options", "multiSelect"],
@@ -892,16 +744,37 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                 },
                 "answers": {
                     "type": "object",
-                    "description": "User answers collected by the permission component.",
+                    "description": "User answers collected by the permission component",
                     "additionalProperties": {"type": "string"}
                 },
                 "annotations": {
                     "type": "object",
-                    "description": "Per-question annotations from the user."
+                    "description": "Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question text.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "preview": {
+                                "type": "string",
+                                "description": "The preview content of the selected option, if the question used previews."
+                            },
+                            "notes": {
+                                "type": "string",
+                                "description": "Free-text notes the user added to their selection."
+                            }
+                        },
+                        "additionalProperties": false
+                    }
                 },
                 "metadata": {
                     "type": "object",
-                    "description": "Tracking metadata; not shown to the user."
+                    "description": "Optional metadata for tracking and analytics purposes. Not displayed to user.",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "Optional identifier for the source of this question (e.g., \"remember\" for /remember command). Used for analytics tracking."
+                        }
+                    },
+                    "additionalProperties": false
                 }
             },
             "required": ["questions"],
@@ -920,12 +793,6 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             },
             "required": ["prompt"],
             "additionalProperties": false
-        }),
-        // ------------------------------------------------------------ Task state
-        "todo" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolTodoDescription),
-            "oneOf": todo_variants()
         }),
         // ------------------------------------------------------------ Plan mode
         // Flat rather than an action `oneOf`: the Claude Agent provider publishes
@@ -954,6 +821,73 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
         "exit_plan_mode" => json!({
             "type": "object",
             "description": profile.text(PromptKey::ToolExitPlanModeDescription),
+            "properties": {},
+            "additionalProperties": false
+        }),
+        // ------------------------------------------------------------ Handoff
+        // The memory tools' shape, pointed at the conversation's handoff
+        // notebook; the index line is the `description`, as in MEMORY.md.
+        "read_handoff_note" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolReadHandoffNoteDescription),
+            "properties": {
+                "name": memory_document_name(
+                    "Note name from the handoff index; the .md suffix is optional."
+                )
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "create_handoff_note" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolCreateHandoffNoteDescription),
+            "properties": {
+                "name": memory_document_name(
+                    "New note name; no path separators, the .md suffix is optional."
+                ),
+                "content": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The note's complete Markdown body, up to 256 KiB of UTF-8."
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 300,
+                    "description": "One sentence saying what the note holds; it becomes the note's line in the handoff index."
+                }
+            },
+            "required": ["name", "content", "description"],
+            "additionalProperties": false
+        }),
+        "edit_handoff_note" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolEditHandoffNoteDescription),
+            "properties": {
+                "name": memory_document_name("Existing note name; the .md suffix is optional."),
+                "old_text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Passage to replace; must occur exactly once in the note."
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Replacement text; an empty string deletes the passage."
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 300,
+                    "description": "One sentence describing the note after the change, for its line in the handoff index."
+                }
+            },
+            "required": ["name", "old_text", "new_text", "description"],
+            "additionalProperties": false
+        }),
+        // No arguments on purpose: the notes are the whole handoff.
+        "handoff" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolHandoffDescription),
             "properties": {},
             "additionalProperties": false
         }),
@@ -1221,7 +1155,7 @@ fn workflow_schema(
                 "minLength": 1,
                 "maxLength": 128,
                 "pattern": "^[A-Za-z0-9_-]+$",
-                "description": "Run id of a previous run of this same script: the name you gave it, or the id its dispatch receipt reported when the host had to number it. Journaled steps replay instantly; the first unjournaled step and everything after it re-runs. On resume, script may be omitted — the host reloads the approved script from the run directory; if provided, it must be byte-identical to the approved one."
+                "description": "Run id of a previous run: the name you gave it, or the id its dispatch receipt reported when the host had to number it. A step whose prompt and options are unchanged replays instantly from the journal; a step the last attempt left running when it stopped re-runs on its own; a changed, failed or skipped step re-runs together with everything after it. script and args may be omitted — the host reuses the ones this run last ran with. Pass an edited script to change later steps or post-processing while unchanged steps still replay; it is approved again."
             }
         },
         "required": ["name"],
@@ -1261,7 +1195,7 @@ fn workflow_script_description(roles: Option<&[String]>, role_required: bool) ->
         concat!(
             "Plain JavaScript (not TypeScript), starting with `export const meta = {{ name, description, phases?: [{{title, detail?}}] }}` — a pure literal. The body runs as an async function: top-level await and return work, and the return value becomes the workflow result.\n",
             "Available globals:\n",
-            "{signature}: spawn one step subagent. It inherits no conversation history — the prompt must be self-contained. opts: label (display name), phase (progress group; defaults to the last phase() call), schema (JSON Schema the step must satisfy; the promise then resolves to validated structured data, otherwise to the step's final text), effort (low|medium|high|xhigh), {agent_type_clause}, isolation. A failed or skipped step resolves to null.\n",
+            "{signature}: spawn one step subagent. It inherits no conversation history — the prompt must be self-contained. opts: label (display name), phase (progress group; defaults to the last phase() call), schema (JSON Schema the step must satisfy; the promise then resolves to validated structured data, otherwise to the step's final text), effort (low|medium|high|extra|max), {agent_type_clause}, isolation. A failed or skipped step resolves to null.\n",
             "- isolation: \"worktree\" gives that one step its own git worktree, checked out from HEAD on a fresh branch, so parallel steps can edit files without colliding. It sees the committed tree only — your uncommitted changes are NOT in it. A step that leaves changes or commits keeps its worktree and reports the path and branch; one that changes nothing has it removed. Requires the workspace to be a git repository root; the step fails on its own if it is not. EXPENSIVE (a full checkout per step) — use it only when steps really would conflict.\n",
             "- parallel(thunks) -> Promise<any[]>: run () => agent(...) thunks concurrently and wait for all; a throwing thunk yields null. This is a barrier — use it only when the next stage needs every result.\n",
             "- pipeline(items, ...stages) -> Promise<any[]>: stream each item through the stages independently with no barrier between stages; stage callbacks receive (prev, originalItem, index), and a throwing stage drops that item to null. Default to pipeline over parallel.\n",
@@ -1269,7 +1203,7 @@ fn workflow_script_description(roles: Option<&[String]>, role_required: bool) ->
             "- args: the args input, verbatim. budget: {{ total, spent(), remaining() }} for the token_budget cap; once exhausted, further agent() calls throw.\n",
             "Date.now(), argless new Date() and Math.random() throw — they would break resume replay; pass timestamps and seeds in via args. No filesystem, network, module or timer access. At most 1000 steps per run and 4096 items per boundary array.
 ",
-            "Required on a fresh run. Optional when resume_run_id is set — the host reloads the approved script from that run's directory."
+            "Required on a fresh run. Optional when resume_run_id is set — the host reloads the script that run last ran from its directory."
         ),
         signature = signature,
         agent_type_clause = agent_type_clause
@@ -1309,7 +1243,7 @@ fn agent_spawn_schema(
             "name": {
                 "type": "string",
                 "pattern": "^[a-z][a-z0-9_-]{0,31}$",
-                "description": "Required. Name this child yourself: it is both the address send_message, followup_task and task_wait take, and the title the task is listed under. Say what the child is for (researcher, review-api), not what you are asking it right now. The name is reserved for the whole conversation branch tree, so it must not repeat one already used here."
+                "description": "Required. Name this child yourself: it is both the address task_wait takes and the title the task is listed under. Say what the child is for (researcher, review-api), not what you are asking it right now. The name is reserved for the whole conversation branch tree, so it must not repeat one already used here."
             },
             "label": {
                 "type": "string",
@@ -1458,30 +1392,6 @@ pub(crate) fn subagent_update_schema(profile: &PromptProfile) -> Value {
     })
 }
 
-/// Model-visible `send_message` schema for a CHILD run.
-///
-/// The public catalog schema takes `{target, message}` because the main agent
-/// picks which of its children to write to. A child has exactly one reachable
-/// correspondent — the agent that spawned it — so `target` is dropped rather
-/// than constrained: a parameter whose only valid value the host already knows
-/// is an invitation to address a sibling and be refused.
-pub(crate) fn child_send_message_schema(profile: &PromptProfile) -> Value {
-    json!({
-        "type": "object",
-        "description": profile.text(PromptKey::SubagentSendMainToolDescription),
-        "properties": {
-            "message": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 32768,
-                "description": profile.text(PromptKey::SubagentSendMainMessageDescription)
-            }
-        },
-        "required": ["message"],
-        "additionalProperties": false
-    })
-}
-
 /// Model-visible `skill` schema.
 ///
 /// It says nothing about which skills exist, and that is deliberate. A schema
@@ -1616,10 +1526,8 @@ mod tests {
     #[test]
     fn tools_that_do_not_act_in_a_directory_are_left_alone() {
         let workspaces = mixed_workspaces();
-        for name in ["preview_list", "preview_screenshot", "ask_user", "todo"] {
+        for name in ["preview_list", "preview_screenshot", "ask_user"] {
             let schema = schema_with_workspaces(name, &workspaces);
-            // `todo` is a `oneOf` with no root properties at all, which is also
-            // the shape the injector has to leave untouched rather than crash on.
             assert!(
                 schema["properties"]["workspace"].is_null(),
                 "{name} should not address a workspace: {schema}"
@@ -1702,15 +1610,6 @@ mod tests {
             .keys()
             .cloned()
             .collect()
-    }
-
-    /// `todo` is a discriminated union, so its shape claims hold per variant. Every
-    /// other tool has exactly one shape and is checked directly.
-    fn schema_shapes(schema: &Value) -> Vec<Value> {
-        match schema["oneOf"].as_array() {
-            Some(variants) => variants.clone(),
-            None => vec![schema.clone()],
-        }
     }
 
     /// Role names must be machine-readable in both role-naming tool schemas:
@@ -2037,18 +1936,7 @@ mod tests {
                 "{} schema must state what the operation is",
                 tool.name
             );
-            // Closedness is a per-shape claim: a union root carries no properties of its own, so
-            // asserting it there would pass vacuously while a variant stayed open.
-            for shape in schema_shapes(&schema) {
-                assert_eq!(shape["type"], "object", "{}", tool.name);
-                assert_eq!(shape["additionalProperties"], false, "{}", tool.name);
-                let shape_description = shape["description"].as_str().unwrap_or_default();
-                assert!(
-                    !shape_description.trim().is_empty(),
-                    "{} schema variant must state what the operation is",
-                    tool.name
-                );
-            }
+            assert_eq!(schema["additionalProperties"], false, "{}", tool.name);
         }
     }
 
@@ -2057,10 +1945,7 @@ mod tests {
         for tool in tool_catalog() {
             let schema =
                 builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).unwrap();
-            let schema_properties: BTreeSet<String> = schema_shapes(&schema)
-                .iter()
-                .flat_map(|shape| properties(shape))
-                .collect();
+            let schema_properties = properties(&schema);
             let parameters: BTreeSet<String> = tool
                 .parameters
                 .iter()
@@ -2179,17 +2064,15 @@ mod tests {
         for tool in tool_catalog() {
             let schema =
                 builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).unwrap();
-            for shape in schema_shapes(&schema) {
-                let shape_properties = properties(&shape);
-                if let Some(required) = shape["required"].as_array() {
-                    for entry in required {
-                        let name = entry.as_str().expect("required entry string");
-                        assert!(
-                            shape_properties.contains(name),
-                            "{}: required {name} is not a declared property",
-                            tool.name
-                        );
-                    }
+            let schema_properties = properties(&schema);
+            if let Some(required) = schema["required"].as_array() {
+                for entry in required {
+                    let name = entry.as_str().expect("required entry string");
+                    assert!(
+                        schema_properties.contains(name),
+                        "{}: required {name} is not a declared property",
+                        tool.name
+                    );
                 }
             }
         }
@@ -2242,43 +2125,6 @@ mod tests {
     #[ignore = "writes the design baseline under docs/; run explicitly to regenerate"]
     fn regenerate_builtin_schema_baseline() {
         std::fs::write(baseline_path(), baseline_document()).expect("write baseline");
-    }
-
-    /// Same union contract as `todo`: the merged state tool must expose exactly the
-    /// actions its executor dispatches on, each discriminated by a required
-    /// `action` const. A variant the executor cannot run — or an action with no variant — would
-    /// be a schema the model can call into a dead end.
-    #[test]
-    fn state_tool_variants_cover_every_action_exactly_once() {
-        for (tool, expected) in [("todo", crate::orchestration::TODO_ACTIONS)] {
-            let schema = builtin_tool_schema(tool, &PromptProfile::builtin_english()).unwrap();
-            let variants = schema["oneOf"].as_array().expect("state tool oneOf");
-            let declared: Vec<&str> = variants
-                .iter()
-                .map(|variant| {
-                    let action = variant["properties"]["action"]["const"]
-                        .as_str()
-                        .expect("action const");
-                    let required: Vec<&str> = variant["required"]
-                        .as_array()
-                        .expect("variant required")
-                        .iter()
-                        .map(|entry| entry.as_str().expect("required entry"))
-                        .collect();
-                    assert!(
-                        required.contains(&"action"),
-                        "{tool} {action} must require action"
-                    );
-                    action
-                })
-                .collect();
-            assert_eq!(declared, expected, "{tool}");
-            assert_eq!(
-                declared.iter().collect::<BTreeSet<_>>().len(),
-                declared.len(),
-                "{tool}"
-            );
-        }
     }
 
     #[test]

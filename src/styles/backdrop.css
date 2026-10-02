@@ -15,6 +15,15 @@
  *   colour at partial alpha, so light and dark glass come from the same night mirror
  *   as everything else.
  *
+ * The blur is baked, not drawn: `lib/glassPlate.ts` runs each filter below once over the
+ * background and sets the result on the root, and a glass surface lays it under its tint,
+ * fixed to the window and fitted as the picture is (`--glass-under`). Nothing on the page has
+ * a `backdrop-filter`. On macOS one is a backdrop layer the window server blurs afresh
+ * whenever anything under or inside it repaints, and that left stray blocks of colour on
+ * screen that no screenshot catches. So glass is one layer deep: the sidebar, the tiles and
+ * the side panes, which lie on the background. What floats over them (windows, menus, the
+ * chips over the timeline) is solid, never glass over glass.
+ *
  * Kept deliberately quiet: no refraction, and enough tint that text reads the same as
  * it does on the plain theme.
  */
@@ -23,13 +32,19 @@
   --glass-saturate: 130%;
   --glass-tile: var(--color-f7f7f5-ap78);
   --glass-pane: var(--color-efefeb-ap80);
-  --glass-frame: var(--color-efefeb-ap66);
   --glass-edge: var(--color-ffffff-ap45);
   --glass-sheen: var(--color-ffffff-ap28);
   --glass-shadow: var(--color-000000-ap13);
   /* A draft's clearer glass (below). It is kept on the root rather than on the draft's tile
-     so that the chip row's sampler (lib/glassGround.ts) can read it whatever the pane shows. */
+     so that the baker can read it whatever the pane shows. */
   --glass-draft-filter: blur(7px) saturate(200%) brightness(1.06);
+  /* The baked glass as a background layer, last under a surface's tint. Until the first bake
+     (or where the picture cannot be read) the layer is empty and the tint lies on the picture. */
+  --glass-under: var(--glass-plate, none) var(--glass-plate-position, center) / cover no-repeat fixed;
+  --glass-under-draft: var(--glass-plate-draft, none) var(--glass-plate-position, center) / cover no-repeat fixed;
+  /* Scrollbar thumbs are veils too. */
+  --scrollbar-thumb: color-mix(in srgb, var(--text) 22%, transparent);
+  --scrollbar-thumb-hover: color-mix(in srgb, var(--text) 36%, transparent);
 }
 /* Mirroring would turn the edge and sheen dark and the shadow light; night glass
    still catches light on its rim and still casts a shadow, so it takes the tokens
@@ -38,22 +53,20 @@
 :root[data-glass="true"][data-theme="night"] {
   --glass-tile: var(--color-f7f7f5-ap84);
   --glass-pane: var(--color-efefeb-ap86);
-  --glass-frame: var(--color-efefeb-ap74);
   --glass-edge: var(--color-000000-ap13);
   --glass-sheen: var(--color-000000-ap6);
   --glass-shadow: var(--color-ffffff-ap34);
   --glass-draft-filter: blur(7px) saturate(180%) brightness(.92);
 }
-/* The top bar's strip: frosted, and denser than the panes it fades over. It reaches
+/* The top bar's strip: a tint denser than the panes it fades over. It reaches
    `--strip-reach` below the bar, and the tiles rise `--tile-rise` into the bar's foot. */
 :root:is([data-backdrop="custom"], [data-glass="true"]) {
-  --glass-strip: color-mix(in srgb, var(--app) 72%, transparent);
-  --glass-strip-filter: blur(38px) saturate(150%);
+  --strip-tint: color-mix(in srgb, var(--app) 72%, transparent);
   --strip-reach: 24px;
   --tile-rise: 4px;
 }
 :root:is([data-backdrop="custom"], [data-glass="true"])[data-theme="night"] {
-  --glass-strip: color-mix(in srgb, var(--app) 78%, transparent);
+  --strip-tint: color-mix(in srgb, var(--app) 78%, transparent);
 }
 /* `[data-theme]` outranks base.css's night gutter, which is declared at the same weight. */
 :root:is([data-backdrop="custom"], [data-glass="true"])[data-theme] { --gutter: transparent; }
@@ -72,7 +85,7 @@
 .app-backdrop__image {
   width: 100%; height: 100%; display: block;
   object-fit: cover; object-position: center;
-  user-select: none;
+  -webkit-user-select: none; user-select: none;
   animation: app-backdrop-in .42s ease-out;
 }
 @keyframes app-backdrop-in { from { opacity: 0; } }
@@ -83,10 +96,11 @@
 :root:is([data-backdrop="custom"], [data-glass="true"]) .main-pane,
 :root:is([data-backdrop="custom"], [data-glass="true"]) .topbar { background: transparent; }
 
-/* The top bar sits on the picture itself. A strip of frosted glass behind it, running
-   the bar's full width and fading out downwards, keeps its title and buttons legible
-   on any picture without boxing the bar in. The strip is a pseudo-element so the mask
-   does not reach the bar's content; the content is lifted over it.
+/* The top bar sits on the picture itself. A strip of tint behind it, running the bar's
+   full width and fading out downwards, keeps its title and buttons legible on any picture
+   without boxing the bar in. It is a gradient, not glass: it lies over the tiles' top edge,
+   and glass is one layer deep. The strip is a pseudo-element under the bar's content, which
+   is lifted over it.
    The tiles rise into the bar's foot, as far below its title and buttons as the frame
    is wide elsewhere, and the strip's fade lies over their top edge. The bar itself sets
    no z-index, so the strip and the content stack against the tiles, while the bar's
@@ -98,41 +112,8 @@
 :root:is([data-backdrop="custom"], [data-glass="true"]) .pane-tiles--solo .pane-tiles__tile.is-solo-hidden { top: 0; }
 :root:is([data-backdrop="custom"], [data-glass="true"]) .topbar::before {
   content: ""; position: absolute; z-index: 1; inset: 0 0 calc(-1 * var(--strip-reach)); pointer-events: none;
-  background: var(--glass-strip);
-  -webkit-backdrop-filter: var(--glass-strip-filter);
-  backdrop-filter: var(--glass-strip-filter);
-  /* A mask reads only alpha; any opaque token will do. */
-  -webkit-mask-image: linear-gradient(180deg, var(--color-000000) 30%, transparent);
-  mask-image: linear-gradient(180deg, var(--color-000000) 30%, transparent);
+  background: linear-gradient(180deg, var(--strip-tint) 30%, transparent);
 }
-/* The strip's glass is drawn afresh whenever anything under it changes. The timeline ran up
-   to the tile's top edge, under the strip's fade, so while it followed a streaming reply the
-   strip was redrawn every frame, and the top bar's buttons, hovered meanwhile, left ever
-   darker blocks on screen: the macOS fault the sidebar showed, which no screenshot catches.
-   The timeline therefore begins where the strip ends. The tile's top edge under the fade is
-   its own unchanging surface, and text fades out as it scrolls up into it; the stream's top
-   padding is that fade, so nothing at rest sits in it. The side panes' headers are taller
-   than the overlap, so nothing under the strip changes there. */
-:root:is([data-backdrop="custom"], [data-glass="true"]) .pane-tiles__chat .context-scroll {
-  --timeline-fade: 12px;
-  margin-top: calc(var(--strip-reach) + var(--tile-rise));
-  -webkit-mask-image: linear-gradient(180deg, transparent, var(--color-000000) var(--timeline-fade));
-  mask-image: linear-gradient(180deg, transparent, var(--color-000000) var(--timeline-fade));
-}
-:root:is([data-backdrop="custom"], [data-glass="true"]) .pane-tiles__chat .context-stream { padding-top: var(--timeline-fade); }
-
-/* The glass itself. Both spellings: WebKit before Safari 18 only knows the prefixed one. */
-:root[data-glass="true"] .sidebar::before,
-:root[data-glass="true"] .window-titlebar,
-:root[data-glass="true"] .pane-tiles > .pane-tiles__chat::before,
-:root[data-glass="true"] .side-pane {
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-}
-
-/* The Windows title bar is frame glass, the thinnest, so the picture reads through it most. */
-:root[data-glass="true"] .window-titlebar { background: var(--glass-frame); }
-
 /* The sidebar is the conversation tile's glass — tint, sheen and shadow — laid against
    the window's left, top and bottom edges as the frame always was. Its right edge is the
    box's, where the top bar's strip begins, so the two meet without a seam. The divider
@@ -140,10 +121,8 @@
    overflow clips to its padding box, so a layer reaching over a border was cut off there
    and left a line of bare picture between the two. Nor is there a rim along that edge,
    which drew the same line in light. The glass is a layer under the rows, as the
-   conversation's is: with the filter on the sidebar itself, the whole pane darkened on
-   screen a little more each time a row repainted under the pointer — a macOS compositing
-   fault that screenshots never showed. The shadow sits on the sidebar, where its overflow
-   does not clip it; it stands in for the narrow window's overlay shadow. */
+   conversation's is. The shadow sits on the sidebar, where its overflow does not clip it;
+   it stands in for the narrow window's overlay shadow. */
 :root[data-glass="true"] .sidebar {
   background: transparent;
   border-right: 0;
@@ -152,22 +131,15 @@
 }
 :root[data-glass="true"] .sidebar::before {
   content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-tile);
+  background:
+    linear-gradient(165deg, var(--glass-sheen), transparent 38%),
+    linear-gradient(var(--glass-tile), var(--glass-tile)),
+    var(--glass-under);
 }
-/* With the glass under the rows, the blocks still showed where rows repaint. Over glass,
-   hovering in the sidebar therefore switches at once, as the timeline's rows always have:
-   an animated highlight repaints a row frame by frame, and a fading button group is lifted
-   into a layer of its own for the fade. Dragging keeps its fade and lift. The top bar's
-   buttons, over their strip, showed the same blocks and switch at once too. */
-:root[data-glass="true"] .conversation-row { transition: opacity .14s, transform .14s; }
-:root[data-glass="true"] .sidebar :is(.conversation-row__actions, .icon-button),
-:root[data-glass="true"] .sidebar-resize-handle::after,
-:root:is([data-backdrop="custom"], [data-glass="true"]) :is(.shell-nav, .topbar) .icon-button { transition: none; }
 
-/* Tiles: the conversation and every side pane. The conversation's glass is a layer
-   under its content rather than a filter on the tile: a tile with a backdrop filter is
-   the containing block of the fixed boxes inside it, and the timeline's insert menu is
-   one — it opened a tile's origin away from the pointer. */
+/* Tiles: the conversation and every side pane. The glass is a layer under a tile's
+   content, as the sidebar's is, with its tint a layer over the baked glass (a colour would
+   lie under every image). */
 :root[data-glass="true"] .pane-tiles > .pane-tiles__chat:not(.is-solo-hidden) { position: relative; }
 :root[data-glass="true"] .pane-tiles > .pane-tiles__chat {
   isolation: isolate;
@@ -177,13 +149,30 @@
 :root[data-glass="true"] .pane-tiles > .pane-tiles__chat::before {
   content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
   border-radius: inherit;
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-tile);
+  background:
+    linear-gradient(165deg, var(--glass-sheen), transparent 38%),
+    linear-gradient(var(--glass-tile), var(--glass-tile)),
+    var(--glass-under);
   box-shadow: inset 0 0 0 1px var(--glass-edge);
 }
+/* A side pane is glass the way the conversation is. The border's width goes to the padding,
+   the content staying where it was, and the rim is drawn on the layer as the conversation's
+   is: the pane clips to its padding box, which a border would leave as a line of bare picture
+   round the glass. */
 :root[data-glass="true"] .side-pane {
-  border-color: var(--glass-edge);
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-pane);
+  border-width: 0;
+  padding: 1px;
+  background: transparent;
   box-shadow: 0 10px 30px var(--glass-shadow);
+}
+:root[data-glass="true"] .side-pane::before {
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  border-radius: inherit;
+  background:
+    linear-gradient(165deg, var(--glass-sheen), transparent 38%),
+    linear-gradient(var(--glass-pane), var(--glass-pane)),
+    var(--glass-under);
+  box-shadow: inset 0 0 0 1px var(--glass-edge);
 }
 
 /* Pane contents that painted the ground over their tile now let the glass through. */
@@ -205,8 +194,8 @@
  *   thinned, which darkens whatever lies under it by about the step its grey took, and
  *   lightens it at night. Rules are the text colour thinned too, so none of them reads as a
  *   pale line over a dark picture.
- * - What floats (dialogs, menus, drawers, the search palette) is a sheet of glass of its
- *   own: blurred, tinted with the panel white, with the tiles' rim and sheen.
+ * - What floats (dialogs, menus, drawers, the search palette) is a solid sheet with the
+ *   tiles' rim and sheen. Glass is one layer deep, so it is never glass over glass.
  *
  * The semantic surface tokens carry most of it. Surfaces that name a palette grey of their
  * own follow by hand, each under `:where()` so it keeps its own rule's weight: states that
@@ -227,126 +216,66 @@
   --danger-soft: color-mix(in srgb, var(--danger) 10%, transparent);
   --success-soft: color-mix(in srgb, var(--success) 11%, transparent);
   --warning-soft: color-mix(in srgb, var(--warning) 11%, transparent);
-  /* Floating sheets. The thin one is for a sheet whose regions lift themselves off it. */
-  --glass-sheet: color-mix(in srgb, var(--color-ffffff) 72%, transparent);
-  --glass-sheet-thin: color-mix(in srgb, var(--color-ffffff) 60%, transparent);
-  /* A window over a window has no blur of its own, and what it would let through is the
-     page of the window under it; even at 97% a coloured swatch ghosted through. Solid. */
-  --glass-sheet-stacked: var(--color-ffffff);
-  --glass-sheet-filter: blur(30px) saturate(160%);
+  /* What floats over the glass: a solid sheet, and its shadow. */
+  --glass-solid: var(--color-ffffff);
   --glass-sheet-shadow: 0 22px 64px var(--glass-shadow), 0 2px 8px var(--glass-shadow);
-  /* What stays put while content scrolls under it: dense enough to cover it without a blur. */
+  /* A dense veil, for a small control laid over content (a code block's copy button). */
+  --glass-sheet: color-mix(in srgb, var(--color-ffffff) 72%, transparent);
+  /* What stays put while content scrolls under it: dense enough to cover it, since glass is
+     one layer deep and this lies over the glass. */
   --glass-pinned: color-mix(in srgb, var(--color-efefeb) 92%, transparent);
 }
-/* Dark glass lets more of the picture through, so night sheets and lifts are denser. */
+/* Dark glass lets more of the picture through, so night veils and lifts are denser. */
 :root[data-glass="true"][data-theme="night"] {
   --panel: color-mix(in srgb, var(--color-ffffff) 40%, transparent);
   --glass-sheet: color-mix(in srgb, var(--color-ffffff) 80%, transparent);
-  --glass-sheet-thin: color-mix(in srgb, var(--color-ffffff) 70%, transparent);
 }
 
-/* Sheets. The glass is a layer under the content, as the tiles' is: the dialog holds fixed
-   boxes (the settings' drawer, the model editor) that a filter on the dialog would pin to
-   it, and a filter on a box whose rows repaint under the pointer is what darkened the
-   sidebar on screen. A sheet that scrolls itself would scroll such a layer away, so those
-   few carry the filter directly (below). */
-:root[data-glass="true"] :is(.dialog, .model-editor-dialog, .conversation-search, .drawer, .fork-request-card) {
-  position: relative;
-  isolation: isolate;
-}
+/* What floats over the glass is solid, with the glass's rim, sheen and shadow: the windows,
+   the search palette, a fork's card and the chart's tip. Global settings, and the windows laid
+   out as it is (presets, roles), lie on the tiles' ground instead, so that their pages lift
+   off it as they did off their glass. */
 :root[data-glass="true"] :is(
   .dialog, .model-editor-dialog, .conversation-search, .drawer, .fork-request-card,
-  .popover-menu__panel, .popover-menu__submenu--flyout,
-  .context-menu, .context-menu__submenu:not(.context-menu__submenu--scroll),
-  .shortcut-settings-page__menu, .provider-rail__filter-menu,
-  .usage-stats__chart-tip, .file-preview__toolbar, .sketch-toolbar__pill
+  .usage-stats__chart-tip
 ) {
   border-color: var(--glass-edge);
-  background: transparent;
+  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-solid);
   box-shadow: var(--glass-sheet-shadow);
 }
+:root[data-glass="true"] .dialog:has(.settings-layout) {
+  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--app);
+}
+/* Menus are the same solid sheet: a menu, a submenu (a panel of its own beside its menu,
+   MenuFlyout.tsx), a menu that scrolls, and the small toolbars that float over a pane's
+   content (a picture's zoom, a PDF's; the browser's annotation pill). */
 :root[data-glass="true"] :is(
-  .dialog, .model-editor-dialog, .conversation-search, .drawer, .fork-request-card,
-  .popover-menu__panel, .popover-menu__submenu--flyout,
-  .context-menu, .context-menu__submenu:not(.context-menu__submenu--scroll),
+  .popover-menu__panel, .context-usage-compact__flyout,
+  .context-menu, .context-menu__submenu,
   .shortcut-settings-page__menu, .provider-rail__filter-menu,
-  .usage-stats__chart-tip, .file-preview__toolbar, .sketch-toolbar__pill
-)::before {
-  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
-  border-radius: inherit;
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-sheet);
-  -webkit-backdrop-filter: var(--glass-sheet-filter);
-  backdrop-filter: var(--glass-sheet-filter);
-}
-/* The ones that scroll: the Git card's list, the browser's menu, a long tool submenu. */
-:root[data-glass="true"] :is(.git-status-card__body, .browser-panel__menu, .context-menu__submenu--scroll) {
+  .git-status-card__body, .browser-panel__menu,
+  .file-preview__toolbar, .sketch-toolbar__pill, .timeline-notice
+) {
   border-color: var(--glass-edge);
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-sheet);
+  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-solid);
   box-shadow: var(--glass-sheet-shadow);
-  -webkit-backdrop-filter: var(--glass-sheet-filter);
-  backdrop-filter: var(--glass-sheet-filter);
 }
-/* A menu's rows were the panel's white on the panel; on the sheet they are the sheet. */
+/* A menu's rows were the panel's white on the panel; on the menu they are the menu. */
 :where(:root[data-glass="true"]) .shortcut-settings-page__menu > button { background: transparent; }
 
-/* A box that is fading in, or that has a backdrop filter itself, is where the glass inside it
-   stops looking: a sheet inside it would blur only the scrim and show the window through it
-   sharp. So over glass a scrim's tint and fade move to a layer beside the sheet rather than
-   around it, and the sheets only rise. The scrim is a tint and nothing more: the plain
-   theme's 2px blur made it a second pane of glass over the whole window, under every sheet,
-   and every sheet was then glass on glass. With two panes stacked, blocks of stale colour
-   showed on screen inside the sheet now and then, the macOS fault the sidebar showed. */
-:root[data-glass="true"] :is(.modal-backdrop, .model-editor-backdrop, .drawer-backdrop, .conversation-search-backdrop) {
-  --glass-scrim: var(--color-1e1e1c-ap24);
-  background: transparent;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-  animation: none;
-}
-:root[data-glass="true"] .model-editor-backdrop { --glass-scrim: var(--color-1e1e1c-ap30); }
-:root[data-glass="true"] :is(.modal-backdrop, .model-editor-backdrop, .drawer-backdrop, .conversation-search-backdrop)::before {
-  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
-  background: var(--glass-scrim);
-  animation: fade-in .12s ease-out;
-}
-/* A window opened over another window (the model editor or a drawer inside the settings,
-   a confirmation over a role, the background picker over the appearance page) would be a
-   second pane of glass over the first, so it is a solid sheet with the glass's rim and sheen
-   and no blur of its own. */
-:root[data-glass="true"] :is(
-  .modal-backdrop ~ .modal-backdrop .dialog,
-  .dialog .model-editor-dialog,
-  .dialog .drawer
-)::before {
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-sheet-stacked);
+/* A scrim is a tint and nothing more: the plain theme's 2px blur would be a pane of glass over
+   the whole window. */
+:root[data-glass="true"] :is(.modal-backdrop, .model-editor-backdrop) {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
-/* Inside a window, hover and selection switch at once, as they do in the sidebar: a colour
-   that eases in repaints its row frame by frame over the sheet's glass, which is where the
-   sidebar's blocks kept showing until its hovers stopped easing. Motion stays (a switch's
-   knob, a chevron turning, a button's lift), since it moves a layer rather than repainting. */
-:root[data-glass="true"] :is(.dialog, .model-editor-dialog, .drawer) *,
-:root[data-glass="true"] :is(.dialog, .model-editor-dialog, .drawer) *::before,
-:root[data-glass="true"] :is(.dialog, .model-editor-dialog, .drawer) *::after {
-  transition-property: transform;
-}
-:root[data-glass="true"] :is(.dialog, .conversation-search) { animation-name: glass-sheet-rise; }
-@keyframes glass-sheet-rise { from { transform: translateY(8px) scale(.985); } }
-:root[data-glass="true"] .context-menu { animation-name: glass-menu-drop; }
-@keyframes glass-menu-drop { from { transform: translateY(-3px) scale(.985); } }
-:root[data-glass="true"] .fork-request-card { animation-name: glass-card-slide; }
-@keyframes glass-card-slide { from { transform: translateX(24px); } }
 
-/* Global settings: its title bar and navigation are the clearest glass, as the sidebar is
-   the window's; the page is lifted off the sheet. A rail page lifts its own columns
-   instead: the rail a little, the detail as the other pages. */
-:root[data-glass="true"] .dialog:has(.global-settings-layout)::before {
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-sheet-thin);
-}
+/* Global settings: the page is lifted off the window's ground, and its navigation lies on that
+   ground as the sidebar lies on the window. A rail page lifts its own columns instead: the
+   rail a little, the detail as the other pages. */
 :where(:root[data-glass="true"]) .settings-nav { background: transparent; }
 :where(:root[data-glass="true"]) .settings-nav__item--active { background: var(--active); }
-:where(:root[data-glass="true"]) .global-settings-content:not(:has(> .settings-rail-page)) { background: var(--panel); }
+:where(:root[data-glass="true"]) .settings-layout__content:not(:has(> .settings-rail-page)) { background: var(--panel); }
 :where(:root[data-glass="true"]) .provider-rail { background: var(--glass-surface-soft); }
 /* Cards that were the page's white on the page's white are the page. */
 :where(:root[data-glass="true"]) :is(
@@ -375,9 +304,18 @@
 /* These two outrank `.text-button:hover`, so its hover is restated after them. */
 :where(:root[data-glass="true"]) :is(.conversation-settings__preset-actions, .template-editor__actions) .text-button { background: var(--glass-surface-soft); }
 :where(:root[data-glass="true"]) :is(.conversation-settings__preset-actions, .template-editor__actions) .text-button:hover { background: var(--accent-soft); }
+:where(:root[data-glass="true"]) .settings-nav__action { background: var(--glass-surface-soft); }
+/* Pinned at the end of a narrow window's strip, with the pages scrolling under it. */
+@media (max-width: 720px) {
+  :where(:root[data-glass="true"]) .settings-layout > .settings-nav > .settings-nav__footer { background: var(--glass-pinned); }
+}
+:where(:root[data-glass="true"]) .settings-nav__action:hover:not(:disabled) { background: var(--accent-soft); }
 :where(:root[data-glass="true"]) .subagent-panel__group-parent:hover,
 :where(:root[data-glass="true"]) .subagent-panel__group-child:hover { background: var(--hover); }
 :where(:root[data-glass="true"]) .domain-rules__aside { background: var(--subtle); }
+/* The tool picker's rules between groups name a palette grey that is nearly the panel
+   white, which over the glass reads as a white line. */
+:where(:root[data-glass="true"]) .tool-settings-group + .tool-settings-group { border-top-color: var(--border); }
 
 /* Rows: hover and selection are veils. */
 :where(:root[data-glass="true"]) .conversation-row:hover { background: var(--hover); }
@@ -400,7 +338,7 @@
 :where(:root[data-glass="true"]) .markdown-content th { background: var(--subtle); }
 :where(:root[data-glass="true"]) .markdown-content mark { background: color-mix(in srgb, var(--warning) 18%, transparent); }
 /* The copy button sits over the code's corner, so it is the dense sheet, enough to read its
-   glyph over the code; no filter, since the timeline under it moves while a reply streams. */
+   glyph over the code. */
 :where(:root[data-glass="true"]) .markdown-code__bar .markdown-code__copy { background: var(--glass-sheet); }
 :where(:root[data-glass="true"]) .markdown-code__bar .markdown-code__copy:hover { background: var(--glass-sheet) linear-gradient(var(--hover), var(--hover)); }
 :where(:root[data-glass="true"]) .timeline-row__badge {
@@ -420,8 +358,10 @@
 :where(:root[data-glass="true"]) :is(.turn-error, .composer-run-error) > button:not(.icon-button):hover { background: color-mix(in srgb, var(--danger) 19%, transparent); }
 :where(:root[data-glass="true"]) .diff-output__header { background: color-mix(in srgb, var(--text) 2.5%, transparent); }
 :where(:root[data-glass="true"]) .diff-output__body { background: transparent; }
-:where(:root[data-glass="true"]) :is(.diff-output__line--addition, .code-token--inserted) { background: var(--success-soft); }
-:where(:root[data-glass="true"]) :is(.diff-output__line--deletion, .code-token--deleted) { background: var(--danger-soft); }
+:where(:root[data-glass="true"]) .diff-output__line--addition .diff-output__content { background: var(--success-soft); }
+:where(:root[data-glass="true"]) .diff-output__line--deletion .diff-output__content { background: var(--danger-soft); }
+:where(:root[data-glass="true"]) .code-token--inserted { background: var(--success-soft); }
+:where(:root[data-glass="true"]) .code-token--deleted { background: var(--danger-soft); }
 :where(:root[data-glass="true"]) .diff-output__line--meta { background: color-mix(in srgb, var(--warning) 8%, transparent); }
 :where(:root[data-glass="true"]) .tool-renderer__terminal { background: color-mix(in srgb, var(--text) 5%, transparent); }
 :where(:root[data-glass="true"]) .tool-renderer__snapshot-tree { background: color-mix(in srgb, var(--text) 2.5%, transparent); }
@@ -429,8 +369,7 @@
 /* The review pane's diff. The code is one lift, which its lines and their marks tint rather
    than lift again. The number column, which the code scrolls under sideways, is pinned glass,
    as the file header above it is; over the lift it reads as the same surface. Both cells mix
-   their colours with `--panel`, so it is set on them. No filter: the code moves under them
-   whenever it scrolls, and a filter over moving content is what left blocks on screen. */
+   their colours with `--panel`, so it is set on them. */
 :where(:root[data-glass="true"]) .diff-viewer__text { --panel: transparent; }
 :where(:root[data-glass="true"]) .diff-viewer__number { --panel: var(--glass-pinned); }
 :where(:root[data-glass="true"]) .diff-viewer__file-header { background: var(--glass-pinned); }
@@ -458,7 +397,7 @@
 :root[data-glass="true"] .browser-panel-content {
   --browser-address-bg: var(--hover);
   --browser-address-focus-bg: var(--panel);
-  --browser-menu-bg: var(--glass-sheet);
+  --browser-menu-bg: var(--glass-solid);
   --browser-menu-border: var(--glass-edge);
   --browser-menu-divider: var(--border);
   --browser-menu-hover: var(--hover);
@@ -472,25 +411,26 @@
 :where(:root[data-glass="true"]) .browser-panel__clear-data > button { background: color-mix(in srgb, var(--danger) 10%, transparent); }
 :where(:root[data-glass="true"]) .browser-panel__clear-data > button:hover:not(:disabled),
 :where(:root[data-glass="true"]) .browser-panel__clear-data > button:focus-visible { background: color-mix(in srgb, var(--danger) 16%, transparent); }
-/* Notices over the page frost it. */
+/* Notices over the page are solid, as its menu is, and tinted. */
 :where(:root[data-glass="true"]) .browser-panel__error {
   border-color: color-mix(in srgb, var(--danger) 26%, transparent);
-  background: var(--glass-sheet) linear-gradient(var(--danger-soft), var(--danger-soft));
-  -webkit-backdrop-filter: var(--glass-sheet-filter);
-  backdrop-filter: var(--glass-sheet-filter);
+  background:
+    linear-gradient(var(--danger-soft), var(--danger-soft)),
+    linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-solid);
 }
 :where(:root[data-glass="true"]) .browser-panel__notice {
-  background: var(--glass-sheet) linear-gradient(var(--warning-soft), var(--warning-soft));
-  -webkit-backdrop-filter: var(--glass-sheet-filter);
-  backdrop-filter: var(--glass-sheet-filter);
+  background:
+    linear-gradient(var(--warning-soft), var(--warning-soft)),
+    linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-solid);
 }
-/* A file dragged over a drop zone: the zone frosts what it covers while it says so. */
-:where(:root[data-glass="true"]) .attachment-drop {
-  background: var(--glass-sheet);
-  -webkit-backdrop-filter: var(--glass-sheet-filter);
-  backdrop-filter: var(--glass-sheet-filter);
+/* A file dragged over a drop zone: the zone covers what it lies over while it says so, as the
+   plain theme's does, with the solid sheet. */
+:where(:root[data-glass="true"]) .attachment-drop { background: color-mix(in srgb, var(--glass-solid) 92%, transparent); }
+:where(:root[data-glass="true"]) .attachment-drop--unavailable {
+  background:
+    linear-gradient(var(--danger-soft), var(--danger-soft)),
+    color-mix(in srgb, var(--glass-solid) 92%, transparent);
 }
-:where(:root[data-glass="true"]) .attachment-drop--unavailable { background: var(--glass-sheet) linear-gradient(var(--danger-soft), var(--danger-soft)); }
 
 /* File previews: a PDF's field is a well; notebook cells are code. */
 :where(:root[data-glass="true"]) .file-preview__pdf-scroll { background: color-mix(in srgb, var(--text) 8%, transparent); }
@@ -498,22 +438,19 @@
 :where(:root[data-glass="true"]) .notebook__text--stderr { background: color-mix(in srgb, var(--danger) 6%, transparent); }
 :where(:root[data-glass="true"]) .notebook__text--error { background: var(--danger-soft); }
 
-/* Scrollbar thumbs and the off switch are veils too. */
-:where(:root[data-glass="true"]) ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--text) 22%, transparent); background-clip: padding-box; }
-:where(:root[data-glass="true"]) ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--text) 36%, transparent); background-clip: padding-box; }
+/* The off switch is a veil too, like the scrollbar thumbs (above). */
 :where(:root[data-glass="true"]) .switch { background: color-mix(in srgb, var(--text) 22%, transparent); }
 :where(:root[data-glass="true"]) .switch--on { background: var(--color-2d2d2b); }
 
 /* The scrim under the composer's floating context row faded cards into the theme's
    ground; over glass it would paint a band of doubled tint, so the timeline itself
    fades out over the same 46px instead and the glass shows through. The stops match
-   the scrim's: clear 46px above the composer, gone 12px above it. The conversation tile's
-   timeline also fades in at its top, below the top bar's strip (see there). */
+   the scrim's: clear 46px above the composer, gone 12px above it. */
 :root[data-glass="true"] .composer-wrap { background: transparent; }
 :root[data-glass="true"] .composer-wrap::before { display: none; }
 :root[data-glass="true"] .conversation-pane .context-scroll {
-  -webkit-mask-image: linear-gradient(180deg, transparent, var(--color-000000) var(--timeline-fade, 0px), var(--color-000000) calc(100% - 46px), transparent calc(100% - 12px));
-  mask-image: linear-gradient(180deg, transparent, var(--color-000000) var(--timeline-fade, 0px), var(--color-000000) calc(100% - 46px), transparent calc(100% - 12px));
+  -webkit-mask-image: linear-gradient(180deg, var(--color-000000) calc(100% - 46px), transparent calc(100% - 12px));
+  mask-image: linear-gradient(180deg, var(--color-000000) calc(100% - 46px), transparent calc(100% - 12px));
 }
 
 /* The context meter's ring sits on the glass beside the composer. Its theme colours are
@@ -525,23 +462,25 @@
 :root[data-glass="true"] .context-usage-meter__trigger:not(.context-usage-meter__trigger--warning, .context-usage-meter__trigger--danger) { color: var(--text); }
 :root[data-glass="true"] .context-usage-meter__track { stroke: color-mix(in srgb, var(--text) 24%, transparent); }
 
-/* The chips above the composer are solid. They float over the timeline's foot, where the
-   glass lies under them and text scrolls out beneath, and a draft's were glass over its
-   glass: a filter over a filter, or a box repainting over one, is what leaves the stray
-   blocks macOS draws on screen. Each is painted instead with what the glass shows there,
-   its tint over the ground its filter makes of the background under the chip, which
-   `lib/glassGround.ts` sets on each. A hover or an open menu is a veil over that. A chip
-   in the branch group is solid through the group. These rules outrank the chips' own
-   hover and open states, which are restated after them. */
+/* The chips above the composer are opaque. They float over the timeline's foot, where text
+   scrolls out beneath them, so each is painted with the glass itself, the tile's tint over the
+   baked glass, which hides what passes under it and matches the glass round it. A hover or an
+   open menu is a veil over that. A chip in the branch group is opaque through the group. These
+   rules outrank the chips' own hover and open states, which are restated after them. */
 :root[data-glass="true"] .composer-context :is(.composer-chip-group, .composer-chip:not(.composer-chip--flush)) {
-  --glass-chip: linear-gradient(var(--glass-tile), var(--glass-tile)) var(--glass-ground, var(--app));
+  --glass-chip: linear-gradient(var(--glass-tile), var(--glass-tile)), var(--glass-under);
   background: var(--glass-chip);
 }
-/* A draft's chips are the dense controls its clear glass needs, over that glass. */
+/* A draft's chips are the dense controls its clear glass needs, a veil over that glass with
+   nothing under it to hide. So are the composer and the controls under it (the draft, below). */
+:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) :is(
+  .composer-context :is(.composer-chip-group, .composer-chip:not(.composer-chip--flush)),
+  .composer,
+  .composer__footer :is(.composer-option, .composer-add-menu__trigger, .context-usage-meter__trigger)
+) {
+  --glass-chip: linear-gradient(var(--glass-control), var(--glass-control));
+}
 :root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer-context :is(.composer-chip-group, .composer-chip:not(.composer-chip--flush)) {
-  --glass-chip:
-    linear-gradient(var(--glass-control), var(--glass-control)),
-    linear-gradient(var(--glass-draft), var(--glass-draft)) var(--glass-ground-draft, var(--app));
   box-shadow: 0 2px 8px var(--glass-shadow);
 }
 :root[data-glass="true"] .composer-context .composer-chip:not(.composer-chip--flush):is(:hover:not(:disabled), .popover-menu__trigger--open, .git-status-card__toggle:focus-visible),
@@ -557,13 +496,13 @@
  * light at the corners and a faint glow along the inside.
  *
  * Light moves through it: soft pools drift near the corners, and a glint crosses it
- * on the diagonal now and then. Both are paint above the content — nothing under a
- * blur changes while they move — and both hold still for reduced motion.
+ * on the diagonal now and then. Both are paint above the content, and both hold still
+ * for reduced motion.
  *
  * The empty-state line and the cat on the composer's rim have no glass of their own
- * under them, so they carry a soft halo in the ground's colour. The composer and the
- * controls below it are dense glass of their own, and the chips above it are as dense
- * but solid: over glass this clear, a halo was not enough to read them by.
+ * under them, so they carry a soft halo in the ground's colour. The composer, the chips
+ * above it and the controls below it are a dense veil over the glass: over glass this
+ * clear, a halo was not enough to read them by.
  */
 :root[data-glass="true"] .pane-tiles > .pane-tiles__chat:has(.context-stream > .empty-state) {
   --glass-light: var(--color-ffffff);
@@ -588,10 +527,11 @@
   --glass-control: color-mix(in srgb, var(--color-ffffff) 82%, transparent);
 }
 :root[data-glass="true"] .pane-tiles > .pane-tiles__chat:has(.context-stream > .empty-state)::before {
-  background: linear-gradient(162deg, var(--glass-glint-soft), transparent 36%), var(--glass-draft);
+  background:
+    linear-gradient(162deg, var(--glass-glint-soft), transparent 36%),
+    linear-gradient(var(--glass-draft), var(--glass-draft)),
+    var(--glass-under-draft);
   box-shadow: none;
-  -webkit-backdrop-filter: var(--glass-draft-filter);
-  backdrop-filter: var(--glass-draft-filter);
   -webkit-mask-image:
     linear-gradient(90deg, transparent, var(--color-000000) 18px, var(--color-000000) calc(100% - 18px), transparent),
     linear-gradient(180deg, transparent, var(--color-000000) 18px, var(--color-000000) calc(100% - 18px), transparent);
@@ -621,25 +561,23 @@
 :root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer-cat {
   filter: drop-shadow(0 0 3px var(--glass-halo)) drop-shadow(0 0 12px var(--glass-halo));
 }
-/* The composer's glass is a layer under its content, as the tiles' is: the text and the
-   caret repaint all the time, and a filter on the box itself is what darkened the sidebar. */
-:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer { background: transparent; }
-:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer::before {
-  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
-  border-radius: inherit;
-  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-control);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+/* The composer and the controls below it are the chips' veil (their `--glass-chip` is set
+   with the chips'); the composer keeps the glass's sheen, and the controls float a little, as
+   the chips do. The rules outrank the controls' own hover and open states, so those are
+   restated as the chips' are: a veil over the veil, and the chips' stronger edge. Colour stays
+   with the controls' own rules, since the context meter's is its ring's. */
+:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer {
+  background: linear-gradient(165deg, var(--glass-sheen), transparent 38%), var(--glass-chip);
 }
-/* The controls below the composer are small glass of their own. `:where` keeps this rule
-   at the controls' own weight, so their hover and open states still paint over the glass.
-   The chips above it are solid (above). */
-:where(:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer__footer)
+:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer__footer
   :is(.composer-option, .composer-add-menu__trigger, .context-usage-meter__trigger) {
-  background: var(--glass-control);
+  background: var(--glass-chip);
   box-shadow: 0 2px 8px var(--glass-shadow);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+}
+:root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state) .composer__footer
+  :is(.composer-option, .composer-add-menu__trigger, .context-usage-meter__trigger):is(:hover:not(:disabled), .popover-menu__trigger--open, .context-usage-meter__trigger--open, [aria-pressed="true"]) {
+  border-color: var(--border-strong);
+  background: linear-gradient(var(--subtle), var(--subtle)), var(--glass-chip);
 }
 /* The pools are a layer a little larger than the pane, so its drift never shows an edge. */
 :root[data-glass="true"] .conversation-pane:has(.context-stream > .empty-state)::after {

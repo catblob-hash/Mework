@@ -3,7 +3,7 @@
   "language": "zh-CN",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 48,
+  "toolCount": 49,
   "tools": [
     {
       "name": "ls",
@@ -852,7 +852,7 @@
           "type": "string",
           "required": true,
           "placeholder": "review-api",
-          "help": "必填。用于 send_message / followup_task / task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名"
+          "help": "必填。用于 task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名"
         },
         {
           "name": "label",
@@ -877,52 +877,6 @@
           "required": false,
           "placeholder": "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\"}},\"required\":[\"verdict\"]}",
           "help": "可选的 JSON Schema 子集；给出后子代理必须调用 structured_output 交回符合该模式的结果，返回值会随 task_wait 一起回来。顶层必须是 type 为 object 的对象模式；支持 type、properties、required、items、enum、const、additionalProperties、minItems/maxItems、minLength/maxLength、minimum/maximum，其余关键字会被当场拒绝"
-        }
-      ]
-    },
-    {
-      "name": "send_message",
-      "label": "发送消息",
-      "description": "",
-      "category": "orchestration",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "target",
-          "label": "子代理",
-          "type": "string",
-          "required": true,
-          "placeholder": "a1",
-          "help": "agent_spawn 返回的名称"
-        },
-        {
-          "name": "message",
-          "label": "消息",
-          "type": "multiline",
-          "required": true
-        }
-      ]
-    },
-    {
-      "name": "followup_task",
-      "label": "追加任务",
-      "description": "",
-      "category": "orchestration",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "target",
-          "label": "子代理",
-          "type": "string",
-          "required": true,
-          "placeholder": "a1",
-          "help": "agent_spawn 返回的名称"
-        },
-        {
-          "name": "message",
-          "label": "消息",
-          "type": "multiline",
-          "required": true
         }
       ]
     },
@@ -965,7 +919,16 @@
       "description": "",
       "category": "orchestration",
       "dangerous": false,
-      "parameters": []
+      "parameters": [
+        {
+          "name": "none",
+          "label": "空参数",
+          "type": "json",
+          "required": true,
+          "placeholder": "[]",
+          "help": "始终为空数组"
+        }
+      ]
     },
     {
       "name": "skill",
@@ -1229,92 +1192,7 @@
           "type": "string",
           "required": false,
           "placeholder": "run0a1b2c3d",
-          "help": "上一次同脚本运行报出的运行 ID；已入日志的步骤即时重放，其余步骤重跑。脚本正文必须与获批时逐字一致"
-        }
-      ]
-    },
-    {
-      "name": "todo",
-      "label": "待办事项",
-      "description": "",
-      "category": "orchestration",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "action",
-          "label": "动作",
-          "type": "string",
-          "required": true,
-          "placeholder": "create",
-          "help": "选择操作：create、update、get、list"
-        },
-        {
-          "name": "taskId",
-          "label": "任务 ID",
-          "type": "string",
-          "required": false,
-          "placeholder": "task-1",
-          "help": "用于 update、get；create 返回的不透明 ID"
-        },
-        {
-          "name": "subject",
-          "label": "任务标题",
-          "type": "string",
-          "required": false,
-          "placeholder": "补全用户认证",
-          "help": "create 必填；update 可选"
-        },
-        {
-          "name": "description",
-          "label": "任务说明",
-          "type": "multiline",
-          "required": false,
-          "placeholder": "实现登录与注册接口，并补齐测试。",
-          "help": "create 必填；update 可选"
-        },
-        {
-          "name": "activeForm",
-          "label": "进行中文案",
-          "type": "string",
-          "required": false,
-          "placeholder": "正在补全用户认证",
-          "help": "create、update；任务处于 in_progress 时显示的简短进行时文案"
-        },
-        {
-          "name": "status",
-          "label": "状态",
-          "type": "string",
-          "required": false,
-          "placeholder": "in_progress",
-          "help": "用于 update；pending | in_progress | completed | deleted"
-        },
-        {
-          "name": "owner",
-          "label": "负责人",
-          "type": "string",
-          "required": false,
-          "help": "仅用于 update"
-        },
-        {
-          "name": "addBlocks",
-          "label": "新增被阻塞任务",
-          "type": "json",
-          "required": false,
-          "help": "用于 update；由本任务阻塞的 task ID 数组"
-        },
-        {
-          "name": "addBlockedBy",
-          "label": "新增前置任务",
-          "type": "json",
-          "required": false,
-          "help": "用于 update；阻塞本任务的 task ID 数组"
-        },
-        {
-          "name": "metadata",
-          "label": "元数据",
-          "type": "json",
-          "required": false,
-          "help": "create 整体写入；update 按 key 合并，值为 null 时删除该 key"
+          "help": "上一次运行报出的运行 ID；提示词与选项没变的步骤即时重放，上次停下时还在跑的步骤单独重跑，从第一个改动或失败的步骤起其余全部重跑。可省略脚本与 args 沿用上次的；传入改过的脚本会重新审批"
         }
       ]
     },
@@ -1379,6 +1257,102 @@
     {
       "name": "exit_plan_mode",
       "label": "退出计划模式",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "read_handoff_note",
+      "label": "读取交接文档",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "文档名",
+          "type": "string",
+          "required": true,
+          "placeholder": "当前进度",
+          "help": "交接索引里列出的文档名，.md 后缀可写可不写"
+        }
+      ]
+    },
+    {
+      "name": "create_handoff_note",
+      "label": "写交接文档",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "文档名",
+          "type": "string",
+          "required": true,
+          "placeholder": "当前进度",
+          "help": "交接文档名，不能包含路径分隔符；.md 后缀可写可不写"
+        },
+        {
+          "name": "content",
+          "label": "文档内容",
+          "type": "multiline",
+          "required": true,
+          "help": "交接文档的完整 Markdown 正文"
+        },
+        {
+          "name": "description",
+          "label": "索引描述",
+          "type": "string",
+          "required": true,
+          "placeholder": "任务目标、已完成的工作与下一步",
+          "help": "一句话说明这份交接文档写了什么，会写进交接索引"
+        }
+      ]
+    },
+    {
+      "name": "edit_handoff_note",
+      "label": "修改交接文档",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "文档名",
+          "type": "string",
+          "required": true,
+          "placeholder": "当前进度",
+          "help": "要修改的交接文档名，.md 后缀可写可不写"
+        },
+        {
+          "name": "old_text",
+          "label": "原文",
+          "type": "multiline",
+          "required": true,
+          "help": "文档中要被替换的原文，必须唯一匹配；不唯一时请提供更长的片段"
+        },
+        {
+          "name": "new_text",
+          "label": "新文本",
+          "type": "multiline",
+          "required": true,
+          "help": "替换后的文本；留空表示删除这段内容"
+        },
+        {
+          "name": "description",
+          "label": "索引描述",
+          "type": "string",
+          "required": true,
+          "placeholder": "任务目标、已完成的工作与下一步",
+          "help": "修改后这份交接文档的一句话说明，会刷新交接索引里的对应条目"
+        }
+      ]
+    },
+    {
+      "name": "handoff",
+      "label": "交接",
       "description": "",
       "category": "orchestration",
       "dangerous": false,

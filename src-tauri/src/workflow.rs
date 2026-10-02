@@ -6,9 +6,9 @@
 //! immediately. `complete_turn` envelopes plan results for delivery through `task_wait` or a
 //! round-boundary fold. The driver owns a nested private pool with
 //! `with_live_limit(min(16, max(2, parallelism - 2)))`; step subagents use that pool and do
-//! not consume the session's `agent_spawn` budget, mailbox, or namespace. Step templates derive
+//! not consume the session's `agent_spawn` budget or namespace. Step templates derive
 //! from the original depth-0 request, so every step has depth 1. Driver templates never run a
-//! model, and non-General tasks reject `send_message` and `followup_task`.
+//! model.
 //!
 //! Step names are allocated only from the private live pool. Stable slot names make ordinary-step
 //! execution-mode payloads byte-stable across runs. Role steps use a separate `ws<N>-as-<role>`
@@ -124,17 +124,17 @@ fn workflow_step_name(pool: &AgentPool, agent_type: Option<&str>) -> String {
     unreachable!("an unused step name always exists")
 }
 
-/// The request ledger a step's traffic is filed under.
+/// The history owner a step's entries are filed under.
 ///
 /// A pool name is unique only inside one invocation of one run: every run's first started step is
-/// `ws1`, so a ledger keyed by the name alone would merge the first steps of every workflow the
+/// `ws1`, so an owner keyed by the name alone would merge the first steps of every workflow the
 /// conversation ever ran into one agent's history — and a resume mints a fresh pool while the
 /// journal replays finished steps without consuming a name, so the first step *re-run* after a
 /// crash would be `ws1` again whatever its plan position. The address is therefore the run id and
 /// the step's plan ordinal, the same coordinates the step call id and its worktree use. The run id
 /// is the workflow's name, reserved for the conversation's whole life and kept across a resume, so
-/// the address is unique in the conversation and a step re-run after a crash continues the ledger
-/// of its first attempt rather than opening a second one. It cannot collide with an `agent_spawn`
+/// the address is unique in the conversation and a step re-run after a crash continues the entries
+/// of its first attempt rather than opening a second owner. It cannot collide with an `agent_spawn`
 /// name, which `validate_agent_name` keeps free of `/`.
 fn step_ledger_owner(run_id: &str, step_index: usize) -> String {
     format!("{run_id}/ws{}", step_index + 1)
@@ -171,57 +171,29 @@ fn role_name_suffix(role: &str) -> String {
     format!("h{}", &digest[..ROLE_SUFFIX_CHARS.min(digest.len()) - 1])
 }
 
-/// Takes the child→main message channel back off a workflow template.
-///
-/// `agent_child_template` grants it whenever the conversation can spawn and
-/// message children, which is the right rule for an `agent_spawn` child and the
-/// wrong one for a step: a step is not a correspondent. It has no durable public
-/// name a main agent could answer, it lives only as long as the run, and what it
-/// found already returns as the step's result.
-///
-/// The descriptor goes with the name, the same rule `agent_child_template`
-/// applies to `workflow` itself — a step that may not use the tool should not
-/// see that it exists, or refusing the call reads as a grantable permission.
-fn strip_child_send_message(mut template: RunModelRequest) -> RunModelRequest {
-    template
-        .enabled_tools
-        .retain(|name| name != crate::api::SEND_MESSAGE_TOOL);
-    template
-        .tools
-        .retain(|tool| tool.name != crate::api::SEND_MESSAGE_TOOL);
-    template
-}
-
 /// Builds one step's request, up to but excluding its structured-output schema.
 ///
 /// Extracted from `spawn_step` so the ordering rules below are testable without
 /// starting a worker: they are ordering rules, and an ordering rule that only
 /// exists inside a threaded spawn path is one nobody can check.
 ///
-/// The role's conversation template comes back beside the request rather than
-/// inside it: a template is the step's opening HISTORY, and `spawn_step` owns
-/// that.
+/// A role's conversation template is deliberately NOT applied here, unlike
+/// `agent_spawn`: a workflow step is a precisely scripted unit of work whose
+/// prompt is the whole of its instructions, and a canned opening history would
+/// sit between the script and the model. The role still supplies its model,
+/// tools and permissions; only its template is dropped.
 fn workflow_step_template(
     parent: &RunModelRequest,
     state: &AppState,
     step: &WorkflowStepRequest,
     worktree: Option<&crate::git::IsolatedWorktree>,
-) -> Result<(RunModelRequest, Option<String>), String> {
+) -> Result<RunModelRequest, String> {
     let mut template = agent_child_template(parent);
-    let mut role_template_id = None;
     // Apply the role before effort and schema. `configure_named_agent_template` replaces the
     // template wholesale, so step-level overrides must follow it.
     if let Some(agent_type) = step.agent_type.as_deref() {
-        role_template_id = crate::api::apply_named_role_to_fresh_template(
-            parent,
-            state,
-            &mut template,
-            agent_type,
-        )?;
+        crate::api::apply_named_role_to_fresh_template(parent, state, &mut template, agent_type)?;
     }
-    // After the role, because `configure_named_agent_template` rebuilds the template from
-    // `agent_child_template` and would restore what an earlier strip removed.
-    let mut template = strip_child_send_message(template);
     // An isolated step's worktree is its trusted workspace. File-tool scope, shell CWD, and Git
     // status derive from it, so assign it after role application for the same reason as other
     // step-level overrides.
@@ -231,7 +203,7 @@ fn workflow_step_template(
     if let Some(effort) = step.effort.as_deref() {
         template.reasoning_effort = parse_step_effort(effort)?;
     }
-    Ok((template, role_template_id))
+    Ok(template)
 }
 
 /// Driver-side record for a dispatched step.
@@ -307,6 +279,105 @@ fn numbered_variant_free(base: &str, is_free: impl Fn(&str) -> bool) -> Option<S
     })
 }
 
+/// Which submitted value of an approved dispatch a resume checks a run-directory file against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovedInput {
+    Script,
+    Args,
+}
+
+/// The fingerprint of `input` for workflow run `run_id` as its approved dispatch ran it: the value
+/// the call that supplied the run's current file carried once every hook had had its say, read
+/// from the history.
+///
+/// The run directory's provenance names that call (`RunStore::record_provenance`); the history
+/// holds the input it ran with, recorded before it ran. That, and not what the model sent, is the
+/// anchor: a `PreToolUse` or `PermissionRequest` hook that rewrites the script is doing what it was
+/// configured to do, and the rewritten bytes are the ones approved and written to `script.js`, so
+/// a check against the model's own words would call that rewrite tampering. Neither is the disk
+/// the anchor, which cannot vouch for itself, nor the timeline, which is the user's to edit.
+///
+/// A dispatch recorded before the history kept calls as they ran has only the model's words to go
+/// by; those are what ran unless a hook rewrote them, and a rewrite then fails the check rather
+/// than passing a change nobody can account for. `None` when neither is there: a run from before
+/// provenance was kept, or a file whose supplying call never reached the history.
+fn approved_fingerprint(
+    request: &RunModelRequest,
+    run_id: &str,
+    input: ApprovedInput,
+) -> Option<String> {
+    use crate::conversation_store::HistoryFilter;
+    use crate::history::{RecordedToolPart, ENTRY_RESPONSE, ENTRY_TOOL};
+    let provenance = crate::workflow_store::read_run_provenance(
+        std::path::Path::new(&request.app_data_path),
+        &request.conversation_id,
+        run_id,
+    )
+    .ok()??;
+    let call_id = match input {
+        ApprovedInput::Script => provenance.script?,
+        ApprovedInput::Args => provenance.args?,
+    };
+    let store = crate::history::history_store(&request.app_data_path).ok()?;
+    let ran = store
+        .history_records(
+            &request.conversation_id,
+            HistoryFilter {
+                kinds: &[ENTRY_TOOL],
+                call_id: Some(&call_id),
+                ..HistoryFilter::default()
+            },
+        )
+        .ok()?
+        .into_iter()
+        .rev()
+        .filter(|record| {
+            !record.truncated
+                && record.detail_str("name") == Some(WORKFLOW_TOOL)
+                && record.detail.get("denied").is_none()
+        })
+        .find_map(|record| crate::history::recorded_tool_input(record.body.as_deref()?));
+    let carried = match ran {
+        Some(carried) => carried,
+        None => {
+            let needle = format!("\"toolCallId\":{}", serde_json::to_string(&call_id).ok()?);
+            store
+                .history_records(
+                    &request.conversation_id,
+                    HistoryFilter {
+                        kinds: &[ENTRY_RESPONSE],
+                        needle: &needle,
+                        ..HistoryFilter::default()
+                    },
+                )
+                .ok()?
+                .iter()
+                .filter(|response| !response.truncated)
+                .filter_map(|response| response.body.as_deref())
+                .flat_map(crate::history::recorded_tool_parts)
+                .find_map(|part| match part {
+                    RecordedToolPart::Call { id, name, input }
+                        if id == call_id && name == WORKFLOW_TOOL =>
+                    {
+                        Some(input)
+                    }
+                    _ => None,
+                })?
+        }
+    };
+    match input {
+        ApprovedInput::Script => carried
+            .get("script")
+            .and_then(Value::as_str)
+            .map(|script| crate::workflow_store::hex_digest(script.as_bytes())),
+        ApprovedInput::Args => carried
+            .get("args")
+            .filter(|args| !args.is_null())
+            .and_then(|args| serde_json::to_vec(args).ok())
+            .map(|body| crate::workflow_store::hex_digest(&body)),
+    }
+}
+
 /// Internal entry point with an injectable deadline and live limit for testing deadline and
 /// backpressure semantics.
 #[allow(clippy::too_many_arguments)]
@@ -341,7 +412,10 @@ pub(crate) fn run_workflow_tool_with_deadline(
                     "resume_run_id must be a string or null".into(),
                 ));
             };
-            resume_run_id = Some(text.to_owned());
+            // A blank id names no run: it is a fresh run, not a resume of "".
+            if !text.trim().is_empty() {
+                resume_run_id = Some(text.to_owned());
+            }
         }
     }
     if let Some(named) = &resume_run_id {
@@ -361,7 +435,9 @@ pub(crate) fn run_workflow_tool_with_deadline(
         }
     }
     let provided_script = match call.input.get("script") {
+        // A blank script is none: a resume then reuses the pinned one.
         None | Some(Value::Null) => None,
+        Some(Value::String(text)) if text.trim().is_empty() => None,
         Some(Value::String(text)) => Some(text.to_owned()),
         Some(_) => {
             return Ok(failed_tool_execution(
@@ -372,9 +448,12 @@ pub(crate) fn run_workflow_tool_with_deadline(
     };
     let script_text = match (provided_script, &resume_run_id) {
         (Some(text), _) => text,
-        // Scriptless resume uses the approved bytes pinned in `script.js`. When a script is
-        // supplied, its SHA is still checked. The timeline's host-signed `scriptSha256` is an
-        // external integrity anchor; comparing disk contents with their own digest is vacuous.
+        // Scriptless resume uses the approved bytes pinned in `script.js`. A supplied script is
+        // approved like any other and, on a resume, replaces the pinned one: unchanged steps
+        // still replay because cache keys never include the script body. The call that supplied
+        // the pinned bytes, as the history recorded it running, is the external integrity
+        // anchor: comparing disk contents with their own digest is vacuous, and the timeline is
+        // the user's to edit.
         (None, Some(named)) => {
             let bytes = match crate::workflow_store::read_run_script(
                 std::path::Path::new(&request.app_data_path),
@@ -392,42 +471,7 @@ pub(crate) fn run_workflow_tool_with_deadline(
                 }
                 Err(error) => return Ok(failed_tool_execution(call, error)),
             };
-            // Find the dispatch that created this run. It either spelled the address out — which
-            // the host does only when it could not use the submitted name — or answered `ok`, and
-            // then the run id is the name on the card.
-            //
-            // Searched newest first. A name normally claims its id durably, but a dispatch whose
-            // run directory could not be created leaves no claim behind, so that same name can be
-            // minted again later; the most recent card is the one describing the run now on disk.
-            let addressed = orchestration::TaskRef::Workflow(named.clone()).wire();
-            let approved_digest = request.contexts.iter().rev().find_map(|context| {
-                let crate::model::ContextItem::Tool {
-                    tool_name,
-                    input,
-                    result,
-                    ..
-                } = context
-                else {
-                    return None;
-                };
-                if tool_name != WORKFLOW_TOOL {
-                    return None;
-                }
-                let dispatched = match result.output.lines().next() {
-                    Some(line) if line == addressed => true,
-                    Some(orchestration::SPAWN_ACK) => {
-                        input.get("name").and_then(Value::as_str) == Some(named.as_str())
-                    }
-                    _ => false,
-                };
-                if !dispatched {
-                    return None;
-                }
-                input
-                    .get("scriptSha256")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
+            let approved_digest = approved_fingerprint(request, named, ApprovedInput::Script);
             let disk_digest = crate::workflow_store::hex_digest(&bytes);
             match approved_digest {
                 Some(approved) if approved == disk_digest => {}
@@ -435,7 +479,7 @@ pub(crate) fn run_workflow_tool_with_deadline(
                     return Ok(failed_tool_execution(
                         call,
                         format!(
-                            "The on-disk script for workflow run {named} does not match the fingerprint approved in the timeline. Scriptless resume is rejected; resubmit it with script for fresh approval."
+                            "The on-disk script for workflow run {named} does not match the one its approved dispatch sent. Scriptless resume is rejected; resubmit it with script for fresh approval."
                         ),
                     ))
                 }
@@ -443,7 +487,7 @@ pub(crate) fn run_workflow_tool_with_deadline(
                     return Ok(failed_tool_execution(
                         call,
                         format!(
-                            "The approved script fingerprint for workflow run {named} is missing from the timeline (the original dispatch card may have been removed). Resubmit it together with script."
+                            "No record of the approved dispatch that supplied workflow run {named}'s saved script remains to check it against. Resubmit it together with script."
                         ),
                     ))
                 }
@@ -480,16 +524,67 @@ pub(crate) fn run_workflow_tool_with_deadline(
     if let Err(error) = crate::agents::validate_agent_name(&run_name) {
         return Ok(failed_tool_execution(call, error));
     }
-    let args = call
+    let mut args = call
         .input
         .get("args")
         .filter(|value| !value.is_null())
         .cloned();
+    // A resume that omits `args` runs with the ones its run last ran with. The model may no longer
+    // have them in view, and a script that reads `args` would otherwise break on replay. They are
+    // checked against the call that supplied them like the script, then written back onto the call
+    // so the approval shows them and this dispatch's card fingerprints them.
+    let mut args_reused = false;
+    if let (None, Some(named)) = (&args, &resume_run_id) {
+        match crate::workflow_store::read_run_args(
+            std::path::Path::new(&request.app_data_path),
+            &request.conversation_id,
+            named,
+        ) {
+            Ok(None) => {}
+            Ok(Some(bytes)) => {
+                let disk_digest = crate::workflow_store::hex_digest(&bytes);
+                match approved_fingerprint(request, named, ApprovedInput::Args) {
+                    Some(approved) if approved == disk_digest => {}
+                    Some(_) => {
+                        return Ok(failed_tool_execution(
+                            call,
+                            format!("The saved args for workflow run {named} do not match the ones its approved dispatch sent, so they are not reused; pass args explicitly."),
+                        ))
+                    }
+                    None => {
+                        return Ok(failed_tool_execution(
+                            call,
+                            format!("No record of the approved dispatch that supplied workflow run {named}'s saved args remains to check them against; pass args explicitly."),
+                        ))
+                    }
+                }
+                match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(saved) => {
+                        call.input.insert("args".into(), saved.clone());
+                        args = Some(saved);
+                        args_reused = true;
+                    }
+                    Err(_) => {
+                        return Ok(failed_tool_execution(
+                            call,
+                            format!("The saved args for workflow run {named} are corrupted; pass args explicitly."),
+                        ))
+                    }
+                }
+            }
+            Err(error) => return Ok(failed_tool_execution(call, error)),
+        }
+    }
+    // What this attempt leaves in `args.json`. Reused args are already there, byte for byte.
+    let args_to_save = if args_reused { None } else { args.clone() };
+    // Zero or less is no budget given, and a fraction rounds; only a value
+    // that is not a number at all is refused.
     let token_budget = match call.input.get("token_budget") {
         None | Some(Value::Null) => None,
-        Some(value) => match value.as_u64() {
-            Some(total) if total > 0 => Some(total),
-            _ => return Ok(failed_tool_execution(
+        Some(value) => match value.as_f64().filter(|total| total.is_finite()) {
+            Some(total) if total >= 1.0 => Some(total.round() as u64),
+            Some(_) => None,
+            None => return Ok(failed_tool_execution(
                 call,
                 "token_budget must be a positive integer (the total tokens permitted for this run)"
                     .into(),
@@ -558,7 +653,7 @@ pub(crate) fn run_workflow_tool_with_deadline(
     // a model; it supplies execution-mode and pool-accounting fields. Step templates derive from
     // the original depth-0 request, preserving step depth 1. Workflow names share the permanently
     // reserved conversation-tree namespace with `agent_spawn` and `web_search`.
-    let driver_template = strip_child_send_message(agent_child_template(request));
+    let driver_template = agent_child_template(request);
     let history = crate::api::historical_agent_records(&request.contexts);
     let orphan_reserved = state.reserved_subagent_names(&request.conversation_id);
     let mut reserved_names = request
@@ -611,10 +706,13 @@ pub(crate) fn run_workflow_tool_with_deadline(
     // the resolved name back onto the call is the only channel that reaches a streaming card —
     // `ToolExecutionStarted` carries no input, and the card's input otherwise comes straight from
     // the model stream. This rides the path a hook rewrite already uses, so the card keeps the
-    // submitted name as `requestedInput` rather than losing it.
+    // submitted name as `requestedInput` rather than losing it. Reused resume args ride the same
+    // path, so the streaming card fingerprints the args this run actually got.
     if name != run_name {
         call.input
             .insert("name".into(), Value::String(name.clone()));
+    }
+    if name != run_name || args_reused {
         event_sink(ModelStreamEvent::ToolCallArgumentsReady {
             round,
             call_id: call.id.clone(),
@@ -639,35 +737,37 @@ pub(crate) fn run_workflow_tool_with_deadline(
     };
     // Run records are conversation-owned data. They remain valid for the conversation lifetime;
     // deleting a conversation removes its run directories, and startup cleanup removes orphans.
-    let mut store = match crate::workflow_store::RunStore::open(
-        std::path::Path::new(&request.app_data_path),
-        &request.conversation_id,
-        &run_id,
-        &source_body,
-    ) {
-        Ok(store) => Some(store),
-        Err(error) if resume_run_id.is_some() => {
-            // Explicit resume failure must not silently start a new run.
-            return Ok(failed_tool_execution(call, error));
-        }
-        Err(error) => {
-            // A fresh run loses recoverability but may still execute.
-            eprintln!("工作流运行目录不可用（本次运行将不可恢复）：{error}");
-            None
-        }
-    };
-    // `open` can create a missing directory, so an explicit resume must reject a newly created
-    // store rather than silently rerunning. Remove that empty store so a retry receives the same
-    // result.
-    if let (Some(existing), Some(named)) = (&store, &resume_run_id) {
-        if existing.is_fresh() {
-            let message = format!("Workflow run {named} was not found. It may never have existed or was removed after its retention period. Omit resume_run_id to run from the beginning.");
-            if let Some(existing) = store {
-                existing.discard_if_fresh();
+    let mut store = match &resume_run_id {
+        // An explicit resume must find its run and must not silently start a new one. Opening it
+        // creates nothing, so a retry of a missing id fails the same way.
+        Some(named) => match crate::workflow_store::RunStore::open_existing(
+            std::path::Path::new(&request.app_data_path),
+            &request.conversation_id,
+            named,
+        ) {
+            Ok(Some(store)) => Some(store),
+            Ok(None) => {
+                return Ok(failed_tool_execution(
+                    call,
+                    format!("Workflow run {named} was not found. It may never have existed or was removed with its conversation. Omit resume_run_id to run from the beginning."),
+                ))
             }
-            return Ok(failed_tool_execution(call, message));
-        }
-    }
+            Err(error) => return Ok(failed_tool_execution(call, error)),
+        },
+        None => match crate::workflow_store::RunStore::open(
+            std::path::Path::new(&request.app_data_path),
+            &request.conversation_id,
+            &run_id,
+            &source_body,
+        ) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                // A fresh run loses recoverability but may still execute.
+                eprintln!("工作流运行目录不可用（本次运行将不可恢复）：{error}");
+                None
+            }
+        },
+    };
     let journal = store
         .as_ref()
         .map(crate::workflow_store::RunStore::load_journal)
@@ -694,6 +794,29 @@ pub(crate) fn run_workflow_tool_with_deadline(
         },
         None => None,
     };
+    // Only now, holding the lock, does this attempt make the run directory its own: a resume's
+    // re-approved script replaces the one the last attempt ran, and the args it runs with are
+    // saved for the next resume. Before the lock, another driver could still be using them.
+    if let Some(existing) = store.as_mut() {
+        if resume_run_id.is_some() {
+            if let Err(error) = existing.replace_source(&source_body) {
+                drop(driver_lock);
+                return Ok(failed_tool_execution(call, error));
+            }
+        }
+        if let Some(args) = &args_to_save {
+            existing.write_args(args);
+        }
+        // Which call the files now on disk came from, for the next resume to check them against.
+        // A fresh run's script is this call's even though `open` pinned it; a resume's is only
+        // when it brought one.
+        let supplied_script =
+            resume_run_id.is_none() || call.input.get("script").is_some_and(Value::is_string);
+        existing.record_provenance(
+            supplied_script.then_some(call.id.as_str()),
+            args_to_save.as_ref().map(|_| call.id.as_str()),
+        );
+    }
 
     if let Err(error) = reserve_subagent_execution_mode(
         &driver_template,
@@ -943,15 +1066,28 @@ fn drive_workflow_task(
     }
     // Harvest any settled-but-unconsumed step with its real terminal state so synthesized audit
     // results match nested records.
+    //
+    // The plan never received these outcomes: the run stopped, failed, or returned first. A value
+    // is still finished work, so it is journaled for a resume to reuse. A step without one gets no
+    // terminal record: it stays `started` only, which a resume reruns without discarding the
+    // results journaled after it — nothing downstream was computed from an outcome nobody saw.
     for index in 0..slots.len() {
         if slots[index].outcome.is_none() {
             if let Some(step_shared) = slots[index].shared.clone() {
-                slots[index].outcome = Some(harvest_outcome(
+                let outcome = harvest_outcome(
                     index,
                     &slots[index].request,
                     &step_shared,
                     &parent.prompt_profile,
-                ));
+                );
+                if let (Some(store), Some(value)) = (store.as_ref(), outcome.value.clone()) {
+                    store.append(&crate::workflow_store::JournalLine::Result {
+                        key: slots[index].cache_key.clone(),
+                        agent_id: step_shared.name.clone(),
+                        result: value,
+                    });
+                }
+                slots[index].outcome = Some(outcome);
             }
         }
     }
@@ -1164,14 +1300,16 @@ fn persist_run(
         }
         let cached = slot.outcome.as_ref().is_some_and(|outcome| outcome.cached);
         if cached || slot.shared.is_none() {
-            if store.step_exists(index) {
+            // A later attempt may have run a different step at this index and left its record
+            // here; pointing a replayed card at that one would show the wrong transcript.
+            if store.step_matches(index, &slot.cache_key) {
                 on_disk.insert(index);
             }
             continue;
         }
         if let Ok(record) = serde_json::to_value(slot.shared.as_ref().map(|shared| shared.record()))
         {
-            if store.write_step(index, &record) {
+            if store.write_step(index, &slot.cache_key, &record) {
                 on_disk.insert(index);
             }
         }
@@ -1416,9 +1554,10 @@ fn drive<'scope, 'env>(
             // intervene, or replay would query a different position.
             let cache_key = chain.advance(&step);
             // Call `consult` exactly once per step, including misses. A miss closes the
-            // one-way replay gate for all following steps.
+            // one-way replay gate for all following steps; a step the last attempt left
+            // unsettled reruns without closing it.
             let journaled = journal.result(&cache_key).cloned();
-            let replay = if chain.consult(journaled.is_some()) {
+            let replay = if chain.consult(journal.lookup(&cache_key)) {
                 journaled
             } else {
                 None
@@ -1643,13 +1782,17 @@ fn drive<'scope, 'env>(
             ));
         }
         // Use envelopes only as wake-up signals; the record is the authoritative result.
-        let finished = in_flight
+        let mut finished = in_flight
             .iter()
             .filter_map(|(name, index)| {
                 let shared = pool.find(name)?;
                 (shared.status() != AgentLiveStatus::Running).then(|| (name.clone(), *index))
             })
             .collect::<Vec<_>>();
+        // Hand a batch to the plan in dispatch order. `in_flight` iterates in no fixed order, and
+        // the order the plan sees results decides the order a `pipeline` issues its next stage —
+        // which is the order a resume's cache chain has to meet it in again.
+        finished.sort_unstable_by_key(|(_, index)| *index);
         let harvested_any = !finished.is_empty();
         for (name, index) in finished {
             in_flight.remove(&name);
@@ -1693,7 +1836,8 @@ fn drive<'scope, 'env>(
             // run finalization, so a later crash cannot lose its transcript or usage.
             if let Some(store) = store {
                 if let Ok(record) = serde_json::to_value(shared.record()) {
-                    slots[index].record_persisted = store.write_step(index, &record);
+                    slots[index].record_persisted =
+                        store.write_step(index, &slots[index].cache_key, &record);
                 }
             }
             outcomes.push(outcome);
@@ -1705,12 +1849,15 @@ fn drive<'scope, 'env>(
     }
 }
 
-/// Writes a step terminal state to the journal. Only steps with values write `Result` entries.
+/// Writes the terminal state of a step the plan is about to receive. Only steps with values write
+/// `Result` entries.
 ///
-/// Null results, including skips, terminal errors, and missing structured output, retain only the
-/// `Started` entry. They must rerun on resume, as must all later steps after the one-way cache gate
-/// diverges. `mark_diverged` keeps that property local to this function; caching a null result
-/// would permanently preserve a failure as the plan answer.
+/// Null results, including skips, terminal errors, and missing structured output, write a
+/// diagnostic `Settled` entry instead. The plan consumes that null, so a resume reads the key as a
+/// miss: the step reruns, as must all later steps after the one-way cache gate diverges.
+/// `mark_diverged` keeps that property local to this function; caching a null result would
+/// permanently preserve a failure as the plan answer. Outcomes the plan never receives are
+/// journaled by the final harvest in `drive_workflow_task`, not here.
 fn journal_outcome(
     store: Option<&crate::workflow_store::RunStore>,
     chain: &mut workflow_core::chain::CacheKeyChain,
@@ -1873,12 +2020,11 @@ fn spawn_step<'scope, 'env>(
     let name = workflow_step_name(pool, step.agent_type.as_deref());
     let label = step_display_label(step, step_index);
     let ledger = step_ledger_owner(run_id, step_index);
-    let (mut template, role_template_id) =
-        match workflow_step_template(parent, state, step, worktree) {
-            Ok(built) => built,
-            Err(error) => return SpawnOutcome::StepFailed(error),
-        };
-    template.wire_ledger_owner = Some(ledger.clone());
+    let mut template = match workflow_step_template(parent, state, step, worktree) {
+        Ok(built) => built,
+        Err(error) => return SpawnOutcome::StepFailed(error),
+    };
+    template.history_owner = Some(ledger.clone());
     if let Some(schema) = &step.schema {
         // Use the same byte-limit and compilation path as spawn and continuation; reject this
         // step when compilation fails.
@@ -1889,18 +2035,10 @@ fn spawn_step<'scope, 'env>(
             Err(error) => return SpawnOutcome::StepFailed(error),
         }
     }
-    // A step names a role the same way `agent_spawn` does, so a role carrying a
-    // conversation template seeds this step's opening history too. The step's
-    // prompt then follows the same `{input}` rule.
-    let seed = match role_template_id.as_deref() {
-        Some(template_id) => match crate::api::role_template_contexts(parent, template_id) {
-            Ok(seeded) => seeded,
-            Err(error) => return SpawnOutcome::StepFailed(error),
-        },
-        None => Vec::new(),
-    };
+    // The step's prompt is its entire opening history: a role's conversation
+    // template never seeds a workflow step (see `workflow_step_template`).
     let initial_contexts = crate::conversation_template::seed_with_task(
-        seed,
+        Vec::new(),
         &step.prompt,
         |_| new_context_id("workflow-step-task"),
         Utc::now().to_rfc3339(),
@@ -1953,6 +2091,7 @@ fn spawn_step<'scope, 'env>(
         };
     }
     *published_role = template.agent_definition_binding.clone();
+    crate::helper_model::uses::on_workflow_step_started(state, parent, round, step_call_id, &step.prompt);
     let shared = match pool.register(
         name,
         label,
@@ -1986,53 +2125,6 @@ fn spawn_step<'scope, 'env>(
         };
     }
     SpawnOutcome::Spawned(shared)
-}
-
-/// A step is not a correspondent of the main agent, so it must not carry the
-/// child→main message channel even when the conversation that started the run
-/// hands it to ordinary `agent_spawn` children.
-///
-/// The caller supplies a parent that DOES grant the channel; without that the
-/// assertions below would hold for the wrong reason.
-#[cfg(test)]
-pub(crate) fn assert_workflow_steps_have_no_child_send_message(
-    parent: &RunModelRequest,
-    state: &AppState,
-) {
-    let granted = agent_child_template(parent);
-    assert!(
-        granted
-            .enabled_tools
-            .iter()
-            .any(|name| name == crate::api::SEND_MESSAGE_TOOL),
-        "夹具无效：这个父对话本该给普通子代理开通上行通道"
-    );
-
-    let step = WorkflowStepRequest::from_prompt("review the host");
-    let (template, _) = workflow_step_template(parent, state, &step, None).unwrap();
-    assert!(
-        !template
-            .enabled_tools
-            .iter()
-            .any(|name| name == crate::api::SEND_MESSAGE_TOOL),
-        "工作流步骤不得持有上行消息通道"
-    );
-    assert!(
-        !template
-            .tools
-            .iter()
-            .any(|tool| tool.name == crate::api::SEND_MESSAGE_TOOL),
-        "步骤连描述符都不该看见"
-    );
-
-    let driver = strip_child_send_message(agent_child_template(parent));
-    assert!(
-        !driver
-            .enabled_tools
-            .iter()
-            .any(|name| name == crate::api::SEND_MESSAGE_TOOL),
-        "驱动记账模板同样不持有该通道"
-    );
 }
 
 #[cfg(test)]
@@ -2176,11 +2268,12 @@ fn step_display_label(step: &WorkflowStepRequest, index: usize) -> String {
 /// worktree path and branch are the coordinates for locating retained work. `role` is the resolved
 /// host binding, not the requested `agentType`, so the task surface displays the actual role.
 ///
-/// `ledger` is the address of the step's request ledger — see [`step_ledger_owner`]. The step's
+/// `ledger` is the step's history owner — see [`step_ledger_owner`]; the key keeps its old name
+/// because archived step shells carry it. The step's
 /// nested record carries no name (pool names are pipeline internals), and an externalized step
 /// carries no record at all, so the shell is the only place the renderer can read the address
-/// from; publishing it from the first frame is what lets the ledger pane of a running step ask
-/// for the right rows. A step that never registered a worker has no ledger and gains no key.
+/// from; publishing it from the first frame is what lets the history pane of a running step ask
+/// for the right entries. A step that never registered a worker has no owner and gains no key.
 fn step_identity_input(
     step: &WorkflowStepRequest,
     label: &str,
@@ -2224,9 +2317,20 @@ fn step_identity_input(
     input
 }
 
+/// A step's `effort` is one of the five levels by name. `xhigh` is also taken,
+/// as `extra`: it is the name providers give that level and the one this option
+/// documented before. The other retired spellings the document loader still
+/// reads (`disabled`, `minimal`) are refused here, since a script naming them
+/// asks for something no level gives.
 fn parse_step_effort(effort: &str) -> Result<ReasoningEffort, String> {
-    serde_json::from_value(Value::String(effort.to_owned()))
-        .map_err(|_| format!("Invalid workflow step effort value: {effort}"))
+    Ok(match effort {
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "extra" | "xhigh" => ReasoningEffort::Extra,
+        "max" => ReasoningEffort::Max,
+        _ => return Err(format!("Invalid workflow step effort value: {effort}")),
+    })
 }
 
 /// Character limit for the timeline preview of an externalized step body.
@@ -2373,6 +2477,7 @@ fn synthesize_step_context(
         input,
         result,
         subagent,
+        notice: None,
         attestation,
         created_at: Utc::now().to_rfc3339(),
     }
@@ -2515,8 +2620,12 @@ mod tests {
         assert!(parse_step_effort("low").is_ok());
         assert!(parse_step_effort("medium").is_ok());
         assert!(parse_step_effort("high").is_ok());
-        assert!(parse_step_effort("xhigh").is_ok());
-        assert!(parse_step_effort("max").is_err());
+        assert_eq!(parse_step_effort("extra"), Ok(ReasoningEffort::Extra));
+        assert_eq!(parse_step_effort("xhigh"), Ok(ReasoningEffort::Extra));
+        assert_eq!(parse_step_effort("max"), Ok(ReasoningEffort::Max));
+        assert!(parse_step_effort("disabled").is_err());
+        assert!(parse_step_effort("minimal").is_err());
+        assert!(parse_step_effort("ultra").is_err());
     }
 
     #[test]

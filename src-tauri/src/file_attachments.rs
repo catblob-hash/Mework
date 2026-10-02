@@ -21,14 +21,31 @@ use crate::content_store::{
 };
 use crate::model::{AppDocument, ContextItem, FileAttachment, FileAttachmentFormat};
 
-/// Largest text file, and largest text a PDF may carry to the model.
+/// Largest stored text file (documents from before [`MAX_TEXT_FILE_UPLOAD_BYTES`]
+/// may hold one this large), and largest text a PDF may carry to the model.
 pub const MAX_FILE_ATTACHMENT_TEXT_BYTES: usize = 512 * 1024;
-pub const MAX_FILE_ATTACHMENT_PDF_BYTES: usize = 10 * 1024 * 1024;
-/// Per user message, queued message, or steer.
-pub const MAX_MESSAGE_FILES: usize = 20;
+/// Largest text file a message takes now: Claude Code attaches none over
+/// 256 KB (`tengu_attachment_file_too_large`).
+pub const MAX_TEXT_FILE_UPLOAD_BYTES: usize = 262_144;
+/// Claude Code's Read reads a whole PDF up to 20 MB.
+pub const MAX_FILE_ATTACHMENT_PDF_BYTES: usize = 20 * 1024 * 1024;
+/// Text over this many tokens is cut to its first [`TRUNCATED_TEXT_FILE_LINES`]
+/// lines, as Claude Code's Read cuts a file (its default output cap).
+pub const MAX_TEXT_FILE_TOKENS: u64 = 25_000;
+pub const TRUNCATED_TEXT_FILE_LINES: usize = 2_000;
+/// A PDF of at most this many pages goes to a model that reads PDFs as the
+/// document itself (Claude Code's whole-file threshold); a longer one, or one
+/// for a model that does not, goes as its extracted text.
+pub const MAX_NATIVE_PDF_PAGES: u32 = 10;
 pub const MAX_FILE_ATTACHMENT_NAME_BYTES: usize = 256;
-/// Largest file `dropped_file_read` hands to the renderer.
-pub const MAX_DROPPED_FILE_BYTES: usize = 10 * 1024 * 1024;
+/// Largest file `dropped_file_read` hands to the renderer: the larger of what a
+/// picture and a PDF may be.
+pub const MAX_DROPPED_FILE_BYTES: usize =
+    if crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES > MAX_FILE_ATTACHMENT_PDF_BYTES {
+        crate::image_attachments::MAX_IMAGE_UPLOAD_BYTES
+    } else {
+        MAX_FILE_ATTACHMENT_PDF_BYTES
+    };
 const MAX_PDF_PAGES: u32 = 100_000;
 const MAX_FILE_ATTACHMENT_TOKENS: u64 = 10_000_000;
 /// `%PDF-` may follow a little junk; readers accept it within the first KiB.
@@ -43,7 +60,7 @@ static FILE_ATTACHMENT_FS_LOCK: Mutex<()> = Mutex::new(());
 
 /// The AI SDK part `aisdk::project` emits for an attachment before hydration.
 /// It is not an AI SDK type: it must be replaced before the step is sent, and
-/// the wire ledger records it as-is instead of the file's text.
+/// the history records it as-is instead of the file's text.
 pub(crate) const FILE_PART_TYPE: &str = "mework-file";
 
 #[derive(Clone, Debug)]
@@ -86,14 +103,18 @@ impl FileAttachmentStore {
                         "A text file attachment takes no extracted text or page count".into(),
                     );
                 }
-                if bytes.len() > MAX_FILE_ATTACHMENT_TEXT_BYTES {
+                if bytes.len() > MAX_TEXT_FILE_UPLOAD_BYTES {
                     return Err(format!(
                         "Text file exceeds the {} limit ({} bytes)",
-                        format_limit(MAX_FILE_ATTACHMENT_TEXT_BYTES),
+                        format_limit(MAX_TEXT_FILE_UPLOAD_BYTES),
                         bytes.len()
                     ));
                 }
-                decode_text_file(bytes)?;
+                if let ModelText::TooLong = ModelText::of(decode_text_file(bytes)?) {
+                    return Err(format!(
+                        "Text file is too long: even its first {TRUNCATED_TEXT_FILE_LINES} lines exceed {MAX_TEXT_FILE_TOKENS} tokens"
+                    ));
+                }
                 None
             }
             FileAttachmentFormat::Pdf => {
@@ -179,6 +200,33 @@ impl FileAttachmentStore {
             format!("Could not write the extracted text of file attachment: {error}")
         })?;
         Ok(text.to_owned())
+    }
+
+    /// A PDF's original bytes as a `data:` URL, for a model that reads the
+    /// document itself. Checked against its metadata and digest like an image
+    /// sidecar, since these are the bytes that are sent.
+    pub fn pdf_data_url(&self, file: &FileAttachment) -> Result<String, String> {
+        validate_file_metadata(file)?;
+        if file.format != FileAttachmentFormat::Pdf {
+            return Err(format!("File attachment {} is not a PDF", file.id));
+        }
+        let _guard = self.directory.lock();
+        self.directory.restore_quarantined_locked(&file.id)?;
+        let bytes = read_original(&self.directory.path_for_id(&file.id)?)
+            .map_err(|error| format!("Could not read file attachment {}: {error}", file.id))?;
+        if bytes.len() as u64 != file.bytes
+            || hex_digest(&bytes) != file.id
+            || !looks_like_pdf(&bytes)
+        {
+            return Err(format!(
+                "File attachment {} failed its content integrity check",
+                file.id
+            ));
+        }
+        Ok(format!(
+            "data:application/pdf;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
     }
 
     /// The original bytes as a `data:` URL, for the renderer's preview.
@@ -273,6 +321,19 @@ impl FileAttachmentStore {
 
     /// See [`crate::image_attachments::ImageAttachmentStore::reconcile_transition`];
     /// the semantics are the same, per entry rather than per file.
+    /// [`Self::reconcile_transition`] for callers that hold the referenced ids
+    /// rather than two documents carrying every body: the document snapshot
+    /// keeps no bodies, and `attachment_refs` answers for them. `next` must
+    /// already include every pinned id.
+    pub fn reconcile_referenced(
+        &self,
+        previous: &HashSet<String>,
+        next: &HashSet<String>,
+    ) -> Result<ReconcileReport, String> {
+        self.directory.reconcile_transition(previous, next)
+    }
+
+    #[cfg(test)]
     pub fn reconcile_transition(
         &self,
         previous: &AppDocument,
@@ -289,6 +350,17 @@ impl FileAttachmentStore {
     /// See [`crate::image_attachments::ImageAttachmentStore::reconcile_startup`].
     /// A caller that cannot read the pinned template ids must skip this rather
     /// than pass none: this is the pass that deletes.
+    /// [`Self::reconcile_startup`] for a caller that holds the referenced ids:
+    /// the startup load drops each body once it has noted what it references
+    /// (`attachment_refs`). `referenced` must already include every pinned id.
+    pub fn reconcile_startup_referenced(
+        &self,
+        referenced: &HashSet<String>,
+    ) -> Result<ReconcileReport, String> {
+        self.directory.reconcile_startup(referenced)
+    }
+
+    #[cfg(test)]
     pub fn reconcile_startup(
         &self,
         document: &AppDocument,
@@ -302,7 +374,33 @@ impl FileAttachmentStore {
     /// Used only by the explicit full-document reset after its durability
     /// barrier and dependency fence have succeeded.
     pub fn purge_all(&self) -> Result<(), String> {
+        let scope = self.pool_scope();
+        crate::memory_pool::MemoryPool::global().retain(|key| {
+            key.kind != crate::memory_pool::PoolKind::FileData || !key.id.starts_with(&scope)
+        });
         self.directory.purge_all()
+    }
+
+    /// Keys of this directory's entries in the shared memory pool. An id names
+    /// the same bytes forever, so a pooled copy never goes stale.
+    fn pool_scope(&self) -> String {
+        format!("{}\u{0}", self.directory.root().display())
+    }
+
+    /// [`Self::data_url_by_id`] through the shared memory pool, as low-priority
+    /// data: only the preview reads it.
+    pub fn pooled_data_url_by_id(&self, id: &str) -> Result<std::sync::Arc<String>, String> {
+        let pool = crate::memory_pool::MemoryPool::global();
+        let key = crate::memory_pool::PoolKey::new(
+            crate::memory_pool::PoolKind::FileData,
+            format!("{}{id}", self.pool_scope()),
+        );
+        if let Some(cached) = pool.get::<String>(&key) {
+            return Ok(cached);
+        }
+        let value = std::sync::Arc::new(self.data_url_by_id(id)?);
+        pool.insert(key, std::sync::Arc::clone(&value), value.len() as u64);
+        Ok(value)
     }
 
     #[cfg(test)]
@@ -363,11 +461,24 @@ pub(crate) fn collect_context_file_ids(contexts: &[ContextItem], ids: &mut HashS
 /// early.
 pub(crate) fn render_for_model(file: &FileAttachment, text: &str) -> String {
     let name = escape_attribute(&file.name);
-    let open = match file.format {
-        FileAttachmentFormat::Text => format!("<attached_file name=\"{name}\">"),
-        FileAttachmentFormat::Pdf => format!(
-            "<attached_file name=\"{name}\" type=\"pdf\" pages=\"{}\" content=\"text extracted from the PDF\">",
-            file.pages.unwrap_or_default()
+    let (open, text) = match file.format {
+        FileAttachmentFormat::Text => match truncated_for_model(file, text) {
+            // Claude Code's note, less its pointer to Read: the model has no
+            // other copy of the file to read the rest from.
+            Some(head) => (
+                format!(
+                    "<attached_file name=\"{name}\" note=\"The file was too large and has been truncated to the first {TRUNCATED_TEXT_FILE_LINES} lines. No need to mention the truncation.\">"
+                ),
+                head,
+            ),
+            None => (format!("<attached_file name=\"{name}\">"), text),
+        },
+        FileAttachmentFormat::Pdf => (
+            format!(
+                "<attached_file name=\"{name}\" type=\"pdf\" pages=\"{}\" content=\"text extracted from the PDF\">",
+                file.pages.unwrap_or_default()
+            ),
+            text,
         ),
     };
     let body = text
@@ -376,6 +487,53 @@ pub(crate) fn render_for_model(file: &FileAttachment, text: &str) -> String {
         .unwrap_or(text)
         .replace("</attached_file", "<\\/attached_file");
     format!("{open}\n{body}\n</attached_file>")
+}
+
+/// The element that stands for a PDF sent as the document itself, which
+/// follows it as a file part of its own.
+pub(crate) fn render_native_pdf_marker(file: &FileAttachment) -> String {
+    format!(
+        "<attached_file name=\"{}\" type=\"pdf\" pages=\"{}\" content=\"the PDF document, attached after this element\"></attached_file>",
+        escape_attribute(&file.name),
+        file.pages.unwrap_or_default()
+    )
+}
+
+/// What of a text file the model reads, by Claude Code's Read rule: the whole
+/// file within [`MAX_TEXT_FILE_TOKENS`], else its first
+/// [`TRUNCATED_TEXT_FILE_LINES`] lines if those are within it, else nothing.
+enum ModelText<'a> {
+    Whole,
+    Truncated(&'a str),
+    TooLong,
+}
+
+impl<'a> ModelText<'a> {
+    fn of(text: &'a str) -> Self {
+        if crate::api::estimate_tokens(text) <= MAX_TEXT_FILE_TOKENS {
+            return Self::Whole;
+        }
+        let head = match text.match_indices('\n').nth(TRUNCATED_TEXT_FILE_LINES - 1) {
+            Some((end, _)) => &text[..end],
+            None => text,
+        };
+        if head.len() == text.len() || crate::api::estimate_tokens(head) > MAX_TEXT_FILE_TOKENS {
+            return Self::TooLong;
+        }
+        Self::Truncated(head)
+    }
+}
+
+/// The first lines of `text` when the file was attached under the truncation
+/// rule. A file attached before it was stored whole, with the whole text's
+/// token estimate, and keeps being sent whole, so a conversation's history
+/// never changes under it; one attached since carries the estimate of the
+/// lines it keeps, which is always less than the whole text's.
+fn truncated_for_model<'a>(file: &FileAttachment, text: &'a str) -> Option<&'a str> {
+    match ModelText::of(text) {
+        ModelText::Truncated(head) if file.tokens < crate::api::estimate_tokens(text) => Some(head),
+        _ => None,
+    }
 }
 
 fn escape_attribute(value: &str) -> String {
@@ -431,13 +589,8 @@ pub fn validate_file_metadata(file: &FileAttachment) -> Result<(), String> {
 }
 
 /// Validates the attachments of one message before it is persisted or admitted
-/// to a live steer.
+/// to a live steer. How many a message carries is not budgeted.
 pub fn validate_file_list(files: &[FileAttachment], owner: &str) -> Result<(), String> {
-    if files.len() > MAX_MESSAGE_FILES {
-        return Err(format!(
-            "{owner} has more than {MAX_MESSAGE_FILES} file attachments"
-        ));
-    }
     let mut seen = HashSet::new();
     for file in files {
         validate_file_metadata(file)
@@ -520,8 +673,14 @@ fn decode_pdf_text(bytes: Vec<u8>) -> Result<String, String> {
     Ok(text)
 }
 
+/// The estimate of what the model reads of a text file: its first lines when
+/// it is cut (see [`truncated_for_model`], which reads the estimate back).
 fn estimate_text_tokens(bytes: &[u8]) -> Result<u64, String> {
-    decode_text_file(bytes).map(crate::api::estimate_tokens)
+    let text = decode_text_file(bytes)?;
+    Ok(match ModelText::of(text) {
+        ModelText::Truncated(head) => crate::api::estimate_tokens(head),
+        ModelText::Whole | ModelText::TooLong => crate::api::estimate_tokens(text),
+    })
 }
 
 #[cfg(test)]
@@ -620,11 +779,17 @@ mod tests {
         assert!(import(b"ab\0cd").contains("NUL"));
         assert!(import(b"\xff\xfe\x00a").contains("NUL"));
         assert!(import(b"caf\xe9").contains("UTF-8"));
-        let oversized = vec![b'a'; MAX_FILE_ATTACHMENT_TEXT_BYTES + 1];
-        assert!(import(&oversized).contains("512 KiB"));
-        let exact = vec![b'a'; MAX_FILE_ATTACHMENT_TEXT_BYTES];
+        let oversized = "a\n".repeat(MAX_TEXT_FILE_UPLOAD_BYTES / 2 + 1);
+        assert!(import(oversized.as_bytes()).contains("256 KiB"));
+        let exact = "a\n".repeat(MAX_TEXT_FILE_UPLOAD_BYTES / 2);
         assert!(store
-            .import("a.txt", &exact, FileAttachmentFormat::Text, None, None)
+            .import(
+                "a.txt",
+                exact.as_bytes(),
+                FileAttachmentFormat::Text,
+                None,
+                None
+            )
             .is_ok());
         assert!(store
             .import(
@@ -684,7 +849,7 @@ mod tests {
         };
         assert!(pdf(&oversized, Some("text"), Some(1))
             .unwrap_err()
-            .contains("10 MiB"));
+            .contains("20 MiB"));
 
         let file = pdf(PDF, Some("第一页\n第二页"), Some(2)).unwrap();
         assert_eq!(file.format, FileAttachmentFormat::Pdf);
@@ -692,6 +857,88 @@ mod tests {
         assert_eq!(file.bytes, PDF.len() as u64);
         assert_eq!(file.tokens, crate::api::estimate_tokens("第一页\n第二页"));
         assert_eq!(store.model_text(&file).unwrap(), "第一页\n第二页");
+    }
+
+    #[test]
+    fn text_over_the_token_cap_is_cut_to_its_first_2000_lines_with_a_note() {
+        let (_temp, store) = store();
+        // 3000 lines of 40 characters: 30 750 tokens, 20 500 in the first 2000.
+        let line = "x".repeat(40);
+        let text = (1..=3_000)
+            .map(|index| format!("{index:05}{}", &line[5..]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(crate::api::estimate_tokens(&text) > MAX_TEXT_FILE_TOKENS);
+        let file = import_text(&store, "big.log", &text);
+        let head = text
+            .lines()
+            .take(TRUNCATED_TEXT_FILE_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(file.tokens, crate::api::estimate_tokens(&head));
+        let rendered = render_for_model(&file, &store.model_text(&file).unwrap());
+        assert_eq!(
+            rendered,
+            format!(
+                "<attached_file name=\"big.log\" note=\"The file was too large and has been truncated to the first 2000 lines. No need to mention the truncation.\">\n{head}\n</attached_file>"
+            )
+        );
+        assert!(rendered.contains("\n02000xxx"));
+        assert!(!rendered.contains("02001xxx"));
+
+        // A file attached before the rule carries its whole text's estimate,
+        // and is sent whole as it always was.
+        let legacy = FileAttachment {
+            tokens: crate::api::estimate_tokens(&text),
+            ..file
+        };
+        assert!(render_for_model(&legacy, &text).contains("03000xxx"));
+    }
+
+    #[test]
+    fn text_still_over_the_token_cap_in_its_first_2000_lines_is_refused() {
+        let (_temp, store) = store();
+        // 1500 lines of 80 characters: nothing to cut, and 30 375 tokens.
+        let text = vec!["y".repeat(80); 1_500].join("\n");
+        assert!(store
+            .import(
+                "wide.csv",
+                text.as_bytes(),
+                FileAttachmentFormat::Text,
+                None,
+                None
+            )
+            .unwrap_err()
+            .contains("too long"));
+        // Within the cap, a file of any line count is sent whole.
+        let short = vec!["z"; 5_000].join("\n");
+        let file = import_text(&store, "short.txt", &short);
+        assert_eq!(file.tokens, crate::api::estimate_tokens(&short));
+        assert!(!render_for_model(&file, &short).contains("note="));
+    }
+
+    #[test]
+    fn a_pdf_reads_back_as_a_checked_data_url_for_native_delivery() {
+        let (_temp, store) = store();
+        let pdf = import_pdf(&store, "text");
+        assert_eq!(
+            store.pdf_data_url(&pdf).unwrap(),
+            format!(
+                "data:application/pdf;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(PDF)
+            )
+        );
+        let text = import_text(&store, "a.txt", "hello");
+        assert!(store.pdf_data_url(&text).unwrap_err().contains("not a PDF"));
+        fs::write(store.path_for_id(&pdf.id).unwrap(), b"%PDF-1.7 tampered").unwrap();
+        assert!(store.pdf_data_url(&pdf).unwrap_err().contains("integrity"));
+        assert_eq!(
+            render_native_pdf_marker(&FileAttachment {
+                name: "a \"b\".pdf".into(),
+                ..pdf
+            }),
+            "<attached_file name=\"a &quot;b&quot;.pdf\" type=\"pdf\" pages=\"3\" content=\"the PDF document, attached after this element\"></attached_file>"
+        );
     }
 
     #[test]
@@ -823,21 +1070,14 @@ mod tests {
             assert!(validate_file_metadata(&file).is_err(), "{file:?}");
         }
 
-        let distinct = (0..MAX_MESSAGE_FILES)
+        // Past the 20 a message once took: how many is not budgeted.
+        let distinct = (0..25)
             .map(|index| FileAttachment {
                 id: format!("{index:064x}"),
                 ..valid.clone()
             })
             .collect::<Vec<_>>();
         assert!(validate_file_list(&distinct, "消息").is_ok());
-        let mut too_many = distinct.clone();
-        too_many.push(FileAttachment {
-            id: "f".repeat(64),
-            ..valid.clone()
-        });
-        assert!(validate_file_list(&too_many, "消息")
-            .unwrap_err()
-            .contains("more than 20"));
         assert!(validate_file_list(&[valid.clone(), valid.clone()], "消息")
             .unwrap_err()
             .contains("more than once"));

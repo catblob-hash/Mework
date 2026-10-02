@@ -6,13 +6,12 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
  * portaled to `document.body` and drawn above the ordinary layout.
  *
  * The built-in browser's page is a native child window, and a native child window paints above
- * every HTML layer no matter what the stacking context says. The pane keeps that page sunk and
- * paints a projection of it for as long as nobody is using it, so most floating surfaces are over
- * a picture and need nothing from anyone. This registry is for the moment they are not: a page
- * raised because the pointer is inside it would paint over a menu opened across it, so the overlap
- * has to be noticed and the page put back down (`browser_action` with `action: "occlude"`, which
- * also takes the page out of agent automation, plus `"project"` for the sink itself — see
- * `browser.rs`).
+ * every HTML layer no matter what the stacking context says. The page is up whenever nothing needs
+ * it gone, so a menu opened across it would be painted over: the overlap has to be noticed and
+ * the page put down under a still of itself (`browser_action` with `action: "occlude"`, which also
+ * takes the page out of agent automation, plus `"project"` for the sink itself — see
+ * `browser.rs`). Surfaces publish from a layout effect so the pane hears of them before the
+ * commit that drew them is painted.
  *
  * What the consumer needs from this registry is only whether anything overlaps the page — the
  * boxes are kept because that overlap test needs them, not because anyone positions anything from

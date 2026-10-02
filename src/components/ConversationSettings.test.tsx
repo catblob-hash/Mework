@@ -1,23 +1,29 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configureI18n } from "../i18n";
+import { resetCacheBreakWarnings } from "../lib/cacheBreakWarning";
+import { modelChoiceOf } from "../lib/documentUpdates";
+import { knownAppendCapabilities } from "../lib/modelCapabilities";
 import { defaultConversationWebSearchSettings } from "../lib/runtime";
 import {
   DEFAULT_SEARCH_COMPRESSION_CUTOFF,
   DEFAULT_SEARCH_MAX_RESULTS
 } from "../lib/searchProviders";
 import { isHostDerivedToolName, isPreviewLifecycleToolName } from "../lib/taskTools";
+import { EMPTY_TOOL_LOCK } from "../lib/toolLock";
 import { createTestDocument as createSeedDocument } from "../test/fixtures";
 import { BUILTIN_PRESET_ID } from "../seed";
 import type {
   CapabilityCatalog,
   ContextItem,
   Conversation,
+  ConversationPreset,
   ConversationPresetSettings,
   ConversationSettings as ConversationSettingsType,
   ConversationTemplateSummary,
+  ConversationToolLock,
   GlobalSettings,
   McpProbeReport,
   ResourceDescriptor,
@@ -31,6 +37,53 @@ import { ConversationSettings } from "./ConversationSettings";
    hand the pane a new identity and re-read the body under the editor. */
 const readNothing = async (): Promise<ContextItem[]> => [];
 const writeSomewhere = async (templateId: string): Promise<string> => templateId || "template_minted";
+
+/* The test document selects a provider with no models, so a test about the
+   lock selects one: Opus 5.5 takes a tool mid-conversation on the Messages
+   API, Haiku 4.5 does not. Each declares what a fetch from that endpoint
+   would declare for it. */
+function withSelectedModel(globalSettings: GlobalSettings, modelId: string): GlobalSettings {
+  return {
+    ...globalSettings,
+    activeProviderId: "anthropic_messages",
+    apiProviders: globalSettings.apiProviders.map((provider) => (
+      provider.id === "anthropic_messages"
+        ? {
+          ...provider,
+          activeModelId: modelId,
+          models: [{
+            id: modelId,
+            name: modelId,
+            group: "claude",
+            capabilities: knownAppendCapabilities(provider, modelId),
+            reasoningContent: "plaintext",
+            promptCache: true
+          }]
+        }
+        : provider
+    ))
+  };
+}
+const withWarmModel = (globalSettings: GlobalSettings) => withSelectedModel(globalSettings, "claude-opus-5-5");
+const withFrozenModel = (globalSettings: GlobalSettings) => withSelectedModel(globalSettings, "claude-haiku-4-5");
+
+/* A lock as a request by the selected model would have left it — just now,
+   unless `at` says otherwise — so a test states only what it is about. */
+function lockFor(
+  globalSettings: GlobalSettings,
+  patch: Partial<ConversationToolLock> = {},
+  at = new Date().toISOString()
+): ConversationToolLock {
+  const { provider, model } = modelChoiceOf(globalSettings);
+  return {
+    ...EMPTY_TOOL_LOCK,
+    promptSkillIds: [],
+    lastRequest: { providerId: provider!.id, modelId: model!.id, at },
+    ...patch
+  };
+}
+
+beforeEach(() => resetCacheBreakWarnings());
 
 /* The two web-backend pickers are menus rather than `<select>`s, because the
    native row opens a second step naming the wire tool version and an option
@@ -62,7 +115,7 @@ function SettingsHarness({
   onDeletePreset = vi.fn(),
   onSavePreset = vi.fn(),
   onSavePresetCopy = vi.fn(),
-  onSaveAsPreset = vi.fn(),
+  onCreatePreset,
   onBindPresetTemplate = vi.fn(),
   templates = [],
   onReadTemplate = readNothing,
@@ -83,8 +136,9 @@ function SettingsHarness({
   onRenamePreset?: (presetId: string, name: string) => void;
   onDeletePreset?: (presetId: string) => void;
   onSavePreset?: (presetId: string, settings: ConversationPresetSettings) => void;
-  onSavePresetCopy?: (presetId: string, settings: ConversationPresetSettings) => void;
-  onSaveAsPreset?: () => void;
+  onSavePresetCopy?: (presetId: string, settings: ConversationPresetSettings, templateBody: ContextItem[] | null) => void;
+  /** Resolves with the preset it made; the harness puts it in the document, as App does. */
+  onCreatePreset?: (request: { name: string; captureTemplate: boolean }) => Promise<ConversationPreset>;
   onBindPresetTemplate?: (presetId: string, templateId: string) => void;
   templates?: ConversationTemplateSummary[];
   onReadTemplate?: (templateId: string) => Promise<ContextItem[]>;
@@ -100,10 +154,11 @@ function SettingsHarness({
   onProbeMcpServer?: (resource: ResourceDescriptor) => Promise<McpProbeReport>;
 }) {
   const [conversation, setConversation] = useState(initialConversation);
+  const [presets, setPresets] = useState(globalSettings.conversationPresets);
   return (
     <ConversationSettings
       conversation={conversation}
-      globalSettings={globalSettings}
+      globalSettings={{ ...globalSettings, conversationPresets: presets }}
       tools={tools}
       capabilities={capabilities}
       onChange={(settings) => {
@@ -122,7 +177,11 @@ function SettingsHarness({
       onDeletePreset={onDeletePreset}
       onSavePreset={onSavePreset}
       onSavePresetCopy={onSavePresetCopy}
-      onSaveAsPreset={onSaveAsPreset}
+      onCreatePreset={onCreatePreset && (async (request) => {
+        const preset = await onCreatePreset(request);
+        setPresets((current) => [...current, preset]);
+        return preset;
+      })}
       onBindPresetTemplate={onBindPresetTemplate}
       templates={templates}
       onReadTemplate={onReadTemplate}
@@ -166,7 +225,7 @@ function template(
 describe("ConversationSettings", () => {
   afterEach(() => configureI18n("zh-CN"));
 
-  it("lists seven pages and opens on the features page", () => {
+  it("lists its pages and opens on the tools page", () => {
     const seed = createSeedDocument();
     render(
       <SettingsHarness
@@ -178,16 +237,17 @@ describe("ConversationSettings", () => {
       />
     );
 
-    // The order is fixed and not data-sorted: the tool surface first, then one
-    // page per catalog of named things the conversation composes with, with the
-    // save-as-preset entry point closing the list.
+    // The order is fixed and not data-sorted: the tool list first, then what
+    // switches derive, then one page per catalog of named things the
+    // conversation composes with, with the save-as-preset entry point closing
+    // the list.
     const pages = within(navigation()).getAllByRole("button")
       .map((button) => (button.textContent ?? "").replace(/\d+$/, ""));
-    expect(pages).toEqual(["功能", "沙箱", "技能", "MCP", "钩子", "代理角色", "对话预设", "另存为预设"]);
+    expect(pages).toEqual(["工具", "高级工具", "技能", "MCP", "钩子", "代理角色", "对话预设", "另存为预设"]);
     // A live conversation's own timeline IS its message queue, editable in
     // place, so the template page belongs to a preset and to a role's window.
     expect(within(navigation()).queryByRole("button", { name: /^对话模板/ })).toBeNull();
-    const active = within(navigation()).getByRole("button", { name: /^功能/ });
+    const active = within(navigation()).getByRole("button", { name: /^工具/ });
     expect(active).toHaveAttribute("aria-current", "true");
     // A row is `[category icon] [label] [optional count]`. Selection is the
     // active class alone, so the trailing chevron is gone and the row's one svg
@@ -198,33 +258,23 @@ describe("ConversationSettings", () => {
     expect(screen.queryByRole("switch", { name: /代码审查/ })).toBeNull();
   });
 
-  it("keeps the sandbox with the conversation, as a page of its own", async () => {
+  it("has no sandbox page: the sandbox belongs to each workspace", () => {
     const seed = createSeedDocument();
-    const onSettingsChange = vi.fn();
-    const user = userEvent.setup();
     render(
       <SettingsHarness
         initialConversation={seed.workspaces[0].conversations[0]}
         globalSettings={seed.globalSettings}
         tools={seed.tools}
         capabilities={seed.capabilities}
-        onSettingsChange={onSettingsChange}
+        onSettingsChange={vi.fn()}
       />
     );
 
-    await user.click(within(navigation()).getByRole("button", { name: /^沙箱/ }));
-    const toggle = screen.getByRole("switch", { name: "在沙箱中运行命令" });
-    expect(toggle).toHaveAttribute("aria-checked", "false");
-    await user.click(toggle);
-    // A preset component, written with the rest of the conversation's body.
-    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
-      sandbox: expect.objectContaining({ enabled: true, network: expect.objectContaining({ mode: "allowlist" }) })
-    }));
+    expect(within(navigation()).queryByRole("button", { name: /^沙箱/ })).toBeNull();
   });
 
   it("keeps the save-as-preset entry point as the last thing in the nav", async () => {
     const seed = createSeedDocument();
-    const onSaveAsPreset = vi.fn();
     const user = userEvent.setup();
     render(
       <SettingsHarness
@@ -233,7 +283,6 @@ describe("ConversationSettings", () => {
         tools={seed.tools}
         capabilities={seed.capabilities}
         onSettingsChange={vi.fn()}
-        onSaveAsPreset={onSaveAsPreset}
       />
     );
 
@@ -249,7 +298,119 @@ describe("ConversationSettings", () => {
     expect(within(nav).queryByRole("combobox", { name: "套用预设" })).toBeNull();
 
     await user.click(saveAs);
-    expect(onSaveAsPreset).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("dialog", { name: "另存为预设" })).toBeInTheDocument();
+  });
+
+  it("saves a preset under a name, with the timeline as its template when asked, and opens it at that page", async () => {
+    const seed = createSeedDocument();
+    const conversation = {
+      ...seed.workspaces[0].conversations[0],
+      contexts: [{ id: "ctx_here", kind: "user" as const, content: "先读一下 README", createdAt: "2026-01-02T03:04:05.000Z" }]
+    };
+    const onCreatePreset = vi.fn(async ({ name, captureTemplate }: { name: string; captureTemplate: boolean }) => ({
+      ...seed.globalSettings.conversationPresets[0],
+      id: "preset_review",
+      name,
+      description: "",
+      templateId: captureTemplate ? "template_review" : ""
+    }));
+    const onReadTemplate = vi.fn(async (): Promise<ContextItem[]> => conversation.contexts);
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={conversation}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+        onCreatePreset={onCreatePreset}
+        onReadTemplate={onReadTemplate}
+      />
+    );
+
+    await user.click(within(navigation()).getByRole("button", { name: "另存为预设" }));
+    const dialog = screen.getByRole("dialog", { name: "另存为预设" });
+    // A name and one choice: no description to write, and no paragraph about it.
+    expect(within(dialog).getAllByRole("textbox")).toHaveLength(1);
+    expect(within(dialog).queryByText(/说明|可复用模板/)).toBeNull();
+    const capture = within(dialog).getByRole("checkbox", { name: "将当前上下文作为对话模板" });
+    expect(capture).not.toBeChecked();
+    expect(within(dialog).getByRole("button", { name: "保存为预设" })).toBeDisabled();
+
+    await user.type(within(dialog).getByRole("textbox", { name: "预设名称" }), "代码评审");
+    await user.click(capture);
+    await user.click(within(dialog).getByRole("button", { name: "保存为预设" }));
+
+    expect(onCreatePreset).toHaveBeenCalledWith({ name: "代码评审", captureTemplate: true });
+    // The new preset opens in its window, on the page holding what it opens with.
+    const window = await screen.findByRole("dialog", { name: "代码评审" });
+    const nestedNav = within(window).getByRole("navigation", { name: "对话设置分类" });
+    expect(within(nestedNav).getByRole("button", { name: /^对话模板/ })).toHaveAttribute("aria-current", "true");
+    expect(onReadTemplate).toHaveBeenCalledWith("template_review");
+    expect(await within(window).findByText("先读一下 README")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "另存为预设" })).toBeNull();
+  });
+
+  it("opens a preset saved without the timeline at its empty template page too", async () => {
+    const seed = createSeedDocument();
+    const onCreatePreset = vi.fn(async ({ name }: { name: string; captureTemplate: boolean }) => ({
+      ...seed.globalSettings.conversationPresets[0],
+      id: "preset_plain",
+      name,
+      description: "",
+      templateId: ""
+    }));
+    const onReadTemplate = vi.fn(readNothing);
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{ ...seed.workspaces[0].conversations[0], contexts: [] }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+        onCreatePreset={onCreatePreset}
+        onReadTemplate={onReadTemplate}
+      />
+    );
+
+    await user.click(within(navigation()).getByRole("button", { name: "另存为预设" }));
+    const dialog = screen.getByRole("dialog", { name: "另存为预设" });
+    // An empty timeline has nothing to open with.
+    expect(within(dialog).getByRole("checkbox", { name: "将当前上下文作为对话模板" })).toBeDisabled();
+    await user.type(within(dialog).getByRole("textbox", { name: "预设名称" }), "空白{Enter}");
+
+    expect(onCreatePreset).toHaveBeenCalledWith({ name: "空白", captureTemplate: false });
+    const window = await screen.findByRole("dialog", { name: "空白" });
+    const nestedNav = within(window).getByRole("navigation", { name: "对话设置分类" });
+    expect(within(nestedNav).getByRole("button", { name: /^对话模板/ })).toHaveAttribute("aria-current", "true");
+    expect(onReadTemplate).not.toHaveBeenCalled();
+  });
+
+  it("keeps the save-as dialog open with the reason when saving fails", async () => {
+    const seed = createSeedDocument();
+    const onCreatePreset = vi.fn(async (): Promise<ConversationPreset> => {
+      throw new Error("对话模板写入失败");
+    });
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+        onCreatePreset={onCreatePreset}
+      />
+    );
+
+    await user.click(within(navigation()).getByRole("button", { name: "另存为预设" }));
+    const dialog = screen.getByRole("dialog", { name: "另存为预设" });
+    await user.type(within(dialog).getByRole("textbox", { name: "预设名称" }), "评审");
+    await user.click(within(dialog).getByRole("button", { name: "保存为预设" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("对话模板写入失败");
+    expect(within(dialog).getByRole("textbox", { name: "预设名称" })).toHaveValue("评审");
   });
 
   it("applies a preset, names the one a conversation carries, and forgets a deleted one", async () => {
@@ -402,10 +563,69 @@ describe("ConversationSettings", () => {
     const nestedNav = within(dialog).getByRole("navigation", { name: "对话设置分类" });
     expect(within(nestedNav).queryByRole("button", { name: "保存预设" })).toBeNull();
     await user.click(within(nestedNav).getByRole("button", { name: "另存为新预设" }));
+    // Its template was never opened, so the copy takes the built-in's own.
     expect(onSavePresetCopy).toHaveBeenCalledWith(BUILTIN_PRESET_ID, expect.objectContaining({
       enabledTools: seed.globalSettings.conversationPresets[0].settings.enabledTools
-    }));
+    }), null);
     expect(onSavePreset).not.toHaveBeenCalled();
+  });
+
+  it("edits the built-in preset's template in its window and carries the edit into the copy", async () => {
+    const seed = createSeedDocument();
+    seed.globalSettings.conversationPresets.unshift({
+      ...seed.globalSettings.conversationPresets[0],
+      id: BUILTIN_PRESET_ID,
+      name: "mework",
+      templateId: "template_preset_mework"
+    });
+    const prompt: ContextItem = {
+      id: "ctx_builtin_prompt",
+      kind: "system",
+      content: "You are a software engineer.",
+      createdAt: "2026-01-02T03:04:05.000Z"
+    };
+    const onReadTemplate = vi.fn(async (): Promise<ContextItem[]> => [prompt]);
+    const onWriteTemplate = vi.fn(writeSomewhere);
+    const onSavePresetCopy = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+        onReadTemplate={onReadTemplate}
+        onWriteTemplate={onWriteTemplate}
+        onSavePresetCopy={onSavePresetCopy}
+      />
+    );
+
+    await openPage(user, /^对话预设/);
+    await user.click(screen.getByRole("button", { name: "打开预设 mework" }));
+    const dialog = screen.getByRole("dialog", { name: "mework" });
+    const nestedNav = within(dialog).getByRole("navigation", { name: "对话设置分类" });
+    await user.click(within(nestedNav).getByRole("button", { name: /^对话模板/ }));
+    expect(await within(dialog).findByText("You are a software engineer.")).toBeInTheDocument();
+
+    // The page is as editable as any preset's: saving was never going to write it in place.
+    await user.click(within(dialog).getByRole("button", { name: "编辑上下文" }));
+    const field = within(dialog).getByRole("textbox", { name: "系统提示词上下文" });
+    await user.clear(field);
+    await user.type(field, "You review code.");
+    await user.click(within(dialog.querySelector(".inline-text-editor") as HTMLElement).getByRole("button", { name: "保存" }));
+
+    // A trip to another page keeps the edit: there is nowhere it was written to read it back from.
+    await user.click(within(nestedNav).getByRole("button", { name: /^工具/ }));
+    await user.click(within(nestedNav).getByRole("button", { name: /^对话模板/ }));
+    expect((await within(dialog).findAllByText("You review code.")).length).toBeGreaterThan(0);
+    expect(within(dialog).queryByText("You are a software engineer.")).toBeNull();
+    expect(onWriteTemplate).not.toHaveBeenCalled();
+
+    await user.click(within(nestedNav).getByRole("button", { name: "另存为新预设" }));
+    expect(onSavePresetCopy).toHaveBeenCalledWith(BUILTIN_PRESET_ID, expect.anything(), [
+      { ...prompt, content: "You review code." }
+    ]);
   });
 
   it("is a pane, not a dialog, and offers no preset-managed or conversation-only zone", () => {
@@ -426,7 +646,7 @@ describe("ConversationSettings", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.queryByRole("button", { name: "关闭" })).toBeNull();
     // Nor does it name itself or its page, as a window does.
-    expect(document.querySelector(".dialog__sidebar-title, .conversation-settings__page-title")).toBeNull();
+    expect(document.querySelector(".dialog__sidebar-title, .settings-page-heading")).toBeNull();
     // A preset is not conversation state, so no preset-managed or conversation-only sections appear.
     expect(screen.queryByText("由预设管理")).toBeNull();
     expect(screen.queryByText("仅此对话")).toBeNull();
@@ -465,15 +685,20 @@ describe("ConversationSettings", () => {
       />
     );
 
-    // Bulk enable/disable is gone: the heading ends with the documentation link,
-    // which is a bare anchor rather than a control wrapped in a container.
+    // Bulk enable/disable is gone, and so is the heading row over the list: the
+    // documentation link ends the line that says what the page is for, and the
+    // count is the one the rail trails, as every other page's is.
     expect(screen.queryByRole("button", { name: "全部启用" })).toBeNull();
     expect(screen.queryByRole("button", { name: "全部关闭" })).toBeNull();
+    expect(screen.queryByText("启用工具")).toBeNull();
+    expect(screen.queryByText(/个已选/)).toBeNull();
     const docs = screen.getByRole("link", { name: "配置说明文档" });
     expect(docs).toHaveAttribute("href", "https://catblob-hash.github.io/Mework/zh-CN/working.html");
     expect(docs).toHaveAttribute("target", "_blank");
-    expect(docs.parentElement).toHaveClass("settings-section__heading--split");
-    expect(screen.getByText(`1 / ${toolNames.length} 个已选`)).toBeInTheDocument();
+    expect(docs.parentElement).toHaveClass("conversation-settings__page-header-line");
+    expect(docs.previousElementSibling).toHaveTextContent("本对话交给模型的工具。");
+    expect(within(navigation()).getByRole("button", { name: /^工具/ })).toHaveTextContent(/^工具1$/);
+    expect(toolNames.length).toBeGreaterThan(1);
 
     // Toggling a tool must not collapse groups; disclosure state changes only on user action.
     const filesystemGroup = screen.getByRole("button", { name: "文件与搜索" });
@@ -482,7 +707,7 @@ describe("ConversationSettings", () => {
     expect(filesystemGroup).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("keeps the web, memory, app-data and tool-description controls on the features page", async () => {
+  it("keeps the web, memory, app-data and tool-description controls on the advanced tools page", async () => {
     const seed = createSeedDocument();
     const onSettingsChange = vi.fn();
     const onConversationOnlyChange = vi.fn();
@@ -498,12 +723,9 @@ describe("ConversationSettings", () => {
       />
     );
 
-    expect(backendTrigger("搜索提供商")).toBeEnabled();
-    expect(screen.getByRole("combobox", { name: "工具描述" })).toBeInTheDocument();
-    // Executor limits and the web-search heading stay gone; the identically named tool row remains.
-    expect(screen.queryByRole("spinbutton", { name: /搜索次数/ })).toBeNull();
-    // Security policy is configured in the composer, and memory tools derive from the tier switches.
-    expect(screen.queryByText("安全")).toBeNull();
+    // The tools page is the list alone.
+    expect(screen.queryByRole("combobox", { name: "工具描述" })).toBeNull();
+    expect(screen.queryByRole("switch", { name: /全局记忆/ })).toBeNull();
     // Memory tools leave the picker along with the tier switches that derive them.
     // A picker row is a button keyed by `data-tool-name` — its accessible name is
     // "{label}已启用/已关闭" and it carries `aria-pressed`, not the switch role — so
@@ -512,6 +734,19 @@ describe("ConversationSettings", () => {
     // attribute, this goes red instead of the guard quietly becoming a no-op.
     expect(document.querySelector('[data-tool-name="read"]')).not.toBeNull();
     expect(document.querySelector('[data-tool-name="read_global_memory"]')).toBeNull();
+
+    await openPage(user, /^高级工具/);
+    // And the advanced page is everything the list is not, under the same
+    // documentation link.
+    expect(document.querySelector('[data-tool-name="read"]')).toBeNull();
+    expect(screen.getByRole("link", { name: "配置说明文档" }).previousElementSibling)
+      .toHaveTextContent(/由开关派生/);
+    expect(backendTrigger("搜索提供商")).toBeEnabled();
+    expect(screen.getByRole("combobox", { name: "工具描述" })).toBeInTheDocument();
+    // Executor limits and the web-search heading stay gone; the identically named tool row remains.
+    expect(screen.queryByRole("spinbutton", { name: /搜索次数/ })).toBeNull();
+    // Security policy is configured in the composer, and memory tools derive from the tier switches.
+    expect(screen.queryByText("安全")).toBeNull();
     // The credential channels are gone, not merely off by default.
     expect(screen.queryByText("允许联网搜索使用我的登录凭证")).toBeNull();
     expect(screen.queryByText("允许 Agent 使用内置浏览器的 Cookie")).toBeNull();
@@ -543,6 +778,7 @@ describe("ConversationSettings", () => {
         onConversationOnlyChange={onConversationOnlyChange}
       />
     );
+    await openPage(user, /^高级工具/);
 
     const toggle = screen.getByRole("switch", { name: "拼接应用数据目录已关闭" });
     expect(toggle).toHaveAttribute("aria-checked", "false");
@@ -576,6 +812,7 @@ describe("ConversationSettings", () => {
         onConversationOnlyChange={onConversationOnlyChange}
       />
     );
+    await openPage(user, /^高级工具/);
 
     await chooseBackend(user, "搜索提供商", /^Tavily/);
     expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
@@ -603,6 +840,7 @@ describe("ConversationSettings", () => {
         onConversationOnlyChange={onConversationOnlyChange}
       />
     );
+    await openPage(user, /^高级工具/);
 
     await user.click(backendTrigger("搜索提供商"));
     const searchMenu = screen.getByRole("menu", { name: "搜索提供商" });
@@ -611,7 +849,8 @@ describe("ConversationSettings", () => {
     // Clicking the row only opens the step; the versions are the choices.
     await user.click(nativeSearch);
     expect(onConversationOnlyChange).not.toHaveBeenCalled();
-    const versions = within(searchMenu).getByRole("menu", { name: /^原生/ });
+    // The step is a panel of its own beside the menu.
+    const versions = screen.getByRole("menu", { name: /^原生/ });
     // The list is the wire `type` verbatim — the request carries no other name
     // for these, so neither should the menu.
     expect(within(versions).getAllByRole("menuitemradio").map((row) => row.textContent))
@@ -629,7 +868,7 @@ describe("ConversationSettings", () => {
     await user.click(backendTrigger("抓取提供商"));
     const fetchMenu = screen.getByRole("menu", { name: "抓取提供商" });
     await user.click(within(fetchMenu).getByRole("menuitemradio", { name: /^原生/ }));
-    const fetchVersions = within(fetchMenu).getByRole("menu", { name: /^原生/ });
+    const fetchVersions = screen.getByRole("menu", { name: /^原生/ });
     expect(within(fetchVersions).getAllByRole("menuitemradio").map((row) => row.textContent))
       .toEqual(["web_fetch_20250910", "web_fetch_20260209"]);
     await user.click(
@@ -674,6 +913,7 @@ describe("ConversationSettings", () => {
         onConversationOnlyChange={onConversationOnlyChange}
       />
     );
+    await openPage(user, /^高级工具/);
 
     await user.click(backendTrigger("搜索提供商"));
     const menu = screen.getByRole("menu", { name: "搜索提供商" });
@@ -705,12 +945,13 @@ describe("ConversationSettings", () => {
         onConversationOnlyChange={vi.fn()}
       />
     );
+    await openPage(user, /^高级工具/);
 
     // Back on a Messages model, the version it left with is the one it has.
     expect(backendTrigger("搜索提供商")).toHaveTextContent("web_search_20260209");
   });
 
-  it("offers the model's own provider as a fetch backend and pins both backends once they have been used", async () => {    const seed = createSeedDocument();
+  it("offers the model's own provider as a fetch backend and pins both native backends once they have been used", async () => {    const seed = createSeedDocument();
     const defaults = defaultConversationWebSearchSettings();
     const onConversationOnlyChange = vi.fn();
     const user = userEvent.setup();
@@ -725,6 +966,7 @@ describe("ConversationSettings", () => {
         onConversationOnlyChange={onConversationOnlyChange}
       />
     );
+    await openPage(user, /^高级工具/);
 
     /* Drawn whatever the search backend is: fetching and searching are separate
        capabilities, so "the model's own provider" is an answer here too — one
@@ -749,10 +991,16 @@ describe("ConversationSettings", () => {
               skillTool: false,
               mcpToolDiscovery: false,
               webSearch: true,
+              planMode: false,
               skillIds: [],
               promptSkillIds: [],
+              searchBackend: { kind: "native" },
+              fetchBackend: { kind: "native" },
+              webFetch: true,
               searchProvider: { kind: "native" },
-              fetchProvider: { kind: "native" }
+              fetchProvider: { kind: "native" },
+              lastRequest: null,
+              modelRequests: []
             }
           }
         }}
@@ -763,11 +1011,72 @@ describe("ConversationSettings", () => {
         onConversationOnlyChange={vi.fn()}
       />
     );
+    await openPage(user, /^高级工具/);
 
-    // A transcript holds results only the backend that produced them can be
-    // replayed against, so neither selector moves once its tool has gone out.
+    // A native backend seals its results into the transcript, so neither
+    // selector moves once its tool has gone out — whatever model is selected.
     expect(backendTrigger("搜索提供商")).toBeDisabled();
     expect(backendTrigger("抓取提供商")).toBeDisabled();
+    expect(screen.getAllByText(/已经用原生后端跑过了/)).toHaveLength(2);
+  });
+
+  it("draws a host-run backend orange while its cache is warm, and warns once before it moves", async () => {
+    const seed = createSeedDocument();
+    const globalSettings = withWarmModel({
+      ...seed.globalSettings,
+      webSearch: {
+        ...seed.globalSettings.webSearch,
+        providers: seed.globalSettings.webSearch.providers.map((provider) => (
+          provider.kind === "tavily" || provider.kind === "jina" ? { ...provider, enabled: true } : provider
+        ))
+      }
+    });
+    const tavily = { kind: "explicit" as const, providerKind: "tavily" as const };
+    const jina = { kind: "explicit" as const, providerKind: "jina" as const };
+    const webSearch = { ...defaultConversationWebSearchSettings(), provider: tavily, fetchProvider: jina };
+    const onConversationOnlyChange = vi.fn();
+    const user = userEvent.setup();
+    const conversation = seed.workspaces[0].conversations[0];
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: {
+            ...conversation.settings,
+            webSearchEnabled: true,
+            webSearch,
+            toolLock: lockFor(globalSettings, {
+              webSearch: true,
+              searchBackend: tavily,
+              fetchBackend: jina,
+              webFetch: true
+            })
+          }
+        }}
+        globalSettings={globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+        onConversationOnlyChange={onConversationOnlyChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+
+    // Orange, not settled: the choice is still the user's.
+    expect(backendTrigger("搜索提供商")).toBeEnabled();
+    expect(backendTrigger("搜索提供商")).toHaveClass("popover-select__trigger--cache");
+    expect(backendTrigger("抓取提供商")).toHaveClass("popover-select__trigger--cache");
+
+    // Moving it asks first, and nothing moves until the answer.
+    await chooseBackend(user, "搜索提供商", /^不启用/);
+    const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
+    expect(onConversationOnlyChange).not.toHaveBeenCalled();
+    await user.click(within(warning).getByRole("button", { name: "仍然更改" }));
+    expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
+      webSearch: { ...webSearch, provider: { kind: "disabled" } }
+    });
+    // Moved away, it is plain again: the cache is already lost for it.
+    expect(backendTrigger("搜索提供商")).not.toHaveClass("popover-select__trigger--cache");
   });
 
   it("picks one discovered tool-description file rather than editing entries", async () => {
@@ -783,6 +1092,7 @@ describe("ConversationSettings", () => {
         onSettingsChange={onSettingsChange}
       />
     );
+    await openPage(user, /^高级工具/);
 
     const picker = screen.getByRole("combobox", { name: "工具描述" });
     // Sniffed from disk and selected, exactly like skills and MCP: the app
@@ -956,9 +1266,11 @@ describe("ConversationSettings", () => {
     }));
   });
 
-  it("draws a skill a run has already delivered as spent and freezes how skills arrive", async () => {
+  it("draws a skill the warm cache holds orange, and warns once before it goes", async () => {
     const seed = createSeedDocument();
+    seed.globalSettings = withWarmModel(seed.globalSettings);
     const conversation = seed.workspaces[0].conversations[0];
+    const onSettingsChange = vi.fn();
     const user = userEvent.setup();
     render(
       <SettingsHarness
@@ -967,41 +1279,99 @@ describe("ConversationSettings", () => {
           settings: {
             ...conversation.settings,
             skillIds: ["skill_code_review"],
-            toolLock: {
-              tools: [],
-              mcpIds: [],
-              globalMemory: false,
-              projectMemory: false,
-              skillTool: false,
-              mcpToolDiscovery: false,
-              webSearch: false,
+            toolLock: lockFor(seed.globalSettings, {
               skillIds: ["skill_code_review"],
-              promptSkillIds: ["skill_code_review"],
-              searchProvider: null,
-              fetchProvider: null
-            }
+              promptSkillIds: ["skill_code_review"]
+            })
           }
         }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+
+    await openPage(user, /^技能/);
+    // Orange, not spent: the user may still take it off.
+    const row = screen.getByRole("switch", { name: /代码审查/ });
+    expect(row).toBeChecked();
+    expect(row).toBeEnabled();
+    expect(row).toHaveClass("switch--cache");
+    expect(row.closest(".catalog-row")).toHaveClass("catalog-row--cache");
+    expect(row.closest(".catalog-row")).toHaveAttribute(
+      "title", expect.stringContaining("缓存还热")
+    );
+    // How skills arrive rewrites the prompt they went out in, either way.
+    expect(screen.getByRole("switch", { name: "拼进提示词" })).toHaveClass("switch--cache");
+
+    // Taking it off asks first, and nothing moves until the answer.
+    await user.click(row);
+    const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
+    expect(onSettingsChange).not.toHaveBeenCalled();
+    await user.click(within(warning).getByRole("button", { name: "取消" }));
+    expect(onSettingsChange).not.toHaveBeenCalled();
+    expect(screen.getByRole("switch", { name: /代码审查/ })).toBeChecked();
+
+    await user.click(screen.getByRole("switch", { name: /代码审查/ }));
+    await user.click(within(screen.getByRole("dialog", { name: "这样改会让缓存失效" }))
+      .getByRole("button", { name: "仍然更改" }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ skillIds: [] }));
+    // Moved away, it is plain again: the cache is already lost for it.
+    expect(screen.getByRole("switch", { name: /代码审查/ })).not.toHaveClass("switch--cache");
+
+    // Once per conversation: the next orange change goes straight through.
+    await user.click(screen.getByRole("switch", { name: "拼进提示词" }));
+    expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ skillToolEnabled: true }));
+  });
+
+  it("stops warning anywhere once told not to show it again", async () => {
+    const seed = createSeedDocument();
+    seed.globalSettings = withWarmModel(seed.globalSettings);
+    const conversation = seed.workspaces[0].conversations[0];
+    const user = userEvent.setup();
+    const settingsWithLock = {
+      ...conversation.settings,
+      mcpIds: ["mcp_workspace"],
+      toolLock: lockFor(seed.globalSettings, { mcpIds: ["mcp_workspace"] })
+    };
+    const { unmount } = render(
+      <SettingsHarness
+        initialConversation={{ ...conversation, settings: settingsWithLock }}
         globalSettings={seed.globalSettings}
         tools={seed.tools}
         capabilities={seed.capabilities}
         onSettingsChange={vi.fn()}
       />
     );
+    await openPage(user, /^MCP/);
+    await user.click(screen.getByRole("switch", { name: /Workspace Files/ }));
+    const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
+    await user.click(within(warning).getByRole("checkbox", { name: "不再显示" }));
+    await user.click(within(warning).getByRole("button", { name: "仍然更改" }));
+    unmount();
 
-    await openPage(user, /^技能/);
-    // The body is already somewhere in the transcript; unchecking the row would
-    // not take it back.
-    const locked = screen.getByRole("switch", { name: /代码审查/ });
-    expect(locked).toBeChecked();
-    expect(locked).toBeDisabled();
-    // And the route it took is settled too: moving it behind the tool now would
-    // point at a tool the earlier rounds never had.
-    expect(screen.getByRole("switch", { name: "拼进提示词" })).toBeDisabled();
+    // Another conversation, another orange row: no warning.
+    const onSettingsChange = vi.fn();
+    render(
+      <SettingsHarness
+        initialConversation={{ ...conversation, id: "conversation_other", settings: settingsWithLock }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+    await openPage(user, /^MCP/);
+    await user.click(screen.getByRole("switch", { name: /Workspace Files/ }));
+    expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ mcpIds: [] }));
   });
 
-  it("draws an MCP selection a run has already exposed as spent rather than removable", async () => {
+  it("draws an MCP selection the warm cache holds orange rather than spent", async () => {
     const seed = createSeedDocument();
+    seed.globalSettings = withWarmModel(seed.globalSettings);
     const conversation = seed.workspaces[0].conversations[0];
     const user = userEvent.setup();
     render(
@@ -1010,19 +1380,8 @@ describe("ConversationSettings", () => {
           ...conversation,
           settings: {
             ...conversation.settings,
-            toolLock: {
-              tools: [],
-              mcpIds: ["mcp_workspace"],
-              globalMemory: false,
-              projectMemory: false,
-              skillTool: false,
-              mcpToolDiscovery: false,
-              webSearch: false,
-              skillIds: [],
-              promptSkillIds: [],
-              searchProvider: null,
-              fetchProvider: null
-            }
+            mcpIds: ["mcp_workspace"],
+            toolLock: lockFor(seed.globalSettings, { mcpIds: ["mcp_workspace"] })
           }
         }}
         globalSettings={seed.globalSettings}
@@ -1033,13 +1392,61 @@ describe("ConversationSettings", () => {
     );
 
     await openPage(user, /^MCP/);
-    const locked = screen.getByRole("switch", { name: /Workspace Files/ });
-    expect(locked).toBeChecked();
-    expect(locked).toBeDisabled();
-    // The reason it is inert joined the row's tooltip when its second line went away.
-    expect(locked.closest(".catalog-row")).toHaveAttribute(
-      "title", expect.stringContaining("已经交给过模型，本对话里不能再移除")
+    const row = screen.getByRole("switch", { name: /Workspace Files/ });
+    expect(row).toBeChecked();
+    expect(row).toBeEnabled();
+    expect(row).toHaveClass("switch--cache");
+    expect(row.closest(".catalog-row")?.querySelector(".lock-mark--cache")).not.toBeNull();
+    // An entry the last request carried is not deleted out from under it.
+    expect(screen.queryByRole("button", { name: "删除 Workspace Files" })).toBeNull();
+  });
+
+  it("drops the orange once the cache has gone cold, or for another model", async () => {
+    const seed = createSeedDocument();
+    seed.globalSettings = withWarmModel(seed.globalSettings);
+    const conversation = seed.workspaces[0].conversations[0];
+    const user = userEvent.setup();
+    const coldLock = lockFor(
+      seed.globalSettings,
+      { mcpIds: ["mcp_workspace"] },
+      new Date(Date.now() - 31 * 60_000).toISOString()
     );
+    const { unmount } = render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: { ...conversation.settings, mcpIds: ["mcp_workspace"], toolLock: coldLock }
+        }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+    await openPage(user, /^MCP/);
+    expect(screen.getByRole("switch", { name: /Workspace Files/ })).not.toHaveClass("switch--cache");
+    unmount();
+
+    // Warm, but sent by a model other than the one selected now.
+    const other = withSelectedModel(seed.globalSettings, "claude-sonnet-5-5");
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: {
+            ...conversation.settings,
+            mcpIds: ["mcp_workspace"],
+            toolLock: lockFor(seed.globalSettings, { mcpIds: ["mcp_workspace"] })
+          }
+        }}
+        globalSettings={other}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+    await openPage(user, /^MCP/);
+    expect(screen.getByRole("switch", { name: /Workspace Files/ })).not.toHaveClass("switch--cache");
   });
 
   it("offers the skill delivery switch below the list whether or not a skill is selected", async () => {
@@ -1132,8 +1539,8 @@ describe("ConversationSettings", () => {
     );
     expect(onConversationOnlyChange).not.toHaveBeenCalled();
 
-    // Once a run has dialed a server, how its tools arrived is settled: the
-    // transcript carries them announced or declared, and neither can be redone.
+    // Once a request has gone out with it, moving it rewrites the prompt the
+    // cache holds: orange, and still the user's to move.
     unmount();
     render(
       <SettingsHarness
@@ -1142,22 +1549,10 @@ describe("ConversationSettings", () => {
           settings: {
             ...seed.workspaces[0].conversations[0].settings,
             mcpToolDiscoveryEnabled: true,
-            toolLock: {
-              tools: [],
-              mcpIds: ["mcp_workspace"],
-              globalMemory: false,
-              projectMemory: false,
-              skillTool: false,
-              mcpToolDiscovery: true,
-              webSearch: false,
-              skillIds: [],
-              promptSkillIds: [],
-              searchProvider: null,
-              fetchProvider: null
-            }
+            toolLock: lockFor(withWarmModel(seed.globalSettings), { mcpIds: ["mcp_workspace"], mcpToolDiscovery: true })
           }
         }}
-        globalSettings={seed.globalSettings}
+        globalSettings={withWarmModel(seed.globalSettings)}
         tools={seed.tools}
         capabilities={seed.capabilities}
         onSettingsChange={vi.fn()}
@@ -1166,7 +1561,116 @@ describe("ConversationSettings", () => {
     await openPage(user, /^MCP/);
     const settled = screen.getByRole("switch", { name: "按需取回" });
     expect(settled).toBeChecked();
-    expect(settled).toBeDisabled();
+    expect(settled).toBeEnabled();
+    expect(settled).toHaveClass("switch--cache");
+  });
+
+  it("does not offer tool discovery on a model that cannot take a tool mid-conversation", async () => {
+    const seed = createSeedDocument();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...seed.workspaces[0].conversations[0],
+          settings: { ...seed.workspaces[0].conversations[0].settings, mcpToolDiscoveryEnabled: true }
+        }}
+        globalSettings={withFrozenModel(seed.globalSettings)}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+    await openPage(user, /^MCP/);
+    const discovery = screen.getByRole("switch", { name: "按需取回" });
+    expect(discovery).toBeDisabled();
+    expect(discovery).not.toBeChecked();
+    expect(screen.getByText(/当前模型不支持中途追加工具/)).toBeInTheDocument();
+  });
+
+  it("freezes the whole tool surface gray on a model that cannot append tools, and leaves skills free", async () => {
+    const seed = createSeedDocument();
+    const frozen = withFrozenModel(seed.globalSettings);
+    const conversation = seed.workspaces[0].conversations[0];
+    const onSettingsChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: {
+            ...conversation.settings,
+            enabledTools: ["read"],
+            skillIds: [],
+            // Long cold: the freeze is the protocol's, not the cache's.
+            toolLock: lockFor(frozen, { tools: ["read"] }, new Date(Date.now() - 3 * 3_600_000).toISOString())
+          }
+        }}
+        globalSettings={frozen}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+
+    // In place, not folded away: on and off rows alike, each with its lock.
+    const read = document.querySelector<HTMLButtonElement>('[data-tool-name="read"]')!;
+    const write = document.querySelector<HTMLButtonElement>('[data-tool-name="write"]')!;
+    for (const row of [read, write]) {
+      expect(row).toBeDisabled();
+      expect(row).toHaveAttribute("data-lock-tone", "hard");
+      expect(row.querySelector(".lock-mark--hard")).not.toBeNull();
+    }
+    expect(read).toHaveAttribute("aria-pressed", "true");
+    expect(write).toHaveAttribute("aria-pressed", "false");
+    // The switches on the advanced page freeze with the list.
+    await openPage(user, /^高级工具/);
+    expect(screen.getByRole("switch", { name: /^联网搜索已/ })).toBeDisabled();
+    // Plan mode is the composer's switch, not a row here.
+    expect(screen.queryByRole("switch", { name: /^计划模式已/ })).toBeNull();
+    expect(screen.queryByText("已生效的工具")).toBeNull();
+
+    // Skills are not tools: a frozen surface still takes one.
+    await openPage(user, /^技能/);
+    await user.click(screen.getByRole("switch", { name: /代码审查/ }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ skillIds: ["skill_code_review"] }));
+  });
+
+  it("draws the tools the warm cache holds orange where they stand", async () => {
+    const seed = createSeedDocument();
+    seed.globalSettings = withWarmModel(seed.globalSettings);
+    const conversation = seed.workspaces[0].conversations[0];
+    const onSettingsChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: {
+            ...conversation.settings,
+            enabledTools: ["read"],
+            toolLock: lockFor(seed.globalSettings, { tools: ["read"] })
+          }
+        }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+
+    const read = document.querySelector<HTMLButtonElement>('[data-tool-name="read"]')!;
+    expect(read).toBeEnabled();
+    expect(read).toHaveAttribute("data-lock-tone", "cache");
+    // Adding a tool appends it at the end, so nothing cached is at stake.
+    const write = document.querySelector<HTMLButtonElement>('[data-tool-name="write"]')!;
+    expect(write).not.toHaveAttribute("data-lock-tone");
+    await user.click(write);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ enabledTools: ["read", "write"] }));
+
+    await user.click(document.querySelector<HTMLButtonElement>('[data-tool-name="read"]')!);
+    expect(screen.getByRole("dialog", { name: "这样改会让缓存失效" })).toBeInTheDocument();
   });
 
   it("ends every capability page with its own documentation link and nothing else", async () => {
@@ -1586,6 +2090,45 @@ describe("ConversationSettings", () => {
     expect(within(row).queryByRole("button", { name: /^删除/ })).not.toBeInTheDocument();
   });
 
+  it("lets the built-in Mework SDK skill be selected but never deleted", async () => {
+    const user = userEvent.setup();
+    const seed = createSeedDocument();
+    // The host lists the compiled-in skill first, as it does the built-in profile.
+    seed.capabilities.skills.unshift({
+      id: "skill_builtin_mework_sdk",
+      name: "Mework SDK",
+      description: "内置，随 Mework 版本更新：指导模型配置 Mework 自身",
+      location: "builtin:skills/mework-sdk/SKILL.md",
+      source: "builtin",
+      available: true
+    });
+    const onSettingsChange = vi.fn();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+        onDeleteCapability={vi.fn()}
+      />
+    );
+
+    await openPage(user, /^技能/);
+    const row = screen.getByText("Mework SDK").closest(".catalog-row") as HTMLElement;
+    expect(within(row).queryByRole("button", { name: /^删除/ })).not.toBeInTheDocument();
+    // A skill of the user's beside it keeps its delete button.
+    const own = screen.getByText("代码审查").closest(".catalog-row") as HTMLElement;
+    expect(within(own).getByRole("button", { name: "删除 代码审查" })).toBeInTheDocument();
+
+    const toggle = screen.getByRole("switch", { name: /Mework SDK/ });
+    expect(toggle).not.toBeChecked();
+    await user.click(toggle);
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      skillIds: expect.arrayContaining(["skill_builtin_mework_sdk", "skill_code_review"])
+    }));
+  });
+
   it("opens a preset into the whole pane in preset mode and saves it back", async () => {
     const user = userEvent.setup();
     const seed = createSeedDocument();
@@ -1606,20 +2149,39 @@ describe("ConversationSettings", () => {
 
     const dialog = screen.getByRole("dialog", { name: "默认" });
     const nestedNav = within(dialog).getByRole("navigation", { name: "对话设置分类" });
-    // A window has no title bar: its name heads the page list, and the page names itself.
+    // A window takes the global settings' layout: its name heads the page list.
+    // The rail names the page, so the page carries its description and no
+    // title, as it does in the side pane.
+    expect(dialog.querySelector(".settings-layout > .settings-nav")).toBe(nestedNav);
     expect(within(nestedNav).getByRole("heading", { level: 2, name: "默认" })).toBeInTheDocument();
-    expect(within(dialog).getByRole("heading", { level: 3, name: "功能" })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("heading", { level: 3 })).toBeNull();
+    const heading = dialog.querySelector(".settings-page-heading");
+    expect(heading).toHaveTextContent(/交给模型的工具/);
+    // The documentation link ends the description's line, as in the side pane.
+    expect(within(dialog).getByRole("link", { name: "配置说明文档" }).parentElement).toBe(heading);
+    expect(within(dialog).queryByText("启用工具")).toBeNull();
     // A preset body describes a reusable copy, so the one page about a live
     // conversation — its own presets — is withheld, the page only a preset has
-    // appears, and the footer saves in place rather than saving a copy.
+    // appears, and the rail's foot saves in place rather than saving a copy.
     expect(within(nestedNav).getAllByRole("button")
       .map((button) => (button.textContent ?? "").replace(/\d+$/, "")))
-      .toEqual(["功能", "沙箱", "技能", "MCP", "钩子", "代理角色", "对话模板", "保存预设"]);
+      .toEqual(["工具", "高级工具", "技能", "MCP", "钩子", "代理角色", "对话模板", "保存预设"]);
     expect(within(nestedNav).queryByRole("button", { name: /对话预设/ })).toBeNull();
     // Conversation-only, so a preset has no room to carry it.
+    await user.click(within(nestedNav).getByRole("button", { name: /^高级工具/ }));
+    expect(within(dialog).getByRole("switch", { name: /^联网搜索已/ })).toBeInTheDocument();
+    // Plan mode is not part of a preset.
+    expect(within(dialog).queryByRole("switch", { name: /^计划模式已/ })).toBeNull();
+    expect(within(dialog).getByRole("link", { name: "配置说明文档" }).parentElement)
+      .toBe(dialog.querySelector(".settings-page-heading"));
     expect(within(dialog).queryByRole("switch", { name: /拼接应用数据目录/ })).toBeNull();
 
-    await user.click(within(nestedNav).getByRole("button", { name: "保存预设" }));
+    // Saving belongs to the window rather than to a page, so it is the rail's
+    // last thing, as it is in the side pane.
+    const save = within(nestedNav).getByRole("button", { name: "保存预设" });
+    expect(save.parentElement).toBe(nestedNav.lastElementChild);
+    expect(save.parentElement).toHaveClass("settings-nav__footer");
+    await user.click(save);
     expect(onSavePreset).toHaveBeenCalledWith("conversation_default", expect.objectContaining({
       enabledTools: expect.any(Array),
       skillIds: expect.any(Array),
@@ -1693,8 +2255,9 @@ describe("ConversationSettings", () => {
     expect(onBindPresetTemplate).not.toHaveBeenCalled();
   });
 
-  it("never disables a field on account of a preset", () => {
+  it("never disables a field on account of a preset", async () => {
     const seed = createSeedDocument();
+    const user = userEvent.setup();
     render(
       <SettingsHarness
         initialConversation={{
@@ -1708,6 +2271,7 @@ describe("ConversationSettings", () => {
         onSettingsChange={vi.fn()}
       />
     );
+    await openPage(user, /^高级工具/);
 
     // A preset trace names where the values came from; it grants nobody authority
     // over the conversation, so every field stays editable.

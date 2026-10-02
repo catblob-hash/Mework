@@ -1,6 +1,7 @@
 //! Runs the real model. Skipped unless `MEWORK_LOCAL_MODEL_GGUF` names the
 //! converted GGUF; `MEWORK_LOCAL_MODEL_DIR` must then name the release
-//! directory (for `tokenizer.json`).
+//! directory (for `tokenizer.json`), and `MEWORK_LLAMA_RUNTIME_DIR` the
+//! unpacked llama.cpp release build.
 //!
 //! `testdata/llama-greedy.json` holds transformers' greedy continuations
 //! (float32, the official checkpoint) of two prompts that share a ~290-token
@@ -118,7 +119,7 @@ fn generate(
         }
     };
     for (i, (slot, tokens)) in requests.iter().enumerate() {
-        let logits = backend.admit(*slot, prefix, tokens).unwrap();
+        let logits = backend.admit_tokens(*slot, prefix, tokens).unwrap();
         assert!(backend.context.as_ref().unwrap().seq_pos_max(*slot as i32) >= 0);
         accept(backend, &mut out[i], &mut live[i], *slot, &logits);
     }
@@ -226,7 +227,7 @@ fn exercise(label: &str, options: LlamaOptions) {
         .iter()
         .map(|request| {
             let start = Instant::now();
-            backend.admit(0, &prefix, request).unwrap();
+            backend.admit_tokens(0, &prefix, request).unwrap();
             backend.release(0);
             ms(start)
         })
@@ -270,7 +271,7 @@ fn exercise(label: &str, options: LlamaOptions) {
     }
 
     // A prefix computed while a request runs leaves that request alone.
-    let mut tokens = vec![greedy(&backend.admit(0, &prefix, &fixture.requests[0]).unwrap(), specials)];
+    let mut tokens = vec![greedy(&backend.admit_tokens(0, &prefix, &fixture.requests[0]).unwrap(), specials)];
     while tokens.len() < alone[0].tokens.len() {
         if tokens.len() == 3 {
             let again = backend.prefix_state(&fixture.prefix).unwrap();
@@ -289,7 +290,7 @@ fn exercise(label: &str, options: LlamaOptions) {
         let first: Vec<u32> = requests
             .iter()
             .enumerate()
-            .map(|(slot, request)| greedy(&backend.admit(slot, &prefix, request).unwrap(), specials))
+            .map(|(slot, request)| greedy(&backend.admit_tokens(slot, &prefix, request).unwrap(), specials))
             .collect();
         const STEPS: usize = 16;
         for live in [1usize, 2, 4] {
@@ -321,7 +322,7 @@ fn exercise(label: &str, options: LlamaOptions) {
     assert!(backend.context.is_none(), "trim kept the context");
     let after = rss_mib();
     eprintln!("[{label}] RSS before/after trim: {before:?} / {after:?} MiB");
-    let logits = backend.admit(0, &prefix, &fixture.requests[0]).unwrap();
+    let logits = backend.admit_tokens(0, &prefix, &fixture.requests[0]).unwrap();
     assert_eq!(greedy(&logits, specials), alone[0].tokens[0], "admit after trim");
     // A live slot keeps the context through trim.
     backend.trim();
@@ -332,11 +333,11 @@ fn exercise(label: &str, options: LlamaOptions) {
     eprintln!("[{label}] peak RSS {:?} MiB", peak_rss_mib());
 }
 
-/// Options for the model tests; `llama-dynamic` builds find their backend
-/// modules in `MEWORK_LLAMA_BACKEND_DIR` (the sys crate's `OUT_DIR/backends`).
+/// Options for the model tests: the release build unpacked in
+/// `MEWORK_LLAMA_RUNTIME_DIR` (`runtime::install`).
 fn options() -> LlamaOptions {
     LlamaOptions {
-        backend_dir: std::env::var_os("MEWORK_LLAMA_BACKEND_DIR").map(PathBuf::from),
+        runtime_dir: std::env::var_os("MEWORK_LLAMA_RUNTIME_DIR").map(PathBuf::from),
         ..LlamaOptions::default()
     }
 }
@@ -349,6 +350,68 @@ fn cpu() {
 #[test]
 fn gpu() {
     exercise("gpu", options());
+}
+
+/// The golden image request (`testdata/vision-golden.json`) through `mtmd`,
+/// beside a text request in another slot, against transformers' greedy
+/// reply. Needs `MEWORK_LOCAL_MODEL_MMPROJ` (the projector,
+/// `gguf::convert_qwen35_mmproj_to_gguf`) besides the variables above.
+fn reads_images(label: &str, options: LlamaOptions) {
+    let Some(fixture) = fixture() else { return };
+    let Some(mmproj) = std::env::var_os("MEWORK_LOCAL_MODEL_MMPROJ").map(PathBuf::from) else {
+        eprintln!("跳过：未设置 MEWORK_LOCAL_MODEL_MMPROJ（视觉投影）");
+        return;
+    };
+    let dir = PathBuf::from(std::env::var_os("MEWORK_LOCAL_MODEL_DIR").unwrap());
+    let tokenizer = Tokenizer::from_file(&dir.join("tokenizer.json")).unwrap();
+    let golden = crate::vision::tests::golden_request(&tokenizer);
+    let margins: Vec<f64> = serde_json::from_value(crate::vision::tests::golden_json()["margins"].clone()).unwrap();
+    let specials = &fixture.specials;
+    let options = LlamaOptions { projector: Some(mmproj), ..options };
+    let mut backend = LlamaBackend::load(&fixture.gguf, options).unwrap();
+    let prefix = backend.prefix_state(&golden.prefix).unwrap();
+    let text = &fixture.requests[0];
+
+    let start = Instant::now();
+    let mut image = vec![greedy(&backend.admit(1, &prefix, &golden.input).unwrap(), specials)];
+    eprintln!("[{label}] image admit (projector load included) {:.0} ms", ms(start));
+    // The text after the image continued at the shifted rotary position
+    // (transformers' `rope_deltas` is negative after an image).
+    let delta = crate::vision::tests::golden_json()["rope_delta"].as_i64().unwrap();
+    let sequence = golden.prefix.len() + golden.input.iter().map(|segment| segment.len(32)).sum::<usize>();
+    assert_eq!(backend.next_position[1], Some((sequence as i64 + delta) as usize));
+    let mut other = greedy(&backend.admit_tokens(0, &prefix, text).unwrap(), specials);
+    while image.len() < golden.expected.len() {
+        let all = backend.step(&[(0, other), (1, *image.last().unwrap())]).unwrap();
+        other = greedy(&all[0], specials);
+        image.push(greedy(&all[1], specials));
+    }
+    eprintln!("[{label}] image -> {:?}", tokenizer.decode(&image));
+    match divergence(&image, &golden.expected) {
+        None => eprintln!("[{label}] image: matches transformers ({} tokens)", image.len()),
+        Some(k) => {
+            assert!(margins[k] < 0.5, "image: differs from transformers at token {k} (its margin {})", margins[k]);
+            eprintln!("[{label}] image: matches transformers up to token {k}, a near tie ({:.3})", margins[k]);
+        }
+    }
+    // A second image reuses the loaded projector.
+    backend.release(1);
+    let start = Instant::now();
+    let again = greedy(&backend.admit(1, &prefix, &golden.input).unwrap(), specials);
+    eprintln!("[{label}] image admit again {:.0} ms", ms(start));
+    assert_eq!(again, image[0]);
+    backend.release(0);
+    backend.release(1);
+}
+
+#[test]
+fn cpu_images() {
+    reads_images("cpu", LlamaOptions { cpu_only: true, ..options() });
+}
+
+#[test]
+fn gpu_images() {
+    reads_images("gpu", options());
 }
 
 /// Qwen3.5-0.8B's shape, as `Shape::read` finds it in the GGUF.
@@ -437,10 +500,10 @@ fn rejects_mismatched_prefix_and_bad_slots() {
     let mut backend =
         LlamaBackend::load(&fixture.gguf, LlamaOptions { cpu_only: true, max_slots: 2, ..options() }).unwrap();
     let mut prefix = backend.prefix_state(&fixture.prefix[..8]).unwrap();
-    assert!(backend.admit(2, &prefix, &fixture.requests[0]).is_err());
+    assert!(backend.admit_tokens(2, &prefix, &fixture.requests[0]).is_err());
     assert!(backend.step(&[(0, 1)]).is_err(), "step on a slot that was never admitted");
     prefix.format.push('x');
-    assert!(backend.admit(0, &prefix, &fixture.requests[0]).is_err());
+    assert!(backend.admit_tokens(0, &prefix, &fixture.requests[0]).is_err());
     let too_long = vec![fixture.requests[0][0]; backend.capacity().context + 1];
     assert!(backend.prefix_state(&too_long).is_err());
 }

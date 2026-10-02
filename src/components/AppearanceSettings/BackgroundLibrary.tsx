@@ -24,7 +24,7 @@ const THUMBNAIL_HEIGHT = 270;
  * An imported picture's thumbnail: its data URL, `null` while it loads, or `false`
  * when its files can no longer be read.
  */
-export function useImportedThumbnail(imageId: string): string | null | false {
+function useImportedThumbnail(imageId: string): string | null | false {
   const libraryGeneration = useBackgroundLibraryGeneration();
   const [thumbnail, setThumbnail] = useState<{ id: string; dataUrl: string | false } | null>(null);
   useEffect(() => {

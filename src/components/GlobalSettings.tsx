@@ -7,6 +7,7 @@ import type {
 } from "../types";
 import { ApiProviderSettings } from "./ProviderSettings";
 import { GlobalSettingsNavigation } from "./GlobalSettingsNavigation";
+import { SettingsLayout } from "./SettingsLayout";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { DependencySettings } from "./DependencySettings";
 import { ShortcutSettings } from "./ShortcutSettings";
@@ -59,36 +60,36 @@ export function GlobalSettings({
   };
 
   return (
-    <section className="global-settings-layout" aria-label={t("全局设置", "Global settings")}>
-        <GlobalSettingsNavigation view={view} onSelect={selectView} />
-        <div className="global-settings-content">
-          {view === "appearance" && <AppearanceSettings settings={settings} onChange={onChange} />}
-          {view === "providers" && <ApiProviderSettings settings={settings} onChange={onChange} onFlush={onFlush} />}
-          {view === "search_providers" && (
-            <WebSearchSettings
-              settings={settings.webSearch}
-              onFlush={onFlush}
-              onChange={(change) => onChange((current) => ({
-                ...current,
-                webSearch: typeof change === "function" ? change(current.webSearch) : change
-              }))}
-            />
-          )}
-          {view === "shortcuts" && (
-            <ShortcutSettings
-              shortcuts={settings.shortcuts}
-              onChange={(shortcuts) => onChange((current) => ({ ...current, shortcuts }))}
-            />
-          )}
-          {view === "usage" && <UsageSettings document={document} />}
-          {view === "dependencies" && (
-            <DependencySettings
-              tools={settings.environmentTools}
-              onChange={(environmentTools) => onChange((current) => ({ ...current, environmentTools }))}
-            />
-          )}
-          {view === "updates" && <UpdateSettings />}
-        </div>
-    </section>
+    <SettingsLayout
+      label={t("全局设置", "Global settings")}
+      navigation={<GlobalSettingsNavigation view={view} onSelect={selectView} />}
+    >
+      {view === "appearance" && <AppearanceSettings settings={settings} onChange={onChange} />}
+      {view === "providers" && <ApiProviderSettings settings={settings} onChange={onChange} onFlush={onFlush} />}
+      {view === "search_providers" && (
+        <WebSearchSettings
+          settings={settings.webSearch}
+          onFlush={onFlush}
+          onChange={(change) => onChange((current) => ({
+            ...current,
+            webSearch: typeof change === "function" ? change(current.webSearch) : change
+          }))}
+        />
+      )}
+      {view === "shortcuts" && (
+        <ShortcutSettings
+          shortcuts={settings.shortcuts}
+          onChange={(shortcuts) => onChange((current) => ({ ...current, shortcuts }))}
+        />
+      )}
+      {view === "usage" && <UsageSettings document={document} />}
+      {view === "dependencies" && (
+        <DependencySettings
+          tools={settings.environmentTools}
+          onChange={(environmentTools) => onChange((current) => ({ ...current, environmentTools }))}
+        />
+      )}
+      {view === "updates" && <UpdateSettings />}
+    </SettingsLayout>
   );
 }

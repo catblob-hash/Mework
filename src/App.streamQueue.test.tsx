@@ -138,6 +138,7 @@ describe("App model run flow — streamQueue", () => {
     expect(streamingArticle).toHaveClass("context-card--assistant");
     expect(streamingArticle.querySelector(".context-card__header")).toBeNull();
     expect(streamingArticle.querySelector(".context-card__footer-actions")).toBeInTheDocument();
+    expect(within(streamingArticle).getByRole("button", { name: "复制模型回复" })).toBeDisabled();
     expect(within(streamingArticle).getByRole("button", { name: "编辑上下文" })).toBeDisabled();
     expect(within(streamingArticle).getByRole("button", { name: "删除上下文" })).toBeDisabled();
     expect(streamingArticle.querySelector(".streaming-cursor")).not.toBeInTheDocument();

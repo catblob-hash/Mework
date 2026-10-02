@@ -1,26 +1,46 @@
-//! Plan mode: the security level in which the model may read and think but not
-//! change anything, and the host-initiated switch out of it.
+//! Plan mode: a switch under the composer that asks the model to research,
+//! write a plan and get it approved before it changes anything.
 //!
-//! Every other security-level change is the user picking one in the composer,
-//! which arrives through `conversations::update`. This one is different: it is
-//! the host acting on an approval the user gave inside a tool call, in the
-//! middle of a turn. It therefore has to move three things that the renderer
-//! path moves for free — the live cell the running turn reads, the persisted
-//! setting SQLite and the document snapshot agree on, and the renderer's own
-//! view of which level is selected.
+//! Independent of the security level: the level decides what the model's calls
+//! need whether or not a plan is being written. What the switch does:
+//!
+//! - **Guidance, appended.** Each time the switch goes on, the round boundary
+//!   appends the plan-mode system prompt (`system.plan_mode`) at that point of
+//!   the transcript (`system_append.rs`) — never into the system prompt itself,
+//!   which would cost the whole prompt cache. Turned off by hand before a plan
+//!   was approved, it appends `system.plan_mode_exit`; an approved plan needs
+//!   no such note, its tool result says so.
+//! - **Tools, once.** The first time, `plan` and `exit_plan_mode` join the tool
+//!   set (`tool_append.rs`), and they stay: switching plan mode on again never
+//!   appends them a second time.
+//! - **Exit.** Approving a plan turns the switch off — the live cell at once,
+//!   so the turn that asked can go on to implement it, and the persisted
+//!   setting, which the renderer mirrors.
+//! - **The repository is left alone.** `write` and `edit` refuse a target Git
+//!   would count as a change — tracked, or inside a work tree and not ignored,
+//!   a new file included (`git_core::write_changes_repository` here, the
+//!   repository probe in `remote_files.rs` on another machine) — with
+//!   `repository_write_refusal`. The run loop checks before the call meets a
+//!   permission hook or an approval card (`tool_executor::plan_mode_refusal`),
+//!   so the user is never asked about a write that would be refused. Nothing
+//!   else is checked: shell commands are the guidance's to rule, and paths
+//!   outside a repository or ignored by Git stay writable.
+//! - **One way out.** Only `exit_plan_mode` puts the plan to the user. A turn
+//!   that simply ends, ends: nothing reminds the model and nothing is put to
+//!   the user on its behalf.
 
 use std::path::Path;
 
 use crate::{
     api::{failed_tool_execution, ToolCall, ToolExecution},
     model::{
-        ConversationPlan, JsonObject, PlanStatus, ResolvedLanguage, RunModelRequest, SecurityLevel,
-        ToolResult,
+        ContextItem, ConversationPlan, JsonObject, PlanStatus, ResolvedLanguage,
+        RunModelRequest, ToolResult,
     },
     push_events::AppPushEvent,
     security::RiskLevel,
     state::AppState,
-    tool_prompt::{PendingToolPrompt, PromptKind, PromptOwner, ToolPromptDecision},
+    tool_prompt::{PendingToolPrompt, PromptKind, PromptOwner},
 };
 
 pub(crate) const PLAN_TOOL: &str = "plan";
@@ -32,106 +52,101 @@ const MAX_PLAN_CHARS: usize = 200_000;
 /// The card is one line above the composer; the plan itself is in the panel.
 const MAX_PLAN_TITLE_CHARS: usize = 240;
 
+/// The topics of the system prompts plan mode appends (`system_append.rs`):
+/// the guidance as the switch goes on, and the note as it goes off by hand.
+pub(crate) const ENTER_TOPIC: &str = "plan-mode";
+pub(crate) const EXIT_TOPIC: &str = "plan-mode-exit";
+/// The same two as host notices in `box`, where the model or endpoint takes no
+/// system message mid-conversation (`host_append::InstructionCarrier`).
+pub(crate) const ENTER_NOTICE_KIND: &str = "plan_mode";
+pub(crate) const EXIT_NOTICE_KIND: &str = "plan_mode_exit";
+
+/// Which of plan mode's two messages `context` is, in either carrier:
+/// `Some(true)` for the guidance, `Some(false)` for the exit note.
+fn plan_mode_message(context: &ContextItem) -> Option<bool> {
+    match crate::system_append::topic(context) {
+        Some(ENTER_TOPIC) => return Some(true),
+        Some(EXIT_TOPIC) => return Some(false),
+        _ => {}
+    }
+    match crate::wire_history::host_notice_kind(context) {
+        Some(ENTER_NOTICE_KIND) => Some(true),
+        Some(EXIT_NOTICE_KIND) => Some(false),
+        _ => None,
+    }
+}
+
+/// How an approved `exit_plan_mode` result begins. The transcript reads plan
+/// mode as ended at a result that does.
+const APPROVED_RESULT_PREFIX: &str = "User has approved your plan.";
+
+/// What `write` and `edit` answer in plan mode when the target is part of a Git
+/// repository's content: tracked, or inside a work tree and not ignored, a new
+/// file included. Everything else stays writable — a scratch file outside the
+/// repository or under an ignored path, the plan itself — and nothing but these
+/// two tools is checked. Only the run loop asks, before any approval card
+/// (`tool_executor::plan_mode_refusal`), so a call the user replays by hand is
+/// never refused.
+pub(crate) fn repository_write_refusal(path: &str) -> String {
+    format!(
+        "Plan mode is on: {path} is part of a Git repository (tracked, or not ignored), and the repository stays as it is until plan mode ends. Put this change in your plan; once the user approves it through exit_plan_mode, plan mode ends and you can make it. Paths outside the repository or ignored by Git can be written now."
+    )
+}
+
 /// True for the two tools whose availability the host derives from the
-/// security level rather than from any list a user or a role can edit.
+/// plan-mode switch rather than from any list a user or a role can edit.
 pub(crate) fn is_plan_mode_tool_name(name: &str) -> bool {
     matches!(name, PLAN_TOOL | EXIT_PLAN_MODE_TOOL)
 }
 
-/// Which plan tools exist for one step, given the level in force right now.
+/// Which plan tools a step offers.
 ///
-/// Derived per step rather than persisted because the level moves mid-turn: the
-/// call that leaves plan mode must be the last step at which `exit_plan_mode`
-/// is offered, and the next step must offer neither tool.
-///
-/// There is no way in from here. Entering plan mode is the user's choice in the
-/// composer, not something the model can ask for: a model that can propose the
-/// mode can also talk its way into it, and the mode exists to be the user's
-/// brake rather than the model's.
-///
-/// Children get neither of them. Plan mode belongs to the conversation the user
-/// is talking to; a child neither writes that plan nor leaves its parent's mode.
-pub(crate) fn derived_tools(
-    level: SecurityLevel,
-    subagent_depth: usize,
-) -> &'static [&'static str] {
-    if subagent_depth > 0 {
-        return &[];
-    }
-    match level {
-        SecurityLevel::Plan => &[PLAN_TOOL, EXIT_PLAN_MODE_TOOL],
-        SecurityLevel::RequestApproval | SecurityLevel::AllowEdits | SecurityLevel::FullAccess => {
-            &[]
-        }
+/// Both or neither. `plan_tools` is sticky (`RunModelRequest::plan_tools`):
+/// once plan mode has been on, the pair stays on every later step, so the
+/// model can read the plan after approval and switching plan mode on again
+/// appends nothing. Children get neither. The plan belongs to the
+/// conversation the user is talking to; a child neither writes it nor asks for
+/// its approval.
+pub(crate) fn derived_tools(plan_tools: bool, subagent_depth: usize) -> &'static [&'static str] {
+    if plan_tools && subagent_depth == 0 {
+        &[PLAN_TOOL, EXIT_PLAN_MODE_TOOL]
+    } else {
+        &[]
     }
 }
 
-/// Moves a conversation to `level` on the host's initiative.
-///
-/// Persistence comes first and the live cell moves only once both stores hold
-/// the new level: a write that fails leaves the turn where it was, and the tool
-/// result says so, rather than running the rest of the turn under a level the
-/// next run will not start in. The read-modify-write runs under the same
-/// `storage_lock` the command layer holds, so a renderer commit cannot
-/// interleave with it.
-pub(crate) fn host_set_security_level(
-    state: &AppState,
-    app_data_path: &str,
-    conversation_id: &str,
-    level: SecurityLevel,
-) -> Result<(), String> {
-    if app_data_path.trim().is_empty() {
-        return Err(
-            "This run has no application data directory, so it cannot change the security level"
-                .into(),
-        );
-    }
-    let anchor = Path::new(app_data_path).join("document.v1.json");
-    let guard = state
-        .storage_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let store = crate::conversations::store(&anchor)?;
-    let workspaces = store.conversation_workspaces()?;
-    let workspace_id = workspaces
-        .get(conversation_id)
-        .ok_or_else(|| format!("Conversation {conversation_id} is not in the conversation store"))?
-        .clone();
-    let mut conversation = store.conversation(conversation_id)?.ok_or_else(|| {
-        format!("Conversation {conversation_id} is not in the conversation store")
-    })?;
-    conversation.settings.security_level = level;
-    // Metadata only: a run owns the timeline rows while this is called, and
-    // rewriting them from this snapshot would drop whatever it persisted since.
-    store.put_conversation_metadata(&workspace_id, &conversation)?;
-    let stored = store.conversation(conversation_id)?.ok_or_else(|| {
-        format!("Conversation {conversation_id} could not be read back after the write")
-    })?;
-    crate::conversations::sync_snapshot(
-        state,
-        &anchor,
-        &workspace_id,
-        conversation_id,
-        Some(stored.clone()),
-    )?;
-    if let Some(live) = state.live_security_level(conversation_id) {
-        live.set(level);
-    }
-    drop(guard);
+/// Whether the transcript has offered the pair before: it holds the plan-mode
+/// guidance, or a call to either tool.
+pub(crate) fn transcript_offered_tools(contexts: &[ContextItem]) -> bool {
+    contexts.iter().any(|context| {
+        matches!(context, ContextItem::Tool { tool_name, .. } if is_plan_mode_tool_name(tool_name))
+            || plan_mode_message(context) == Some(true)
+    })
+}
 
-    state
-        .push_events
-        .publish(AppPushEvent::ConversationSecurityLevelChanged {
-            conversation_id: conversation_id.to_owned(),
-            security_level: level,
-        });
-    // The navigation callbacks enforcing browser admission run on the WebView's
-    // own thread and read a cached level. Best effort: the next preview call
-    // pushes it again, so a conversation with no browser session is not an error.
-    if let Ok(session_id) = crate::browser::preview_page_session_id(conversation_id) {
-        state.browser.set_session_security_level(&session_id, level);
+/// Whether the model was last told it is in plan mode, reading the transcript
+/// back from its end: the appended guidance says it is, the exit note or an
+/// approved plan says it is not, and a transcript with none of them never was.
+pub(crate) fn transcript_in_plan_mode<'a>(
+    contexts: impl DoubleEndedIterator<Item = &'a ContextItem>,
+) -> bool {
+    for context in contexts.rev() {
+        if let Some(entered) = plan_mode_message(context) {
+            return entered;
+        }
+        if let ContextItem::Tool {
+            tool_name, result, ..
+        } = context
+        {
+            if tool_name == EXIT_PLAN_MODE_TOOL
+                && result.success
+                && result.output.starts_with(APPROVED_RESULT_PREFIX)
+            {
+                return false;
+            }
+        }
     }
-    Ok(())
+    false
 }
 
 /// The conversation database beside this run's application-data root.
@@ -191,10 +206,6 @@ fn text_argument<'a>(input: &'a JsonObject, key: &str) -> Option<&'a str> {
 }
 
 /// Reads or replaces the conversation's plan document.
-///
-/// Writing is gated on plan mode because the document exists to be reviewed
-/// before implementation starts; reading is not, so the approved plan is still
-/// retrievable in the mode the approval moved the conversation into.
 pub(crate) fn run_plan_tool(
     request: &RunModelRequest,
     call: ToolCall,
@@ -213,12 +224,6 @@ pub(crate) fn run_plan_tool(
     };
     match action.as_str() {
         "write" => {
-            if request.effective_security_level() != SecurityLevel::Plan {
-                return failed_tool_execution(
-                    call,
-                    "The plan tool is only available in plan mode.".into(),
-                );
-            }
             let content = text_argument(&call.input, "content")
                 .unwrap_or_default()
                 .trim()
@@ -246,8 +251,8 @@ pub(crate) fn run_plan_tool(
             let plan = ConversationPlan {
                 conversation_id: request.conversation_id.clone(),
                 markdown: content,
-                // A rewrite is a new draft even after a rejection: the user is
-                // being asked again, about different text.
+                // A rewrite is a new draft even after feedback or approval: the
+                // user is being asked again, about different text.
                 status: PlanStatus::Draft,
                 created_at: existing
                     .map(|plan| plan.created_at)
@@ -277,11 +282,14 @@ pub(crate) fn run_plan_tool(
     }
 }
 
-/// Presents the written plan for approval and, on approval, leaves plan mode.
+/// Presents the written plan for approval.
 ///
 /// The call blocks on the card: the model asked a question whose answer decides
-/// what it may do next, so returning before the user answers would leave it
-/// guessing at its own permissions.
+/// whether it starts implementing, so returning before the user answers would
+/// leave it guessing. The card has no refusal: the user either approves or
+/// writes what should change, and after feedback the model revises the plan and
+/// asks again, as many times as it takes. Approval ends plan mode and moves
+/// nothing else — the security level is the user's, and the plan tools stay.
 pub(crate) fn run_exit_plan_mode_tool(
     request: &RunModelRequest,
     call: ToolCall,
@@ -293,10 +301,12 @@ pub(crate) fn run_exit_plan_mode_tool(
             "exit_plan_mode cannot be used in agent contexts".into(),
         );
     }
-    if request.effective_security_level() != SecurityLevel::Plan {
+    // The pair outlives plan mode, so the model can reach for this after the
+    // switch went off; there is nothing to approve then.
+    if !request.plan_mode_active() {
         return failed_tool_execution(
             call,
-            "You are not in plan mode. Only the user can put this conversation into plan mode, from the security-level menu in the composer. If your plan was already approved, continue with implementation.".into(),
+            "Plan mode is off, so there is no plan to ask approval for. The user turns plan mode on from the composer; until then, carry on with the task.".into(),
         );
     }
     let store = match plan_store(&request.app_data_path) {
@@ -313,7 +323,23 @@ pub(crate) fn run_exit_plan_mode_tool(
         }
         Err(error) => return failed_tool_execution(call, error),
     };
+    match review(request, state, &store, plan) {
+        // Success either way: the call did run and produced the answer the
+        // model asked for. A failed result would read as "the tool broke",
+        // not "not yet".
+        Ok(output) => succeeded(call, output),
+        Err(error) => failed_tool_execution(call, error),
+    }
+}
 
+/// Raises the approval card for `plan`, records the answer on the document,
+/// and words it for the model. Approval also ends plan mode.
+fn review(
+    request: &RunModelRequest,
+    state: &AppState,
+    store: &crate::conversation_store::ConversationStore,
+    plan: ConversationPlan,
+) -> Result<String, String> {
     let language = crate::api::approval_card_language(state, &request.app_data_path);
     let english = language == ResolvedLanguage::EnUs;
     let card = PendingToolPrompt {
@@ -330,9 +356,9 @@ pub(crate) fn run_exit_plan_mode_tool(
         summary: plan_title(&plan.markdown),
         risk_level: RiskLevel::Low.label(language).to_owned(),
         reason: if english {
-            "The model has written a plan and is waiting for you to decide whether to implement it"
+            "The model has written a plan and is waiting for your approval or your feedback"
         } else {
-            "模型已写好计划，等待你决定是否开始实施"
+            "模型已写好计划，等待你批准或提意见"
         }
         .to_owned(),
         requester: None,
@@ -340,19 +366,15 @@ pub(crate) fn run_exit_plan_mode_tool(
         source_call_id: None,
         allow_always_offered: false,
         mandatory: true,
+        questions: None,
     };
-    let answer = match ask_plan_card(request, state, card) {
-        Ok(answer) => answer,
-        Err(error) => return failed_tool_execution(call, error),
-    };
+    let answer = ask_plan_card(request, state, card)?;
 
     let now = chrono::Utc::now().to_rfc3339();
     if !answer.decision.allows() {
-        if let Err(error) =
-            store.set_conversation_plan_status(&request.conversation_id, PlanStatus::Rejected, &now)
-        {
-            return failed_tool_execution(call, error);
-        }
+        // Feedback, not a refusal: `Rejected` is the stored word for "changes
+        // requested", and the model is expected to come back with a revision.
+        store.set_conversation_plan_status(&request.conversation_id, PlanStatus::Rejected, &now)?;
         publish_plan(
             state,
             &request.conversation_id,
@@ -362,38 +384,17 @@ pub(crate) fn run_exit_plan_mode_tool(
                 ..plan
             }),
         );
-        // Success: the call did run and produced the answer the model asked
-        // for. A failed result would read as "the tool broke", not "not yet".
         let feedback = answer
             .feedback
-            .unwrap_or_else(|| "(no reason given)".to_owned());
-        return succeeded(
-            call,
-            format!(
-                "The user does not want to proceed with this plan yet and chose to stay in plan mode. The user said:\n{feedback}\n\nRevise the plan with the plan tool, then call exit_plan_mode again."
-            ),
-        );
+            .filter(|feedback| !feedback.trim().is_empty())
+            .unwrap_or_else(|| "(no feedback given)".to_owned());
+        return Ok(format!(
+            "The user has not approved this plan yet and left feedback:\n{feedback}\n\nRevise the plan with the plan tool to address it, then call exit_plan_mode again."
+        ));
     }
 
-    // "Always" is the accept-edits answer and "once" the manual-approval one:
-    // the two buttons on the card are two destinations, not two strengths.
-    let (level, mode) = match answer.decision {
-        ToolPromptDecision::AllowAlways => (SecurityLevel::AllowEdits, "accept edits"),
-        _ => (SecurityLevel::RequestApproval, "manual approval"),
-    };
-    if let Err(error) = host_set_security_level(
-        state,
-        &request.app_data_path,
-        &request.conversation_id,
-        level,
-    ) {
-        return failed_tool_execution(call, error);
-    }
-    if let Err(error) =
-        store.set_conversation_plan_status(&request.conversation_id, PlanStatus::Approved, &now)
-    {
-        return failed_tool_execution(call, error);
-    }
+    store.set_conversation_plan_status(&request.conversation_id, PlanStatus::Approved, &now)?;
+    leave_plan_mode(request, state);
     let markdown = plan.markdown.clone();
     publish_plan(
         state,
@@ -404,12 +405,66 @@ pub(crate) fn run_exit_plan_mode_tool(
             ..plan
         }),
     );
-    succeeded(
-        call,
-        format!(
-            "User has approved your plan. You can now start coding. Start with updating your todo list if applicable.\n\nPermission mode is now {mode}. The plan stays available through the plan tool's read action.\n\n## Approved Plan:\n{markdown}"
-        ),
-    )
+    Ok(format!(
+        "{APPROVED_RESULT_PREFIX} You can now start implementing it.\n\nThe plan stays available through the plan tool's read action.\n\n## Approved Plan:\n{markdown}"
+    ))
+}
+
+/// Ends plan mode once the user approved a plan: the live cell first, so the
+/// next boundary of this very turn — which goes on to implement the plan —
+/// already reads plan mode as off, then the persisted switch, which the
+/// composer mirrors.
+///
+/// A failed write leaves the switch on disk for the user to turn off; the turn
+/// itself already left plan mode, and its transcript says the plan was
+/// approved, so the next boundary appends nothing either way.
+fn leave_plan_mode(request: &RunModelRequest, state: &AppState) {
+    if let Some(cell) = &request.live_plan_mode {
+        cell.set(false);
+    }
+    if let Err(error) =
+        persist_switch_off(state, Path::new(&request.app_data_path), &request.conversation_id)
+    {
+        eprintln!("计划已批准，但计划模式开关未能写回: {error}");
+    }
+}
+
+/// Writes the conversation's plan-mode switch off on the host's initiative and
+/// tells the renderer, the way the host writes a title (`helper_model`).
+fn persist_switch_off(
+    state: &AppState,
+    app_data_path: &Path,
+    conversation_id: &str,
+) -> Result<(), String> {
+    if app_data_path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let anchor = app_data_path.join("document.v1.json");
+    let guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = crate::conversations::store(&anchor)?;
+    let Some(workspace_id) = store.conversation_workspaces()?.get(conversation_id).cloned() else {
+        return Ok(());
+    };
+    let Some(mut conversation) = store.conversation(conversation_id)? else {
+        return Ok(());
+    };
+    if conversation.settings.plan_mode_enabled {
+        conversation.settings.plan_mode_enabled = false;
+        store.put_conversation_metadata(&workspace_id, &conversation)?;
+        let stored = store.conversation(conversation_id)?;
+        crate::conversations::sync_snapshot(state, &anchor, &workspace_id, conversation_id, stored)?;
+    }
+    drop(guard);
+    state
+        .push_events
+        .publish(AppPushEvent::ConversationPlanModeChanged {
+            conversation_id: conversation_id.to_owned(),
+            enabled: false,
+        });
+    Ok(())
 }
 
 /// Raises one plan card and blocks on it.
@@ -440,116 +495,36 @@ fn ask_plan_card(
 mod tests {
     use super::*;
 
-    /// The whole availability rule, level by level. Plan mode is the only level
-    /// with plan tools at all — no other level offers a way in, because entering
-    /// the mode is the user's choice in the composer — and a child agent gets
-    /// neither of them at any level.
+    /// The whole availability rule: the setting offers both tools, never one,
+    /// and a child agent gets neither whatever the setting says.
     #[test]
-    fn only_plan_mode_derives_plan_tools_and_children_derive_none() {
-        for level in SecurityLevel::ALL {
-            let expected: &[&str] = match level {
-                SecurityLevel::Plan => &[PLAN_TOOL, EXIT_PLAN_MODE_TOOL],
-                _ => &[],
-            };
-            assert_eq!(derived_tools(level, 0), expected, "{level:?} at depth 0");
-            assert!(derived_tools(level, 1).is_empty(), "{level:?} at depth 1");
-        }
-        assert!(SecurityLevel::ALL
+    fn the_setting_derives_both_plan_tools_and_children_derive_none() {
+        assert_eq!(derived_tools(true, 0), &[PLAN_TOOL, EXIT_PLAN_MODE_TOOL]);
+        assert!(derived_tools(false, 0).is_empty());
+        assert!(derived_tools(true, 1).is_empty());
+        assert!(derived_tools(true, 0)
             .iter()
-            .flat_map(|level| derived_tools(*level, 0))
             .all(|name| is_plan_mode_tool_name(name)));
     }
 
-    /// The switch has to land in all three places at once: the running turn's
-    /// cell, the database, and the document snapshot the run path reads.
+    /// An archive from when plan mode was a security level keeps its intent:
+    /// the level becomes the strictest one and the plan-mode setting turns on,
+    /// wherever the settings sit.
     #[test]
-    fn a_host_switch_moves_the_live_cell_the_database_and_the_snapshot() {
-        let directory = tempfile::tempdir().unwrap();
-        let app_data = directory.path();
-        let document = crate::catalog::default_document();
-        let anchor = app_data.join("document.v1.json");
-        let state = AppState::default();
-        state
-            .document_store
-            .acquire_process_authority(&anchor)
-            .unwrap();
-        state
-            .document_store
-            .commit(&anchor, document.clone())
-            .unwrap();
-        let store = crate::conversations::store(&anchor).unwrap();
-        let workspace = &document.workspaces[0];
-        let conversation = &workspace.conversations[0];
-        store.put_conversation(&workspace.id, conversation).unwrap();
-
-        let cell = state.live_security_level_for_run(&conversation.id, SecurityLevel::Plan);
-
-        host_set_security_level(
-            &state,
-            &app_data.to_string_lossy(),
-            &conversation.id,
-            SecurityLevel::AllowEdits,
-        )
-        .unwrap();
-
-        assert_eq!(cell.get(), SecurityLevel::AllowEdits);
-        assert_eq!(
-            store
-                .conversation(&conversation.id)
-                .unwrap()
-                .unwrap()
-                .settings
-                .security_level,
-            SecurityLevel::AllowEdits
-        );
-        let snapshot = state.document_store.current_snapshot(&anchor).unwrap();
-        assert_eq!(
-            snapshot.workspaces[0].conversations[0]
-                .settings
-                .security_level,
-            SecurityLevel::AllowEdits
-        );
-    }
-
-    /// Nothing registers a cell outside a run, and the level still has to move:
-    /// the persisted setting is the whole truth when no turn is in flight.
-    #[test]
-    fn a_switch_without_a_running_turn_still_persists() {
-        let directory = tempfile::tempdir().unwrap();
-        let app_data = directory.path();
-        let document = crate::catalog::default_document();
-        let anchor = app_data.join("document.v1.json");
-        let state = AppState::default();
-        state
-            .document_store
-            .acquire_process_authority(&anchor)
-            .unwrap();
-        state
-            .document_store
-            .commit(&anchor, document.clone())
-            .unwrap();
-        let store = crate::conversations::store(&anchor).unwrap();
-        let workspace = &document.workspaces[0];
-        let conversation = &workspace.conversations[0];
-        store.put_conversation(&workspace.id, conversation).unwrap();
-
-        host_set_security_level(
-            &state,
-            &app_data.to_string_lossy(),
-            &conversation.id,
-            SecurityLevel::Plan,
-        )
-        .unwrap();
-
-        assert!(state.live_security_level(&conversation.id).is_none());
-        assert_eq!(
-            store
-                .conversation(&conversation.id)
-                .unwrap()
-                .unwrap()
-                .settings
-                .security_level,
-            SecurityLevel::Plan
-        );
+    fn the_legacy_plan_level_becomes_the_setting() {
+        let mut value = serde_json::json!({
+            "settings": { "securityLevel": "plan", "enabledTools": [] },
+            "presets": [{ "settings": { "securityLevel": "allow_edits" } }],
+            "lastConversationSettings": { "securityLevel": "plan" },
+        });
+        crate::model::migrate_legacy_plan_level(&mut value);
+        assert_eq!(value["settings"]["securityLevel"], "request_approval");
+        assert_eq!(value["settings"]["planModeEnabled"], true);
+        assert_eq!(value["presets"][0]["settings"]["securityLevel"], "allow_edits");
+        assert!(value["presets"][0]["settings"].get("planModeEnabled").is_none());
+        assert_eq!(value["lastConversationSettings"]["planModeEnabled"], true);
+        // A stray old value that skipped the migration still loads.
+        let level: crate::model::SecurityLevel = serde_json::from_str("\"plan\"").unwrap();
+        assert_eq!(level, crate::model::SecurityLevel::RequestApproval);
     }
 }

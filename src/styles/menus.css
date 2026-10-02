@@ -5,14 +5,12 @@
 .context-menu > button:hover:not(:disabled), .context-menu > button:focus-visible, .context-menu__branch > button:hover:not(:disabled), .context-menu__branch > button:focus-visible, .context-menu__submenu > button:hover:not(:disabled), .context-menu__submenu > button:focus-visible { background: var(--hover); outline: 0; }
 .context-menu > button:disabled, .context-menu__branch > button:disabled { color: var(--faint); cursor: not-allowed; }
 /* Choosing a tool is two choices deep, so each step opens beside the one it came
-   from rather than replacing it. Only the last step scrolls: a group's tool list
-   can outrun the viewport, while a panel that holds another panel must not clip
-   it — `overflow-y: auto` alone would make the group list scroll sideways the
-   moment its own submenu opened past its edge. */
-.context-menu__branch { position: relative; }
-.context-menu__submenu { position: absolute; left: 100%; top: -4px; z-index: 1; min-width: 140px; margin-left: 2px; padding: 3px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--color-ffffff-ap98); box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8); }
-.context-menu__submenu--scroll { max-height: min(340px, 60vh); overflow: hidden auto; }
-.context-menu__submenu--flipped { left: auto; right: 100%; margin: 0 2px 0 0; }
+   from rather than replacing it: a panel of its own beside the menu (MenuFlyout.tsx),
+   placed by script. Only the last step scrolls: a group's tool list can outrun the
+   viewport, and a list that scrolls would leave its rows' open submenus behind. */
+.context-menu__submenu { position: fixed; z-index: 1000; min-width: 140px; padding: 3px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--color-ffffff-ap98); box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8); }
+.context-menu__submenu--scroll { max-height: min(340px, 60vh); overflow: hidden scroll; }
+.context-menu__branch > button[aria-expanded="true"] { background: var(--hover); }
 .context-menu > button > svg, .context-menu__branch > button > svg, .context-menu__submenu > button > svg { flex: 0 0 auto; color: var(--faint); }
 .context-menu__more { margin-left: auto; padding-left: 10px; box-sizing: content-box; }
 .context-menu__divider { height: 1px; margin: 3px 2px; background: var(--border); }
@@ -30,59 +28,60 @@
 .popover-menu__list { min-height: 0; max-height: min(420px, calc(100vh - 32px)); display: flex; flex-direction: column; overflow: auto; overscroll-behavior: contain; }
 .popover-menu__section { display: flex; flex-direction: column; }
 .popover-menu__label { padding: 6px 8px 3px; color: var(--faint); font-size: 10px; font-weight: 650; }
-/* A heading that carries a trailing button: the text ellipsizes and the button keeps the row's right edge. */
-.popover-menu__label--action { padding-top: 3px; padding-bottom: 1px; padding-right: 3px; display: flex; align-items: center; gap: 6px; }
-.popover-menu__label--action > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A heading that carries a button: the button sits right against the text, which ellipsizes before it is pushed out. */
+.popover-menu__label--action { padding-top: 3px; padding-bottom: 1px; padding-right: 3px; display: flex; align-items: center; gap: 0; }
+.popover-menu__label--action > span { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .popover-menu__divider { height: 1px; margin: 4px 2px; background: var(--border); }
 .popover-menu__row { display: flex; flex-direction: column; }
+/* Every menu's single-line row is the timeline context menu's row above: 24px,
+   2px 7px, 12px text. Custom menus elsewhere (GitStatusCard, the browser panel's
+   menu, shortcut and provider-list menus, the context ring's auto-compact row)
+   keep to the same height. */
 .popover-menu__item {
-  width: 100%; min-height: 32px; padding: 5px 8px; display: flex; align-items: center; gap: 9px;
-  border-radius: 7px; background: transparent; color: var(--text); text-align: left; font-size: 12.5px;
+  width: 100%; min-height: 24px; padding: 2px 7px; display: flex; align-items: center; gap: 7px;
+  border-radius: 5px; background: transparent; color: var(--text); text-align: left; font-size: 12px;
 }
 .popover-menu__item:hover:not(:disabled), .popover-menu__item:focus-visible { background: var(--hover); outline: 0; }
 .popover-menu__item:disabled { color: var(--faint); cursor: not-allowed; }
 /* A row with a trailing action: the row's own button and the action are siblings, since nested buttons are invalid. */
 .popover-menu__line { display: flex; align-items: center; gap: 2px; }
 .popover-menu__line > .popover-menu__item { flex: 1; min-width: 0; }
-.popover-menu__action { flex: 0 0 auto; width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 6px; background: transparent; color: var(--faint); }
+.popover-menu__action { flex: 0 0 auto; width: 20px; height: 20px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; background: transparent; color: var(--faint); }
 .popover-menu__action:hover, .popover-menu__action:focus-visible { background: var(--hover); color: var(--text); outline: 0; }
-.popover-menu__panel--dense .popover-menu__action { width: 20px; height: 20px; border-radius: 5px; }
 .popover-menu__icon { flex: 0 0 auto; display: inline-flex; color: var(--muted); }
 .popover-menu__item:disabled .popover-menu__icon { color: var(--faint); }
 .popover-menu__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.popover-menu__copy > strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 500; }
+.popover-menu__copy > strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 500; }
 .popover-menu__copy > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 10px; line-height: 1.35; }
 .popover-menu__check { flex: 0 0 auto; color: var(--text); }
 .popover-menu__hint { flex: 0 0 auto; color: var(--faint); font-size: 10px; }
+/* A model whose prompt cache for this conversation is still warm (LockTone.tsx), in the cache tone. */
+.model-cache-mark { flex: 0 0 auto; display: inline-flex; color: var(--warning); }
 .popover-menu__chevron { flex: 0 0 auto; color: var(--faint); transition: transform .18s ease; }
 .popover-menu__chevron--open { transform: rotate(90deg); }
 .popover-menu__submenu { margin: 2px 0 2px 10px; padding-left: 8px; border-left: 1px solid var(--border); display: flex; flex-direction: column; gap: 1px; }
 /* Flyout nesting: the second step opens beside the row it refines rather than
    under it, so the branch that was chosen stays on screen next to its choices.
-   A panel that holds another panel must not clip it, which is why the list
-   stops scrolling here — `overflow: auto` alone would make the outer list
-   scroll sideways the moment a flyout opened past its edge. Only menus with a
-   list short enough to stand without scrolling may ask for this. */
+   The submenu is a panel of its own, beside its menu (MenuFlyout.tsx), placed by
+   script; the list it came from does not scroll, so its rows stay beside their
+   open submenus. Only menus with a list short enough to stand without scrolling
+   may ask for this. */
 .popover-menu__panel--flyout .popover-menu__list { overflow: visible; max-height: none; }
-.popover-menu__row--branch { position: relative; }
-.popover-menu__submenu--flyout { position: absolute; left: 100%; top: -5px; z-index: 1; min-width: 150px; margin: 0 0 0 3px; padding: 5px; border: 1px solid var(--border-strong); border-left: 1px solid var(--border-strong); border-radius: 11px; background: var(--panel); box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8); }
-.popover-menu__submenu--flipped { left: auto; right: 100%; margin: 0 3px 0 0; }
+.popover-menu__flyout { min-width: 150px; }
+/* The row a submenu came from stays lit while the submenu is open, as a menu's trigger does. */
+.popover-menu__row--branch > .popover-menu__item[aria-expanded="true"],
+.popover-menu__row--branch > .popover-menu__line > .popover-menu__item[aria-expanded="true"],
+.context-usage-compact__trigger[aria-expanded="true"] { background: var(--hover); }
 .popover-menu__empty { margin: 0; padding: 9px 8px; color: var(--faint); font-size: 11px; }
 .popover-menu__search { flex: 0 0 auto; min-height: 30px; margin: 4px 2px 2px; padding: 0 7px; display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); color: var(--faint); }
 .popover-menu__panel:not(.popover-menu__panel--flipped) .popover-menu__search { margin: 2px 2px 4px; border-top: 0; border-bottom: 1px solid var(--border); }
 .popover-menu__search input { flex: 1; min-width: 0; height: 28px; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 12px; }
 .popover-menu__search input::placeholder { color: var(--faint); }
-/* Dense: single-line rows without icons or descriptions, sized to their text. */
+/* Dense: the context menu's tighter panel. Its rows are every menu's rows. */
 .popover-menu__panel--dense { padding: 3px; border-radius: 8px; }
-.popover-menu__panel--dense .popover-menu__item { min-height: 24px; padding: 2px 7px; gap: 7px; border-radius: 5px; font-size: 12px; }
-.popover-menu__panel--dense .popover-menu__copy > strong { font-size: 12px; }
 .popover-menu__panel--dense .popover-menu__label { padding: 4px 7px 2px; }
 .popover-menu__panel--dense .popover-menu__divider { margin: 3px 2px; }
 .popover-menu__panel--dense .popover-menu__submenu { margin: 1px 0 1px 8px; padding-left: 7px; gap: 0; }
-/* After the inline dense rule so the flyout's own box wins: a flyout is a panel
-   of its own, not an indented branch of the list it came from. */
-.popover-menu__panel--dense .popover-menu__submenu--flyout { margin: 0 0 0 3px; padding: 3px; top: -3px; border-radius: 8px; }
-.popover-menu__panel--dense .popover-menu__submenu--flyout.popover-menu__submenu--flipped { margin: 0 3px 0 0; }
 
 /* Context-usage panel (ContextUsageMeter.tsx). It uses the
    `.popover-menu__panel` shell but presents a composition table rather than a
@@ -112,6 +111,42 @@
 .context-usage-panel [data-segment="other"] { background: var(--faint); }
 .context-usage-panel [data-segment="free"] { background: var(--border); }
 .context-usage-panel__swatch[data-segment="free"] { box-shadow: inset 0 0 0 1px var(--border-strong); }
+/* The auto-compact threshold, drawn across the bar at its percent of the window. */
+.context-usage-panel__bar { position: relative; }
+.context-usage-panel__threshold { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--text); opacity: .5; pointer-events: none; }
+/* The auto-compact row at the panel's foot and the small panel it opens beside
+   itself, which reads like `PopoverMenu`'s flyouts but holds controls: a
+   switch, then the threshold as a number field above a range. The row bleeds
+   into the panel's padding so its hover fills the width like a menu item. */
+.context-usage-compact { position: relative; margin: -3px -6px -3px; }
+.context-usage-compact__trigger { min-height: 24px; padding: 2px 7px; gap: 7px; font-size: 12px; }
+.context-usage-compact__label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A panel of its own beside the panel it came from (MenuFlyout.tsx), placed by script. */
+.context-usage-compact__flyout {
+  position: fixed; z-index: 1000; width: 236px; padding: 10px 11px 9px;
+  display: flex; flex-direction: column; gap: 9px;
+  border: 1px solid var(--border-strong); border-radius: 11px; background: var(--panel);
+  box-shadow: 0 14px 42px var(--color-000000-ap16), 0 2px 6px var(--color-000000-ap8);
+  font-variant-numeric: tabular-nums; cursor: default;
+}
+.context-usage-compact__switch { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text); font-size: 12px; }
+.context-usage-compact__threshold { display: flex; flex-direction: column; gap: 5px; padding-top: 9px; border-top: 1px solid var(--border); }
+.context-usage-compact__threshold--disabled { opacity: .5; }
+.context-usage-compact__threshold-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11.5px; }
+.context-usage-compact__field { display: inline-flex; align-items: center; gap: 3px; color: var(--faint); font-size: 11px; }
+.context-usage-compact__field input {
+  width: 44px; height: 24px; padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 6px; outline: 0;
+  background: transparent; color: var(--text); font: inherit; font-size: 12px; text-align: right;
+  -moz-appearance: textfield; appearance: textfield;
+}
+.context-usage-compact__field input::-webkit-inner-spin-button,
+.context-usage-compact__field input::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
+.context-usage-compact__field input:focus { border-color: var(--focus); box-shadow: 0 0 0 2px var(--color-5f5f5a-ap12); }
+.context-usage-compact__field input:disabled { color: var(--faint); cursor: not-allowed; }
+.context-usage-compact__slider { width: 100%; margin: 2px 0 0; accent-color: var(--accent); }
+.context-usage-compact__slider:disabled { cursor: not-allowed; }
+.context-usage-compact__scale { display: flex; justify-content: space-between; color: var(--faint); font-size: 10px; }
+.context-usage-compact__hint { margin: 1px 0 0; color: var(--faint); font-size: 10.5px; line-height: 1.4; }
 
 /* Dialog and shared form */
 .modal-backdrop { position: fixed; inset: 0; z-index: 1200; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--color-1e1e1c-ap24); backdrop-filter: blur(2px); animation: fade-in .12s ease-out; }
@@ -126,7 +161,7 @@
 .dialog__header h2 { flex: 1; min-width: 0; margin: 0; font-size: 13px; line-height: 20px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The sentence the header used to carry, now leading the body it describes. */
 .dialog__lede { margin: 0 0 14px; color: var(--muted); font-size: 11px; line-height: 1.45; }
-.dialog__body { flex: 1; min-height: 0; padding: 4px 20px 16px; overflow: auto; }
+.dialog__body { flex: 1; min-height: 0; padding: 4px 20px 16px; overflow: auto scroll; }
 /* For a body that is itself a full page — its own padding, dividers and scroll containers.
    The preferred height lives on the flex basis rather than on the child, so a viewport too
    short for it shrinks the body and the page inside it instead of clipping the page's foot. */
@@ -157,46 +192,45 @@
 .dialog__close { position: absolute; z-index: 1; top: calc((var(--dialog-band) - 32px) / 2); right: 12px; }
 
 .settings-nav:has(> .dialog__sidebar-title) { padding-top: 0; }
-.conversation-settings__nav > .dialog__sidebar-title { padding-inline: 7px; }
 .domain-rules__aside > .dialog__sidebar-title { padding-inline: 18px; }
 .domain-rules__aside:has(> .dialog__sidebar-title) > .domain-rules__nav { padding-top: 0; }
 
 /* Page titles on the band's centre line. */
-.dialog--sidebar :is(.settings-page-heading h3, .conversation-settings__page-title, .domain-rules__title) { line-height: 20px; }
+.dialog--sidebar :is(.settings-page-heading h3, .domain-rules__title) { line-height: 20px; }
 .dialog--sidebar .settings-page { padding-top: calc((var(--dialog-band) - 20px) / 2); }
 .dialog--sidebar .settings-page-heading { padding-right: calc(var(--dialog-close-reach) - 22px); }
 .dialog--sidebar .provider-pane__header { min-height: var(--dialog-band); padding-right: var(--dialog-close-reach); }
 .dialog--sidebar .usage-stats { padding-top: calc((var(--dialog-band) - 32px) / 2); }
 .dialog--sidebar .usage-stats__toolbar { padding-right: calc(var(--dialog-close-reach) - 24px); }
-.dialog--sidebar .conversation-settings__page-header { padding-top: calc((var(--dialog-band) - 20px) / 2); }
-/* Narrowed on both sides rather than padded on one, so the header still centres
-   over the same column as the body beneath it. */
-.dialog--sidebar .conversation-settings__page-header > * {
-  max-width: min(var(--conversation-settings-measure), calc(100% - 2 * (var(--dialog-close-reach) - 24px)));
-}
-.conversation-settings__page-title { margin: 0 auto 3px; font-size: 13px; font-weight: 650; }
 .dialog--sidebar .domain-rules__page { padding-top: calc((var(--dialog-band) - 20px) / 2); }
 .domain-rules__title { margin: 0; padding-right: calc(var(--dialog-close-reach) - 14px); font-size: 13px; font-weight: 650; }
-/* On a narrow window the global settings' sidebar is a strip across the top
+/* On a narrow window a settings window's sidebar is a strip across the top
    (feedback.css). The name leads the strip, the strip is the band, and the page below
    starts under it as before. The strip scrolls sideways, so it ends short of the close
    button rather than padding its far end, and the rule under it moves to the page so it
    still runs the window's full width. */
 @media (max-width: 720px) {
-  .dialog--sidebar .global-settings-layout > .settings-nav {
+  .dialog--sidebar .settings-layout > .settings-nav {
     min-height: var(--dialog-band);
     margin-right: calc(var(--dialog-close-reach) - 4px);
     padding: 6px 9px;
     align-items: center;
     border-bottom: 0;
   }
-  .dialog--sidebar .global-settings-layout > .global-settings-content { border-top: 1px solid var(--border); }
-  .global-settings-layout > .settings-nav > .dialog__sidebar-title { padding-block: 0; }
-  .dialog--sidebar .global-settings-layout .settings-page { padding-top: 21px; }
-  .dialog--sidebar .global-settings-layout .settings-page-heading { padding-right: 0; }
-  .dialog--sidebar .global-settings-layout .provider-pane__header { padding-right: calc(18px + var(--scrollbar-size)); }
-  .dialog--sidebar .global-settings-layout .usage-stats { padding-top: 22px; }
-  .dialog--sidebar .global-settings-layout .usage-stats__toolbar { padding-right: 0; }
+  .dialog--sidebar .settings-layout > .settings-layout__content { border-top: 1px solid var(--border); }
+  /* The rail's foot ends the strip rather than sitting under it, pinned to the strip's end so
+     a long strip does not scroll the save out of reach. */
+  .settings-layout > .settings-nav > .settings-nav__footer {
+    position: sticky; right: 0; flex: 0 0 auto; flex-direction: row; align-items: center;
+    margin: 0 0 0 auto; padding: 0 0 0 9px; border-top: 0; background: var(--color-f6f6f3);
+  }
+  .settings-layout > .settings-nav > .settings-nav__footer > .settings-nav__action { width: auto; }
+  .settings-layout > .settings-nav > .dialog__sidebar-title { padding-block: 0; }
+  .dialog--sidebar .settings-layout .settings-page { padding-top: 21px; }
+  .dialog--sidebar .settings-layout .settings-page-heading { padding-right: 0; }
+  .dialog--sidebar .settings-layout .provider-pane__header { padding-right: calc(18px + var(--scrollbar-size)); }
+  .dialog--sidebar .settings-layout .usage-stats { padding-top: 22px; }
+  .dialog--sidebar .settings-layout .usage-stats__toolbar { padding-right: 0; }
 }
 /* The template editor's body IS a timeline, so a failed save has nowhere to
    report inside it and takes the free space in the footer instead. */
@@ -207,6 +241,9 @@
 .field__label { font-size: 11.5px; font-weight: 600; }
 .field__hint { margin-top: -2px; color: var(--faint); font-size: 9.5px; line-height: 1.4; }
 .field__hint--error { color: var(--danger); }
+/* The lock's note said above a field's standing advice (`lockedFieldHint`). */
+.field__hint .lock-note { display: block; }
+.field__hint .lock-note--cache { color: var(--warning); }
 .input { width: 100%; min-height: 36px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 7px; outline: 0; background: var(--color-ffffff); font-size: 12px; line-height: 1.5; transition: border .12s, box-shadow .12s; }
 .input:hover { border-color: var(--color-c0c0ba); }
 .input:focus { border-color: var(--focus); box-shadow: 0 0 0 2px var(--color-5f5f5a-ap12); }
@@ -222,15 +259,21 @@
 .popover-select__value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .popover-select__note { flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: 10.5px; }
 .popover-select__chevron { flex: 0 0 auto; color: var(--faint); }
+/* A selector the conversation's lock tones (LockTone.tsx): orange while the
+   cache is warm, the choice still moves; gray, it cannot. */
+.popover-select__trigger--cache .popover-select__value { color: var(--warning); }
+.popover-select__trigger--cache { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 40%, transparent); }
 .switch { width: 31px; height: 18px; flex: 0 0 31px; padding: 2px; border-radius: 999px; background: var(--color-c8c8c2); position: relative; transition: background .15s; }
 .switch span { display: block; width: 14px; height: 14px; border-radius: 50%; background: var(--color-ffffff); box-shadow: 0 1px 2px var(--color-000000-ap20); transition: transform .15s; }
 .switch--on { background: var(--color-2d2d2b); }
 .switch--on span { transform: translateX(13px); }
 .switch:disabled { cursor: not-allowed; opacity: .45; }
+/* A switch whose move would throw a warm prompt cache away (LockTone.tsx). */
+.switch--cache { box-shadow: inset 0 0 0 1px var(--warning); }
+.switch--cache.switch--on { background: var(--warning); box-shadow: none; }
 
 .editor-kind { width: fit-content; height: 29px; margin-bottom: 9px; padding: 0 8px; display: inline-flex; align-items: center; gap: 6px; border-radius: 7px; background: var(--subtle); color: var(--muted); font-size: 10.5px; font-weight: 650; }
 .context-text-editor { font-size: 13px; line-height: 1.6; }
 .confirm-copy { margin: 0; color: var(--muted); font-size: 12.5px; }
-.confirm-list { margin: 9px 0 0; padding: 8px 10px; border-radius: 7px; background: var(--subtle); list-style: none; display: flex; flex-wrap: wrap; gap: 4px 6px; }
-.confirm-list li { padding: 2px 7px; border-radius: 99px; background: var(--panel); color: var(--text); font-size: 10.5px; }
+.confirm-check { margin-top: 12px; display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
 .safe-boundary-note { display: flex; align-items: flex-start; gap: 8px; padding: 10px; border-radius: 8px; background: var(--subtle); color: var(--muted); font-size: 10.5px; line-height: 1.45; }

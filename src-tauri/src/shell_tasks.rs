@@ -161,7 +161,37 @@ pub struct ShellTaskSnapshot {
     /// reached this host. So when the agent's own figure arrives it supersedes that span.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// Directory the command started in, on its machine: the conversation's remembered `cd` for a
+    /// local command, the workspace root for one that runs elsewhere. It is what the row is titled
+    /// by. `None` on a row recorded before the host kept it; the workspace root stands in then.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The tool call that ran this command, which is how a summary the helper model writes for
+    /// that call finds its row. `None` for a command no model call ran.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// One-line summary of the command from the local helper model, when shell explanations are
+    /// on and the model has answered. The row shows it in place of the command text.
+    #[serde(default)]
+    pub explanation: Option<String>,
 }
+
+/// Where a command runs and which call ran it — the parts of a row its caller knows and the
+/// registry does not.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShellTaskOrigin<'a> {
+    /// See [`ShellTaskSnapshot::workspace_root`].
+    pub workspace_root: Option<&'a str>,
+    /// See [`ShellTaskSnapshot::cwd`].
+    pub cwd: Option<&'a str>,
+    /// See [`ShellTaskSnapshot::call_id`].
+    pub call_id: Option<&'a str>,
+}
+
+/// Explanations parked for calls whose row has not registered yet. The helper model starts on a
+/// call as the run loop dispatches it and the row registers only once the process has spawned, so
+/// a fast answer can arrive first. Bounded: a call that never spawned leaves its entry behind.
+const MAX_PENDING_EXPLANATIONS: usize = 64;
 
 struct ShellTaskEntry {
     conversation_id: String,
@@ -182,6 +212,12 @@ struct ShellTaskEntry {
     workspace_root: Option<String>,
     /// See [`ShellTaskSnapshot::duration_ms`]. Set once, with the outcome.
     duration_ms: Option<u64>,
+    /// See [`ShellTaskSnapshot::cwd`].
+    cwd: Option<String>,
+    /// See [`ShellTaskSnapshot::call_id`].
+    call_id: Option<String>,
+    /// See [`ShellTaskSnapshot::explanation`].
+    explanation: Option<String>,
     /// Mint order, so finished rows evict oldest-first and sort stably alongside running ones.
     sequence: u64,
     /// Live output and its single watcher. Only one page can be looking at a command at a time,
@@ -248,6 +284,9 @@ impl ShellTaskEntry {
             background: self.background,
             workspace_root: self.workspace_root.clone(),
             duration_ms: self.duration_ms,
+            cwd: self.cwd.clone(),
+            call_id: self.call_id.clone(),
+            explanation: self.explanation.clone(),
         }
     }
 
@@ -267,6 +306,9 @@ struct Registry {
     /// would let the deletion of all history hand the next command an address that a timeline or
     /// an open output pane still refers to, so it is persisted in its own right.
     minted: u64,
+    /// Explanations that arrived before their row, keyed by conversation and call, oldest first.
+    /// See [`MAX_PENDING_EXPLANATIONS`].
+    pending_explanations: VecDeque<(String, String, String)>,
 }
 
 impl Registry {
@@ -275,6 +317,31 @@ impl Registry {
     fn mint_sequence(&mut self) -> u64 {
         self.minted = self.minted.saturating_add(1);
         self.minted
+    }
+
+    fn park_explanation(&mut self, conversation_id: &str, call_id: &str, text: &str) {
+        self.pending_explanations
+            .retain(|(conversation, call, _)| conversation != conversation_id || call != call_id);
+        while self.pending_explanations.len() >= MAX_PENDING_EXPLANATIONS {
+            self.pending_explanations.pop_front();
+        }
+        self.pending_explanations.push_back((
+            conversation_id.to_owned(),
+            call_id.to_owned(),
+            text.to_owned(),
+        ));
+    }
+
+    fn take_pending_explanation(&mut self, conversation_id: &str, call_id: &str) -> Option<String> {
+        let position = self
+            .pending_explanations
+            .iter()
+            .position(|(conversation, call, _)| {
+                conversation == conversation_id && call == call_id
+            })?;
+        self.pending_explanations
+            .remove(position)
+            .map(|(_, _, text)| text)
     }
 
     fn persist(&mut self) -> Result<(), String> {
@@ -479,6 +546,9 @@ impl ShellTaskRegistry {
                     background: snapshot.background,
                     workspace_root: snapshot.workspace_root,
                     duration_ms: snapshot.duration_ms,
+                    cwd: snapshot.cwd,
+                    call_id: snapshot.call_id,
+                    explanation: snapshot.explanation,
                     sequence: record.sequence,
                     output,
                 },
@@ -544,18 +614,24 @@ impl ShellTaskRegistry {
         command: &str,
         background: bool,
     ) -> ShellTaskGuard {
-        self.try_register(conversation_id, tool_name, command, background, None)
-            .unwrap()
+        self.try_register(
+            conversation_id,
+            tool_name,
+            command,
+            background,
+            ShellTaskOrigin::default(),
+        )
+        .unwrap()
     }
 
-    /// `workspace_root` is the root of the workspace the command runs in, on its machine.
+    /// `origin` says where the command runs and which call ran it; see [`ShellTaskOrigin`].
     pub fn try_register(
         &self,
         conversation_id: &str,
         tool_name: &str,
         command: &str,
         background: bool,
-        workspace_root: Option<&str>,
+        origin: ShellTaskOrigin<'_>,
     ) -> Result<ShellTaskGuard, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let started_at = Utc::now().to_rfc3339();
@@ -570,6 +646,9 @@ impl ShellTaskRegistry {
             // the number handed to the caller cannot diverge.
             let sequence = registry.mint_sequence();
             let shell_task_id = sequence.to_string();
+            let explanation = origin
+                .call_id
+                .and_then(|call_id| registry.take_pending_explanation(conversation_id, call_id));
             let entry = ShellTaskEntry {
                 conversation_id: conversation_id.to_owned(),
                 tool_name: tool_name.to_owned(),
@@ -580,8 +659,11 @@ impl ShellTaskRegistry {
                 outcome: None,
                 exit_code: None,
                 background,
-                workspace_root: workspace_root.map(str::to_owned),
+                workspace_root: origin.workspace_root.map(str::to_owned),
                 duration_ms: None,
+                cwd: origin.cwd.map(str::to_owned),
+                call_id: origin.call_id.map(str::to_owned),
+                explanation,
                 sequence,
                 output: ShellTaskOutput::default(),
             };
@@ -649,6 +731,49 @@ impl ShellTaskRegistry {
         // started it while that turn is still running.
         self.publish(AppPushEvent::ShellTaskStarted { task: snapshot });
         true
+    }
+
+    /// Puts the helper model's summary of a call's command on that call's row.
+    ///
+    /// The model starts on the call before the process spawns, so the row may not exist yet; the
+    /// summary is then parked and picked up by [`Self::try_register`]. The row is re-published under
+    /// the event its state already has — started while it runs, ended once it has — so the renderer
+    /// replaces it in place.
+    pub fn explain(&self, conversation_id: &str, call_id: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let snapshot = {
+            let mut registry = self.lock();
+            let found = registry.entries.iter().find_map(|(shell_task_id, entry)| {
+                (entry.conversation_id == conversation_id
+                    && entry.call_id.as_deref() == Some(call_id))
+                .then(|| shell_task_id.clone())
+            });
+            let Some(shell_task_id) = found else {
+                registry.park_explanation(conversation_id, call_id, text);
+                return;
+            };
+            let entry = registry.entries.get_mut(&shell_task_id).unwrap();
+            if entry.explanation.as_deref() == Some(text) {
+                return;
+            }
+            entry.explanation = Some(text.to_owned());
+            let snapshot = entry.snapshot(&shell_task_id);
+            // A summary that fails to reach disk is still worth showing now: it is a label, and the
+            // row it labels is already durable.
+            if registry.persist().is_err() {
+                drop(registry);
+                self.report_write_error();
+            }
+            snapshot
+        };
+        self.publish(if snapshot.outcome.is_some() {
+            AppPushEvent::ShellTaskEnded { task: snapshot }
+        } else {
+            AppPushEvent::ShellTaskStarted { task: snapshot }
+        });
     }
 
     /// Asks the named command to stop. Returns false when the task is unknown, already finished, or
@@ -1049,7 +1174,13 @@ mod tests {
         .unwrap();
         connection.execute_batch("CREATE TRIGGER refuse_shell_write BEFORE INSERT ON shell_task BEGIN SELECT RAISE(FAIL, 'injected shell write failure'); END;").unwrap();
         assert!(registry
-            .try_register("conv", "bash", "must not start", true, None)
+            .try_register(
+                "conv",
+                "bash",
+                "must not start",
+                true,
+                ShellTaskOrigin::default()
+            )
             .is_err());
         assert_eq!(registry.task_snapshots("conv").len(), 1);
         assert!(!registry.mark_background("conv", &id));
@@ -1190,7 +1321,16 @@ mod tests {
         registry.install_store(directory.path()).unwrap();
         let (remote_id, local_id) = {
             let mut remote = registry
-                .try_register("conv", "bash", "cargo build", false, Some("~/src/app"))
+                .try_register(
+                    "conv",
+                    "bash",
+                    "cargo build",
+                    false,
+                    ShellTaskOrigin {
+                        workspace_root: Some("~/src/app"),
+                        ..ShellTaskOrigin::default()
+                    },
+                )
                 .unwrap();
             let running = registry
                 .task_snapshot("conv", remote.shell_task_id())
@@ -1203,7 +1343,17 @@ mod tests {
             remote.measured_runtime(std::time::Duration::from_millis(1_234));
 
             let mut local = registry
-                .try_register("conv", "bash", "ls", false, Some("/Users/me/site"))
+                .try_register(
+                    "conv",
+                    "bash",
+                    "ls",
+                    false,
+                    ShellTaskOrigin {
+                        workspace_root: Some("/Users/me/site"),
+                        cwd: Some("/Users/me/site/web"),
+                        ..ShellTaskOrigin::default()
+                    },
+                )
                 .unwrap();
             local.finish(ShellTaskOutcome::Succeeded, Some(0));
             (
@@ -1217,6 +1367,7 @@ mod tests {
             assert!(remote.ended_at.is_some(), "the end is still this host's");
             let local = registry.task_snapshot("conv", &local_id).unwrap();
             assert_eq!(local.workspace_root.as_deref(), Some("/Users/me/site"));
+            assert_eq!(local.cwd.as_deref(), Some("/Users/me/site/web"));
             assert_eq!(
                 local.duration_ms, None,
                 "a local command is timed by its span"
@@ -1950,5 +2101,48 @@ mod tests {
             .output_sink(ShellOutputStream::Stdout)
             .append(b"nobody");
         assert_eq!(second_received.lock().unwrap().len(), 1);
+    }
+
+    /// The helper model answers on the call, which may be before or after the row exists; either
+    /// way the summary lands on that call's row and on no other.
+    #[test]
+    fn an_explanation_finds_its_row_whichever_arrives_first() {
+        let registry = ShellTaskRegistry::default();
+        let origin = |call_id| ShellTaskOrigin {
+            call_id: Some(call_id),
+            ..ShellTaskOrigin::default()
+        };
+
+        registry.explain("conv", "call-early", "  Lists the files  ");
+        let early = registry
+            .try_register("conv", "bash", "ls", false, origin("call-early"))
+            .unwrap();
+        let late = registry
+            .try_register("conv", "bash", "cargo test", false, origin("call-late"))
+            .unwrap();
+        registry.explain("conv", "call-late", "Runs the tests");
+        // Another conversation's call with the same id is a different call.
+        registry.explain("other", "call-late", "Something else");
+
+        let snapshot = |guard: &ShellTaskGuard| {
+            registry
+                .task_snapshot("conv", guard.shell_task_id())
+                .unwrap()
+        };
+        assert_eq!(
+            snapshot(&early).explanation.as_deref(),
+            Some("Lists the files")
+        );
+        assert_eq!(snapshot(&early).call_id.as_deref(), Some("call-early"));
+        assert_eq!(
+            snapshot(&late).explanation.as_deref(),
+            Some("Runs the tests")
+        );
+
+        // A parked summary is consumed by its row, so a later call cannot inherit it.
+        let again = registry
+            .try_register("conv", "bash", "ls", false, origin("call-early"))
+            .unwrap();
+        assert_eq!(snapshot(&again).explanation, None);
     }
 }

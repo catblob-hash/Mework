@@ -1,7 +1,7 @@
 import type { ComponentProps } from "react";
 import type { TasksPane } from "./components/TaskContainer";
 import type { TaskItem } from "./lib/taskContainer";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App, { subagentViewsEqualForChrome } from "./App";
@@ -13,7 +13,6 @@ import type { SubagentView } from "./lib/subagents";
 import type {
   AppDocument,
   JsonObject,
-  ModelRunResponse,
   ModelStreamEvent,
   ToolContext
 } from "./types";
@@ -322,14 +321,14 @@ describe("App model run flow — agents", () => {
     expect(screen.getByRole("status", { name: "正在查找文件" }))
       .toHaveAttribute("data-pending-tool", "find");
 
-    // The visible row is now the localized action; its wire name, target, and
-    // completion state remain on the disclosure tooltip for precise inspection.
+    // The visible row is the localized action and the file it read; its wire
+    // name, target, and completion state remain on the disclosure tooltip.
     const readSummary = within(readRow).getByRole("button", {
-      name: "读取了文件 · read · README.md · 完成"
+      name: "已读取：README.md · read · README.md · 完成"
     });
     expect(readSummary).toHaveAttribute("title", "read · README.md · 完成");
     expect(readRow.querySelector(".timeline-row__line")).toBeNull();
-    expect(within(readRow).getByText("读取了文件")).toBeInTheDocument();
+    expect(readRow.querySelector(".timeline-row__name")).toHaveTextContent("已读取：README.md");
     await user.click(readSummary);
     expect(within(readRow).getByText("read-output")).toBeInTheDocument();
 
@@ -344,7 +343,12 @@ describe("App model run flow — agents", () => {
       emit({ type: "tool_execution_started", round: 1, callId: "call_find" });
       emit({ type: "tool_execution_completed", round: 1, callId: "call_find", result: findResult });
     });
-    expect(await within(group).findByText("find-failed")).toBeInTheDocument();
+    await waitFor(() => expect(group.querySelector(".timeline-row--error")).toBeInTheDocument());
+    // A failure starts closed like every other row; its output waits to be opened.
+    const findRow = group.querySelector<HTMLElement>(".timeline-row--error")!;
+    expect(within(findRow).queryByText("find-failed")).not.toBeInTheDocument();
+    await user.click(findRow.querySelector<HTMLButtonElement>(".timeline-row__summary")!);
+    expect(within(findRow).getByText("find-failed")).toBeInTheDocument();
     // The read row is the same element it was before its sibling landed.
     expect(group.querySelector(`[data-context-id="${readRowId}"]`)).toBe(readRow);
     expect(groupToggle).toHaveAttribute("aria-expanded", "true");
@@ -401,7 +405,7 @@ describe("App model run flow — agents", () => {
       expect(settled).toHaveLength(1);
       expect(settled[0]).toMatchObject({ status: "completed", durationMs: 25 });
     });
-    expect(screen.getByRole("button", { name: "编辑工具调用 读取了文件" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "编辑工具调用 已读取：README.md" })).toBeInTheDocument();
     await waitFor(() => {
       const saved = runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined;
       const savedRead = saved?.workspaces
@@ -546,7 +550,7 @@ describe("App model run flow — agents", () => {
     expect(within(selectedPanel).getByText(streamedPrelude)).toBeInTheDocument();
     expect(within(selectedPanel).queryByText(`${streamedPrelude}${streamedText}`)).not.toBeInTheDocument();
     const childRead = within(selectedPanel).getByRole("button", {
-      name: "读取了文件 · read · README.md · 完成"
+      name: "已读取：README.md · read · README.md · 完成"
     });
     expect(childRead).toHaveAttribute("title", "read · README.md · 完成");
     await user.click(childRead);
@@ -557,18 +561,18 @@ describe("App model run flow — agents", () => {
     // its own, so the transcript it is read against stays on screen.
     expect(within(selectedPanel).queryByText("已完成")).not.toBeInTheDocument();
     const ledgerButton = within(selectedPanel).getByRole("button", {
-      name: `${label} 发出的请求`
+      name: `${label} 的历史记录`
     });
     expect(ledgerButton).toHaveAttribute("aria-pressed", "false");
     await user.click(ledgerButton);
-    const ledgerPane = await screen.findByRole("region", { name: `${label} 发出的请求` });
+    const ledgerPane = await screen.findByRole("region", { name: `${label} 的历史记录` });
     expect(
-      await within(ledgerPane).findByText("这个子代理还没有记录到发出去的请求。记录从下一次请求开始。")
+      await within(ledgerPane).findByText("这个子代理还没有历史记录。记录从它发出的第一次请求开始。")
     ).toBeInTheDocument();
     expect(ledgerButton).toHaveAttribute("aria-pressed", "true");
     expect(within(selectedPanel).getByText(streamedText)).toBeInTheDocument();
     await user.click(ledgerButton);
-    expect(screen.queryByRole("region", { name: `${label} 发出的请求` })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: `${label} 的历史记录` })).not.toBeInTheDocument();
 
     await act(async () => resolveRun({
       contexts: [{
@@ -616,11 +620,12 @@ describe("App model run flow — agents", () => {
     expect(within(persistedPanel).getByText(update)).toBeInTheDocument();
     expect(within(persistedPanel).queryByText(streamedPrelude)).not.toBeInTheDocument();
     expect(within(persistedPanel).queryByText(streamedText)).not.toBeInTheDocument();
-    // The subagent stops being a task once its run persists, so its row leaves
-    // the container even though the timeline keeps a chip for the record.
-    expect(within(tasks).queryByRole("button", {
+    // The subagent stops being running work once its run persists, so its row
+    // leaves the running list for the finish list below it.
+    const runningRows = tasks.querySelector(".tasks-pane > .task-container__list");
+    expect(runningRows && within(runningRows as HTMLElement).queryByRole("button", {
       name: `打开子代理 ${label}`
-    })).not.toBeInTheDocument();
+    })).toBeFalsy();
   });
 
   it("renders agent_send as a new user turn without hiding the existing child transcript", async () => {
@@ -698,8 +703,10 @@ describe("App model run flow — agents", () => {
     await user.click(await within(tasks).findByRole("button", { name: "打开子代理 helper" }));
     const panel = screen.getByRole("region", { name: "API 审查" });
     expect(within(panel).getByText("旧的 API 审查结论")).toBeInTheDocument();
-    expect(within(panel).getByText("追加检查取消竞态")).toBeInTheDocument();
-    expect(within(panel).getByText("正在检查取消竞态")).toBeInTheDocument();
+    // The row is on screen from the start — finished rows are not folded away —
+    // so the click can land before the new turn reaches the transcript.
+    expect(await within(panel).findByText("追加检查取消竞态")).toBeInTheDocument();
+    expect(await within(panel).findByText("正在检查取消竞态")).toBeInTheDocument();
 
     await act(async () => resolveRun({
       contexts: [],
@@ -762,13 +769,29 @@ describe("App model run flow — agents", () => {
     expect(within(panel).getByText("Alpha 独立流")).toBeInTheDocument();
     expect(within(panel).queryByText("Beta 独立流")).not.toBeInTheDocument();
 
-    // Panes stack rather than replace one another, so Alpha's transcript is still
-    // on screen while Beta's opens beside it; the two must not bleed into each other.
+    // Agents share one pane as its tabs: Beta's transcript takes the pane while
+    // Alpha's stays a tab away, and the two must not bleed into each other.
     await user.click(within(tasks).getByRole("button", { name: "打开子代理 beta" }));
     panel = screen.getByRole("region", { name: "Beta" });
-    expect(screen.getByRole("region", { name: "Alpha" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Alpha" })).not.toBeInTheDocument();
+    const strip = within(panel).getByRole("tablist", { name: "子代理标签" });
+    expect(within(strip).getByRole("tab", { name: "Alpha, 工作中" })).toHaveAttribute("aria-selected", "false");
+    expect(within(strip).getByRole("tab", { name: "Beta, 工作中" })).toHaveAttribute("aria-selected", "true");
     expect(within(panel).getByText("Beta 独立流")).toBeInTheDocument();
     expect(within(panel).queryByText("Alpha 独立流")).not.toBeInTheDocument();
+
+    await user.click(within(strip).getByRole("tab", { name: "Alpha, 工作中" }));
+    expect(screen.getByRole("region", { name: "Alpha" })).toBe(panel);
+    expect(within(panel).getByText("Alpha 独立流")).toBeInTheDocument();
+    expect(within(panel).queryByText("Beta 独立流")).not.toBeInTheDocument();
+    expect(within(tasks).getByRole("button", { name: "打开子代理 alpha" })).toHaveAttribute("aria-current", "true");
+
+    // A tab is only a view: closing it takes the transcript away and stops nothing,
+    // and the agent's row still opens it again.
+    await user.click(within(panel).getByRole("button", { name: "关闭标签 Alpha" }));
+    expect(screen.getByRole("region", { name: "Beta" })).toBe(panel);
+    expect(within(panel).queryByRole("tab", { name: "Alpha, 工作中" })).not.toBeInTheDocument();
+    expect(within(tasks).getByRole("button", { name: "打开子代理 alpha" })).toBeInTheDocument();
 
     await act(async () => resolveRun({
       contexts: [],
@@ -780,10 +803,12 @@ describe("App model run flow — agents", () => {
   });
 
   /**
-   * One prompt, one card. Panes stack, so every open subagent pane used to draw the same
-   * approval dialog and the duplicates fought over focus and the same `promptId`.
+   * One prompt, one card. Panes used to stack, so every open subagent pane drew the same
+   * approval dialog and the duplicates fought over focus and the same `promptId`. Now the
+   * agents are tabs of one pane, and a card from an agent behind another tab brings its tab
+   * forward rather than docking where nobody can see it.
    */
-  it("docks a pending approval on the requesting subagent pane only", async () => {
+  it("docks a pending approval on the requesting subagent's tab only", async () => {
     const document = documentWithModel();
     const conversation = document.workspaces[0].conversations[0];
     runtimeMocks.loadDocument.mockResolvedValue(document);
@@ -814,28 +839,30 @@ describe("App model run flow — agents", () => {
     const tasks = await openTasksPane(user);
     await user.click(await within(tasks).findByRole("button", { name: "打开子代理 alpha" }));
     await user.click(within(tasks).getByRole("button", { name: "打开子代理 beta" }));
-    expect(screen.getByRole("region", { name: "Alpha" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Beta" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Alpha, 工作中" })).toHaveAttribute("aria-selected", "false");
 
     await act(async () => {
       emitAppPushEvent({
         type: "toolApprovalRequested",
         conversationId: conversation.id,
-        promptId: "prompt-from-beta",
+        promptId: "prompt-from-alpha",
         toolName: "write",
         label: "写入文件",
         summary: "notes.md",
         riskLevel: "中",
         reason: "请求批准模式要求确认所有写入操作",
-        requester: "beta",
-        sourceAgent: "beta",
-        sourceCallId: "call-beta",
+        requester: "alpha",
+        sourceAgent: "alpha",
+        sourceCallId: "call-alpha",
         allowAlwaysOffered: true
       });
     });
 
     const card = await screen.findByRole("dialog", { name: "需要你的确认" });
     expect(screen.getAllByRole("dialog", { name: "需要你的确认" })).toHaveLength(1);
-    expect(card.closest("[role='region']")).toBe(screen.getByRole("region", { name: "Beta" }));
+    expect(card.closest("[role='region']")).toBe(screen.getByRole("region", { name: "Alpha" }));
+    expect(screen.getByRole("tab", { name: "Alpha, 工作中" })).toHaveAttribute("aria-selected", "true");
 
     await act(async () => resolveRun({
       contexts: [],
@@ -925,113 +952,124 @@ describe("App model run flow — agents", () => {
     expect(screen.queryByText("页面读取")).not.toBeInTheDocument();
   });
 
-  it("reveals a streamed ask_user card and queues an early option click for the next turn", async () => {
+  /** A run blocked on an `ask_user` call, with its question card on screen. */
+  async function blockedOnQuestionCard(questions: JsonObject[]) {
     const document = documentWithModel();
-    const firstConversation = { ...document.workspaces[0].conversations[0], title: "提问任务" };
-    const secondConversation = {
-      ...firstConversation,
-      id: "conv_other_task",
-      title: "其他任务",
-      // Empty persisted slots are intentionally hidden in the sidebar. This is a
-      // real task that can be selected while the first run settles.
-      contexts: [{
-        id: "ctx_other_task_history",
-        kind: "user" as const,
-        content: "另一项已有任务",
-        createdAt: "2026-09-10T00:00:00Z"
-      }]
-    };
-    document.workspaces[0].conversations = [firstConversation, secondConversation];
     runtimeMocks.loadDocument.mockResolvedValue(document);
     let emit!: (event: ModelStreamEvent) => void;
-    let resolveFirstRun!: (value: unknown) => void;
-    const pendingResult = {
-      success: true,
-      output: ASK_USER_PENDING_OUTPUT,
-      executedAt: "2026-07-12T00:00:00Z",
-      durationMs: 4
-    };
-    const finalQuestion = {
-      id: "ctx_ask_user_final",
-      kind: "tool" as const,
-      toolName: "ask_user",
-      round: 1,
-      input: {
-        questions: [{
-          question: "采用哪个实现方案？",
-          header: "方案",
-          options: [
-            { label: "方案 A", description: "保持改动最小" },
-            { label: "方案 B", description: "完整重构" }
-          ],
-          multiSelect: false
-        }]
-      },
-      result: pendingResult,
-      createdAt: "2026-07-12T00:00:00Z"
-    };
-    runtimeMocks.runModel
-      .mockImplementationOnce((_request, onEvent) => {
-        emit = onEvent;
-        return new Promise((resolve) => { resolveFirstRun = resolve; });
-      })
-      .mockResolvedValueOnce({
-        contexts: [{ id: "ctx_after_answer", kind: "assistant", content: "已按方案 A 继续", createdAt: "2026-07-12T00:00:01Z" }],
-        usage: {},
-        model: model.id,
-        providerName: "OpenAI Responses",
-        durationMs: 5,
-        stopReason: "completed"
-      });
-
+    runtimeMocks.runModel.mockImplementationOnce((_request, onEvent) => {
+      emit = onEvent;
+      return new Promise(() => {});
+    });
     const user = userEvent.setup();
     render(<App />);
     await user.type(await screen.findByLabelText("向 Agent 发送消息"), "请先确认方案");
     await user.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
-
     act(() => {
-      emit({ type: "tool_call_announced", round: 1, callId: "call_ask", toolName: "ask_user", contextId: "ctx-call_ask" });
       emit({
-        type: "tool_call_arguments_ready",
-        round: 1,
-        callId: "call_ask",
-        input: finalQuestion.input
+        type: "tool_approval_requested",
+        promptId: "prompt-question",
+        toolName: "ask_user",
+        kind: "question",
+        label: "回答问题？",
+        summary: String(questions[0]?.question ?? ""),
+        riskLevel: "低",
+        reason: "模型在等你回答问题",
+        allowAlwaysOffered: false,
+        mandatory: true,
+        questions
       });
-      emit({ type: "tool_execution_started", round: 1, callId: "call_ask" });
-      emit({ type: "tool_execution_completed", round: 1, callId: "call_ask", result: pendingResult });
     });
+    await screen.findByRole("dialog", { name: String(questions[0]?.question ?? "") });
+    return { user };
+  }
 
-    const option = await screen.findByRole("button", { name: /方案 A/ });
-    expect(option.closest("[data-pending-question=true]")).toBeInTheDocument();
-    expect(screen.getByLabelText("回答 Agent 的提问")).toBeInTheDocument();
-    await user.click(option);
-    await user.click(screen.getByRole("button", { name: "完成" }));
+  const questionFixture = (question: string, header: string): JsonObject => ({
+    question,
+    header,
+    options: [
+      { label: "方案 A", description: "保持改动最小" },
+      { label: "方案 B", description: "完整重构" }
+    ],
+    multiSelect: false
+  });
+
+  it("draws the card a run blocks on and hands the picked answer back as the call's result", async () => {
+    const { user } = await blockedOnQuestionCard([questionFixture("采用哪个实现方案？", "方案")]);
+
+    await user.click(screen.getByRole("option", { name: /方案 A/ }));
+
+    await waitFor(() => expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith(
+      "prompt-question",
+      "deny",
+      undefined,
+      { action: "submit", answers: ["方案 A"], previews: [null], notes: [null] }
+    ));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "采用哪个实现方案？" })).not.toBeInTheDocument());
+    // The answer is the tool result, not a new user message.
     expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1);
-    await user.click(screen.getByText("其他任务").closest("button")!);
+  });
 
-    await act(async () => resolveFirstRun({
-      contexts: [finalQuestion],
-      usage: {},
-      model: model.id,
-      providerName: "OpenAI Responses",
-      durationMs: 9,
-      stopReason: "cancelled"
-    }));
+  it("closes the card on Esc without asking the model anything", async () => {
+    await blockedOnQuestionCard([questionFixture("采用哪个实现方案？", "方案")]);
 
-    await waitFor(() => expect(screen.getByLabelText("向 Agent 发送消息")).toBeInTheDocument());
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "采用哪个实现方案？" }), { key: "Escape" });
+
+    await waitFor(() => expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith(
+      "prompt-question",
+      "deny",
+      undefined,
+      { action: "close", answers: [] }
+    ));
     expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1);
-    await user.click(screen.getByText("提问任务").closest("button")!);
-    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(2));
-    expect(runtimeMocks.runModel).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      contexts: expect.arrayContaining([
-        expect.objectContaining({ kind: "tool", toolName: "ask_user" }),
-        expect.objectContaining({
-          kind: "user",
-          content: 'User has answered your questions: "采用哪个实现方案？"="方案 A"'
-        })
-      ])
-    }), expect.any(Function), expect.any(String));
+  });
+
+  it("sends a composer message into the run first, then hands back what the card had filled in", async () => {
+    const { user } = await blockedOnQuestionCard([
+      questionFixture("先做哪个？", "顺序"),
+      questionFixture("用什么库？", "库")
+    ]);
+
+    await user.click(screen.getByRole("option", { name: /方案 B/ }));
+    const composer = screen.getByLabelText("向 Agent 发送消息");
+    expect(composer).toHaveAttribute("placeholder", "发送消息会先交回卡片上已填的回答…");
+    await user.type(composer, "第二题先别管，看看日志");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith(
+      "prompt-question",
+      "deny",
+      undefined,
+      expect.objectContaining({ action: "submit", answers: ["方案 B", null] })
+    ));
+    expect(runtimeMocks.steerModelRun).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ content: "第二题先别管，看看日志" })
+    );
+    // Steered before the card is answered: the host keeps a closed card's turn
+    // going only when a message is already waiting to follow it.
+    expect(runtimeMocks.steerModelRun.mock.invocationCallOrder[0])
+      .toBeLessThan(runtimeMocks.resolveToolPrompt.mock.invocationCallOrder[0]);
+    expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes an untouched card when a composer message is sent", async () => {
+    const { user } = await blockedOnQuestionCard([questionFixture("采用哪个实现方案？", "方案")]);
+
+    await user.type(screen.getByLabelText("向 Agent 发送消息"), "换个话题");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(runtimeMocks.resolveToolPrompt).toHaveBeenCalledWith(
+      "prompt-question",
+      "deny",
+      undefined,
+      { action: "close", answers: [] }
+    ));
+    expect(runtimeMocks.steerModelRun).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ content: "换个话题" })
+    );
   });
 
   /**
@@ -1098,7 +1136,7 @@ describe("App model run flow — agents", () => {
     return { document, host, hostAssistantId, streamedAssistantId };
   }
 
-  it("re-commits a refused question answer against the host body instead of running without it", async () => {
+  it("re-commits a refused message against the host body instead of running without it", async () => {
     const { host, hostAssistantId, streamedAssistantId } = conversationWithRefusingHost(false);
     runtimeMocks.runModel.mockResolvedValue({
       contexts: [],
@@ -1111,34 +1149,33 @@ describe("App model run flow — agents", () => {
 
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /方案 A/ }));
-    await user.click(screen.getByRole("button", { name: "完成" }));
+    await user.type(await screen.findByLabelText("向 Agent 发送消息"), "就用方案 A");
+    await user.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
-    // The answer must enter the authoritative conversation body before the run.
+    // The message must enter the authoritative conversation body before the run.
     await waitFor(() => expect(host.contexts.some((context) => (
-      context.kind === "user" && context.content.startsWith("User has answered your questions:")
+      context.kind === "user" && context.content === "就用方案 A"
     ))).toBe(true));
     expect(host.contexts.some((context) => context.id === hostAssistantId)).toBe(true);
     expect(host.contexts.some((context) => context.id === streamedAssistantId)).toBe(false);
-    expect(screen.queryByText("回答已提交")).not.toBeInTheDocument();
   });
 
-  it("refuses to start a run when the answer cannot be committed, and unlocks the dock", async () => {
+  it("refuses to start a run when the message cannot be committed, and keeps the draft", async () => {
     conversationWithRefusingHost(true);
 
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /方案 A/ }));
-    await user.click(screen.getByRole("button", { name: "完成" }));
+    const composer = await screen.findByLabelText("向 Agent 发送消息");
+    await user.type(composer, "就用方案 A");
+    await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByText(
       "这条消息没能写进对话库，已取消发送——请重新发送，不要让模型收到一份缺了它的历史。"
     )).toBeInTheDocument();
     expect(runtimeMocks.runModel).not.toHaveBeenCalled();
-    // An uncommitted answer must not appear submitted; controls unlock and the question remains pending.
-    expect(screen.queryByText("回答已提交")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "完成" })).toBeInTheDocument();
+    // An uncommitted message stays in the composer for another try.
+    expect(composer).toHaveValue("就用方案 A");
   });
 
   /**
@@ -1154,338 +1191,19 @@ describe("App model run flow — agents", () => {
 
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /方案 A/ }));
+    await user.type(await screen.findByLabelText("向 Agent 发送消息"), "就用方案 A");
     if (reload === "error") runtimeMocks.loadConversationRemote.mockRejectedValue(new Error("offline"));
     if (reload === "null") runtimeMocks.loadConversationRemote.mockResolvedValue(null);
-    await user.click(screen.getByRole("button", { name: "完成" }));
+    await user.click(screen.getByRole("button", { name: "发送" }));
 
     const banner = await screen.findByText(/这条消息没能写进对话库/);
     // Display the host's rejection reason instead of leaving it only in DevTools.
     expect(banner).toHaveTextContent("无法证明来自本应用自己的执行");
     expect(runtimeMocks.runModel).not.toHaveBeenCalled();
     expect(host.contexts.some((context) => (
-      context.kind === "user" && context.content.startsWith("User has answered your questions:")
+      context.kind === "user" && context.content === "就用方案 A"
     ))).toBe(false);
-    expect(screen.queryByText("回答已提交")).not.toBeInTheDocument();
-    if (reload === "success") expect(screen.getByRole("button", { name: "完成" })).toBeInTheDocument();
-    else expect(screen.queryByRole("button", { name: "停止生成" })).not.toBeInTheDocument();
-  });
-
-  it("holds the queue while a question is pending and lets the answer jump ahead of it", async () => {
-    const document = documentWithModel();
-    const conversation = document.workspaces[0].conversations[0];
-    const askCard: ToolContext = {
-      id: "ctx_ask_queued",
-      kind: "tool",
-      toolName: "ask_user",
-      round: 1,
-      input: {
-        questions: [{
-          question: "采用哪个实现方案？",
-          header: "方案",
-          options: [
-            { label: "方案 A", description: "保持改动最小" },
-            { label: "方案 B", description: "完整重构" }
-          ],
-          multiSelect: false
-        }]
-      },
-      result: {
-        success: true,
-        output: ASK_USER_PENDING_OUTPUT,
-        executedAt: "2026-08-25T00:00:00Z",
-        durationMs: 0
-      },
-      createdAt: "2026-08-25T00:00:00Z"
-    };
-    conversation.contexts = [
-      { id: "ctx_user_first", kind: "user", content: "请先确认方案", createdAt: "2026-08-25T00:00:00Z" },
-      askCard
-    ];
-    conversation.queuedMessages = [
-      { id: "queued_unrelated", content: "顺手把 README 也改了", createdAt: "2026-08-25T00:00:01Z" }
-    ];
-    runtimeMocks.loadDocument.mockResolvedValue(document);
-    runtimeMocks.runModel.mockResolvedValue({
-      contexts: [],
-      usage: {},
-      model: model.id,
-      providerName: "OpenAI Responses",
-      durationMs: 3,
-      stopReason: "completed"
-    });
-
-    const user = userEvent.setup();
-    render(<App />);
-    const option = await screen.findByRole("button", { name: /方案 A/ });
-    // A queued message is not an answer. Starting it would close the pending
-    // question before the actual answer arrives.
-    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
-
-    await user.click(option);
-    await user.click(screen.getByRole("button", { name: "完成" }));
-    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalled());
-    const firstRequest = runtimeMocks.runModel.mock.calls[0][0];
-    expect(firstRequest.contexts.at(-1)).toEqual(expect.objectContaining({
-      kind: "user",
-      content: 'User has answered your questions: "采用哪个实现方案？"="方案 A"'
-    }));
-    // Continue the queue only after the answer is committed.
-    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(2));
-    expect(runtimeMocks.runModel.mock.calls[1][0].contexts.at(-1)).toEqual(expect.objectContaining({
-      kind: "user",
-      content: "顺手把 README 也改了"
-    }));
-  });
-
-  it("keeps an answered ask_user continuation in one running UI turn until the final completion", async () => {
-    const document = documentWithModel();
-    runtimeMocks.loadDocument.mockResolvedValue(document);
-    let emitFirst!: (event: ModelStreamEvent) => void;
-    let emitSecond!: (event: ModelStreamEvent) => void;
-    let resolveFirst!: (value: ModelRunResponse) => void;
-    let resolveSecond!: (value: ModelRunResponse) => void;
-    const pendingResult = {
-      success: true,
-      output: ASK_USER_PENDING_OUTPUT,
-      executedAt: "2026-07-24T00:00:01Z",
-      durationMs: 4
-    };
-    const question: ToolContext = {
-      id: "ctx_same_turn_question",
-      kind: "tool",
-      toolName: "ask_user",
-      round: 1,
-      input: {
-        questions: [{
-          question: "继续采用方案 A 吗？",
-          header: "方案",
-          options: [
-            { label: "方案 A", description: "沿用当前实现" },
-            { label: "方案 B", description: "切换实现路径" }
-          ],
-          multiSelect: false
-        }]
-      },
-      result: pendingResult,
-      createdAt: "2026-07-24T00:00:01Z"
-    };
-    runtimeMocks.runModel
-      .mockImplementationOnce((_request, onEvent) => {
-        emitFirst = onEvent;
-        return new Promise<ModelRunResponse>((resolve) => { resolveFirst = resolve; });
-      })
-      .mockImplementationOnce((_request, onEvent) => {
-        emitSecond = onEvent;
-        return new Promise<ModelRunResponse>((resolve) => { resolveSecond = resolve; });
-      });
-
-    const user = userEvent.setup();
-    const { container } = render(<App />);
-    await user.type(await screen.findByLabelText("向 Agent 发送消息"), "先确认方案再继续");
-    await user.click(screen.getByRole("button", { name: "发送" }));
-    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
-
-    act(() => {
-      emitFirst({
-        type: "usage_updated",
-        round: 1,
-        usage: {
-          inputTokens: 100,
-          cachedInputTokens: 20,
-          outputTokens: 7,
-          totalTokens: 107
-        }
-      });
-      emitFirst({ type: "tool_call_announced", round: 1, callId: "call_same_turn_ask", toolName: "ask_user", contextId: "ctx-call_same_turn_ask" });
-      emitFirst({
-        type: "tool_call_arguments_ready",
-        round: 1,
-        callId: "call_same_turn_ask",
-        input: question.input
-      });
-      emitFirst({ type: "tool_execution_started", round: 1, callId: "call_same_turn_ask" });
-      emitFirst({
-        type: "tool_execution_completed",
-        round: 1,
-        callId: "call_same_turn_ask",
-        result: pendingResult
-      });
-    });
-
-    await user.click(await screen.findByRole("button", { name: /方案 A.*沿用当前实现/ }));
-    await user.click(screen.getByRole("button", { name: "完成" }));
-    await act(async () => resolveFirst({
-      contexts: [question],
-      usage: {
-        inputTokens: 100,
-        cachedInputTokens: 20,
-        outputTokens: 7,
-        totalTokens: 107
-      },
-      model: model.id,
-      providerName: "OpenAI Responses",
-      durationMs: 2_000,
-      stopReason: "awaiting_user"
-    }));
-
-    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(2));
-    // The pause and the answer belong to one round: the record stays a single
-    // turn, resumed into its second segment rather than replaced by a new one.
-    await waitFor(() => {
-      const live = Object.values(
-        JSON.parse(window.localStorage.getItem(CONVERSATION_TURNS_STORAGE_KEY) ?? "{}") as Record<
-          string,
-          Array<{ status: string; segmentCount: number; usage: Record<string, number> }>
-        >
-      ).flat();
-      expect(live).toHaveLength(1);
-      expect(live[0]).toMatchObject({ status: "running", segmentCount: 2 });
-    });
-    await waitFor(() => {
-      const questionCard = container.querySelector<HTMLElement>(".question-history");
-      expect(questionCard).not.toBeNull();
-      expect(within(questionCard!).getByText("你的回答")).toBeInTheDocument();
-      expect(within(questionCard!).getByText("方案 A")).toBeInTheDocument();
-    });
-
-    act(() => emitSecond({
-      type: "usage_updated",
-      round: 1,
-      usage: {
-        inputTokens: 140,
-        cachedInputTokens: 30,
-        outputTokens: 5,
-        totalTokens: 145
-      }
-    }));
-    await waitFor(() => {
-      const live = Object.values(
-        JSON.parse(window.localStorage.getItem(CONVERSATION_TURNS_STORAGE_KEY) ?? "{}") as Record<
-          string,
-          Array<{ usage: Record<string, number> }>
-        >
-      ).flat();
-      expect(live).toHaveLength(1);
-      expect(live[0].usage).toMatchObject({ inputTokens: 240, cachedInputTokens: 50, outputTokens: 12 });
-    });
-
-    await act(async () => resolveSecond({
-      contexts: [
-        {
-          id: "ctx_same_turn_reasoning",
-          kind: "reasoning",
-          content: "结合用户回答继续处理",
-          createdAt: "2026-07-24T00:00:03Z"
-        },
-        {
-          id: "ctx_same_turn_final",
-          kind: "assistant",
-          content: "已按方案 A 完成",
-          createdAt: "2026-07-24T00:00:04Z"
-        }
-      ],
-      usage: {
-        inputTokens: 140,
-        cachedInputTokens: 30,
-        outputTokens: 9,
-        totalTokens: 149
-      },
-      model: model.id,
-      providerName: "OpenAI Responses",
-      durationMs: 3_000,
-      stopReason: "completed"
-    }));
-
-    // 2s + 3s of wall clock and both legs' counters, settled as one round.
-    await waitFor(() => {
-      const settled = Object.values(
-        JSON.parse(window.localStorage.getItem(CONVERSATION_TURNS_STORAGE_KEY) ?? "{}") as Record<
-          string,
-          Array<{ status: string; durationMs?: number; usage: Record<string, number> }>
-        >
-      ).flat();
-      expect(settled).toHaveLength(1);
-      expect(settled[0]).toMatchObject({ status: "completed", durationMs: 5_000 });
-      expect(settled[0].usage).toMatchObject({ inputTokens: 240, cachedInputTokens: 50, outputTokens: 16 });
-    });
-    const questionCard = container.querySelector<HTMLElement>(".question-history")!;
-    const continuedReasoning = container.querySelector<HTMLElement>(
-      '[data-context-id="ctx_same_turn_reasoning"]'
-    )!;
-    const finalAssistant = container.querySelector<HTMLElement>(
-      '[data-context-id="ctx_same_turn_final"]'
-    )!;
-
-    // The question, the work that followed it and the reply read in the order
-    // they happened, with nothing between them.
-    expect(questionCard.compareDocumentPosition(continuedReasoning) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy();
-    expect(continuedReasoning.compareDocumentPosition(finalAssistant) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy();
-    expect(screen.getByText("已按方案 A 完成")).toBeInTheDocument();
-  });
-
-  it("discards a queued ask_user answer when the run is stopped", async () => {
-    const document = documentWithModel();
-    runtimeMocks.loadDocument.mockResolvedValue(document);
-    let emit!: (event: ModelStreamEvent) => void;
-    let resolveRun!: (value: unknown) => void;
-    const pendingResult = {
-      success: true,
-      output: ASK_USER_PENDING_OUTPUT,
-      executedAt: "2026-07-12T00:00:00Z",
-      durationMs: 4
-    };
-    runtimeMocks.runModel.mockImplementation((_request, onEvent) => {
-      emit = onEvent;
-      return new Promise((resolve) => { resolveRun = resolve; });
-    });
-
-    const user = userEvent.setup();
-    render(<App />);
-    await user.type(await screen.findByLabelText("向 Agent 发送消息"), "等待提问");
-    await user.click(screen.getByRole("button", { name: "发送" }));
-    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
-    act(() => {
-      emit({ type: "tool_call_announced", round: 1, callId: "call_stop_ask", toolName: "ask_user", contextId: "ctx-call_stop_ask" });
-      emit({
-        type: "tool_call_arguments_ready",
-        round: 1,
-        callId: "call_stop_ask",
-        input: {
-          questions: [{
-            question: "继续吗？",
-            header: "继续",
-            options: [
-              { label: "继续", description: "继续当前任务" },
-              { label: "停止", description: "停止当前任务" }
-            ],
-            multiSelect: false
-          }]
-        }
-      });
-      emit({ type: "tool_execution_started", round: 1, callId: "call_stop_ask" });
-      emit({ type: "tool_execution_completed", round: 1, callId: "call_stop_ask", result: pendingResult });
-    });
-
-    await user.click(await screen.findByRole("button", { name: /继续.*继续当前任务/ }));
-    await user.click(screen.getByRole("button", { name: "完成" }));
-    await user.click(screen.getByRole("button", { name: "停止生成" }));
-    expect(runtimeMocks.cancelModelRun).toHaveBeenCalledTimes(1);
-
-    await act(async () => resolveRun({
-      contexts: [],
-      usage: {},
-      model: model.id,
-      providerName: "OpenAI Responses",
-      durationMs: 9,
-      stopReason: "awaiting_user"
-    }));
-    // Wait for run settlement, then confirm no continuation starts.
-    await waitFor(() => expect(screen.queryByRole("button", { name: /停止生成|正在停止生成/ }))
-      .not.toBeInTheDocument());
-    expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "停止生成" })).not.toBeInTheDocument();
   });
 
   it("streams a reasoning row and renames its disclosure once the round settles", async () => {

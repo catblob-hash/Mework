@@ -4,5 +4,7 @@ fn main() {
     if let Some(code) = mework_lib::cef_subprocess_main() {
         std::process::exit(code);
     }
+    #[cfg(target_os = "macos")]
+    mework_lib::cef_preload_framework();
     std::process::exit(mework_lib::run_browser_dev());
 }

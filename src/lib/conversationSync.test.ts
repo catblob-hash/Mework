@@ -35,7 +35,7 @@ function conversation(id: string, contextIds: string[], title = "t"): Conversati
       toolDescriptionFileId: null,
       agentDefinitions: [],
       webSearch: { maxSearchesPerCall: 0, provider: "native" },
-      reasoningEffort: "disabled",
+      reasoningEffort: "low",
       securityLevel: "request_approval",
       globalMemoryEnabled: false,
       projectMemoryEnabled: false
@@ -82,6 +82,20 @@ describe("createConversationSync", () => {
     expect(sent.title).toBe("last");
     expect(expectedContextIds).toEqual(["ctx_1"]);
     expect(applied.at(-1)?.title).toBe("last");
+  });
+
+  it("never offers an unloaded body as the timeline, whatever the baseline", async () => {
+    const sync = createConversationSync(() => undefined);
+    const loaded = conversation("conv_a", ["ctx_1", "ctx_2"]);
+    // A body that went from loaded to unloaded inside one debounce window: the baseline still
+    // names the host's real timeline, which is exactly when the empty stand-in would replace it.
+    const unloaded = { ...conversation("conv_a", [], "renamed"), bodyUnloaded: true };
+    sync.changed("ws", loaded, unloaded);
+    await sync.flush();
+
+    const [, sent, expectedContextIds] = remote.updateConversationRemote.mock.calls[0];
+    expect(sent.title).toBe("renamed");
+    expect(expectedContextIds).toEqual(["\u0000unloaded-body"]);
   });
 
   it("applies the host's authoritative body over the optimistic one", async () => {

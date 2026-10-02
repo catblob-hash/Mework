@@ -290,29 +290,32 @@ describe("TasksPane", () => {
     }
   });
 
-  it("collapses a finished shell command into the finish disclosure with no stop control", async () => {
-    const user = userEvent.setup();
+  it("moves a finished shell command into the finish list, red and with no stop control", () => {
     const { pane } = renderPane({
       shellTasks: [shellTask({
         command: "npm test",
         outcome: "failed",
         exitCode: 1,
-        endedAt: new Date().toISOString()
+        endedAt: new Date().toISOString(),
+        cwd: "/Users/me/web"
       })]
     });
 
-    // Hidden until the disclosure is opened — that is what "collapsed" means.
-    expect(within(pane).queryByText("已失败（退出码 1） · npm test")).not.toBeInTheDocument();
-    await user.click(within(pane).getByRole("button", { name: /已完成/ }));
-
-    const row = within(pane).getByText("已失败（退出码 1） · npm test")
-      .closest(".task-row") as HTMLElement;
-    expect(row).toBeTruthy();
+    // The subtitle is the command alone; the failure is the row's colour, and
+    // the exit code its hover text.
+    const detail = within(pane).getByText("npm test");
+    const row = detail.closest(".task-row") as HTMLElement;
+    expect(row).toHaveClass("task-row--failed");
+    expect(detail.closest(".task-row__main")).toHaveAttribute("title", "已失败（退出码 1）");
+    // Titled by the shell and the directory it ran in, drawn as a path.
+    const label = row.querySelector(".task-row__label") as HTMLElement;
+    expect(label).toHaveClass("path-text");
+    expect(label).toHaveTextContent("bash:/Users/me/web");
     // No process is left to kill, so offering a button that cannot work would be a lie.
     expect(within(row).queryByRole("button", { name: /中止/ })).not.toBeInTheDocument();
   });
 
-  it("keeps finished rows behind the finish disclosure until it is opened", async () => {
+  it("shows finished rows under an open finish disclosure until it is folded", async () => {
     const user = userEvent.setup();
     const { pane } = renderPane({
       agents: [
@@ -322,16 +325,16 @@ describe("TasksPane", () => {
     });
 
     expect(within(pane).getByRole("button", { name: "打开子代理 正在审查" })).toBeInTheDocument();
-    expect(within(pane).queryByRole("button", { name: "打开子代理 已经完成" })).not.toBeInTheDocument();
-
     const disclosure = within(pane).getByRole("button", { name: /已完成/ });
-    expect(disclosure).toHaveAttribute("aria-expanded", "false");
-    await user.click(disclosure);
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
     expect(within(pane).getByRole("button", { name: "打开子代理 已经完成" })).toBeInTheDocument();
 
     await user.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
     expect(within(pane).queryByRole("button", { name: "打开子代理 已经完成" })).not.toBeInTheDocument();
+
+    await user.click(disclosure);
+    expect(within(pane).getByRole("button", { name: "打开子代理 已经完成" })).toBeInTheDocument();
   });
 
   it("draws a workflow as its own panel whose steps open but whose run does not", async () => {
@@ -374,9 +377,10 @@ describe("TasksPane", () => {
     const heads = Array.from(panel.querySelectorAll(".workflow-phase__head"));
     expect(heads.map((head) => head.textContent)).toEqual(["Review0/1", "Verify0/1"]);
     expect(heads.every((head) => head.closest("button") === null)).toBe(true);
-    // Step rows display the bound role. Without one, use the conversation model or
-    // an em dash rather than inferring a model.
-    expect(within(panel).getByText("reviewer")).toBeInTheDocument();
+    // A step is titled role:name and subtitled with what it was asked; the
+    // model stays out of sight, in the tooltip.
+    expect(within(panel).getByText("reviewer:审查一")).toBeInTheDocument();
+    expect(within(panel).getByText("执行 review-1")).toBeInTheDocument();
     expect(within(panel).queryByText("sonnet-5")).not.toBeInTheDocument();
 
     await user.click(within(panel).getByRole("button", { name: "打开步骤 验证一" }));
@@ -385,8 +389,7 @@ describe("TasksPane", () => {
     expect(onSelectAgent).not.toHaveBeenCalledWith("run");
   });
 
-  it("renders persisted user aborts as inert failed rows", async () => {
-    const user = userEvent.setup();
+  it("renders persisted user aborts as inert failed rows", () => {
     const { pane, onStopItem, onSelectAgent } = renderPane({
       userAbortedTasks: [{
         id: "abort-1",
@@ -401,7 +404,6 @@ describe("TasksPane", () => {
       }]
     });
 
-    await user.click(within(pane).getByRole("button", { name: /已完成/ }));
     const detail = within(pane).getByText("用户中止操作 · 检查任务栏");
     const row = detail.closest("li");
     expect(row).toHaveClass("task-row--failed");
@@ -411,8 +413,7 @@ describe("TasksPane", () => {
     expect(onSelectAgent).not.toHaveBeenCalled();
   });
 
-  it("shows a failed row's error as its hover text and says nothing on a clean one", async () => {
-    const user = userEvent.setup();
+  it("shows a failed row's error as its hover text and says nothing on a clean one", () => {
     const { pane } = renderPane({
       agents: [
         agent("broken", { label: "抓取失败", status: "failed", summary: "工具调用超时" }),
@@ -420,7 +421,6 @@ describe("TasksPane", () => {
       ]
     });
 
-    await user.click(within(pane).getByRole("button", { name: /已完成/ }));
     expect(within(pane).getByRole("button", { name: "打开子代理 抓取失败" }))
       .toHaveAttribute("title", "工具调用超时");
     // A run that finished cleanly has no failure to explain, so no tooltip.
@@ -495,7 +495,7 @@ describe("TasksPane", () => {
     const { pane } = renderPane({
       browserSessionId: "conversation-1",
       browser: {
-        hasPage: true, suspended: true, open: false, loading: false,
+        hasPage: false, suspended: true, open: false, loading: false,
         url: "https://example.test/docs", title: "文档",
         canGoBack: false, canGoForward: false, zoom: 1,
         viewport: { width: 1280, height: 800 }
@@ -507,28 +507,6 @@ describe("TasksPane", () => {
     // reach and close.
     expect(within(pane).getByText("文档")).toBeInTheDocument();
     expect(within(pane).getByText("已挂起")).toBeInTheDocument();
-  });
-
-  it("hosts its todo plan above the task list", async () => {
-    const user = userEvent.setup();
-    const { pane } = renderPane({
-      status: {
-        todo: [
-          { id: "1", content: "拓宽任务模型", status: "completed" },
-          { id: "2", content: "重建侧边栏", status: "in_progress", activeForm: "正在重建侧边栏" },
-          { id: "3", content: "接上小蓝点", status: "pending", blockedBy: ["2"] }
-        ]
-      }
-    });
-
-    expect(within(pane).getByText("正在重建侧边栏")).toBeInTheDocument();
-    expect(within(pane).getByText("1/3")).toBeInTheDocument();
-
-    // The plan itself is collapsed until asked for; the tasks are the point.
-    expect(within(pane).queryByText("拓宽任务模型")).not.toBeInTheDocument();
-    await user.click(within(pane).getByRole("button", { name: /正在重建侧边栏/ }));
-    expect(within(pane).getByText("拓宽任务模型")).toBeInTheDocument();
-    expect(within(pane).getByText("等待 1 个前置任务")).toBeInTheDocument();
   });
 
   it("lists a terminal process without making it openable as an agent", async () => {
@@ -580,10 +558,8 @@ describe("TasksPane", () => {
       forkDecisions: [forkDecision()]
     });
 
-    // A decision is settled by the time it has a row, so it is history: hidden
-    // until the disclosure is opened.
-    expect(within(pane).queryByText("已创建子对话 · 点击打开")).not.toBeInTheDocument();
-    await user.click(within(pane).getByRole("button", { name: /已完成/ }));
+    // A decision is settled by the time it has a row, so it is history.
+    expect(within(pane).getByRole("button", { name: /已完成/ })).toHaveAttribute("aria-expanded", "true");
 
     const row = within(pane).getByRole("button", { name: "打开“迁移升级脚本”" });
     expect(row).toHaveTextContent("已创建子对话 · 点击打开");
@@ -612,7 +588,6 @@ describe("TasksPane", () => {
       })]
     });
 
-    await user.click(within(pane).getByRole("button", { name: /已完成/ }));
     // The refusal is still recorded — the model is never told the outcome, so
     // this row is the only trace the request ever existed.
     const detail = within(pane).getByText("用户拒绝了分叉");

@@ -802,7 +802,7 @@ fn forward(
             })
         }
         StepEvent::ToolCall { call_id, input } => {
-            let input = input.as_object().cloned().unwrap_or_default();
+            let input = super::call_arguments(input);
             event_sink(ModelStreamEvent::ToolCallArgumentsReady {
                 round,
                 call_id,

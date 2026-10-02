@@ -2,7 +2,7 @@ Writes a value into one form control on the conversation's preview page. The mod
 
 ## Approval
 
-The call is classified as an unbounded action (`tool.unbounded`, high risk): `request_approval`, `allow_edits` and `plan` ask before it runs, `full_access` does not. No page tool is remembered by **Always allow**. If the page is one you signed into yourself, a takeover card comes first, naming the signed-in origin; that confirmation is not turned off by any security level and a hook cannot answer it.
+The call is classified as an unbounded action (`tool.unbounded`, high risk): `request_approval` and `allow_edits` ask before it runs, `full_access` does not. No page tool is remembered by **Always allow**. If the page is one you signed into yourself, a takeover card comes first, naming the signed-in origin; that confirmation is not turned off by any security level and a hook cannot answer it.
 
 ## Behavior and limits
 

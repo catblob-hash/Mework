@@ -35,7 +35,7 @@
 .markdown-code:hover .markdown-code__bar,
 .markdown-code:focus-within .markdown-code__bar { opacity: 1; pointer-events: auto; }
 .markdown-code__language {
-  padding: 0 4px; color: var(--faint); font: 10.5px/20px var(--mono); user-select: none;
+  padding: 0 4px; color: var(--faint); font: 10.5px/20px var(--mono); -webkit-user-select: none; user-select: none;
 }
 .markdown-code__bar .markdown-code__copy {
   width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px;
@@ -48,8 +48,8 @@
 .numbered-code {
   --numbered-code-digits: 3;
   flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 4px 0;
-  display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden;
-  font: 11.5px/18px var(--mono); tab-size: 2; user-select: text;
+  display: flex; flex-direction: column; overflow-y: scroll; overflow-x: hidden;
+  font: 11.5px/18px var(--mono); tab-size: 2; -webkit-user-select: text; user-select: text;
 }
 /* Rows keep their own height: as items of the scrolling column they would otherwise shrink to the
    18px minimum and wrapped lines would draw over the ones below. */
@@ -59,15 +59,15 @@
 .numbered-code__line { transition: background-color .3s; }
 .numbered-code__line--lit { background: var(--accent-soft); }
 /* The gutter has no background of its own: it is the same surface as the code, so a lit line is
-   one band across both and the column never shows a seam. */
+   one band across both and the column never shows a seam. It is exactly as wide as the file's
+   widest number, with no padding either side; the space before the code is the code's own. */
 .numbered-code__number {
-  flex: 0 0 auto; box-sizing: content-box;
-  min-width: calc(var(--numbered-code-digits) * 1ch); padding: 0 10px 0 8px;
-  color: var(--faint); text-align: right; user-select: none;
+  flex: 0 0 auto; width: calc(var(--numbered-code-digits) * 1ch); padding: 0;
+  color: var(--faint); text-align: right; -webkit-user-select: none; user-select: none;
 }
 /* Wrapping is not a setting here, so the line box always owns its own height. */
 .numbered-code__text {
-  flex: 1 1 auto; min-width: 0; padding-right: 10px;
+  flex: 1 1 auto; min-width: 0; padding: 0 10px 0 1ch;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .numbered-code__text .code-token--inserted,

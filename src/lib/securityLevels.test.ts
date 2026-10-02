@@ -11,20 +11,20 @@ const en = (zhCn: string, enUs: string, parameters?: Record<string, string | num
   translate("en-US", zhCn, enUs, parameters);
 
 describe("securityLevels", () => {
-  it("orders the levels from most to least supervised, with plan before full access", () => {
+  it("orders the levels from most to least supervised", () => {
+    // Plan mode is a conversation setting of its own, not a level.
     expect(SECURITY_LEVEL_OPTIONS).toEqual([
       "request_approval",
       "allow_edits",
-      "plan",
       "full_access"
     ]);
   });
 
   it("names every level in both languages", () => {
     expect(SECURITY_LEVEL_OPTIONS.map((level) => securityLevelLabel(level, zh)))
-      .toEqual(["手动", "允许编辑", "计划模式", "完全访问"]);
+      .toEqual(["手动", "允许编辑", "完全访问"]);
     expect(SECURITY_LEVEL_OPTIONS.map((level) => securityLevelLabel(level, en)))
-      .toEqual(["Manual", "Accept edits", "Plan mode", "Full access"]);
+      .toEqual(["Manual", "Accept edits", "Full access"]);
   });
 
   it("gives every level a distinct label", () => {

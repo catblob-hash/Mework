@@ -194,7 +194,7 @@
   display: grid;
   gap: 2px;
   max-height: 160px;
-  overflow: auto;
+  overflow: auto scroll;
   color: var(--faint);
   font-size: 10px;
   overflow-wrap: anywhere;

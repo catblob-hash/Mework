@@ -1,6 +1,6 @@
 //! The local helper model inside the app: a small model (Qwen3.5-0.8B, see
-//! the `mework-local-model` crate) that names conversations and explains
-//! shell commands without calling any provider.
+//! the `mework-local-model` crate) that names conversations and subagents
+//! and explains shell commands without calling any provider.
 //!
 //! There is one build of the model per inference backend (`catalog`): on a
 //! Mac the Neural Engine build and the MLX build, offered by what the chip
@@ -19,7 +19,7 @@ pub(crate) mod uses;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use local_model::prompts::{default_prompt, Task};
@@ -34,13 +34,14 @@ use crate::model::{GlobalSettings, ResolvedLanguage};
 use crate::push_events::{AppEventHub, AppPushEvent};
 
 const CACHE_DIR: &str = "prompt-cache";
+/// In the root: the llama build's runtime (llama.cpp's release build).
+const RUNTIME_DIR: &str = "runtime";
 /// In a variant's directory once it is fully installed: its catalog version.
 const MARKER: &str = "installed.json";
 /// In the root: the variant in use.
 const ACTIVE: &str = "active.json";
-/// Positions per sequence: the prompt (up to ~750 tokens), a 256-token
-/// request and the reply.
-const CONTEXT: usize = 1024;
+/// Positions per sequence (see `local_model::service::CONTEXT`).
+const CONTEXT: usize = local_model::service::CONTEXT;
 
 /// Where one variant's install is, for the renderer.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -83,6 +84,10 @@ pub struct Status {
     /// The active build is loading and caching its prompts (the first load
     /// of the Neural Engine build compiles it for this Mac: minutes).
     pub warming: bool,
+    /// The active build's weights are loading, for whatever reason (warming,
+    /// a request after an idle unload). A Neural Engine load compiles first
+    /// when the system has no compiled copy for this app: minutes.
+    pub loading: bool,
     /// Where the active build runs once loaded, e.g. "Apple Neural Engine".
     pub device: Option<String>,
     pub loaded: bool,
@@ -98,7 +103,8 @@ pub struct Status {
 #[serde(rename_all = "camelCase")]
 pub struct PromptReport {
     pub tokens: usize,
-    pub cache_bytes: u64,
+    /// `None`: no cached state yet, and none was built.
+    pub cache_bytes: Option<u64>,
     pub max_tokens: usize,
 }
 
@@ -107,6 +113,7 @@ pub struct PromptReport {
 pub struct DefaultPrompts {
     pub title: String,
     pub shell: String,
+    pub error: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +140,8 @@ struct Inner {
     generation: u64,
     _pressure: Option<local_model::pressure::Watch>,
     last_status_push: Option<Instant>,
+    /// Where status changes are pushed; set by `initialize`.
+    hub: Option<AppEventHub>,
 }
 
 /// A title the host just wrote, so a renderer commit built before the
@@ -164,6 +173,7 @@ impl Default for HelperModel {
                 generation: 0,
                 _pressure: None,
                 last_status_push: None,
+                hub: None,
             }),
             recent_titles: Mutex::new(HashMap::new()),
             titles_in_flight: Mutex::new(Default::default()),
@@ -181,8 +191,27 @@ mod backends {
     use local_model::mlx::METALLIB_FILE;
     use local_model::scheduler::Loader;
 
-    use super::catalog::{self, VariantId};
+    use super::catalog::VariantId;
     use super::CONTEXT;
+
+    /// The build has its vision files, so its requests may carry images.
+    pub fn sees_images(id: VariantId, dir: &Path) -> bool {
+        match id {
+            VariantId::Ane | VariantId::Mlx => dir.join(local_model::vision::VISION_FILE).is_file(),
+            VariantId::Llama => dir.join(local_model::gguf::MMPROJ_FILE).is_file(),
+        }
+    }
+
+    /// The vision tower of an Apple build in `dir`, if it has one.
+    #[cfg(target_os = "macos")]
+    fn vision_tower(dir: &Path) -> Result<Option<local_model::vision::VisionTower>, String> {
+        let weights = dir.join(local_model::vision::VISION_FILE);
+        if !weights.is_file() {
+            return Ok(None);
+        }
+        let config = local_model::vision::VisionConfig::load(&dir.join("config.json"))?;
+        local_model::vision::VisionTower::open(config, &weights).map(Some)
+    }
 
     /// The backend's own files are in place (the marker says the rest is).
     pub fn is_built(id: VariantId, dir: &Path) -> bool {
@@ -194,12 +223,69 @@ mod backends {
                     use local_model::mlx::weights::{INDEX_FILE, WEIGHTS_FILE};
                     [INDEX_FILE, WEIGHTS_FILE, METALLIB_FILE].iter().all(|name| dir.join(name).exists())
                 }
-                VariantId::Llama => dir.join(GGUF_FILE).exists(),
+                VariantId::Llama => dir.join(GGUF_FILE).exists() && llama_runtime_ready(dir),
             }
     }
 
+    /// Where the llama build in `dir` has its runtime unpacked: under the
+    /// local-model root rather than in `dir`, because once loaded its
+    /// libraries stay loaded (on Windows, locked) until the app quits, even
+    /// after the model is removed.
+    #[cfg(not(target_os = "macos"))]
+    fn llama_runtime(dir: &Path) -> Option<PathBuf> {
+        Some(dir.parent()?.join(super::RUNTIME_DIR).join(local_model::llama::runtime::dir_name()?))
+    }
+
+    /// The llama build in `dir` has its runtime unpacked.
+    pub fn llama_runtime_ready(dir: &Path) -> bool {
+        #[cfg(not(target_os = "macos"))]
+        return llama_runtime(dir)
+            .is_some_and(|runtime| local_model::llama::runtime::is_installed(&runtime, local_model::llama::runtime::archives()));
+        #[cfg(target_os = "macos")]
+        return {
+            let _ = dir;
+            false
+        };
+    }
+
     /// The package's weight file, kept only if the compiled copy differs.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     const ANE_EMBEDDING_FALLBACK: &str = "embedding-weights.bin";
+
+    /// Puts an earlier install's copy of the package's weight file where the
+    /// download continues from, if it is the one `files` pins: a new package
+    /// usually changes the program, not the weights, and the package itself is
+    /// deleted once compiled while the compiled model keeps the same bytes.
+    /// Saves downloading 1.5 GB again.
+    #[cfg(target_os = "macos")]
+    pub fn provide_ane_weights(dir: &Path, files: &[super::download::RemoteFile]) {
+        use local_model::coreml::backend::compiled_weights;
+        let Some(file) = files.iter().find(|file| file.local == ANE_PACKAGE_WEIGHTS) else { return };
+        let target = dir.join(ANE_PACKAGE_WEIGHTS);
+        let part = target.with_file_name("weight.bin.part");
+        if target.exists() || std::fs::metadata(&part).is_ok_and(|meta| meta.len() == file.size) {
+            return;
+        }
+        let candidates = [compiled_weights(&dir.join("model.mlmodelc")), dir.join(ANE_EMBEDDING_FALLBACK)];
+        let Some(found) = candidates.iter().find(|path| {
+            std::fs::metadata(path).is_ok_and(|meta| meta.len() == file.size)
+                && super::download::sha256_file(path).is_ok_and(|digest| digest == file.sha256)
+        }) else {
+            return;
+        };
+        // A whole `.part` passes straight to verification.
+        let copied = part.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::copy(found, &part));
+        match copied {
+            Ok(_) => eprintln!("[local-model] reusing {} instead of downloading it", found.display()),
+            Err(error) => {
+                eprintln!("[local-model] could not copy {}: {error}", found.display());
+                let _ = std::fs::remove_file(&part);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn provide_ane_weights(_dir: &Path, _files: &[super::download::RemoteFile]) {}
     const ANE_PACKAGE: &str = "model.mlpackage";
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     const ANE_PACKAGE_WEIGHTS: &str = "model.mlpackage/Data/com.apple.CoreML/weights/weight.bin";
@@ -211,8 +297,33 @@ mod backends {
     pub fn prepare(id: VariantId, dir: &Path, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(), String> {
         match id {
             VariantId::Ane => prepare_ane(dir, progress),
-            VariantId::Mlx | VariantId::Llama => Ok(()),
+            VariantId::Mlx => Ok(()),
+            VariantId::Llama => prepare_llama(dir, progress),
         }
+    }
+
+    /// Unpacks the llama build's runtime from its archives, unless an earlier
+    /// install already did, and drops the archives.
+    #[cfg(not(target_os = "macos"))]
+    fn prepare_llama(dir: &Path, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(), String> {
+        use local_model::llama::runtime;
+        let target = llama_runtime(dir).ok_or("此平台没有可用的 llama.cpp 运行库")?;
+        let paths: Vec<PathBuf> = runtime::archives().iter().map(|archive| dir.join(archive.name)).collect();
+        if !runtime::is_installed(&target, runtime::archives()) {
+            progress("unpack", 0, 1);
+            let archives: Vec<_> = paths.iter().map(PathBuf::as_path).zip(runtime::archives()).collect();
+            runtime::install(&archives, &target)?;
+            progress("unpack", 1, 1);
+        }
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_llama(_dir: &Path, _progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(), String> {
+        Err("此平台不支持 llama.cpp 版".into())
     }
 
     /// Core ML compiles the package for this Mac (seconds). The compiled
@@ -223,10 +334,12 @@ mod backends {
         use local_model::coreml::backend::compiled_weights;
         let package = dir.join(ANE_PACKAGE);
         let compiled = dir.join("model.mlmodelc");
+        // An earlier install's copy describes an earlier package.
+        let _ = std::fs::remove_file(dir.join(ANE_EMBEDDING_FALLBACK));
         progress("compile", 0, 1);
         local_model::coreml::runtime::compile(&package, &compiled)?;
         progress("verify", 0, 1);
-        let expected = catalog::files(VariantId::Ane)
+        let expected = super::catalog::files(VariantId::Ane)
             .files
             .into_iter()
             .find(|file| file.local == ANE_PACKAGE_WEIGHTS)
@@ -348,6 +461,16 @@ mod backends {
         if id == VariantId::Ane {
             let _ = std::fs::remove_dir_all(dir.join(ANE_PACKAGE));
         }
+        // Runtimes an earlier version of the app unpacked.
+        #[cfg(not(target_os = "macos"))]
+        if let Some(current) = llama_runtime(dir).filter(|_| id == VariantId::Llama) {
+            let entries = current.parent().and_then(|parent| std::fs::read_dir(parent).ok());
+            for entry in entries.into_iter().flatten().flatten() {
+                if entry.path() != current {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
     }
 
     pub fn loader(id: VariantId, dir: PathBuf) -> Loader {
@@ -362,18 +485,34 @@ mod backends {
                 let compiled = dir.join("model.mlmodelc");
                 let fallback = dir.join(ANE_EMBEDDING_FALLBACK);
                 let weights = if fallback.exists() { fallback } else { compiled_weights(&compiled) };
-                let backend = AneBackend::load(&compiled, &weights, &layout, config, &plan, &mut |_, _| {})?;
+                let mut backend = AneBackend::load(&compiled, &weights, &layout, config, &plan, &mut |_, _| {})?;
+                if let Some(tower) = vision_tower(&dir)? {
+                    backend = backend.with_vision(tower);
+                }
                 Ok(Box::new(backend) as Box<dyn local_model::engine::Backend>)
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             VariantId::Mlx => {
-                let backend = local_model::mlx::MlxBackend::load(&dir, SHAPES.slots, CONTEXT)?;
+                let mut backend = local_model::mlx::MlxBackend::load(&dir, SHAPES.slots, CONTEXT)?;
+                if let Some(tower) = vision_tower(&dir)? {
+                    backend = backend.with_vision(tower);
+                }
                 Ok(Box::new(backend) as Box<dyn local_model::engine::Backend>)
             }
             #[cfg(not(target_os = "macos"))]
             VariantId::Llama => {
                 use local_model::llama::{LlamaBackend, LlamaOptions};
-                let options = LlamaOptions { context: CONTEXT, ..LlamaOptions::default() };
+                let projector = dir.join(local_model::gguf::MMPROJ_FILE);
+                let image_factor = local_model::vision::VisionConfig::load(&dir.join("config.json"))
+                    .map(|vision| vision.factor())
+                    .unwrap_or(32);
+                let options = LlamaOptions {
+                    context: CONTEXT,
+                    runtime_dir: llama_runtime(&dir),
+                    projector: projector.is_file().then_some(projector),
+                    image_factor,
+                    ..LlamaOptions::default()
+                };
                 Ok(Box::new(LlamaBackend::load(&dir.join(GGUF_FILE), options)?) as Box<dyn local_model::engine::Backend>)
             }
             #[allow(unreachable_patterns)]
@@ -408,6 +547,7 @@ pub fn prompt_for(settings: &GlobalSettings, task: Task) -> String {
     let custom = match task {
         Task::Title => &prefs.title_prompt,
         Task::Shell => &prefs.shell_prompt,
+        Task::Error => &prefs.error_prompt,
     };
     if custom.trim().is_empty() {
         default_prompt(task, language(settings)).to_string()
@@ -428,6 +568,7 @@ pub fn default_prompts(settings: &GlobalSettings) -> DefaultPrompts {
     DefaultPrompts {
         title: default_prompt(Task::Title, language).to_string(),
         shell: default_prompt(Task::Shell, language).to_string(),
+        error: default_prompt(Task::Error, language).to_string(),
     }
 }
 
@@ -437,6 +578,12 @@ fn dir_size(path: &Path) -> u64 {
         return meta.len();
     }
     std::fs::read_dir(path).map(|entries| entries.flatten().map(|entry| dir_size(&entry.path())).sum()).unwrap_or(0)
+}
+
+/// A build's files on disk, the llama build's runtime included.
+fn variant_disk_bytes(id: VariantId, root: &Path) -> u64 {
+    let runtime = if id == VariantId::Llama { dir_size(&root.join(RUNTIME_DIR)) } else { 0 };
+    dir_size(&root.join(id.dir())) + runtime
 }
 
 fn is_installed(id: VariantId, dir: &Path) -> bool {
@@ -468,8 +615,9 @@ impl HelperModel {
         }
     }
 
-    /// Called once at startup with `<app local data>/local-model`.
-    pub fn initialize(&self, root: PathBuf) {
+    /// Called once at startup with `<app local data>/local-model`; status
+    /// changes the model's thread reports are pushed to `hub`.
+    pub fn initialize(&self, root: PathBuf, hub: AppEventHub) {
         let machine = Machine::detect();
         let mut phases = BTreeMap::new();
         for id in catalog::platform_variants() {
@@ -478,6 +626,11 @@ impl HelperModel {
                 backends::tidy(*id, &root.join(id.dir()));
             }
             phases.insert(*id, phase);
+        }
+        // A removed llama build leaves its runtime behind until the next
+        // start, when nothing has loaded it yet.
+        if phases.get(&VariantId::Llama) != Some(&Phase::Ready) {
+            let _ = std::fs::remove_dir_all(root.join(RUNTIME_DIR));
         }
         let saved = std::fs::read_to_string(root.join(ACTIVE))
             .ok()
@@ -490,6 +643,7 @@ impl HelperModel {
         inner.machine = machine;
         inner.phases = phases;
         inner.active = active;
+        inner.hub = Some(hub);
     }
 
     /// A build is installed and in use.
@@ -528,25 +682,31 @@ impl HelperModel {
         hub.publish(AppPushEvent::LocalModelChanged { status: serde_json::to_value(status).unwrap_or_default() });
     }
 
+    /// The status, with the runtime's fields from `runtime`. Sizes on disk
+    /// are measured after the lock is released.
     fn snapshot(&self, runtime: Option<local_model::scheduler::Status>) -> Status {
-        let inner = self.inner.lock().expect("helper model");
+        let (root, phases, machine, active, warming) = {
+            let inner = self.inner.lock().expect("helper model");
+            (inner.root.clone(), inner.phases.clone(), inner.machine.clone(), inner.active, inner.warming)
+        };
         let runtime = runtime.unwrap_or_default();
         let variants: Vec<VariantStatus> = catalog::platform_variants()
             .iter()
             .map(|id| VariantStatus {
                 id: *id,
-                phase: inner.phases.get(id).cloned().unwrap_or(Phase::Missing),
+                phase: phases.get(id).cloned().unwrap_or(Phase::Missing),
                 download_bytes: catalog::download_bytes(*id),
-                disk_bytes: inner.root.as_deref().map(|root| dir_size(&root.join(id.dir()))).unwrap_or(0),
+                disk_bytes: root.as_deref().map(|root| variant_disk_bytes(*id, root)).unwrap_or(0),
             })
             .collect();
         Status {
-            recommended: inner.machine.recommended(catalog::platform_variants()),
-            machine: inner.machine.clone(),
+            recommended: machine.recommended(catalog::platform_variants()),
+            machine,
             disk_bytes: variants.iter().map(|variant| variant.disk_bytes).sum(),
             variants,
-            active: inner.active,
-            warming: inner.warming,
+            active,
+            warming,
+            loading: runtime.loading,
             device: runtime.device,
             loaded: runtime.loaded,
             running: runtime.running,
@@ -558,43 +718,71 @@ impl HelperModel {
     }
 
     /// Current status, including the runtime's when a service is running.
+    /// Never waits: the runtime's part is what the model's thread last
+    /// published, so a load in progress (minutes, the first time on the
+    /// Neural Engine) cannot hold up whoever asks.
     pub fn status(&self) -> Status {
         let service = self.inner.lock().expect("helper model").service.clone();
-        let runtime = service.and_then(|service| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            service.status(Box::new(move |status| {
-                let _ = tx.send(status);
-            }));
-            rx.recv_timeout(Duration::from_secs(2)).ok().and_then(Result::ok)
-        });
-        self.snapshot(runtime)
+        self.snapshot(service.map(|service| service.status()))
     }
 
-    /// The active build's service, started on first use.
-    pub fn service(&self) -> Result<Service, String> {
-        let mut inner = self.inner.lock().expect("helper model");
-        Self::start_service(&mut inner)
-    }
-
-    fn start_service(inner: &mut Inner) -> Result<Service, String> {
-        if let Some(service) = &inner.service {
-            return Ok(service.clone());
+    /// The active build's service, started on first use. Starting reads the
+    /// tokenizer (megabytes of JSON), so it happens outside the lock; the
+    /// model itself loads on the service's thread when first needed.
+    pub fn service(self: &Arc<Self>) -> Result<Service, String> {
+        loop {
+            if let Some(service) = self.try_start_service()? {
+                return Ok(service);
+            }
         }
-        let id = inner.active.filter(|id| inner.phases.get(id) == Some(&Phase::Ready)).ok_or("本地模型尚未安装")?;
-        let dir = inner.root.clone().ok_or("本地模型尚未初始化")?.join(id.dir());
+    }
+
+    /// `None` when the build in use changed while the service was starting.
+    fn try_start_service(self: &Arc<Self>) -> Result<Option<Service>, String> {
+        let (id, dir, generation) = {
+            let inner = self.inner.lock().expect("helper model");
+            if let Some(service) = &inner.service {
+                return Ok(Some(service.clone()));
+            }
+            let id = inner.active.filter(|id| inner.phases.get(id) == Some(&Phase::Ready)).ok_or("本地模型尚未安装")?;
+            (id, inner.root.clone().ok_or("本地模型尚未初始化")?.join(id.dir()), inner.generation)
+        };
         let service = Service::start(
             ServiceConfig {
                 model_dir: dir.clone(),
                 cache_dir: dir.join(CACHE_DIR),
                 context: CONTEXT,
                 limits: Limits::default(),
+                vision: backends::sees_images(id, &dir),
             },
             backends::loader(id, dir),
         )?;
+        let mut inner = self.inner.lock().expect("helper model");
+        if inner.generation != generation {
+            return Ok(None);
+        }
+        if let Some(existing) = &inner.service {
+            // Another caller started one meanwhile; this one's thread ends when it drops.
+            return Ok(Some(existing.clone()));
+        }
+        let model: Weak<Self> = Arc::downgrade(self);
+        service.observe(Arc::new(move |_status| {
+            if let Some(model) = model.upgrade() {
+                model.publish_with_runtime_now();
+            }
+        }));
         let weak = service.clone();
         inner._pressure = local_model::pressure::watch(move |_critical| weak.unload());
         inner.service = Some(service.clone());
-        Ok(service)
+        Ok(Some(service))
+    }
+
+    /// `publish_with_runtime` to the hub `initialize` was given.
+    fn publish_with_runtime_now(&self) {
+        let hub = self.inner.lock().expect("helper model").hub.clone();
+        if let Some(hub) = hub {
+            self.publish_with_runtime(&hub);
+        }
     }
 
     /// Downloads `id` (from the mirrors in mainland China with
@@ -676,6 +864,13 @@ impl HelperModel {
                 files.files.remove(index);
             }
         }
+        if id == VariantId::Ane {
+            backends::provide_ane_weights(&dir, &files.files);
+        }
+        // The runtime is still unpacked from an earlier install.
+        if id == VariantId::Llama && backends::llama_runtime_ready(&dir) {
+            files.files.retain(|file| file.url.is_none());
+        }
         let source = download::Source::of(&catalog::PREBUILT_REPO, china_mirror);
         download::download(&dir, &files.files, &source, cancel, &mut |p| {
             self.set_phase(hub, id, Phase::Downloading { received: p.received, total: p.total, source: p.source.label.into() });
@@ -697,12 +892,12 @@ impl HelperModel {
         }
     }
 
-    /// Makes `id` (installed) the build in use, then loads it and caches both
+    /// Makes `id` (installed) the build in use, then loads it and caches its
     /// prompts in the background: on a Mac the Neural Engine build's first
     /// load compiles it for this chip, which should happen now rather than
     /// when the first title is due.
     pub fn activate(self: &Arc<Self>, id: VariantId, hub: AppEventHub, settings: GlobalSettings) -> Result<(), String> {
-        let generation = {
+        let (generation, replaced) = {
             let mut inner = self.inner.lock().expect("helper model");
             if inner.phases.get(&id) != Some(&Phase::Ready) {
                 return Err("这个模型还没有安装好".into());
@@ -710,22 +905,28 @@ impl HelperModel {
             let root = inner.root.clone().ok_or("本地模型尚未初始化")?;
             let text = serde_json::to_string(&ActiveFile { variant: id }).expect("active");
             std::fs::write(root.join(ACTIVE), text).map_err(|error| format!("无法保存选择: {error}"))?;
+            let mut replaced = None;
             if inner.active != Some(id) || inner.service.is_none() {
                 inner.active = Some(id);
-                inner.service = None;
+                replaced = inner.service.take();
                 inner._pressure = None;
             }
             inner.generation += 1;
             inner.warming = true;
-            inner.generation
+            (inner.generation, replaced)
         };
+        // Dropping the last handle joins the old model's thread, which may be
+        // in the middle of a load: not here, and never under the lock.
+        if let Some(replaced) = replaced {
+            let _ = std::thread::Builder::new().name("mework-local-model-stop".into()).spawn(move || drop(replaced));
+        }
         self.publish(&hub);
         let this = self.clone();
         std::thread::Builder::new()
             .name("mework-local-model-warm".into())
             .spawn(move || {
                 let result = this.service().and_then(|service| {
-                    for task in [Task::Title, Task::Shell] {
+                    for task in [Task::Title, Task::Shell, Task::Error] {
                         wait_prompt_info(&service, &prompt_for(&settings, task))?;
                     }
                     Ok(())
@@ -749,13 +950,14 @@ impl HelperModel {
     /// takes over (without loading it until needed), or none.
     pub fn remove(&self, id: VariantId, hub: &AppEventHub) -> Result<(), String> {
         let root = self.root()?;
-        {
+        let replaced = {
             let mut inner = self.inner.lock().expect("helper model");
             if inner.installing.as_ref().is_some_and(|(running, _)| *running == id) {
                 return Err("请先取消正在进行的下载".into());
             }
+            let mut replaced = None;
             if inner.active == Some(id) {
-                inner.service = None;
+                replaced = inner.service.take();
                 inner._pressure = None;
                 inner.warming = false;
                 inner.generation += 1;
@@ -772,7 +974,10 @@ impl HelperModel {
                 }
             }
             inner.phases.insert(id, Phase::Missing);
-        }
+            replaced
+        };
+        // Stop the model (joining its thread) before its files go, outside the lock.
+        drop(replaced);
         let dir = root.join(id.dir());
         let result = if dir.exists() { std::fs::remove_dir_all(&dir).map_err(|error| format!("无法删除本地模型: {error}")) } else { Ok(()) };
         {
@@ -784,12 +989,18 @@ impl HelperModel {
         result
     }
 
-    /// Caches `prompt`'s prefix state (loading the model if needed) and
-    /// reports its token count and size.
-    pub fn prompt_report(&self, prompt: &str) -> Result<PromptReport, String> {
+    /// Reports `prompt`'s token count and its prefix state's size. A state
+    /// already on disk is read without the model; otherwise `build` caches
+    /// one (loading the model if needed) and without it the size is `None`.
+    pub fn prompt_report(self: &Arc<Self>, prompt: &str, build: bool) -> Result<PromptReport, String> {
         let service = self.service()?;
+        let max_tokens = service.max_prefix_tokens();
+        let cached = service.cached_prompt_info(prompt)?;
+        if cached.cache_bytes.is_some() || !build {
+            return Ok(PromptReport { tokens: cached.tokens, cache_bytes: cached.cache_bytes, max_tokens });
+        }
         let info = wait_prompt_info(&service, prompt)?;
-        Ok(PromptReport { tokens: info.tokens, cache_bytes: info.cache_bytes, max_tokens: service.max_prefix_tokens() })
+        Ok(PromptReport { tokens: info.tokens, cache_bytes: Some(info.cache_bytes), max_tokens })
     }
 
     /// Drops prompt caches for prompts no longer in effect.
@@ -797,7 +1008,8 @@ impl HelperModel {
         let Some(service) = self.inner.lock().expect("helper model").service.clone() else { return };
         let title = prompt_for(settings, Task::Title);
         let shell = prompt_for(settings, Task::Shell);
-        service.prune_cache(&[&title, &shell]);
+        let error = prompt_for(settings, Task::Error);
+        service.prune_cache(&[&title, &shell, &error]);
     }
 
     pub(crate) fn remember_title(&self, conversation_id: &str, replaced: String, title: String) {
@@ -849,7 +1061,7 @@ mod tests {
     fn status_lists_every_platform_variant() {
         let model = HelperModel::default();
         let dir = tempfile::tempdir().unwrap();
-        model.initialize(dir.path().to_path_buf());
+        model.initialize(dir.path().to_path_buf(), AppEventHub::default());
         let status = model.snapshot(None);
         assert_eq!(status.variants.len(), catalog::platform_variants().len());
         assert_eq!(status.active, None);
@@ -865,7 +1077,7 @@ mod tests {
         let id = catalog::platform_variants()[0];
         std::fs::write(dir.path().join(ACTIVE), serde_json::to_string(&ActiveFile { variant: id }).unwrap()).unwrap();
         let model = HelperModel::default();
-        model.initialize(dir.path().to_path_buf());
+        model.initialize(dir.path().to_path_buf(), AppEventHub::default());
         assert_eq!(model.snapshot(None).active, None, "a saved choice of a missing build is dropped");
     }
 }

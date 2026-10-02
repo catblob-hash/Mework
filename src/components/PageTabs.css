@@ -34,7 +34,7 @@
   gap: 2px;
   border-radius: 6px;
   color: var(--muted);
-  user-select: none;
+  -webkit-user-select: none; user-select: none;
   transition: background .14s, color .14s;
 }
 .page-tab:hover { background: var(--hover); }
@@ -83,22 +83,16 @@
 
 /* Two classes to outrank `.icon-button`'s 32px in the barrel, which loads last. The same rules
    size the measuring copy's placeholders, which carry these classes on plain spans. */
-.page-tab .page-tab__menu-trigger,
 .page-tab .page-tab__close {
   width: 18px;
   height: 18px;
   flex: 0 0 18px;
   border-radius: 5px;
 }
-.page-tab__menu { flex: 0 0 auto; display: flex; align-items: center; }
 .page-tab > :last-child:not(.page-tab__label, .page-tab__editor) { margin-right: 3px; }
 /* Present but unlit until the tab is pointed at or in use, so a row of tabs reads as names
    rather than as a row of controls. */
-.page-tab .page-tab__menu-trigger,
 .page-tab .page-tab__close { opacity: 0; }
-.page-tab:hover .page-tab__menu-trigger,
-.page-tab:focus-within .page-tab__menu-trigger,
-.page-tab .page-tab__menu-trigger.popover-menu__trigger--open,
 .page-tab:hover .page-tab__close,
 .page-tab:focus-within .page-tab__close,
 .page-tab--active .page-tab__close { opacity: 1; }

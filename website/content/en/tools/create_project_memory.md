@@ -2,7 +2,7 @@ Creates one new Markdown document in `<workspace>/.mework/memory/` and records i
 
 ## Approval
 
-Classified as a host-local state change (`host.local_state_change`, medium risk, write effect). No security level raises a card, and plan mode does not refuse it the way it refuses a file write, so there is no **Always allow** to remember. The mandatory confirmation belongs to the global tier alone.
+Classified as a host-local state change (`host.local_state_change`, medium risk, write effect). No security level raises a card, so there is no **Always allow** to remember. The mandatory confirmation belongs to the global tier alone.
 
 ## Behavior and limits
 
@@ -10,7 +10,7 @@ The body is complete Markdown, up to 256 KiB of UTF-8 and free of NUL characters
 
 An existing name fails instead of overwriting. The body is written to a temporary file in the same directory and published by atomic replace, refusing a symbolic link at the target, and the existence check through the index rewrite holds a blocking cross-process lock (`.memory.lock`) inside the tier's `memory/` directory. A failed index rewrite deletes the new document again, so no orphan body survives. The index itself is capped at 64 KiB.
 
-The tier is unavailable when the conversation is not bound to a workspace directory on disk; it fails closed rather than writing into the global tier. On success the tool reports the normalized file name and the tier. The body stays out of the timeline, hooks and receipts, which keep the name, the description and a byte count.
+The tier is unavailable when the conversation is not bound to a workspace directory on disk; it fails closed rather than writing into the global tier. On success the tool reports the normalized file name and the tier. Like any other tool's, the call — body included — appears on the timeline card, reaches hooks, and stays in the conversation the model is replayed.
 
 ## Related
 

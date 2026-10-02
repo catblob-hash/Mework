@@ -227,6 +227,11 @@ pub enum PromptKind {
     Tool,
     /// The model finished a plan and wants to start implementing.
     PlanExit,
+    /// `ask_user`: the model is blocked on the user's answers to its questions.
+    /// The card carries the questions and is answered with a
+    /// [`QuestionResponse`] rather than a yes/no, and it never times out —
+    /// like the terminal dialog it mirrors, it waits for the user.
+    Question,
 }
 
 /// One answer to one card. `feedback` is the user's prose, which only the plan
@@ -236,6 +241,9 @@ pub enum PromptKind {
 pub struct PromptAnswer {
     pub decision: ToolPromptDecision,
     pub feedback: Option<String>,
+    /// What the user did with a question card. Only `PromptKind::Question`
+    /// cards are answered with one; see [`ToolPromptRegistry::resolve_question`].
+    pub question: Option<QuestionResponse>,
 }
 
 impl PromptAnswer {
@@ -243,8 +251,48 @@ impl PromptAnswer {
         Self {
             decision,
             feedback: None,
+            question: None,
         }
     }
+}
+
+/// The renderer's answer to a question card, as the user left it.
+///
+/// `answers` and `notes` are index-aligned with the card's questions: slot `i`
+/// belongs to question `i`, and an unanswered question is `None`. A
+/// multi-select answer arrives already joined with `", "`, which is how the
+/// model reads it. The host, not the renderer, turns this into the tool result
+/// text, so the wording the model sees cannot be supplied by the page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuestionResponse {
+    pub action: QuestionAction,
+    #[serde(default)]
+    pub answers: Vec<Option<String>>,
+    /// The preview text of the option the user picked, per question.
+    #[serde(default)]
+    pub previews: Vec<Option<String>>,
+    /// Free-form notes the user attached to a question.
+    #[serde(default)]
+    pub notes: Vec<Option<String>>,
+}
+
+/// How the user left the question card.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionAction {
+    /// Handed back their answers (possibly not every question) — from the
+    /// card's own submit, or by sending a message from the composer with some
+    /// of the card filled in.
+    #[default]
+    Submit,
+    /// Closed the card without answering. On its own that ends the turn; when
+    /// the user closed it by sending a composer message, the message follows
+    /// the result into the next round instead.
+    Close,
+    /// "Chat about this": the questions are declined, with whatever was
+    /// answered so far handed back so the model can clarify.
+    Chat,
 }
 
 /// Normalizes renderer-supplied card feedback: trimmed, empty treated as
@@ -297,6 +345,11 @@ pub struct PendingToolPrompt {
     /// they are looking at is a deliberate circuit breaker.
     #[serde(default)]
     pub mandatory: bool,
+    /// The questions a `PromptKind::Question` card asks, as the model wrote
+    /// them (the `questions` array of the `ask_user` input). Absent on every
+    /// other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<Value>,
 }
 
 /// Why a prompt stopped waiting. Only `Answered` carries the user's intent.
@@ -503,23 +556,41 @@ impl ToolPromptRegistry {
     ///
     /// `feedback` is the prose the plan cards collect. The manual path has no
     /// card that asks for it and drops it.
+    ///
+    /// A question card only accepts `Deny` here — the user dismissing the
+    /// questions. Answers go through [`resolve_question`](Self::resolve_question);
+    /// a bare "allow" would hand the model an empty answer the user never gave.
     pub fn resolve(
         &self,
         prompt_id: &str,
         decision: ToolPromptDecision,
         feedback: Option<String>,
     ) -> Result<PromptResolution, String> {
-        let entry = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(prompt_id)
-            .ok_or_else(|| "This tool confirmation has ended or does not exist".to_owned())?;
+        let entry = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let question = matches!(
+                pending.get(prompt_id),
+                Some(PendingPrompt::Model { card, .. }) if card.kind == PromptKind::Question
+            );
+            if question && decision.allows() {
+                return Err("A question card is answered with answers, not an approval".into());
+            }
+            pending
+                .remove(prompt_id)
+                .ok_or_else(|| "This tool confirmation has ended or does not exist".to_owned())?
+        };
         match entry {
             PendingPrompt::Model { sender, .. } => {
                 // The receiver is gone only if the waiter already bailed out;
                 // the prompt is over either way.
-                let _ = sender.try_send(PromptAnswer { decision, feedback });
+                let _ = sender.try_send(PromptAnswer {
+                    decision,
+                    feedback,
+                    question: None,
+                });
                 Ok(PromptResolution::Model)
             }
             PendingPrompt::Manual {
@@ -540,6 +611,66 @@ impl ToolPromptRegistry {
                 Ok(PromptResolution::Manual { request, decision })
             }
         }
+    }
+
+    /// Answers a question card with what the user did in it.
+    ///
+    /// `Submit` wakes the worker with an allowing decision and `Chat` with a
+    /// denying one; both carry the response, which is what the worker formats
+    /// into the tool result. The answer must line up with the card's
+    /// questions — one slot per question — so a stale page cannot answer a
+    /// card whose questions it never saw.
+    pub fn resolve_question(
+        &self,
+        prompt_id: &str,
+        response: QuestionResponse,
+    ) -> Result<(), String> {
+        let entry = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(PendingPrompt::Model { card, .. }) = pending.get(prompt_id) else {
+                return Err("This question has ended or does not exist".into());
+            };
+            if card.kind != PromptKind::Question {
+                return Err("This card is not a question".into());
+            }
+            let count = card
+                .questions
+                .as_ref()
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let aligned = |slots: &[Option<String>]| slots.is_empty() || slots.len() == count;
+            // A close carries no answers at all.
+            let answers_aligned = if response.action == QuestionAction::Close {
+                response.answers.is_empty() || response.answers.len() == count
+            } else {
+                response.answers.len() == count
+            };
+            if !answers_aligned
+                || !aligned(&response.previews)
+                || !aligned(&response.notes)
+            {
+                return Err("The answers do not match this card's questions".into());
+            }
+            pending
+                .remove(prompt_id)
+                .ok_or_else(|| "This question has ended or does not exist".to_owned())?
+        };
+        let PendingPrompt::Model { sender, .. } = entry else {
+            unreachable!("checked above");
+        };
+        let decision = match response.action {
+            QuestionAction::Submit => ToolPromptDecision::AllowOnce,
+            QuestionAction::Close | QuestionAction::Chat => ToolPromptDecision::Deny,
+        };
+        let _ = sender.try_send(PromptAnswer {
+            decision,
+            feedback: None,
+            question: Some(response),
+        });
+        Ok(())
     }
 
     /// Retracts the cards **one finished run** raised on its own thread.
@@ -624,9 +755,8 @@ impl ToolPromptRegistry {
     ///
     /// Blanket allowances are a property of authorizing a *tool*, so a card
     /// whose `kind` is not `Tool` neither consults nor records one — a user who
-    /// once said "always allow" for some tool has not thereby agreed to leave
-    /// plan mode, and agreeing to leave plan mode this once must not silently
-    /// answer a later card.
+    /// once said "always allow" for some tool has not thereby approved a plan,
+    /// and approving one plan must not silently answer a later card.
     pub fn ask_answer(
         &self,
         conversation_id: &str,
@@ -638,6 +768,7 @@ impl ToolPromptRegistry {
         announce: impl FnOnce(&PendingToolPrompt) -> Result<(), String>,
     ) -> Result<PromptAnswer, String> {
         let tool_name = card.tool_name.clone();
+        let never_times_out = card.kind == PromptKind::Question;
         let blanket_allowable =
             card.kind == PromptKind::Tool && !mandatory && !never_blanket_allowed(&tool_name);
         if blanket_allowable && self.is_always_allowed(conversation_id, &tool_name, risk_level) {
@@ -687,7 +818,9 @@ impl ToolPromptRegistry {
                 Err(RecvTimeoutError::Disconnected) => break PromptOutcome::Retracted,
                 Err(RecvTimeoutError::Timeout) => {
                     waited += CANCELLATION_POLL;
-                    if waited >= PROMPT_TIMEOUT {
+                    // A question waits for its answer the way the terminal
+                    // dialog does; the run's stop button is what releases it.
+                    if !never_times_out && waited >= PROMPT_TIMEOUT {
                         break PromptOutcome::TimedOut;
                     }
                 }
@@ -763,6 +896,7 @@ mod tests {
             source_call_id: None,
             allow_always_offered: true,
             mandatory: false,
+            questions: None,
         }
     }
 
@@ -917,8 +1051,8 @@ mod tests {
     }
 
     /// Blanket allowances authorize a *tool*. Saying "always allow" to some
-    /// tool has not agreed to leave plan mode, and agreeing to leave plan mode
-    /// this once must not answer a later card by itself.
+    /// tool has not approved a plan, and approving one plan must not answer a
+    /// later card by itself.
     #[test]
     fn a_plan_card_neither_records_nor_consults_an_allowance() {
         let registry = registry();

@@ -202,8 +202,8 @@ update the counts here in the same commit; see the module doc and \
 `model::canonical_subagent_execution_mode_payload`.";
 
         let english = addendum(PromptVersion::V2, &PromptProfile::builtin_english());
-        assert_eq!(english.len(), 2038, "{WHY}");
-        assert_eq!(english.chars().count(), 2034, "{WHY}");
+        assert_eq!(english.len(), 1915, "{WHY}");
+        assert_eq!(english.chars().count(), 1911, "{WHY}");
     }
 
     /// Acceptance (c): `render(V1, x)` is byte-identical to the pre-change

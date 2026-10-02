@@ -10,10 +10,14 @@
 //! Chromium Embedded Framework, loaded into this process, each page a child view of the main
 //! window beside the React WKWebView, DevTools messages sent in-process.
 //!
-//! The engine starts lazily, on the main thread, the first time a page is needed, so a
-//! session that never opens the browser pays nothing. CEF runs with an external message pump
-//! ([`pump`]) on the AppKit run loop tao already turns, and the application object tao created
-//! is taught Chromium's protocols at run time ([`app_protocol`]).
+//! The framework is loaded first thing in `main` ([`preload_framework`]); the engine itself
+//! starts lazily, on the main thread, the first time a page is needed. Loading cannot be lazy:
+//! the framework's static initializers make PartitionAlloc the process's default malloc zone,
+//! and a process that changed allocators halfway through its life crashed on its next
+//! conversation write after the preview pane first opened (SIGSEGV inside SQLite's allocator).
+//! Electron, and so Claude desktop, has Chromium's allocator from the first instruction. CEF runs
+//! with an external message pump ([`pump`]) on the AppKit run loop tao already turns, and the
+//! application object tao created is taught Chromium's protocols at run time ([`app_protocol`]).
 //!
 //! Helper processes: a bundled build ships `Mework Helper.app` (and its GPU/Renderer/Plugin/
 //! Alerts variants) in `Contents/Frameworks`, next to the framework, and runs them sandboxed. A
@@ -30,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Mutex, MutexGuard,
+        mpsc, Mutex, MutexGuard, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -213,6 +217,38 @@ fn helper_executable() -> Result<(PathBuf, bool), String> {
     })
 }
 
+/// The framework this process loaded, loading it on the first call. `cef_load_library` refuses
+/// a second load, so every caller in the application process goes through here.
+fn loaded_framework() -> Result<PathBuf, String> {
+    static LOADED: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    LOADED
+        .get_or_init(|| {
+            let framework = locate_framework()?;
+            load_framework(&framework)?;
+            Ok(framework)
+        })
+        .clone()
+}
+
+/// Loads the framework before anything else in the application allocates. Call first thing in
+/// `main`, after [`subprocess_main`].
+///
+/// The framework's static initializers replace the default malloc zone with PartitionAlloc.
+/// Loaded lazily, with the preview pane, that swap happened under live SQLite connections, and
+/// the next conversation write crashed with SQLite's lookaside free list overwritten. SQLite
+/// keeps the zone it found when it initialized, and after the swap that zone answers 0 for the
+/// size of every block the system allocator handed out before it; which mix-up did the damage
+/// was not pinned down, but with the framework loaded here, before anything else allocates, the
+/// crash is gone. The engine itself still starts only when a page is first needed; loading is a
+/// mapping, about 10 ms warm.
+pub fn preload_framework() {
+    if let Err(error) = loaded_framework() {
+        // The browser pane reports the same error when it is opened; the rest of the
+        // application runs without it.
+        eprintln!("内置浏览器不可用：{error}");
+    }
+}
+
 fn load_framework(framework: &Path) -> Result<(), String> {
     let binary = CString::new(framework.join(FRAMEWORK_BINARY).as_os_str().as_bytes())
         .map_err(|_| "Chromium Embedded Framework 路径无效".to_owned())?;
@@ -331,8 +367,7 @@ fn start_on_main(root: &Path) -> Result<(), String> {
 }
 
 fn start_engine(root: &Path) -> Result<pump::ExternalPump, String> {
-    let framework = locate_framework()?;
-    load_framework(&framework)?;
+    let framework = loaded_framework()?;
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     app_protocol::install()?;
     std::fs::create_dir_all(root)

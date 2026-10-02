@@ -2,130 +2,377 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HistoryPane } from "./HistoryPane";
-import type { WireRequestDetail, WireRequestPart, WireRequestSummary } from "../lib/runtime";
+import type { HistoryEntry, HistoryEntryDetail, HistoryOp, HistoryPart, HistoryUsage } from "../lib/runtime";
 
 const runtime = vi.hoisted(() => ({
-  listWireRequests: vi.fn(),
-  loadWireRequest: vi.fn()
+  listHistoryEntries: vi.fn(),
+  loadHistoryEntry: vi.fn()
 }));
 
 vi.mock("../lib/runtime", () => runtime);
 
-function summary(seq: number, overrides: Partial<WireRequestSummary> = {}): WireRequestSummary {
+interface RequestOverrides {
+  requestId?: string;
+  kind?: "model" | "search" | "fetch";
+  modelId?: string;
+  messagesAdded?: number;
+  usage?: HistoryUsage;
+}
+
+/** A request entry, as the list carries it. */
+function summary(seq: number, overrides: RequestOverrides = {}): HistoryEntry {
+  const { requestId = "run_a", kind = "model", usage, ...detail } = overrides;
   return {
     seq,
     createdAt: "2026-09-15T10:00:00Z",
-    kind: "model",
-    requestId: "run_a",
+    kind: "request",
+    requestId,
     round: 1,
-    attempt: 1,
-    providerName: "Anthropic",
-    family: "anthropic",
-    modelId: "claude-opus-5",
-    partCount: 2,
-    bytes: 2048,
-    messagesAdded: 0,
-    messagesRemoved: 0,
+    detail: {
+      type: kind,
+      attempt: 1,
+      providerName: "Anthropic",
+      family: "anthropic",
+      modelId: "claude-opus-5",
+      partCount: 2,
+      bytes: 2048,
+      messagesAdded: 0,
+      ...detail
+    },
+    usage
+  };
+}
+
+/** Any other entry, as the list carries it. */
+function entry(
+  seq: number,
+  kind: HistoryEntry["kind"],
+  detail: Record<string, unknown> = {},
+  overrides: Partial<HistoryEntry> = {}
+): HistoryEntry {
+  return {
+    seq,
+    createdAt: "2026-09-15T10:00:00Z",
+    kind,
+    requestId: kind === "edit" ? undefined : "run_a",
+    detail,
     ...overrides
   };
 }
 
-function message(ordinal: number, value: unknown, hash: string): WireRequestPart {
-  const body = JSON.stringify(value);
-  return {
+/** A body read back for an entry. */
+function body(of: HistoryEntry, value: unknown): HistoryEntryDetail {
+  return { entry: of, body: JSON.stringify(value), truncated: false };
+}
+
+/** A timeline change read back as its steps. */
+function steps(of: HistoryEntry, ops: HistoryOp[]): HistoryEntryDetail {
+  return { entry: of, truncated: false, ops };
+}
+
+/** The user's message, as the timeline change that put it there. */
+function sent(seq: number, content: string): [HistoryEntry, HistoryEntryDetail] {
+  const edit = entry(seq, "edit", { source: "message", inserted: 1 });
+  return [
+    edit,
+    steps(edit, [
+      {
+        ordinal: 0,
+        op: "insert",
+        contextId: `ctx_${seq}`,
+        position: 0,
+        body: JSON.stringify({ kind: "user", content })
+      }
+    ])
+  ];
+}
+
+/** A run's settlement: the rows it put on the timeline. */
+function settled(seq: number, requestId: string, rows: unknown[]): [HistoryEntry, HistoryEntryDetail] {
+  const run = entry(seq, "run", { source: "run", inserted: rows.length }, { requestId });
+  return [
+    run,
+    steps(
+      run,
+      rows.map((row, ordinal) => ({
+        ordinal,
+        op: "insert" as const,
+        contextId: `ctx_${seq}_${ordinal}`,
+        position: ordinal,
+        body: JSON.stringify(row)
+      }))
+    )
+  ];
+}
+
+/** A request, with the payload it carried: a system prompt and whatever else is given. */
+function sentRequest(
+  seq: number,
+  overrides: RequestOverrides,
+  system = "You are Mework.",
+  rest: Pick<HistoryPart, "kind" | "body">[] = []
+): [HistoryEntry, HistoryEntryDetail] {
+  const request = summary(seq, overrides);
+  const parts = [{ kind: "system" as const, body: system }, ...rest].map((part, ordinal) => ({
     ordinal,
-    kind: "message",
-    hash,
-    body,
-    bytes: new TextEncoder().encode(body).length,
+    ...part,
+    hash: `h-${part.body}`,
+    bytes: part.body.length,
     truncated: false
-  };
+  }));
+  return [request, { entry: request, truncated: false, body: "{}", parts }];
 }
 
-function detail(seq: number, parts: WireRequestPart[]): WireRequestDetail {
+/** The tool list a request declared, as `wire_audit` records it. */
+function tools(...names: string[]): Pick<HistoryPart, "kind" | "body"> {
   return {
-    summary: summary(seq, { partCount: parts.length }),
-    envelope: { family: "anthropic", modelId: "claude-opus-5", $omitted: ["apiKey"] },
-    parts
+    kind: "tools",
+    body: JSON.stringify(names.map((name) => ({ description: "", inputSchema: { type: "object" }, name })))
   };
 }
 
-const question = message(0, { role: "user", content: "看看这个文件" }, "h-question");
-const answer = message(1, { role: "assistant", content: "好的" }, "h-answer");
+/** The marker a request carries where tools joined it. */
+function joined(...names: string[]): Pick<HistoryPart, "kind" | "body"> {
+  return {
+    kind: "message",
+    body: JSON.stringify({ role: "system", content: "", providerOptions: { mework: { toolAddition: names } } })
+  };
+}
+
+/** Serves the pane a history and the bodies of its entries. */
+function serve(pairs: (HistoryEntry | [HistoryEntry, HistoryEntryDetail])[]) {
+  const list = pairs.map((pair) => (Array.isArray(pair) ? pair[0] : pair));
+  const bodies = new Map(
+    pairs.flatMap((pair) => (Array.isArray(pair) ? [[pair[0].seq, pair[1]] as const] : []))
+  );
+  runtime.listHistoryEntries.mockResolvedValue(list);
+  runtime.loadHistoryEntry.mockImplementation(async (_id: string, seq: number) => bodies.get(seq) ?? null);
+}
 
 beforeEach(() => {
-  runtime.listWireRequests.mockReset();
-  runtime.loadWireRequest.mockReset();
-  // A turn is drawn from every payload it issued, so opening one reads them all.
-  // Tests that do not care which say so by answering every read the same way.
-  runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) =>
-    detail(seq, [question])
-  );
+  runtime.listHistoryEntries.mockReset();
+  runtime.loadHistoryEntry.mockReset();
+  runtime.loadHistoryEntry.mockResolvedValue(null);
 });
 
 function paneProps() {
   return { conversationId: "conv_1", contexts: [], streaming: false };
 }
 
-/** The turn rows of the ledger, oldest first. */
-function turnRows(): HTMLElement[] {
+/** The bars of the history, oldest first. */
+function bars(): HTMLElement[] {
   return [...document.querySelectorAll<HTMLElement>(".history-pane__row--round")];
 }
 
-/** The rule one recorded request left inside its turn, or null if unopened. */
-function queryRule(seq: number): HTMLElement | null {
-  const index = screen
-    .queryAllByText(String(seq))
-    .find((node) => node.classList.contains("history-pane__index"));
-  return index?.closest("button") ?? null;
+function barTitles(): (string | null)[] {
+  return bars().map((bar) => bar.querySelector(".history-pane__title")?.textContent ?? null);
 }
 
-function rule(seq: number): HTMLElement {
-  const found = queryRule(seq);
-  if (!found) throw new Error(`no rule for request ${seq}`);
-  return found;
+/** The rows of the open bars, top to bottom, each as the word it leads with. */
+function listShape(): (string | null | undefined)[] {
+  return [...document.querySelectorAll(".history-pane__parts > li > button")].map(
+    (row) => row.querySelector(".history-pane__role")?.textContent
+  );
 }
 
 describe("HistoryPane", () => {
   it("says recording has not started rather than showing an empty list", async () => {
-    runtime.listWireRequests.mockResolvedValue([]);
+    runtime.listHistoryEntries.mockResolvedValue([]);
     render(<HistoryPane {...paneProps()} />);
-    expect(await screen.findByText(/还没有记录到发出去的请求/)).toBeInTheDocument();
+    expect(await screen.findByText(/这个对话还没有历史记录/)).toBeInTheDocument();
   });
 
-  it("groups the requests into the turns that issued them, newest turn open", async () => {
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { requestId: "run_a", messagesAdded: 1 }),
-      summary(2, { requestId: "run_a" }),
-      summary(3, { requestId: "run_b", messagesAdded: 1 })
+  it("lays a turn out as the messages it added, with no request among them", async () => {
+    serve([
+      sent(1, "你看到追加的工具了吗"),
+      sentRequest(2, { messagesAdded: 1 }),
+      entry(3, "response", { finishReason: "stop" }, { answers: 2 }),
+      settled(4, "run_a", [
+        { kind: "system", content: "Tools added: shell", localOnly: true, toolsAdded: ["shell"] },
+        { kind: "reasoning", content: "想一想" },
+        { kind: "tool", toolName: "ls", input: { path: "." }, result: { success: true, output: "a.txt" } },
+        { kind: "assistant", content: "只有一个文件" }
+      ])
     ]);
     render(<HistoryPane {...paneProps()} />);
 
-    // Two turns, and only the newest is open, so request 3 is the one on screen.
-    await waitFor(() => expect(turnRows()).toHaveLength(2));
-    await waitFor(() => expect(rule(3)).toBeInTheDocument());
-    expect(queryRule(1)).toBeNull();
+    await screen.findByText("只有一个文件");
+    // The system prompt it opened with, what the user sent, and what the run put
+    // on the timeline — the tool it was handed, its thinking, the call, the answer.
+    // Each leads with its role and nothing else: no glyph beside the chevron.
+    expect(listShape()).toEqual(["system", "user", "system", "reasoning", "tool", "assistant"]);
+    for (const row of document.querySelectorAll(".history-pane__parts > li > button")) {
+      expect(row.querySelectorAll("svg")).toHaveLength(1);
+    }
+    expect(document.querySelector(".history-pane__row--event")).toBeNull();
+    expect(screen.queryByText(/请求/)).not.toBeInTheDocument();
+  });
 
-    await userEvent.click(turnRows()[0]);
-    await waitFor(() => expect(rule(1)).toBeInTheDocument());
-    expect(rule(2)).toBeInTheDocument();
+  it("stands the user's edits between turns as a bar of their own, with the message a deletion took away", async () => {
+    const removal = entry(5, "edit", { source: "edit", removed: 1 });
+    const rewrite = entry(6, "edit", { source: "edit", replaced: 1 });
+    serve([
+      sent(1, "随便玩一下"),
+      sentRequest(2, { requestId: "run_a", messagesAdded: 1 }),
+      entry(3, "response", {}, { requestId: "run_a", answers: 2 }),
+      settled(4, "run_a", [{ kind: "assistant", content: "我先逛逛" }]),
+      [
+        removal,
+        steps(removal, [
+          {
+            ordinal: 0,
+            op: "remove",
+            contextId: "ctx_4_0",
+            before: JSON.stringify({ kind: "assistant", content: "我先逛逛" })
+          }
+        ])
+      ],
+      [
+        rewrite,
+        steps(rewrite, [
+          {
+            ordinal: 0,
+            op: "replace",
+            contextId: "ctx_1",
+            body: JSON.stringify({ kind: "user", content: "在两个工作区里看看" }),
+            before: JSON.stringify({ kind: "user", content: "随便玩一下" })
+          }
+        ])
+      ],
+      // The edited message sent again.
+      sentRequest(7, { requestId: "run_b", messagesAdded: 0 }),
+      entry(8, "response", {}, { requestId: "run_b", answers: 7 }),
+      settled(9, "run_b", [{ kind: "assistant", content: "两个工作区都是 Mework" }])
+    ]);
+    render(<HistoryPane {...paneProps()} />);
+
+    await waitFor(() => expect(barTitles()).toEqual(["claude-opus-5", "上下文编辑", "claude-opus-5"]));
+    // No bar counts whole messages: what happened to each is said on its own row.
+    expect(bars().map((bar) => bar.textContent)).not.toContainEqual(expect.stringMatching(/[+−~]1/));
+
+    await userEvent.click(bars()[1]);
+    // A message taken away whole is drawn red, and nothing more: no line count.
+    const gone = (await screen.findByText("我先逛逛")).closest("button") as HTMLElement;
+    expect(gone).toHaveAttribute("data-change", "remove");
+    // Tagged as it is in a turn: the edits bar names roles the same way.
+    expect(within(gone).getByText("assistant")).toBeInTheDocument();
+    expect(gone.querySelector(".history-pane__stat")).toBeNull();
+    // One whose content was edited says how many lines the edit changed.
+    const rewritten = screen.getByText("在两个工作区里看看").closest("button") as HTMLElement;
+    expect(rewritten).toHaveAttribute("data-change", "replace");
+    expect(rewritten.querySelector(".history-pane__stat")?.textContent).toBe("+1 −1");
+    await userEvent.click(rewritten);
+    expect(document.querySelector(".history-pane__diff")?.textContent).toContain("随便玩一下");
+  });
+
+  it("folds a turn whose last request never got its answer into a bar titled 意外中断", async () => {
+    const reply = {
+      role: "assistant",
+      content: [
+        { type: "text", text: "我先看看" },
+        { type: "tool-call", toolCallId: "c1", toolName: "shell", input: { command: "ls" } }
+      ]
+    };
+    const response = entry(5, "response", { finishReason: "tool-calls" }, { requestId: "run_b", answers: 4 });
+    const tool = entry(6, "tool", { name: "shell", rewritten: true }, { requestId: "run_b", callId: "c1" });
+    serve([
+      sent(1, "第一句"),
+      sentRequest(2, { requestId: "run_a", messagesAdded: 1 }),
+      entry(3, "response", {}, { requestId: "run_a", answers: 2 }),
+      sentRequest(4, { requestId: "run_b", messagesAdded: 1 }),
+      [response, body(response, reply)],
+      [tool, body(tool, { input: { command: "ls -a" }, requestedInput: { command: "ls" } })],
+      sentRequest(7, { requestId: "run_b", messagesAdded: 0 })
+    ]);
+    render(<HistoryPane {...paneProps()} />);
+
+    await waitFor(() => expect(barTitles()).toEqual(["claude-opus-5", "意外中断"]));
+    // Nothing settled, so what came back is all there is to show.
+    await screen.findByText("我先看看");
+    expect(listShape()).toEqual(["assistant", "tool"]);
+    await userEvent.click(document.querySelector(".history-pane__row--event[data-tone='tool']") as HTMLElement);
+    expect(document.querySelector(".history-pane__diff")?.textContent).toContain("ls -a");
+  });
+
+  it("does not call the turn that is still running interrupted", async () => {
+    serve([
+      sent(1, "第一句"),
+      sentRequest(2, { requestId: "run_a", messagesAdded: 1 }),
+      entry(3, "response", {}, { requestId: "run_a", answers: 2 }),
+      sent(4, "第二句"),
+      sentRequest(5, { requestId: "run_b", messagesAdded: 1 })
+    ]);
+    render(<HistoryPane {...paneProps()} streaming />);
+    await waitFor(() => expect(barTitles()).toEqual(["claude-opus-5", "claude-opus-5"]));
+  });
+
+  it("draws the system prompt only in the turn that changed it", async () => {
+    serve([
+      sent(1, "第一句"),
+      sentRequest(2, { requestId: "run_a", messagesAdded: 1 }),
+      sent(3, "第二句"),
+      sentRequest(4, { requestId: "run_b", messagesAdded: 1 }),
+      sent(5, "第三句"),
+      sentRequest(6, { requestId: "run_c", messagesAdded: 1 }, "You are Mework, careful.")
+    ]);
+    render(<HistoryPane {...paneProps()} />);
+
+    await waitFor(() => expect(listShape()).toEqual(["system", "user"]));
+    const changed = document.querySelector(".history-pane__row--message[data-kind='prompt']");
+    expect(changed).toHaveAttribute("data-change", "replace");
+
+    await userEvent.click(bars()[1]);
+    await waitFor(() => expect(listShape()).toEqual(["user", "system", "user"]));
+  });
+
+  it("draws the tools a turn registered, and a tool a running turn was handed where it joined", async () => {
+    const user = { kind: "message" as const, body: JSON.stringify({ role: "user", content: "第一句" }) };
+    const first = entry(3, "response", { finishReason: "tool-calls" }, { requestId: "run_a", answers: 2 });
+    serve([
+      sent(1, "第一句"),
+      sentRequest(2, { requestId: "run_a", messagesAdded: 1 }, undefined, [tools("ls", "grep"), user]),
+      [first, body(first, { role: "assistant", content: [{ type: "text", text: "先看看" }] })],
+      // The next round hands `handoff` over by append: the list carries it, the
+      // declared tools did not change.
+      sentRequest(4, { requestId: "run_a", messagesAdded: 0 }, undefined, [
+        tools("ls", "grep", "handoff"),
+        user,
+        joined("handoff")
+      ])
+    ]);
+    render(<HistoryPane {...paneProps()} streaming />);
+
+    // The tool list first, as the model reads it, tagged as the field it is.
+    await waitFor(() => expect(listShape()).toEqual(["tools", "system", "user", "assistant", "system"]));
+    const registered = document.querySelector(".history-pane__row--message[data-kind='tools']") as HTMLElement;
+    expect(registered).toHaveAttribute("data-change", "insert");
+    expect(within(registered).getByText("注册 2 个工具")).toBeInTheDocument();
+    expect(within(registered).getByText("ls, grep")).toBeInTheDocument();
+    const appended = document.querySelector(".history-pane__row--message[data-kind='toolsAdded']") as HTMLElement;
+    expect(within(appended).getByText("追加 1 个工具")).toBeInTheDocument();
+    expect(within(appended).getByText("handoff")).toBeInTheDocument();
+  });
+
+  it("gives what nothing has sent yet a bar of its own", async () => {
+    serve([sent(1, "第一句"), sentRequest(2, { messagesAdded: 1 }), sent(3, "还没发出去")]);
+    render(<HistoryPane {...paneProps()} />);
+
+    await waitFor(() => expect(barTitles()).toEqual(["claude-opus-5", "尚未发出"]));
+    expect(await screen.findByText("还没发出去")).toBeInTheDocument();
   });
 
   it("keeps a run that brought no message of the user's in the turn before it", async () => {
     // A bare Send or a task wake opens a new run while continuing the round.
-    runtime.listWireRequests.mockResolvedValue([
+    runtime.listHistoryEntries.mockResolvedValue([
       summary(1, { requestId: "run_a", messagesAdded: 1 }),
       summary(2, { requestId: "run_b", messagesAdded: 0 })
     ]);
     render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(turnRows()).toHaveLength(1));
-    await waitFor(() => expect(rule(1)).toBeInTheDocument());
-    expect(rule(2)).toBeInTheDocument();
+    await waitFor(() => expect(bars()).toHaveLength(1));
   });
 
   it("shows what a turn cost beside the model it ran on", async () => {
-    runtime.listWireRequests.mockResolvedValue([
+    runtime.listHistoryEntries.mockResolvedValue([
       summary(1, {
         messagesAdded: 1,
         usage: { inputTokens: 12_400, cachedInputTokens: 8_100, outputTokens: 210 }
@@ -133,8 +380,8 @@ describe("HistoryPane", () => {
     ]);
     render(<HistoryPane {...paneProps()} />);
 
-    await waitFor(() => expect(turnRows()).toHaveLength(1));
-    const row = turnRows()[0];
+    await waitFor(() => expect(bars()).toHaveLength(1));
+    const row = bars()[0];
     expect(within(row).getByText("claude-opus-5")).toBeInTheDocument();
     expect(row.textContent).toContain("↑12k");
     expect(row.textContent).toContain("⚡8.1k");
@@ -142,258 +389,70 @@ describe("HistoryPane", () => {
   });
 
   it("says a turn recorded no usage rather than drawing it as zero", async () => {
-    runtime.listWireRequests.mockResolvedValue([summary(1, { messagesAdded: 1 })]);
+    runtime.listHistoryEntries.mockResolvedValue([summary(1, { messagesAdded: 1 })]);
     render(<HistoryPane {...paneProps()} />);
-    await waitFor(() => expect(turnRows()).toHaveLength(1));
-    expect(within(turnRows()[0]).getAllByText("—").length).toBeGreaterThan(0);
+    await waitFor(() => expect(bars()).toHaveLength(1));
+    expect(within(bars()[0]).getAllByText("—").length).toBeGreaterThan(0);
   });
 
-  it("counts the messages the user added and removed on the turn", async () => {
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { messagesAdded: 2, messagesRemoved: 1 })
-    ]);
-    render(<HistoryPane {...paneProps()} />);
-
-    const added = await screen.findAllByText("+2");
-    const removed = screen.getAllByText("−1");
-    expect(added[0]).toHaveAttribute("data-status", "added");
-    expect(removed[0]).toHaveAttribute("data-status", "removed");
-  });
-
-  it("draws no counts at all for a turn that changed nothing", async () => {
-    runtime.listWireRequests.mockResolvedValue([summary(1)]);
-    render(<HistoryPane {...paneProps()} />);
-    await waitFor(() => expect(turnRows()).toHaveLength(1));
-    expect(document.querySelector(".history-pane__counts")).toBeNull();
-  });
-
-  it("names a host-minted native request for what it is on its own rule", async () => {
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { kind: "search", requestId: "", messagesAdded: 1 })
-    ]);
-    render(<HistoryPane {...paneProps()} />);
-    expect(await screen.findByText("原生搜索")).toBeInTheDocument();
-  });
-
-  it("marks a retry of the same payload as another attempt", async () => {
-    runtime.listWireRequests.mockResolvedValue([summary(1, { attempt: 2, messagesAdded: 1 })]);
-    render(<HistoryPane {...paneProps()} />);
-    expect(await screen.findByText("第 2 次尝试")).toBeInTheDocument();
-  });
-
-  it("opens a turn into one row per part, and a part into its text", async () => {
-    runtime.listWireRequests.mockResolvedValue([summary(1, { messagesAdded: 1 })]);
-    runtime.loadWireRequest.mockResolvedValue(detail(1, [question, answer]));
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledWith("conv_1", 1));
-
-    expect(await screen.findByText("user")).toBeInTheDocument();
-    expect(screen.getByText("assistant")).toBeInTheDocument();
-    // The preview is on the closed row; the body only appears once it opens.
-    await userEvent.click(screen.getByText("user").closest("button") as HTMLElement);
-    const body = document.querySelector(".history-pane__text");
-    expect(body?.textContent).toContain("看看这个文件");
-  });
-
-  it("folds the history a turn replayed and leaves what it added in front", async () => {
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { requestId: "run_a", messagesAdded: 1 }),
-      summary(2, { requestId: "run_b", messagesAdded: 1 })
-    ]);
-    runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) =>
-      seq === 1 ? detail(1, [question]) : detail(2, [question, answer])
-    );
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledTimes(2));
-
-    // The replayed question is behind the rule; the appended answer is not.
-    const fold = await screen.findByText("此前 1 条消息");
-    expect(screen.queryByText("user")).not.toBeInTheDocument();
-    expect(screen.getByText("assistant")).toBeInTheDocument();
-
-    await userEvent.click(fold.closest("button") as HTMLElement);
-    expect(screen.getByText("user")).toBeInTheDocument();
-  });
-
-  it("rules off each request of a turn under what it was the first to carry", async () => {
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { requestId: "run_a", messagesAdded: 1 }),
-      summary(2, { requestId: "run_a" })
-    ]);
-    runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) =>
-      seq === 1 ? detail(1, [question]) : detail(2, [question, answer])
-    );
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledTimes(2));
-    // One list: the user's message, the rule request 1 left on, the answer it
-    // brought back, and the rule request 2 left on.
-    const rows = [...document.querySelectorAll(".history-pane__parts > li button")];
-    await waitFor(() => expect(rows.length).toBeGreaterThan(0));
-    const shape = [...document.querySelectorAll(".history-pane__parts > li button")].map((row) =>
-      row.classList.contains("history-pane__row--rule")
-        ? `rule:${row.querySelector(".history-pane__index")?.textContent}`
-        : row.querySelector(".history-pane__role")?.textContent
-    );
-    expect(shape).toEqual(["user", "rule:1", "assistant", "rule:2"]);
-  });
-
-  it("paints a message the user added green and one it removed red", async () => {
-    const typed = message(1, { role: "user", content: "再看看这个" }, "h-typed");
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { requestId: "run_a", messagesAdded: 1 }),
-      summary(2, { requestId: "run_b", messagesAdded: 1, messagesRemoved: 1 })
-    ]);
-    runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) =>
-      seq === 1 ? detail(1, [question, answer]) : detail(2, [question, typed])
-    );
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledTimes(2));
-
-    await waitFor(() => {
-      const tones = [...document.querySelectorAll(".history-pane__row--part[data-tone]")].map(
-        (row) => row.getAttribute("data-tone")
-      );
-      expect(tones).toContain("user-added");
-      expect(tones).toContain("removed");
-    });
-  });
-
-  it("leaves the turn's own output uncoloured, so only the user's edits stand out", async () => {
-    runtime.listWireRequests.mockResolvedValue([summary(1, { messagesAdded: 1 }), summary(2)]);
-    runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) =>
-      seq === 1 ? detail(1, [question]) : detail(2, [question, answer])
-    );
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledTimes(2));
-
-    const assistant = await screen.findByText("assistant");
-    expect(assistant.closest("button")).toHaveAttribute("data-tone", "output");
-  });
-
-  it("opens a rewritten message into its own line diff", async () => {
-    const edited = message(0, { role: "user", content: "看看这两个文件" }, "h-edited");
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { requestId: "run_a", messagesAdded: 1 }),
-      summary(2, { requestId: "run_b", messagesAdded: 1 })
-    ]);
-    runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) =>
-      seq === 1 ? detail(1, [question]) : detail(2, [edited])
-    );
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledTimes(2));
-
-    const stat = await screen.findByText("+1 −1 行");
-    await userEvent.click(stat.closest("button") as HTMLElement);
-    const diff = document.querySelector(".history-pane__diff")?.textContent ?? "";
-    expect(diff).toContain("看看这两个文件");
-  });
-
-  it("says a turn carried exactly what the request before it carried", async () => {
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { requestId: "run_a", messagesAdded: 1 }),
-      summary(2, { requestId: "run_b", messagesAdded: 1, attempt: 2 })
-    ]);
-    runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) =>
-      detail(seq, [question])
-    );
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText(/完全相同/)).toBeInTheDocument();
-  });
-
-  it("attributes nothing in a turn whose predecessor the ledger no longer holds", async () => {
-    // Retention prunes from the front, so the oldest surviving turn has nothing
-    // to be read against and must not report its whole history as new.
-    runtime.listWireRequests.mockResolvedValue([summary(7, { messagesAdded: 1 })]);
-    runtime.loadWireRequest.mockResolvedValue(detail(7, [question, answer]));
-    render(<HistoryPane {...paneProps()} />);
-
-    await waitFor(() => expect(runtime.loadWireRequest).toHaveBeenCalledWith("conv_1", 7));
-
-    expect(await screen.findByText("此前 2 条消息")).toBeInTheDocument();
-    expect(screen.queryByText(/完全相同/)).not.toBeInTheDocument();
-  });
-
-  it("shows the payload that was actually sent under the rule the request left", async () => {
-    runtime.listWireRequests.mockResolvedValue([summary(1, { messagesAdded: 1 })]);
-    runtime.loadWireRequest.mockResolvedValue(detail(1, [question]));
-    render(<HistoryPane {...paneProps()} />);
-
-    await userEvent.click(await waitFor(() => rule(1)));
-
-    const json = document.querySelector(".history-pane__text--json")?.textContent ?? "";
-    expect(json).toContain("\"messages\"");
-    expect(json).toContain("看看这个文件");
-    // Credentials are absent by construction, and the payload says so.
-    expect(json).toContain("$omitted");
-    expect(json).not.toContain("apiKey\":");
-  });
-
-  it("keeps the ledger visible when one request's parts cannot be read, and retries", async () => {
-    runtime.listWireRequests.mockResolvedValue([
-      summary(1, { requestId: "run_a", messagesAdded: 1 }),
-      summary(2, { requestId: "run_b", messagesAdded: 1 })
-    ]);
+  it("keeps the history visible when one entry cannot be read, and retries it", async () => {
+    const [message, messageBody] = sent(1, "看看这个文件");
+    const [request, requestBody] = sentRequest(2, { messagesAdded: 1 });
+    const [run, runBody] = settled(3, "run_a", [{ kind: "assistant", content: "好的" }]);
+    runtime.listHistoryEntries.mockResolvedValue([message, request, run]);
     let refused = false;
-    runtime.loadWireRequest.mockImplementation(async (_id: string, seq: number) => {
-      if (seq === 2 && !refused) {
+    runtime.loadHistoryEntry.mockImplementation(async (_id: string, seq: number) => {
+      if (seq === 3 && !refused) {
         refused = true;
-        throw new Error("分段读取失败");
+        throw new Error("正文读取失败");
       }
-      return detail(seq, [question]);
+      return seq === 1 ? messageBody : seq === 2 ? requestBody : seq === 3 ? runBody : null;
     });
     render(<HistoryPane {...paneProps()} />);
 
+    // What the user sent still reads; only the settlement says it failed.
+    expect(await screen.findByText("看看这个文件")).toBeInTheDocument();
     const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("分段读取失败");
-    // The other turn is still there; only this payload failed.
-    expect(turnRows()).toHaveLength(2);
+    expect(alert).toHaveTextContent("正文读取失败");
 
     await userEvent.click(within(alert).getByRole("button", { name: "重试" }));
-    expect(await waitFor(() => rule(2))).toBeInTheDocument();
+    expect(await screen.findByText("好的")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("says so when a payload a turn is drawn from is no longer in the ledger", async () => {
-    runtime.listWireRequests.mockResolvedValue([summary(1, { messagesAdded: 1 })]);
-    runtime.loadWireRequest.mockResolvedValue(null);
+  it("says so when an entry is no longer in the history", async () => {
+    serve([entry(1, "edit", { source: "message", inserted: 1 }), sentRequest(2, { messagesAdded: 1 })]);
     render(<HistoryPane {...paneProps()} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("已不在账本里");
+    expect(await screen.findByRole("alert")).toHaveTextContent("已不在历史记录里");
   });
 
   it("surfaces a read failure instead of an empty pane", async () => {
-    runtime.listWireRequests.mockRejectedValue(new Error("对话库不可用"));
+    runtime.listHistoryEntries.mockRejectedValue(new Error("对话库不可用"));
     render(<HistoryPane {...paneProps()} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("对话库不可用");
   });
 
-  it("reads the conversation's own ledger when no agent is named", async () => {
-    runtime.listWireRequests.mockResolvedValue([]);
+  it("reads the conversation's own history when no agent is named", async () => {
+    runtime.listHistoryEntries.mockResolvedValue([]);
     render(<HistoryPane {...paneProps()} />);
-    await screen.findByText(/这个对话还没有记录到发出去的请求/);
-    expect(runtime.listWireRequests).toHaveBeenCalledWith("conv_1", undefined);
+    await screen.findByText(/这个对话还没有历史记录/);
+    expect(runtime.listHistoryEntries).toHaveBeenCalledWith("conv_1", undefined);
   });
 
-  it("reads one agent's ledger, and says so when that agent has sent nothing", async () => {
-    runtime.listWireRequests.mockResolvedValue([]);
+  it("reads one agent's history, and says so when that agent has done nothing", async () => {
+    runtime.listHistoryEntries.mockResolvedValue([]);
     const { rerender } = render(<HistoryPane {...paneProps()} owners={["reviewer"]} />);
-    expect(await screen.findByText(/这个子代理还没有记录到发出去的请求/)).toBeInTheDocument();
-    expect(runtime.listWireRequests).toHaveBeenCalledWith("conv_1", ["reviewer"]);
+    expect(await screen.findByText(/这个子代理还没有历史记录/)).toBeInTheDocument();
+    expect(runtime.listHistoryEntries).toHaveBeenCalledWith("conv_1", ["reviewer"]);
 
     // The host separates a child's traffic from the session's own, so an agent
     // with nothing recorded must not fall back to the conversation's rows.
-    expect(runtime.listWireRequests).not.toHaveBeenCalledWith("conv_1", undefined);
+    expect(runtime.listHistoryEntries).not.toHaveBeenCalledWith("conv_1", undefined);
 
-    // A list rebuilt on every render is the same ledger; re-reading it once a
+    // A list rebuilt on every render is the same history; re-reading it once a
     // render would poll the store for nothing.
-    const reads = runtime.listWireRequests.mock.calls.length;
+    const reads = runtime.listHistoryEntries.mock.calls.length;
     rerender(<HistoryPane {...paneProps()} owners={["reviewer"]} />);
-    await waitFor(() => expect(runtime.listWireRequests.mock.calls.length).toBe(reads));
+    await waitFor(() => expect(runtime.listHistoryEntries.mock.calls.length).toBe(reads));
   });
 });

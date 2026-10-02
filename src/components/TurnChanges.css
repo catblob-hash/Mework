@@ -29,7 +29,7 @@
 }
 .turn-changes__counts b { color: var(--success); font-weight: 500; }
 .turn-changes__counts em { color: var(--danger); font-style: normal; }
-.turn-changes__chevron { flex: 0 0 auto; color: var(--faint); transition: transform .12s ease; }
+.turn-changes__chevron { flex: 0 0 auto; color: var(--faint); }
 .turn-changes__heading[aria-expanded="true"] .turn-changes__chevron { transform: rotate(90deg); }
 .turn-changes__more { color: var(--muted); }
 .turn-changes__more .turn-changes__chevron { margin-left: auto; }

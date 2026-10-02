@@ -71,7 +71,7 @@ pub(crate) fn image_part(image: &ImageAttachment) -> Value {
 /// File attachment placeholder.
 ///
 /// Carries only the attachment's metadata; `step::hydrate_files` replaces it
-/// with the file's text, read and checked from the store, after the wire ledger
+/// with the file's text, read and checked from the store, after the history
 /// has recorded this form. Like image slots, only this part type in a user
 /// message is recognized — never a lookalike nested in model-controlled JSON.
 pub(crate) fn file_part(file: &FileAttachment) -> Value {
@@ -112,6 +112,10 @@ fn user_message(
 /// a tool result cannot be mistaken for the user speaking, which is what the
 /// old text carrier needed a disclaimer preamble for.
 ///
+/// The call carries the one empty argument `box` takes, and the result the
+/// whole message: nothing the host says rides on arguments the model reads as
+/// its own.
+///
 /// Both parts carry the same wire id, derived from the delivery card's context
 /// id, so the pair stays intact across every later turn.
 pub(crate) fn host_delivery_messages(
@@ -130,7 +134,7 @@ pub(crate) fn host_delivery_messages(
             "type": "tool-call",
             "toolCallId": call_id,
             "toolName": crate::api::BOX_TOOL,
-            "input": {},
+            "input": crate::wire_history::box_call_input(),
         }],
     });
     // The host issued this call, so it has no reasoning to replay. Chat-shaped
@@ -344,6 +348,12 @@ pub(crate) fn project_block(family: Family, block: &CanonicalHistoryBlock, out: 
         CanonicalHistoryBlock::HostDelivery(delivery) => {
             host_delivery_messages(family, delivery, out);
         }
+        CanonicalHistoryBlock::ToolAddition(tools) => {
+            out.push(crate::tool_append::marker_message(tools));
+        }
+        CanonicalHistoryBlock::SystemAppend(content) => {
+            out.push(crate::system_append::marker_message(content));
+        }
     }
 }
 
@@ -372,7 +382,7 @@ pub(crate) fn enforce_frame_budget(messages: &[Value]) -> Result<(), String> {
     let budget = MAX_LINE_BYTES / 2;
     if bytes > budget {
         return Err(format!(
-            "本次请求的对话历史序列化后为 {} MiB，超过单帧 {} MiB 的预算；请先压缩或分支该对话",
+            "本次请求的对话历史序列化后为 {} MiB，超过侧车单帧 {} MiB 的上限；请先压缩或分支该对话",
             bytes / 1024 / 1024,
             budget / 1024 / 1024
         ));
@@ -605,7 +615,7 @@ mod tests {
     fn an_oversized_history_is_refused_with_a_repairable_message() {
         let big = vec![json!({ "role": "user", "content": "x".repeat(MAX_LINE_BYTES) })];
         let error = enforce_frame_budget(&big).expect_err("超预算必须被拒绝");
-        assert!(error.contains("超过单帧"), "{error}");
+        assert!(error.contains("单帧"), "{error}");
         // Ordinary histories must remain within the budget.
         assert!(enforce_frame_budget(&[json!({ "role": "user", "content": "hi" })]).is_ok());
     }

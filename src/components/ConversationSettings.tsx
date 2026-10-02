@@ -4,8 +4,8 @@ import {
   Box,
   FileText,
   FolderCog,
-  ShieldCheck,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Wrench
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
@@ -15,6 +15,7 @@ import {
 } from "../lib/conversationPresets";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
+import { acknowledgeCacheBreak, shouldWarnCacheBreak } from "../lib/cacheBreakWarning";
 import type {
   CapabilityCatalog,
   ContextItem,
@@ -29,19 +30,33 @@ import type {
   ResourceDescriptor,
   ToolDescriptor
 } from "../types";
-import { Dialog, DialogSidebarTitle, Switch, useInSidebarDialog } from "./Common";
+import { Dialog, useInSidebarDialog } from "./Common";
+import { isImeKeyEvent } from "../lib/shortcuts";
 import { editableUserAgentDefinition } from "../lib/agentDefinitions";
 import { isHostDerivedToolName, isPreviewLifecycleToolName } from "../lib/taskTools";
 import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/webSearch";
-import { toolLockOf } from "../lib/toolLock";
+import {
+  backendPinned,
+  backendTone,
+  lockTone,
+  lockTouch,
+  toolLockModelOf,
+  toolLockState,
+  type LockedSettingKind,
+  type WebBackendLeg
+} from "../lib/toolLock";
 import { ConversationTemplateEditor } from "./ConversationTemplateEditor";
-import { FeaturesPage } from "./FeaturesPage";
-import { SandboxSettings } from "./SandboxSettings";
+import { AdvancedToolsPage } from "./AdvancedToolsPage";
+import { DocsLink } from "./DocsLink";
+import { LockableSwitchRow, lockHints as lockHintsOf, type BackendLock } from "./LockTone";
+import { SettingsLayout, SettingsNavigation } from "./SettingsLayout";
+import { SettingsPageHeading } from "./SettingsPageHeading";
+import { ToolSelectionGroups } from "./ToolSelectionGroups";
+import { HostedWindow } from "./WindowLayer";
 import {
   AgentRolesPage,
   CapabilitySelectionPage,
   ConversationPresetsPage,
-  lockedInThisConversationHint,
   settledBackendHint
 } from "./ConversationSettingsPages";
 import "./ConversationSettings.css";
@@ -49,13 +64,13 @@ import "./ConversationSettings.css";
 /**
  * The pages the conversation-settings pane lists down its left edge.
  *
- * `features` carries everything that is not a catalog of named things — the tool
- * picker and the switches derived from it. The others each own one kind of thing
- * the conversation composes with, so a page is never a mixed bag.
+ * `tools` is the tool picker alone; `advanced` carries what is derived from a
+ * switch rather than picked from that list. The others each own one kind of
+ * thing the conversation composes with, so a page is never a mixed bag.
  */
 type ConversationSettingsView =
-  | "features"
-  | "sandbox"
+  | "tools"
+  | "advanced"
   | "skills"
   | "mcp"
   | "hooks"
@@ -75,8 +90,8 @@ type ConversationSettingsView =
 export type ConversationSettingsMode = "conversation" | "preset";
 
 const NAVIGATION: Array<{ id: ConversationSettingsView; icon: typeof SlidersHorizontal }> = [
-  { id: "features", icon: SlidersHorizontal },
-  { id: "sandbox", icon: ShieldCheck },
+  { id: "tools", icon: Wrench },
+  { id: "advanced", icon: SlidersHorizontal },
   { id: "skills", icon: Box },
   { id: "mcp", icon: Blocks },
   { id: "hooks", icon: FolderCog },
@@ -115,8 +130,12 @@ interface ConversationSettingsProps {
   onDeletePreset?: (presetId: string) => void;
   /** Writes an edited body back onto a saved preset. */
   onSavePreset?: (presetId: string, settings: ConversationPresetSettings) => void;
-  /** Saves an edited body of the built-in preset, which cannot change, as a new preset. */
-  onSavePresetCopy?: (presetId: string, settings: ConversationPresetSettings) => void;
+  /**
+   * Saves an edited body of the built-in preset, which cannot change, as a new
+   * preset. `templateBody` is the template as edited in the window, or null to
+   * copy the built-in's own.
+   */
+  onSavePresetCopy?: (presetId: string, settings: ConversationPresetSettings, templateBody: ContextItem[] | null) => void;
   /**
    * Records the template id a preset opens with, at once rather than on Save.
    * A body is written to the host the moment the user asks for it, so the id it
@@ -172,13 +191,24 @@ interface ConversationSettingsProps {
    */
   presetError?: string | null;
   /**
-   * In `conversation` mode, saves these components as a new independent preset.
-   * In `preset` mode, saves the open preset in place.
+   * In `conversation` mode, saves these components as a new independent preset,
+   * opening its timeline as the preset's template when asked to, and resolves
+   * with the preset once it is in the document. The pane then opens it in a
+   * window at its template page.
    */
-  onSaveAsPreset: () => void;
+  onCreatePreset?: (request: { name: string; captureTemplate: boolean }) => Promise<ConversationPreset>;
+  /**
+   * In `preset` mode, saves the open preset in place — or, for the built-in one,
+   * which cannot change, as a new preset. The copy takes the template body as it
+   * was edited in this window, or null when it was not, in which case the copy
+   * takes the built-in's own.
+   */
+  onSaveAsPreset?: (templateBody: ContextItem[] | null) => void;
   mode?: ConversationSettingsMode;
   /** In `preset` mode, the preset this pane is a window onto. */
   presetId?: string;
+  /** The page the pane opens on. */
+  initialView?: ConversationSettingsView;
 }
 
 export function ConversationSettings({
@@ -204,24 +234,38 @@ export function ConversationSettings({
   onRescanCapabilities,
   onRevealCapabilityLocation,
   onProbeMcpServer,
+  onCreatePreset,
   onSaveAsPreset,
   mode = "conversation",
-  presetId
+  presetId,
+  initialView = "tools"
 }: ConversationSettingsProps) {
   const { t } = useI18n();
   const inWindow = useInSidebarDialog();
   const settings = conversation.settings;
-  const [view, setView] = useState<ConversationSettingsView>("features");
+  const [view, setView] = useState<ConversationSettingsView>(initialView);
   /* The preset currently open in a window of this pane, held as a whole
    * conversation-settings body rather than a preset body: the pane edits the
    * former, and narrowing back down to the latter is exactly what saving is. */
   const [presetDraft, setPresetDraft] = useState<
-    { id: string; settings: ConversationSettingsType } | null
+    { id: string; settings: ConversationSettingsType; view?: ConversationSettingsView } | null
   >(null);
   /* The open preset's template body, read once the user asks for that page. A
    * template is big enough that reading it on the chance the page is opened
    * would make opening a preset slower for everyone who never looks. */
   const [templateBody, setTemplateBody] = useState<ContextItem[] | null>(null);
+  /* The built-in preset's template as edited in its window. The host refuses
+   * every write to that template, so the edits are held here, outlive a trip to
+   * another page, and go with the copy that saving makes. */
+  const [heldTemplate, setHeldTemplate] = useState<ContextItem[] | null>(null);
+  /* "Save as preset" asks for a name, and whether the conversation's own
+   * timeline becomes the new preset's template. */
+  const [saveAs, setSaveAs] = useState<{
+    name: string;
+    captureTemplate: boolean;
+    saving: boolean;
+    error: string | null;
+  } | null>(null);
   const editingPreset = mode === "preset";
   const pages = useMemo(
     () => NAVIGATION.filter((item) => (editingPreset
@@ -264,9 +308,77 @@ export function ConversationSettings({
     () => settings.agentDefinitions.filter(editableUserAgentDefinition).length,
     [settings.agentDefinitions]
   );
-  const update = (patch: Partial<ConversationSettingsType>) => onChange({ ...settings, ...patch });
+  /* The conversation's lock, read against the model selected now
+   * (`toolLock.ts`): what its last request cached, whether that cache is still
+   * warm, and whether this model freezes the tool surface outright. A preset
+   * body carries no lock, so a preset window is never toned. */
+  const lockModel = useMemo(() => {
+    const { provider, model } = modelChoiceOf(globalSettings);
+    return toolLockModelOf(provider, model);
+  }, [globalSettings]);
+  /* Ticks when the cache goes cold, so the orange goes with it. */
+  const [lockClock, setLockClock] = useState(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `lockClock` is the moment to read the clock again, though nothing here reads it.
+  const lockState = useMemo(
+    () => toolLockState(settings, lockModel, Date.now()),
+    [settings, lockModel, lockClock]
+  );
+  useEffect(() => {
+    if (!lockState.warm || lockState.warmUntil === null) return;
+    const timer = window.setTimeout(
+      () => setLockClock((tick) => tick + 1),
+      Math.max(0, lockState.warmUntil - Date.now()) + 250
+    );
+    return () => window.clearTimeout(timer);
+  }, [lockState]);
+  const lock = lockState.lock;
+  const toneOf = (kind: LockedSettingKind, lastOn: boolean, nowOn: boolean | undefined) => (
+    lockTone(lockState, kind, lastOn, Boolean(nowOn))
+  );
+  const lockHints = lockHintsOf(t);
+  /* A change that would throw the warm cache away waits here for the one
+   * warning every page shares; the patch, not the whole body, so a run that
+   * lands meanwhile is not written over. The web backends are conversation-only
+   * fields and are written the conversation-only way, so the patch remembers
+   * which writer it belongs to. */
+  const [cacheBreak, setCacheBreak] = useState<{
+    patch: Partial<ConversationSettingsType>;
+    conversationOnly: boolean;
+  } | null>(null);
+  const [cacheBreakNever, setCacheBreakNever] = useState(false);
+  const commit = (patch: Partial<ConversationSettingsType>, conversationOnly: boolean) => {
+    if (conversationOnly) onChangeConversationOnly(patch);
+    else onChange({ ...settings, ...patch });
+  };
+  const guarded = (patch: Partial<ConversationSettingsType>, conversationOnly: boolean) => {
+    const touch = lockTouch(lockState, settings, { ...settings, ...patch });
+    if (touch.hard) return;
+    if (touch.cache && shouldWarnCacheBreak(conversation.id)) {
+      setCacheBreakNever(false);
+      setCacheBreak({ patch, conversationOnly });
+      return;
+    }
+    commit(patch, conversationOnly);
+  };
+  const update = (patch: Partial<ConversationSettingsType>) => guarded(patch, false);
+  /* Whether this model can take a tool mid-conversation at all. Without it a
+     fetched MCP schema would have to join the declared list, so discovery is
+     not offered (the host ignores the setting too). */
+  const discoveryAvailable = lockModel ? lockModel.appendsTools : true;
   const updateWebSearch = (patch: Partial<ConversationWebSearchSettings>) =>
-    onChangeConversationOnly({ webSearch: { ...settings.webSearch, ...patch } });
+    guarded({ webSearch: { ...settings.webSearch, ...patch } }, true);
+  /* A native backend a run has used is settled for good; a host-run one is a
+     cache lock like the switches around it (`backendTone`). */
+  const backendLock = (leg: WebBackendLeg): BackendLock | null => {
+    const tone = backendTone(
+      lockState,
+      leg,
+      leg === "search" ? settings.webSearch.provider : settings.webSearch.fetchProvider
+    );
+    if (!tone) return null;
+    const note = backendPinned(lock, leg) ? settledBackendHint(t) : lockHints[tone];
+    return { tone, note };
+  };
   /* Whether the model this conversation runs on can retrieve a page with its
    * own provider's server-side fetch tool. It decides whether the fetch-provider
    * selector is worth drawing at all, so it is read from the active provider
@@ -299,22 +411,6 @@ export function ConversationSettings({
     const model = modelChoiceOf(globalSettings).model;
     return Boolean(model && supportsVision(model));
   }, [globalSettings]);
-  /* Everything a run has already put in front of the model. Tool exposure is
-   * one-way, so each control the lock covers is drawn spent rather than removed:
-   * the user can still see what this conversation is carrying. */
-  const lock = useMemo(() => toolLockOf(settings), [settings]);
-  const lockedHint = lockedInThisConversationHint(t);
-  /* Delivery freezes as soon as any skill has gone out, in either direction:
-     bodies already in the prompt cannot be moved behind a tool the earlier
-     rounds did not have, and trigger lines already sent cannot be replaced by
-     bodies without saying the same thing twice. A conversation that has run
-     without ever selecting a skill is still free to choose. */
-  const skillDeliveryLocked = lock.skillIds.length > 0;
-  /* Same rule one catalog over: once a server has been dialed, whether its
-     tools' schemas went on the wire is settled. Schemas already declared
-     cannot be withdrawn behind a tool the earlier rounds did not have, and
-     names already announced cannot retroactively have carried their schemas. */
-  const mcpDeliveryLocked = lock.mcpIds.length > 0;
   const presetOptions = globalSettings.conversationPresets;
   /* The built-in preset ships with the build and cannot change, so its window
    * edits a draft the user can only keep as a preset of their own. */
@@ -365,8 +461,8 @@ export function ConversationSettings({
   const listId = (view: ConversationSettingsView) => `catalog:${conversation.id}:${view}`;
 
   const pageTitles: Record<ConversationSettingsView, string> = {
-    features: t("功能", "Features"),
-    sandbox: t("沙箱", "Sandbox"),
+    tools: t("工具", "Tools"),
+    advanced: t("高级工具", "Advanced tools"),
     skills: t("技能", "Skills"),
     mcp: "MCP",
     hooks: t("钩子", "Hooks"),
@@ -376,29 +472,24 @@ export function ConversationSettings({
   };
   /** The count each row trails, so the nav says what the conversation carries. */
   const pageCounts: Record<ConversationSettingsView, number | null> = {
-    features: null,
-    sandbox: null,
+    tools: validEnabledToolCount,
+    advanced: null,
     skills: settings.skillIds.length,
     mcp: settings.mcpIds.length,
     hooks: settings.hookIds.length,
     roles: editableRoleCount,
-    template: templates.find((item) => item.id === openTemplateId)?.messageCount ?? 0,
+    template: heldTemplate?.length ?? templates.find((item) => item.id === openTemplateId)?.messageCount ?? 0,
     presets: presetOptions.length
   };
   const pageBlurbs: Record<ConversationSettingsView, string> = {
-    features: t(
-      "本对话给模型的工具面，以及由开关派生的那几件事。",
-      "The tool surface this conversation hands the model, and the things derived from switches."
+    tools: t(
+      "本对话交给模型的工具。",
+      "The tools this conversation hands the model."
     ),
-    sandbox: editingPreset
-      ? t(
-        "套用这份预设的对话，命令是否在操作系统的沙箱里运行。沙箱以对话为单位：每个对话在它用到的每台机器上各有一个沙箱进程，按“命令里的代码可能是恶意的”来设防。",
-        "Whether the commands of a conversation this preset is applied to run in the operating system's sandbox. A sandbox is drawn around one conversation: each has one sandboxed process on every machine it uses, set up on the assumption that the code its commands run may be hostile."
-      )
-      : t(
-        "本对话的命令是否在操作系统的沙箱里运行。沙箱以对话为单位：本对话在它用到的每台机器上各有一个沙箱进程，与其他对话互不影响，按“命令里的代码可能是恶意的”来设防。",
-        "Whether this conversation's commands run in the operating system's sandbox. A sandbox is drawn around one conversation: this one has one sandboxed process on every machine it uses, apart from every other conversation's, set up on the assumption that the code its commands run may be hostile."
-      ),
+    advanced: t(
+      "不在工具列表里逐个挑、而由开关派生的那几件事：联网、记忆与工具描述。",
+      "What is derived from a switch rather than picked from the tool list: web access, memory and tool descriptions."
+    ),
     skills: t(
       "技能从 ~/.mework/skills/ 与工作区的 .mework/skills/ 扫描而来；这里挑给本对话用的，并决定正文怎么送到模型面前。",
       "Skills are scanned from ~/.mework/skills/ and the workspace's .mework/skills/. Pick which ones this conversation uses, and how their bodies reach the model."
@@ -425,13 +516,497 @@ export function ConversationSettings({
     )
   };
 
+  /* The two tool pages are explained by one page of the site. The link rides on
+   * the line that says what the page is for, at its far end, rather than taking
+   * a row of its own above the list. */
+  const pageDocs = view === "tools" || view === "advanced"
+    ? <DocsLink page="features" />
+    : undefined;
+
+  /* The page itself, the same in the side pane and in a window: only the frame
+   * around it differs. */
+  const pageBody = (
+    <>
+      {view === "tools" && (
+        <ToolSelectionGroups
+          tools={tools}
+          enabledTools={settings.enabledTools}
+          toneOf={(name, enabled) => toneOf("tool", lock.tools.includes(name), enabled)}
+          lockHints={lockHints}
+          onChange={(enabledTools) => update({ enabledTools })}
+          expansionKey={conversation.id}
+        />
+      )}
+
+      {view === "advanced" && (
+        <AdvancedToolsPage
+          webAccess={{
+            enabled: Boolean(settings.webSearchEnabled),
+            tone: toneOf("webSearch", lock.webSearch, settings.webSearchEnabled),
+            onChange: (webSearchEnabled) => update({ webSearchEnabled })
+          }}
+          web={{
+            value: settings.webSearch,
+            onChange: updateWebSearch,
+            webSearchAssets: globalSettings.webSearch,
+            nativeFetchAvailable,
+            nativeToolTypeSelectable,
+            searchLock: backendLock("search"),
+            fetchLock: backendLock("fetch")
+          }}
+          memory={{
+            global: Boolean(settings.globalMemoryEnabled),
+            project: Boolean(settings.projectMemoryEnabled),
+            globalTone: toneOf("memory", lock.globalMemory, settings.globalMemoryEnabled),
+            projectTone: toneOf("memory", lock.projectMemory, settings.projectMemoryEnabled),
+            onChangeGlobal: (globalMemoryEnabled) => update({ globalMemoryEnabled }),
+            onChangeProject: (projectMemoryEnabled) => update({ projectMemoryEnabled })
+          }}
+          /* Conversation-only, so a preset body has no room to carry it:
+             drawing the switch there would promise a save that discards it. */
+          appDataPath={editingPreset ? undefined : {
+            enabled: Boolean(settings.includeAppDataPath),
+            onChange: (includeAppDataPath) => onChangeConversationOnly({ includeAppDataPath })
+          }}
+          toolDescription={{
+            resources: capabilities.toolDescriptionFiles,
+            selectedId: settings.toolDescriptionFileId,
+            onChange: (toolDescriptionFileId) => update({ toolDescriptionFileId })
+          }}
+          lockHints={lockHints}
+        />
+      )}
+
+      {view === "skills" && (
+        <CapabilitySelectionPage
+          kind="skills"
+          onDelete={onDeleteCapability && ((resource) => onDeleteCapability("skills", resource))}
+          error={capabilityError}
+          listId={listId("skills")}
+          resources={capabilities.skills}
+          selectedIds={settings.skillIds}
+          toneOf={(id, selected) => toneOf("skill", lock.skillIds.includes(id), selected)}
+          lockHints={lockHints}
+          workspaceId={workspaceId}
+          onRescan={onRescanCapabilities}
+          onReveal={onRevealCapabilityLocation}
+          onChange={(skillIds) => update({ skillIds })}
+          searchLabel={t("搜索技能", "Search skills")}
+          emptyTitle={t("尚未发现技能", "No skills discovered")}
+          emptyDescription={t(
+            "把技能目录放在 ~/.mework/skills/ 或工作区的 .mework/skills/ 下，Mework 会自动扫描。",
+            "Put skill folders under ~/.mework/skills/ or the workspace's .mework/skills/ and Mework scans them automatically."
+          )}
+          /* Delivery is a property of the page, not of any one row, so it
+             is read after the list it qualifies and drawn even with an
+             empty catalog: how skills would arrive is worth knowing
+             before deciding to install one. Moving it once skills have
+             gone out rewrites the prompt they went out in. */
+          footer={(
+            <LockableSwitchRow
+              title={t("技能按需加载", "Load skills on demand")}
+              description={t(
+                "关闭时已选技能的正文开局就拼进系统提示词。开启后改为暴露一个 skill 工具：模型先看到每个技能的名字与触发条件，需要哪一个才把正文取出来。",
+                "When off, the selected skills' bodies are concatenated into the system prompt up front. When on, a skill tool is exposed instead: the model sees each skill's name and trigger, and pulls the body only for the one it needs."
+              )}
+              checked={Boolean(settings.skillToolEnabled)}
+              tone={toneOf("skillTool", lock.skillTool, settings.skillToolEnabled)}
+              hints={lockHints}
+              onChange={(skillToolEnabled) => update({ skillToolEnabled })}
+              label={settings.skillToolEnabled
+                ? t("按需加载", "On demand")
+                : t("拼进提示词", "In the prompt")}
+            />
+          )}
+        />
+      )}
+
+      {view === "mcp" && (
+        <CapabilitySelectionPage
+          kind="mcp"
+          onDelete={onDeleteCapability && ((resource) => onDeleteCapability("mcp", resource))}
+          error={capabilityError}
+          listId={listId("mcp")}
+          resources={capabilities.mcps}
+          selectedIds={settings.mcpIds}
+          toneOf={(id, selected) => toneOf("mcp", lock.mcpIds.includes(id), selected)}
+          lockHints={lockHints}
+          workspaceId={workspaceId}
+          onRescan={onRescanCapabilities}
+          onReveal={onRevealCapabilityLocation}
+          onProbeMcpServer={onProbeMcpServer}
+          onChange={(mcpIds) => update({ mcpIds })}
+          searchLabel={t("搜索 MCP Server", "Search MCP servers")}
+          emptyTitle={t("尚未发现 MCP Server", "No MCP servers discovered")}
+          emptyDescription={t(
+            "把服务器写进 ~/.mework/mcp.json 或工作区的 .mework/mcp.json（mcpServers 格式，与 Claude Code 的 .mcp.json 相同），保存后重新扫描。",
+            "Declare servers in ~/.mework/mcp.json or the workspace's .mework/mcp.json (the mcpServers shape, same as Claude Code's .mcp.json), then rescan."
+          )}
+          /* How the selected servers' tools arrive, read after the list
+             it qualifies and drawn even with an empty catalog: a server
+             with thirty tools costs a great deal of every request, and
+             that is worth knowing before adding the first one. A model
+             that cannot take a tool mid-conversation has no way to hand
+             over a fetched schema, so it is not offered one. */
+          footer={(
+            <LockableSwitchRow
+              title={t("工具发现", "Tool discovery")}
+              description={t(
+                "关闭时每个 MCP 工具的完整 schema 每一轮都随请求发出。开启后改为只报名字，并暴露一个 tool_search 工具：模型搜到需要的工具，才把它的 schema 取回来，取回之后就能直接调用。",
+                "When off, every MCP tool's full schema goes out with every request. When on, only the names are announced and a tool_search tool is exposed: the model searches for the tool it needs, pulls that one's schema, and can then call it directly."
+              )}
+              checked={discoveryAvailable && Boolean(settings.mcpToolDiscoveryEnabled)}
+              tone={toneOf("discovery", lock.mcpToolDiscovery, settings.mcpToolDiscoveryEnabled)}
+              hints={lockHints}
+              disabled={!discoveryAvailable}
+              disabledNote={t(
+                "当前模型不支持中途追加工具，取回的 schema 无处交付，所以不提供工具发现。",
+                "The selected model cannot take a tool mid-conversation, so a fetched schema would have nowhere to go; tool discovery is not offered."
+              )}
+              onChange={(mcpToolDiscoveryEnabled) => update({ mcpToolDiscoveryEnabled })}
+              label={settings.mcpToolDiscoveryEnabled
+                ? t("按需取回", "On demand")
+                : t("全部声明", "All declared")}
+            />
+          )}
+        />
+      )}
+
+      {view === "hooks" && (
+        <CapabilitySelectionPage
+          kind="hooks"
+          onDelete={onDeleteCapability && ((resource) => onDeleteCapability("hooks", resource))}
+          error={capabilityError}
+          listId={listId("hooks")}
+          resources={capabilities.hooks}
+          selectedIds={settings.hookIds}
+          workspaceId={workspaceId}
+          onRescan={onRescanCapabilities}
+          onReveal={onRevealCapabilityLocation}
+          onChange={(hookIds) => update({ hookIds })}
+          searchLabel={t("搜索钩子", "Search hooks")}
+          emptyTitle={t("尚未发现钩子", "No hooks discovered")}
+          emptyDescription={t(
+            "钩子写在 ~/.mework/hooks.json 或工作区的 .mework/hooks.json 里，保存后自动扫描。",
+            "Hooks live in ~/.mework/hooks.json or the workspace's .mework/hooks.json, and are re-scanned on save."
+          )}
+        />
+      )}
+
+      {view === "roles" && (
+        <AgentRolesPage
+          listId={listId("roles")}
+          settings={settings}
+          globalSettings={globalSettings}
+          tools={tools}
+          templates={templates}
+          presets={presetOptions}
+          onReadTemplate={onReadTemplate}
+          onWriteTemplate={onWriteTemplate}
+          onChange={update}
+        />
+      )}
+
+      {/* The preset's own message queue, edited on the same surface a
+          timeline is. Each edit is written back as it lands — the page
+          carries no save of its own — and saving mints the id when the
+          preset has none and binds it immediately: the body is already on
+          disk by then, so deferring the binding to the dialog's Save would
+          be a window in which abandoning the dialog stranded it. */}
+      {view === "template" && (
+        <ConversationTemplateEditor
+          templateId={openTemplateId}
+          contexts={heldTemplate ?? templateBody}
+          tools={tools}
+          enabledTools={settings.enabledTools}
+          imageInputSupported={imageInputSupported}
+          autosave
+          onEnableTools={(names) => update({
+            enabledTools: [...new Set([...settings.enabledTools, ...names])]
+          })}
+          onSave={builtinPreset
+            /* Nothing can be written to the built-in's template, so an edit is
+               only ever kept for the copy. */
+            ? async (contexts) => setHeldTemplate(contexts)
+            : async (contexts) => {
+              const savedId = await onWriteTemplate(openTemplateId, contexts);
+              setTemplateBody(contexts);
+              if (presetId && savedId !== openTemplateId) {
+                onBindPresetTemplate?.(presetId, savedId);
+              }
+            }}
+        />
+      )}
+
+      {view === "presets" && (
+        <ConversationPresetsPage
+          listId={listId("presets")}
+          presets={presetOptions}
+          appliedId={appliedPresetId}
+          error={presetError}
+          onApply={onApplyPreset}
+          onOpen={openPreset}
+          onRename={(presetId, name) => onRenamePreset?.(presetId, name)}
+          onDelete={(presetId) => onDeletePreset?.(presetId)}
+        />
+      )}
+    </>
+  );
+  /* The template page is a timeline, which brings its own scroller and its own
+   * edges. Padding and a second scrollbar around one would fight it, so that page
+   * gets the body flush. */
+  const flush = view === "template";
+  const pageStack = (
+    <div className={flush
+      ? "conversation-settings__page-stack conversation-settings__page-stack--flush"
+      : "conversation-settings__page-stack"}>
+      {pageBody}
+    </div>
+  );
+  const saveLabel = editingPreset && !builtinPreset
+    ? t("保存预设", "Save preset")
+    : builtinPreset
+      ? t("另存为新预设", "Save as new preset")
+      : t("另存为预设", "Save as preset");
+  const save = editingPreset
+    ? () => onSaveAsPreset?.(builtinPreset ? heldTemplate : null)
+    : () => setSaveAs({ name: "", captureTemplate: false, saving: false, error: null });
+  /* A preset can only open with a timeline the conversation has. */
+  const canCaptureTemplate = conversation.contexts.length > 0;
+  const createPreset = async () => {
+    if (!saveAs || saveAs.saving || !onCreatePreset) return;
+    const name = saveAs.name.trim();
+    if (!name) return;
+    const captureTemplate = saveAs.captureTemplate && canCaptureTemplate;
+    setSaveAs({ ...saveAs, saving: true, error: null });
+    try {
+      const preset = await onCreatePreset({ name, captureTemplate });
+      setSaveAs(null);
+      // Either way the new preset opens at its template: the timeline it took,
+      // or an empty one to write.
+      setPresetDraft({ id: preset.id, settings: presetBodyAsSettings(preset, settings), view: "template" });
+    } catch (reason) {
+      setSaveAs((current) => current && {
+        ...current,
+        saving: false,
+        error: reason instanceof Error ? reason.message : String(reason)
+      });
+    }
+  };
+
+  const dialogs = (
+    <>
+      {/* The one warning every orange row shares: said once per conversation,
+          or never again. The change waits here as a patch and lands on the
+          settings as they are when the user answers. */}
+      {cacheBreak && (
+        <Dialog
+          title={t("这样改会让缓存失效", "This change throws the cache away")}
+          onClose={() => setCacheBreak(null)}
+          width="440px"
+          footer={(
+            <>
+              <button type="button" className="button" onClick={() => setCacheBreak(null)}>
+                {t("取消", "Cancel")}
+              </button>
+              <button
+                type="button"
+                className="button button--primary"
+                onClick={() => {
+                  acknowledgeCacheBreak(conversation.id, cacheBreakNever);
+                  const { patch, conversationOnly } = cacheBreak;
+                  setCacheBreak(null);
+                  commit(patch, conversationOnly);
+                }}
+              >{t("仍然更改", "Change anyway")}</button>
+            </>
+          )}
+        >
+          <p className="confirm-copy">{t(
+            "橘色的设置是上一次请求带着的，它的提示缓存还没过期。改动其中任何一项，下一次请求就得把整段对话重新计费；在那之前改回原样，缓存仍然有效。",
+            "The orange settings are what the last request went out with, and its prompt cache has not expired yet. Changing any of them makes the next request pay for the whole conversation again; change it back before then and the cache still holds."
+          )}</p>
+          <label className="confirm-check">
+            <input
+              type="checkbox"
+              checked={cacheBreakNever}
+              onChange={(event) => setCacheBreakNever(event.target.checked)}
+            />
+            <span>{t("不再显示", "Don't show this again")}</span>
+          </label>
+        </Dialog>
+      )}
+
+      {saveAs && (
+        <Dialog
+          title={t("另存为预设", "Save as preset")}
+          onClose={() => setSaveAs(null)}
+          footer={(
+            <>
+              <button type="button" className="button button--ghost" onClick={() => setSaveAs(null)}>
+                {t("取消", "Cancel")}
+              </button>
+              <button
+                type="button"
+                className="button button--primary"
+                disabled={!saveAs.name.trim() || saveAs.saving}
+                onClick={() => void createPreset()}
+              >
+                {saveAs.saving ? t("正在保存…", "Saving…") : t("保存为预设", "Save as preset")}
+              </button>
+            </>
+          )}
+        >
+          <label className="field">
+            <span className="field__label">{t("预设名称", "Preset name")}</span>
+            <input
+              className="input"
+              autoFocus
+              value={saveAs.name}
+              onChange={(event) => setSaveAs((current) => current && { ...current, name: event.target.value })}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || isImeKeyEvent(event.nativeEvent)) return;
+                event.preventDefault();
+                void createPreset();
+              }}
+              placeholder={t("例如：代码评审", "e.g. Code review")}
+            />
+          </label>
+          <label
+            className="confirm-check"
+            title={canCaptureTemplate ? undefined : t("这段对话还没有消息", "This conversation has no messages yet")}
+          >
+            <input
+              type="checkbox"
+              checked={saveAs.captureTemplate && canCaptureTemplate}
+              disabled={!canCaptureTemplate}
+              onChange={(event) => setSaveAs((current) => current && {
+                ...current,
+                captureTemplate: event.target.checked
+              })}
+            />
+            <span>{t("将当前上下文作为对话模板", "Use the current context as the conversation template")}</span>
+          </label>
+          {saveAs.error && <p className="field__hint field__hint--error" role="alert">{saveAs.error}</p>}
+        </Dialog>
+      )}
+
+      {/* A preset opens into this same pane rather than a second editor: they
+          would otherwise have to be kept in step by hand forever. Its catalog
+          pages list the same skills, servers and hooks the outer pane does, so
+          they get the same delete: removing an entry here removes it from disk,
+          not merely from the preset. */}
+      {presetDraft && openedPreset && (
+        <HostedWindow>
+          <Dialog
+            title={openedPreset.name || t("未命名预设", "Untitled preset")}
+            width="1040px"
+            sidebar
+            bodyClassName="dialog__body--flush"
+            onClose={() => setPresetDraft(null)}
+          >
+            <ConversationSettings
+              mode="preset"
+              presetId={presetDraft.id}
+              conversation={{
+                ...conversation,
+                id: `preset:${presetDraft.id}`,
+                presetId: "",
+                /* The preset's own binding, read live rather than from the draft:
+                   saving a body binds the id at once, so the draft is not where
+                   that fact lives. */
+                templateId: openedPreset.templateId,
+                settings: presetDraft.settings
+              }}
+              globalSettings={globalSettings}
+              tools={tools}
+              capabilities={capabilities}
+              onChange={(next) => setPresetDraft((current) => (
+                current && { ...current, settings: next }
+              ))}
+              onChangeConversationOnly={(patch) => setPresetDraft((current) => (
+                current && { ...current, settings: { ...current.settings, ...patch } }
+              ))}
+              onApplyPreset={onApplyPreset}
+              onBindPresetTemplate={onBindPresetTemplate}
+              templates={templates}
+              onReadTemplate={onReadTemplate}
+              onWriteTemplate={onWriteTemplate}
+              onDeleteCapability={onDeleteCapability}
+              capabilityError={capabilityError}
+              /* A preset is reusable and points at no workspace in particular, so it
+                 is deliberately handed no `workspaceId`: the pages draw the whole
+                 catalog rather than narrowing to one conversation's level. */
+              onRescanCapabilities={onRescanCapabilities}
+              onRevealCapabilityLocation={onRevealCapabilityLocation}
+              onProbeMcpServer={onProbeMcpServer}
+              initialView={presetDraft.view}
+              onSaveAsPreset={(templateBody) => {
+                const body = captureConversationPresetSettings(presetDraft.settings);
+                if (isBuiltinConversationPreset(presetDraft.id)) onSavePresetCopy?.(presetDraft.id, body, templateBody);
+                else onSavePreset?.(presetDraft.id, body);
+                setPresetDraft(null);
+              }}
+            />
+          </Dialog>
+        </HostedWindow>
+      )}
+    </>
+  );
+
+  /* In a window — a preset opened from the presets page — the pane takes the
+   * global settings' layout: the same rail and the same page. Saving belongs to
+   * the whole window rather than to one page, so it sits at the foot of the rail,
+   * as it does in the side pane. */
+  if (inWindow) {
+    return (
+      <>
+        <SettingsLayout
+          label={editingPreset ? t("预设设置", "Preset settings") : t("对话设置", "Conversation settings")}
+          navigation={(
+            <SettingsNavigation
+              label={t("对话设置分类", "Conversation settings categories")}
+              groups={[{
+                id: "pages",
+                items: pages.map((item) => ({
+                  id: item.id,
+                  icon: item.icon,
+                  label: pageTitles[item.id],
+                  count: pageCounts[item.id]
+                }))
+              }]}
+              view={view}
+              onSelect={setView}
+              footer={(
+                <button type="button" className="settings-nav__action" onClick={save}>
+                  {saveLabel}
+                </button>
+              )}
+            />
+          )}
+        >
+          <section className={flush ? "settings-page settings-editor-page" : "settings-page"}>
+            {/* The rail names the page, so the page says only what it is for, as
+                it does in the side pane. */}
+            <SettingsPageHeading description={pageBlurbs[view]} action={pageDocs} />
+            {builtinPreset && <p className="settings-page__note">{t(
+              "内置预设随 Mework 版本更新，不能修改或删除。在这里做的改动，连同对话模板，可以另存为一份新预设。",
+              "The built-in preset updates with Mework and cannot be edited or deleted. What you change here, the conversation template included, can be saved as a new preset."
+            )}</p>}
+            {pageStack}
+          </section>
+        </SettingsLayout>
+        {dialogs}
+      </>
+    );
+  }
+
   return (
     <div className="conversation-settings">
       <nav
         className="conversation-settings__nav settings-nav"
         aria-label={t("对话设置分类", "Conversation settings categories")}
       >
-        <DialogSidebarTitle />
         <div className="conversation-settings__nav-items">
           {pages.map((item) => {
             const Icon = item.icon;
@@ -465,319 +1040,28 @@ export function ConversationSettings({
             <button
               type="button"
               className="text-button"
-              onClick={onSaveAsPreset}
-            >{editingPreset && !builtinPreset
-              ? t("保存预设", "Save preset")
-              : builtinPreset
-                ? t("另存为新预设", "Save as new preset")
-                : t("另存为预设", "Save as preset")}</button>
+              onClick={save}
+            >{saveLabel}</button>
           </div>
         </div>
       </nav>
 
       <div className="conversation-settings__page">
+        {/* The side pane's own header names it and the page; the blurb says what
+            the page is for. */}
         <header className="conversation-settings__page-header">
-          {/* In the side pane the pane's own header names it; a window has no title
-              bar, so the page names itself, beside the window's close button. */}
-          {inWindow && <h3 className="conversation-settings__page-title">{pageTitles[view]}</h3>}
-          <p>{pageBlurbs[view]}</p>
-          {builtinPreset && <p className="field__hint">{t(
-            "内置预设随 Mework 版本更新，不能修改或删除。在这里改动的设置可以另存为一份新预设；对话模板只读，不随副本带走。",
-            "The built-in preset updates with Mework and cannot be edited or deleted. Settings changed here can be saved as a new preset; the conversation template is read-only and does not go with the copy."
-          )}</p>}
+          <div className="conversation-settings__page-header-line">
+            <p>{pageBlurbs[view]}</p>
+            {pageDocs}
+          </div>
         </header>
-        {/* The template page is a timeline, which brings its own scroller and
-            its own edges. Padding and a second scrollbar around one would fight
-            it, so that page gets the body flush. */}
-        <div className={view === "template"
+        <div className={flush
           ? "conversation-settings__page-body conversation-settings__page-body--flush"
           : "conversation-settings__page-body"}>
-          <div className={view === "template"
-            ? "conversation-settings__page-stack conversation-settings__page-stack--flush"
-            : "conversation-settings__page-stack"}>
-            {view === "features" && (
-              <FeaturesPage
-                picker={{
-                  tools,
-                  enabledTools: settings.enabledTools,
-                  lockedTools: lock.tools,
-                  onChange: (enabledTools) => update({ enabledTools }),
-                  expansionKey: conversation.id
-                }}
-                pickerSummary={t(
-                  "{enabled} / {total} 个已选",
-                  "{enabled} / {total} selected",
-                  { enabled: validEnabledToolCount, total: toolNames.length }
-                )}
-                webAccess={{
-                  enabled: Boolean(settings.webSearchEnabled),
-                  locked: lock.webSearch,
-                  onChange: (webSearchEnabled) => update({ webSearchEnabled })
-                }}
-                web={{
-                  value: settings.webSearch,
-                  onChange: updateWebSearch,
-                  webSearchAssets: globalSettings.webSearch,
-                  nativeFetchAvailable,
-                  nativeToolTypeSelectable,
-                  lockedHint: settledBackendHint(t),
-                  searchLocked: lock.searchProvider !== null,
-                  fetchLocked: lock.fetchProvider !== null
-                }}
-                memory={{
-                  global: Boolean(settings.globalMemoryEnabled),
-                  project: Boolean(settings.projectMemoryEnabled),
-                  globalLocked: lock.globalMemory,
-                  projectLocked: lock.projectMemory,
-                  onChangeGlobal: (globalMemoryEnabled) => update({ globalMemoryEnabled }),
-                  onChangeProject: (projectMemoryEnabled) => update({ projectMemoryEnabled })
-                }}
-                /* Conversation-only, so a preset body has no room to carry it:
-                   drawing the switch there would promise a save that discards it. */
-                appDataPath={editingPreset ? undefined : {
-                  enabled: Boolean(settings.includeAppDataPath),
-                  onChange: (includeAppDataPath) => onChangeConversationOnly({ includeAppDataPath })
-                }}
-                toolDescription={{
-                  resources: capabilities.toolDescriptionFiles,
-                  selectedId: settings.toolDescriptionFileId,
-                  onChange: (toolDescriptionFileId) => update({ toolDescriptionFileId })
-                }}
-                lockedHint={lockedHint}
-              />
-            )}
-
-            {view === "sandbox" && (
-              <SandboxSettings
-                settings={settings.sandbox}
-                onChange={(sandbox) => update({ sandbox })}
-              />
-            )}
-
-            {view === "skills" && (
-              <CapabilitySelectionPage
-                kind="skills"
-                onDelete={onDeleteCapability && ((resource) => onDeleteCapability("skills", resource))}
-                error={capabilityError}
-                listId={listId("skills")}
-                resources={capabilities.skills}
-                selectedIds={settings.skillIds}
-                lockedIds={lock.skillIds}
-                workspaceId={workspaceId}
-                onRescan={onRescanCapabilities}
-                onReveal={onRevealCapabilityLocation}
-                onChange={(skillIds) => update({ skillIds })}
-                searchLabel={t("搜索技能", "Search skills")}
-                emptyTitle={t("尚未发现技能", "No skills discovered")}
-                emptyDescription={t(
-                  "把技能目录放在 ~/.mework/skills/ 或工作区的 .mework/skills/ 下，Mework 会自动扫描。",
-                  "Put skill folders under ~/.mework/skills/ or the workspace's .mework/skills/ and Mework scans them automatically."
-                )}
-                /* Delivery is a property of the page, not of any one row, so it
-                   is read after the list it qualifies and drawn even with an
-                   empty catalog: how skills would arrive is worth knowing
-                   before deciding to install one. Frozen once skills have gone
-                   out — the transcript already carries them one way. */
-                footer={(
-                  <div className={`tool-toggle-row${skillDeliveryLocked ? " tool-toggle-row--locked" : ""}`}>
-                    <span><strong>{t("技能按需加载", "Load skills on demand")}</strong><small>{t(
-                      "关闭时已选技能的正文开局就拼进系统提示词。开启后改为暴露一个 skill 工具：模型先看到每个技能的名字与触发条件，需要哪一个才把正文取出来。",
-                      "When off, the selected skills' bodies are concatenated into the system prompt up front. When on, a skill tool is exposed instead: the model sees each skill's name and trigger, and pulls the body only for the one it needs."
-                    )}</small>{skillDeliveryLocked && <small>{lockedHint}</small>}</span>
-                    <Switch
-                      checked={Boolean(settings.skillToolEnabled)}
-                      disabled={skillDeliveryLocked}
-                      onChange={(skillToolEnabled) => update({ skillToolEnabled })}
-                      label={settings.skillToolEnabled
-                        ? t("按需加载", "On demand")
-                        : t("拼进提示词", "In the prompt")}
-                    />
-                  </div>
-                )}
-              />
-            )}
-
-            {view === "mcp" && (
-              <CapabilitySelectionPage
-                kind="mcp"
-                onDelete={onDeleteCapability && ((resource) => onDeleteCapability("mcp", resource))}
-                error={capabilityError}
-                listId={listId("mcp")}
-                resources={capabilities.mcps}
-                selectedIds={settings.mcpIds}
-                lockedIds={lock.mcpIds}
-                workspaceId={workspaceId}
-                onRescan={onRescanCapabilities}
-                onReveal={onRevealCapabilityLocation}
-                onProbeMcpServer={onProbeMcpServer}
-                onChange={(mcpIds) => update({ mcpIds })}
-                searchLabel={t("搜索 MCP Server", "Search MCP servers")}
-                emptyTitle={t("尚未发现 MCP Server", "No MCP servers discovered")}
-                emptyDescription={t(
-                  "把服务器写进 ~/.mework/mcp.json 或工作区的 .mework/mcp.json（mcpServers 格式，与 Claude Code 的 .mcp.json 相同），保存后重新扫描。",
-                  "Declare servers in ~/.mework/mcp.json or the workspace's .mework/mcp.json (the mcpServers shape, same as Claude Code's .mcp.json), then rescan."
-                )}
-                /* How the selected servers' tools arrive, read after the list
-                   it qualifies and drawn even with an empty catalog: a server
-                   with thirty tools costs a great deal of every request, and
-                   that is worth knowing before adding the first one. Frozen
-                   once any server has been dialed — the transcript already
-                   carries its tools one way. */
-                footer={(
-                  <div className={`tool-toggle-row${mcpDeliveryLocked ? " tool-toggle-row--locked" : ""}`}>
-                    <span><strong>{t("工具发现", "Tool discovery")}</strong><small>{t(
-                      "关闭时每个 MCP 工具的完整 schema 每一轮都随请求发出。开启后改为只报名字，并暴露一个 tool_search 工具：模型搜到需要的工具，才把它的 schema 取回来，取回之后就能直接调用。",
-                      "When off, every MCP tool's full schema goes out with every request. When on, only the names are announced and a tool_search tool is exposed: the model searches for the tool it needs, pulls that one's schema, and can then call it directly."
-                    )}</small>{mcpDeliveryLocked && <small>{lockedHint}</small>}</span>
-                    <Switch
-                      checked={Boolean(settings.mcpToolDiscoveryEnabled)}
-                      disabled={mcpDeliveryLocked}
-                      onChange={(mcpToolDiscoveryEnabled) => update({ mcpToolDiscoveryEnabled })}
-                      label={settings.mcpToolDiscoveryEnabled
-                        ? t("按需取回", "On demand")
-                        : t("全部声明", "All declared")}
-                    />
-                  </div>
-                )}
-              />
-            )}
-
-            {view === "hooks" && (
-              <CapabilitySelectionPage
-                kind="hooks"
-                onDelete={onDeleteCapability && ((resource) => onDeleteCapability("hooks", resource))}
-                error={capabilityError}
-                listId={listId("hooks")}
-                resources={capabilities.hooks}
-                selectedIds={settings.hookIds}
-                workspaceId={workspaceId}
-                onRescan={onRescanCapabilities}
-                onReveal={onRevealCapabilityLocation}
-                onChange={(hookIds) => update({ hookIds })}
-                searchLabel={t("搜索钩子", "Search hooks")}
-                emptyTitle={t("尚未发现钩子", "No hooks discovered")}
-                emptyDescription={t(
-                  "钩子写在 ~/.mework/hooks.json 或工作区的 .mework/hooks.json 里，保存后自动扫描。",
-                  "Hooks live in ~/.mework/hooks.json or the workspace's .mework/hooks.json, and are re-scanned on save."
-                )}
-              />
-            )}
-
-            {view === "roles" && (
-              <AgentRolesPage
-                listId={listId("roles")}
-                settings={settings}
-                globalSettings={globalSettings}
-                tools={tools}
-                templates={templates}
-                presets={presetOptions}
-                onReadTemplate={onReadTemplate}
-                onWriteTemplate={onWriteTemplate}
-                onChange={update}
-              />
-            )}
-
-            {/* The preset's own message queue, edited on the same surface a
-                timeline is. Each edit is written back as it lands — the page
-                carries no save of its own — and saving mints the id when the
-                preset has none and binds it immediately: the body is already on
-                disk by then, so deferring the binding to the dialog's Save would
-                be a window in which abandoning the dialog stranded it. */}
-            {view === "template" && (
-              <ConversationTemplateEditor
-                templateId={openTemplateId}
-                contexts={templateBody}
-                tools={tools}
-                enabledTools={settings.enabledTools}
-                editable={!builtinPreset}
-                imageInputSupported={imageInputSupported}
-                autosave
-                onEnableTools={(names) => update({
-                  enabledTools: [...new Set([...settings.enabledTools, ...names])]
-                })}
-                onSave={async (contexts) => {
-                  const savedId = await onWriteTemplate(openTemplateId, contexts);
-                  setTemplateBody(contexts);
-                  if (presetId && savedId !== openTemplateId) {
-                    onBindPresetTemplate?.(presetId, savedId);
-                  }
-                }}
-              />
-            )}
-
-            {view === "presets" && (
-              <ConversationPresetsPage
-                listId={listId("presets")}
-                presets={presetOptions}
-                appliedId={appliedPresetId}
-                error={presetError}
-                onApply={onApplyPreset}
-                onOpen={openPreset}
-                onRename={(presetId, name) => onRenamePreset?.(presetId, name)}
-                onDelete={(presetId) => onDeletePreset?.(presetId)}
-              />
-            )}
-          </div>
+          {pageStack}
         </div>
       </div>
-
-      {/* A preset opens into this same pane rather than a second editor: they
-          would otherwise have to be kept in step by hand forever. Its catalog
-          pages list the same skills, servers and hooks the outer pane does, so
-          they get the same delete: removing an entry here removes it from disk,
-          not merely from the preset. */}
-      {presetDraft && openedPreset && (
-        <Dialog
-          title={openedPreset.name || t("未命名预设", "Untitled preset")}
-          width="1040px"
-          sidebar
-          bodyClassName="dialog__body--flush"
-          onClose={() => setPresetDraft(null)}
-        >
-          <ConversationSettings
-            mode="preset"
-            presetId={presetDraft.id}
-            conversation={{
-              ...conversation,
-              id: `preset:${presetDraft.id}`,
-              presetId: "",
-              /* The preset's own binding, read live rather than from the draft:
-                 saving a body binds the id at once, so the draft is not where
-                 that fact lives. */
-              templateId: openedPreset.templateId,
-              settings: presetDraft.settings
-            }}
-            globalSettings={globalSettings}
-            tools={tools}
-            capabilities={capabilities}
-            onChange={(next) => setPresetDraft((current) => (
-              current && { ...current, settings: next }
-            ))}
-            onChangeConversationOnly={(patch) => setPresetDraft((current) => (
-              current && { ...current, settings: { ...current.settings, ...patch } }
-            ))}
-            onApplyPreset={onApplyPreset}
-            onBindPresetTemplate={onBindPresetTemplate}
-            templates={templates}
-            onReadTemplate={onReadTemplate}
-            onWriteTemplate={onWriteTemplate}
-            onDeleteCapability={onDeleteCapability}
-            capabilityError={capabilityError}
-            /* A preset is reusable and points at no workspace in particular, so it
-               is deliberately handed no `workspaceId`: the pages draw the whole
-               catalog rather than narrowing to one conversation's level. */
-            onRescanCapabilities={onRescanCapabilities}
-            onRevealCapabilityLocation={onRevealCapabilityLocation}
-            onProbeMcpServer={onProbeMcpServer}
-            onSaveAsPreset={() => {
-              const body = captureConversationPresetSettings(presetDraft.settings);
-              if (isBuiltinConversationPreset(presetDraft.id)) onSavePresetCopy?.(presetDraft.id, body);
-              else onSavePreset?.(presetDraft.id, body);
-              setPresetDraft(null);
-            }}
-          />
-        </Dialog>
-      )}
+      {dialogs}
     </div>
   );
 }
@@ -788,9 +1072,9 @@ export function ConversationSettings({
  * The fields a preset does not own are borrowed from the conversation so the
  * pane has something coherent to draw, and are dropped again by
  * `captureConversationPresetSettings` on save. `toolLock` is deliberately NOT
- * borrowed: a preset has run nothing and exposed nothing, so nothing in it is
- * spent — carrying the conversation's lock in would grey out switches that are
- * in fact still free to move.
+ * borrowed: a preset has run nothing and cached nothing — carrying the
+ * conversation's lock in would tone switches orange or gray that are in fact
+ * free to move.
  */
 function presetBodyAsSettings(
   preset: ConversationPreset,

@@ -12,11 +12,17 @@ use serde_json::Value;
 ///
 /// Increment this when a stale sidecar could silently suppress required behavior;
 /// the generation gate turns that condition into an explicit startup failure.
-pub(crate) const PROTOCOL_VERSION: u32 = 13;
+pub(crate) const PROTOCOL_VERSION: u32 = 15;
 
-/// Maximum line size (16 MiB). Both sides enforce it because neither side trusts
-/// the other.
-pub(crate) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum line size (128 MiB). Both sides enforce it because neither side
+/// trusts the other.
+///
+/// A step's messages may take half of it ([`super::project::enforce_frame_budget`]),
+/// 64 MiB, which is past what any provider takes in one request (Anthropic's
+/// Messages API takes 32 MB): images and attachments are not budgeted, so the
+/// frame must not become the budget in their place, and a request too large
+/// for its provider is refused by the provider, in its own words.
+pub(crate) const MAX_LINE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Adapter family. Maps one-to-one to `crate::model::ProviderFamily`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -110,6 +116,11 @@ pub(crate) struct NativeFetch {
 /// family has no credential at all — the CLI uses its own login — so
 /// `api_key`/`base_url` are always absent; `env` is the sole channel by which a
 /// loopback test double can be pointed at, and the sidecar rejects a remote one.
+///
+/// `tool_changes` is per step: whether Claude Code appends tools mid-session
+/// for this step's model ([`crate::tool_append::known`]). A session the
+/// sidecar rebuilds hands the CLI the history's tool additions only then; on
+/// any other model the CLI would announce them in words of its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct AgentSession {
     pub(crate) session: String,
@@ -117,6 +128,8 @@ pub(crate) struct AgentSession {
     pub(crate) cwd: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
+    #[serde(rename = "toolChanges")]
+    pub(crate) tool_changes: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,7 +157,7 @@ pub(crate) struct StepRequest {
     /// The stable system prompt: everything assembled once at run start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) system: Option<String>,
-    /// The per-step tail of the system prompt (plan-mode and web-safety
+    /// The per-step tail of the system prompt (the web-safety and preview
     /// sections, conversation system contexts). The sidecar appends it to
     /// `system` after a blank line for every family, so the prompt a provider
     /// sees is unchanged; the Anthropic dialect also reads it as Claude Code's
@@ -165,8 +178,9 @@ pub(crate) struct StepRequest {
     /// when the window exceeds the CLI's standard 200k. No other family reads it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) context_window: Option<u64>,
-    /// Reasoning effort using the AI SDK 7 vocabulary (`none`, `low`, `medium`,
-    /// `high`, or `xhigh`), not a provider dialect.
+    /// Reasoning effort: AI SDK 7's levels `low`, `medium`, `high`, `xhigh`,
+    /// plus `max`, which the SDK has no shared name for. Not a provider
+    /// dialect: the sidecar maps it per family and model (`reasoning.ts`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<&'static str>,
     /// The model's reasoning response form: `"plaintext"` or `"encrypted"`.
@@ -191,6 +205,20 @@ pub(crate) struct StepRequest {
     /// Present only for the `claude-agent` family; see [`AgentSession`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) agent: Option<AgentSession>,
+    /// Whether this model, at this endpoint, takes a tool mid-conversation
+    /// through the protocol's append interface
+    /// (`tool_append::appends_tools`: what Mework knows, else the user's
+    /// answer on the model). Only then does the sidecar hand the history's
+    /// tool additions over in place; otherwise it drops them and every tool
+    /// stays declared.
+    #[serde(rename = "toolAppend", skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) tool_append: bool,
+    /// Whether this model, at this endpoint, takes a system message in the
+    /// middle of the conversation (`system_append::appends_system`, decided
+    /// the same way). Where it does not, the sidecar lifts every appended
+    /// system prompt in `messages` into the system prompt's tail.
+    #[serde(rename = "systemAppend", skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) system_append: bool,
 }
 
 /// Sidecar-to-host frame.
@@ -508,7 +536,7 @@ mod tests {
         assert_eq!(parsed.native_search_call_ids, vec!["a", "b"]);
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":-1}"#).is_err());
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":1.5}"#).is_err());
-        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(PROTOCOL_VERSION, 15);
     }
 
     /// Provider-executed tool failures use cross-language field names, so pin each
@@ -572,6 +600,8 @@ mod tests {
             native_search: None,
             native_fetch: None,
             agent: None,
+            tool_append: false,
+            system_append: false,
         };
         let value = serde_json::to_value(&request).unwrap();
         // Upstream options distinguish explicit null from an omitted field.
@@ -627,6 +657,8 @@ mod tests {
             }),
             native_fetch: None,
             agent: None,
+            tool_append: false,
+            system_append: false,
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(
@@ -682,7 +714,7 @@ mod tests {
         assert_eq!(error.status, Some(500));
     }
 
-    /// The `agent` block is the `claude-agent` wire contract: its four field
+    /// The `agent` block is the `claude-agent` wire contract: its five field
     /// names are read by the sidecar's session table, so pin them byte-for-byte.
     /// `env` is omitted when empty, like every other optional map.
     #[test]
@@ -692,6 +724,7 @@ mod tests {
             executable: r"C:\Users\me\.local\bin\claude.exe".into(),
             cwd: r"C:\data\claude-agent".into(),
             env: BTreeMap::from([("USERPROFILE".to_owned(), r"C:\Users\me".to_owned())]),
+            tool_changes: true,
         };
         let value = serde_json::to_value(&session).unwrap();
         assert_eq!(
@@ -700,7 +733,8 @@ mod tests {
                 "session": "run-1",
                 "executable": r"C:\Users\me\.local\bin\claude.exe",
                 "cwd": r"C:\data\claude-agent",
-                "env": { "USERPROFILE": r"C:\Users\me" }
+                "env": { "USERPROFILE": r"C:\Users\me" },
+                "toolChanges": true
             })
         );
 

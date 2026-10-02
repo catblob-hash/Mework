@@ -1,8 +1,10 @@
 import { Check, ChevronRight, Search } from "lucide-react";
-import type { ReactNode } from "react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
+import { MenuFlyout, MenuSurfacesContext, createMenuSurfaces } from "./MenuFlyout";
+import { PathText } from "./PathText";
 import { usePopoverAnchor } from "./usePopoverAnchor";
 
 /** A copy of the open panel's measured box, by value. */
@@ -26,9 +28,13 @@ export interface PopoverMenuItem {
   label: string;
   /** Secondary text explaining this item or why it is disabled. */
   description?: string;
+  /** The description is a path, drawn so that it gives way in the middle. */
+  descriptionIsPath?: boolean;
   icon?: ReactNode;
   /** Subtle trailing text, such as a shortcut or why a setting is not taking effect. */
   hint?: string;
+  /** A small trailing mark about the row's state, such as a warm cache; it carries its own accessible name. */
+  badge?: ReactNode;
   /**
    * A defined value renders a checked row; `true` shows a checkmark. `undefined` is an action
    * rendered as a regular `menuitem`.
@@ -104,8 +110,6 @@ export interface PopoverMenuProps {
    * the page. Must be referentially stable.
    */
   onPanelRectChange?: (rect: PopoverPanelRect | null) => void;
-  /** Opens the menu whenever this value changes; the first value is the baseline. */
-  openSignal?: number;
 }
 
 function matchesQuery(item: PopoverMenuItem, query: string): boolean {
@@ -114,46 +118,6 @@ function matchesQuery(item: PopoverMenuItem, query: string): boolean {
   if (item.label.toLowerCase().includes(needle)) return true;
   if (item.description?.toLowerCase().includes(needle)) return true;
   return Boolean(item.children?.some((child) => matchesQuery(child, query)));
-}
-
-/**
- * A nested list that opens beside the row that owns it.
- *
- * It measures itself once, where it was drawn, and moves only if it would leave
- * the window: to the other side of its row when the right edge is too close,
- * and upward by however much hangs below the bottom. Measuring again after
- * moving would let a flipped panel decide to flip back.
- */
-function PopoverFlyout({ label, children }: { label: string; children: ReactNode }) {
-  const panelRef = useRef<HTMLDivElement>(null);
-  const [placement, setPlacement] = useState<{ flipped: boolean; shift: number }>({
-    flipped: false,
-    shift: 0
-  });
-  useLayoutEffect(() => {
-    const panel = panelRef.current;
-    if (!panel) return;
-    // A window that reports no size — an unrendered preview — cannot say the
-    // panel has left it, and treating 0 as the edge throws it off screen.
-    if (!window.innerWidth || !window.innerHeight) return;
-    const box = panel.getBoundingClientRect();
-    const flipped = box.right > window.innerWidth - 8;
-    const shift = Math.min(0, window.innerHeight - 8 - box.bottom);
-    if (flipped || shift) setPlacement({ flipped, shift });
-  }, []);
-  return (
-    <div
-      ref={panelRef}
-      role="menu"
-      aria-label={label}
-      className={`popover-menu__submenu popover-menu__submenu--flyout${
-        placement.flipped ? " popover-menu__submenu--flipped" : ""
-      }`}
-      style={placement.shift ? { marginTop: placement.shift } : undefined}
-    >
-      {children}
-    </div>
-  );
 }
 
 /**
@@ -181,19 +145,23 @@ export function PopoverMenu({
   emptyLabel,
   submenu = "inline",
   onOpen,
-  onPanelRectChange,
-  openSignal
+  onPanelRectChange
 }: PopoverMenuProps) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  /** The open submenu was opened from the keyboard, so it takes the focus. */
+  const [expandedByKey, setExpandedByKey] = useState(false);
+  const branchButtons = useRef(new Map<string, HTMLButtonElement>());
+  const [surfaces] = useState(createMenuSurfaces);
   const { open, position, triggerRef, panelRef, toggle, close } = usePopoverAnchor({
     align,
     placement,
     width: menuWidth,
     anchorToPointer,
     onOpen,
-    openSignal
+    // A submenu is a panel of its own on the page, not inside the menu's.
+    keepOpenOnPress: surfaces.contains
   });
   const publishedRect = useRef(false);
 
@@ -223,6 +191,25 @@ export function PopoverMenu({
     setQuery("");
     setExpandedId(null);
   }, [open]);
+
+  const expand = (id: string | null, byKey: boolean) => {
+    setExpandedByKey(byKey);
+    setExpandedId(id);
+  };
+
+  /** A submenu's own keys: the arrows move through it, and left goes back to its row. */
+  const onFlyoutKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>, item: PopoverMenuItem) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      event.stopPropagation();
+      moveFocus(event.currentTarget, event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      event.stopPropagation();
+      expand(null, false);
+      branchButtons.current.get(item.id)?.focus();
+    }
+  };
 
   const moveFocus = (container: HTMLElement, direction: 1 | -1) => {
     const focusable = Array.from(
@@ -256,9 +243,17 @@ export function PopoverMenu({
     const expanded = expandable && expandedId === item.id;
     const nested = expanded && (
       submenu === "flyout"
-        ? <PopoverFlyout label={item.label}>
-          {item.children?.map((child) => renderItem(child, depth + 1))}
-        </PopoverFlyout>
+        ? (
+          <MenuFlyout
+            className={`popover-menu__panel popover-menu__panel--flyout popover-menu__flyout${dense ? " popover-menu__panel--dense" : ""}`}
+            role="menu"
+            aria-label={item.label}
+            autoFocus={expandedByKey}
+            onKeyDown={(event) => onFlyoutKeyDown(event, item)}
+          >
+            {item.children?.map((child) => renderItem(child, depth + 1))}
+          </MenuFlyout>
+        )
         : <div className="popover-menu__submenu" role="menu" aria-label={item.label}>
           {item.children?.map((child) => renderItem(child, depth + 1))}
         </div>
@@ -266,6 +261,12 @@ export function PopoverMenu({
     const button = (
       <button
         type="button"
+        ref={expandable && submenu === "flyout"
+          ? (element) => {
+            if (element) branchButtons.current.set(item.id, element);
+            else branchButtons.current.delete(item.id);
+          }
+          : undefined}
         role={item.checked === undefined
           ? "menuitem"
           : item.checkedRole === "checkbox" ? "menuitemcheckbox" : "menuitemradio"}
@@ -275,22 +276,35 @@ export function PopoverMenu({
         className={`popover-menu__item${depth > 0 ? " popover-menu__item--nested" : ""}`}
         disabled={item.disabled}
         title={item.title}
-        onClick={() => {
+        onClick={(event) => {
           if (expandable) {
-            setExpandedId((current) => (current === item.id ? null : item.id));
+            // A keyboard press reports no clicks.
+            expand(expandedId === item.id ? null : item.id, event.detail === 0);
             return;
           }
           item.onSelect?.();
           close(false);
         }}
+        onKeyDown={expandable && submenu === "flyout"
+          ? (event) => {
+            if (event.key !== "ArrowRight") return;
+            event.preventDefault();
+            event.stopPropagation();
+            expand(item.id, true);
+          }
+          : undefined}
       >
         {item.icon && <span className="popover-menu__icon">{item.icon}</span>}
         <span className="popover-menu__copy">
           <strong>{item.label}</strong>
-          {item.description && <small>{item.description}</small>}
+          {item.description && (
+            <small>{item.descriptionIsPath ? <PathText path={item.description} /> : item.description}</small>
+          )}
         </span>
         {item.hint && <span className="popover-menu__hint">{item.hint}</span>}
         {item.checked && <Check size={14} className="popover-menu__check" />}
+        {/* After the checkmark, so badges line up at the edge whichever row is checked. */}
+        {item.badge}
         {expandable && (
           <ChevronRight
             size={13}
@@ -354,49 +368,51 @@ export function PopoverMenu({
         {trigger}
       </button>
       {open && createPortal(
-        <div
-          ref={panelRef}
-          className={`popover-menu__panel${position?.flipped ? " popover-menu__panel--flipped" : ""}${dense ? " popover-menu__panel--dense" : ""}${submenu === "flyout" ? " popover-menu__panel--flyout" : ""}${panelClassName ? ` ${panelClassName}` : ""}`}
-          role="menu"
-          aria-label={menuLabel}
-          style={{
-            left: position?.left ?? 0,
-            top: position?.top ?? 0,
-            width: menuWidth,
-            minWidth: position?.minWidth,
-            zIndex: position?.layer,
-            visibility: position ? "visible" : "hidden"
-          }}
-          onKeyDown={(event) => {
-            if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-            event.preventDefault();
-            moveFocus(event.currentTarget, event.key === "ArrowDown" ? 1 : -1);
-          }}
-        >
-          {position?.flipped === false && searchField}
-          <div className="popover-menu__list">
-            {visibleSections.map((section, index) => (
-              <div className="popover-menu__section" key={section.id}>
-                {index > 0 && <div className="popover-menu__divider" />}
-                {section.label && (section.action
-                  ? (
-                    <div className="popover-menu__label popover-menu__label--action">
-                      <span>{section.label}</span>
-                      {renderAction(section.action)}
-                    </div>
-                  )
-                  : <div className="popover-menu__label">{section.label}</div>)}
-                {section.items.map((item) => renderItem(item, 0))}
-              </div>
-            ))}
-            {empty && (
-              <p className="popover-menu__empty">
-                {emptyLabel ?? t("没有匹配项", "No matches")}
-              </p>
-            )}
+        <MenuSurfacesContext.Provider value={surfaces}>
+          <div
+            ref={panelRef}
+            className={`popover-menu__panel${position?.flipped ? " popover-menu__panel--flipped" : ""}${dense ? " popover-menu__panel--dense" : ""}${submenu === "flyout" ? " popover-menu__panel--flyout" : ""}${panelClassName ? ` ${panelClassName}` : ""}`}
+            role="menu"
+            aria-label={menuLabel}
+            style={{
+              left: position?.left ?? 0,
+              top: position?.top ?? 0,
+              width: menuWidth,
+              minWidth: position?.minWidth,
+              zIndex: position?.layer,
+              visibility: position ? "visible" : "hidden"
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+              event.preventDefault();
+              moveFocus(event.currentTarget, event.key === "ArrowDown" ? 1 : -1);
+            }}
+          >
+            {position?.flipped === false && searchField}
+            <div className="popover-menu__list">
+              {visibleSections.map((section, index) => (
+                <div className="popover-menu__section" key={section.id}>
+                  {index > 0 && <div className="popover-menu__divider" />}
+                  {section.label && (section.action
+                    ? (
+                      <div className="popover-menu__label popover-menu__label--action">
+                        <span>{section.label}</span>
+                        {renderAction(section.action)}
+                      </div>
+                    )
+                    : <div className="popover-menu__label">{section.label}</div>)}
+                  {section.items.map((item) => renderItem(item, 0))}
+                </div>
+              ))}
+              {empty && (
+                <p className="popover-menu__empty">
+                  {emptyLabel ?? t("没有匹配项", "No matches")}
+                </p>
+              )}
+            </div>
+            {position?.flipped !== false && searchField}
           </div>
-          {position?.flipped !== false && searchField}
-        </div>,
+        </MenuSurfacesContext.Provider>,
         document.body
       )}
     </div>

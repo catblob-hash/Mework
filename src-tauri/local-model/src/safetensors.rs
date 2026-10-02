@@ -48,12 +48,6 @@ pub struct TensorInfo {
     end: usize,
 }
 
-impl TensorInfo {
-    pub fn element_count(&self) -> usize {
-        self.shape.iter().product()
-    }
-}
-
 pub struct SafeTensors {
     map: Mmap,
     data_start: usize,
@@ -154,7 +148,12 @@ impl Tensor<'_> {
     }
 
     pub fn to_f32(&self) -> Vec<f32> {
-        (0..self.len()).map(|index| self.get_f32(index)).collect()
+        let pairs = || self.bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+        match self.dtype {
+            Dtype::F32 => self.bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+            Dtype::F16 => pairs().map(f16_to_f32).collect(),
+            Dtype::BF16 => pairs().map(bf16_to_f32).collect(),
+        }
     }
 }
 

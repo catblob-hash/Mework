@@ -6,13 +6,13 @@
 
 ## 行为与限制
 
-一次调用最多指名 16 个地址，形式就是 `task_list` 打印的那些：子代理用裸名字，`workflow:<runId>`（裸运行名也可以解析），`shell:<id>`、`terminal:<id>` 与 `preview:<serverId>`——对话有多个工作区时写 `preview:<serverId>@<工作区编号>`。此时只有一个工作区有这个 id 的服务器时，裸的 `preview:<serverId>` 也接受；多个工作区都有时，调用会被拒绝，并列出每一个完整地址。没有任何东西应答的地址会让调用失败，并指向 `task_list`。省略 `tasks` 则监视对话的每一个子代理、工作流运行和后台命令；终端和开发服务器不在其列。`timeout_seconds` 取 5 到 600，默认 60。
+一次调用最多指名 16 个地址，形式就是 `task_list` 打印的那些：子代理用裸名字，`workflow:<runId>`（裸运行名也可以解析），`shell:<id>`、`terminal:<id>` 与 `preview:<serverId>`——对话有多个工作区时写 `preview:<serverId>@<工作区编号>`。此时只有一个工作区有这个 id 的服务器时，裸的 `preview:<serverId>` 也接受；多个工作区都有时，调用会被拒绝，并列出每一个完整地址。没有任何东西应答的地址会让调用失败，并指向 `task_list`。省略 `tasks` 则监视对话的每一个子代理、工作流运行和后台命令；终端和开发服务器不在其列。`timeout_seconds` 取 5 到 600，超出范围按较近的一端算，默认 60，填 `0` 也是 60。
 
 每个结果都带着一个 `[name · status]` 头返回，内含子代理的文本、派生时若设置了 `schema` 则还有对应的结构化值，以及一行收尾的 token 数、工具调用数和毫秒数。答案上限为 64 KiB，这份预算在任何其他内容加入之前先在各结果之间分摊，因此一条很长的结果无法把其他结果挤出去。进度更新跟在结果之后而不是之前；结尾还有一份状态清单，逐一交代每个被监视的任务当前处在什么状态。终端和开发服务器不交回结果；改为报告它们的状态。期限一到，答案会同时点明哪些已经到达、哪些仍在运行，并说明什么都没有丢。
 
 ## 相关
 
-- [agent_spawn](agent_spawn.html)、[followup_task](followup_task.html)
+- [agent_spawn](agent_spawn.html) — 派生本工具收取其结果的子代理
 - [task_list](task_list.html) — 本工具接受的地址
 - [box](box.html) — 未经收取的结果改以何种方式到达
 - [使用 Mework](../working.html#subagents-workflows-and-tasks)

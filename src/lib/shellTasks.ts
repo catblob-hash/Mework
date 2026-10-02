@@ -50,6 +50,19 @@ export interface ShellTaskSnapshot {
    * so once this arrives it is the duration the row reports.
    */
   durationMs?: number | null;
+  /**
+   * Directory the command started in, on its machine: the conversation's remembered `cd` for a
+   * local command, the workspace root for one elsewhere. The row is titled by it. Null on a row
+   * recorded before the host kept it, where the workspace root stands in.
+   */
+  cwd?: string | null;
+  /** The model's id for the call that ran the command; null when no model call did. */
+  callId?: string | null;
+  /**
+   * The local helper model's one-line summary of the command, once shell explanations are on and
+   * it has answered. The row shows it instead of the command text.
+   */
+  explanation?: string | null;
 }
 
 function requireDesktopRuntime(): void {

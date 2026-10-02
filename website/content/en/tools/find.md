@@ -2,7 +2,7 @@
 
 ## Approval
 
-Calls are classified as reads. A search inside the workspace, the app-data directory or an extra working directory granted to the conversation runs without asking at every security level, Plan mode included. A `path` outside those roots asks under `request_approval` and Plan mode and passes under `allow_edits` and `full_access`; **Always allow** can remember that for this tool in this conversation, capped at the risk level of the card you answered. `memory/` under the app-data directory is refused at every level, `full_access` included.
+Calls are classified as reads. A search inside the workspace, the app-data directory or an extra working directory granted to the conversation runs without asking at every security level. A `path` outside those roots asks under `request_approval` and passes under `allow_edits` and `full_access`; **Always allow** can remember that for this tool in this conversation, capped at the risk level of the card you answered. `memory/` under the app-data directory is refused at every level, `full_access` included.
 
 ## Behavior and limits
 

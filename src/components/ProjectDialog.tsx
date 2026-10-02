@@ -19,6 +19,7 @@ import type { MachineUsage } from "../lib/workspaces";
 import type { AttachedWorkspace, RunTarget, SshMachineConfig, WslDistro } from "../types";
 import { Dialog, IconButton } from "./Common";
 import { MachineSettingsDialog, SshMachineDialog, type MachineShellsControl } from "./MachineDialogs";
+import { PathText } from "./PathText";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuItem, PopoverPanelRect } from "./PopoverMenu";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
@@ -62,21 +63,6 @@ interface ProjectRow {
   path: string;
   /** The primary of a project being edited: its machine and path cannot change. */
   locked: boolean;
-}
-
-/**
- * Splits a path so its last segment can stay whole while the rest ellipsizes:
- * `head + tail` is always exactly `path`, so every separator — `\` or `/` —
- * is shown as written. The tail starts at the separator before the last
- * segment, so a shortened head still reads as `C:\Users\…\app`; a trailing
- * separator stays with the tail too.
- */
-export function splitPathForDisplay(path: string): { head: string; tail: string } {
-  const withoutTrailing = path.replace(/[\\/]+$/, "");
-  if (!withoutTrailing) return { head: "", tail: path };
-  const cut = Math.max(withoutTrailing.lastIndexOf("/"), withoutTrailing.lastIndexOf("\\"));
-  if (cut < 0) return { head: "", tail: path };
-  return { head: path.slice(0, cut), tail: path.slice(cut) };
 }
 
 /** A drive-letter or UNC path: Windows compares those without regard to case. */
@@ -333,7 +319,6 @@ export function ProjectDialog({
         />
       );
     }
-    const { head, tail } = splitPathForDisplay(row.path);
     const picking = pickingRow === row.id;
     return (
       <button
@@ -352,10 +337,7 @@ export function ProjectDialog({
         {picking ? <LoaderCircle size={13} className="spin" /> : <Folder size={13} />}
         {row.path
           ? (
-            <span className="project-dialog__path-text">
-              <span className="project-dialog__path-head">{head}</span>
-              <span className="project-dialog__path-tail">{tail}</span>
-            </span>
+            <PathText className="project-dialog__path-text" path={row.path} title={null} />
           )
           : <span className="project-dialog__path-placeholder">{t("选择目录…", "Choose a directory…")}</span>}
       </button>

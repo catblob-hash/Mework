@@ -221,7 +221,7 @@ function makeConversation(
         provider: selection,
         fetchProvider: { kind: "disabled" },
       },
-      reasoningEffort: "disabled",
+      reasoningEffort: "low",
       securityLevel: "full_access",
     },
   });
@@ -295,7 +295,7 @@ function modelRequest(
   return {
     provider,
     model,
-    reasoningEffort: "disabled",
+    reasoningEffort: "low",
     conversationId,
     workspacePath: workspace.path,
     enabledTools: [...conversation.settings.enabledTools],

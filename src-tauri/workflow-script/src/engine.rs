@@ -63,17 +63,6 @@ where
     function
 }
 
-/// Allowed `agent()` option keys. `model` is separate because it needs a dedicated
-/// rejection message.
-const ALLOWED_OPT_KEYS: [&str; 6] = [
-    "label",
-    "phase",
-    "schema",
-    "effort",
-    "agentType",
-    "isolation",
-];
-
 /// The only permitted `isolation` value.
 const WORKTREE_ISOLATION: &str = "worktree";
 
@@ -775,25 +764,16 @@ fn issue_step<'js>(
             ));
         }
         let object = opts.as_object().expect("checked above");
-        for key in object.keys::<String>() {
-            let key = key?;
-            match key.as_str() {
-                "model" => {
-                    return Err(Exception::throw_type(
-                        ctx,
-                        "Steps do not accept model: the role name is the complete model-facing input. Select a role with agentType; this tool schema's $defs.agentType lists valid values, and user configuration maps roles to provider/model.",
-                    ))
-                }
-                known if ALLOWED_OPT_KEYS.contains(&known) => {}
-                unknown => {
-                    return Err(Exception::throw_type(
-                        ctx,
-                        &format!(
-                            "agent() opts does not recognize key {unknown}; allowed keys: label, phase, schema, effort, agentType, isolation"
-                        ),
-                    ))
-                }
-            }
+        // A `model` with a value asks for something a step cannot do — the role
+        // decides the model — so it is refused rather than quietly dropped. Left
+        // `undefined` or `null` it asks nothing. Any key `agent()` does not take
+        // means nothing to it and is ignored.
+        let model: Value = object.get("model")?;
+        if !(model.is_undefined() || model.is_null()) {
+            return Err(Exception::throw_type(
+                ctx,
+                "Steps do not accept model: the role name is the complete model-facing input. Select a role with agentType; this tool schema's $defs.agentType lists valid values, and user configuration maps roles to provider/model.",
+            ));
         }
         request.label = read_opt_string(ctx, object, "label")?;
         let explicit_phase = read_opt_string(ctx, object, "phase")?;
@@ -802,10 +782,14 @@ fn issue_step<'js>(
         }
         request.effort = read_opt_string(ctx, object, "effort")?;
         if let Some(effort) = request.effort.as_deref() {
-            if !matches!(effort, "low" | "medium" | "high" | "xhigh") {
+            // `xhigh` is the former name of `extra`, still taken (the host maps it).
+            if !matches!(
+                effort,
+                "low" | "medium" | "high" | "extra" | "xhigh" | "max"
+            ) {
                 return Err(Exception::throw_type(
                     ctx,
-                    &format!("effort must be low, medium, high, or xhigh; got {effort}"),
+                    &format!("effort must be low, medium, high, extra, or max; got {effort}"),
                 ));
             }
         }
@@ -824,10 +808,13 @@ fn issue_step<'js>(
             let json = value_to_json(ctx, schema).map_err(|error| {
                 Exception::throw_type(ctx, &format!("schema cannot cross the boundary: {error}"))
             })?;
-            workflow_core::schema::compile(&json).map_err(|error| {
-                Exception::throw_type(ctx, &format!("schema is invalid: {error}"))
-            })?;
-            request.schema = Some(json);
+            // `{}` constrains nothing: it is no schema, not a broken one.
+            if json.as_object().is_none_or(|object| !object.is_empty()) {
+                workflow_core::schema::compile(&json).map_err(|error| {
+                    Exception::throw_type(ctx, &format!("schema is invalid: {error}"))
+                })?;
+                request.schema = Some(json);
+            }
         }
     }
 
@@ -894,7 +881,8 @@ fn issue_step<'js>(
     Ok(id as u32)
 }
 
-/// Read an optional string option; present values must be nonempty strings.
+/// Read an optional string option; `undefined`, `null` and a blank string all
+/// mean it was left out.
 fn read_opt_string<'js>(
     ctx: &Ctx<'js>,
     object: &Object<'js>,
@@ -912,10 +900,7 @@ fn read_opt_string<'js>(
     };
     let text = text.to_string()?;
     if text.trim().is_empty() {
-        return Err(Exception::throw_type(
-            ctx,
-            &format!("agent() opts.{key} must not be an empty string"),
-        ));
+        return Ok(None);
     }
     Ok(Some(text))
 }
@@ -1200,16 +1185,31 @@ mod tests {
         assert_eq!(wave[0].agent_type.as_deref(), Some("anything"));
     }
 
+    /// Keys `agent()` does not take, a `model` left `null`, and blank strings
+    /// are ignored: the step is issued as if they were not there.
     #[test]
-    fn empty_prompts_model_opts_and_unknown_opts_throw_catchable_type_errors() {
+    fn unknown_opts_null_model_and_blank_strings_are_ignored() {
+        let mut source = spec(&script(
+            r#"await agent("p", { nope: 1, model: null, label: "", phase: " " }); return null;"#,
+        ))
+        .start()
+        .unwrap();
+        let StepProgress::Run(wave) = source.advance(&[]).unwrap() else {
+            panic!("expected one request");
+        };
+        assert_eq!(wave[0].label, None);
+        assert_eq!(wave[0].phase, None);
+    }
+
+    #[test]
+    fn empty_prompts_model_opts_and_bad_values_throw_catchable_type_errors() {
         let mut source = spec(&script(
             r#"const errors = [];
 for (const attempt of [
   () => agent(""),
   () => agent("p", { model: "gpt" }),
   () => agent("p", { isolation: "vm" }),
-  () => agent("p", { nope: 1 }),
-  () => agent("p", { effort: "max" }),
+  () => agent("p", { effort: "disabled" }),
 ]) {
   try { attempt(); errors.push("missed"); } catch (e) { errors.push(e.message.slice(0, 6)); }
 }
@@ -1222,9 +1222,26 @@ return errors;"#,
             panic!("script should settle without issuing steps");
         };
         let texts = value.as_array().unwrap();
-        assert_eq!(texts.len(), 5);
+        assert_eq!(texts.len(), 4);
         for text in texts {
             assert_ne!(text, &json!("missed"));
+        }
+    }
+
+    /// Every level travels to the driver as written; `xhigh` is `extra` under
+    /// its former name, which the host maps.
+    #[test]
+    fn every_effort_level_travels_on_the_request() {
+        for effort in ["low", "medium", "high", "extra", "max", "xhigh"] {
+            let mut source = spec(&script(&format!(
+                r#"await agent("p", {{ effort: "{effort}" }}); return null;"#
+            )))
+            .start()
+            .unwrap();
+            let StepProgress::Run(wave) = source.advance(&[]).unwrap() else {
+                panic!("expected one request for {effort}");
+            };
+            assert_eq!(wave[0].effort.as_deref(), Some(effort));
         }
     }
 

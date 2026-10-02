@@ -182,7 +182,7 @@ pub fn resolve_shell_runner(
             Ok(ShellRunner::Wsl {
                 distro: distro.clone(),
                 env,
-                agent_shell: resolve_agent_shell(target, assets.wsl_agent_shells.get(distro).copied()),
+                agent_shell: resolve_agent_shell(target, None, assets.wsl_agent_shells.get(distro).copied()),
             })
         }
         Some(RunTarget::Ssh { machine_id }) => {
@@ -206,7 +206,11 @@ pub fn resolve_shell_runner(
                 port: machine.port,
                 identity_file: machine.identity_file.clone(),
                 env,
-                agent_shell: resolve_agent_shell(target, machine.agent_shell),
+                agent_shell: resolve_agent_shell(
+                    target,
+                    Some(&crate::machine_shells::Endpoint::of_machine(machine)),
+                    machine.agent_shell,
+                ),
             })
         }
     }
@@ -214,13 +218,15 @@ pub fn resolve_shell_runner(
 
 /// The agent shell a machine's scripts run in: the one its settings chose when
 /// the machine still has it, otherwise the first backend in the OS's priority
-/// order that the last probe found. A machine never probed keeps its choice by
-/// name, or bash — what every remote script ran in before there was a choice.
+/// order that the last probe found. A machine never probed — at `endpoint`, the
+/// one an SSH machine has now — keeps its choice by name, or bash: what every
+/// remote script ran in before there was a choice.
 fn resolve_agent_shell(
     target: Option<&RunTarget>,
+    endpoint: Option<&crate::machine_shells::Endpoint>,
     configured: Option<crate::shell_backend::ShellBackend>,
 ) -> AgentShell {
-    let Some(probed) = crate::machine_shells::get(&env_key(target)) else {
+    let Some(probed) = crate::machine_shells::get(&env_key(target), endpoint) else {
         return configured
             .map(|backend| AgentShell::new(backend, backend.default_program()))
             .unwrap_or_default();

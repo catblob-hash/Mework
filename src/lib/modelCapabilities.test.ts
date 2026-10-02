@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import modelSource from "../../src-tauri/src/model.rs?raw";
+import toolAppendSource from "../../src-tauri/src/tool_append.rs?raw";
 import type { ProviderFamily, ModelProfile } from "../types";
 import {
+  appendsTools,
   chatEndpointOf,
   derivesBaseUrl,
   ENDPOINT_TYPES,
   hasUsableBaseUrl,
   isEncryptedReasoning,
+  knownAppendCapabilities,
+  knownSystemAppend,
+  knownToolAppend,
   MODEL_CAPABILITIES,
   modelGroup,
   normalizeCapabilities,
@@ -18,6 +23,8 @@ import {
   reasoningContentTakesEffect,
   REASONING_CONTENTS,
   repairActiveModelId,
+  systemAppendTakesEffect,
+  toolAppendTakesEffect,
 } from "./modelCapabilities";
 
 function model(id: string, group = ""): ModelProfile {
@@ -362,5 +369,61 @@ describe("active model repair", () => {
   it("returns null only when the provider has no models left", () => {
     expect(repairActiveModelId({ models: [], activeModelId: "gone" })).toBeNull();
     expect(repairActiveModelId({ models: [], activeModelId: null })).toBeNull();
+  });
+});
+
+describe("append capabilities", () => {
+  const answer = (text: string) => (text === "None" ? null : text === "Some(true)");
+
+  /**
+   * Mework declares a model's `tool_append` / `system_append` from what it
+   * knows of the model at its endpoint, in the host's projection of a fetch
+   * and in the drawer as an ID is typed. Both sides answer the one fixture
+   * `tool_append.rs` checks itself against.
+   */
+  it("knows what the host's fixture says it knows, and leaves the rest to the user", () => {
+    const block = /const APPEND_FIXTURE[\s\S]*?&\[([\s\S]*?)\n        \]/u.exec(toolAppendSource)?.[1] ?? "";
+    const cases = [...block.matchAll(
+      /\((\w+), "([^"]*)", "([^"]+)", (Some\((?:true|false)\)|None), (Some\((?:true|false)\)|None)\)/gu
+    )];
+    expect(cases.length).toBeGreaterThan(20);
+    for (const [, variant, baseUrl, model, tool, system] of cases) {
+      const family = FAMILY_SLUGS.get(variant);
+      expect(family, variant).toBeDefined();
+      expect(knownToolAppend(family!, baseUrl, model), `tool: ${variant} ${baseUrl} ${model}`).toBe(answer(tool));
+      expect(knownSystemAppend(family!, baseUrl, model), `system: ${variant} ${baseUrl} ${model}`).toBe(answer(system));
+    }
+  });
+
+  it("mirrors ProviderFamily::tool_append_takes_effect and system_append_takes_effect", () => {
+    for (const [name, mirror] of [
+      ["tool_append_takes_effect", toolAppendTakesEffect],
+      ["system_append_takes_effect", systemAppendTakesEffect],
+    ] as const) {
+      const body = new RegExp(`fn ${name}\\(self\\) -> bool \\{([\\s\\S]*?)\\n    \\}`, "u").exec(modelSource);
+      expect(body, `model.rs 里找不到 ${name}`).toBeTruthy();
+      const rustTrue = new Set([...(body as RegExpExecArray)[1].matchAll(/Self::(\w+)/gu)].map((match) => match[1]));
+      expect(rustTrue.size, name).toBeGreaterThan(2);
+      for (const [variant, family] of FAMILY_SLUGS) {
+        expect(mirror(family), `${name} ProviderFamily::${variant}`).toBe(rustTrue.has(variant));
+      }
+    }
+  });
+
+  it("reads the declared capability, and only where the protocol can append", () => {
+    const declared = { capabilities: ["tool_append", "system_append"] as const };
+    expect(appendsTools({ family: "anthropic" }, declared)).toBe(true);
+    expect(appendsTools({ family: "anthropic" }, { capabilities: [] })).toBe(false);
+    expect(appendsTools({ family: "openai_compatible" }, declared)).toBe(false);
+  });
+
+  it("declares what it knows and nothing for a relay", () => {
+    const official = { family: "anthropic" as const, baseUrl: "https://api.anthropic.com/v1" };
+    expect(knownAppendCapabilities(official, "claude-opus-5-5")).toEqual(["tool_append", "system_append"]);
+    expect(knownAppendCapabilities(official, "claude-sonnet-5")).toEqual([]);
+    expect(knownAppendCapabilities({ ...official, baseUrl: "https://relay.example.com/v1" }, "claude-opus-5-5"))
+      .toEqual([]);
+    expect(knownAppendCapabilities({ family: "openai_responses", baseUrl: "https://relay.example.com/v1" }, "gpt-5.5"))
+      .toEqual(["system_append"]);
   });
 });

@@ -81,11 +81,6 @@ impl Msg {
         self.bytes(field, &body.0)
     }
 
-    pub fn packed_f32(&mut self, field: u32, values: &[f32]) -> &mut Self {
-        let body: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
-        self.bytes(field, &body)
-    }
-
     pub fn packed_bool(&mut self, field: u32, values: &[bool]) -> &mut Self {
         let body: Vec<u8> = values.iter().map(|value| *value as u8).collect();
         self.bytes(field, &body)

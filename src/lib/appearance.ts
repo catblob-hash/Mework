@@ -76,7 +76,15 @@ export function defaultAppearancePreferences(): AppearancePreferences {
     customCss: "",
     liquidGlass: false,
     background: "solid",
-    localModel: { titles: false, shellExplanations: false, titlePrompt: "", shellPrompt: "" }
+    localModel: {
+      titles: false,
+      shellExplanations: false,
+      errorExplanations: false,
+      subagents: false,
+      titlePrompt: "",
+      shellPrompt: "",
+      errorPrompt: ""
+    }
   };
 }
 

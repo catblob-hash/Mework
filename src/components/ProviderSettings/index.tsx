@@ -992,6 +992,7 @@ export function ApiProviderSettings({
         <ModelProfileDrawer
           providerName={modelEditorProvider.name}
           family={modelEditorProvider.family}
+          baseUrl={modelEditorProvider.baseUrl}
           mode={modelEditor.mode}
           draft={modelEditor.draft}
           idError={modelIdError}

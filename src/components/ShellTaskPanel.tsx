@@ -93,11 +93,11 @@ export interface ShellTaskPanelProps {
 }
 
 /**
- * One `bash` / `powershell` command's output, read-only.
+ * One `bash` / `powershell` command's output, read-only: the terminal pane's read-only page.
  *
- * Deliberately not `TerminalPanel`: that one owns a PTY — open, write, resize, detach — and is
- * being kept for the interactive terminal that will live in a bottom drawer. This page has no
- * process to talk to. It subscribes to a command the model started and draws what comes back.
+ * Deliberately not `TerminalPanel`: that one owns a PTY — open, write, resize, detach. This page
+ * has no process to talk to. It subscribes to a command the model started and draws what comes
+ * back.
  */
 export function ShellTaskPanel({ task, open, onStop, stopping = false }: ShellTaskPanelProps) {
   const { t } = useI18n();
@@ -287,7 +287,7 @@ export function ShellTaskPanel({ task, open, onStop, stopping = false }: ShellTa
   return (
     <div className="shell-task-panel" id={shellTaskPanelId(task.shellTaskId)}>
       <header className="shell-task-panel__header">
-        <code className="shell-task-panel__command" title={task.command}>{task.command}</code>
+        <code className="shell-task-panel__command">{task.command}</code>
         <span
           className={`shell-task-panel__status shell-task-panel__status--${task.outcome ?? "running"}`}
           role="status"

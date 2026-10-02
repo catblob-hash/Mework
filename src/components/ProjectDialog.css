@@ -54,29 +54,9 @@
   flex: 0 0 auto;
 }
 
-/* Middle ellipsis: the head gives way first, the last segment stays whole. */
+/* The path takes the rest of the chip and gives way in the middle (`PathText`). */
 .project-dialog__path-text {
   flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  overflow: hidden;
-  white-space: nowrap;
-}
-
-.project-dialog__path-head {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.project-dialog__path-tail {
-  flex: 0 0 auto;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .project-dialog__path-placeholder {

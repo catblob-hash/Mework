@@ -134,7 +134,8 @@ describe("conversation presets", () => {
       skillToolEnabled: settings.skillToolEnabled,
       mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled
     });
-    // Conversation-only fields do not enter presets; web search, security, and memory tiers do.
+    // Conversation-only fields — plan mode among them — do not enter presets;
+    // web search, security, and memory tiers do.
     expect(Object.keys(captured).sort()).toEqual(PRESET_FIELDS);
     captured.enabledTools.push("mutated");
     captured.agentDefinitions[0].tools?.push("write");
@@ -210,7 +211,7 @@ describe("conversation presets", () => {
     expect(applied.projectMemoryEnabled).toBe(false);
   });
 
-  it("lets a preset widen a locked conversation but never move what a run has settled", () => {
+  it("applies a preset over a conversation that has run, moving everything but the pins", () => {
     const document = createSeedDocument();
     const current: ConversationSettings = {
       ...document.workspaces[0].conversations[0].settings,
@@ -225,10 +226,16 @@ describe("conversation presets", () => {
         skillTool: false,
         mcpToolDiscovery: false,
         webSearch: true,
+        planMode: false,
         skillIds: ["skill_locked"],
         promptSkillIds: ["skill_locked"],
+        searchBackend: { kind: "native" },
+        fetchBackend: { kind: "native" },
+        webFetch: true,
         searchProvider: { kind: "native" },
-        fetchProvider: { kind: "native" }
+        fetchProvider: { kind: "native" },
+        lastRequest: null,
+        modelRequests: []
       }
     };
     const preset = {
@@ -244,10 +251,11 @@ describe("conversation presets", () => {
 
     const applied = applyConversationPresetSettings(current, preset);
 
-    // Widening is what a preset is for.
-    expect(applied.skillIds).toEqual(["skill_locked", "skill_other"]);
-    // Everything a run has acted on stays where it put it.
-    expect(applied.skillToolEnabled).toBe(false);
+    // The surface is the preset's: the lock only warns about the cache, and a
+    // frozen surface is the caller's to put back.
+    expect(applied.skillIds).toEqual(["skill_other"]);
+    expect(applied.skillToolEnabled).toBe(true);
+    // A backend the transcript already used cannot be swapped part-way through.
     expect(applied.webSearch.provider).toEqual({ kind: "native" });
     expect(applied.webSearch.fetchProvider).toEqual({ kind: "native" });
     // The rest of the preset's web-search body still applies.

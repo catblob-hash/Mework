@@ -96,6 +96,8 @@ struct Config {
   int lk, lv, dk, dv, kernel;
   float eps;
   int slots, context;
+  // Per rotary frequency, the position axis that turns it.
+  std::vector<uint8_t> axes;
 
   int key_dim() const { return lk * dk; }
   int value_dim() const { return lv * dv; }
@@ -132,9 +134,13 @@ struct mwx_model {
   std::unordered_map<std::string, mx::array> weights;
   mx::array cos = mx::array(0.0f);
   mx::array sin = mx::array(0.0f);
+  // `[rotary_dim]` int32: the axis of each column (both halves).
+  mx::array axis = mx::array(0);
   mx::fast::CustomKernelFunction delta_kernel;
   std::optional<States> slots;
   std::vector<int> lens;
+  // Rotary position minus sequence position, per slot.
+  std::vector<int> deltas;
   std::vector<bool> live;
 
   const mx::array& w(const std::string& name) const {
@@ -153,12 +159,24 @@ struct mwx_model {
     return mx::fast::rms_norm(x, weight, c.eps);
   }
 
+  // The table rows at rotary positions `pos` `[B, T, 3]`: each column from
+  // the row of its axis. `[B, T, rot]`.
+  mx::array rotary(const mx::array& table, const mx::array& pos) const {
+    auto shape = pos.shape();
+    auto at = [&](int a) {
+      auto p = mx::reshape(mx::slice(pos, {0, 0, a}, {shape[0], shape[1], a + 1}), {shape[0], shape[1]});
+      return mx::take(table, p, 0);
+    };
+    auto t = at(0), h = at(1), w = at(2);
+    return mx::where(mx::equal(axis, mx::array(1)), h, mx::where(mx::equal(axis, mx::array(2)), w, t));
+  }
+
   // RoPE on the first `rotary_dim` features of `x` `[B, T, heads, head_dim]`
-  // at positions `pos` `[B, T]`.
+  // at rotary positions `pos` `[B, T, 3]`.
   mx::array rope(const mx::array& x, const mx::array& pos) const {
     int rot = c.rotary_dim, half = rot / 2;
-    auto cs = mx::expand_dims(mx::take(cos, pos, 0), 2); // [B, T, 1, rot]
-    auto sn = mx::expand_dims(mx::take(sin, pos, 0), 2);
+    auto cs = mx::expand_dims(rotary(cos, pos), 2); // [B, T, 1, rot]
+    auto sn = mx::expand_dims(rotary(sin, pos), 2);
     auto shape = x.shape();
     auto head = mx::slice(x, {0, 0, 0, 0}, {shape[0], shape[1], shape[2], rot});
     auto rest = mx::slice(x, {0, 0, 0, rot}, {shape[0], shape[1], shape[2], shape[3]});
@@ -284,24 +302,30 @@ struct mwx_model {
     return s;
   }
 
-  // One sequence: `tokens` after `start` positions whose attention keys and
+  // Rotary positions `[1, T, 3]` of plain text from `start`.
+  static mx::array text_positions(int start, int T) {
+    auto p = mx::reshape(mx::arange(start, start + T, mx::int32), {1, T, 1});
+    return mx::concatenate({p, p, p}, 2);
+  }
+
+  // One sequence: `x` `[1, T, H]` (embedded inputs) at rotary positions
+  // `pos` `[1, T, 3]`, after `start` positions whose attention keys and
   // values are `history` (`[1, kv_heads, start, head_dim]` each, per
   // attention layer; empty when start is 0) and whose DeltaNet states are in
   // `conv`/`ssm`. Returns the last position's hidden state `[1, H]`; the
-  // states are advanced and `history` grows by the tokens.
+  // states are advanced and `history` grows by the T positions.
   mx::array run_sequence(
-      const std::vector<uint32_t>& tokens,
+      mx::array x,
+      const mx::array& pos,
       int start,
       std::vector<mx::array>& conv,
       std::vector<mx::array>& ssm,
       std::vector<mx::array>& keys,
       std::vector<mx::array>& values) const {
-    int T = static_cast<int>(tokens.size());
+    int T = x.shape(1);
     if (start + T > c.context) {
       throw std::runtime_error("超出上下文长度");
     }
-    auto x = embed(tokens, 1, T);
-    auto pos = mx::reshape(mx::arange(start, start + T, mx::int32), {1, T});
     int li = 0, ai = 0;
     for (int layer = 0; layer < c.layers; ++layer) {
       mx::array mixed = mx::array(0.0f);
@@ -439,6 +463,14 @@ mwx_model* mwx_load(const mwx_config* config, const mwx_tensor* tensors, size_t 
     }
     m->cos = mx::array(config->cos, {c.context, c.rotary_dim}, mx::float32);
     m->sin = mx::array(config->sin, {c.context, c.rotary_dim}, mx::float32);
+    std::vector<int32_t> axis(c.rotary_dim);
+    for (int i = 0; i < c.rotary_dim / 2; ++i) {
+      if (config->axes[i] > 2) {
+        throw std::runtime_error("无效的 RoPE 轴");
+      }
+      axis[i] = axis[i + c.rotary_dim / 2] = config->axes[i];
+    }
+    m->axis = mx::array(axis.data(), {c.rotary_dim}, mx::int32);
     for (size_t i = 0; i < count; ++i) {
       const auto& t = tensors[i];
       mx::Shape shape(t.shape, t.shape + t.ndim);
@@ -453,6 +485,7 @@ mwx_model* mwx_load(const mwx_config* config, const mwx_tensor* tensors, size_t 
         {"y", "state_out"},
         GATED_DELTA_SOURCE);
     m->lens.assign(c.slots, 0);
+    m->deltas.assign(c.slots, 0);
     m->live.assign(c.slots, false);
     model = m.release();
   });
@@ -470,7 +503,8 @@ int mwx_prefix(mwx_model* model, const uint32_t* tokens, size_t n, uint8_t** out
     auto s = model->empty_states(1);
     std::vector<mx::array> keys(s.k.size(), mx::array(0.0f)), values(s.v.size(), mx::array(0.0f));
     std::vector<uint32_t> ids(tokens, tokens + n);
-    model->run_sequence(ids, 0, s.conv, s.ssm, keys, values);
+    int T = static_cast<int>(n);
+    model->run_sequence(model->embed(ids, 1, T), mwx_model::text_positions(0, T), 0, s.conv, s.ssm, keys, values);
     std::vector<mx::array> all;
     all.insert(all.end(), s.conv.begin(), s.conv.end());
     all.insert(all.end(), s.ssm.begin(), s.ssm.end());
@@ -510,12 +544,27 @@ int mwx_admit(
     size_t prefix_len,
     int32_t prefix_tokens,
     const uint32_t* tokens,
+    const int32_t* rows,
+    const float* features,
+    size_t feature_rows,
+    const int32_t* positions,
     size_t n,
+    int32_t delta,
     float* logits_out) {
   return guard([&] {
     auto& c = model->c;
     if (slot < 0 || slot >= c.slots || n == 0) {
       throw std::runtime_error("无效的槽位或空请求");
+    }
+    for (size_t i = 0; i < n; ++i) {
+      if (rows[i] < -1 || rows[i] >= static_cast<int64_t>(feature_rows)) {
+        throw std::runtime_error("无效的图片特征行");
+      }
+      for (int a = 0; a < 3; ++a) {
+        if (positions[3 * i + a] < 0 || positions[3 * i + a] >= c.context) {
+          throw std::runtime_error("RoPE 位置超出上下文");
+        }
+      }
     }
     Reader r{prefix, prefix_len};
     auto header = r.take<uint32_t>(3);
@@ -537,8 +586,23 @@ int mwx_admit(
         ssm.emplace_back(r.take<float>(ssm_count), mx::Shape{1, c.lv, c.dv, c.dk}, mx::float32);
       }
     }
+    // Image positions carry the image placeholder token; look up a valid id
+    // and replace the row.
     std::vector<uint32_t> ids(tokens, tokens + n);
-    auto h = model->run_sequence(ids, P, conv, ssm, keys, values);
+    int T = static_cast<int>(n);
+    auto x = model->embed(ids, 1, T);
+    if (feature_rows > 0) {
+      auto table = mx::array(features, {static_cast<int>(feature_rows), c.hidden}, mx::float32);
+      std::vector<int32_t> index(rows, rows + n);
+      auto is_feature = mx::reshape(mx::array(index.data(), {T}, mx::int32) >= 0, {1, T, 1});
+      for (auto& r : index) {
+        r = std::max(r, 0);
+      }
+      auto picked = mx::expand_dims(mx::take(table, mx::array(index.data(), {T}, mx::int32), 0), 0);
+      x = mx::where(is_feature, picked, x);
+    }
+    auto pos = mx::array(positions, {1, T, 3}, mx::int32);
+    auto h = model->run_sequence(x, pos, P, conv, ssm, keys, values);
     auto logits = model->logits(h);
 
     model->ensure_slots();
@@ -560,6 +624,7 @@ int mwx_admit(
     mx::eval(all);
     std::memcpy(logits_out, logits.data<float>(), sizeof(float) * c.vocab);
     model->lens[slot] = len;
+    model->deltas[slot] = delta;
     model->live[slot] = true;
   });
 }
@@ -574,6 +639,7 @@ int mwx_step(mwx_model* model, const int32_t* slots, const uint32_t* tokens, siz
     int S = c.slots;
     std::vector<uint32_t> row_tokens(S, 0);
     std::vector<int32_t> row_pos(S, 0);
+    std::vector<int32_t> row_rotary(S, 0);
     std::vector<bool> listed(S, false);
     int longest = 1;
     for (size_t i = 0; i < n; ++i) {
@@ -587,6 +653,7 @@ int mwx_step(mwx_model* model, const int32_t* slots, const uint32_t* tokens, siz
       listed[slot] = true;
       row_tokens[slot] = tokens[i];
       row_pos[slot] = model->lens[slot];
+      row_rotary[slot] = model->lens[slot] + model->deltas[slot];
       longest = std::max(longest, model->lens[slot] + 1);
     }
     // Every row runs (their cost is the same as one row's: the weights are
@@ -608,7 +675,8 @@ int mwx_step(mwx_model* model, const int32_t* slots, const uint32_t* tokens, siz
     auto commit = mx::array(reinterpret_cast<const bool*>(keep_bytes.data()), {S, 1, 1}, mx::bool_);
     auto mask = mx::array(reinterpret_cast<const bool*>(attend.data()), {S, 1, 1, longest}, mx::bool_);
     auto x = model->embed(row_tokens, S, 1);
-    auto pos = mx::array(row_pos.data(), {S, 1}, mx::int32);
+    auto rotary = mx::reshape(mx::array(row_rotary.data(), {S, 1}, mx::int32), {S, 1, 1});
+    auto pos = mx::concatenate({rotary, rotary, rotary}, 2);
 
     int li = 0, ai = 0;
     for (int layer = 0; layer < c.layers; ++layer) {
@@ -663,6 +731,7 @@ void mwx_release(mwx_model* model, int32_t slot) {
   if (slot >= 0 && slot < model->c.slots) {
     model->live[slot] = false;
     model->lens[slot] = 0;
+    model->deltas[slot] = 0;
   }
 }
 

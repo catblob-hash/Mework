@@ -90,10 +90,10 @@
   min-height: 0;
   padding: 14px 24px 32px;
   overflow-x: hidden;
-  overflow-y: auto;
+  overflow-y: scroll;
   font-size: 13px;
   line-height: 1.65;
-  user-select: text;
+  -webkit-user-select: text; user-select: text;
 }
 
 .attachment-preview__document--flush {

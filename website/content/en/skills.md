@@ -47,9 +47,13 @@ The folder on disk **is** the skill. Edit `SKILL.md` or a script beside it and t
 
 The skill's identity is its **directory name**: that is the value the model passes to the `skill` tool, as with `/<name>` in Claude Code. The frontmatter `name` and `description` are only the label and trigger the catalog shows.
 
-A fresh installation writes five skill folders into `~/.mework/skills/` — `systematic-debugging`, `verification-before-completion`, `code-review-and-quality`, `git-workflow-and-versioning` and `resolving-merge-conflicts` — and the built-in **mework** preset selects them. They are ordinary files: edit one freely, and one you delete stays deleted.
+## The built-in Mework SDK skill
 
-Each discovered row in the conversation drawer's **Skills** page has a delete button that removes the skill's folder, `scripts/` and `references/` included, after a second click confirms; a skill this conversation has already handed the model is locked — its checkbox is disabled and it has no delete button. The page toolbar also has a **Rescan** button and **open folder** buttons: the global `~/.mework/skills`, plus this workspace's `.mework/skills` when the conversation has a workspace. They create the directory when it is not there yet and reveal it in your file manager. Rescan also runs at startup, when the settings pane opens, when a workspace is added, and after every delete; every run rescans for itself, so a run uses what is on disk at that moment.
+One skill ships with the app: **Mework SDK** (`mework-sdk`), which teaches the model how to configure Mework itself — writing skills, `mcp.json`, `hooks.json`, `lsp.json`, prompt profiles, `launch.json`, `MEWORK.md` and rules, and pointing you at the right place in the app for the settings that are not files. It is compiled into the app rather than written to disk, so it updates with each version of Mework, cannot be edited, and has no delete button; it heads the **Skills** list and appears in every conversation's list, whatever its workspace.
+
+Like every skill it does nothing until a conversation selects it: no preset selects it, the built-in **mework** preset included. Tick it in a conversation when you want the model to set up or troubleshoot Mework for you. Its id, `skill_builtin_mework_sdk`, stays the same across versions, so a preset of your own that selects it keeps it through updates. With on-demand loading it is listed as `mework-sdk`, and the `skill` tool returns it with no base directory, since it has no files.
+
+Each discovered row in the conversation drawer's **Skills** page has a delete button that removes the skill's folder, `scripts/` and `references/` included, after a second click confirms; a skill the conversation's last request carried is drawn orange while the model's cache is warm (see [the tool lock](tools.html#lock)): it can still be turned off, after the cache warning, but it has no delete button. The page toolbar also has a **Rescan** button and **open folder** buttons: the global `~/.mework/skills`, plus this workspace's `.mework/skills` when the conversation has a workspace. They create the directory when it is not there yet and reveal it in your file manager. Rescan also runs at startup, when the settings pane opens, when a workspace is added, and after every delete; every run rescans for itself, so a run uses what is on disk at that moment.
 
 ## Selecting skills for a conversation
 
@@ -66,7 +70,7 @@ The **Load skills on demand** switch (under the list, always shown) chooses betw
 
 A new conversation takes the switch from the preset it starts from; the built-in **mework** preset starts it on.
 
-Either way, the skills a conversation **starts** with are the ones its system prompt is built from, and that prompt does not change afterwards. Selecting another skill later delivers it as its own **system message** at that point in the transcript — the body with delivery off, the trigger line with delivery on (`system.skill_added_body` / `system.skill_added_trigger`). This is why neither the skills already handed over nor the delivery switch can be changed back: the transcript carries them in the form they were sent, and the rounds already answered cannot be re-asked.
+Either way, the skills a conversation **starts** with are the ones its system prompt is built from, and that prompt does not change afterwards. Selecting another skill later delivers it at that point in the transcript as a host message through the [`box` tool](tools/box.html) — the body with delivery off, the trigger line with delivery on (`system.skill_added_body` / `system.skill_added_trigger`, under the summary `host_notice.skill_added_summary`) — so the cached prompt ahead of it stays as it was. Taking a skill off, or moving the delivery switch, does rewrite that prompt, which is why both are drawn orange while the cache is warm; neither is refused.
 
 The `skill` tool is derived, not in the tool picker: it appears exactly when the switch is on and at least one selected skill resolved. Subagents inherit the parent conversation's selected skills.
 
@@ -79,6 +83,7 @@ The `skill` tool is derived, not in the tool picker: it appears exactly when the
 
 | Symptom | Cause |
 |---|---|
+| Mework SDK has no delete button | It is built into the app. Uncheck it to stop using it. |
 | The skill is not in the drawer | Its folder is not a direct child of `~/.mework/skills` or of this workspace's `.mework/skills`, or it has no `SKILL.md`, or it is a symlink, or its name contains `(`, `)` or `,`, or it has leading or trailing whitespace. |
 | Shown as unavailable | Mework found the folder but cannot read `SKILL.md`: over 256 KiB, not UTF-8, or unreadable. A run that selects it fails with that reason. |
 | Shown as *Dangling* | The selected id's folder has been renamed or deleted. It is ignored at run time; uncheck the row to remove it. |

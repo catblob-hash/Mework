@@ -5,19 +5,16 @@ import {
   ICON_BARE_VIEWBOX,
   ICON_MARK_TRANSFORM,
   ICON_PROMPT_PATH,
-  LOCKUP_MARK_TRANSFORM,
-  LOCKUP_VIEWBOX,
   MARK_PATH,
-  MARK_VIEWBOX,
-  WORDMARK_PATH
+  MARK_VIEWBOX
 } from "./brandMark";
 
 /**
- * The Mework brand in the app: the application icon, the bare mark, and the wordmark
- * lockup. The geometry is `brandMark.ts`, which the shipped SVG assets are cut from too.
+ * The Mework brand in the app: the application icon and the bare mark. The geometry is
+ * `brandMark.ts`, which the shipped SVG assets are cut from too.
  *
- * Rendered inline rather than through `<img src=...>` so the mark and the wordmark can take
- * their color from the page: an external SVG loaded by `<img>` gets its own document and
+ * Rendered inline rather than through `<img src=...>` so the mark can take its color from
+ * the page: an external SVG loaded by `<img>` gets its own document and
  * cannot see the host's palette, so it could not follow day and night.
  */
 
@@ -87,27 +84,6 @@ export function MeworkMark({ className }: BrandProps) {
       focusable="false"
     >
       <path d={MARK_PATH} />
-    </svg>
-  );
-}
-
-/**
- * "Mework" with the mark after it. The wordmark takes `currentColor`; the mark carries the
- * `mework-lockup__mark` class so the stylesheet can give it the amber token, which follows
- * the night palette where an attribute color could not. Size it by height in CSS.
- */
-export function MeworkLockup({ className }: BrandProps) {
-  return (
-    <svg
-      className={className}
-      viewBox={LOCKUP_VIEWBOX}
-      fill="currentColor"
-      role="img"
-      aria-label="Mework"
-      focusable="false"
-    >
-      <path d={WORDMARK_PATH} />
-      <path className="mework-lockup__mark" d={MARK_PATH} transform={LOCKUP_MARK_TRANSFORM} />
     </svg>
   );
 }

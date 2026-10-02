@@ -42,6 +42,11 @@ pub const GGUF_FILE: &str = "qwen3.5-0.8b-f16.gguf";
 /// Names this converter's output in the published build; a change to the
 /// output needs a new one.
 pub const GGUF_VERSION: &str = "qwen35-gguf-f16-1";
+/// The vision projector llama.cpp's `mtmd` loads beside the model.
+pub const MMPROJ_FILE: &str = "mmproj-qwen3.5-0.8b-f16.gguf";
+/// Names `convert_qwen35_mmproj_to_gguf`'s output in the published build.
+pub const MMPROJ_VERSION: &str = "qwen35-mmproj-f16-1";
+const CLIP_PROJECTOR: &str = "qwen3vl_merger";
 
 /// `tokenizer.ggml.pre` selects a pre-tokenizer regex built into llama.cpp.
 /// The reference converter recognizes it by hashing a sample tokenization;
@@ -88,7 +93,212 @@ pub fn convert_qwen35_to_gguf(
     let mut metadata = Metadata::default();
     model_metadata(&config, &raw_config, &mut metadata);
     vocab_metadata(model_dir, &raw_config, config.vocab_size, &mut metadata)?;
+    write_gguf(out, metadata, &checkpoint, &plan, cancel, progress)
+}
 
+/// Converts the release's vision tower into the projector file llama.cpp's
+/// `mtmd` loads beside the model (architecture `clip`): what llama.cpp's
+/// converter writes with `--mmproj --outtype f16` (its
+/// `Qwen3VLVisionModel`), down to the bytes, like `convert_qwen35_to_gguf`.
+pub fn convert_qwen35_mmproj_to_gguf(
+    model_dir: &Path,
+    out: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(ConvertProgress),
+) -> Result<(), String> {
+    let config = Config::load(&model_dir.join("config.json"))?;
+    let vision = crate::vision::VisionConfig::load(&model_dir.join("config.json"))?;
+    let preprocessor: Json = read_json(&model_dir.join("preprocessor_config.json"))?;
+    let floats = |key: &str| -> Result<Vec<f32>, String> {
+        preprocessor
+            .get(key)
+            .and_then(Json::as_array)
+            .and_then(|values| values.iter().map(|value| value.as_f64().map(|v| v as f32)).collect())
+            .ok_or_else(|| format!("preprocessor_config.json 缺少 {key}"))
+    };
+    let (mean, std) = (floats("image_mean")?, floats("image_std")?);
+
+    let checkpoint = Checkpoint::open(model_dir)?;
+    let plan = plan_mmproj(&checkpoint, &vision)?;
+    let parameters: u64 = plan.iter().map(|planned| planned.rule.shape.iter().product::<usize>() as u64).sum();
+
+    let mut metadata = Metadata::default();
+    let count = |value: usize| Value::U32(value as u32);
+    metadata.add("general.architecture", Value::Str("clip".into()));
+    metadata.add("general.type", Value::Str("mmproj".into()));
+    // What the reference derives from the repository name `Qwen3.5-0.8B` once
+    // the parameter count (the tower's) no longer matches the name's size.
+    let label = size_label(&config);
+    metadata.add("general.name", Value::Str(label.map_or_else(|| "Qwen3.5".into(), |label| format!("Qwen3.5 {label}"))));
+    if let Some(label) = label {
+        metadata.add("general.finetune", Value::Str(label.to_lowercase()));
+    }
+    metadata.add("general.basename", Value::Str("Qwen3.5".into()));
+    metadata.add("general.size_label", Value::Str(rounded_count(parameters)));
+    metadata.add("general.file_type", Value::U32(FILE_TYPE_MOSTLY_F16));
+    metadata.add("clip.has_vision_encoder", Value::Bool(true));
+    metadata.add("clip.vision.projection_dim", count(config.hidden_size));
+    let side = (vision.num_position_embeddings as f64).sqrt() as usize;
+    metadata.add("clip.vision.image_size", count(side * vision.patch_size));
+    metadata.add("clip.vision.patch_size", count(vision.patch_size));
+    metadata.add("clip.vision.embedding_length", count(vision.hidden_size));
+    metadata.add("clip.vision.feed_forward_length", count(vision.intermediate_size));
+    metadata.add("clip.vision.block_count", count(vision.depth));
+    metadata.add("clip.vision.attention.head_count", count(vision.num_heads));
+    metadata.add("clip.vision.image_mean", Value::F32s(mean));
+    metadata.add("clip.vision.image_std", Value::F32s(std));
+    metadata.add("clip.projector_type", Value::Str(CLIP_PROJECTOR.into()));
+    metadata.add("clip.use_gelu", Value::Bool(true));
+    metadata.add("clip.vision.spatial_merge_size", count(vision.spatial_merge_size));
+    // The reference takes the text model's RMSNorm epsilon here.
+    metadata.add("clip.vision.attention.layer_norm_epsilon", Value::F32(config.rms_norm_eps));
+    metadata.add("clip.vision.is_deepstack_layers", Value::Bools(vec![false; vision.depth]));
+    metadata.add("general.quantization_version", Value::U32(QUANTIZATION_VERSION));
+    write_gguf(out, metadata, &checkpoint, &plan, cancel, progress)
+}
+
+/// gguf-py's `model_weight_count_rounded_notation` (two significant digits at least).
+fn rounded_count(count: u64) -> String {
+    let count = count as f64;
+    let (scaled, suffix) = if count > 1e12 {
+        (count * 1e-12, "T")
+    } else if count > 1e9 {
+        (count * 1e-9, "B")
+    } else if count > 1e6 {
+        (count * 1e-6, "M")
+    } else {
+        (count * 1e-3, "K")
+    };
+    let digits = format!("{}", scaled.round_ties_even() as u64).trim_start_matches('0').len();
+    let fix = 2usize.saturating_sub(digits);
+    format!("{scaled:.fix$}{suffix}")
+}
+
+/// The vision tower's tensors in checkpoint order, as the reference maps them.
+fn plan_mmproj(checkpoint: &Checkpoint, vision: &crate::vision::VisionConfig) -> Result<Vec<Planned>, String> {
+    let v = vision;
+    let (h, merged) = (v.hidden_size, v.hidden_size * v.spatial_merge_size * v.spatial_merge_size);
+    let patch = vec![h, v.in_channels, v.temporal_patch_size, v.patch_size, v.patch_size];
+    let mut expected: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut expect = |name: String, shape: Vec<usize>| expected.insert(format!("{}{name}", crate::vision::TENSOR_PREFIX), shape);
+    expect("patch_embed.proj.weight".into(), patch.clone());
+    expect("patch_embed.proj.bias".into(), vec![h]);
+    expect("pos_embed.weight".into(), vec![v.num_position_embeddings, h]);
+    for (name, shape) in [
+        ("merger.norm.weight", vec![h]),
+        ("merger.norm.bias", vec![h]),
+        ("merger.linear_fc1.weight", vec![merged, merged]),
+        ("merger.linear_fc1.bias", vec![merged]),
+        ("merger.linear_fc2.weight", vec![v.out_hidden_size, merged]),
+        ("merger.linear_fc2.bias", vec![v.out_hidden_size]),
+    ] {
+        expect(name.into(), shape);
+    }
+    for block in 0..v.depth {
+        for (name, shape) in [
+            ("attn.qkv.weight", vec![3 * h, h]),
+            ("attn.qkv.bias", vec![3 * h]),
+            ("attn.proj.weight", vec![h, h]),
+            ("attn.proj.bias", vec![h]),
+            ("mlp.linear_fc1.weight", vec![v.intermediate_size, h]),
+            ("mlp.linear_fc1.bias", vec![v.intermediate_size]),
+            ("mlp.linear_fc2.weight", vec![h, v.intermediate_size]),
+            ("mlp.linear_fc2.bias", vec![h]),
+            ("norm1.weight", vec![h]),
+            ("norm1.bias", vec![h]),
+            ("norm2.weight", vec![h]),
+            ("norm2.bias", vec![h]),
+        ] {
+            expect(format!("blocks.{block}.{name}"), shape);
+        }
+    }
+    if v.temporal_patch_size != 2 {
+        return Err("视觉投影只支持 temporal_patch_size = 2".into());
+    }
+    let mut plan = Vec::new();
+    let mut seen = 0;
+    for (index, file) in checkpoint.files.iter().enumerate() {
+        for name in file.names() {
+            let Some(local) = name.strip_prefix(crate::vision::TENSOR_PREFIX) else { continue };
+            let shape = &file.info(name).expect("listed").shape;
+            match expected.get(name) {
+                Some(want) if want == shape => seen += 1,
+                Some(want) => return Err(format!("张量 {name} 的形状 {shape:?} 与配置不符（应为 {want:?}）")),
+                None => return Err(format!("权重里有无法识别的视觉张量 {name}")),
+            }
+            let mut push = |gguf: String, shape: Vec<usize>, ty: GgmlType, cols: Option<Vec<usize>>| {
+                plan.push(Planned {
+                    file: index,
+                    source: name.to_owned(),
+                    rule: Rule { name: gguf, shape, ty, op: Op::Copy, rows: None, cols },
+                })
+            };
+            if local == "patch_embed.proj.weight" {
+                // The Conv3d becomes one Conv2d per frame.
+                let (c, p) = (v.in_channels, v.patch_size);
+                for frame in 0..2 {
+                    let cols = (0..c * p * p)
+                        .map(|i| {
+                            let (channel, pixel) = (i / (p * p), i % (p * p));
+                            (channel * 2 + frame) * p * p + pixel
+                        })
+                        .collect();
+                    let gguf = if frame == 0 { "v.patch_embd.weight".to_string() } else { "v.patch_embd.weight.1".into() };
+                    push(gguf, vec![h, c, p, p], GgmlType::F16, Some(cols));
+                }
+                continue;
+            }
+            let gguf = mmproj_name(local).ok_or_else(|| format!("无法识别的视觉张量 {name}"))?;
+            let ty = if gguf == "v.position_embd.weight" || shape.len() <= 1 { GgmlType::F32 } else { GgmlType::F16 };
+            push(gguf, shape.clone(), ty, None);
+        }
+    }
+    if seen != expected.len() {
+        return Err("权重里缺少视觉张量".into());
+    }
+    Ok(plan)
+}
+
+/// gguf-py's tensor map for the `clip` architecture, as Qwen3-VL uses it.
+fn mmproj_name(local: &str) -> Option<String> {
+    let fixed = match local {
+        "patch_embed.proj.bias" => Some("v.patch_embd.bias"),
+        "pos_embed.weight" => Some("v.position_embd.weight"),
+        "merger.norm.weight" => Some("v.post_ln.weight"),
+        "merger.norm.bias" => Some("v.post_ln.bias"),
+        "merger.linear_fc1.weight" => Some("mm.0.weight"),
+        "merger.linear_fc1.bias" => Some("mm.0.bias"),
+        "merger.linear_fc2.weight" => Some("mm.2.weight"),
+        "merger.linear_fc2.bias" => Some("mm.2.bias"),
+        _ => None,
+    };
+    if let Some(name) = fixed {
+        return Some(name.into());
+    }
+    let (block, rest) = local.strip_prefix("blocks.")?.split_once('.')?;
+    let block: usize = block.parse().ok()?;
+    let (module, kind) = rest.rsplit_once('.')?;
+    let short = match module {
+        "attn.qkv" => "attn_qkv",
+        "attn.proj" => "attn_out",
+        "mlp.linear_fc1" => "ffn_up",
+        "mlp.linear_fc2" => "ffn_down",
+        "norm1" => "ln1",
+        "norm2" => "ln2",
+        _ => return None,
+    };
+    Some(format!("v.blk.{block}.{short}.{kind}"))
+}
+
+/// Writes `metadata` and the planned tensors to `out`, atomically.
+fn write_gguf(
+    out: &Path,
+    metadata: Metadata,
+    checkpoint: &Checkpoint,
+    plan: &[Planned],
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(ConvertProgress),
+) -> Result<(), String> {
     let entries: Vec<TensorEntry> = plan.iter().map(|planned| planned.rule.entry()).collect();
     let header = encode_header(&metadata, &entries);
     drop(metadata);
@@ -154,6 +364,7 @@ pub enum Value {
     F32(f32),
     Bool(bool),
     Str(String),
+    F32s(Vec<f32>),
     I32s(Vec<i32>),
     Bools(Vec<bool>),
     Strs(Vec<String>),
@@ -163,6 +374,7 @@ impl Value {
     fn is_empty(&self) -> bool {
         match self {
             Self::Str(value) => value.is_empty(),
+            Self::F32s(values) => values.is_empty(),
             Self::I32s(values) => values.is_empty(),
             Self::Bools(values) => values.is_empty(),
             Self::Strs(values) => values.is_empty(),
@@ -187,6 +399,12 @@ impl Value {
             Self::Str(value) => {
                 put_u32(out, TYPE_STRING);
                 put_str(out, value);
+            }
+            Self::F32s(values) => {
+                put_array_header(out, TYPE_F32, values.len());
+                for value in values {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
             }
             Self::I32s(values) => {
                 put_array_header(out, TYPE_I32, values.len());
@@ -930,7 +1148,9 @@ fn convert_tensor(
 ) -> Result<(), String> {
     let rows = rule.shape.first().copied().unwrap_or(1);
     let cols = rule.shape.iter().skip(1).product::<usize>();
-    if rows * cols != source.len() {
+    // A column order may also pick a subset of the source's columns.
+    let source_cols = if rule.cols.is_some() { source.len() / rows } else { cols };
+    if rows * source_cols != source.len() || rule.cols.as_ref().is_some_and(|order| order.iter().any(|c| *c >= source_cols)) {
         return Err(format!("张量 {} 的元素数与形状不符", rule.name));
     }
     let same_type = matches!((source.dtype, rule.ty), (Dtype::F32, GgmlType::F32) | (Dtype::F16, GgmlType::F16));
@@ -942,7 +1162,7 @@ fn convert_tensor(
     }
 
     let rows_per_chunk = (CHUNK_BYTES / (cols * rule.ty.size()).max(1)).max(1);
-    let mut row = vec![0f32; cols];
+    let mut row = vec![0f32; source_cols];
     let mut permuted = vec![0f32; if rule.cols.is_some() { cols } else { 0 }];
     let mut buffer = Vec::with_capacity(rows_per_chunk.min(rows) * cols * rule.ty.size());
     let mut start = 0;
@@ -951,7 +1171,7 @@ fn convert_tensor(
         buffer.clear();
         for out_row in start..end {
             let source_row = rule.rows.as_ref().map_or(out_row, |rows| rows[out_row]);
-            decode(&source, source_row * cols, &mut row);
+            decode(&source, source_row * source_cols, &mut row);
             let values = match &rule.cols {
                 Some(order) => {
                     for (value, &col) in permuted.iter_mut().zip(order) {
@@ -1134,6 +1354,7 @@ mod tests {
                     let len = self.u64() as usize;
                     match item {
                         TYPE_I32 => Value::I32s((0..len).map(|_| self.u32() as i32).collect()),
+                        TYPE_F32 => Value::F32s((0..len).map(|_| f32::from_bits(self.u32())).collect()),
                         TYPE_BOOL => Value::Bools((0..len).map(|_| self.u8() != 0).collect()),
                         TYPE_STRING => Value::Strs((0..len).map(|_| self.str()).collect()),
                         other => panic!("array of {other}"),
@@ -1792,5 +2013,37 @@ mod tests {
         let (_, dims, ty, offset) = parsed.tensors.last().unwrap();
         let size_of = if *ty == 0 { 4 } else { 2 };
         assert_eq!(parsed.data_start as u64 + offset + padded(dims.iter().product::<u64>() * size_of), size);
+    }
+
+    /// The projector llama.cpp b11074's own converter writes for the release
+    /// (`convert_hf_to_gguf.py --mmproj --outtype f16`, Qwen/Qwen3.5-0.8B at
+    /// 2fc06364): this converter must match it byte for byte.
+    const REFERENCE_MMPROJ_SHA256: &str = "413334162c7cbacebe6bef772011cf916e9123a07a0805a78cdb097394aaa5be";
+
+    #[test]
+    fn converts_the_release_vision_tower_like_llama_cpp() {
+        let Some(dir) = std::env::var_os("MEWORK_LOCAL_MODEL_DIR") else {
+            eprintln!("MEWORK_LOCAL_MODEL_DIR 未设置，跳过");
+            return;
+        };
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join(MMPROJ_FILE);
+        convert_qwen35_mmproj_to_gguf(&PathBuf::from(dir), &out, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        let bytes = fs::read(&out).unwrap();
+        let parsed = parse(&bytes);
+        assert_eq!(parsed.get("clip.projector_type"), Some(&Value::Str(CLIP_PROJECTOR.into())));
+        assert_eq!(parsed.get("general.size_label"), Some(&Value::Str("101M".into())));
+        assert_eq!(parsed.tensors.len(), 154);
+        use sha2::Digest;
+        let digest: String = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(digest, REFERENCE_MMPROJ_SHA256);
+    }
+
+    #[test]
+    fn rounds_parameter_counts_like_gguf_py() {
+        assert_eq!(rounded_count(100_592_896), "101M");
+        assert_eq!(rounded_count(752_393_024), "752M");
+        assert_eq!(rounded_count(1_500_000), "1.5M");
+        assert_eq!(rounded_count(8_030_000_000), "8.0B");
     }
 }

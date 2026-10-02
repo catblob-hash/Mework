@@ -14,6 +14,7 @@ import type { ToolDescriptor } from "../types";
 import { subagentAvatarTone } from "../lib/subagents";
 import type { SubagentView, SubagentViewStatus } from "../lib/subagents";
 import { ConversationView } from "./ConversationView";
+import { PageTabs } from "./PageTabs";
 import { subagentChangeSpans } from "./TurnChanges";
 import "./SubagentPanel.css";
 
@@ -69,6 +70,59 @@ export function SubagentStatusBadge({ status }: { status: SubagentViewStatus }) 
       <Icon className={status === "running" ? "subagent-status__spinner" : undefined} size={12} aria-hidden="true" />
       {meta.label(t)}
     </span>
+  );
+}
+
+export interface SubagentTabBarProps {
+  /** The agents with a tab, in tab order. */
+  agents: SubagentView[];
+  activeId: string | null;
+  onSelect: (id: string) => void;
+  onClose: (id: string) => void;
+  /** Makes the tab order the user's; receives every agent id in the new order. */
+  onReorder?: (ids: string[]) => void;
+}
+
+/**
+ * The subagent pane's title bar: a tab per agent whose transcript was opened, on the shared page
+ * strip, each marked with how its agent is doing. It takes the pane's `header` slot, so the pane
+ * draws no title of its own. A tab is only a view of a transcript — closing one stops nothing and
+ * the agent's row opens it again — so Delete closes the focused tab, and there is no `+`: an agent
+ * is opened from its task row, its record in the timeline or a neighbour's group links.
+ */
+export function SubagentTabBar({ agents, activeId, onSelect, onClose, onReorder }: SubagentTabBarProps) {
+  const { t } = useI18n();
+  return (
+    <PageTabs
+      tabs={agents.map((agent) => {
+        const meta = statusMeta[agent.status];
+        const Icon = meta.icon;
+        const status = meta.label(t);
+        return {
+          id: agent.id,
+          label: agent.label,
+          title: `${agent.label} · ${status}`,
+          icon: (
+            <Icon
+              className={agent.status === "running" ? "subagent-status__spinner" : undefined}
+              size={12}
+              aria-hidden="true"
+            />
+          ),
+          // The icon is unseen to a screen reader, so the status rides along in words.
+          content: <>{agent.label}<span className="sr-only">{`, ${status}`}</span></>,
+          className: `subagent-tab subagent-tab--${agent.status}`
+        };
+      })}
+      activeId={activeId}
+      ariaLabel={t("子代理标签", "Subagent tabs")}
+      moreLabel={t("更多子代理", "More subagents")}
+      onSelect={onSelect}
+      onClose={onClose}
+      closeLabel={(tab) => t("关闭标签 {label}", "Close tab {label}", { label: tab.label })}
+      closeOnDeleteKey
+      onReorder={onReorder}
+    />
   );
 }
 

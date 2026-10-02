@@ -3,7 +3,7 @@
   "language": "en-US",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 48,
+  "toolCount": 49,
   "tools": [
     {
       "name": "ls",
@@ -852,7 +852,7 @@
           "type": "string",
           "required": true,
           "placeholder": "review-api",
-          "help": "Required. Name the child yourself: it is the address send_message / followup_task / task_wait take, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree."
+          "help": "Required. Name the child yourself: it is the address task_wait takes, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree."
         },
         {
           "name": "label",
@@ -877,52 +877,6 @@
           "required": false,
           "placeholder": "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\"}},\"required\":[\"verdict\"]}",
           "help": "Optional JSON Schema subset. When set, the child must call structured_output with a result matching it, and that value comes back with task_wait. The top level must be an object schema; type, properties, required, items, enum, const, additionalProperties, minItems/maxItems, minLength/maxLength and minimum/maximum are supported and every other keyword is rejected on the spot."
-        }
-      ]
-    },
-    {
-      "name": "send_message",
-      "label": "Send message",
-      "description": "",
-      "category": "orchestration",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "target",
-          "label": "Child agent",
-          "type": "string",
-          "required": true,
-          "placeholder": "a1",
-          "help": "Name returned by agent_spawn."
-        },
-        {
-          "name": "message",
-          "label": "Message",
-          "type": "multiline",
-          "required": true
-        }
-      ]
-    },
-    {
-      "name": "followup_task",
-      "label": "Follow up",
-      "description": "",
-      "category": "orchestration",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "target",
-          "label": "Child agent",
-          "type": "string",
-          "required": true,
-          "placeholder": "a1",
-          "help": "Name returned by agent_spawn."
-        },
-        {
-          "name": "message",
-          "label": "Message",
-          "type": "multiline",
-          "required": true
         }
       ]
     },
@@ -965,7 +919,16 @@
       "description": "",
       "category": "orchestration",
       "dangerous": false,
-      "parameters": []
+      "parameters": [
+        {
+          "name": "none",
+          "label": "Empty argument",
+          "type": "json",
+          "required": true,
+          "placeholder": "[]",
+          "help": "Always an empty list."
+        }
+      ]
     },
     {
       "name": "skill",
@@ -1229,92 +1192,7 @@
           "type": "string",
           "required": false,
           "placeholder": "run0a1b2c3d",
-          "help": "Run id from a previous run of this same script; journaled steps replay, the first unjournaled one and everything after it re-runs."
-        }
-      ]
-    },
-    {
-      "name": "todo",
-      "label": "Todo",
-      "description": "",
-      "category": "orchestration",
-      "dangerous": false,
-      "parameters": [
-        {
-          "name": "action",
-          "label": "Action",
-          "type": "string",
-          "required": true,
-          "placeholder": "create",
-          "help": "create, update, get, list."
-        },
-        {
-          "name": "taskId",
-          "label": "Task ID",
-          "type": "string",
-          "required": false,
-          "placeholder": "task-1",
-          "help": "update, get; the opaque ID returned by create."
-        },
-        {
-          "name": "subject",
-          "label": "Task subject",
-          "type": "string",
-          "required": false,
-          "placeholder": "Implement user authentication",
-          "help": "Required by create; optional patch field for update."
-        },
-        {
-          "name": "description",
-          "label": "Description",
-          "type": "multiline",
-          "required": false,
-          "placeholder": "Add login and signup endpoints and cover them with tests.",
-          "help": "Required by create; optional patch field for update."
-        },
-        {
-          "name": "activeForm",
-          "label": "Active form",
-          "type": "string",
-          "required": false,
-          "placeholder": "Implementing user authentication",
-          "help": "create, update; short present-continuous text shown while the task is in_progress."
-        },
-        {
-          "name": "status",
-          "label": "Status",
-          "type": "string",
-          "required": false,
-          "placeholder": "in_progress",
-          "help": "update; pending | in_progress | completed | deleted"
-        },
-        {
-          "name": "owner",
-          "label": "Owner",
-          "type": "string",
-          "required": false,
-          "help": "update."
-        },
-        {
-          "name": "addBlocks",
-          "label": "Add blocked tasks",
-          "type": "json",
-          "required": false,
-          "help": "update; array of task IDs that this task blocks."
-        },
-        {
-          "name": "addBlockedBy",
-          "label": "Add blockers",
-          "type": "json",
-          "required": false,
-          "help": "update; array of task IDs that block this task."
-        },
-        {
-          "name": "metadata",
-          "label": "Metadata",
-          "type": "json",
-          "required": false,
-          "help": "create writes the whole object; update merges keys, and a null value removes that key."
+          "help": "Run id from a previous run; steps whose prompt and options are unchanged replay, a step the last attempt left running re-runs alone, and everything from the first changed or failed step re-runs. script and args may be omitted to reuse the last ones; an edited script is approved again."
         }
       ]
     },
@@ -1379,6 +1257,102 @@
     {
       "name": "exit_plan_mode",
       "label": "Exit plan mode",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "read_handoff_note",
+      "label": "Read handoff note",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "current-state",
+          "help": "A note name listed in the handoff index. The .md suffix is optional."
+        }
+      ]
+    },
+    {
+      "name": "create_handoff_note",
+      "label": "Write handoff note",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "current-state",
+          "help": "The handoff note's name. Path separators are forbidden; the .md suffix is optional."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true,
+          "help": "The note's complete Markdown body."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The goal, the work done and the next step",
+          "help": "One sentence describing what this handoff note holds. It is written into the handoff index."
+        }
+      ]
+    },
+    {
+      "name": "edit_handoff_note",
+      "label": "Edit handoff note",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "current-state",
+          "help": "The handoff note to modify. The .md suffix is optional."
+        },
+        {
+          "name": "old_text",
+          "label": "Original text",
+          "type": "multiline",
+          "required": true,
+          "help": "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        },
+        {
+          "name": "new_text",
+          "label": "New text",
+          "type": "multiline",
+          "required": true,
+          "help": "The replacement text. Leave it empty to delete the passage."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The goal, the work done and the next step",
+          "help": "One sentence describing this handoff note after the change. It refreshes the note's entry in the handoff index."
+        }
+      ]
+    },
+    {
+      "name": "handoff",
+      "label": "Hand off",
       "description": "",
       "category": "orchestration",
       "dangerous": false,

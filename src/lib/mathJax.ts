@@ -52,7 +52,7 @@ function remember(key: string, render: MathRender): MathRender {
 }
 
 /** Starts loading the engine if nothing has yet; safe to call as often as a render likes. */
-export function loadMathEngine(): Promise<void> {
+function loadMathEngine(): Promise<void> {
   if (engineLoad) return engineLoad;
   engineLoad = import("./mathJaxEngine").then((loaded) => {
     engine = loaded;
@@ -103,24 +103,4 @@ export function subscribeMath(listener: () => void): () => void {
 /** Changes whenever `subscribeMath` fires; the snapshot `useSyncExternalStore` compares. */
 export function mathVersion(): number {
   return version;
-}
-
-/**
- * Resolves once this formula has an answer.
- *
- * For callers that are not renders — tests, and anything that wants the drawing
- * before showing a page — rather than for components, which subscribe instead.
- */
-export async function renderMath(source: string, display: boolean): Promise<MathRender> {
-  for (let attempt = 0; attempt < 64; attempt += 1) {
-    const now = peekMath(source, display);
-    if (now) return now;
-    await new Promise<void>((resolve) => {
-      const stop = subscribeMath(() => {
-        stop();
-        resolve();
-      });
-    });
-  }
-  return { status: "error", message: "MathJax did not finish loading this formula" };
 }

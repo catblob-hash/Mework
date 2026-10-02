@@ -2,7 +2,7 @@ Evaluates one JavaScript expression in the preview page and hands the result bac
 
 ## Approval
 
-The call is classified as an unbounded action (`tool.unbounded`, high risk), so `request_approval`, `allow_edits` and `plan` raise an approval card before it runs, and `full_access` does not. **Always allow** is never offered for a page tool. On a page you signed into yourself, the run loop first asks whether the Agent may take the tab over, naming the signed-in origin; that card is not disabled by any security level and a hook cannot answer it.
+The call is classified as an unbounded action (`tool.unbounded`, high risk), so `request_approval` and `allow_edits` raise an approval card before it runs, and `full_access` does not. **Always allow** is never offered for a page tool. On a page you signed into yourself, the run loop first asks whether the Agent may take the tab over, naming the signed-in origin; that card is not disabled by any security level and a hook cannot answer it.
 
 ## Behavior and limits
 

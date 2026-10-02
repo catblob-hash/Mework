@@ -21,6 +21,7 @@ import type { AppVersionInfo } from "../../types";
 import { IconButton } from "../Common";
 import { MarkdownContent } from "../MarkdownContent";
 import { MeworkIcon } from "../MeworkIcon";
+import { PathText } from "../PathText";
 import { SettingsPageHeading } from "../SettingsPageHeading";
 import "./UpdateSettings.css";
 
@@ -127,9 +128,7 @@ function VersionCard({
           </div>
         )}
         {info && (
-          <p className="update-settings__path" title={info.executableDir}>
-            {info.executableDir}
-          </p>
+          <PathText className="update-settings__path" path={info.executableDir} />
         )}
         {!connected && (
           <p className="update-settings__hint">

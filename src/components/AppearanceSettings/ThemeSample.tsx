@@ -1,4 +1,6 @@
-import type { JSX } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { JSX, RefObject } from "react";
+import { frostPicture, parseGlassFilter } from "../../lib/glassPlate";
 
 /**
  * Which palette a sample is drawn in. `current` and `opposite` are relative to the
@@ -8,6 +10,29 @@ import type { JSX } from "react";
  * drawn in the palette's real values without the page switching theme.
  */
 export type ThemeSampleScheme = "current" | "opposite" | "day" | "night";
+
+/** The window's glass in miniature: its blur is the window's scaled down. */
+const SAMPLE_GLASS = parseGlassFilter("blur(3px) saturate(130%)");
+
+/**
+ * `picture` baked as the sample's glass (`lib/glassPlate.ts`), for the size the sample is drawn
+ * at; null until it is ready, or when there is no picture.
+ */
+function useFrostedPicture(picture: string | null, sample: RefObject<HTMLElement | null>): string | null {
+  const [frosted, setFrosted] = useState<{ picture: string; url: string } | null>(null);
+  useEffect(() => {
+    const box = sample.current;
+    if (!picture || !box?.clientWidth || !box.clientHeight) return;
+    let disposed = false;
+    void frostPicture(picture, box.clientWidth, box.clientHeight, SAMPLE_GLASS).then((url) => {
+      if (!disposed && url) setFrosted({ picture, url });
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [picture, sample]);
+  return frosted && frosted.picture === picture ? frosted.url : null;
+}
 
 /**
  * A miniature of the window — sidebar, top bar, the conversation tile with its
@@ -26,8 +51,11 @@ export function ThemeSample({
   picture?: string | null;
   className?: string;
 }): JSX.Element {
+  const sampleRef = useRef<HTMLSpanElement>(null);
+  const frosted = useFrostedPicture(glass ? picture : null, sampleRef);
   return (
     <span
+      ref={sampleRef}
       className={`theme-sample${className ? ` ${className}` : ""}`}
       data-scheme={scheme}
       data-glass={glass || undefined}
@@ -35,10 +63,10 @@ export function ThemeSample({
       aria-hidden="true"
     >
       {picture && <img className="theme-sample__picture" src={picture} alt="" draggable={false} />}
-      {picture && glass && (
+      {frosted && (
         <img
           className="theme-sample__picture theme-sample__picture--frosted"
-          src={picture}
+          src={frosted}
           alt=""
           draggable={false}
         />

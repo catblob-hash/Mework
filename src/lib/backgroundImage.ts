@@ -15,7 +15,7 @@ import { hasBackendRuntime, invoke } from "./backend";
  */
 
 /** Long-edge sizes of the ladder. The top is where a 6K window stops needing more. */
-export const BACKGROUND_LADDER = [640, 1280, 1920, 2560, 3840, 5120, 7680] as const;
+const BACKGROUND_LADDER = [640, 1280, 1920, 2560, 3840, 5120, 7680] as const;
 const MAX_LONG_EDGE = BACKGROUND_LADDER[BACKGROUND_LADDER.length - 1];
 /**
  * Past this the full-size decode is not read back pixel by pixel; the engine shrinks it
@@ -271,7 +271,7 @@ async function encode(pixels: Pixels, opaque: boolean): Promise<Uint8Array> {
 }
 
 /** Every tier of a picked file, smallest first. Each is shrunk from the one above it. */
-export async function buildBackgroundTiers(file: Blob): Promise<EncodedTier[]> {
+async function buildBackgroundTiers(file: Blob): Promise<EncodedTier[]> {
   const top = await readSource(file);
   const opaque = isOpaque(top);
   const ladder = backgroundLadder(top.width, top.height);

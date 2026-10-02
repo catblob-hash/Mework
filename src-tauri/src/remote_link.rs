@@ -387,6 +387,121 @@ pub fn helper_link(runner: &ShellRunner, patience: Duration) -> Result<Option<Li
     }
 }
 
+/// Whether the machine `runner` reaches is there to answer right now, found
+/// out in at most `within`.
+///
+/// For a caller that has already waited on a machine longer than a healthy one
+/// takes and must decide whether to keep waiting. A link's status cannot say:
+/// one that reads connected may be talking to a machine switched off a moment
+/// ago — its heartbeat notices only after [`LinkConfig::dead_after`] — and one
+/// still connecting may be dialing a machine that is not on. So a link that is
+/// up is asked for the cheapest reply its agent gives, and a machine without
+/// one is checked for anything accepting a connection where `ssh` would make
+/// it. What that cannot check — a connection through a proxy, a configuration
+/// `ssh` cannot print, a WSL distribution still starting — counts as there,
+/// and the caller's own bounds decide.
+pub fn machine_is_there(runner: &ShellRunner, within: Duration) -> bool {
+    let key = match runner {
+        ShellRunner::Local { .. } => return true,
+        ShellRunner::Wsl { distro, .. } => format!("wsl\u{0}{distro}"),
+        ShellRunner::Ssh {
+            host,
+            port,
+            identity_file,
+            ..
+        } => endpoint_key(host, *port, identity_file),
+    };
+    let link = HUB.get().and_then(|hub| lock(&hub.state).links.get(&key).cloned());
+    if let Some(link) = link.filter(|link| matches!(link.status(), LinkStatus::Connected { .. })) {
+        // A failure is an answer too: only silence means the machine is gone.
+        let reply = link.call(protocol::Op::Which { names: Vec::new() }, &[], within);
+        return !matches!(reply, Err(CallError::Timeout | CallError::Link(_)));
+    }
+    match runner {
+        ShellRunner::Ssh { host, port, .. } => endpoint_accepts(host, *port, within),
+        _ => true,
+    }
+}
+
+/// Whether anything accepts a TCP connection where `ssh` connects for `host`,
+/// decided in `within`. Resolving a name has no timeout of its own, so the
+/// check runs where it can be left behind; every address is tried at once.
+fn endpoint_accepts(host: &str, port: u16, within: Duration) -> bool {
+    let (sender, verdict) = std::sync::mpsc::channel();
+    let host = host.to_owned();
+    std::thread::spawn(move || {
+        let Some((name, port)) = ssh_endpoint(&host, port) else {
+            let _ = sender.send(true);
+            return;
+        };
+        // A name that does not resolve is a machine that is not there; every
+        // address refusing or timing out drops the last sender, which ends the
+        // wait at once.
+        let addresses = std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), port))
+            .map(Iterator::collect::<Vec<_>>)
+            .unwrap_or_default();
+        for address in addresses {
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                if std::net::TcpStream::connect_timeout(&address, within).is_ok() {
+                    let _ = sender.send(true);
+                }
+            });
+        }
+    });
+    verdict.recv_timeout(within).unwrap_or(false)
+}
+
+/// Where `ssh` connects for `host` once the user's configuration has had its
+/// say — `HostName`, `Port` — as `ssh -G` prints it. None when `ssh` does not
+/// make that connection itself (`ProxyJump`, `ProxyCommand`) or cannot say.
+fn ssh_endpoint(host: &str, port: u16) -> Option<(String, u16)> {
+    let mut args = vec!["-G".to_owned()];
+    if port != 0 {
+        args.extend(["-p".to_owned(), port.to_string()]);
+    }
+    args.extend(["--".to_owned(), host.to_owned()]);
+    let output = run_environment::ssh_client_candidates()
+        .into_iter()
+        .find_map(|program| {
+            let mut command = Command::new(program);
+            command
+                .args(&args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null());
+            for name in crate::child_environment::private_child_environment_names() {
+                command.env_remove(&name);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                command.creation_flags(0x0800_0000);
+            }
+            command.output().ok()
+        })?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ssh_endpoint(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_ssh_endpoint(config: &str) -> Option<(String, u16)> {
+    let (mut name, mut port) = (None, None);
+    for line in config.lines() {
+        let Some((key, value)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.to_ascii_lowercase().as_str() {
+            "hostname" => name = Some(value.to_owned()),
+            "port" => port = value.parse().ok(),
+            "proxyjump" | "proxycommand" if !value.eq_ignore_ascii_case("none") => return None,
+            _ => {}
+        }
+    }
+    Some((name?, port?))
+}
+
 fn report_status(host: &str, status: &LinkStatus) {
     if let Some(observer) = HUB.get().and_then(|hub| hub.observer.as_ref()) {
         observer(host, status);
@@ -732,13 +847,7 @@ pub fn spawn_in_sandbox(
         ShellRunner::Ssh { host, .. } => match route(runner, FIRST_CONNECT_WAIT) {
             Route::Agent(link, agent) => (link, agent, format!("the SSH machine {host}")),
             Route::Legacy => {
-                let why = HUB
-                    .get()
-                    .and_then(|hub| lock(&hub.state).unavailable.values().next().map(|(why, _)| why.clone()))
-                    .unwrap_or_else(|| "it is still being installed there, or it is switched off".into());
-                return Err(format!(
-                    "The sandbox needs Mework's agent on the SSH machine {host}, which is not running there ({why}); the command was not run"
-                ));
+                return Err(format!("{}; the command was not run", no_agent_for_sandbox(host)));
             }
             Route::Unreachable(error) => return Err(error),
         },
@@ -787,9 +896,31 @@ pub fn spawn_in_sandbox(
 // This computer and its WSL distributions, through the agent
 // ---------------------------------------------------------------------------
 
-/// What the agent on this computer says about sandboxing here.
-pub fn local_sandbox_support() -> Result<protocol::SandboxSupport, String> {
-    local_link(&ShellRunner::default(), FIRST_CONNECT_WAIT).map(|(_, agent)| agent.sandbox)
+/// Why an SSH machine the agent does not serve cannot sandbox.
+fn no_agent_for_sandbox(host: &str) -> String {
+    let why = HUB
+        .get()
+        .and_then(|hub| lock(&hub.state).unavailable.values().next().map(|(why, _)| why.clone()))
+        .unwrap_or_else(|| "it is still being installed there, or it is switched off".into());
+    format!("The sandbox needs Mework's agent on the SSH machine {host}, which is not running there ({why})")
+}
+
+/// What the agent on the machine `runner` reaches says about sandboxing
+/// there: this computer's, a WSL distribution's, or an SSH machine's — the
+/// same agent [`spawn_in_sandbox`] would start the cell through. An SSH
+/// machine the agent does not serve cannot sandbox at all, and says why.
+pub fn sandbox_support(runner: &ShellRunner) -> Result<protocol::SandboxSupport, String> {
+    match runner {
+        ShellRunner::Ssh { host, .. } => match route(runner, FIRST_CONNECT_WAIT) {
+            Route::Agent(_, agent) => Ok(agent.sandbox),
+            Route::Legacy => Ok(protocol::SandboxSupport {
+                detail: no_agent_for_sandbox(host),
+                ..Default::default()
+            }),
+            Route::Unreachable(error) => Err(error),
+        },
+        _ => local_link(runner, FIRST_CONNECT_WAIT).map(|(_, agent)| agent.sandbox),
+    }
 }
 
 /// The link to the agent Mework runs on this computer — or inside a WSL
@@ -934,7 +1065,7 @@ pub fn setup_local_sandbox() -> Result<protocol::SandboxSupport, String> {
     if let Some(link) = stale {
         link.close(true);
     }
-    local_sandbox_support()
+    sandbox_support(&ShellRunner::default())
 }
 
 /// The build as a file this computer can execute. A bundled build may have
@@ -2038,6 +2169,40 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_is_checked_where_ssh_connects_unless_a_proxy_does() {
+        assert_eq!(
+            parse_ssh_endpoint("user holycat\nhostname desktop.example.ts.net\nport 2222\nconnecttimeout none\n"),
+            Some(("desktop.example.ts.net".to_owned(), 2222))
+        );
+        assert_eq!(parse_ssh_endpoint("hostname 10.0.0.2\nport 22\nproxycommand none\n"), Some(("10.0.0.2".to_owned(), 22)));
+        assert_eq!(parse_ssh_endpoint("hostname 10.0.0.2\nport 22\nproxyjump bastion\n"), None);
+        assert_eq!(parse_ssh_endpoint("hostname 10.0.0.2\nport 22\nproxycommand nc %h %p\n"), None);
+        assert_eq!(parse_ssh_endpoint("port 22\n"), None);
+    }
+
+    #[test]
+    fn a_machine_nothing_answers_for_is_not_there() {
+        let runner = |host: &str, port: u16| ShellRunner::Ssh {
+            agent_shell: Default::default(),
+            host: host.to_owned(),
+            port,
+            identity_file: String::new(),
+            env: Default::default(),
+        };
+        let within = Duration::from_millis(500);
+        // A port nothing listens on is refused at once; a reserved name never resolves.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let started = Instant::now();
+        assert!(!machine_is_there(&runner("127.0.0.1", port), within));
+        assert!(!machine_is_there(&runner("there-is-no-such-machine.invalid", 0), within));
+        assert!(started.elapsed() < within * 2, "{:?}", started.elapsed());
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(machine_is_there(&runner("127.0.0.1", open.local_addr().unwrap().port()), within));
+    }
+
+    #[test]
     fn a_machine_gets_the_best_build_it_can_run() {
         let catalog = catalog_with(&["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-apple-darwin"]);
         assert_eq!(
@@ -2257,7 +2422,7 @@ mod tests {
     fn a_sandboxed_command_runs_through_this_computers_agent() {
         let app_data = tempfile::tempdir().unwrap();
         install(app_data.path(), Vec::new(), None);
-        let support = local_sandbox_support().expect("the local agent starts");
+        let support = sandbox_support(&ShellRunner::default()).expect("the local agent starts");
         if !support.available {
             eprintln!("skipped: {}", support.detail);
             return;
@@ -2268,12 +2433,16 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let settings = crate::model::SandboxSettings {
-            enabled: true,
-            ..Default::default()
-        };
-        let set = crate::workspace_set::WorkspaceSet::local_root(workspace.to_string_lossy().into_owned())
-            .sandboxed(&settings, "conv-e2e");
+        let root = workspace.to_string_lossy().into_owned();
+        let mut assets = crate::model::ExecutionEnvironmentAssets::default();
+        assets.sandboxes.insert(
+            crate::run_environment::workspace_env_key(None, &root),
+            crate::model::SandboxSettings {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let set = crate::workspace_set::WorkspaceSet::local_root(root).sandboxed(&assets, "conv-e2e");
         let sandbox = set.primary().unwrap().sandbox.clone().expect("sandboxed");
         let script = format!(
             "echo inside > made.txt && echo wrote; echo x > '{}/escape' 2>/dev/null || echo outside-refused; echo \"[$MEWORK_SANDBOX]\"",

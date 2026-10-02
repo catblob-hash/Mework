@@ -214,7 +214,7 @@ describe("the new task's panes", () => {
     expect(await openTasksPane(user)).toBeInTheDocument();
   });
 
-  it("opens the files and outgoing-requests panes for a new task", async () => {
+  it("opens the files and history panes for a new task", async () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
@@ -225,15 +225,46 @@ describe("the new task's panes", () => {
     await user.click(files);
     expect(await screen.findByRole("region", { name: "文件" })).toBeInTheDocument();
 
-    const history = await paneMenuItem(user, "发出的请求");
+    const history = await paneMenuItem(user, "历史记录");
     expect(history).toBeEnabled();
     await user.click(history);
-    const ledger = await screen.findByRole("region", { name: "发出的请求" });
-    // Nothing has been sent yet, so the ledger is simply empty.
-    expect(await within(ledger).findByText(/这个对话还没有记录到发出去的请求/)).toBeInTheDocument();
+    const ledger = await screen.findByRole("region", { name: "历史记录" });
+    // Nothing has happened yet, so the history is simply empty.
+    expect(await within(ledger).findByText(/这个对话还没有历史记录/)).toBeInTheDocument();
   });
 
-  it("keeps the files pane closed to a new task aimed at no project, which has no directory yet", async () => {
+  it("shows tasks and history as the two fixed tabs of one pane, tasks on the left", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+
+    await user.click(await paneMenuItem(user, "历史记录"));
+    const pane = await screen.findByRole("region", { name: "历史记录" });
+    const strip = within(pane).getByRole("tablist", { name: "任务面板标签" });
+    const tabs = within(strip).getAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["任务", "历史记录"]);
+    expect(tabs[1]).toHaveAttribute("aria-selected", "true");
+    // The tabs take the title bar in place of a title, and neither one closes.
+    expect(pane.querySelector(".side-pane__title")).toBeNull();
+    expect(within(strip).queryByRole("button", { name: /关闭/ })).not.toBeInTheDocument();
+
+    await user.click(tabs[0]);
+    expect(await screen.findByRole("region", { name: "任务" })).toBe(pane);
+    expect(within(pane).queryByText(/这个对话还没有历史记录/)).not.toBeInTheDocument();
+    expect(screen.getAllByRole("region").filter((region) => region.classList.contains("side-pane"))).toHaveLength(1);
+
+    // The menu's two rows are the pane's two tabs: the other row switches, the shown one closes.
+    expect(await paneMenuItem(user, "任务")).toHaveAttribute("aria-checked", "true");
+    await user.click(screen.getByRole("menuitemradio", { name: "历史记录" }));
+    expect(await screen.findByRole("region", { name: "历史记录" })).toBe(pane);
+    await user.click(await paneMenuItem(user, "历史记录"));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "历史记录" })).not.toBeInTheDocument());
+    expect(screen.queryByRole("region", { name: "任务" })).not.toBeInTheDocument();
+  });
+
+  /** The pane browses any machine, so a task with no directory yet still has one: this computer's home. */
+  it("opens the files pane for a new task aimed at no project, at this computer's home", async () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
@@ -241,8 +272,11 @@ describe("the new task's panes", () => {
     await moveDraftTo(user, "Mework", "临时项目");
     await screen.findByRole("button", { name: "项目：临时项目" });
 
-    expect(await paneMenuItem(user, "文件")).toBeDisabled();
-    expect(screen.getByRole("menuitemradio", { name: "发出的请求" })).toBeEnabled();
+    const files = await paneMenuItem(user, "文件");
+    expect(files).toBeEnabled();
+    await user.click(files);
+    const pane = await screen.findByRole("region", { name: "文件" });
+    expect(within(pane).getByRole("button", { name: "位置：~，点按编辑" })).toBeInTheDocument();
   });
 });
 

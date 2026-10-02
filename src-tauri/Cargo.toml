@@ -30,7 +30,7 @@ license = "GPL-3.0-or-later"
 # `app_update` reads releases from this repository's GitHub API; it is a runtime contract.
 repository = "https://github.com/catblob-hash/Mework"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.89"
 default-run = "mework"
 
 [lib]
@@ -112,6 +112,10 @@ base64 = "0.22.1"
 gif = "=0.13.3"
 image-webp = "=0.2.4"
 zune-jpeg = "=0.4.21"
+# Encoders for Claude Code's prompt-image pipeline (`image_attachments`): the
+# JPEG quality ladder and the palette PNG, which `gif` already pulls in.
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
+color_quant = "=1.1.0"
 zeroize = "1.8"
 png = "=0.17.16"
 
@@ -148,7 +152,9 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win3
 libc = "0.2"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-# The local helper model on llama.cpp (CPU, and a GPU where one is usable).
+# The local helper model on llama.cpp (CPU, and a GPU where one is usable),
+# whose official release build is downloaded with the model and loaded at run
+# time; nothing of llama.cpp is compiled into the app.
 mework-local-model = { path = "local-model", features = ["llama"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -172,7 +178,7 @@ cef = { version = "=154.0.0", default-features = false, features = ["sandbox"] }
 cef-dll-sys = { version = "=154.0.0", features = ["sandbox"] }
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", features = ["NSThread", "NSTimer", "NSRunLoop", "NSValue", "NSObject", "NSGeometry", "NSString"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSEvent", "NSResponder", "NSView", "NSWindow", "NSGraphics"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSEvent", "NSResponder", "NSView", "NSWindow", "NSGraphics", "NSImage"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
@@ -184,13 +190,6 @@ tempfile = "3"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 browser-dev = ["dep:axum", "dep:futures-util"]
-# GPU backends for the local helper model's llama.cpp build (Windows, Linux).
-# Vulkan and CUDA link their runtimes into the executable; `local-model-dynamic`
-# loads each backend as a module instead, but then the llama/ggml libraries must
-# be packaged beside the executable (see local-model/Cargo.toml).
-local-model-vulkan = ["mework-local-model/llama-vulkan"]
-local-model-cuda = ["mework-local-model/llama-cuda"]
-local-model-dynamic = ["mework-local-model/llama-dynamic"]
 
 # The local helper model converts 1.5 GB of weights and runs its sampling and
 # state copies in tight loops; unoptimized, a dev build takes minutes for what

@@ -47,7 +47,7 @@ describe("e2eConversationSettings", () => {
       allowRolelessSubagents: false,
       webSearch: defaultConversationWebSearchSettings(),
       webSearchEnabled: false,
-      reasoningEffort: "disabled",
+      reasoningEffort: "low",
       securityLevel: "full_access",
       globalMemoryEnabled: false,
       projectMemoryEnabled: false,
@@ -108,7 +108,7 @@ describe("the conversations the two runners build", () => {
           maxSearchesPerCall,
           provider: { kind: "native" }
         },
-        reasoningEffort: "disabled",
+        reasoningEffort: "low",
         securityLevel: "full_access"
       }
     });
@@ -129,7 +129,7 @@ describe("the conversations the two runners build", () => {
       title: "图片输入真实 UI E2E",
       settings: {
         enabledTools: ["preview_start", "preview_upload_image", "preview_screenshot", "read"],
-        reasoningEffort: "disabled",
+        reasoningEffort: "low",
         securityLevel: "full_access"
       },
       contexts: [imageProtocolContext]
@@ -158,7 +158,7 @@ describe("the conversations the two runners build", () => {
     expect(conversation.settings.webSearch.maxSearchesPerCall).toBe(3);
     expect(conversation.settings.webSearch.provider).toEqual({ kind: "native" });
     expect(conversation.settings.securityLevel).toBe("full_access");
-    expect(conversation.settings.reasoningEffort).toBe("disabled");
+    expect(conversation.settings.reasoningEffort).toBe("low");
   });
 
   it("satisfies the image runner's allowlist and temporary-workspace placement", () => {

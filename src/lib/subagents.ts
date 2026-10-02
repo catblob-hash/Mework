@@ -15,9 +15,10 @@ export type SubagentViewStatus = "running" | SubagentRunStatus;
 
 /**
  * One agent as shown in the workspace card, chips and the read-only drawer.
- * `agent_spawn` and every message/follow-up call touching the same agent merge
- * into a single view keyed by the agent name; legacy `subagent` calls keep one
- * view per call.
+ * `agent_spawn` and every call touching the same agent merge into a single
+ * view keyed by the agent name — in saved conversations that includes the
+ * retired message/follow-up calls (`agent_send`, `send_message`,
+ * `followup_task`); legacy `subagent` calls keep one view per call.
  */
 export interface SubagentView {
   /**
@@ -26,24 +27,24 @@ export interface SubagentView {
    */
   id: string;
   /**
-   * Addressable name for messaging/task_wait; null on legacy views and on
-   * workflow steps, which nothing can be sent to — their record's pool name is
+   * Addressable name `task_wait` takes; null on legacy views and on
+   * workflow steps, which nothing can address — their record's pool name is
    * a pipeline internal that restarts at `ws1` in every run, so it is neither
    * an address nor an identity.
    */
   name: string | null;
   /**
-   * The request ledger this agent's traffic is filed under, or null when there
+   * The owner this agent's history entries are filed under, or null when there
    * is no way to name one.
    *
-   * A spawned agent's ledger is its name. A workflow step's is the run-scoped
+   * A spawned agent's owner is its name. A workflow step's is the run-scoped
    * address the host publishes on the step shell from its first streamed
    * frame, read here as an opaque string — never the pool name its record
    * carries, which restarts at `ws1` in every run and would merge the first
-   * steps of every workflow the conversation ran into one ledger. Null is
-   * "ask for nothing", never "fall back to the conversation's own ledger": a
-   * nameless agent's pane must not show the session's traffic as if the agent
-   * sent it.
+   * steps of every workflow the conversation ran into one owner. Null is
+   * "ask for nothing", never "fall back to the conversation's own entries": a
+   * nameless agent's pane must not show the session's history as if it were
+   * the agent's.
    */
   ledgerOwner: string | null;
   kind: "general" | "workflowStep";
@@ -171,6 +172,8 @@ const defaultSubagentViewMessages: SubagentViewMessages = {
 const agentRunToolNames = new Set([
   "subagent",
   "agent_spawn",
+  // Retired names, kept so saved conversations still project: an old child's
+  // cumulative record can live on one of these cards instead of its spawn.
   "agent_send",
   "send_message",
   "followup_task",
@@ -274,6 +277,11 @@ function agentModelId(
     ?? role?.modelId
     ?? null;
 }
+/**
+ * Retired calls that addressed an existing child with a `message` instead of
+ * starting one. Nothing issues them any more; saved conversations still hold
+ * their cards, and those must keep merging into the child they addressed.
+ */
 const agentMessageToolNames = new Set(["agent_send", "send_message", "followup_task"]);
 
 /** Tool calls that carry a child run (chips, live stream, persisted record). */
@@ -282,9 +290,10 @@ function isAgentRunTool(toolName: string): boolean {
 }
 
 /**
- * A child's own `send_message` — the narrowed form whose one recipient is the
- * main agent, so the host mints it without a `target`.
+ * A child's own `send_message` — the narrowed form whose one recipient was the
+ * main agent, so the host minted it without a `target`.
  *
+ * The tool is retired, but saved child transcripts still carry these calls.
  * Same wire name as the parent→child call and nothing else in common: it starts
  * no child, addresses no child, and carries no child transcript. Without this
  * distinction the call keys a nameless subagent view of its own and renders as
@@ -328,9 +337,11 @@ export function agentTimelineRunStatus(item: ToolContext): SubagentViewStatus {
     return item.live.status;
   }
   if (item.streaming && item.streamStatus !== "completed") return "running";
-  // spawn/send only acknowledge that the protocol call was accepted. During
-  // the streamed handoff there is a brief gap before live/subagent arrives;
-  // the background child is still running throughout that gap.
+  // A spawn only acknowledges that the protocol call was accepted. During the
+  // streamed handoff there is a brief gap before live/subagent arrives; the
+  // background child is still running throughout that gap. The retired
+  // `agent_send` / `followup_task` stay listed beside it, like every other
+  // legacy name this module still reads.
   if (
     item.streaming
     && item.result.success
@@ -674,16 +685,17 @@ function conversationTranscript(
       // Position replaces the clock rather than nothing: a `context:
       // "conversation"` fork copies the parent's own user turns into the head of
       // the child's record, and matching on content alone let an undrained
-      // follow-up claim one of those and vanish from the transcript.
+      // follow-up in a saved conversation claim one of those and vanish from
+      // the transcript.
       const persistedIndex = persistedUsers.findIndex((candidate, index) => (
         index >= matchedThrough && candidate.content.trim() === message
       ));
       if (persistedIndex >= 0) {
         matchedThrough = persistedIndex + 1;
       } else if (item.toolName !== "send_message") {
-        // send_message is queue-only. Until the child actually drains it into
-        // a persisted user context it must not look like a completed child
-        // turn in the transcript.
+        // The retired send_message was queue-only. Until the child actually
+        // drained it into a persisted user context it must not look like a
+        // completed child turn in the transcript.
         push({
           id: `${id}:message:${item.id}`,
           kind: "user",
@@ -731,7 +743,7 @@ function conversationTranscript(
 /** Status contributed by one tool context of the agent. */
 function contextStatus(item: ToolContext): SubagentViewStatus {
   // A streamed lifecycle transition wins while the parent turn is live: the
-  // spawn/follow-up call itself completes instantly, its child keeps running.
+  // spawn call itself completes instantly, its child keeps running.
   // Legacy `subagent` calls never stream one, so their own state decides.
   if (item.streaming && item.live?.status) {
     if (item.live.status === "running") return "running";
@@ -741,10 +753,11 @@ function contextStatus(item: ToolContext): SubagentViewStatus {
     return item.live.status;
   }
   if (item.streaming && item.streamStatus !== "completed") return "running";
-  // agent_spawn/followup_task complete when the host has accepted the protocol
-  // call, not when the background child has finished.  There is a short (and
+  // agent_spawn completes when the host has accepted the protocol call, not
+  // when the background child has finished.  There is a short (and
   // observable) hand-off window before the first status delta arrives; keep
   // the child running through it instead of flashing a false completed state.
+  // The retired `agent_send` / `followup_task` stay listed beside it.
   if (
     item.streaming
     && item.result.success
@@ -776,6 +789,17 @@ function contextStatus(item: ToolContext): SubagentViewStatus {
   if (settledLive && settledLive !== "running") {
     return settledLive === "idle" ? "completed" : settledLive;
   }
+  // A spawn's result is only the host accepting the call, so it says nothing
+  // about how the child ended. With no record anywhere, the child either still
+  // runs past its parent's turn — which `live` shows in this session, and a
+  // reload cannot know — or never reported an ending that reached disk before
+  // the app exited, which the host reports to the model as lost.
+  if (
+    item.result.success
+    && (item.toolName === "agent_spawn"
+      || item.toolName === "agent_send"
+      || item.toolName === "followup_task")
+  ) return settledLive === "running" ? "running" : "interrupted";
   // A persisted context without a record: the record lives on a later context
   // of the same agent, or the call itself failed.
   return item.result.success ? "completed" : "interrupted";
@@ -868,8 +892,9 @@ function liveUsage(items: ToolContext[]): ModelUsage {
 /**
  * The stable identity one tool context contributes.
  *
- * `name` is the addressable agent name — what `send_message`, `followup_task`
- * and `task_wait` point at — and becomes the view id when there is one.
+ * `name` is the addressable agent name — what `task_wait` points at, and what
+ * the retired `send_message` / `followup_task` addressed in saved
+ * conversations — and becomes the view id when there is one.
  * `address` is an identity that is *not* addressable: a workflow step has one,
  * and nothing may be sent to it.
  */
@@ -886,8 +911,8 @@ function agentKeyForContext(
   // and stays on the settled shell, so it also stops the id from flipping from
   // context id to pool name the moment somebody opens an externalized step.
   //
-  // `name` stays null: the address is not a string `send_message` or
-  // `task_wait` can be pointed at, and a step is not addressable at all.
+  // `name` stays null: the address is not a string `task_wait` can be pointed
+  // at, and a step is not addressable at all.
   if (item.toolName === "workflow_step") {
     const address = stringInput(item, "ledger");
     if (address) return { key: `step:${address}`, name: null, address };
@@ -927,11 +952,12 @@ interface AgentAccumulator {
 
 /**
  * Builds the card/drawer projection from parent timeline tool contexts.
- * Every spawn/message/follow-up call touching the same agent name merges into
- * one conversation. Cumulative records, continuation messages and every live
- * stream are unioned; the view id prefers the agent name so it stays stable
- * across continuations, with call ids kept for selection matching during
- * streaming hand-offs.
+ * Every call touching the same agent name merges into one conversation — a
+ * spawn, and in saved conversations the retired message/follow-up calls.
+ * Cumulative records, those continuation messages and every live stream are
+ * unioned; the view id prefers the agent name so it stays stable across
+ * continuations, with call ids kept for selection matching during streaming
+ * hand-offs.
  *
  * The result is a pre-order flattening of the whole agent tree: every view is
  * immediately followed by its descendants, and `parentId`/`depth`/`childIds`
@@ -1099,8 +1125,8 @@ function nestedSubagentViews(
         // The latest record already covers every turn this agent ran: the host
         // restores the running total onto a rehydrated agent before it
         // continues, so each successive record supersedes the one before it
-        // rather than adding to it. Summing them would double-count a
-        // followup_task.
+        // rather than adding to it. Summing them would double-count an agent a
+        // saved (retired) followup_task continued.
         //
         // Failing that, two weaker sources fill the gap the record leaves. An
         // externalized workflow step has no record at all, only the shell the

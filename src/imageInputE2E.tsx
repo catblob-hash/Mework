@@ -193,7 +193,7 @@ function makeDocument(): { documentValue: AppDocument; conversationId: string; p
     title: "图片输入真实 UI E2E",
     settings: {
       enabledTools: ["preview_start", "preview_upload_image", "preview_screenshot", "read"],
-      reasoningEffort: "disabled",
+      reasoningEffort: "low",
       securityLevel: "full_access"
     },
     contexts: [{

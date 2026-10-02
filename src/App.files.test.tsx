@@ -77,43 +77,35 @@ describe("App — file attachments", () => {
       .not.toBeInTheDocument());
   });
 
-  it("turns a long paste into a Markdown attachment and keeps short pastes as text", async () => {
+  it("folds a long paste into a tag and sends the text it stands for", async () => {
     runtimeMocks.loadDocument.mockResolvedValue(documentWithModel());
     resolvedRun();
     const user = userEvent.setup();
     render(<App />);
-    const composer = await screen.findByLabelText("向 Agent 发送消息");
+    const composer = await screen.findByLabelText<HTMLTextAreaElement>("向 Agent 发送消息");
     const composerRegion = composer.closest(".composer") as HTMLElement;
 
     const short = fireEvent.paste(composer, { clipboardData: { files: [], getData: () => "short" } });
     expect(short).toBe(true);
 
+    await user.type(composer, "看看这段：");
     const long = "长".repeat(6000);
-    const handled = fireEvent.paste(composer, { clipboardData: { files: [], getData: () => long } });
+    const handled = fireEvent.paste(composer, {
+      clipboardData: { files: [], getData: (type: string) => (type === "text/plain" ? long : "") }
+    });
     expect(handled).toBe(false);
-    expect(await within(composerRegion).findByRole("button", { name: "预览文件 pasted-text.md" })).toBeInTheDocument();
-    const [name, bytes, format] = runtimeMocks.prepareFileAttachment.mock.calls[0];
-    expect(name).toBe("pasted-text.md");
-    expect(format).toBe("text");
-    expect(new TextDecoder().decode(bytes as Uint8Array)).toBe(long);
-    expect(composer).toHaveValue("");
+    expect(composer).toHaveValue("看看这段：\u00a0粘贴文本\u00a0#1\u00a0");
+    expect(composerRegion.querySelector(".pasted-text-tag")).toHaveTextContent("粘贴文本 #1", { normalizeWhitespace: true });
+    expect(runtimeMocks.prepareFileAttachment).not.toHaveBeenCalled();
 
-    // A second long paste gets its own name rather than colliding with the first.
-    fireEvent.paste(composer, { clipboardData: { files: [], getData: () => "另一段".repeat(3000) } });
-    expect(await within(composerRegion).findByRole("button", { name: "预览文件 pasted-text-2.md" })).toBeInTheDocument();
-
-    await user.type(composer, "看看这两段");
     await user.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
     const request = runtimeMocks.runModel.mock.calls[0][0] as ModelRunRequest;
-    expect(request.contexts.at(-1)).toMatchObject({
-      kind: "user",
-      content: "看看这两段",
-      files: [
-        expect.objectContaining({ name: "pasted-text.md" }),
-        expect.objectContaining({ name: "pasted-text-2.md" })
-      ]
-    });
+    const sent = request.contexts.at(-1);
+    expect(sent).toMatchObject({ kind: "user", content: `看看这段：${long}` });
+    expect(sent && "files" in sent ? sent.files : undefined).toBeUndefined();
+    await waitFor(() => expect(composer).toHaveValue(""));
+    expect(composerRegion.querySelector(".pasted-text-tag")).toBeNull();
   });
 
   it("says why a binary file or a folder was not attached", async () => {

@@ -10,8 +10,9 @@ function structuralClasses(element: Element): string[] {
 }
 
 function structuralShape(element: Element): unknown {
-  // The complete set of nodes a read-only transcript is allowed to omit: every
-  // one of them is an edit, delete or insert affordance and nothing else.
+  // The complete set of nodes a read-only transcript is allowed to omit or thin
+  // out: every one of them holds edit, delete or insert affordances, and copy
+  // buttons, which a read-only transcript keeps, and nothing else.
   const mutationOnly = [
     ".context-actions",
     ".context-card__footer-actions",
@@ -98,8 +99,10 @@ describe("ConversationView shared rendering contract", () => {
       expect(structuralClasses(readonlyContext)).toEqual(structuralClasses(editableContext));
     }
 
-    expect(editableView.querySelector(".context-actions")).toBeInTheDocument();
-    expect(readonlyView.querySelector(".context-actions")).not.toBeInTheDocument();
+    expect(within(editableView.querySelector<HTMLElement>(".context-actions")!).getByRole("button", { name: "编辑上下文" }))
+      .toBeInTheDocument();
+    expect(within(readonlyView.querySelector<HTMLElement>(".context-actions")!).getAllByRole("button")
+      .map((button) => button.getAttribute("aria-label"))).toEqual(["复制模型回复"]);
     expect(within(editableView).getByLabelText("主会话输入")).toBeInTheDocument();
     expect(within(readonlyView).queryByRole("textbox")).not.toBeInTheDocument();
     expect(within(readonlyView).queryByRole("button", { name: /编辑|删除|发送/ })).not.toBeInTheDocument();
@@ -118,7 +121,7 @@ describe("ConversationView shared rendering contract", () => {
     });
     expect(screen.queryByRole("menu", { name: "添加上下文" })).not.toBeInTheDocument();
 
-    const readonlyTool = within(readonlyView).getByRole("button", { name: /读取了文件.*README\.md/ });
+    const readonlyTool = within(readonlyView).getByRole("button", { name: /已读取：README\.md/ });
     expect(readonlyTool).toHaveAttribute("aria-expanded", "false");
     await user.click(readonlyTool);
     expect(readonlyTool).toHaveAttribute("aria-expanded", "true");

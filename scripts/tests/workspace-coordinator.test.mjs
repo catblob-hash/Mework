@@ -970,6 +970,7 @@ test("browser-dev fingerprint covers Cargo, build-script, and served resource in
     ".cargo/config.toml",
     "src/mework-icon-small.svg",
     "src/mework-icon.svg",
+    "src/mework-mark.svg",
     "src-tauri/app_commands.rs",
     "src-tauri/resources/image-input-browser-e2e.html"
   ];

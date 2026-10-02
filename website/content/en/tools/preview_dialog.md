@@ -2,7 +2,7 @@ Answers an `alert`, `confirm` or `prompt` the preview page has opened. Dialogs a
 
 ## Approval
 
-The call is classified as an unbounded action (`tool.unbounded`, high risk), so `request_approval`, `allow_edits` and `plan` ask first and `full_access` does not. **Always allow** is never offered for a page tool. If the held page is one you signed into yourself, the takeover card comes first and names the signed-in origin; no security level and no hook can answer that one on your behalf.
+The call is classified as an unbounded action (`tool.unbounded`, high risk), so `request_approval` and `allow_edits` ask first and `full_access` does not. **Always allow** is never offered for a page tool. If the held page is one you signed into yourself, the takeover card comes first and names the signed-in origin; no security level and no hook can answer that one on your behalf.
 
 ## Behavior and limits
 

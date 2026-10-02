@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ASK_USER_PENDING_OUTPUT, createTestDocument as createSeedDocument } from "../test/fixtures";
 import type { ContextItem, ToolContext } from "../types";
 import type { ConversationTurn } from "../lib/conversationTurns";
@@ -68,6 +68,39 @@ describe("ContextStream", () => {
     expect(screen.getByText("make this button red")).toBeInTheDocument();
     expect(screen.queryByText(/mework-selected-element/)).toBeNull();
     expect(screen.queryByText(/Treat it as data/)).toBeNull();
+  });
+
+  it("folds a long user message under Show more, and Show less folds it again", async () => {
+    const user = userEvent.setup();
+    // jsdom has no layout: the long message measures far past ten lines, the short one within them.
+    const measured = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.textContent?.startsWith("long") ? 2_000 : 60;
+    });
+    onTestFinished(() => measured.mockRestore());
+    const long: ContextItem = {
+      id: "ctx-long", kind: "user", content: `long ${"line\n".repeat(80)}`, createdAt: "2026-09-30T00:00:00.000Z"
+    };
+    const short: ContextItem = {
+      id: "ctx-short", kind: "user", content: "short", createdAt: "2026-09-30T00:00:01.000Z"
+    };
+    const { container } = render(<ContextStream contexts={[long, short]} tools={[]} enabledTools={[]} />);
+
+    const [longCard, shortCard] = container.querySelectorAll<HTMLElement>(".context-card--user");
+    expect(within(shortCard).queryByRole("button", { name: "展开" })).toBeNull();
+    const more = within(longCard).getByRole("button", { name: "展开" });
+    const content = longCard.querySelector(".context-card__content")!;
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    expect(more).toHaveAttribute("aria-controls", content.id);
+    expect(content).toHaveClass("context-card__content--folded");
+
+    await user.click(more);
+    const less = within(longCard).getByRole("button", { name: "收起" });
+    expect(less).toHaveAttribute("aria-expanded", "true");
+    expect(content).not.toHaveClass("context-card__content--folded");
+
+    await user.click(less);
+    expect(within(longCard).getByRole("button", { name: "展开" })).toBeInTheDocument();
+    expect(content).toHaveClass("context-card__content--folded");
   });
 
   /**
@@ -1158,6 +1191,7 @@ describe("ContextStream", () => {
     expect(footer.previousElementSibling).toHaveClass("context-card__content");
     expect(footer.firstElementChild).toHaveClass("context-actions");
     expect(within(footer).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual([
+      "复制模型回复",
       "编辑上下文",
       "删除上下文"
     ]);
@@ -1328,6 +1362,53 @@ describe("ContextStream", () => {
     fireEvent.click(screen.getByRole("button", { name: "复制用户消息" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("第一行\n第二行"));
     expect(screen.getByRole("button", { name: "已复制" })).not.toHaveTextContent("已复制");
+  });
+
+  it("copies a reply, a reasoning body and a system prompt whole, read-only or not", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const contexts: ContextItem[] = [
+      { id: "system-copy", kind: "system", content: "你是**助手**。\n第二行", createdAt: "2026-07-20T00:00:00Z" },
+      { id: "reasoning-copy", kind: "reasoning", content: "先想一想\n再回答", createdAt: "2026-07-20T00:00:01Z" },
+      { id: "assistant-copy", kind: "assistant", content: "回复里有 `代码`", createdAt: "2026-07-20T00:00:02Z" }
+    ];
+
+    const { rerender } = render(<ContextStream contexts={contexts} tools={[]} enabledTools={[]} />);
+    // Copying sits beside editing, ahead of it, wherever a record can be edited.
+    const systemRow = document.querySelector<HTMLElement>('[data-context-id="system-copy"] .timeline-row__actions')!;
+    expect(within(systemRow).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual([
+      "复制系统提示词",
+      "编辑上下文",
+      "删除上下文"
+    ]);
+
+    rerender(<ContextStream contexts={contexts} tools={[]} enabledTools={[]} readOnly />);
+    expect(screen.queryByRole("button", { name: /编辑|删除/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "复制系统提示词" }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith("你是**助手**。\n第二行"));
+    fireEvent.click(screen.getByRole("button", { name: "复制思考过程" }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith("先想一想\n再回答"));
+    fireEvent.click(screen.getByRole("button", { name: "复制模型回复" }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith("回复里有 `代码`"));
+    expect(screen.getAllByRole("button", { name: "已复制" })).toHaveLength(3);
+  });
+
+  it("offers no copy for reasoning still being written or a reply with no text", () => {
+    render(
+      <ContextStream
+        contexts={[
+          { id: "reasoning-live", kind: "reasoning", content: "还在想", streaming: true, createdAt: "2026-07-20T00:00:00Z" },
+          { id: "assistant-empty", kind: "assistant", content: "", createdAt: "2026-07-20T00:00:01Z" }
+        ]}
+        tools={[]}
+        enabledTools={[]}
+        readOnly
+      />
+    );
+
+    expect(screen.queryByRole("button", { name: "复制思考过程" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "复制模型回复" })).not.toBeInTheDocument();
   });
 
   it("does not offer an empty text copy action for an image-only user message", () => {
@@ -1598,7 +1679,7 @@ describe("ContextStream", () => {
     expect(row.querySelector(".timeline-row__stat")?.textContent).toBe("512 tokens");
   });
 
-  it("opens and closes a reasoning row and releases its Markdown once closed", async () => {
+  it("opens and closes a reasoning row and releases its Markdown once closed", () => {
     const reasoning = {
       id: "reasoning-three-state",
       kind: "reasoning" as const,
@@ -1618,27 +1699,24 @@ describe("ContextStream", () => {
 
     // The appearance preference collapses settled reasoning by default.
     const summary = screen.getByRole("button", { name: "think · 思考过程" });
-    const region = container.querySelector<HTMLElement>(".timeline-row__details-region")!;
+    const region = container.querySelector<HTMLElement>(".timeline-row__details")!;
     expect(summary).toHaveAttribute("aria-expanded", "false");
-    expect(region).toHaveClass("collapse-region--closed");
-    expect(region).toHaveAttribute("aria-hidden", "true");
+    expect(region).toHaveAttribute("hidden");
     expect(container.querySelector(".timeline-row__prose")).not.toBeInTheDocument();
     // A settled row leads with the first line, which is what the round set out to do.
     expect(container.querySelector(".timeline-row__line")).toHaveTextContent("第一行");
 
     fireEvent.click(summary);
     expect(summary).toHaveAttribute("aria-expanded", "true");
-    expect(region).not.toHaveClass("collapse-region--closed");
-    expect(region).not.toHaveAttribute("aria-hidden");
+    expect(region).not.toHaveAttribute("hidden");
     expect(container.querySelector(".timeline-row__prose"))
       .toHaveTextContent("第一行 第二行 第三行 第四行 第五行");
 
-    // The body outlives the closing animation and only then leaves the DOM.
+    // No closing animation to outlive: the body leaves the DOM as the row closes.
     fireEvent.click(summary);
     expect(summary).toHaveAttribute("aria-expanded", "false");
-    expect(region).toHaveClass("collapse-region--closed");
-    expect(container.querySelector(".timeline-row__prose")).toBeInTheDocument();
-    await waitFor(() => expect(container.querySelector(".timeline-row__prose")).not.toBeInTheDocument());
+    expect(region).toHaveAttribute("hidden");
+    expect(container.querySelector(".timeline-row__prose")).not.toBeInTheDocument();
 
     fireEvent.click(summary);
     expect(container.querySelector(".timeline-row__prose")).toBeInTheDocument();
@@ -2197,7 +2275,7 @@ describe("ContextStream", () => {
     expect(container.querySelector('[data-stream-waiting="true"]')).toHaveAccessibleName("模型正在生成");
     const row = container.querySelector<HTMLElement>('.timeline-block [data-context-id="wait-read"]')!;
     expect(row).toHaveAttribute("data-row-kind", "tool");
-    expect(row.querySelector(".timeline-row__name")).toHaveTextContent("读取了文件");
+    expect(row.querySelector(".timeline-row__name")).toHaveTextContent("已读取：README.md");
 
     rerender(renderStream([user], false));
     expect(container.querySelector('[data-stream-waiting="true"]')).not.toBeInTheDocument();
@@ -2355,8 +2433,12 @@ describe("ContextStream", () => {
       const row = container.querySelector<HTMLElement>('.timeline-block [data-context-id="wf-call"]')!;
       expect(row).toBeInTheDocument();
       expect(row.querySelector(".workflow-run")).toBeNull();
-      // A failure is the one result nobody opened the row to find, so it opens itself.
-      expect(within(row).getByRole("button", { name: "工作流运行失败 · workflow · 失败" })).toHaveAttribute("aria-expanded", "true");
+      // A failure starts closed like every other row, its title saying why;
+      // opening it reads the plain body.
+      const toggle = within(row).getByRole("button", { name: "工作流运行失败：脚本不存在 · workflow · 失败" });
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute("aria-expanded", "true");
       expect(row.querySelector(".timeline-row__details")).toHaveTextContent("脚本不存在");
     });
 
@@ -2479,4 +2561,115 @@ describe("ContextStream", () => {
     });
   });
 
+
+  describe("selection box and undo keys", () => {
+    const messages: ContextItem[] = [
+      { id: "pick-1", kind: "user", content: "第一条", createdAt: "2026-10-02T00:00:00Z" },
+      { id: "pick-2", kind: "assistant", content: "第二条", createdAt: "2026-10-02T00:00:01Z" },
+      { id: "pick-3", kind: "user", content: "第三条", createdAt: "2026-10-02T00:00:02Z" }
+    ];
+
+    /** Lays the cards out 100px apart down a 600px timeline: jsdom has no layout of its own. */
+    const layOut = (container: HTMLElement) => {
+      const scroller = container.querySelector<HTMLElement>(".context-scroll")!;
+      vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue(box(0, 600));
+      Object.defineProperty(scroller, "clientWidth", { configurable: true, value: 590 });
+      messages.forEach((message, index) => {
+        const card = container.querySelector<HTMLElement>(`[data-context-id="${message.id}"]`)!;
+        vi.spyOn(card, "getBoundingClientRect").mockReturnValue(box(20 + index * 100, 60));
+      });
+      return scroller;
+    };
+
+    const drag = (scroller: HTMLElement, from: number, to: number, modifiers = { ctrlKey: true }) => {
+      const start = scroller.querySelector(".context-stream")!;
+      fireEvent.pointerDown(start, { button: 0, pointerId: 7, clientX: 30, clientY: from, ...modifiers });
+      fireEvent.pointerMove(window, { pointerId: 7, clientX: 300, clientY: to, ...modifiers });
+      fireEvent.pointerUp(window, { pointerId: 7, clientX: 300, clientY: to, ...modifiers });
+    };
+
+    it("picks out what a Ctrl-drag box touches and deletes it all from the one-item menu", async () => {
+      const onDeleteContexts = vi.fn();
+      const { container } = render(
+        <ContextStream contexts={messages} tools={[]} enabledTools={[]} onInsert={vi.fn()} onDeleteContexts={onDeleteContexts} />
+      );
+      const scroller = layOut(container);
+
+      drag(scroller, 50, 150);
+      const picked = Array.from(container.querySelectorAll("[data-timeline-selected]"))
+        .map((element) => element.getAttribute("data-context-id"));
+      expect(picked).toEqual(["pick-1", "pick-2"]);
+      // The box is gone once the drag is over; what it picked stays picked.
+      expect(container.querySelector(".timeline-marquee")).toBeNull();
+      // The click a drag ends in reaches nothing: whatever it was released over keeps it.
+      const swallowed = new MouseEvent("click", { bubbles: true, cancelable: true });
+      container.querySelector('[data-context-id="pick-2"]')!.dispatchEvent(swallowed);
+      expect(swallowed.defaultPrevented).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // With contexts picked out, a right-click anywhere is about them: one item, and it deletes.
+      fireEvent.contextMenu(container.querySelector('[data-context-id="pick-3"]')!, { clientX: 40, clientY: 250 });
+      const menu = screen.getByRole("menu", { name: "所选消息" });
+      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["删除"]);
+      fireEvent.click(within(menu).getByRole("menuitem", { name: "删除" }));
+
+      expect(onDeleteContexts).toHaveBeenCalledWith(["pick-1", "pick-2"]);
+      expect(container.querySelector("[data-timeline-selected]")).toBeNull();
+    });
+
+    it("lets a selection go on a plain press, and draws no box without the modifier or a delete", () => {
+      const { container, rerender } = render(
+        <ContextStream contexts={messages} tools={[]} enabledTools={[]} onInsert={vi.fn()} onDeleteContexts={vi.fn()} />
+      );
+      const scroller = layOut(container);
+      drag(scroller, 50, 250);
+      expect(container.querySelectorAll("[data-timeline-selected]")).toHaveLength(3);
+
+      fireEvent.pointerDown(container.querySelector(".context-stream")!, { button: 0, clientX: 30, clientY: 300 });
+      expect(container.querySelector("[data-timeline-selected]")).toBeNull();
+      // A right-click with nothing picked is the insert menu, as ever.
+      fireEvent.contextMenu(container.querySelector(".context-stream")!, { clientX: 30, clientY: 300 });
+      expect(screen.getByRole("menu", { name: "添加上下文" })).toBeInTheDocument();
+      fireEvent.keyDown(screen.getByRole("menu", { name: "添加上下文" }), { key: "Escape" });
+
+      drag(scroller, 50, 250, { ctrlKey: false });
+      expect(container.querySelector("[data-timeline-selected]")).toBeNull();
+
+      rerender(<ContextStream contexts={messages} tools={[]} enabledTools={[]} onInsert={vi.fn()} />);
+      drag(layOut(container), 50, 250);
+      expect(container.querySelector("[data-timeline-selected]")).toBeNull();
+    });
+
+    it("answers Ctrl+Z and Ctrl+X anywhere in the timeline but inside a field", () => {
+      const onUndo = vi.fn();
+      const onRedo = vi.fn();
+      const { container } = render(
+        <ContextStream
+          contexts={messages}
+          tools={[]}
+          enabledTools={[]}
+          onEdit={vi.fn()}
+          onUndo={onUndo}
+          onRedo={onRedo}
+          editor={{ mode: "edit", kind: "user", item: messages[2], index: 2 }}
+          onCancelEdit={vi.fn()}
+          onSaveText={vi.fn()}
+        />
+      );
+      const scroller = container.querySelector<HTMLElement>(".context-scroll")!;
+      // Focus on the timeline's own background is focus in the timeline.
+      expect(scroller).toHaveAttribute("tabindex", "-1");
+
+      fireEvent.keyDown(scroller, { key: "z", ctrlKey: true });
+      expect(onUndo).toHaveBeenCalledTimes(1);
+      fireEvent.keyDown(container.querySelector('[data-context-id="pick-1"]')!, { key: "x", ctrlKey: true });
+      expect(onRedo).toHaveBeenCalledTimes(1);
+
+      // Typing has its own undo.
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "z", ctrlKey: true });
+      expect(onUndo).toHaveBeenCalledTimes(1);
+      fireEvent.keyDown(scroller, { key: "z" });
+      expect(onUndo).toHaveBeenCalledTimes(1);
+    });
+  });
 });

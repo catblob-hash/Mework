@@ -11,7 +11,6 @@ import type { TranslationFunction } from "../i18n";
 export const SECURITY_LEVEL_OPTIONS: readonly SecurityLevel[] = [
   "request_approval",
   "allow_edits",
-  "plan",
   "full_access"
 ];
 
@@ -27,8 +26,6 @@ export function securityLevelLabel(level: SecurityLevel, t: TranslationFunction)
       return t("手动", "Manual");
     case "allow_edits":
       return t("允许编辑", "Accept edits");
-    case "plan":
-      return t("计划模式", "Plan mode");
     case "full_access":
       return t("完全访问", "Full access");
   }

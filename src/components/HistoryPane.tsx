@@ -1,17 +1,21 @@
-import { ArrowUpRight, ChevronRight, History, MessageSquare } from "lucide-react";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChevronRight, MessageSquare, Pencil, TriangleAlert } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
-import { listWireRequests, loadWireRequest } from "../lib/runtime";
-import type { WireRequestDetail, WireRequestSummary, WireUsage } from "../lib/runtime";
+import { listHistoryEntries, loadHistoryEntry } from "../lib/runtime";
+import type { HistoryEntry, HistoryEntryDetail, HistoryUsage } from "../lib/runtime";
 import {
-  anyTruncated,
-  ledgerRounds,
-  rawPayload,
-  readTurn,
-  wireUsageIsEmpty
-} from "../lib/wireLedger";
-import type { LedgerEntry, LedgerRequestGroup, LedgerRound, TurnReading } from "../lib/wireLedger";
+  barItems,
+  describeAppended,
+  describeChange,
+  describeEvent,
+  describePrompts,
+  describeTools,
+  historyBars,
+  usageIsEmpty
+} from "../lib/historyRecord";
+import type { BarKind, EventBadge, EventLabels, HistoryBar, MessageRow } from "../lib/historyRecord";
 import { DiffOutput } from "./DiffOutput";
 import "./HistoryPane.css";
 
@@ -22,26 +26,16 @@ export interface HistoryPaneProps {
   /** Rows appear as they are sent, so a running turn is polled rather than awaited. */
   streaming: boolean;
   /**
-   * Which of the conversation's ledgers to read: omitted is the session's own,
-   * and a child agent's ledger address is that agent's — its name for a spawned
-   * agent, the host's run-scoped address for a workflow step. A child runs
-   * under its parent's conversation id, so this is the only thing that
-   * separates them.
+   * Whose history to read: omitted is the session's own, and a child agent's
+   * address is that agent's — its name for a spawned agent, the host's
+   * run-scoped address for a workflow step. A child runs under its parent's
+   * conversation id, so this is the only thing that separates them.
    */
   owners?: readonly string[];
 }
 
-/** How often a running turn's new requests are picked up. */
+/** How often a running turn's new entries are picked up. */
 const STREAMING_POLL_MS = 1000;
-
-function formatBytes(bytes: number): string {
-  // A size the host did not report is shown as unknown rather than as a number
-  // that is not one: this pane is read for what it can vouch for.
-  if (!Number.isFinite(bytes)) return "—";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 /** Token counts sit in a 10px column, so they are shortened rather than wrapped. */
 function formatTokens(tokens: number): string {
@@ -64,16 +58,14 @@ function formatTime(createdAt: string): string {
 }
 
 /**
- * What a turn, or one request inside it, cost — in the three numbers a reader of
- * this pane is after.
+ * What a turn cost — in the three numbers a reader of this pane is after.
  *
  * A counter the provider never disclosed stays out rather than reading as zero,
- * and a request whose response never came back says so — the same rule the byte
- * column follows.
+ * and a turn whose responses never came back says so.
  */
-function Usage({ usage }: { usage: WireUsage | undefined }) {
+function Usage({ usage }: { usage: HistoryUsage | undefined }) {
   const { t } = useI18n();
-  if (!usage || wireUsageIsEmpty(usage)) {
+  if (!usage || usageIsEmpty(usage)) {
     return (
       <span className="history-pane__change" title={t("没有记录到用量", "No usage was recorded")}>
         —
@@ -100,46 +92,55 @@ function Usage({ usage }: { usage: WireUsage | undefined }) {
   );
 }
 
-/**
- * How a part stands against the payload before it, in the terms the pane paints.
- *
- * A message the model produced is not a change the reader has to inspect — it
- * is what the round was for — so it is left uncoloured even though it is an
- * addition. Only what the person did gets a colour. What the wire cannot answer
- * it does not guess: a message the user typed into the timeline by hand as the
- * assistant is indistinguishable from one the model wrote, and reads as output.
- */
-type EntryTone = "kept" | "output" | "user-added" | "removed" | "changed";
+const BAR_GLYPHS: Record<BarKind, LucideIcon> = {
+  turn: MessageSquare,
+  interrupted: TriangleAlert,
+  edits: Pencil,
+  pending: MessageSquare
+};
 
-function entryTone(entry: LedgerEntry): EntryTone {
-  if (entry.status === "removed") return "removed";
-  if (entry.status === "changed") return "changed";
-  if (entry.status === "kept") return "kept";
-  return entry.part.author === "user" ? "user-added" : "output";
-}
-
-interface PartRowProps {
-  entry: LedgerEntry;
+interface RowProps {
+  /** Distinguishes the two row shapes for their styles. */
+  variant: "message" | "event";
+  /** The role the row is tagged with; empty for none. */
+  label: string;
+  detail: string;
+  badges: readonly EventBadge[];
+  preview: string;
+  /** What sits at the row's end: the line counts of a rewrite. */
+  stat?: ReactNode;
+  title?: string;
+  data: Record<`data-${string}`, string | undefined>;
   open: boolean;
-  /** True behind the turn's rule: replayed history rather than what it added. */
-  cached?: boolean;
   onToggle: () => void;
   children: ReactNode;
 }
 
-/** One single-line row for one part of a payload, opening in place. */
-function PartRow({ entry, open, cached, onToggle, children }: PartRowProps) {
-  const { t } = useI18n();
-  const { part } = entry;
-  const tone = entryTone(entry);
+/**
+ * One single-line row that opens in place. It leads with its role and nothing
+ * else: a glyph beside it would be a second name for the same thing.
+ */
+function Row({
+  variant,
+  label,
+  detail,
+  badges,
+  preview,
+  stat,
+  title,
+  data,
+  open,
+  onToggle,
+  children
+}: RowProps) {
   return (
     <li className="history-pane__part">
       <button
         type="button"
-        className="history-pane__row history-pane__row--part"
-        data-tone={tone}
-        data-cached={cached || undefined}
+        className={`history-pane__row history-pane__row--${variant}`}
+        {...data}
         aria-expanded={open}
+        title={title}
         onClick={onToggle}
       >
         <ChevronRight
@@ -148,315 +149,240 @@ function PartRow({ entry, open, cached, onToggle, children }: PartRowProps) {
           data-open={open || undefined}
           aria-hidden="true"
         />
-        <span className="history-pane__role" data-role={part.role}>
-          {part.role}
-        </span>
-        {part.detail && <span className="history-pane__detail">{part.detail}</span>}
-        <span className="history-pane__preview">{part.preview}</span>
-        {entry.status === "kept" ? (
-          <span className="history-pane__meta">{formatBytes(part.bytes)}</span>
-        ) : (
-          <span className="history-pane__stat" data-status={entry.status}>
-            {t("+{added} −{removed} 行", "+{added} −{removed} lines", {
-              added: entry.additions,
-              removed: entry.deletions
-            })}
+        {label && <span className="history-pane__role">{label}</span>}
+        {detail && <span className="history-pane__detail">{detail}</span>}
+        {badges.map((badge) => (
+          <span key={badge.label} className="history-pane__badge" data-tone={badge.tone}>
+            {badge.label}
           </span>
-        )}
+        ))}
+        <span className="history-pane__preview">{preview}</span>
+        {stat}
       </button>
       {open && children}
     </li>
   );
 }
 
-interface EntryListProps {
-  entries: readonly LedgerEntry[];
+/** What an opened row shows: its diff when it is a rewrite, its text otherwise. */
+function RowBody({ patch, text, truncated }: { patch: string; text: string; truncated?: boolean }) {
+  const { t } = useI18n();
+  if (patch) {
+    return (
+      <div className="history-pane__diff">
+        <DiffOutput value={patch} />
+      </div>
+    );
+  }
+  return (
+    <pre className="history-pane__text">
+      {text}
+      {truncated ? `\n\n${t("（记录时已截断）", "(truncated when recorded)")}` : ""}
+    </pre>
+  );
+}
+
+interface MessageRowsProps {
+  rows: readonly MessageRow[];
   rowKey: string;
   openParts: Set<string>;
-  cached?: boolean;
   onTogglePart: (key: string) => void;
 }
 
-/** The rows for one group of parts: the prompts, the history, or one request. */
-function EntryList({ entries, rowKey, openParts, cached, onTogglePart }: EntryListProps) {
+/**
+ * The lines a rewrite added and took away. A message put there or taken away
+ * whole has none: its colour says what happened to it, and a count of its lines
+ * would read as an edit it never had.
+ */
+function RewriteStat({ row }: { row: MessageRow }) {
   const { t } = useI18n();
+  if (row.change !== "replace") return null;
+  return (
+    <span
+      className="history-pane__stat"
+      title={t("新增 {added} 行，删除 {removed} 行", "{added} lines added, {removed} removed", {
+        added: row.additions,
+        removed: row.deletions
+      })}
+    >
+      <span data-status="added">+{row.additions}</span>{" "}
+      <span data-status="removed">−{row.deletions}</span>
+    </span>
+  );
+}
+
+/** The messages one change or one prompt check produced, each a row of its own. */
+function MessageRows({ rows, rowKey, openParts, onTogglePart }: MessageRowsProps) {
   return (
     <>
-      {entries.map((entry) => {
-        const key = `${rowKey}:${entry.key}`;
+      {rows.map((row) => {
+        const key = `${rowKey}:${row.key}`;
         return (
-          <PartRow
+          <Row
             key={key}
-            entry={entry}
+            variant="message"
+            label={row.label}
+            detail={row.detail}
+            badges={row.badges}
+            preview={row.preview}
+            stat={<RewriteStat row={row} />}
+            data={{ "data-kind": row.kind, "data-change": row.change }}
             open={openParts.has(key)}
-            cached={cached}
             onToggle={() => onTogglePart(key)}
           >
-            {entry.status === "changed" && entry.patch ? (
-              <div className="history-pane__diff">
-                <DiffOutput value={entry.patch} />
-              </div>
-            ) : (
-              <pre className="history-pane__text">
-                {entry.part.text}
-                {entry.part.truncated
-                  ? `\n\n${t("（记录时已截断）", "(truncated when recorded)")}`
-                  : ""}
-              </pre>
-            )}
-          </PartRow>
+            <RowBody patch={row.patch} text={row.text} />
+          </Row>
         );
       })}
     </>
   );
 }
 
-interface RequestRuleProps {
-  group: LedgerRequestGroup;
-  detail: WireRequestDetail;
-  /** True when the turn did not run every one of its requests on one model. */
-  showModel: boolean;
-  open: boolean;
-  onToggle: () => void;
-}
-
-/**
- * The rule where one request left.
- *
- * Everything above it, down to the rule before it, is what that payload was the
- * first to carry. It opens into the payload itself, so every request a turn
- * issued still has its bytes one click away: a pane that drew only the turn's
- * last payload would have stopped being a ledger.
- *
- * A component rather than a helper so re-serialising the payload can be
- * memoised on the detail it comes from. The list refetches once a second while
- * a turn runs; without this, every tick would redo it for every open rule.
- */
-function RequestRule({ group, detail, showModel, open, onToggle }: RequestRuleProps) {
+/** Where a read is still in flight, or failed and can be asked for again. */
+function Waiting({ error, onRetry }: { error: string | undefined; onRetry: () => void }) {
   const { t } = useI18n();
-  const payload = useMemo(() => JSON.stringify(rawPayload(detail), null, 2), [detail]);
-  const { summary } = group;
-  const kind =
-    summary.kind === "search"
-      ? t("原生搜索", "Native search")
-      : summary.kind === "fetch"
-        ? t("原生抓取", "Native fetch")
-        : "";
+  if (error === undefined) {
+    return (
+      <li className="history-pane__part">
+        <p className="history-pane__empty">{t("正在读取…", "Reading…")}</p>
+      </li>
+    );
+  }
+  // Held where the entry would be, not over the pane: one unreadable entry must
+  // not hide the history it belongs to.
   return (
     <li className="history-pane__part">
-      <button
-        type="button"
-        className="history-pane__row history-pane__row--rule"
-        aria-expanded={open}
-        title={t(
-          "第 {seq} 次请求 · {size} · 展开为发出去的原始 JSON",
-          "Request {seq} · {size} · opens the raw payload as sent",
-          { seq: summary.seq, size: formatBytes(summary.bytes) }
-        )}
-        onClick={onToggle}
-      >
-        <ChevronRight
-          size={12}
-          className="history-pane__chevron"
-          data-open={open || undefined}
-          aria-hidden="true"
-        />
-        <ArrowUpRight size={11} className="history-pane__glyph" aria-hidden="true" />
-        {/* The store's own sequence, not a position in the list: retention
-            prunes from the front, and a request must not be renumbered by the
-            disappearance of one that came before it. */}
-        <span className="history-pane__index">{summary.seq}</span>
-        {kind && <span className="history-pane__rule-label">{kind}</span>}
-        {showModel && <span className="history-pane__rule-label">{summary.modelId}</span>}
-        {summary.attempt > 1 && (
-          <span className="history-pane__badge">
-            {t("第 {n} 次尝试", "attempt {n}", { n: summary.attempt })}
-          </span>
-        )}
-        <span className="history-pane__rule-line" aria-hidden="true" />
-        <Usage usage={summary.usage} />
-        <span className="history-pane__meta">{formatBytes(summary.bytes)}</span>
-        <span className="history-pane__time">{formatTime(summary.createdAt)}</span>
-      </button>
-      {open && <pre className="history-pane__text history-pane__text--json">{payload}</pre>}
+      <p className="history-pane__empty" role="alert">
+        {error}{" "}
+        <button type="button" className="history-pane__retry" onClick={onRetry}>
+          {t("重试", "Retry")}
+        </button>
+      </p>
     </li>
   );
 }
 
-interface TurnBodyProps {
-  reading: TurnReading;
-  round: LedgerRound;
-  details: Record<number, WireRequestDetail | null>;
-  /** True when a body this turn is read from was cut at record time. */
-  truncated: boolean;
-  rowKey: string;
-  openParts: Set<string>;
-  onTogglePart: (key: string) => void;
+interface ChangeRowsProps extends Omit<MessageRowsProps, "rows"> {
+  entry: HistoryEntry;
+  detail: HistoryEntryDetail;
+  labels: EventLabels;
 }
 
 /**
- * One turn as a single flat list: its prompts, the history it replayed folded
- * behind one rule, and then everything it put on the wire, ruled off under each
- * request that left.
- *
- * The history folds because every request replays all of it; without the fold
- * the two or three parts worth reading would sit under hundreds the reader has
- * already seen. It opens *above* its own rule rather than below, so the rule
- * stays what it says it is — the line between what was carried over and what
- * this turn added.
+ * The messages one change to the timeline made. A component so the reading,
+ * with a line diff for every rewrite, is done once per body rather than once a
+ * second while a turn is running.
  */
-function TurnBody({
-  reading,
-  round,
-  details,
-  truncated,
-  rowKey,
-  openParts,
-  onTogglePart
-}: TurnBodyProps) {
+function ChangeRows({ entry, detail, labels, ...rest }: ChangeRowsProps) {
+  const rows = useMemo(() => describeChange(entry, detail, labels), [entry, detail, labels]);
+  return <MessageRows rows={rows} {...rest} />;
+}
+
+interface PromptRowsProps extends Omit<MessageRowsProps, "rows"> {
+  before: HistoryEntryDetail | null;
+  after: HistoryEntryDetail;
+  labels: EventLabels;
+}
+
+/**
+ * The tool list and the system prompt a turn opened with, when either is new or
+ * changed — in that order, the order the model reads them in.
+ */
+function PromptRows({ before, after, labels, rowKey, ...rest }: PromptRowsProps) {
+  const rows = useMemo(() => {
+    const key = `p${after.entry.seq}`;
+    const previous = before?.parts ?? null;
+    const current = after.parts ?? [];
+    return [
+      ...describeTools(previous, current, key, labels),
+      ...describePrompts(previous, current, key, labels)
+    ];
+  }, [before, after, labels]);
+  return <MessageRows rows={rows} rowKey={rowKey} {...rest} />;
+}
+
+/** The tools a request of a run that never settled was the first to hand over by append. */
+function AppendedRows({ before, after, labels, rowKey, ...rest }: PromptRowsProps) {
+  const rows = useMemo(
+    () => describeAppended(before?.parts ?? null, after.parts ?? [], `a${after.entry.seq}`, labels),
+    [before, after, labels]
+  );
+  return <MessageRows rows={rows} rowKey={rowKey} {...rest} />;
+}
+
+interface EventRowProps {
+  entry: HistoryEntry;
+  /** The loaded body; `null` while it is being read, absent before that. */
+  detail: HistoryEntryDetail | null | undefined;
+  /** Why the body could not be read, once a read has failed. */
+  error: string | undefined;
+  labels: EventLabels;
+  open: boolean;
+  onToggle: () => void;
+  onRetry: () => void;
+}
+
+/**
+ * One entry of a run that never settled: a response where it arrived, a hook's
+ * decision, a call as it ran, what it returned. The row says what it is from the
+ * list alone and fills in its preview once its body is read.
+ */
+function EventRow({ entry, detail, error, labels, open, onToggle, onRetry }: EventRowProps) {
   const { t } = useI18n();
-  const cachedKey = `${rowKey}:cached`;
-  const cachedOpen = openParts.has(cachedKey);
-  const rule = useRef<HTMLLIElement | null>(null);
-  /** Where the rule sat when the reader clicked it, so it can be put back. */
-  const anchored = useRef<number | null>(null);
-
-  function toggleCached() {
-    anchored.current = rule.current?.getBoundingClientRect().top ?? null;
-    onTogglePart(cachedKey);
-  }
-
-  useLayoutEffect(() => {
-    const top = anchored.current;
-    anchored.current = null;
-    const row = rule.current;
-    if (top === null || !row) return;
-    const scroller = row.closest(".history-pane");
-    // The history opens above its own rule, and the browser's own scroll
-    // anchoring does not catch an insertion made by a re-render: without this,
-    // opening a few hundred replayed messages would shove the rows the reader
-    // was actually looking at off the bottom of the pane.
-    if (scroller) scroller.scrollTop += row.getBoundingClientRect().top - top;
-  }, [cachedOpen]);
-
-  const unchanged =
-    reading.comparable
-    && reading.groups.every((group) => !group.entries.length)
-    && reading.prompts.every((entry) => entry.status === "kept");
+  const described = useMemo(() => describeEvent(entry, detail, labels), [entry, detail, labels]);
   return (
-    <ol className="history-pane__parts">
-      <EntryList
-        entries={reading.prompts}
-        rowKey={rowKey}
-        openParts={openParts}
-        onTogglePart={onTogglePart}
-      />
-      {reading.cached.length > 0 && (
-        <>
-          {cachedOpen && (
-            <EntryList
-              entries={reading.cached}
-              rowKey={cachedKey}
-              openParts={openParts}
-              cached
-              onTogglePart={onTogglePart}
-            />
-          )}
-          <li className="history-pane__part" ref={rule}>
-            <button
-              type="button"
-              className="history-pane__row history-pane__row--rule"
-              aria-expanded={cachedOpen}
-              title={t(
-                "这一轮原样重放的历史，展开在这条线上方",
-                "The history this turn replayed untouched, opening above this rule"
-              )}
-              onClick={toggleCached}
-            >
-              <ChevronRight
-                size={12}
-                className="history-pane__chevron"
-                data-open={cachedOpen || undefined}
-                aria-hidden="true"
-              />
-              <History size={11} className="history-pane__glyph" aria-hidden="true" />
-              <span className="history-pane__rule-label">
-                {t("此前 {n} 条消息", "{n} earlier messages", { n: reading.cached.length })}
-              </span>
-              <span className="history-pane__rule-line" aria-hidden="true" />
-            </button>
-          </li>
-        </>
+    <Row
+      variant="event"
+      label={described.label}
+      detail={described.detail}
+      badges={described.badges}
+      preview={described.preview}
+      title={t("第 {seq} 条记录", "Entry {seq}", { seq: entry.seq })}
+      data={{ "data-tone": described.tone }}
+      open={open}
+      onToggle={onToggle}
+    >
+      {error !== undefined ? (
+        <p className="history-pane__empty" role="alert">
+          {error}{" "}
+          <button type="button" className="history-pane__retry" onClick={onRetry}>
+            {t("重试", "Retry")}
+          </button>
+        </p>
+      ) : !detail ? (
+        <p className="history-pane__empty">{t("正在读取…", "Reading…")}</p>
+      ) : (
+        <RowBody patch={described.patch} text={described.text} truncated={detail.truncated} />
       )}
-      {unchanged && (
-        // A retry re-sends the same bytes, and so does a round the host repeated
-        // for a continuation. Saying so is the point: "nothing new" is a finding.
-        <li className="history-pane__part">
-          <p className="history-pane__empty">
-            {truncated
-              ? t(
-                  "与上一次请求相比，记录下来的部分没有差异；其中有正文在记录时被截断，更长处的改动看不到。",
-                  "No difference from the request before it in what was recorded; a body was cut at record time, so a change past the cap cannot be seen."
-                )
-              : t(
-                  "这一轮发出去的内容和上一次请求完全相同。",
-                  "This turn carried exactly what the request before it carried."
-                )}
-          </p>
-        </li>
-      )}
-      {reading.groups.map((group) => {
-        const detail = details[group.summary.seq];
-        const groupKey = `${rowKey}:${group.key}`;
-        return (
-          <Fragment key={group.key}>
-            <EntryList
-              entries={group.entries}
-              rowKey={groupKey}
-              openParts={openParts}
-              onTogglePart={onTogglePart}
-            />
-            {detail && (
-              <RequestRule
-                group={group}
-                detail={detail}
-                showModel={round.mixedModels}
-                open={openParts.has(groupKey)}
-                onToggle={() => onTogglePart(groupKey)}
-              />
-            )}
-          </Fragment>
-        );
-      })}
-    </ol>
+    </Row>
   );
 }
 
 /**
- * The conversation's outgoing requests, oldest first, grouped into the turns
- * that issued them.
+ * The conversation's history, oldest first, as the bars the things that
+ * happened to it make.
  *
- * A turn opens into the payload it built: the history it replayed, folded, and
- * then every part it put on the wire, ruled off at each request that left.
- * Reading a turn against the payload before it is what says which of its
- * messages the rounds produced and which the user put there — so the pane
- * accounts for everything that was sent, not only for what the conversation
- * kept afterwards.
+ * A turn the user started, a run of edits the user made to the context by hand,
+ * and a turn that was cut off before its answer came back each stand as a bar of
+ * their own, side by side. Each opens into the messages it added, removed or
+ * rewrote, one row each in the order it made them — what the user sent, the
+ * system prompt when it changed, what the model thought and said, each call with
+ * what it returned, each tool it was handed on the way.
  */
 export function HistoryPane({ conversationId, contexts, streaming, owners }: HistoryPaneProps) {
   const { t } = useI18n();
-  const [requests, setRequests] = useState<WireRequestSummary[] | null>(null);
-  const [details, setDetails] = useState<Record<number, WireRequestDetail | null>>({});
+  const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
+  const [details, setDetails] = useState<Record<number, HistoryEntryDetail | null>>({});
   const [detailErrors, setDetailErrors] = useState<Record<number, string>>({});
   const [openRows, setOpenRows] = useState<Set<string>>(new Set());
   const [openParts, setOpenParts] = useState<Set<string>>(new Set());
   const [failure, setFailure] = useState<string | null>(null);
-  /** Requests already read or in flight, so an expansion never reads twice. */
+  /** Entries already read or in flight, so an expansion never reads twice. */
   const requested = useRef<Set<number>>(new Set());
   /** The conversation the pane is on right now, for discarding late reads. */
   const latestConversation = useRef(conversationId);
   /**
-   * Whether this conversation's newest turn has been opened for the reader.
+   * Whether this conversation's newest bar has been opened for the reader.
    *
    * Every row here is a fold, so a pane that opened onto nothing but collapsed
    * headers would hide the thing it was opened to look at. Done once per
@@ -464,47 +390,65 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
    */
   const primed = useRef(false);
   /**
-   * One reading per turn, computed at most once per shape.
-   *
-   * A loaded detail never changes, so the sequence numbers that went into a
-   * reading identify it completely — and a running turn gains requests, so the
-   * entry is replaced rather than added to. Without this the alignment and
-   * every line diff under it would recompute on every render, and the list
-   * re-renders once a second while a turn is running.
-   */
-  const readingCache = useRef<Map<string, { signature: string; reading: TurnReading }>>(new Map());
-  /**
-   * Identity of the ledger being read, for the refetch dependency.
+   * Identity of the owners being read, for the refetch dependency.
    *
    * The array is rebuilt on every render of the host, so it is compared by value
    * rather than by reference: by reference the pane would refetch once a render.
    */
   const ownersKey = owners === undefined ? null : JSON.stringify(owners);
   /** The same list, stable for as long as its contents are. */
-  const ledgerOwners = useMemo(
+  const historyOwners = useMemo(
     () => (ownersKey === null ? undefined : (JSON.parse(ownersKey) as string[])),
     [ownersKey]
+  );
+  const labels = useMemo<EventLabels>(
+    () => ({
+      toolsAdded: (count) => t("追加 {n} 个工具", "{n} tools added", { n: count }),
+      toolsRegistered: (count) => t("注册 {n} 个工具", "{n} tools registered", { n: count }),
+      localOnly: t("仅本地", "local only"),
+      interrupted: t("中断前的部分", "cut off"),
+      unseen: t("（记录里没有这一行被删前的内容）", "(the record never saw this row before it went)"),
+      rewroteInput: t("改写了输入", "rewrote input"),
+      addedContext: t("注入上下文", "added context"),
+      blocked: t("拦下", "blocked"),
+      halted: t("中止", "halted"),
+      failed: t("失败", "failed"),
+      denied: t("被拒绝", "denied"),
+      permission: (decision) =>
+        decision === "allow"
+          ? t("放行", "allowed")
+          : decision === "ask"
+            ? t("要求确认", "asked")
+            : decision === "deny"
+              ? t("拒绝", "denied")
+              : decision,
+      truncated: t("输出被截断", "cut off"),
+      paused: t("暂停", "paused"),
+      images: (count) => t("{n} 张图", "{n} images", { n: count }),
+      files: (count) => t("{n} 个文件", "{n} files", { n: count })
+    }),
+    [t]
   );
 
   useEffect(() => {
     latestConversation.current = conversationId;
     requested.current = new Set();
-    readingCache.current = new Map();
     primed.current = false;
-    setRequests(null);
+    setEntries(null);
     setDetails({});
     setDetailErrors({});
     setOpenRows(new Set());
     setOpenParts(new Set());
   }, [conversationId]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `contexts` is the change signal — a new array means the trunk moved — though nothing here reads it.
   useEffect(() => {
     let cancelled = false;
     const read = () => {
-      listWireRequests(conversationId, ledgerOwners).then(
+      listHistoryEntries(conversationId, historyOwners).then(
         (next) => {
           if (cancelled) return;
-          setRequests(next);
+          setEntries(next);
           setFailure(null);
         },
         (error: unknown) => {
@@ -520,10 +464,10 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
       clearTimeout(timer);
       if (poll !== null) clearInterval(poll);
     };
-  }, [conversationId, contexts, ledgerOwners, streaming]);
+  }, [conversationId, contexts, historyOwners, streaming]);
 
   /**
-   * Reads one request's parts once.
+   * Reads one entry's body once.
    *
    * The guard is a ref rather than a look at `details`, because a state updater
    * must stay a pure function of its input: React is allowed to run it twice,
@@ -535,35 +479,36 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
       requested.current.add(seq);
       const conversation = conversationId;
       setDetails((current) => ({ ...current, [seq]: null }));
-      loadWireRequest(conversation, seq).then(
+      const fail = (message: string) => {
+        requested.current.delete(seq);
+        setDetails((next) => {
+          const rest = { ...next };
+          delete rest[seq];
+          return rest;
+        });
+        setDetailErrors((next) => ({ ...next, [seq]: message }));
+      };
+      loadHistoryEntry(conversation, seq).then(
         (detail) => {
           // A read that lands after the pane moved on belongs to a conversation
           // nobody is looking at; writing it here would show its rows under
           // another one's heading.
           if (conversation !== latestConversation.current) return;
           if (!detail) {
-            // A turn is drawn from every one of its payloads at once, so a row
-            // the store no longer holds has to be said out loud rather than
-            // left as a read that never finishes.
-            requested.current.delete(seq);
-            setDetailErrors((next) => ({
-              ...next,
-              [seq]: t(
-                "第 {seq} 次请求已不在账本里。",
-                "Request {seq} is no longer in the ledger.",
-                { seq }
-              )
-            }));
+            // An entry the store no longer holds has to be said out loud rather
+            // than left as a read that never finishes.
+            fail(
+              t("第 {seq} 条记录已不在历史记录里。", "Entry {seq} is no longer in the history.", {
+                seq
+              })
+            );
             return;
           }
           setDetails((next) => ({ ...next, [seq]: detail }));
         },
         (error: unknown) => {
           if (conversation !== latestConversation.current) return;
-          // Held against the row, not the pane: one unreadable request must not
-          // hide the ledger it belongs to.
-          requested.current.delete(seq);
-          setDetailErrors((next) => ({ ...next, [seq]: String(error) }));
+          fail(String(error));
         }
       );
     },
@@ -600,51 +545,63 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
     });
   }, []);
 
-  const rounds = useMemo(() => ledgerRounds(requests ?? []), [requests]);
-  /** Sequence number of the request before each one, by position in the list. */
+  const bars = useMemo(() => historyBars(entries ?? [], { live: streaming }), [entries, streaming]);
+  /** The model request before each one: what a turn's system prompt is read against. */
   const predecessors = useMemo(() => {
     const map = new Map<number, number>();
-    (requests ?? []).forEach((summary, index) => {
-      const previous = (requests ?? [])[index - 1];
-      if (previous) map.set(summary.seq, previous.seq);
-    });
+    let previous: number | undefined;
+    for (const entry of entries ?? []) {
+      if (entry.kind !== "request" || entry.detail.type === "search" || entry.detail.type === "fetch") {
+        continue;
+      }
+      if (previous !== undefined) map.set(entry.seq, previous);
+      previous = entry.seq;
+    }
     return map;
-  }, [requests]);
+  }, [entries]);
 
-  /** Every payload an open turn is drawn from, including the one before it. */
-  const turnSeqs = useCallback(
-    (round: LedgerRound): number[] => {
-      const seqs = round.turns.map((turn) => turn.summary.seq);
-      const before = predecessors.get(seqs[0]);
-      return before === undefined ? seqs : [before, ...seqs];
+  /** The payloads a bar's system prompt is read from: its first model request, and the one before. */
+  const promptSeqs = useCallback(
+    (bar: HistoryBar): { first: number; before: number | undefined } | null => {
+      const first = bar.requests.find((request) => request.kind === "model");
+      return first ? { first: first.seq, before: predecessors.get(first.seq) } : null;
     },
     [predecessors]
   );
 
   useEffect(() => {
-    if (primed.current || !rounds.length) return;
+    if (primed.current || !bars.length) return;
     primed.current = true;
-    const newest = rounds.at(-1);
+    const newest = bars.at(-1);
     if (newest) setOpenRows(new Set([newest.key]));
-  }, [rounds]);
+  }, [bars]);
 
   /**
-   * Keeps every open turn's payloads read.
+   * Keeps every open bar's entries read.
    *
-   * A turn is drawn from all of them at once, and while it is still running new
-   * ones join it row by row — so this follows the open set rather than the click
-   * that opened it. A payload whose read failed is left alone until the reader
-   * asks again: retrying it here would turn one unreadable row into a request a
-   * second for as long as the turn runs.
+   * While a turn is still running new entries join it one by one — so this
+   * follows the open set rather than the click that opened it. An entry whose
+   * read failed is left alone until the reader asks again: retrying it here
+   * would turn one unreadable entry into a request a second for as long as the
+   * turn runs.
    */
   useEffect(() => {
-    for (const round of rounds) {
-      if (!openRows.has(round.key)) continue;
-      for (const seq of turnSeqs(round)) {
+    for (const bar of bars) {
+      if (!openRows.has(bar.key)) continue;
+      const prompt = promptSeqs(bar);
+      const seqs = [
+        ...(prompt ? [prompt.first, ...(prompt.before === undefined ? [] : [prompt.before])] : []),
+        ...barItems(bar).flatMap((item) => {
+          if (item.type !== "request") return [item.entry.seq];
+          const before = predecessors.get(item.request.seq);
+          return before === undefined ? [item.request.seq] : [item.request.seq, before];
+        })
+      ];
+      for (const seq of seqs) {
         if (detailErrors[seq] === undefined) load(seq);
       }
     }
-  }, [rounds, openRows, turnSeqs, detailErrors, load]);
+  }, [bars, openRows, promptSeqs, predecessors, detailErrors, load]);
 
   if (failure) {
     return (
@@ -653,133 +610,178 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
       </p>
     );
   }
-  if (requests === null) {
-    return <p className="history-pane__empty">{t("正在读取请求账本…", "Reading the request log…")}</p>;
+  if (entries === null) {
+    return <p className="history-pane__empty">{t("正在读取历史记录…", "Reading the history…")}</p>;
   }
-  if (!requests.length) {
+  if (!entries.length) {
     return (
       <p className="history-pane__empty">
-        {ledgerOwners
+        {historyOwners
           ? t(
-              "这个子代理还没有记录到发出去的请求。记录从下一次请求开始。",
-              "No outgoing request has been recorded for this subagent yet. Recording starts with the next one."
+              "这个子代理还没有历史记录。记录从它发出的第一次请求开始。",
+              "Nothing has been recorded for this subagent yet. Recording starts with its first request."
             )
           : t(
-              "这个对话还没有记录到发出去的请求。记录从下一次请求开始。",
-              "No outgoing request has been recorded for this conversation yet. Recording starts with the next one."
+              "这个对话还没有历史记录。记录从下一次发送或编辑开始。",
+              "Nothing has been recorded for this conversation yet. Recording starts with the next send or edit."
             )}
       </p>
     );
   }
 
-  /**
-   * Whole messages the user added and removed before this turn's payloads went
-   * out.
-   *
-   * Counted by the host against each predecessor's own parts, because reaching
-   * the same number here would mean reading every recorded payload back. A turn
-   * from before the ledger counted them draws nothing, which is not the same as
-   * drawing a zero.
-   */
-  function renderCounts(added: number | null, removed: number | null): ReactNode {
-    if (!added && !removed) return null;
-    return (
-      <span
-        className="history-pane__counts"
-        title={t(
-          "用户手动新增 {added} 条、删除 {removed} 条消息",
-          "{added} messages the user added, {removed} the user removed",
-          { added: added ?? 0, removed: removed ?? 0 }
-        )}
-      >
-        {added ? (
-          <span className="history-pane__count" data-status="added">
-            +{added}
-          </span>
-        ) : null}
-        {removed ? (
-          <span className="history-pane__count" data-status="removed">
-            −{removed}
-          </span>
-        ) : null}
-      </span>
-    );
+  function modelName(bar: HistoryBar): string {
+    return bar.mixedModels
+      ? t("{model} 等", "{model} and others", { model: bar.modelId })
+      : bar.modelId;
   }
 
-  /** A turn's body while its payloads are still unread, or unreadable. */
-  function pending(seqs: number[]): ReactNode {
-    const failed = seqs.filter((seq) => detailErrors[seq] !== undefined);
-    if (!failed.length) {
-      return <p className="history-pane__empty">{t("正在读取…", "Reading…")}</p>;
+  function barTitle(bar: HistoryBar): string {
+    if (bar.kind === "edits") return t("上下文编辑", "Context edits");
+    if (bar.kind === "interrupted") return t("意外中断", "Interrupted");
+    if (bar.kind === "pending") return t("尚未发出", "Not sent yet");
+    return modelName(bar);
+  }
+
+  function barTooltip(bar: HistoryBar): string {
+    if (bar.kind === "edits") {
+      return t("手动改动上下文 {n} 次", "{n} changes made to the context by hand", {
+        n: bar.entries.length
+      });
+    }
+    if (bar.kind === "pending") {
+      return t("还没有请求带出去的内容", "What no request has carried yet");
+    }
+    if (bar.kind === "interrupted") {
+      return t(
+        "第 {n} 轮 · 最后一次请求没有等到回复",
+        "Turn {n} · its last request never got an answer back",
+        { n: bar.index }
+      );
+    }
+    return t("第 {n} 轮 · 发出 {count} 次请求", "Turn {n} · {count} requests", {
+      n: bar.index,
+      count: bar.requests.length
+    });
+  }
+
+  function renderPrompt(bar: HistoryBar): ReactNode {
+    const prompt = promptSeqs(bar);
+    if (!prompt) return null;
+    const failed = [prompt.first, prompt.before].find(
+      (seq): seq is number => seq !== undefined && detailErrors[seq] !== undefined
+    );
+    if (failed !== undefined) {
+      return <Waiting key="prompt" error={detailErrors[failed]} onRetry={() => retry(failed)} />;
+    }
+    const after = details[prompt.first];
+    const before = prompt.before === undefined ? null : details[prompt.before];
+    if (!after || before === undefined || (prompt.before !== undefined && !before)) {
+      return <Waiting key="prompt" error={undefined} onRetry={() => undefined} />;
     }
     return (
-      <p className="history-pane__empty" role="alert">
-        {detailErrors[failed[0]]}{" "}
-        <button
-          type="button"
-          className="history-pane__retry"
-          onClick={() => {
-            for (const seq of failed) retry(seq);
-          }}
-        >
-          {t("重试", "Retry")}
-        </button>
-      </p>
+      <PromptRows
+        key="prompt"
+        before={before}
+        after={after}
+        labels={labels}
+        rowKey={bar.key}
+        openParts={openParts}
+        onTogglePart={togglePart}
+      />
     );
   }
 
-  /** The reading of one turn against the request before it, computed once. */
-  function readingFor(round: LedgerRound): TurnReading {
-    const seqs = round.turns.map((turn) => turn.summary.seq);
-    const beforeSeq = predecessors.get(seqs[0]);
-    const beforeDetail = beforeSeq === undefined ? null : details[beforeSeq] ?? null;
-    // A turn that opens the conversation had an empty payload before it as a
-    // matter of fact. Anything else with nothing to compare against is a
-    // retention gap or a dropped row left behind, and the reading attributes
-    // nothing rather than calling the whole history new.
-    const atStart = seqs[0] === 1;
-    const before = beforeDetail ? beforeDetail.parts : atStart ? [] : null;
-    const signature = `${beforeDetail ? beforeSeq : atStart ? "start" : "none"}:${seqs.join(",")}`;
-    const cached = readingCache.current.get(round.key);
-    if (cached && cached.signature === signature) return cached.reading;
-    const reading = readTurn(
-      before,
-      round.turns.map((turn) => ({
-        summary: turn.summary,
-        parts: (details[turn.summary.seq] as WireRequestDetail).parts
-      }))
-    );
-    readingCache.current.set(round.key, { signature, reading });
-    return reading;
-  }
-
-  function roundTitle(round: LedgerRound): string {
-    return round.mixedModels
-      ? t("{model} 等", "{model} and others", { model: round.modelId })
-      : round.modelId;
-  }
-
-  function renderRound(round: LedgerRound) {
-    const open = openRows.has(round.key);
-    const seqs = round.turns.map((turn) => turn.summary.seq);
-    const beforeSeq = predecessors.get(seqs[0]);
-    const loaded = seqs.every((seq) => details[seq]);
-    // The request before the turn is only needed to attribute its opening
-    // payload; when it cannot be read the turn is still shown, with nothing
-    // attributed.
-    const waitingOnBefore =
-      beforeSeq !== undefined && !details[beforeSeq] && detailErrors[beforeSeq] === undefined;
+  function renderBody(bar: HistoryBar): ReactNode {
+    const items = barItems(bar);
+    const prompt = renderPrompt(bar);
+    if (!items.length && !prompt) {
+      // A turn from before anything but its payloads was recorded. Saying so is
+      // the point: an empty fold would read as a turn in which nothing happened.
+      return (
+        <p className="history-pane__empty">
+          {t(
+            "这一轮除了发出的请求，没有记录到别的条目。",
+            "Nothing but the requests it sent was recorded for this turn."
+          )}
+        </p>
+      );
+    }
     return (
-      <li className="history-pane__entry" key={round.key} data-kind="round">
+      <ol className="history-pane__parts" data-bar={bar.kind}>
+        {prompt}
+        {items.map((item) => {
+          if (item.type === "request") {
+            const seq = item.request.seq;
+            const key = `${bar.key}:r${seq}`;
+            const before = predecessors.get(seq);
+            const after = details[seq];
+            const previous = before === undefined ? null : details[before];
+            // Nothing until both payloads are read: most requests hand over no
+            // tool, and a placeholder for each would flicker through a running turn.
+            if (!after || previous === undefined || (before !== undefined && previous === null)) return null;
+            return (
+              <AppendedRows
+                key={key}
+                before={previous}
+                after={after}
+                labels={labels}
+                rowKey={key}
+                openParts={openParts}
+                onTogglePart={togglePart}
+              />
+            );
+          }
+          const { type, entry } = item;
+          const key = `${bar.key}:e${entry.seq}`;
+          if (type === "event") {
+            return (
+              <EventRow
+                key={key}
+                entry={entry}
+                detail={details[entry.seq]}
+                error={detailErrors[entry.seq]}
+                labels={labels}
+                open={openParts.has(key)}
+                onToggle={() => togglePart(key)}
+                onRetry={() => retry(entry.seq)}
+              />
+            );
+          }
+          const detail = details[entry.seq];
+          if (!detail) {
+            return (
+              <Waiting key={key} error={detailErrors[entry.seq]} onRetry={() => retry(entry.seq)} />
+            );
+          }
+          return (
+            <ChangeRows
+              key={key}
+              entry={entry}
+              detail={detail}
+              labels={labels}
+              rowKey={key}
+              openParts={openParts}
+              onTogglePart={togglePart}
+            />
+          );
+        })}
+      </ol>
+    );
+  }
+
+  function renderBar(bar: HistoryBar) {
+    const open = openRows.has(bar.key);
+    const Glyph = BAR_GLYPHS[bar.kind];
+    const ran = bar.kind === "turn" || bar.kind === "interrupted";
+    return (
+      <li className="history-pane__entry" key={bar.key} data-kind={bar.kind}>
         <button
           type="button"
           className="history-pane__row history-pane__row--round"
+          data-kind={bar.kind}
           aria-expanded={open}
-          title={t("第 {n} 轮 · 发出 {count} 次请求", "Turn {n} · {count} requests", {
-            n: round.index,
-            count: round.turns.length
-          })}
-          onClick={() => toggleRow(round.key)}
+          title={barTooltip(bar)}
+          onClick={() => toggleRow(bar.key)}
         >
           <ChevronRight
             size={13}
@@ -787,41 +789,26 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
             data-open={open || undefined}
             aria-hidden="true"
           />
-          <span className="history-pane__kind" data-kind="round">
-            <MessageSquare size={12} aria-hidden="true" />
+          <span className="history-pane__kind" data-kind={bar.kind}>
+            <Glyph size={12} aria-hidden="true" />
           </span>
-          {/* No number of its own. The rules inside it carry the store's
-              sequence, and a second counter out here would read as one of
-              those — a turn's position in this list is not a request id. */}
-          <span className="history-pane__title">{roundTitle(round)}</span>
-          <Usage usage={round.usage} />
-          {renderCounts(round.messagesAdded, round.messagesRemoved)}
-          <span className="history-pane__time">{formatTime(round.createdAt)}</span>
+          {/* No number of its own: a bar's position in this list is not an
+              entry's number. */}
+          <span className="history-pane__title">{barTitle(bar)}</span>
+          {bar.kind === "interrupted" && bar.modelId && (
+            <span className="history-pane__detail">{modelName(bar)}</span>
+          )}
+          {ran ? <Usage usage={bar.usage} /> : <span className="history-pane__change" />}
+          <span className="history-pane__time">{formatTime(bar.createdAt)}</span>
         </button>
-        {open && (
-          <div className="history-pane__body">
-            {!loaded || waitingOnBefore ? (
-              pending(turnSeqs(round))
-            ) : (
-              <TurnBody
-                reading={readingFor(round)}
-                round={round}
-                details={details}
-                truncated={seqs.some((seq) => anyTruncated(details[seq]?.parts ?? []))}
-                rowKey={round.key}
-                openParts={openParts}
-                onTogglePart={togglePart}
-              />
-            )}
-          </div>
-        )}
+        {open && <div className="history-pane__body">{renderBody(bar)}</div>}
       </li>
     );
   }
 
   return (
     <div className="history-pane">
-      <ol className="history-pane__list">{rounds.map(renderRound)}</ol>
+      <ol className="history-pane__list">{bars.map(renderBar)}</ol>
     </div>
   );
 }

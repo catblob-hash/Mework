@@ -3,6 +3,10 @@
 //! Each key hashes the preceding key, step prompt, and canonical options in entry
 //! order. Once a journal lookup misses, every later lookup is untrusted because
 //! downstream results depend on recomputed upstream output.
+//!
+//! A step the previous attempt started but never settled is the one exception: the
+//! script never received its outcome, so nothing downstream can depend on it. It
+//! reruns alone and leaves the chain trusted.
 
 use std::fmt::Write as _;
 
@@ -10,6 +14,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{WorkflowStepRequest, CACHE_KEY_PREFIX};
+
+/// What a run's journal holds for one key when the chain consults it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalLookup {
+    /// A reusable result.
+    Hit,
+    /// Started, but the attempt ended before the step settled: a host crash, a user stop, or
+    /// the plan returning while the step still ran. Its outcome never reached the script.
+    Unsettled,
+    /// Never started, or settled without a value that the script then consumed.
+    Miss,
+}
 
 /// Cache-key chain and divergence state for one run or replay.
 ///
@@ -53,16 +69,20 @@ impl CacheKeyChain {
     /// Return whether the newly advanced key may reuse its journal result.
     ///
     /// The first miss permanently latches the chain as divergent, including when
-    /// later journal lookups would otherwise hit.
-    pub fn consult(&mut self, journal_has_result: bool) -> bool {
+    /// later journal lookups would otherwise hit. An unsettled key reruns without
+    /// latching: its outcome never reached the script, so no later step was
+    /// dispatched from it.
+    pub fn consult(&mut self, lookup: JournalLookup) -> bool {
         if self.diverged {
             return false;
         }
-        if journal_has_result {
-            true
-        } else {
-            self.diverged = true;
-            false
+        match lookup {
+            JournalLookup::Hit => true,
+            JournalLookup::Unsettled => false,
+            JournalLookup::Miss => {
+                self.diverged = true;
+                false
+            }
         }
     }
 
@@ -312,13 +332,13 @@ mod tests {
     fn one_miss_latches_the_chain_so_a_later_would_be_hit_is_never_trusted() {
         let mut chain = CacheKeyChain::new();
         chain.advance(&request("a"));
-        assert!(chain.consult(true), "分歧前的命中可复用");
+        assert!(chain.consult(JournalLookup::Hit), "分歧前的命中可复用");
         chain.advance(&request("b"));
-        assert!(!chain.consult(false), "miss 本身不可复用");
+        assert!(!chain.consult(JournalLookup::Miss), "miss 本身不可复用");
         assert!(chain.is_diverged());
         chain.advance(&request("c"));
         assert!(
-            !chain.consult(true),
+            !chain.consult(JournalLookup::Hit),
             "分歧后的「本可命中」不得再被采信——上游已经重跑，它是旧输入的结果"
         );
 
@@ -326,11 +346,39 @@ mod tests {
         marked.advance(&request("a"));
         marked.mark_diverged();
         assert!(marked.is_diverged());
-        assert!(!marked.consult(true));
+        assert!(!marked.consult(JournalLookup::Hit));
 
         let mut fresh = CacheKeyChain::new();
         fresh.advance(&request("a"));
-        assert!(fresh.consult(true), "新链未分歧时命中可复用");
+        assert!(fresh.consult(JournalLookup::Hit), "新链未分歧时命中可复用");
+    }
+
+    /// A step the previous attempt never settled reruns alone. Its outcome never reached the
+    /// script, so a sibling dispatched after it was not computed from it and stays reusable.
+    #[test]
+    fn an_unsettled_step_reruns_alone_without_latching_the_chain() {
+        let mut chain = CacheKeyChain::new();
+        chain.advance(&request("a"));
+        assert!(chain.consult(JournalLookup::Hit));
+        chain.advance(&request("b"));
+        assert!(
+            !chain.consult(JournalLookup::Unsettled),
+            "没结算的步骤没有可复用的结果，必须重跑"
+        );
+        assert!(!chain.is_diverged(), "没结算不等于分歧");
+        chain.advance(&request("c"));
+        assert!(
+            chain.consult(JournalLookup::Hit),
+            "排在未结算步骤之后的兄弟步骤仍可复用"
+        );
+
+        // Divergence still wins: once a real miss latched, an unsettled key cannot reopen it.
+        chain.advance(&request("d"));
+        assert!(!chain.consult(JournalLookup::Miss));
+        chain.advance(&request("e"));
+        assert!(!chain.consult(JournalLookup::Unsettled));
+        chain.advance(&request("f"));
+        assert!(!chain.consult(JournalLookup::Hit));
     }
 
     #[test]

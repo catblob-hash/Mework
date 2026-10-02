@@ -25,12 +25,12 @@
   background: var(--app);
 }
 
+/* The side area's minimum width grows with its columns; the component sets it inline. */
 .pane-tiles > .pane-tiles__side {
   min-width: 280px;
   min-height: 0;
   overflow: hidden;
-  display: flex;
-  flex-direction: column;
+  position: relative;
 }
 
 /* `display: flex` above outranks the user-agent `[hidden]` rule, so both the empty side column
@@ -40,7 +40,16 @@
   min-width: 0;
 }
 
+/* Every tile is placed from its column's share of the width and its share of the column's
+   height, less the 12px gaps between them. The tiles stay siblings in one element whatever the
+   columns are, so a pane moving to another column changes style, never parent: its surface —
+   a live shell, a native page — is not remounted. */
 .pane-tiles .pane-tiles__tile {
+  position: absolute;
+  left: calc((100% - (var(--tile-cols) - 1) * 12px) * var(--tile-x) + var(--tile-col) * 12px);
+  width: calc((100% - (var(--tile-cols) - 1) * 12px) * var(--tile-w));
+  top: calc((100% - (var(--tile-rows) - 1) * 12px) * var(--tile-y) + var(--tile-row) * 12px);
+  height: calc((100% - (var(--tile-rows) - 1) * 12px) * var(--tile-h));
   min-height: 32px;
   min-width: 0;
   display: flex;
@@ -54,13 +63,25 @@
 /* While one pane is shown alone, the chat column and the other tiles keep their box so a
    transcript keeps its scroll position and a terminal keeps its measurements; they are only
    taken out of the flow and made unreachable. `display: none` would discard both. */
-.pane-tiles--solo > .pane-tiles__chat.is-solo-hidden,
-.pane-tiles--solo .pane-tiles__tile.is-solo-hidden {
+.pane-tiles--solo > .pane-tiles__chat.is-solo-hidden {
   position: absolute;
   inset: 8px;
   visibility: hidden;
   content-visibility: hidden;
   pointer-events: none;
+}
+
+.pane-tiles--solo .pane-tiles__tile.is-solo-hidden {
+  visibility: hidden;
+  content-visibility: hidden;
+  pointer-events: none;
+}
+
+.pane-tiles--solo .pane-tiles__tile.is-solo {
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
 }
 
 .pane-tiles--solo > .pane-tiles__side {
@@ -89,6 +110,25 @@
 .pane-tiles .pane-tiles__handle--column {
   height: 12px;
   cursor: row-resize;
+}
+
+/* The dividers inside the side area sit in the gaps the tiles leave, placed by the same
+   formulas: one between two columns spans the area's height, one between two tiles spans its
+   column's width. */
+.pane-tiles .pane-tiles__side > .pane-tiles__handle {
+  position: absolute;
+}
+
+.pane-tiles .pane-tiles__side > .pane-tiles__handle--row {
+  left: calc((100% - (var(--tile-cols) - 1) * 12px) * var(--tile-x) + var(--tile-col) * 12px);
+  top: 0;
+  height: 100%;
+}
+
+.pane-tiles .pane-tiles__side > .pane-tiles__handle--column {
+  left: calc((100% - (var(--tile-cols) - 1) * 12px) * var(--tile-x) + var(--tile-col) * 12px);
+  width: calc((100% - (var(--tile-cols) - 1) * 12px) * var(--tile-w));
+  top: calc((100% - (var(--tile-rows) - 1) * 12px) * var(--tile-y) + var(--tile-row) * 12px);
 }
 
 .pane-tiles .pane-tiles__handle::before {
@@ -130,7 +170,7 @@
 body.pane-tiles-resize-active,
 body.pane-tiles-resize-active * {
   cursor: col-resize !important;
-  user-select: none !important;
+  -webkit-user-select: none !important; user-select: none !important;
 }
 
 body.pane-tiles-resize-active.pane-tiles-resize-active--column,

@@ -318,6 +318,7 @@ const CLAUDE_AGENT_SEED_MODELS: &[(&str, &str, u64, u64)] = &[
     ("claude-fable-5", "Claude Fable 5", 1_000_000, 128_000),
     ("claude-opus-5-5", "Claude Opus 5.5", 1_000_000, 128_000),
     ("claude-opus-5", "Claude Opus 5", 200_000, 128_000),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5", 1_000_000, 128_000),
     ("claude-sonnet-5", "Claude Sonnet 5", 1_000_000, 128_000),
     ("claude-opus-4-8", "Claude Opus 4.8", 200_000, 128_000),
     ("claude-opus-4-7", "Claude Opus 4.7", 200_000, 128_000),
@@ -561,6 +562,18 @@ const MAX_OUTPUT_PATHS: &[&[&str]] = &[
 
 // ───────────────────────────── Projection ─────────────────────────────
 
+/// The append capabilities Mework knows `model_id` has at `provider`'s
+/// endpoint (`tool_append::known`, `system_append::known`). A `None` there is
+/// the user's to declare, so it adds nothing.
+pub(crate) fn known_append_capabilities(provider: &ApiProvider, model_id: &str) -> Vec<ModelCapability> {
+    let tool = crate::tool_append::known(provider.family, &provider.base_url, model_id);
+    let system = crate::system_append::known(provider.family, &provider.base_url, model_id);
+    [(tool, ModelCapability::ToolAppend), (system, ModelCapability::SystemAppend)]
+        .into_iter()
+        .filter_map(|(known, capability)| (known == Some(true)).then_some(capability))
+        .collect()
+}
+
 /// Merge model data in descending authority:
 ///
 /// 1. Fields, capabilities, and limits declared by the upstream response.
@@ -584,6 +597,11 @@ fn finish(provider: &ApiProvider, fetched: Vec<Fetched>) -> Vec<ModelProfile> {
             for denied in denied_capabilities(&item.raw) {
                 capabilities.remove(&denied);
             }
+            // Appending a tool or a system prompt mid-conversation is declared
+            // the way vision is, from what Mework knows of this model at this
+            // endpoint. Where it does not know — a relay — it declares
+            // neither, and the user ticks what the endpoint takes.
+            capabilities.extend(known_append_capabilities(provider, &item.id));
 
             let context_window = u64_at_any(&item.raw, CONTEXT_WINDOW_PATHS)
                 .or_else(|| resolved.as_ref().and_then(|value| value.context_window));
@@ -621,6 +639,7 @@ fn finish(provider: &ApiProvider, fetched: Vec<Fetched>) -> Vec<ModelProfile> {
                 // Claude Code caches by default; discovery only establishes the
                 // default, and the settings merge keeps a curated `false`.
                 prompt_cache: true,
+                cache_ttl_minutes: None,
             }
         })
         .collect()

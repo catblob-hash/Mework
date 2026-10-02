@@ -34,6 +34,7 @@ const {
   loadToolExplanations,
   resetToolExplanationsForTests,
   subscribeToolExplanations,
+  toolErrorExplanation,
   toolExplanation,
   toolExplanationVersion
 } = await import("./localModel");
@@ -47,6 +48,7 @@ const ready = {
   active: "ane" as const,
   recommended: "ane" as const,
   warming: false,
+  loading: false,
   device: "Apple Neural Engine",
   loaded: true,
   running: 0,
@@ -90,6 +92,43 @@ describe("local model controller", () => {
     expect(activate).toHaveBeenCalledWith("ane");
     expect(seen).toEqual(["missing", "downloading", "ready", "ready"]);
   });
+
+  it("shares one status request between overlapping refreshes", async () => {
+    let answer: (status: typeof ready) => void = () => {};
+    const status = vi.fn(
+      () =>
+        new Promise<typeof ready>((resolve) => {
+          answer = resolve;
+        })
+    );
+    const promptInfo = vi.fn(async () => ({ tokens: 1, cacheBytes: null, maxTokens: 2 }));
+    const controller = createLocalModelController({
+      status,
+      install: vi.fn(),
+      activate: vi.fn(),
+      cancelInstall: vi.fn(async () => {}),
+      remove: vi.fn(),
+      promptInfo,
+      defaultPrompts: vi.fn(),
+      subscribePush: () => () => {}
+    });
+    const first = controller.refresh();
+    const second = controller.refresh();
+    expect(status).toHaveBeenCalledTimes(1);
+    answer(ready);
+    await Promise.all([first, second]);
+    expect(controller.current()).toBe(ready);
+    // Once answered, the next refresh asks again.
+    const third = controller.refresh();
+    expect(status).toHaveBeenCalledTimes(2);
+    answer(ready);
+    await third;
+
+    await controller.promptInfo("title", "Name it.");
+    expect(promptInfo).toHaveBeenLastCalledWith("title", "Name it.", false);
+    await controller.promptInfo("title", "Name it.", true);
+    expect(promptInfo).toHaveBeenLastCalledWith("title", "Name it.", true);
+  });
 });
 
 describe("tool explanations", () => {
@@ -102,7 +141,7 @@ describe("tool explanations", () => {
     const onChange = vi.fn();
     const unsubscribe = subscribeToolExplanations(onChange);
     const before = toolExplanationVersion();
-    mocks.emit({ type: "toolExplained", conversationId: "c1", contextId: "tool_1", callId: "call_9", text: "列出文件" });
+    mocks.emit({ type: "toolExplained", conversationId: "c1", contextId: "tool_1", callId: "call_9", text: "列出文件", error: false });
     expect(toolExplanation("tool_1")).toBe("列出文件");
     expect(toolExplanation("not-yet-saved", "c1", "call_9")).toBe("列出文件");
     expect(toolExplanation("not-yet-saved", "c2", "call_9")).toBeUndefined();
@@ -111,17 +150,28 @@ describe("tool explanations", () => {
     unsubscribe();
   });
 
+  it("keeps why a call failed apart from what it does", () => {
+    const unsubscribe = subscribeToolExplanations(() => {});
+    mocks.emit({ type: "toolExplained", conversationId: "c1", contextId: "tool_1", callId: "call_9", text: "安装依赖", error: false });
+    mocks.emit({ type: "toolExplained", conversationId: "c1", contextId: "tool_1", callId: "call_9", text: "没有安装 pnpm", error: true });
+    expect(toolExplanation("tool_1")).toBe("安装依赖");
+    expect(toolErrorExplanation("tool_1")).toBe("没有安装 pnpm");
+    expect(toolErrorExplanation("tool_2")).toBeUndefined();
+    unsubscribe();
+  });
+
   it("loads a conversation's stored explanations once", async () => {
-    mocks.getToolExplanations.mockResolvedValue({ tool_a: "运行测试" });
+    mocks.getToolExplanations.mockResolvedValue({ explanations: { tool_a: "运行测试" }, errors: { tool_a: "断言失败" } });
     await loadToolExplanations("c1");
     await loadToolExplanations("c1");
     expect(mocks.getToolExplanations).toHaveBeenCalledTimes(1);
     expect(toolExplanation("tool_a")).toBe("运行测试");
+    expect(toolErrorExplanation("tool_a")).toBe("断言失败");
   });
 
   it("retries a load that failed", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    mocks.getToolExplanations.mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce({ tool_b: "构建项目" });
+    mocks.getToolExplanations.mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce({ explanations: { tool_b: "构建项目" }, errors: {} });
     await loadToolExplanations("c2");
     await loadToolExplanations("c2");
     expect(toolExplanation("tool_b")).toBe("构建项目");

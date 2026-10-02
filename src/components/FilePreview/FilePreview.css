@@ -54,7 +54,7 @@
 /* ---- picture ---- */
 
 .file-preview__stage {
-  flex: 1; min-width: 0; min-height: 0; overflow: auto;
+  flex: 1; min-width: 0; min-height: 0; overflow: auto scroll;
   display: grid; padding: 16px 16px 52px;
 }
 /* The picture sits in the middle while it is smaller than the pane, and scrolls from its corner
@@ -81,14 +81,14 @@
 
 /* The page's shadow host: a fixed box the page scrolls inside, containing its own paint so a
    `position: fixed` element in the page pins to the preview rather than to the app window. */
-.file-preview__html-host { flex: 1; min-width: 0; min-height: 0; contain: strict; overflow: auto; }
+.file-preview__html-host { flex: 1; min-width: 0; min-height: 0; contain: strict; overflow: auto scroll; }
 .file-preview__html-inline { min-width: 0; }
 .file-preview__html-host--inline { contain: layout paint; overflow-x: auto; overflow-y: visible; max-width: 100%; }
 
 /* ---- PDF ---- */
 
 .file-preview__pdf-scroll {
-  flex: 1; min-width: 0; min-height: 0; overflow: auto;
+  flex: 1; min-width: 0; min-height: 0; overflow: auto scroll;
   background: var(--color-e4e4df);
 }
 .file-preview__pdf-pages {
@@ -103,9 +103,13 @@
 
 /* pdf.js's text layer: the page's words, transparent and positioned over the drawing so they can
    be selected. Taken from pdf.js's own viewer stylesheet, flattened. */
+/* Every page's text is selectable, and the pages together are one selection region
+   (`data-selection-region` on the page column), so a selection runs from page to page. The
+   engine paints it (`data-native-selection`): the tint has to stay see-through over the page. */
 .file-preview__pdf-page .textLayer {
   color-scheme: only light;
   position: absolute; inset: 0; overflow: clip; z-index: 0;
+  -webkit-user-select: text; user-select: text;
   text-align: initial; opacity: 1; line-height: 1; letter-spacing: normal; word-spacing: normal;
   -webkit-text-size-adjust: none; text-size-adjust: none; forced-color-adjust: none;
   transform-origin: 0 0; caret-color: CanvasText;
@@ -134,6 +138,9 @@
   display: block; position: absolute; inset: 100% 0 0; z-index: 0; cursor: default;
   -webkit-user-select: none; user-select: none;
 }
+/* While a selection is being made the box covers the page, beside the moving end, so a drag
+   over blank space stays where it is instead of jumping (`pdfTextSelection.ts`). */
+.file-preview__pdf-page .textLayer.selecting .endOfContent { top: 0; }
 
 /* ---- audio ---- */
 
@@ -165,7 +172,7 @@
 
 /* ---- font ---- */
 
-.file-preview--font { overflow: auto; padding: 14px 16px 24px; gap: 16px; }
+.file-preview--font { overflow: auto scroll; padding: 14px 16px 24px; gap: 16px; }
 .file-preview__font-header { display: flex; flex-direction: column; gap: 6px; }
 .file-preview__font-name { color: var(--text); font-size: 26px; line-height: 1.25; overflow-wrap: anywhere; }
 .file-preview__font-header .file-preview__meta { padding-left: 0; }
@@ -194,10 +201,10 @@
   display: flex; align-items: center; gap: 10px;
   border-bottom: 1px solid var(--border); color: var(--muted); font-size: 11px;
 }
-.file-preview__csv-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+.file-preview__csv-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; -webkit-user-select: none; user-select: none; }
 .file-preview__csv-toggle input { margin: 0; accent-color: var(--accent); }
-.file-preview__csv-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; }
-.file-preview__csv { border-collapse: separate; border-spacing: 0; font-size: 11.5px; user-select: text; }
+.file-preview__csv-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto scroll; }
+.file-preview__csv { border-collapse: separate; border-spacing: 0; font-size: 11.5px; -webkit-user-select: text; user-select: text; }
 .file-preview__csv th, .file-preview__csv td {
   max-width: 320px; padding: 3px 8px;
   border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
@@ -217,7 +224,7 @@
 
 /* ---- notebook ---- */
 
-.file-preview--notebook { overflow: auto; padding: 8px 12px 28px 4px; gap: 10px; font-size: 12.5px; line-height: 1.6; user-select: text; }
+.file-preview--notebook { overflow: auto scroll; padding: 8px 12px 28px 4px; gap: 10px; font-size: 12.5px; line-height: 1.6; -webkit-user-select: text; user-select: text; }
 .notebook__cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .notebook__row { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
 .notebook__prompt {

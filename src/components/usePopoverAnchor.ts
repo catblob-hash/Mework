@@ -57,12 +57,6 @@ export interface PopoverAnchorOptions {
   /** Invoked once each time the popover opens, for lazy list loading. */
   onOpen?: () => void;
   /**
-   * Opens the panel whenever this value changes. For callers that need to hand
-   * the user straight to a menu — a dialog that closes onto the control it was
-   * asking about. The first value only establishes the baseline.
-   */
-  openSignal?: number;
-  /**
    * Presses outside the panel and its trigger that should leave the panel open. A tab strip
    * whose tabs can be dragged into its open overflow panel needs one: the press that starts the
    * drag lands on a tab, and dismissing the panel there would take the drop target away.
@@ -103,7 +97,6 @@ export function usePopoverAnchor<
   width,
   anchorToPointer = false,
   onOpen,
-  openSignal,
   keepOpenOnPress
 }: PopoverAnchorOptions = {}): PopoverAnchor<Trigger, Panel> {
   const [open, setOpen] = useState(false);
@@ -111,17 +104,10 @@ export function usePopoverAnchor<
   const triggerRef = useRef<Trigger>(null);
   const panelRef = useRef<Panel>(null);
   const pointerRef = useRef<{ x: number; y: number } | null>(null);
-  const openSignalRef = useRef(openSignal);
   const onOpenRef = useRef(onOpen);
   onOpenRef.current = onOpen;
   const keepOpenOnPressRef = useRef(keepOpenOnPress);
   keepOpenOnPressRef.current = keepOpenOnPress;
-
-  useEffect(() => {
-    if (openSignal === undefined || openSignal === openSignalRef.current) return;
-    openSignalRef.current = openSignal;
-    setOpen(true);
-  }, [openSignal]);
 
   const close = useCallback((refocus: boolean) => {
     setOpen(false);

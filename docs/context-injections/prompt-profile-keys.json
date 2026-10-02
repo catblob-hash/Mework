@@ -1,5 +1,5 @@
 {
-  "keyCount": 262,
+  "keyCount": 268,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -114,7 +114,7 @@
       ]
     },
     {
-      "description": "System message delivering a skill selected after the conversation started, when skill bodies go into the prompt rather than behind the `skill` tool.",
+      "description": "`<result>` of the host notice delivering a skill selected after the conversation started, when skill bodies go into the prompt rather than behind the `skill` tool.",
       "id": "system.skill_added_body",
       "placeholders": [
         "name",
@@ -122,7 +122,7 @@
       ]
     },
     {
-      "description": "System message announcing a skill selected after the conversation started, when skills are loaded on demand; the body stays behind the `skill` tool.",
+      "description": "`<result>` of the host notice announcing a skill selected after the conversation started, when skills are loaded on demand; the body stays behind the `skill` tool.",
       "id": "system.skill_added_trigger",
       "placeholders": [
         "name",
@@ -180,23 +180,13 @@
       "placeholders": []
     },
     {
-      "description": "Safety boundary appended to the system prompt whenever `web_search` is enabled. Empty by default: the search backend is one the user configured and is therefore trusted. Fill it in to warn the model that web evidence is untrusted.",
-      "id": "system.web_safety",
-      "placeholders": []
-    },
-    {
-      "description": "Section appended to the system prompt whenever `preview_start` is enabled and the workspace's `.mework/launch.json` leaves `autoVerify` on: which tools drive a dev server, when a change is worth verifying, and the verification workflow that ends in evidence for the user. The `<preview_tools>`, `<when_to_verify>` and `<verification_workflow>` element names are structural — the prose refers to them by name — so a translation keeps them as written.",
-      "id": "system.preview_tools",
-      "placeholders": []
-    },
-    {
-      "description": "Section appended to the system prompt of the main agent while the conversation is in plan mode: what plan mode forbids, how the plan document works, and the workflow ending in `exit_plan_mode`.",
+      "description": "System prompt appended at the point the user turns plan mode on, every time they do: what plan mode forbids, how the plan document works, and the workflow that ends in `exit_plan_mode`. It travels as a mid-conversation system message where the model and endpoint take one, and as the `<result>` of a `box` host notice (`host_notice.plan_mode_summary`) where they do not. Child agents never receive it.",
       "id": "system.plan_mode",
       "placeholders": []
     },
     {
-      "description": "Section appended to the system prompt of a child agent while the conversation is in plan mode. A child may research but never writes the plan or leaves the mode, so it gets the prohibition without the workflow.",
-      "id": "system.plan_mode_subagent",
+      "description": "System prompt appended at the point the user turns plan mode off before approving a plan, carried like `system.plan_mode` (in `box` under `host_notice.plan_mode_exit_summary`). An approved plan needs no such note: the `exit_plan_mode` result says so.",
+      "id": "system.plan_mode_exit",
       "placeholders": []
     },
     {
@@ -355,16 +345,6 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `send_message` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `send_message` overrides this key.",
-      "id": "tool.send_message.description",
-      "placeholders": []
-    },
-    {
-      "description": "Root description of the `followup_task` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `followup_task` overrides this key.",
-      "id": "tool.followup_task.description",
-      "placeholders": []
-    },
-    {
       "description": "Root description of the `task_wait` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `task_wait` overrides this key.",
       "id": "tool.task_wait.description",
       "placeholders": []
@@ -420,11 +400,6 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `todo` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `todo` overrides this key.",
-      "id": "tool.todo.description",
-      "placeholders": []
-    },
-    {
       "description": "Root description of the `workflow` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `workflow` overrides this key.",
       "id": "tool.workflow.description",
       "placeholders": []
@@ -437,6 +412,26 @@
     {
       "description": "Root description of the `exit_plan_mode` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `exit_plan_mode` overrides this key.",
       "id": "tool.exit_plan_mode.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `read_handoff_note` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `read_handoff_note` overrides this key.",
+      "id": "tool.read_handoff_note.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `create_handoff_note` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `create_handoff_note` overrides this key.",
+      "id": "tool.create_handoff_note.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `edit_handoff_note` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `edit_handoff_note` overrides this key.",
+      "id": "tool.edit_handoff_note.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `handoff` schema — what the model reads to decide what the tool is. A profile's `tools[].schemaNotes` for `handoff` overrides this key.",
+      "id": "tool.handoff.description",
       "placeholders": []
     },
     {
@@ -457,21 +452,6 @@
     {
       "description": "Tool result a child receives after a successful `subagent_update` call.",
       "id": "subagent.update_ack",
-      "placeholders": []
-    },
-    {
-      "description": "Schema description of `send_message` in its child form, whose only recipient is the main agent.",
-      "id": "subagent.send_main_tool_description",
-      "placeholders": []
-    },
-    {
-      "description": "Schema description of `send_message.message` in its child form.",
-      "id": "subagent.send_main_message_description",
-      "placeholders": []
-    },
-    {
-      "description": "Tool result a child receives after a successful child-form `send_message` call.",
-      "id": "subagent.send_main_ack",
       "placeholders": []
     },
     {
@@ -663,11 +643,6 @@
       ]
     },
     {
-      "description": "Tool result of a valid `ask_user` call; the turn pauses afterwards.",
-      "id": "task.ask_user_pending",
-      "placeholders": []
-    },
-    {
       "description": "Leading notice of a `task_wait` result that timed out before any named task settled.",
       "id": "task.wait_timeout_all_pending",
       "placeholders": [
@@ -780,11 +755,6 @@
       ]
     },
     {
-      "description": "Suffix of a `task_list` row for a subagent that `followup_task` can continue.",
-      "id": "task.list_continuable",
-      "placeholders": []
-    },
-    {
       "description": "Line under a `task_list` row showing the task's latest progress update.",
       "id": "task.list_latest_update",
       "placeholders": [
@@ -794,11 +764,6 @@
     {
       "description": "Suffix of a `task_list` status for a finished task whose result is in the timeline.",
       "id": "task.list_result_in_timeline",
-      "placeholders": []
-    },
-    {
-      "description": "Suffix of a `task_list` status for a finished task that can only be viewed.",
-      "id": "task.list_view_only",
       "placeholders": []
     },
     {
@@ -958,42 +923,6 @@
       "placeholders": []
     },
     {
-      "description": "`send_message` result when the target is running and will read the message this turn.",
-      "id": "task.send.delivered",
-      "placeholders": [
-        "target"
-      ]
-    },
-    {
-      "description": "`send_message` result when the target is idle and will not wake up.",
-      "id": "task.send.queued_idle",
-      "placeholders": [
-        "target"
-      ]
-    },
-    {
-      "description": "`followup_task` result when the target is running and will continue after its current turn.",
-      "id": "task.followup.queued",
-      "placeholders": [
-        "target"
-      ]
-    },
-    {
-      "description": "`followup_task` result when the message was queued but no worker slot is free.",
-      "id": "task.followup.capacity",
-      "placeholders": [
-        "target",
-        "limit"
-      ]
-    },
-    {
-      "description": "`followup_task` result when an idle target was woken.",
-      "id": "task.followup.woken",
-      "placeholders": [
-        "target"
-      ]
-    },
-    {
       "description": "Tool result of a `box` call the model made itself; the tool is a host carrier and does nothing when called.",
       "id": "task.box_no_op",
       "placeholders": []
@@ -1034,15 +963,128 @@
       ]
     },
     {
-      "description": "`<summary>` of a notification carrying a message a still-running child sent to the main agent.",
-      "id": "task.notification.message",
+      "description": "`<summary>` of the notification delivered when an application exit lost a subagent before its result reached the model.",
+      "id": "task.restart_summary",
       "placeholders": [
         "task"
       ]
     },
     {
+      "description": "Body of the notification delivered when an application exit lost a subagent before its result reached the model. `{last_output}` is `task.restart_last_output` or `task.restart_no_output`.",
+      "id": "task.restart_notice",
+      "placeholders": [
+        "task",
+        "last_output"
+      ]
+    },
+    {
+      "description": "Stands in for `{last_output}` with the last text the lost subagent wrote.",
+      "id": "task.restart_last_output",
+      "placeholders": [
+        "text"
+      ]
+    },
+    {
+      "description": "Stands in for `{last_output}` when the lost subagent had written no text.",
+      "id": "task.restart_no_output",
+      "placeholders": []
+    },
+    {
       "description": "Tool result of `fork` when the request was raised for the user to decide.",
       "id": "fork.request_submitted",
+      "placeholders": []
+    },
+    {
+      "description": "The instruction to write handoff notes and call `handoff`, given at the round boundary where the context crosses the auto-compact threshold: a mid-conversation system message where the model and endpoint take one, otherwise the `<result>` of a `box` host notice with no `<summary>`. Either way it is all the model is told.",
+      "id": "handoff.armed_notice",
+      "placeholders": []
+    },
+    {
+      "description": "The handoff notes a continuation inherited. On a model that reads its tools ahead of its system prompt it is a system card, the system prompt's last section; on any other it is handed over once at the first round boundary, right behind the opening message — as a mid-conversation system message where the model and endpoint take one, otherwise as the `<result>` of a `box` host notice (`handoff.index_summary`). `{notes}` is one `- name — description` line per note.",
+      "id": "handoff.index_context",
+      "placeholders": [
+        "notes"
+      ]
+    },
+    {
+      "description": "`<summary>` of the `box` host notice that hands a continuation its notebook index where the model or endpoint takes no system message mid-conversation; its `<result>` is `handoff.index_context`.",
+      "id": "handoff.index_summary",
+      "placeholders": []
+    },
+    {
+      "description": "The host's first user message in a continuation: what its first run is asked to do.",
+      "id": "handoff.start_message",
+      "placeholders": []
+    },
+    {
+      "description": "Tool result of a successful `create_handoff_note` call.",
+      "id": "handoff.note_created",
+      "placeholders": [
+        "name"
+      ]
+    },
+    {
+      "description": "Tool result of a successful `edit_handoff_note` call.",
+      "id": "handoff.note_updated",
+      "placeholders": [
+        "name"
+      ]
+    },
+    {
+      "description": "Tool result of a successful `handoff` call. `{title}` is the continuation's title.",
+      "id": "handoff.completed",
+      "placeholders": [
+        "title"
+      ]
+    },
+    {
+      "description": "`<summary>` of the host notice sent when a response was cut off at the output limit.",
+      "id": "host_notice.output_truncated_summary",
+      "placeholders": []
+    },
+    {
+      "description": "`<result>` of the same notice: the instruction to continue.",
+      "id": "host_notice.output_truncated",
+      "placeholders": []
+    },
+    {
+      "description": "`<summary>` of the host notice a schema-bound run gets when a round ends without `structured_output`; its `<result>` is `subagent.structured_output_nudge`.",
+      "id": "host_notice.structured_output_summary",
+      "placeholders": []
+    },
+    {
+      "description": "`<summary>` of the host notice carrying a hook's `additionalContext`, which is its `<result>`. `{name}` is the hook's name and `{event}` its lifecycle event.",
+      "id": "host_notice.hook_context_summary",
+      "placeholders": [
+        "name",
+        "event"
+      ]
+    },
+    {
+      "description": "`<summary>` of the host notice delivering a skill selected after the conversation started; its `<result>` is `system.skill_added_body` or `system.skill_added_trigger`.",
+      "id": "host_notice.skill_added_summary",
+      "placeholders": [
+        "name"
+      ]
+    },
+    {
+      "description": "`<summary>` of the host notice carrying the problems language servers published since the last round.",
+      "id": "host_notice.diagnostics_summary",
+      "placeholders": []
+    },
+    {
+      "description": "`<summary>` of the host notice listing files the model read that changed on disk since.",
+      "id": "host_notice.file_changes_summary",
+      "placeholders": []
+    },
+    {
+      "description": "`<summary>` of the `box` host notice that carries `system.plan_mode` where the model or endpoint takes no system message mid-conversation.",
+      "id": "host_notice.plan_mode_summary",
+      "placeholders": []
+    },
+    {
+      "description": "`<summary>` of the `box` host notice that carries `system.plan_mode_exit` the same way.",
+      "id": "host_notice.plan_mode_exit_summary",
       "placeholders": []
     },
     {
@@ -1206,11 +1248,6 @@
     {
       "description": "Tool result of a call that was not executed because a hook interrupted the turn.",
       "id": "hook.interrupted_call_skipped",
-      "placeholders": []
-    },
-    {
-      "description": "Tool result of a call that was not executed because the turn paused for a user answer.",
-      "id": "hook.pending_question_call_skipped",
       "placeholders": []
     },
     {

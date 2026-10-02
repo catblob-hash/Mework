@@ -7,9 +7,8 @@ import {
   Search,
   Terminal
 } from "lucide-react";
-import { Fragment } from "react";
 import { useI18n } from "../i18n";
-import { DialogSidebarTitle } from "./Common";
+import { SettingsNavigation } from "./SettingsLayout";
 import type { SettingsView } from "../types";
 
 /**
@@ -79,28 +78,15 @@ export function GlobalSettingsNavigation({
     system: t("系统", "System")
   };
   return (
-    <nav className="settings-nav" aria-label={t("全局设置分类", "Global settings categories")}>
-      <DialogSidebarTitle />
-      {globalSettingsNavigationGroups.map((group) => (
-        <Fragment key={group.id}>
-          {groupTitles[group.id] && (
-            <div className="settings-nav__group-title">{groupTitles[group.id]}</div>
-          )}
-          {group.items.map((item) => {
-            const Icon = item.icon;
-            return (
-              <button
-                type="button"
-                key={item.id}
-                className={view === item.id ? "settings-nav__item settings-nav__item--active" : "settings-nav__item"}
-                onClick={() => onSelect(item.id)}
-              >
-                <Icon size={16} /><span>{labels[item.id]}</span>
-              </button>
-            );
-          })}
-        </Fragment>
-      ))}
-    </nav>
+    <SettingsNavigation
+      label={t("全局设置分类", "Global settings categories")}
+      groups={globalSettingsNavigationGroups.map((group) => ({
+        id: group.id,
+        title: groupTitles[group.id],
+        items: group.items.map((item) => ({ ...item, label: labels[item.id] ?? item.id }))
+      }))}
+      view={view}
+      onSelect={onSelect}
+    />
   );
 }

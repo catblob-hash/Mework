@@ -2,7 +2,7 @@ The `bash` tool runs one command line through a native Bash — Git for Windows 
 
 ## Approval
 
-Every call raises a card at Manual approval, Accept edits and Plan mode; only Full access — or a `PreToolUse` hook answering `allow` — clears it. Static analysis only sets the card's risk level and rule: a redirection, a command substitution or an explicit executable path is unbounded, and a command over 10,000 characters is not analysed at all. A recursive delete that could reach the filesystem root, your home directory or a system path, or whose target cannot be resolved statically, is a confirmation no security level and no hook turns off. `bash` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox: approval lets the command run, it does not confine it.
+Every call raises a card at Manual approval and Accept edits; only Full access — or a `PreToolUse` hook answering `allow` — clears it. Static analysis only sets the card's risk level and rule: a redirection, a command substitution or an explicit executable path is unbounded, and a command over 10,000 characters is not analysed at all. A recursive delete that could reach the filesystem root, your home directory or a system path, or whose target cannot be resolved statically, is a confirmation no security level and no hook turns off. `bash` never carries a standing allowance, so **Always allow** is not offered. There is no OS-level sandbox: approval lets the command run, it does not confine it.
 
 ## Behavior and limits
 

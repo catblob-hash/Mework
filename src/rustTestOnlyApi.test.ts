@@ -58,7 +58,9 @@ describe("Rust methods that only tests use", () => {
   it.each(testOnlyMethods)(
     "$file has no production caller of $method",
     ({ source, method, file }) => {
-      const testModuleAt = source.indexOf("\n#[cfg(test)]\nmod tests {");
+      // The module may carry a visibility: agents.rs exports `pub(crate) mod tests` so
+      // workflow.rs tests can borrow its fixtures. That is still the boundary.
+      const testModuleAt = source.search(/\n#\[cfg\(test\)\]\n(?:pub(?:\([^)]*\))? )?mod tests \{/u);
       expect(testModuleAt, `${file} 没有顶层测试模块，本钉子的分界线不成立`).toBeGreaterThan(-1);
 
       // Only a call — `.divergences()` — counts. A field read or a struct literal of the

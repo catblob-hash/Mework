@@ -19,7 +19,7 @@ vi.mock("../lib/workspacePicker", () => ({
   authorizeRemoteWorkspace: mocks.authorizeRemoteWorkspace
 }));
 
-import { ProjectDialog, projectWorkspaceKey, splitPathForDisplay } from "./ProjectDialog";
+import { ProjectDialog, projectWorkspaceKey } from "./ProjectDialog";
 import type { ProjectDialogProps } from "./ProjectDialog";
 
 const devbox: SshMachineConfig = {
@@ -78,18 +78,7 @@ beforeEach(() => {
 
 afterEach(() => configureI18n("zh-CN"));
 
-describe("splitPathForDisplay", () => {
-  it("keeps the last segment whole and every separator as written", () => {
-    expect(splitPathForDisplay("C:\\Users\\me\\app")).toEqual({ head: "C:\\Users\\me", tail: "\\app" });
-    expect(splitPathForDisplay("/srv/www/app")).toEqual({ head: "/srv/www", tail: "/app" });
-    expect(splitPathForDisplay("~/code")).toEqual({ head: "~", tail: "/code" });
-    expect(splitPathForDisplay("/srv/app/")).toEqual({ head: "/srv", tail: "/app/" });
-    expect(splitPathForDisplay("/srv")).toEqual({ head: "", tail: "/srv" });
-    expect(splitPathForDisplay("/")).toEqual({ head: "", tail: "/" });
-    expect(splitPathForDisplay("C:\\")).toEqual({ head: "", tail: "C:\\" });
-    expect(splitPathForDisplay("\\\\server\\share\\dir")).toEqual({ head: "\\\\server\\share", tail: "\\dir" });
-  });
-
+describe("projectWorkspaceKey", () => {
   it("folds case only for Windows-looking paths when comparing rows", () => {
     expect(projectWorkspaceKey(null, "C:\\Work\\App")).toBe(projectWorkspaceKey(null, "c:\\work\\app"));
     expect(projectWorkspaceKey(null, "/work/App")).not.toBe(projectWorkspaceKey(null, "/work/app"));
@@ -294,7 +283,7 @@ describe("ProjectDialog", () => {
     expect(dialog).toHaveTextContent("1 个项目、0 个对话在这台机器上有工作区");
     // Variables are not a machine's: the dialog points to where they are set instead.
     expect(within(dialog).queryByRole("textbox")).toBeNull();
-    expect(dialog).toHaveTextContent("环境变量属于工作区");
+    expect(dialog).toHaveTextContent("环境变量和沙箱属于工作区");
     await user.click(within(dialog.querySelector(".dialog__footer") as HTMLElement).getByRole("button", { name: "关闭" }));
     expect(screen.queryByRole("dialog", { name: "本机" })).toBeNull();
 
@@ -306,18 +295,19 @@ describe("ProjectDialog", () => {
     expect(machineChip(1)).toHaveTextContent("本机");
   });
 
-  it("shows the full path with a middle ellipsis: a shrinking head and a whole last segment", () => {
+  it("draws the path through the shared middle-ellipsis path text", () => {
     const path = "C:\\Users\\me\\very\\deep\\projects\\app";
     renderDialog({ initialWorkspaces: [{ path }] });
 
     const button = screen.getByRole("button", { name: `工作区 1：${path}` });
     expect(button).toHaveClass("composer-chip", "project-dialog__path");
     expect(button).toHaveAttribute("title", path);
-    const head = button.querySelector(".project-dialog__path-head");
-    const tail = button.querySelector(".project-dialog__path-tail");
-    expect(head?.textContent).toBe("C:\\Users\\me\\very\\deep\\projects");
-    expect(tail?.textContent).toBe("\\app");
-    expect(button.querySelector(".project-dialog__path-text")?.textContent).toBe(path);
+    const text = button.querySelector(".project-dialog__path-text");
+    expect(text).toHaveClass("path-text");
+    // No layout here, so nothing is measured and the whole path is drawn.
+    expect(text?.querySelector(".path-text__shown")?.textContent).toBe(path);
+    // The chip already carries the hover text; the path does not repeat it.
+    expect(text).not.toHaveAttribute("title");
   });
 
   it("picks a local directory through the host picker and submits the rows", async () => {

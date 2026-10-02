@@ -54,6 +54,11 @@ export interface BrowserPanelBounds {
   height: number;
   visible: boolean;
   occludedTop?: number;
+  /**
+   * The radius the pane rounds the page's bottom corners to. Nothing in the renderer can clip a
+   * native page, so the host rounds it itself (macOS only for now).
+   */
+  bottomCornerRadius?: number;
 }
 
 export type BrowserControlOwner = "available" | "user" | "agent";

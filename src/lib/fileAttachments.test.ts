@@ -5,14 +5,20 @@ import {
   dragItemFromMediaType,
   dragItemFromProbe,
   intakeAttachments,
-  isLongPaste,
   mergeFileAttachments,
-  pastedTextFile,
   rejectionsForDragItems,
   sniffAttachmentBytes,
-  summarizeDrag
+  summarizeDrag,
+  textForModel
 } from "./fileAttachments";
-import { MAX_FILE_ATTACHMENT_TEXT_BYTES, MAX_MESSAGE_FILE_TOKENS, MAX_MESSAGE_FILES } from "./fileBudget";
+import {
+  MAX_FILE_ATTACHMENT_PDF_BYTES,
+  MAX_MESSAGE_ATTACHMENT_BYTES,
+  MAX_TEXT_FILE_TOKENS,
+  MAX_TEXT_FILE_UPLOAD_BYTES
+} from "./fileBudget";
+import { estimateTokens } from "./contextTokens";
+import { MAX_IMAGE_ATTACHMENT_BYTES } from "./imageBudget";
 
 const mocks = vi.hoisted(() => ({
   prepareFileAttachment: vi.fn(),
@@ -72,9 +78,19 @@ describe("drag verdicts", () => {
       path: "/big.log",
       name: "big.log",
       kind: "file",
-      size: MAX_FILE_ATTACHMENT_TEXT_BYTES + 1,
+      size: MAX_TEXT_FILE_UPLOAD_BYTES + 1,
       sniff: "text"
     }).verdict).toBe("tooLarge");
+    // Claude Code's limits: text up to 256 KB, a whole PDF up to 20 MB.
+    expect(MAX_TEXT_FILE_UPLOAD_BYTES).toBe(262_144);
+    expect(dragItemFromProbe({ path: "/t", name: "t", kind: "file", size: MAX_TEXT_FILE_UPLOAD_BYTES, sniff: "text" }).verdict)
+      .toBe("text");
+    expect(dragItemFromProbe({ path: "/p", name: "p", kind: "file", size: MAX_FILE_ATTACHMENT_PDF_BYTES, sniff: "pdf" }).verdict)
+      .toBe("pdf");
+    expect(dragItemFromProbe({ path: "/q", name: "q", kind: "file", size: MAX_FILE_ATTACHMENT_PDF_BYTES + 1, sniff: "pdf" }).verdict)
+      .toBe("tooLarge");
+    expect(dragItemFromProbe({ path: "/i", name: "i", kind: "file", size: MAX_IMAGE_ATTACHMENT_BYTES, sniff: "image" }).verdict)
+      .toBe("image");
     expect(dragItemFromProbe({ path: "/c.zip", name: "c.zip", kind: "file", size: 10, sniff: "binary" }).verdict).toBe("unsupported");
     expect(dragItemFromProbe({ path: "/d", name: "d", kind: "file", size: 0, sniff: "empty" }).verdict).toBe("empty");
   });
@@ -112,22 +128,24 @@ describe("drag verdicts", () => {
   });
 });
 
-describe("long pastes", () => {
-  it("becomes a file past the character or line threshold", () => {
-    expect(isLongPaste("a".repeat(4_999))).toBe(false);
-    expect(isLongPaste("a".repeat(5_000))).toBe(true);
-    expect(isLongPaste(Array.from({ length: 99 }, () => "x").join("\n"))).toBe(false);
-    expect(isLongPaste(Array.from({ length: 100 }, () => "x").join("\n"))).toBe(true);
+describe("textForModel", () => {
+  it("sends a text within the token cap whole", () => {
+    const text = Array.from({ length: 5_000 }, () => "z").join("\n");
+    expect(textForModel(text)).toEqual({ text, truncated: false });
   });
 
-  it("is named so it cannot collide with a file the message already carries", async () => {
-    const first = pastedTextFile("one", []);
-    expect(first.name).toBe("pasted-text.md");
-    expect(first.type).toBe("text/markdown");
-    expect(await first.text()).toBe("one");
-    expect(pastedTextFile("two", [stored("pasted-text.md")]).name).toBe("pasted-text-2.md");
-    expect(pastedTextFile("three", [stored("pasted-text.md"), stored("pasted-text-2.md")]).name)
-      .toBe("pasted-text-3.md");
+  it("cuts a longer one to its first 2000 lines, as Claude Code's Read does", () => {
+    // 3000 lines of 40 characters: 30 750 tokens, 20 500 in the first 2000.
+    const lines = Array.from({ length: 3_000 }, (_, index) => `${String(index + 1).padStart(5, "0")}${"x".repeat(35)}`);
+    const text = lines.join("\n");
+    expect(estimateTokens(text)).toBeGreaterThan(MAX_TEXT_FILE_TOKENS);
+    const read = textForModel(text);
+    expect(read).toEqual({ text: lines.slice(0, 2_000).join("\n"), truncated: true });
+  });
+
+  it("gives up on one still over the cap in those lines", () => {
+    expect(textForModel(Array.from({ length: 1_500 }, () => "y".repeat(80)).join("\n"))).toBeNull();
+    expect(textForModel("w".repeat(120_000))).toBeNull();
   });
 });
 
@@ -154,7 +172,7 @@ describe("intakeAttachments", () => {
     const result = await intakeAttachments([
       new File([bytes(0xff, 0xfe, 0x68, 0x00, 0x69, 0x00)], "wide.txt"),
       new File([utf8("%PDF-1.7 body")], "paper.pdf", { type: "application/pdf" })
-    ], { existingFiles: () => [] });
+    ], { existingFiles: () => [], existingImages: () => [] });
 
     expect(result.rejected).toEqual([]);
     expect(result.files.map((file) => file.name)).toEqual(["wide.txt", "paper.pdf"]);
@@ -174,9 +192,9 @@ describe("intakeAttachments", () => {
       new File([], "empty.txt"),
       new File([utf8("%PDF-1.4")], "scan.pdf"),
       new File([utf8("%PDF-1.4")], "locked.pdf"),
-      new File([utf8("a".repeat(MAX_FILE_ATTACHMENT_TEXT_BYTES + 1))], "huge.log"),
+      new File([utf8("a\n".repeat(MAX_TEXT_FILE_UPLOAD_BYTES / 2 + 1))], "huge.log"),
       new File([bytes(1)], "photo.png", { type: "image/png" })
-    ], { existingFiles: () => [], preRejected: [{ name: "folder", reason: "directory" }] });
+    ], { existingFiles: () => [], existingImages: () => [], preRejected: [{ name: "folder", reason: "directory" }] });
 
     expect(result.files).toEqual([]);
     expect(result.rejected).toEqual([
@@ -191,13 +209,39 @@ describe("intakeAttachments", () => {
     expect(mocks.prepareFileAttachment).not.toHaveBeenCalled();
   });
 
+  it("sends a long text file as its first lines, and refuses one that is still too long", async () => {
+    const lines = Array.from({ length: 3_000 }, () => "x".repeat(40));
+    const result = await intakeAttachments([
+      new File([utf8(lines.join("\n"))], "big.log"),
+      new File([utf8(Array.from({ length: 1_500 }, () => "y".repeat(80)).join("\n"))], "wide.csv")
+    ], { existingFiles: () => [], existingImages: () => [] });
+
+    expect(result.files.map((file) => file.name)).toEqual(["big.log"]);
+    expect(result.rejected).toEqual([{ name: "wide.csv", reason: "tooLong" }]);
+  });
+
+  it("turns away a picture or PDF too large to hand over, by name", async () => {
+    const addImages = vi.fn().mockResolvedValue([]);
+    const photo = new File([bytes(1)], "photo.jpg", { type: "image/jpeg" });
+    Object.defineProperty(photo, "size", { value: MAX_IMAGE_ATTACHMENT_BYTES + 1 });
+    const pdf = new File([utf8("%PDF-1.7 "), new Uint8Array(MAX_FILE_ATTACHMENT_PDF_BYTES)], "big.pdf");
+    const result = await intakeAttachments([photo, pdf], { addImages, existingFiles: () => [], existingImages: () => [] });
+
+    expect(addImages).not.toHaveBeenCalled();
+    expect(result.rejected).toEqual([
+      { name: "photo.jpg", reason: "tooLarge" },
+      { name: "big.pdf", reason: "tooLarge" }
+    ]);
+    expect(mocks.extractPdfText).not.toHaveBeenCalled();
+  });
+
   it("hands pictures to the image path and reports the ones it did not take", async () => {
     const accepted: ImageAttachment = { id: "i".repeat(64), name: "a.png", mime: "image/png", width: 1, height: 1, bytes: 1, shortId: 1 };
     const addImages = vi.fn().mockResolvedValue([accepted]);
     const result = await intakeAttachments([
       new File([bytes(1)], "a.png", { type: "image/png" }),
       new File([bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)], "unlabelled")
-    ], { addImages, existingFiles: () => [] });
+    ], { addImages, existingFiles: () => [], existingImages: () => [] });
 
     expect(addImages).toHaveBeenCalledWith([
       expect.objectContaining({ name: "a.png" }),
@@ -207,29 +251,53 @@ describe("intakeAttachments", () => {
     expect(result.rejected).toEqual([{ reason: "imageRejected" }]);
   });
 
-  it("stops at the per-message file limit and drops a file it already has", async () => {
-    const existing = Array.from({ length: MAX_MESSAGE_FILES - 1 }, (_, index) => stored(`f${index}.txt`));
-    const result = await intakeAttachments([
-      new File([utf8("again")], "f0.txt"),
-      new File([utf8("last")], "last.txt")
-    ], { existingFiles: () => existing });
+  it("takes any number of files and drops a file it already has", async () => {
+    const existing = Array.from({ length: 20 }, (_, index) => stored(`f${index}.txt`));
+    const added = Array.from({ length: 25 }, (_, index) => new File([utf8(`n${index}`)], `n${index}.txt`));
+    const result = await intakeAttachments([new File([utf8("again")], "f0.txt"), ...added], {
+      existingFiles: () => existing, existingImages: () => []
+    });
 
-    // `f0.txt` fits by count but is the same file the message already carries.
-    expect(result.files).toEqual([]);
-    expect(result.rejected).toEqual([{ name: "last.txt", reason: "tooMany" }]);
-    expect(mergeFileAttachments(existing, [stored("new.txt")])).toHaveLength(MAX_MESSAGE_FILES);
-    expect(mergeFileAttachments([...existing, stored("new.txt")], [stored("more.txt")])).toHaveLength(MAX_MESSAGE_FILES);
+    // `f0.txt` is the same file the message already carries; how many is not budgeted.
+    expect(result.files.map((file) => file.name)).toEqual(added.map((file) => file.name));
+    expect(result.rejected).toEqual([]);
+    expect(mergeFileAttachments(existing, result.files)).toHaveLength(45);
   });
 
-  it("keeps one message's file text within its budget, before uploading what would not fit", async () => {
-    const heavy = { ...stored("heavy.txt"), tokens: MAX_MESSAGE_FILE_TOKENS - 10 };
+  it("keeps one message's attachments within 32 MiB, images and files together, in the order they come", async () => {
+    const MIB = 1024 * 1024;
+    expect(MAX_MESSAGE_ATTACHMENT_BYTES).toBe(32 * MIB);
+    const sized = (file: File, size: number) => {
+      Object.defineProperty(file, "size", { value: size });
+      return file;
+    };
+    const photoImage: ImageAttachment = { id: "p".repeat(64), name: "photo.png", mime: "image/png", width: 1, height: 1, bytes: 1, shortId: 1 };
+    const addImages = vi.fn().mockResolvedValue([photoImage]);
+    const photo = sized(new File([bytes(1)], "photo.png", { type: "image/png" }), 15 * MIB);
+    const report = sized(new File([utf8("%PDF-1.7 ")], "report.pdf"), 10 * MIB);
+    const notes = new File([utf8("notes")], "notes.txt");
+    // 2 MiB of images and 10 MiB of files already on the message leave 20 MiB.
+    const result = await intakeAttachments([photo, report, notes], {
+      addImages,
+      existingFiles: () => [{ ...stored("old.pdf"), format: "pdf", bytes: 10 * MIB, pages: 1 }],
+      existingImages: () => [{ ...photoImage, id: "o".repeat(64), bytes: 2 * MIB }]
+    });
+
+    // The photo fits (5 MiB left), the report does not, and the small note still does.
+    expect(addImages).toHaveBeenCalledWith([photo]);
+    expect(result.files.map((file) => file.name)).toEqual(["notes.txt"]);
+    expect(result.rejected).toEqual([{ name: "report.pdf", reason: "messageTooLarge" }]);
+    expect(mocks.extractPdfText).not.toHaveBeenCalled();
+  });
+
+  it("takes a message's files however much text they come to", async () => {
+    const heavy = { ...stored("heavy.txt"), tokens: 400_000 };
     const result = await intakeAttachments([
       new File([utf8("tiny")], "tiny.txt"),
       new File([utf8("x".repeat(400))], "more.txt")
-    ], { existingFiles: () => [heavy] });
+    ], { existingFiles: () => [heavy], existingImages: () => [] });
 
-    expect(result.files.map((file) => file.name)).toEqual(["tiny.txt"]);
-    expect(result.rejected).toEqual([{ name: "more.txt", reason: "overBudget" }]);
-    expect(mocks.prepareFileAttachment).toHaveBeenCalledTimes(1);
+    expect(result.files.map((file) => file.name)).toEqual(["tiny.txt", "more.txt"]);
+    expect(result.rejected).toEqual([]);
   });
 });

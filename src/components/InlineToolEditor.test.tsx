@@ -73,6 +73,55 @@ describe("InlineToolEditor", () => {
     expect(onRerun).not.toHaveBeenCalled();
   });
 
+  it("saves an untouched call exactly as recorded, adding no defaults and dropping no explicit values", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const read: ToolContext = {
+      id: "read-call",
+      kind: "tool",
+      toolName: "read",
+      input: { path: "shot.png" },
+      result: { success: true, output: "image", executedAt: "2026-07-24T00:00:00Z", durationMs: 1 },
+      createdAt: "2026-07-24T00:00:00Z"
+    };
+    const { unmount } = render(
+      <InlineToolEditor item={read} descriptor={descriptorFor("read")} onCancel={vi.fn()} onSave={onSave} />
+    );
+    // The declared default is a hint in the empty control, not a value.
+    expect(screen.getByLabelText("起始行")).toHaveValue("");
+    expect(screen.getByLabelText("起始行")).toHaveAttribute("placeholder", "1");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(onSave).toHaveBeenLastCalledWith({ path: "shot.png" }, "image", []);
+    unmount();
+
+    const shell = descriptorFor("zsh") ?? descriptorFor("bash")!;
+    const explicit: ToolContext = {
+      ...read,
+      id: "shell-call",
+      toolName: shell.name,
+      input: { command: "ls", run_in_background: false }
+    };
+    render(<InlineToolEditor item={explicit} descriptor={shell} onCancel={vi.fn()} onSave={onSave} />);
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(onSave).toHaveBeenLastCalledWith({ command: "ls", run_in_background: false }, "image", []);
+  });
+
+  it("edits the call as the model made it and keeps untouched values exactly", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const rewritten: ToolContext = {
+      ...writeCall(),
+      // A hook ran it with another path; the model wrote `notes.txt`, a number
+      // where text belongs, and an explicit null.
+      requestedInput: { path: "notes.txt", content: 5, mode: null },
+      input: { path: "safe/notes.txt", content: "5" }
+    };
+    render(<InlineToolEditor item={rewritten} descriptor={descriptorFor("write")} onCancel={vi.fn()} onSave={onSave} />);
+    expect(screen.getByLabelText("文件路径 *")).toHaveValue("notes.txt");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(onSave).toHaveBeenLastCalledWith({ path: "notes.txt", content: 5, mode: null }, "written", []);
+  });
+
   it("offers no rerun for a call the host only runs inside a model turn", () => {
     render(
       <InlineToolEditor

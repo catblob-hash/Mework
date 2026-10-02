@@ -386,10 +386,6 @@ impl Function {
         self.op("write_state", vec![("data", vec![value]), ("input", vec![state])], Vec::new());
         self.read_state(state)
     }
-
-    pub fn op_count(&self) -> usize {
-        self.ops.iter().filter(|op| op.kind != "const").count()
-    }
 }
 
 // ---------------------------------------------------------------- serialization

@@ -91,15 +91,15 @@ describe("App plan mode", () => {
     // The tasks pane is a roster of running work and stays out of the way.
     expect(screen.queryByRole("region", { name: "任务" })).not.toBeInTheDocument();
 
-    const card = within(page).getByRole("dialog", { name: "计划已就绪，是否开始实施？" });
+    const card = within(page).getByRole("dialog", { name: "计划已就绪，批准或提意见" });
     expect(Array.from(card.querySelectorAll("footer button")).map((button) => button.textContent))
-      .toEqual(["否，继续规划", "是，手动批准编辑", "是，自动接受编辑"]);
+      .toEqual(["发送意见", "批准"]);
     // One card, one place: the composer must not draw a second copy of it.
-    expect(screen.getAllByRole("dialog", { name: "计划已就绪，是否开始实施？" })).toHaveLength(1);
+    expect(screen.getAllByRole("dialog", { name: "计划已就绪，批准或提意见" })).toHaveLength(1);
 
-    await user.click(within(card).getByRole("button", { name: "是，自动接受编辑" }));
+    await user.click(within(card).getByRole("button", { name: "批准" }));
     expect(runtimeMocks.resolveToolPrompt)
-      .toHaveBeenCalledWith("prompt-plan-exit", "allow_always", undefined);
+      .toHaveBeenCalledWith("prompt-plan-exit", "allow_once", undefined);
 
     await act(async () => resolveRun({
       contexts: [{ id: "ctx_started", kind: "assistant", content: "开始实施", createdAt: "2026-09-06T00:10:00Z" }],
@@ -140,11 +140,9 @@ describe("App plan mode", () => {
     });
 
     const page = await screen.findByRole("region", { name: "替换审批闸" });
-    await user.click(within(page).getByRole("button", { name: "否，继续规划" }));
-    expect(runtimeMocks.resolveToolPrompt).not.toHaveBeenCalled();
-
     await user.type(within(page).getByRole("textbox", { name: "修改意见" }), "先补迁移脚本");
-    await user.click(within(page).getByRole("button", { name: "提交反馈" }));
+    expect(runtimeMocks.resolveToolPrompt).not.toHaveBeenCalled();
+    await user.click(within(page).getByRole("button", { name: "发送意见" }));
     expect(runtimeMocks.resolveToolPrompt)
       .toHaveBeenCalledWith("prompt-plan-exit-2", "deny", "先补迁移脚本");
   });
@@ -189,29 +187,71 @@ describe("App plan mode", () => {
     expect(within(tasks).queryByRole("button", { name: "打开“实施计划”" })).not.toBeInTheDocument();
   });
 
-  it("mirrors a host-side security level change into the composer without saving it back", async () => {
+  it("lets the user move the security level while a turn is streaming", async () => {
     const document = documentWithModel();
     runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.runModel.mockImplementation(() => new Promise(() => {}));
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByLabelText("向 Agent 发送消息"), "开始");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
+
+    const trigger = screen.getByRole("button", { name: "安全层级：手动" });
+    expect(trigger).toBeEnabled();
+    await user.click(trigger);
+    await user.click(within(screen.getByRole("menu", { name: "安全层级" }))
+      .getByRole("menuitemradio", { name: "完全访问" }));
+
+    // Written through like any other setting; the host moves the running
+    // turn's level when the write lands (`conversations::update`).
+    expect(await screen.findByRole("button", { name: "安全层级：完全访问" })).toBeInTheDocument();
+    expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches plan mode from beside the security level, a streaming turn included", async () => {
+    const document = documentWithModel();
+    runtimeMocks.loadDocument.mockResolvedValue(document);
+    runtimeMocks.runModel.mockImplementation(() => new Promise(() => {}));
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByLabelText("向 Agent 发送消息"), "开始");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1));
+
+    const toggle = screen.getByRole("button", { name: "计划" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(toggle).toBeEnabled();
+    await user.click(toggle);
+    // Written through like the level; the host moves the running turn when
+    // the write lands (`conversations::update`), and nothing restarts.
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(runtimeMocks.runModel).toHaveBeenCalledTimes(1);
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("turns the switch back off when the host says an approved plan ended plan mode", async () => {
+    const document = documentWithModel();
     const conversation = document.workspaces[0].conversations[0];
+    conversation.settings = { ...conversation.settings, planModeEnabled: true };
+    runtimeMocks.loadDocument.mockResolvedValue(document);
 
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
-    expect(screen.getByRole("button", { name: "安全层级：手动" })).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "计划" });
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
 
-    await act(async () => {
-      emitAppPushEvent({
-        type: "conversationSecurityLevelChanged",
-        conversationId: conversation.id,
-        securityLevel: "plan"
-      });
-    });
-
-    expect(await screen.findByRole("button", { name: "安全层级：计划模式" })).toBeInTheDocument();
-    // The host already committed the level; writing it back would race its own save.
-    expect(runtimeMocks.updateConversationRemote).not.toHaveBeenCalled();
+    act(() => emitAppPushEvent({ type: "conversationPlanModeChanged", conversationId: conversation.id, enabled: false }));
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    // And it can go on again for the next plan.
+    await userEvent.setup().click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("offers plan mode as its own security level, between accepting edits and full access", async () => {
+  it("offers the three security levels, with plan mode no longer among them", async () => {
     const document = documentWithModel();
     runtimeMocks.loadDocument.mockResolvedValue(document);
 
@@ -222,6 +262,6 @@ describe("App plan mode", () => {
     await user.click(screen.getByRole("button", { name: "安全层级：手动" }));
     const menu = screen.getByRole("menu", { name: "安全层级" });
     expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent?.trim()))
-      .toEqual(["手动", "允许编辑", "计划模式", "完全访问"]);
+      .toEqual(["手动", "允许编辑", "完全访问"]);
   });
 });

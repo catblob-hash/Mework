@@ -87,6 +87,10 @@
    on those rows it is the control that put the row in this state. */
 .catalog-row--on .catalog-row__name { color: var(--success); }
 .catalog-row--on > .icon-button { color: var(--success); }
+/* The conversation's lock, as the tool picker draws it (panels.css). */
+.catalog-row--cache .catalog-row__name { color: var(--warning); }
+.catalog-row--hard .catalog-row__name { color: var(--faint); }
+.catalog-row__lock { flex: 0 0 auto; margin: 0 5px; }
 
 /* The drop line. `.sortable-surface` and `.drop-target--*` come from the sidebar
    sheet, which sets the line's colour and inset but leaves each list to say which

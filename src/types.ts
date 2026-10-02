@@ -53,6 +53,12 @@ export interface SystemContext extends TextContextBase {
   localOnly?: boolean;
   /** Present on lifecycle diagnostics and model-visible context produced by a hook. */
   hookExecution?: HookExecutionMetadata;
+  /**
+   * Tools that joined the conversation at this point (Rust `tool_append.rs`).
+   * Always local-only: the wire hands the tools over here through the
+   * protocol's own append interface, and the timeline draws no row for it.
+   */
+  toolsAdded?: string[];
 }
 
 export interface UserContext extends TextContextBase {
@@ -210,12 +216,13 @@ export interface ForkModelBinding {
 }
 
 /**
- * A cumulative child run snapshot persisted with the latest
- * agent tool context (`agent_spawn`, `send_message`, or `followup_task`);
- * legacy `subagent` contexts carry one too.
+ * A cumulative child run snapshot persisted with the agent tool context that
+ * started the child (`agent_spawn`). Older saved conversations may carry it on
+ * a retired `send_message` or `followup_task` context instead, and legacy
+ * `subagent` contexts carry one too.
  */
 export interface SubagentRunRecord {
-  /** Addressable agent name for agent messaging/waiting; absent on legacy records. */
+  /** Addressable agent name `task_wait` takes; absent on legacy records. */
   name?: string;
   /**
    * Model-visible task address of a managed run (`workflow:<runId>`) or a
@@ -241,7 +248,6 @@ export interface SubagentRunRecord {
   status: SubagentRunStatus;
   contexts: ContextItem[];
   updates: SubagentUpdate[];
-  queuedMessages?: Array<{ content: string; triggerTurn: boolean }>;
   /**
    * Result of this agent's latest turn when the spawn set an `output_schema`,
    * already validated against it by the host. Absent on every other record.
@@ -313,6 +319,13 @@ export interface ToolContext {
   /** Persisted child transcript and terminal state for a `subagent` call. */
   subagent?: SubagentRunRecord;
   /**
+   * Which host message a `box` delivery card carries (Rust
+   * `wire_history::notice_kind`); absent on a delivered background result. Host
+   * bookkeeping that never reaches the model: the card's input is the empty
+   * argument and its result the whole message, as the model reads them.
+   */
+  notice?: string;
+  /**
    * Host proof that this card's result came from the backend's own execution,
    * issued when the card was built. The renderer treats it as opaque and must
    * carry it through untouched: a card that arrives back without it cannot be
@@ -360,6 +373,14 @@ export interface ConversationSettings {
   reasoningEffort: ReasoningEffort;
   securityLevel: SecurityLevel;
   /**
+   * Whether this conversation is in plan mode: the switch under the composer.
+   * Independent of the security level — the model writes a plan and asks for
+   * approval, and the level decides what its calls need either way. Not part
+   * of a preset; a new conversation starts with it off, and the host turns it
+   * off when the user approves a plan.
+   */
+  planModeEnabled?: boolean;
+  /**
    * Whether this conversation loads the global memory tier (`~/.mework`). When
    * enabled, that tier's `MEWORK.md` instructions and `MEMORY.md` index are
    * concatenated into the context and its three tools
@@ -389,35 +410,39 @@ export interface ConversationSettings {
    * schema when the model asks for one. Both paths dial the same `mcpIds`.
    */
   mcpToolDiscoveryEnabled: boolean;
-  /**
-   * Whether this conversation's commands run in the operating system's
-   * sandbox, and what it lets through. Absent is off, with the default
-   * network allowlist waiting for when it is switched on.
-   */
-  sandbox?: SandboxSettings;
+  /* The sandbox used to be a setting here. It belongs to each workspace now
+   * (`ExecutionEnvironmentAssets.sandboxes`); the host hands an old
+   * conversation's to its workspaces when it loads and never sends it here. */
   /* The five file write guards used to be switches here. They are now
    * unconditional in the host — every conversation, and every child of one,
    * runs with read-before-write, the stale-write refusal, external-change
    * notices, hook re-sync and the formatter hint — so there is nothing left for
    * a conversation to carry about them. See `FileGuard` on the Rust side. */
   /**
-   * What this conversation's runs have already put in front of the model.
-   * Absent until the first run. Per-conversation runtime state, not a preset
-   * component: it records history and must never be copied into one.
+   * What this conversation's last request put in front of the model, and which
+   * model sent it when. Absent until the first run. Per-conversation runtime
+   * state, not a preset component: it records history and must never be copied
+   * into one.
    */
   toolLock?: ConversationToolLock;
 }
 
 /**
- * The tool surface a conversation has already exposed. Each run merges its own
- * exposure in, and it never shrinks: a transcript that already calls a tool
- * cannot be replayed to a model that no longer has it, so the settings panel
- * offers additions only.
+ * The tool surface the conversation's last request went out with, and which
+ * model sent it when (`src/lib/toolLock.ts`).
  *
- * The four nullable fields are pins rather than growing sets. What they hold is
- * not a collection of names but one answer that has already been acted on, and
- * a second answer would contradict the transcript rather than extend it. Each
- * is `null` until the run that sets it.
+ * The prompt cache belongs to that model and that surface. While the selected
+ * model is the same one, a change that would rewrite the cached prefix is drawn
+ * orange and asks first; on a model that cannot take a tool mid-conversation
+ * the surface is frozen gray. Picking another model lifts both, and picking
+ * this one again puts them back.
+ *
+ * Three fields are pins rather than parts of the surface: what they hold is one
+ * answer the transcript already carries, fixed by the first run that gave it.
+ *
+ * A fork of the conversation carries the lock as it stands, timestamps and all:
+ * the cache the fork's history rides on is the same one, and it runs out at the
+ * same moment for both.
  */
 export interface ConversationToolLock {
   tools: string[];
@@ -425,43 +450,65 @@ export interface ConversationToolLock {
   globalMemory: boolean;
   projectMemory: boolean;
   skillTool: boolean;
-  /**
-   * Whether a run has already withheld MCP tool schemas behind `tool_search`.
-   * A pin rather than a widening, for the same reason `skillTool` is: the
-   * transcript carries this conversation's MCP tools one way or the other, and
-   * the other way would either redeclare what is already in it or point at a
-   * tool the earlier rounds never had.
-   */
+  /** Whether the last request withheld MCP tool schemas behind `tool_search`. */
   mcpToolDiscovery: boolean;
   /**
-   * Whether a run has already granted web access. One bit for the feature, not
+   * Whether the last request granted web access. One bit for the feature, not
    * one per tool name: which of `web_search` / `web_fetch` a run grants follows
-   * the resolved backend's capabilities, the same way which memory tools a tier
-   * grants follows the tier.
+   * the resolved backend's capabilities.
    */
   webSearch: boolean;
   /**
-   * Skills already handed to the model, by catalog id. They cannot be taken out
-   * of the conversation again: their bodies, or the trigger lines standing in
-   * for them, are already somewhere in the transcript.
+   * Whether a request has offered the plan-mode pair. Sticky: once plan mode
+   * has been on, the pair stays on every later request.
    */
+  planMode: boolean;
+  /** Skills the conversation had selected at the last request, by catalog id. */
   skillIds: string[];
   /**
    * The skills the system prompt was assembled from, fixed by this
    * conversation's first run and `null` before it. Skills selected afterwards
-   * arrive as their own system message instead, so the prompt the earlier
-   * rounds were cached against never changes under them.
+   * arrive as host notices instead, so the prompt the earlier rounds were
+   * cached against never changes under them.
    */
   promptSkillIds: string[] | null;
   /**
-   * The backend that has performed this conversation's searches. Pinned because
-   * a native search leaves provider-sealed blocks in the transcript that only
-   * that provider's models can read back, and a host-run search leaves ordinary
-   * tool results that a native backend would never have produced.
+   * The search backend the last request's settings named, or `null` when that
+   * request had no web access. Part of the surface: a host-run search leaves
+   * ordinary tool results any backend can follow, so another one may take over
+   * — it only throws the warm cache away.
+   */
+  searchBackend: SearchProviderSelection | null;
+  /** The fetch backend the last request's settings named, on the same terms. */
+  fetchBackend: FetchProviderSelection | null;
+  /** Whether the last request granted `web_fetch`, which the fetch backend alone cannot say. */
+  webFetch: boolean;
+  /**
+   * Native search, once a run has searched with it. Pinned because a native
+   * search leaves provider-sealed blocks in the transcript that only that
+   * provider's models can read back. Only ever `{ kind: "native" }`: a host-run
+   * backend is part of the surface above instead.
    */
   searchProvider: SearchProviderSelection | null;
-  /** The backend that has fetched pages here, pinned for the same reason. `null` while no run has granted `web_fetch` at all. */
+  /** Native fetch, once a run has been granted `web_fetch` with it, pinned for the same reason. */
   fetchProvider: FetchProviderSelection | null;
+  /** The model the last request used, and when it went out. `null` before the first. */
+  lastRequest: ToolLockRequest | null;
+  /**
+   * Every model's latest request in this conversation, one entry per model.
+   * The surface belongs to the last request alone, but each of these models
+   * still holds a cache of its own until its lifetime runs out — which is what
+   * the composer's model menu marks.
+   */
+  modelRequests: ToolLockRequest[];
+}
+
+/** Which model a conversation's last request used, and when. */
+export interface ToolLockRequest {
+  providerId: string;
+  modelId: string;
+  /** RFC 3339. */
+  at: string;
 }
 
 /** The reusable subset of conversation settings owned by a conversation preset. */
@@ -493,8 +540,6 @@ export interface ConversationPresetSettings {
   skillToolEnabled: boolean;
   /** MCP tool-discovery template copied into conversations. */
   mcpToolDiscoveryEnabled: boolean;
-  /** Sandbox template copied into conversations; absent means off. */
-  sandbox?: SandboxSettings;
 }
 
 /**
@@ -528,6 +573,15 @@ export interface ConversationForkOrigin {
   conversationId: string;
   number: number;
 }
+
+/**
+ * The conversation an auto-compact continuation carries on, and which of its
+ * continuations this is. The host titles it `<origin title>-handover-<number>`
+ * when it opens (`src-tauri/src/handoff.rs`); a continuation of a continuation
+ * names the same origin, so a chain of handoffs shares one numbering. A fork's
+ * shape, not a fork: the title follows nothing afterwards.
+ */
+export type ConversationHandoffOrigin = ConversationForkOrigin;
 
 /** Retained solely to deserialize persisted `webSearch` abort records. */
 export type UserAbortedTaskKind = "subagent" | "workflow" | "terminal" | "shell" | "webSearch" | "browser";
@@ -654,6 +708,12 @@ export interface Conversation {
    */
   forkOf?: ConversationForkOrigin | null;
   /**
+   * Set by the host on a continuation the `handoff` tool opened. Only the host
+   * reads it, to number the next handoff; the renderer carries it through so
+   * a write does not drop it. Renaming keeps it.
+   */
+  handoffOf?: ConversationHandoffOrigin | null;
+  /**
    * Conversation preset most recently applied. Empty means an unnamed draft:
    * either nothing was ever applied, or a preset-owned field has since changed.
    * A trace, not a link — it never validates, never disables a field, and may
@@ -668,6 +728,14 @@ export interface Conversation {
    * difference between a preset quietly replacing the timeline and asking first.
    */
   templateId: string;
+  /**
+   * Renderer-only: this conversation's body — `contexts` and every branch's —
+   * is not in memory. Bodies are pooled data (`lib/conversationBodies.ts`): the
+   * host loads a document without them, and the renderer unloads the least
+   * recently opened once its pool is full. The conversation is not empty; its
+   * body is fetched again when it is opened. Never written back.
+   */
+  bodyUnloaded?: boolean;
 }
 
 export interface QueuedMessage {
@@ -801,9 +869,15 @@ export type EndpointType =
  * Explicit model capabilities. Mirrors Rust `model.rs::ModelCapability`.
  * Unknown models infer capabilities from their ID once, then persist them.
  */
-export type ModelCapability = "image_recognition";
+export type ModelCapability =
+  | "image_recognition"
+  /** Takes a tool appended mid-conversation through its protocol's interface. */
+  | "tool_append"
+  /** Takes a system message in the middle of the conversation. */
+  | "system_append";
 
-export type ReasoningEffort = "disabled" | "low" | "medium" | "high" | "xhigh";
+/** Mirrors Rust `model.rs::ReasoningEffort`; the ladder and legacy spellings live in `lib/reasoningEffort.ts`. */
+export type ReasoningEffort = "low" | "medium" | "high" | "extra" | "max";
 
 /**
  * Form in which this model returns reasoning. Mirrors Rust
@@ -820,7 +894,7 @@ export type ReasoningContent = "plaintext" | "encrypted";
  */
 export type ReasoningForm = "plaintext" | "encrypted";
 
-export type SecurityLevel = "request_approval" | "allow_edits" | "plan" | "full_access";
+export type SecurityLevel = "request_approval" | "allow_edits" | "full_access";
 
 /**
  * The one plan document a conversation owns while it is in plan mode.
@@ -853,6 +927,13 @@ export interface ModelProfile {
    * holds put it on the wire.
    */
   promptCache: boolean;
+  /**
+   * Minutes after a request this model's prompt cache is taken to still hold
+   * it; absent means 30. Only the conversation settings read it, to decide how
+   * long a change that would rewrite that cache is drawn orange. It is not sent
+   * to any provider.
+   */
+  cacheTtlMinutes?: number;
 }
 
 /** Account facts the host extracted from the Codex OAuth tokens; no token material. */
@@ -1308,9 +1389,23 @@ export interface LocalModelPreferences {
   titles: boolean;
   /** Describe each shell command in one line on its card. */
   shellExplanations: boolean;
+  /** Say in a few words why a failed tool call or shell command failed, on its card's title. */
+  errorExplanations: boolean;
+  /**
+   * The uses above reach subagents and workflow steps too (each step also gets a title); their
+   * requests wait behind the conversation's own.
+   */
+  subagents: boolean;
   titlePrompt: string;
   shellPrompt: string;
+  errorPrompt: string;
 }
+
+/** What the local helper model is asked to do, each with its own prompt (Rust `prompts::Task`). */
+export type LocalModelTask = "title" | "shell" | "error";
+
+/** Mirror of Rust `helper_model::DefaultPrompts`: the built-in prompt of each task. */
+export type LocalModelDefaultPrompts = Record<LocalModelTask, string>;
 
 /** Mirror of Rust `helper_model::Phase` (serde tag `phase`). */
 /** Mirror of Rust `helper_model::VariantId`: one build of the model per inference backend. */
@@ -1327,8 +1422,8 @@ export type LocalModelUnavailable =
 export type LocalModelPhase =
   | { phase: "missing" }
   | { phase: "unsupported"; reason: LocalModelUnavailable }
-  | { phase: "downloading"; received: number; total: number; source: "huggingFace" | "hfMirror" | "mirror" }
-  | { phase: "preparing"; step: "compile" | "verify"; done: number; total: number }
+  | { phase: "downloading"; received: number; total: number; source: "huggingFace" | "hfMirror" | "mirror" | "release" }
+  | { phase: "preparing"; step: "compile" | "verify" | "unpack"; done: number; total: number }
   | { phase: "ready" }
   | { phase: "failed"; message: string };
 
@@ -1357,6 +1452,8 @@ export interface LocalModelStatus {
   recommended: LocalModelVariantId | null;
   /** The active build is loading and caching its prompts. */
   warming: boolean;
+  /** The active build's weights are loading (warming, or a request after an idle unload). */
+  loading: boolean;
   device: string | null;
   loaded: boolean;
   running: number;
@@ -1370,7 +1467,8 @@ export interface LocalModelStatus {
 /** Mirror of Rust `helper_model::PromptReport`. */
 export interface LocalModelPromptReport {
   tokens: number;
-  cacheBytes: number;
+  /** `null`: no cached state yet, and none was built. */
+  cacheBytes: number | null;
   maxTokens: number;
 }
 
@@ -1591,6 +1689,22 @@ export interface GlobalSettings {
    * restart instead of being rebuilt from the preset.
    */
   draftConversation?: DraftConversationSnapshot | null;
+  /** When a conversation hands its work over to a forked continuation. */
+  autoCompact: AutoCompactSettings;
+}
+
+/**
+ * The composer's auto-compact switch. The host reads it at every round
+ * boundary: once the latest request's context reaches `thresholdPercent` of the
+ * model's window (rounded down to a token count), the conversation is armed to
+ * hand off — the model writes handoff notes and calls `handoff`, and the work
+ * continues in a new conversation, `<title>-handover-<n>`, that starts from
+ * those notes with none of this one's cache state (`src-tauri/src/handoff.rs`).
+ */
+export interface AutoCompactSettings {
+  enabled: boolean;
+  /** 20–97. */
+  thresholdPercent: number;
 }
 
 /** What of the new-task draft outlives the process: its settings and their preset trace. */
@@ -1651,12 +1765,18 @@ export interface MachineShells {
 
 /**
  * Execution-environment assets. WSL distributions are machine state and are
- * enumerated live by `list_wsl_distros`. Environment variables are keyed by
- * `local`, `wsl:<distro>`, or `ssh:<machine id>`.
+ * enumerated live by `list_wsl_distros`. Environment variables and sandboxes
+ * belong to workspaces, keyed by `workspaceEnvKey`: the machine's `local`,
+ * `wsl:<distro>` or `ssh:<machine id>`, then `|` and the directory.
  */
 export interface ExecutionEnvironmentAssets {
   sshMachines: SshMachineConfig[];
   envVars: Record<string, Record<string, string>>;
+  /**
+   * Each workspace's sandbox. A workspace with no entry is off; one switched
+   * off keeps its entry, which records that answer.
+   */
+  sandboxes?: Record<string, SandboxSettings>;
   /** Each WSL distribution's agent shell, by distribution name. */
   wslAgentShells?: Record<string, ShellBackend>;
 }
@@ -1665,13 +1785,12 @@ export interface ExecutionEnvironmentAssets {
 export type SandboxNetworkMode = "off" | "allowlist" | "open";
 
 /**
- * The sandbox a conversation's commands run in when it is on. Mirrors
- * `model::SandboxSettings`: one sandboxed agent process per conversation and
- * machine, which can write the conversation's workspaces (and nothing in them
- * that runs outside the sandbox later), cannot read credentials, and reaches
- * the network only through a proxy that applies `network`. A setting of each
- * conversation, and a component of a preset — the conversation is the
- * smallest thing a sandbox is drawn around.
+ * The sandbox a workspace's commands run in when it is on. Mirrors
+ * `model::SandboxSettings`: sandboxed agent processes on the workspace's
+ * machine, one per conversation working there, which can write the workspace
+ * (and nothing in it that runs outside the sandbox later), cannot read
+ * credentials, and reach the network only through a proxy that applies
+ * `network`. A setting of each workspace, like its variables.
  */
 export interface SandboxSettings {
   enabled: boolean;
@@ -1681,9 +1800,9 @@ export interface SandboxSettings {
     allow: string[];
     deny: string[];
   };
-  /** Further directories every sandbox may write: absolute or `~/…`. */
+  /** Further directories the workspace's sandbox may write: absolute or `~/…`. */
   writable: string[];
-  /** Further paths no sandbox may read, besides the built-in credential locations. */
+  /** Further paths the workspace's sandbox may not read, besides the built-in credential locations. */
   denyRead: string[];
 }
 
@@ -1819,8 +1938,30 @@ export interface PendingToolPrompt {
    * Which card this is. Plain tool approvals omit it. `plan_exit` asks whether
    * to leave plan mode and start implementing; it is answered with the same
    * decisions but draws different copy and collects feedback on a denial.
+   * `question` is an `ask_user` call blocked on the user's answers; it is
+   * answered with a {@link QuestionResponse} instead of a decision.
    */
-  kind?: "tool" | "plan_exit";
+  kind?: ToolPromptKind;
+  /** The questions a `question` card asks: the `ask_user` input's `questions`. */
+  questions?: JsonValue;
+}
+
+export type ToolPromptKind = "tool" | "plan_exit" | "question";
+
+/**
+ * How the user left a question card. `answers`, `previews`, and `notes` are
+ * index-aligned with the card's questions; `null` is an unanswered slot. A
+ * multi-select answer is the picked labels joined with `", "`. The host words
+ * the tool result from this, exactly as Claude Code does.
+ */
+export interface QuestionResponse {
+  /** `submit` hands the answers back; `close` closes the card unanswered;
+   * `chat` declines the questions so the user can talk them over, carrying
+   * whatever was answered so far. */
+  action: "submit" | "close" | "chat";
+  answers: Array<string | null>;
+  previews?: Array<string | null>;
+  notes?: Array<string | null>;
 }
 
 export type ToolPromptDecision = "deny" | "allow_once" | "allow_always";
@@ -1983,6 +2124,14 @@ export type ModelStreamEvent =
   /** Provider-reported cumulative usage for this backend request round. */
   | { type: "usage_updated"; round: number; usage: ModelUsage }
   | { type: "user_input_received"; round: number; id: string; content: string; images?: ImageAttachment[]; files?: FileAttachment[]; createdAt: string }
+  /**
+   * A context the host added to the transcript ahead of `round` — a `box`
+   * delivery (background result, host notice such as auto-compact arming), an
+   * appended system prompt, a tool-addition marker, a Stop hook's
+   * continuation. Already persisted host-side; this puts it in the live turn.
+   * Sent in transcript order relative to `user_input_received`.
+   */
+  | { type: "host_context_added"; round: number; context: ContextItem }
   | {
       type: "tool_call_announced";
       round: number;
@@ -2007,7 +2156,7 @@ export type ModelStreamEvent =
    * above the composer and answers with `resolveToolPrompt`; the backend worker
    * that raised it stays blocked until then. Carries no round: approval is
    * raised from the tool executor, which does not know the surrounding turn. */
-  | { type: "tool_approval_requested"; promptId: string; toolName: string; label: string; summary: string; riskLevel: string; reason: string; requester?: string; sourceAgent?: string; sourceCallId?: string; allowAlwaysOffered: boolean; mandatory?: boolean; kind?: "tool" | "plan_exit" }
+  | { type: "tool_approval_requested"; promptId: string; toolName: string; label: string; summary: string; riskLevel: string; reason: string; requester?: string; sourceAgent?: string; sourceCallId?: string; allowAlwaysOffered: boolean; mandatory?: boolean; kind?: ToolPromptKind; questions?: JsonValue }
   /** The card for `promptId` is over. `approved` is what the host concluded,
    * which is not always what the user clicked — a cancelled run resolves its
    * outstanding cards as denied. */

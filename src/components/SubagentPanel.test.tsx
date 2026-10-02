@@ -93,7 +93,7 @@ describe("SubagentPanel", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /编辑|删除|发送/ })).not.toBeInTheDocument();
 
-    const readSummary = screen.getByRole("button", { name: "读取了文件 · read · README.md · 完成" });
+    const readSummary = screen.getByRole("button", { name: "已读取：README.md · read · README.md · 完成" });
     expect(readSummary).toHaveAttribute("title", "read · README.md · 完成");
     expect(readSummary.closest("article")?.querySelector(".timeline-row__line")).toBeNull();
     await user.click(readSummary);
@@ -123,7 +123,7 @@ describe("SubagentPanel", () => {
     const answerCard = within(transcript).getByText("已复用主消息样式").closest<HTMLElement>(".context-card--assistant");
     expect(taskCard).not.toBeNull();
     expect(answerCard).not.toBeNull();
-    expect(transcript.querySelector(".context-actions")).not.toBeInTheDocument();
+    expect(within(answerCard!).getByRole("button", { name: "复制模型回复" })).toBeInTheDocument();
     expect(within(transcript).queryByRole("textbox")).not.toBeInTheDocument();
     expect(within(transcript).queryByRole("button", { name: /编辑|删除|发送/ })).not.toBeInTheDocument();
 

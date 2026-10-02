@@ -538,6 +538,101 @@ describe("reduceModelStreamEvent", () => {
     expect(replay.run.steeredInputsByRound[0]).toHaveLength(1);
   });
 
+  it("shows what the host adds between rounds in the live turn, in the host's order", () => {
+    const notice: ContextItem = {
+      id: "ctx_agent-result_handoff",
+      kind: "tool",
+      toolName: "box",
+      round: 2,
+      input: { none: [] },
+      notice: "handoff",
+      result: {
+        success: true,
+        output:
+          "<task-notification>\n<summary>past the threshold</summary>\n<result>\nCall handoff.\n</result>\n</task-notification>",
+        executedAt: AT,
+        durationMs: 0
+      },
+      createdAt: AT
+    } as ContextItem;
+    const continuation: ContextItem = {
+      id: "ctx_hook-continuation_1",
+      kind: "user",
+      content: "Also write ENCORE.",
+      createdAt: AT
+    };
+    const { run, effects } = reduceAll(runFixture(), [
+      { type: "text_delta", round: 1, delta: "第一轮" },
+      // A Stop hook's continuation joins before the next round's steering…
+      { type: "host_context_added", round: 2, context: continuation },
+      { type: "user_input_received", round: 2, id: "queued_1", content: "插话", createdAt: AT },
+      // …and the boundary's notices after it.
+      { type: "host_context_added", round: 2, context: notice },
+      { type: "host_context_added", round: 2, context: notice },
+      { type: "text_delta", round: 2, delta: "第二轮" }
+    ]);
+    // Host additions split no turn; only the steered input does.
+    expect(effects.filter((effect) => effect.kind === "turn_split")).toHaveLength(1);
+    const ids = contextsFromModelRun(run, true).map((context) => context.id);
+    expect(ids).toEqual([
+      "ctx_assistant_run_test_1",
+      "ctx_hook-continuation_1",
+      "queued_1",
+      "ctx_agent-result_handoff",
+      "ctx_assistant_run_test_2"
+    ]);
+    // Settling an interrupted run keeps them: the host persisted them already.
+    expect(contextsFromModelRun(run, false).map((context) => context.id)).toEqual(ids);
+
+    // A retry of round two redoes the request, not what the host added ahead of it.
+    const retried = reduceAll(run, [
+      {
+        type: "stream_retry_scheduled",
+        round: 2,
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 0,
+        message: "overloaded"
+      },
+      { type: "text_delta", round: 2, delta: "重来" }
+    ]).run;
+    expect(contextsFromModelRun(retried, true).map((context) => context.id)).toEqual(ids);
+  });
+
+  it("puts what the host adds to a child's run in the child's live transcript", () => {
+    const tool = (live: SubagentLiveState) => ({
+      id: "ctx-agent",
+      callId: "call_agent",
+      toolName: "agent_spawn",
+      input: {},
+      result: { success: true, output: "", executedAt: AT, durationMs: 0 },
+      streamStatus: "running" as const,
+      live,
+      createdAt: AT
+    });
+    const notice: ContextItem = {
+      id: "ctx_agent-result_child",
+      kind: "tool",
+      toolName: "box",
+      round: 2,
+      input: {},
+      result: { success: true, output: "child notice", executedAt: AT, durationMs: 0 }
+    } as ContextItem;
+    const added = {
+      type: "subagent_event" as const,
+      round: 1,
+      callId: "call_agent",
+      event: { type: "host_context_added" as const, round: 2, context: notice }
+    };
+    const { run } = reduceAll(
+      runFixture({ streamedToolsByRound: { 1: [tool({ contexts: [], updates: [] })] } }),
+      [added, added]
+    );
+    expect(run.streamedToolsByRound[1][0].live.contexts.map((context) => context.id)).toEqual([
+      "ctx_agent-result_child"
+    ]);
+  });
+
   it("reports tool completion with the announced tool name", () => {
     const { effects } = reduceAll(runFixture(), [
       {

@@ -15,7 +15,7 @@
  */
 
 /** Spring rate, per second. A line-high step is 90 % covered in about 200 ms. */
-export const FOLLOW_GLIDE_RATE = 18;
+const FOLLOW_GLIDE_RATE = 18;
 
 /** Longest frame the spring integrates, so a stalled tab resumes gently. */
 const MAX_STEP_SECONDS = 0.05;

@@ -2,7 +2,7 @@
   "name": "Mework 内置工具上下文重设计基线",
   "note": "schemaNotes replaces the built-in tool description; usageGuidance is appended after a blank line. Copy this file to .mework/tool-descriptions only when you want Mework to discover it, then explicitly select it in the conversation preset.",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
-  "toolCount": 48,
+  "toolCount": 49,
   "tools": [
     {
       "toolName": "ls",
@@ -150,16 +150,6 @@
       "usageGuidance": ""
     },
     {
-      "toolName": "send_message",
-      "schemaNotes": "",
-      "usageGuidance": ""
-    },
-    {
-      "toolName": "followup_task",
-      "schemaNotes": "",
-      "usageGuidance": ""
-    },
-    {
       "toolName": "task_wait",
       "schemaNotes": "",
       "usageGuidance": ""
@@ -220,11 +210,6 @@
       "usageGuidance": ""
     },
     {
-      "toolName": "todo",
-      "schemaNotes": "",
-      "usageGuidance": ""
-    },
-    {
       "toolName": "ask_user",
       "schemaNotes": "",
       "usageGuidance": ""
@@ -241,6 +226,26 @@
     },
     {
       "toolName": "exit_plan_mode",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "read_handoff_note",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "create_handoff_note",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "edit_handoff_note",
+      "schemaNotes": "",
+      "usageGuidance": ""
+    },
+    {
+      "toolName": "handoff",
       "schemaNotes": "",
       "usageGuidance": ""
     }

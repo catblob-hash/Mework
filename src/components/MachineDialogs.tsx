@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Dialog } from "./Common";
+import { PathText } from "./PathText";
 import { useI18n } from "../i18n";
 import { createId } from "../lib/id";
 import { listWslDistros } from "../lib/runtime";
@@ -104,7 +105,7 @@ function MachineShellsSection({ machine, shells, agentShell }: MachineShellsSect
         ? <p className="run-location__error" role="alert">{error}</p>
         : probed
           ? (
-            <dl className="machine-settings__facts machine-shells__found">
+            <dl className="machine-shells__found">
               <dt>{t("系统", "System")}</dt>
               <dd>{machineOsLabel(probed.os)}</dd>
               <dt>{t("可用 shell", "Shells")}</dt>
@@ -113,8 +114,8 @@ function MachineShellsSection({ machine, shells, agentShell }: MachineShellsSect
                   ? t("没有 Mework 能在这个系统上使用的 shell", "No shell Mework can use on this system")
                   : found.map((shell) => (
                     <span key={shell.backend} className="machine-shells__shell" title={shell.path}>
-                      {shellBackendLabel(shell.backend)}
-                      <code>{shell.path}</code>
+                      <span>{shellBackendLabel(shell.backend)}</span>
+                      <PathText className="machine-shells__path" path={shell.path} title={null} />
                     </span>
                   ))}
               </dd>
@@ -142,185 +143,13 @@ function MachineShellsSection({ machine, shells, agentShell }: MachineShellsSect
   );
 }
 
-/** Mirrors the host `validate_env_var_name` predicate for field-level validation. */
-const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** Mirrors host-reserved shell-startup and private child-environment names.
- * The host rejects an entire document containing these names, so reject them at
- * the field rather than on save. */
-function reservedEnvVarName(name: string): boolean {
-  if ([
-    "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "GIT_EXTERNAL_DIFF"
-  ].includes(name)) return true;
-  const upper = name.toUpperCase();
-  return (upper.startsWith("MEWORK_") || upper.startsWith("VITE_"))
-    && (upper.includes("BROWSER_DEV") || upper.includes("E2E"));
-}
-
 /** Mirrors limits enforced by host `validate_execution_environments`. */
-const MAX_ENV_VARS_PER_TABLE = 128;
-const MAX_ENV_VALUE_CHARS = 8192;
 const MAX_SSH_MACHINES = 64;
 const MAX_MACHINE_NAME_CHARS = 64;
 const MAX_HOST_CHARS = 512;
 const MAX_PATH_FIELD_CHARS = 4096;
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
-
-function formatEnvText(vars: Record<string, string>): string {
-  return Object.entries(vars).map(([key, value]) => `${key}=${value}`).join("\n");
-}
-
-interface ParsedEnvText {
-  vars: Record<string, string>;
-  /** Lines with invalid variable-name syntax. */
-  invalid: string[];
-  /** Lines with host-reserved variable names. */
-  reserved: string[];
-  /** Lines whose values are too long or contain control characters. */
-  badValues: string[];
-  tooMany: boolean;
-}
-
-/** Parses `KEY=value` lines. Preserve everything after the first `=` verbatim;
- * only keys are trimmed. */
-function parseEnvText(text: string): ParsedEnvText {
-  const vars: Record<string, string> = {};
-  const invalid: string[] = [];
-  const reserved: string[] = [];
-  const badValues: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const position = line.indexOf("=");
-    const key = position < 0 ? line.trim() : line.slice(0, position).trim();
-    if (!key) continue;
-    if (position < 0 || !ENV_NAME_PATTERN.test(key) || key.length > 128) {
-      invalid.push(key || line.trim());
-      continue;
-    }
-    if (reservedEnvVarName(key)) {
-      reserved.push(key);
-      continue;
-    }
-    const value = line.slice(position + 1);
-    if (value.length > MAX_ENV_VALUE_CHARS || CONTROL_CHARS.test(value)) {
-      badValues.push(key);
-      continue;
-    }
-    vars[key] = value;
-  }
-  return {
-    vars,
-    invalid,
-    reserved,
-    badValues,
-    tooMany: Object.keys(vars).length > MAX_ENV_VARS_PER_TABLE
-  };
-}
-
-/**
- * Field-level validation for the environment-variable editor. The host rejects
- * an entire document with invalid execution environments, so errors stay local.
- */
-function envTextError(
-  parsed: ParsedEnvText,
-  t: (zh: string, en: string, params?: Record<string, string>) => string
-): string | null {
-  if (parsed.invalid.length) {
-    return t(
-      "变量名不合法：{names}（需以字母或下划线开头，只含字母、数字、下划线，最长 128）",
-      "Invalid variable names: {names} (must start with a letter or underscore, contain only letters, digits and underscores, max 128)",
-      { names: parsed.invalid.join(", ") }
-    );
-  }
-  if (parsed.reserved.length) {
-    return t(
-      "这些变量名由宿主保留，不能配置：{names}",
-      "These variable names are reserved by the host and cannot be configured: {names}",
-      { names: parsed.reserved.join(", ") }
-    );
-  }
-  if (parsed.badValues.length) {
-    return t(
-      "这些变量的值过长或含控制字符：{names}",
-      "The values of these variables are too long or contain control characters: {names}",
-      { names: parsed.badValues.join(", ") }
-    );
-  }
-  if (parsed.tooMany) {
-    return t(
-      "一个工作区最多 {max} 条变量",
-      "A workspace can hold at most {max} variables",
-      { max: String(MAX_ENV_VARS_PER_TABLE) }
-    );
-  }
-  return null;
-}
-
-export interface WorkspaceEnvironmentDialogProps {
-  title: string;
-  vars: Record<string, string>;
-  onSave: (vars: Record<string, string>) => void;
-  onClose: () => void;
-}
-
-/** A workspace's environment-variable editor. The textarea holds its raw draft so
- * incremental edits are not normalized away. */
-export function WorkspaceEnvironmentDialog({
-  title,
-  vars,
-  onSave,
-  onClose
-}: WorkspaceEnvironmentDialogProps) {
-  const { t } = useI18n();
-  const [text, setText] = useState(() => formatEnvText(vars));
-  const [error, setError] = useState<string | null>(null);
-  return (
-    <Dialog
-      title={title}
-      description={t(
-        "每行一条 KEY=value。这些变量会注入在这个工作区里执行的 shell 命令，同一台机器上的其他工作区不受影响。",
-        "One KEY=value per line. These variables are injected into shell commands run in this workspace; other workspaces on the same machine are unaffected."
-      )}
-      width="420px"
-      onClose={onClose}
-      footer={<>
-        <button type="button" className="button button--secondary" onClick={onClose}>
-          {t("取消", "Cancel")}
-        </button>
-        <button
-          type="button"
-          className="button button--primary"
-          onClick={() => {
-            const parsed = parseEnvText(text);
-            const message = envTextError(parsed, t);
-            if (message) {
-              setError(message);
-              return;
-            }
-            onSave(parsed.vars);
-          }}
-        >
-          {t("保存", "Save")}
-        </button>
-      </>}
-    >
-      <textarea
-        className="run-location__env-input"
-        rows={8}
-        value={text}
-        aria-label={t("环境变量", "Environment variables")}
-        placeholder={"API_KEY=value\nHTTP_PROXY=http://127.0.0.1:7890"}
-        spellCheck={false}
-        onChange={(event) => {
-          setText(event.target.value);
-          setError(null);
-        }}
-      />
-      {error && <p className="run-location__error" role="alert">{error}</p>}
-    </Dialog>
-  );
-}
 
 export interface SshMachineDialogProps {
   /** Null when creating a machine. */
@@ -341,8 +170,9 @@ export interface SshMachineDialogProps {
 }
 
 /**
- * SSH machine creation and editing dialog. Environment variables are not set
- * here: they belong to each workspace on the machine, not to the machine.
+ * SSH machine creation and editing dialog. Environment variables and the
+ * sandbox are not set here: they belong to each workspace on the machine, not
+ * to the machine.
  */
 export function SshMachineDialog({
   machine,
@@ -391,8 +221,8 @@ export function SshMachineDialog({
         ? t("配置 SSH 机器", "Configure SSH machine")
         : t("添加 SSH 机器", "Add SSH machine")}
       description={t(
-        "认证材料不落盘：连接时由 OpenSSH 按身份文件、~/.ssh/config 与 agent 解析。工作目录和环境变量不在这里设——它们属于工作区：在项目里为这台机器选一个目录。",
-        "No credentials are stored: OpenSSH resolves the identity file, ~/.ssh/config and the agent at connect time. The working directory and environment variables are not set here — they belong to a workspace: pick a directory on this machine in a project."
+        "认证材料不落盘：连接时由 OpenSSH 按身份文件、~/.ssh/config 与 agent 解析。工作目录、环境变量和沙箱不在这里设——它们属于工作区：在项目里为这台机器选一个目录。",
+        "No credentials are stored: OpenSSH resolves the identity file, ~/.ssh/config and the agent at connect time. The working directory, environment variables and sandbox are not set here — they belong to a workspace: pick a directory on this machine in a project."
       )}
       width="460px"
       onClose={onClose}
@@ -523,7 +353,7 @@ export interface MachineSettingsDialogProps {
  * what is on them. Every machine shows its shell backends and can be probed
  * again; a WSL distribution and an SSH machine also choose their agent shell.
  *
- * Environment variables are never here: they belong to each workspace.
+ * Environment variables and the sandbox are never here: they belong to each workspace.
  */
 export function MachineSettingsDialog({
   machine,
@@ -678,8 +508,8 @@ export function MachineSettingsDialog({
       )}
       <p className="machine-settings__note">
         {t(
-          "环境变量属于工作区，不属于机器：在输入框上方的工作区菜单里，点工作区右侧的齿轮来设置。",
-          "Environment variables belong to a workspace, not to its machine: set them from the gear beside a workspace in the workspace menu above the message box."
+          "环境变量和沙箱属于工作区，不属于机器：在输入框上方的工作区菜单里，点工作区右侧的齿轮来设置。",
+          "Environment variables and the sandbox belong to a workspace, not to its machine: set them from the gear beside a workspace in the workspace menu above the message box."
         )}
       </p>
     </Dialog>

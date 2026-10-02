@@ -7,10 +7,12 @@ import {
   knownShells,
   preferredBackend,
   SHELL_BACKENDS_BY_OS,
+  sshEndpoint,
   terminalShellsFor,
   toolsForShellBackends,
   withAgentShell,
-  withDefaultAgentShell
+  withDefaultAgentShell,
+  withoutProbe
 } from "./machineShells";
 
 const probe = (os: MachineShells["os"], backends: MachineShells["shells"][number]["backend"][]): MachineShells => ({
@@ -141,5 +143,31 @@ describe("agent shells", () => {
     expect(effectiveAgentShell(machine, chosen, { "ssh:m1": probe("linux", ["bash", "sh"]) })).toBe("bash");
     expect(effectiveAgentShell(machine, chosen, {})).toBe("zsh");
     expect(effectiveAgentShell(null, chosen, {})).toBeNull();
+  });
+});
+
+describe("a machine moved to another address", () => {
+  const machine = { kind: "ssh" as const, machineId: "m1" };
+  const moved = (host: string) => {
+    const base = assets();
+    return { ...base, sshMachines: base.sshMachines.map((entry) => ({ ...entry, host })) };
+  };
+
+  it("is told apart by its endpoint, not its id", () => {
+    const before = sshEndpoint(assets(), machine);
+    expect(before).not.toBeNull();
+    expect(sshEndpoint(assets(), machine)).toBe(before);
+    expect(sshEndpoint(moved("dev@other"), machine)).not.toBe(before);
+    expect(sshEndpoint({ ...assets(), sshMachines: [] }, machine)).toBeNull();
+    expect(sshEndpoint(assets(), { kind: "wsl", distro: "Ubuntu" })).toBeNull();
+    expect(sshEndpoint(assets(), null)).toBeNull();
+  });
+
+  it("loses its old probe, so it reads as never probed until the new address answers", () => {
+    const probes = { local: probe("macos", ["zsh"]), "ssh:m1": probe("linux", ["bash"]) };
+    const next = withoutProbe(probes, "ssh:m1");
+    expect(next).toEqual({ local: probes.local });
+    expect(knownShells(machine, next, "MacIntel")).toEqual({ os: null, backends: ["bash"] });
+    expect(withoutProbe(next, "ssh:m1")).toBe(next);
   });
 });

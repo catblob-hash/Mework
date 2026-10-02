@@ -21,6 +21,7 @@ import { isBuiltinConversationPreset } from "../lib/conversationPresets";
 import { modelChoiceOf } from "../lib/documentUpdates";
 import { supportsVision } from "../lib/modelCapabilities";
 import { isImeKeyEvent } from "../lib/shortcuts";
+import type { LockTone } from "../lib/toolLock";
 import type {
   ContextItem,
   ConversationPreset,
@@ -35,27 +36,21 @@ import { AgentDefinitionSettings } from "./AgentDefinitionSettings";
 import { CatalogList, CatalogRow, CatalogToggleRow, useCatalogSort } from "./CatalogRow";
 import { ConfirmDeleteButton, IconButton, Switch } from "./Common";
 import { DocsLink } from "./DocsLink";
-
-/** Said of every control a run has already handed the model and cannot take back. */
-export function lockedInThisConversationHint(t: TranslationFunction): string {
-  return t(
-    "已经交给过模型，本对话里不能再关掉。",
-    "The model has already been handed this; it cannot be taken back in this conversation."
-  );
-}
+import type { LockHints } from "./LockTone";
 
 /**
- * Said of a backend a run has already used.
+ * Said of a native backend a run has already used.
  *
  * Not the same claim as the hint above: nothing is being withheld, the choice
- * is simply settled. The transcript holds results only this backend could have
- * produced — a native search seals them in blocks only its own provider's
- * models can read back — so a different one cannot take over half way through.
+ * is simply settled. A native search seals its results in blocks only its own
+ * provider's models can read back, so a different backend cannot take over
+ * half way through. A host-run backend leaves ordinary tool results and is
+ * never settled this way — only the cache says anything about moving it.
  */
 export function settledBackendHint(t: TranslationFunction): string {
   return t(
-    "本对话已经用这个后端跑过了；转录里的结果只有它能被回放，所以不能中途换人。开一段新对话可以重选。",
-    "This conversation has already run on this backend. The results in its transcript can only be replayed against it, so it cannot be swapped part-way through — start a new conversation to choose again."
+    "本对话已经用原生后端跑过了；它的结果封在只有该提供商的模型才读得回的块里，所以不能中途换人。开一段新对话可以重选。",
+    "This conversation has already run on the native backend. Its results are sealed in blocks only that provider's models can read back, so it cannot be swapped part-way through — start a new conversation to choose again."
   );
 }
 
@@ -115,7 +110,8 @@ export function CapabilitySelectionPage({
   listId,
   resources,
   selectedIds,
-  lockedIds = [],
+  toneOf,
+  lockHints,
   onChange,
   onDelete,
   error = null,
@@ -133,8 +129,10 @@ export function CapabilitySelectionPage({
   listId: string;
   resources: ResourceDescriptor[];
   selectedIds: string[];
-  /** Selections a run has already exposed, drawn spent rather than removable. */
-  lockedIds?: readonly string[];
+  /** How the conversation's lock draws a row (`lockTone` in `toolLock.ts`). */
+  toneOf?: (id: string, selected: boolean) => LockTone | null;
+  /** What a toned row says about itself. */
+  lockHints?: LockHints;
   onChange: (ids: string[]) => void;
   /**
    * Removes the entry from the catalog itself — the skill folder, the server
@@ -175,8 +173,8 @@ export function CapabilitySelectionPage({
   /* One result per resource id, replaced wholesale by the next test. */
   const [probes, setProbes] = useState<Record<string, McpProbeState>>({});
   const Icon = KIND_ICONS[kind];
-  const locked = useMemo(() => new Set(lockedIds), [lockedIds]);
   const selected = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const tone = (id: string) => toneOf?.(id, selected.has(id)) ?? null;
   /* The entries this conversation may select: the global level (no workspace) and
      its own workspace. Anything else belongs to a sibling workspace and is not
      offered here — the host would skip such a selection at run time anyway. */
@@ -213,7 +211,7 @@ export function CapabilitySelectionPage({
   });
 
   const toggle = (id: string, checked: boolean) => {
-    if (!checked && locked.has(id)) return;
+    if (tone(id) === "hard") return;
     onChange(checked
       ? [...selectedIds.filter((existing) => existing !== id), id]
       : selectedIds.filter((existing) => existing !== id));
@@ -244,10 +242,6 @@ export function CapabilitySelectionPage({
     setProbes((current) => ({ ...current, [resource.id]: next }));
   };
 
-  const lockedNote = t(
-    "已经交给过模型，本对话里不能再移除",
-    "Already handed to the model; it cannot be removed in this conversation"
-  );
   /* A missing selection is not one thing: skills and MCP are skipped at run time,
      while a hook that is gone fails the run outright. The row says which. */
   const danglingDetail = kind === "hooks"
@@ -312,8 +306,10 @@ export function CapabilitySelectionPage({
 
       <CatalogList sort={sort}>
         {visible.map((resource) => {
-          const isLocked = locked.has(resource.id);
           const isSelected = selected.has(resource.id);
+          const rowTone = tone(resource.id);
+          /* An entry the last request carried is not deleted out from under it. */
+          const inPlay = isSelected && rowTone !== null;
           const probe = probes[resource.id];
           /* The badge is one slot with one meaning: what a test just said, or —
              where there is no test to report — that the entry cannot run. An
@@ -334,7 +330,7 @@ export function CapabilitySelectionPage({
           const actions: ReactNode[] = [];
           /* A connection test is only offered where there is something to connect
              to: an unavailable entry already carries the reason it cannot. */
-          if (kind === "mcp" && onProbeMcpServer && resource.available && !isLocked) {
+          if (kind === "mcp" && onProbeMcpServer && resource.available) {
             actions.push(
               <IconButton
                 key="probe"
@@ -346,9 +342,9 @@ export function CapabilitySelectionPage({
               ><Plug size={13} /></IconButton>
             );
           }
-          /* A built-in entry has no copy of its own to remove, and a locked one is
-             already in the model's hands for this conversation. */
-          if (onDelete && resource.source !== "builtin" && !isLocked) {
+          /* A built-in entry has no copy of its own to remove, and one the last
+             request carried is still in the model's hands. */
+          if (onDelete && resource.source !== "builtin" && !inPlay) {
             actions.push(
               <ConfirmDeleteButton
                 key="delete"
@@ -367,11 +363,11 @@ export function CapabilitySelectionPage({
               detail={rowDetail(
                 resource.description,
                 resource.location,
-                isLocked && lockedNote,
+                rowTone && lockHints?.[rowTone],
                 /* The scope badge is gone, so the one thing it said that the path
                    does not say moves here. */
                 !resource.available && t("当前不可用", "Currently unavailable"),
-                !isLocked && !resource.available && isSelected && t(
+                !inPlay && !resource.available && isSelected && t(
                   "已选择，当前不会生效",
                   "Selected, currently inactive"
                 ),
@@ -383,7 +379,7 @@ export function CapabilitySelectionPage({
               badge={badge}
               actions={actions.length ? actions : undefined}
               checked={isSelected}
-              disabled={isLocked}
+              tone={rowTone}
               onChange={(checked) => toggle(resource.id, checked)}
             />
           );
@@ -396,7 +392,7 @@ export function CapabilitySelectionPage({
             detail={danglingDetail}
             badge={<em className="catalog-row__badge catalog-row__badge--warning">{t("悬空", "Dangling")}</em>}
             checked
-            disabled={locked.has(id)}
+            tone={tone(id)}
             onChange={(checked) => toggle(id, checked)}
           />
         ))}

@@ -32,8 +32,8 @@ pub struct AssetLibrary {
     /// [`ConversationWebSearchSettings`].
     #[serde(default)]
     pub web_search: WebSearchAssets,
-    /// SSH machine catalog and workspace-specific variables. Conversations own
-    /// their selected execution environment.
+    /// SSH machine catalog and each workspace's variables and sandbox.
+    /// Conversations own their selected execution environment.
     #[serde(default)]
     pub execution_environments: ExecutionEnvironmentAssets,
 }
@@ -55,6 +55,12 @@ pub struct ExecutionEnvironmentAssets {
     /// does not invalidate the document.
     #[serde(default)]
     pub env_vars: BTreeMap<String, BTreeMap<String, String>>,
+    /// Workspace key to the sandbox its commands run in, keyed like
+    /// [`env_vars`](Self::env_vars). A missing entry is off; an entry the user
+    /// switched off stays, so it records that answer. Dangling keys are allowed
+    /// for the same reason as there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sandboxes: BTreeMap<String, SandboxSettings>,
     /// The agent shell each WSL distribution runs Mework's own scripts in,
     /// keyed by distribution name. Distributions are found rather than
     /// registered, so their one setting lives here instead of on a catalog row;
@@ -68,16 +74,17 @@ pub struct ExecutionEnvironmentAssets {
     pub wsl_agent_shells: BTreeMap<String, crate::shell_backend::ShellBackend>,
 }
 
-/// The sandbox a conversation's commands run in when it is on: one sandboxed
-/// agent process per conversation and machine (see
-/// `remote_agent::agent::sandbox`), which can write the conversation's
-/// workspaces and nothing that runs outside it later, cannot read the
-/// account's credentials, and reaches the network only through a proxy that
-/// applies [`SandboxNetworkSettings`].
+/// The sandbox a workspace's commands run in when it is on: sandboxed agent
+/// processes on the workspace's machine (see `remote_agent::agent::sandbox`),
+/// one per conversation working there, which can write the workspace and
+/// nothing that runs outside it later, cannot read the account's credentials,
+/// and reach the network only through a proxy that applies
+/// [`SandboxNetworkSettings`].
 ///
-/// A setting of each conversation rather than of the application: the
-/// conversation is the smallest thing a sandbox is ever drawn around, so it is
-/// where the answer lives, and a preset carries one to copy in.
+/// A setting of each workspace ([`ExecutionEnvironmentAssets::sandboxes`]),
+/// like its variables: whether the code in a directory is trusted is a
+/// question about the directory, so every conversation working in it gets the
+/// same answer.
 ///
 /// A machine that cannot sandbox — no bubblewrap, WSL 1, an SSH machine the
 /// agent does not serve — refuses the command rather than running it
@@ -89,12 +96,12 @@ pub struct SandboxSettings {
     pub enabled: bool,
     #[serde(default)]
     pub network: SandboxNetworkSettings,
-    /// Further directories every sandbox may write, on whichever machine has
-    /// them: absolute, or starting with `~`.
+    /// Further directories the workspace's sandbox may write, on its machine:
+    /// absolute, or starting with `~`.
     #[serde(default)]
     pub writable: Vec<String>,
-    /// Further paths no sandbox may read, besides the built-in credential
-    /// locations.
+    /// Further paths the workspace's sandbox may not read, besides the
+    /// built-in credential locations.
     #[serde(default)]
     pub deny_read: Vec<String>,
 }
@@ -181,12 +188,6 @@ fn default_sandbox_allowlist() -> Vec<String> {
 }
 
 impl SandboxSettings {
-    /// Whether this is what an unstated conversation gets, so storing it would
-    /// say nothing.
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-
     /// The network policy the agent applies.
     pub fn network_policy(&self) -> remote_agent::protocol::NetworkPolicy {
         use remote_agent::protocol::{NetworkMode, NetworkPolicy};
@@ -374,6 +375,37 @@ pub struct GlobalSettings {
     /// conversation, not here: nothing runs from a draft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_conversation: Option<DraftConversationSnapshot>,
+    /// When a conversation hands its work over to a fresh one (`handoff.rs`).
+    /// Read by the run loop at every round boundary, so a change applies to a
+    /// run that is already going.
+    #[serde(default)]
+    pub auto_compact: AutoCompactSettings,
+}
+
+/// The composer's "auto-compact" switch and threshold.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCompactSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Percent of the model's context window at which a conversation is armed
+    /// to hand off, 20–97. The token threshold is this share of the window,
+    /// rounded down.
+    #[serde(default = "default_auto_compact_threshold")]
+    pub threshold_percent: u32,
+}
+
+impl Default for AutoCompactSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_percent: default_auto_compact_threshold(),
+        }
+    }
+}
+
+fn default_auto_compact_threshold() -> u32 {
+    crate::handoff::DEFAULT_THRESHOLD_PERCENT
 }
 
 /// What of the renderer's new-task draft outlives the process.
@@ -472,10 +504,21 @@ pub struct LocalModelPreferences {
     /// Describe each shell command in one line on its card.
     #[serde(default)]
     pub shell_explanations: bool,
+    /// Say in a few words why a failed tool call or shell command failed,
+    /// on its card's title.
+    #[serde(default)]
+    pub error_explanations: bool,
+    /// The uses above reach subagents and workflow steps too: their commands
+    /// and failures are explained, and each workflow step gets a title.
+    /// Their requests wait behind the conversation's own.
+    #[serde(default)]
+    pub subagents: bool,
     #[serde(default)]
     pub title_prompt: String,
     #[serde(default)]
     pub shell_prompt: String,
+    #[serde(default)]
+    pub error_prompt: String,
 }
 
 fn default_zoom() -> f64 {
@@ -1969,6 +2012,34 @@ impl ProviderFamily {
         matches!(self, Self::Anthropic)
     }
 
+    /// Whether this family has a tool-append interface, so a model's
+    /// `ToolAppend` capability is read: Messages' `tool_addition`, Responses'
+    /// `additional_tools`, Claude Code's own. Elsewhere the capability is
+    /// stored but idle, and every tool is declared up front.
+    pub fn tool_append_takes_effect(self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic | Self::OpenaiResponses | Self::OpenaiCodex | Self::Azure | Self::ClaudeAgent
+        )
+    }
+
+    /// Whether this family can carry a system message mid-conversation, so a
+    /// model's `SystemAppend` capability is read. Google's, Bedrock's and
+    /// Vertex's protocols put every system message at the head, and the Claude
+    /// Code CLI writes its own requests.
+    pub fn system_append_takes_effect(self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic
+                | Self::OpenaiResponses
+                | Self::OpenaiCodex
+                | Self::Azure
+                | Self::OpenaiChat
+                | Self::OpenaiCompatible
+                | Self::Xai
+        )
+    }
+
     /// Identity fields this family recognizes, including optional fields. Claude
     /// Agent has none: Mework ships the Claude Code build it drives, so there is
     /// no path for the user to name.
@@ -2053,12 +2124,20 @@ impl EndpointType {
 #[serde(rename_all = "snake_case")]
 pub enum ModelCapability {
     ImageRecognition,
+    /// Takes a tool appended mid-conversation through its protocol's append
+    /// interface at its provider's endpoint (`tool_append.rs`). Read only
+    /// where `ProviderFamily::tool_append_takes_effect` holds.
+    ToolAppend,
+    /// Takes a system message in the middle of the conversation at its
+    /// provider's endpoint (`system_append.rs`). Read only where
+    /// `ProviderFamily::system_append_takes_effect` holds.
+    SystemAppend,
 }
 
 impl ModelCapability {
     /// Catalog and chip-rendering order, matched by TypeScript tests.
     #[cfg(test)]
-    pub const CATALOG: &'static [Self] = &[Self::ImageRecognition];
+    pub const CATALOG: &'static [Self] = &[Self::ImageRecognition, Self::ToolAppend, Self::SystemAppend];
 
     /// This declaration is read only by cross-language tests and must agree with
     /// serde's `snake_case` persistence form.
@@ -2066,6 +2145,8 @@ impl ModelCapability {
     pub fn slug(self) -> &'static str {
         match self {
             Self::ImageRecognition => "image_recognition",
+            Self::ToolAppend => "tool_append",
+            Self::SystemAppend => "system_append",
         }
     }
 
@@ -2154,23 +2235,36 @@ pub struct ReasoningReplay {
     pub parts: Vec<Value>,
 }
 
+/// The five reasoning levels the composer offers, lowest first. There is no
+/// "off": every request asks the model to think, and how each level reaches a
+/// provider is the sidecar's per-family mapping (`aisdk-service/src/reasoning.ts`).
+///
+/// Older archives spell levels this no longer has: `disabled` (thinking off)
+/// and `minimal` read as the lowest level there is, `xhigh` is `extra` under
+/// its former name.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
-    #[default]
-    Disabled,
-    #[serde(alias = "minimal")]
+    #[serde(alias = "minimal", alias = "disabled")]
     Low,
+    #[default]
     Medium,
     High,
-    Xhigh,
+    #[serde(alias = "xhigh")]
+    Extra,
+    Max,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityLevel {
-    Plan,
+    /// `plan` is what archives written while plan mode was a security level
+    /// hold. Plan mode is a conversation setting of its own now
+    /// (`ConversationSettings::plan_mode_enabled`), and the loaders move the
+    /// old value there (`migrate_legacy_plan_level`); the alias only keeps a
+    /// stray one from failing a whole document.
     #[default]
+    #[serde(alias = "plan")]
     RequestApproval,
     AllowEdits,
     FullAccess,
@@ -2180,8 +2274,7 @@ impl SecurityLevel {
     /// Every level, so exhaustiveness can be asserted at run time where the
     /// compiler cannot (serde names, the `LiveSecurityLevel` byte mapping).
     #[cfg(test)]
-    pub const ALL: [SecurityLevel; 4] = [
-        SecurityLevel::Plan,
+    pub const ALL: [SecurityLevel; 3] = [
         SecurityLevel::RequestApproval,
         SecurityLevel::AllowEdits,
         SecurityLevel::FullAccess,
@@ -2189,7 +2282,6 @@ impl SecurityLevel {
 
     const fn as_byte(self) -> u8 {
         match self {
-            SecurityLevel::Plan => 0,
             SecurityLevel::RequestApproval => 1,
             SecurityLevel::AllowEdits => 2,
             SecurityLevel::FullAccess => 3,
@@ -2198,7 +2290,6 @@ impl SecurityLevel {
 
     const fn from_byte(byte: u8) -> SecurityLevel {
         match byte {
-            0 => SecurityLevel::Plan,
             2 => SecurityLevel::AllowEdits,
             3 => SecurityLevel::FullAccess,
             // Only `as_byte` writes the cell, so this is the `RequestApproval`
@@ -2209,10 +2300,34 @@ impl SecurityLevel {
     }
 }
 
+/// Moves the security level `plan`, which archives from when plan mode was a
+/// level hold, to what it means now: the strictest level, with the plan-mode
+/// setting on. Walks the whole value, because the level sits in every settings
+/// carrier — a conversation's own, a preset's, a workspace's last-used ones.
+pub fn migrate_legacy_plan_level(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.get("securityLevel").and_then(serde_json::Value::as_str) == Some("plan") {
+                object.insert("securityLevel".into(), serde_json::json!("request_approval"));
+                object.insert("planModeEnabled".into(), serde_json::json!(true));
+            }
+            for child in object.values_mut() {
+                migrate_legacy_plan_level(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                migrate_legacy_plan_level(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The level a live run is executing under right now, as opposed to the level
-/// it started with. Plan approval switches the level mid-turn, so every gate
-/// that runs after the switch must read this cell rather than the snapshot the
-/// run began with.
+/// it started with. The user may move the level at any time, mid-turn
+/// included, so every gate that runs after the switch must read this cell
+/// rather than the snapshot the run began with.
 pub struct LiveSecurityLevel(std::sync::atomic::AtomicU8);
 
 impl LiveSecurityLevel {
@@ -2242,6 +2357,39 @@ impl std::fmt::Debug for LiveSecurityLevel {
 /// `RunModelRequest` derives `PartialEq`; compare the level the cell holds,
 /// because the atomic itself is not comparable.
 impl PartialEq for LiveSecurityLevel {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+/// Whether a conversation is in plan mode right now, as opposed to when its
+/// run started. The user turns it on and off from the composer at any time,
+/// and an approved plan turns it off in the middle of the turn that asked, so
+/// everything that reads the mode after the run started reads this cell.
+pub struct LivePlanMode(std::sync::atomic::AtomicBool);
+
+impl LivePlanMode {
+    pub fn new(enabled: bool) -> Self {
+        Self(std::sync::atomic::AtomicBool::new(enabled))
+    }
+
+    pub fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set(&self, enabled: bool) {
+        self.0.store(enabled, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for LivePlanMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("LivePlanMode").field(&self.get()).finish()
+    }
+}
+
+/// Compared by the value the cell holds, like [`LiveSecurityLevel`].
+impl PartialEq for LivePlanMode {
     fn eq(&self, other: &Self) -> bool {
         self.get() == other.get()
     }
@@ -2321,6 +2469,13 @@ pub struct ModelProfile {
     /// is stored but has no wire effect.
     #[serde(default = "default_prompt_cache")]
     pub prompt_cache: bool,
+    /// How many minutes after a request this model's prompt cache is taken to
+    /// still hold it. Only the renderer reads it: it decides how long the
+    /// conversation settings warn before rewriting that cache
+    /// (`src/lib/toolLock.ts`). `None` means the renderer's default. It is not
+    /// sent to any provider — the providers' own lifetimes are theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_minutes: Option<u32>,
 }
 
 fn default_prompt_cache() -> bool {
@@ -2468,11 +2623,9 @@ pub struct ConversationPresetSettings {
     /// schema up front.
     #[serde(default)]
     pub mcp_tool_discovery_enabled: bool,
-    /// Sandbox template copied into a new conversation. A missing key is the
-    /// default: off, with the default network allowlist ready for when it is
-    /// switched on.
-    #[serde(default, skip_serializing_if = "SandboxSettings::is_default")]
-    pub sandbox: SandboxSettings,
+    // A sandbox template was copied into new conversations from here. The
+    // sandbox is a setting of each workspace now, so a preset has none; an
+    // old preset's key is read past and not written back.
     // The five file write guards were preset templates here. They are
     // unconditional in the host now, so there is nothing left to copy into a
     // conversation. See [`FileGuard`].
@@ -2643,6 +2796,13 @@ pub struct ConversationForkOrigin {
     pub number: u32,
 }
 
+/// Which conversation an auto-compact continuation carries on, and which of its
+/// continuations it is: the host titles it `<origin title>-handover-<number>`
+/// (`handoff.rs`). A continuation of a continuation names the same origin, so a
+/// chain of handoffs shares one numbering. A fork's shape, not a fork: its title
+/// is fixed when it opens and follows nothing afterwards.
+pub type ConversationHandoffOrigin = ConversationForkOrigin;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
@@ -2697,6 +2857,11 @@ pub struct Conversation {
     /// is deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_of: Option<ConversationForkOrigin>,
+    /// Set on a continuation the `handoff` tool opened; only the next handoff
+    /// reads it, to number its own continuation. A trace like `fork_of`: it may
+    /// dangle once the origin is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_of: Option<ConversationHandoffOrigin>,
     /// Conversation preset most recently applied. Empty means an unnamed draft.
     /// A trace, not a link: it is never validated against the catalog, never
     /// disables a field, and may dangle after its preset is deleted.
@@ -2934,6 +3099,13 @@ pub struct ConversationSettings {
     pub reasoning_effort: ReasoningEffort,
     #[serde(default)]
     pub security_level: SecurityLevel,
+    /// Whether this conversation is in plan mode (`plan_mode.rs`): the switch
+    /// under the composer. Independent of the security level — the model
+    /// writes a plan and asks for approval, and the level decides what its
+    /// calls need either way. The host turns it off when the user approves a
+    /// plan. A missing key means off.
+    #[serde(default)]
+    pub plan_mode_enabled: bool,
     /// Whether this conversation loads the global memory tier (`~/.mework`).
     ///
     /// When true, that tier's `MEWORK.md` instructions and `MEMORY.md` index
@@ -2968,20 +3140,20 @@ pub struct ConversationSettings {
     /// purpose.
     #[serde(default)]
     pub mcp_tool_discovery_enabled: bool,
-    /// Whether this conversation's commands run in the operating system's
-    /// sandbox, and what it lets through. One cell per conversation and machine
-    /// ([`crate::workspace_set::WorkspaceSet::sandboxed`]), so a conversation's
-    /// answer changes nothing for any other.
-    ///
-    /// A missing key means OFF, like every capability here that a conversation
-    /// is given deliberately; a preset is where "on" is decided.
-    #[serde(default, skip_serializing_if = "SandboxSettings::is_default")]
-    pub sandbox: SandboxSettings,
-    /// What this conversation's runs have already put in front of the model.
+    /// The sandbox this conversation's commands ran in when the sandbox was a
+    /// setting of each conversation. It is a setting of each workspace now
+    /// ([`ExecutionEnvironmentAssets::sandboxes`]), so this is read and never
+    /// written: loading hands one that was on to the workspaces the
+    /// conversation works in (`storage::lift_conversation_sandboxes`), and
+    /// nothing else reads it.
+    #[serde(default, rename = "sandbox", skip_serializing)]
+    pub legacy_sandbox: SandboxSettings,
+    /// What this conversation's last request put in front of the model, and
+    /// which model sent it when.
     ///
     /// `None` until the first run. The host does not decide the contents — the
-    /// renderer merges each run's exposure in — but the field must exist here so
-    /// a settings round trip through the store does not drop it.
+    /// renderer records each request's surface — but the field must exist here
+    /// so a settings round trip through the store does not drop it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_lock: Option<ConversationToolLock>,
 }
@@ -3009,13 +3181,16 @@ pub struct FileGuard {
     pub parent_scope: Option<String>,
 }
 
-/// The tool surface a conversation has already exposed. It only ever grows: a
-/// transcript that already calls a tool cannot be replayed to a model that no
-/// longer has it.
+/// The tool surface a conversation's last request went out with, and which
+/// model sent it when. The renderer owns it (`src/lib/toolLock.ts`): it draws
+/// the settings that would rewrite that model's cached prompt, and freezes the
+/// surface of a model that cannot take a tool mid-conversation. The host only
+/// round-trips it, apart from `prompt_skill_ids`.
 ///
-/// The four optional fields are pins rather than growing sets: each holds one
-/// answer a run has already acted on, where a second answer would contradict
-/// the transcript rather than extend it.
+/// The three optional selection fields are pins: each holds one answer a run
+/// has already acted on, where a second answer would contradict the transcript
+/// rather than extend it. The two backend pins only ever hold native: a
+/// host-run backend is part of the surface (`search_backend`/`fetch_backend`).
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationToolLock {
@@ -3029,20 +3204,19 @@ pub struct ConversationToolLock {
     pub project_memory: bool,
     #[serde(default)]
     pub skill_tool: bool,
-    /// Whether a run has already withheld MCP tool schemas behind
-    /// `tool_search`. A pin rather than a widening: the transcript carries the
-    /// conversation's MCP tools one way or the other, and the other way would
-    /// either redeclare what is already there or point at a tool the earlier
-    /// rounds never had.
+    /// Whether the last request withheld MCP tool schemas behind `tool_search`.
     #[serde(default)]
     pub mcp_tool_discovery: bool,
-    /// Whether a run has already granted web access. One bit for the feature,
+    /// Whether the last request granted web access. One bit for the feature,
     /// not one per tool name: which of `web_search` / `web_fetch` a run grants
     /// follows the resolved backend's capabilities, the same way which memory
     /// tools a tier grants follows the tier.
     #[serde(default)]
     pub web_search: bool,
-    /// Skills already handed to the model, by catalog id.
+    /// Whether the last request offered the plan-mode pair.
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// Skills selected at the last request, by catalog id.
     #[serde(default)]
     pub skill_ids: Vec<String>,
     /// The skills this conversation's system prompt was assembled from, fixed
@@ -3052,13 +3226,39 @@ pub struct ConversationToolLock {
     /// later additions had a second route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_skill_ids: Option<Vec<String>>,
-    /// The backend that has searched for this conversation. Host-read only for
+    /// The search backend the last request's settings named, `None` when it
+    /// had no web access. Round-tripped only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_backend: Option<SearchProviderSelection>,
+    /// The fetch backend the last request's settings named, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_backend: Option<FetchProviderSelection>,
+    /// Whether the last request granted `web_fetch`.
+    #[serde(default)]
+    pub web_fetch: bool,
+    /// Native search, once a run has searched with it. Host-read only for
     /// round tripping; the renderer owns the decision to pin it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_provider: Option<SearchProviderSelection>,
-    /// The backend that has fetched pages for this conversation.
+    /// Native fetch, once a run has been granted `web_fetch` with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_provider: Option<FetchProviderSelection>,
+    /// The model the last request used, and when it went out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request: Option<ToolLockRequest>,
+    /// Every model's latest request in this conversation, one entry per model,
+    /// for the composer's model menu to mark the ones whose cache is still warm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_requests: Vec<ToolLockRequest>,
+}
+
+/// Which model a conversation's last request used, and when (RFC 3339).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLockRequest {
+    pub provider_id: String,
+    pub model_id: String,
+    pub at: String,
 }
 
 /// Hand-written so a lock pinned by a build that still had the `auto` fetch
@@ -3104,13 +3304,25 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             #[serde(default)]
             web_search: bool,
             #[serde(default)]
+            plan_mode: bool,
+            #[serde(default)]
             skill_ids: Vec<String>,
             #[serde(default)]
             prompt_skill_ids: Option<Vec<String>>,
             #[serde(default)]
+            search_backend: Option<SearchProviderSelection>,
+            #[serde(default)]
+            fetch_backend: Option<FetchProviderSelection>,
+            #[serde(default)]
+            web_fetch: bool,
+            #[serde(default)]
             search_provider: Option<SearchProviderSelection>,
             #[serde(default)]
             fetch_provider: Option<StoredFetchProvider>,
+            #[serde(default)]
+            last_request: Option<ToolLockRequest>,
+            #[serde(default)]
+            model_requests: Vec<ToolLockRequest>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -3139,10 +3351,16 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             skill_tool: raw.skill_tool,
             mcp_tool_discovery: raw.mcp_tool_discovery,
             web_search: raw.web_search,
+            plan_mode: raw.plan_mode,
             skill_ids: raw.skill_ids,
             prompt_skill_ids: raw.prompt_skill_ids,
+            search_backend: raw.search_backend,
+            fetch_backend: raw.fetch_backend,
+            web_fetch: raw.web_fetch,
             search_provider: raw.search_provider,
             fetch_provider,
+            last_request: raw.last_request,
+            model_requests: raw.model_requests,
         })
     }
 }
@@ -3161,15 +3379,38 @@ pub struct ResolvedSkill {
     pub directory: String,
 }
 
-/// One skill that reaches the model as its own system message rather than
-/// through the opening prompt, already rendered in the conversation's prompt
-/// profile and its delivery mode.
+/// One skill that reaches the model as a host notice rather than through the
+/// opening prompt, already rendered in the conversation's prompt profile and
+/// its delivery mode.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AddedSkill {
     /// Catalog resource id. The context id is derived from it, which is what
     /// keeps a second round from delivering the same skill again.
     pub resource_id: String,
+    /// The skill's name, for the notice's summary line.
+    pub name: String,
     pub content: String,
+}
+
+/// One message the host has for the model, waiting for the round loop to hand
+/// it over as a `box` delivery (`api::deliver_host_notices`).
+///
+/// Producers only queue: most of them run where no card can be placed yet — a
+/// hook in the middle of a tool batch, a diagnostics scan before the round's
+/// exchange exists — and the loop is the one place that knows whether the
+/// notice rides this round's tool results or takes its own timeline spot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostNotice {
+    /// The notice's name on its card (`wire_history::notice_kind`). The
+    /// renderer titles the row by it; it never reaches the wire.
+    pub kind: &'static str,
+    /// The `<summary>` line: what arrived, in one sentence.
+    pub summary: String,
+    /// The `<result>` body.
+    pub body: String,
+    /// The card id for a notice a conversation receives at most once (a skill
+    /// added mid-conversation); `None` mints a fresh one.
+    pub id: Option<String>,
 }
 
 /// One MCP tool whose schema this run withheld from the wire.
@@ -3214,6 +3455,13 @@ pub enum ContextItem {
             skip_serializing_if = "Option::is_none"
         )]
         hook_execution: Option<HookContextMetadata>,
+        /// Tools that joined the conversation at this point (`tool_append.rs`).
+        /// A host record, always `local_only`: its text never reaches the
+        /// model. What it does reach is each protocol's own append interface,
+        /// which hands the tools over here, at the end of the transcript as it
+        /// stood, instead of rewriting the tool list every request declares.
+        #[serde(rename = "toolsAdded", default, skip_serializing_if = "Vec::is_empty")]
+        tools_added: Vec<String>,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -3354,6 +3602,17 @@ pub enum ContextItem {
         /// Full child transcript and progress updates for a `subagent` call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent: Option<SubagentRunRecord>,
+        /// Which host message a `box` delivery card carries
+        /// (`wire_history::notice_kind`), so the renderer can title the row and
+        /// the host can find its own notices again. Absent on a delivered
+        /// background result and on every other card.
+        ///
+        /// Host bookkeeping, never model input: the card's `input` is the empty
+        /// argument the fabricated call carries and its result is the whole
+        /// message, both exactly as the model reads them. Unattested on purpose,
+        /// like `round`: it changes no byte the model sees.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
         /// Host proof that this card's result came from this application's own
         /// execution rather than from the renderer.
         ///
@@ -3436,7 +3695,7 @@ pub struct SubagentRunRecord {
     /// generic agent_spawn arguments and uses a narrower capability profile.
     #[serde(default)]
     pub kind: SubagentRunKind,
-    /// Stable per-conversation agent name used by messaging and `agent_wait`.
+    /// Stable per-conversation agent name addressed by `task_wait`.
     /// Absent on legacy `subagent` records, which are not continuable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -3473,10 +3732,6 @@ pub struct SubagentRunRecord {
     pub status: SubagentRunStatus,
     pub contexts: Vec<ContextItem>,
     pub updates: Vec<SubagentUpdate>,
-    /// Parent messages not yet consumed by a child turn. Queue-only messages
-    /// remain dormant; follow-up tasks wake the child when resumed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued_messages: Vec<QueuedSubagentMessage>,
     /// The latest value this agent returned through `structured_output`.
     /// `#[serde(default)]` is mandatory: `task`/`status`/`contexts`/`updates`
     /// above carry no serde attributes and are required keys, so every existing
@@ -3720,14 +3975,6 @@ pub(crate) fn canonical_subagent_execution_mode_payload(
     .map_err(|error| format!("无法编码子代理执行模式回执: {error}"))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct QueuedSubagentMessage {
-    pub content: String,
-    #[serde(default)]
-    pub trigger_turn: bool,
-}
-
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -3922,9 +4169,9 @@ pub enum ToolCategory {
     /// trusted model loop so renderer input can never select the search
     /// provider, its credentials, or its endpoint) and the preview tools.
     Web,
-    /// Host-owned coordination: the subagent tools, `workflow`, the `todo`
-    /// state tool, and `ask_user`. Every member is executed by the
-    /// model run loop itself, never by the manual tool executor.
+    /// Host-owned coordination: the subagent tools, `workflow`, and
+    /// `ask_user`. Every member is executed by the model run loop itself,
+    /// never by the manual tool executor.
     Orchestration,
     /// Model-owned long-term memory. The model identity and workspace scope are
     /// injected by the trusted host request and are never accepted as tool
@@ -4076,8 +4323,8 @@ pub struct RunModelRequest {
     #[serde(skip)]
     pub memory_context_id: Option<String>,
     /// Exact host-created startup context carrying trusted project/user
-    /// instructions. It is distinct from model-owned memory capability and
-    /// lets refresh remove only the context it previously created.
+    /// instructions. It is distinct from the long-term memory block and lets
+    /// refresh remove only the context it previously created.
     #[serde(skip)]
     pub project_memory_context_id: Option<String>,
     /// Exact trusted named-agent definition selected for this child. It is
@@ -4130,10 +4377,16 @@ pub struct RunModelRequest {
     pub enabled_tools: Vec<String>,
     pub contexts: Vec<ContextItem>,
     /// Per-run low-priority context assembled by the trusted host (for
-    /// example project instructions and model-owned memory). It is projected
+    /// example project instructions and the long-term memory index). It is projected
     /// as user context before conversation history and is never persisted.
     #[serde(skip)]
     pub ephemeral_contexts: Vec<ContextItem>,
+    /// Host notices queued for the next delivery point of the round loop. Every
+    /// message the host appends to a conversation goes through here and reaches
+    /// the model as a `box` result, so it lands at the end of the transcript
+    /// rather than in the system prompt or ahead of the history.
+    #[serde(skip)]
+    pub host_notices: Vec<HostNotice>,
     pub tools: Vec<ToolDescriptor>,
     /// Resolved from the persisted conversation by Rust. Renderer-provided values are replaced.
     #[serde(default)]
@@ -4143,11 +4396,22 @@ pub struct RunModelRequest {
     /// for the level in force right now.
     #[serde(default)]
     pub security_level: SecurityLevel,
-    /// Shared with every descendant of this run so a mid-turn switch (plan
-    /// approval) reaches them. Absent outside a registered run, and never on
-    /// the wire — the renderer must not be able to name a level.
+    /// Shared with every descendant of this run so a mid-turn switch (the user
+    /// picking another level while the turn streams) reaches them. Absent
+    /// outside a registered run, and never on the wire — the renderer must not
+    /// be able to name a level.
     #[serde(skip)]
     pub live_security_level: Option<std::sync::Arc<LiveSecurityLevel>>,
+    /// Whether this run offers the `plan` / `exit_plan_mode` pair: plan mode
+    /// is on, or was on earlier in this conversation — once offered, the pair
+    /// stays, so turning plan mode on again never appends it twice. Host-only,
+    /// like the level: the renderer cannot grant the tools by asserting it.
+    #[serde(skip)]
+    pub plan_tools: bool,
+    /// The conversation's plan-mode switch as it stands now (`LivePlanMode`).
+    /// Absent outside a registered top-level run, which is never in plan mode.
+    #[serde(skip)]
+    pub live_plan_mode: Option<std::sync::Arc<LivePlanMode>>,
     /// Trusted Tauri application-data root injected by Rust. Renderer input is ignored.
     #[serde(default)]
     pub app_data_path: String,
@@ -4186,6 +4450,12 @@ pub struct RunModelRequest {
     /// when spawning a subagent so nested spawns can be refused deterministically.
     #[serde(skip)]
     pub subagent_depth: usize,
+    /// The conversation's handoff notebook and whether the run is armed to
+    /// hand off (`handoff.rs`). Host-only: resolved when the run starts and
+    /// moved only by the run loop, so neither the renderer nor the model can
+    /// grant itself the tools it decides.
+    #[serde(skip)]
+    pub handoff: crate::handoff::HandoffRun,
     /// The turn this request belongs to, as the host knows it.
     ///
     /// Hydrated in `trusted_run_request` from `run_model`'s own argument, never
@@ -4213,21 +4483,16 @@ pub struct RunModelRequest {
     /// displays, so this is what lets the card open the requester's own page.
     #[serde(skip)]
     pub subagent_call_id: Option<String>,
-    /// The request ledger this run's traffic is filed under when `subagent_name`
-    /// alone would not name one ledger per agent. A workflow step's pool name
-    /// restarts at `ws1` for every run, so two runs' first steps would share a
-    /// ledger and read as one agent; the step's driver sets this to
+    /// The owner this run's history entries are filed under when `subagent_name`
+    /// alone would not name one owner per agent. A workflow step's pool name
+    /// restarts at `ws1` for every run, so two runs' first steps would share an
+    /// owner and read as one agent; the step's driver sets this to
     /// `<run>/<name>` instead, which the step shell also publishes so the
-    /// renderer can ask for exactly that ledger. `None` — every other request —
+    /// renderer can ask for exactly those entries. `None` — every other request —
     /// derives the owner from `subagent_name` and `subagent_depth`. Host-set;
     /// never from IPC.
     #[serde(skip)]
-    pub wire_ledger_owner: Option<String>,
-    /// Parent→child mailbox attached only to trusted child requests built by
-    /// the run loop; the child drains it before every model round so queued
-    /// Queue-only child-agent messages arrive mid-turn. Never crosses IPC.
-    #[serde(skip)]
-    pub agent_mailbox: crate::agents::AgentMailboxHandle,
+    pub history_owner: Option<String>,
     /// User steer inbox attached only by the trusted `run_model` command.
     /// Queue cards remain persisted until the loop emits `UserInputReceived`.
     #[serde(skip)]
@@ -4277,9 +4542,19 @@ impl RunModelRequest {
 
     /// The security level in force for the next decision.
     ///
-    /// Plan approval switches the level in the middle of a turn, so every gate
+    /// The user may switch the level in the middle of a turn, so every gate
     /// evaluated during a run reads this rather than `security_level`, which is
     /// only the value the run started with.
+    /// Whether this run is in plan mode right now. Only the conversation the
+    /// user is talking to plans; a child never is, whatever the switch says.
+    pub fn plan_mode_active(&self) -> bool {
+        self.subagent_depth == 0
+            && self
+                .live_plan_mode
+                .as_ref()
+                .is_some_and(|cell| cell.get())
+    }
+
     pub fn effective_security_level(&self) -> SecurityLevel {
         match &self.live_security_level {
             Some(cell) => cell.get(),
@@ -4500,6 +4775,20 @@ pub enum ModelStreamEvent {
         #[serde(rename = "createdAt")]
         created_at: String,
     },
+    /// A context the host itself added to the transcript between two of the
+    /// model's requests: a `box` delivery (a background result, a restart
+    /// notice, a host notice such as auto-compact arming), an appended system
+    /// prompt, a tool-addition marker, a Stop hook's continuation message.
+    ///
+    /// Nothing else announces these. The card is already in the run's
+    /// persisted contexts; this lets the renderer show it in the live turn
+    /// rather than only once the turn settles. `round` is the round it joins
+    /// ahead of, and the host sends these and `UserInputReceived` in the
+    /// order the transcript holds them.
+    HostContextAdded {
+        round: usize,
+        context: Box<ContextItem>,
+    },
     ToolCallAnnounced {
         round: usize,
         #[serde(rename = "callId")]
@@ -4570,6 +4859,10 @@ pub enum ModelStreamEvent {
         /// reads as the deliberate exception it is rather than a malfunction.
         #[serde(default)]
         mandatory: bool,
+        /// The questions a `question` card asks (the `ask_user` input's
+        /// `questions` array). Absent on every other kind.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        questions: Option<serde_json::Value>,
     },
     /// The pending approval card for `promptId` is over. `approved` reports
     /// what the host concluded, which is not always what the user clicked —
@@ -4853,6 +5146,7 @@ mod tests {
             capabilities: BTreeSet::new(),
             reasoning_content: Default::default(),
             prompt_cache: true,
+            cache_ttl_minutes: None,
         };
         assert!(!model.supports_vision());
 
@@ -5619,6 +5913,44 @@ mod tests {
         );
     }
 
+    /// The host only round-trips the lock, so every field the renderer writes
+    /// must survive a save — a dropped one would take the cache marks and the
+    /// backend tones with it.
+    #[test]
+    fn the_lock_surface_backends_and_model_requests_round_trip() {
+        let wire = serde_json::json!({
+            "tools": ["read"],
+            "mcpIds": [],
+            "globalMemory": false,
+            "projectMemory": false,
+            "skillTool": false,
+            "mcpToolDiscovery": false,
+            "webSearch": true,
+            "planMode": false,
+            "skillIds": [],
+            "searchBackend": { "kind": "explicit", "providerKind": "tavily" },
+            "fetchBackend": { "kind": "explicit", "providerKind": "jina" },
+            "webFetch": true,
+            "searchProvider": { "kind": "native" },
+            "lastRequest": { "providerId": "p", "modelId": "b", "at": "2026-09-30T10:05:00Z" },
+            "modelRequests": [
+                { "providerId": "p", "modelId": "a", "at": "2026-09-30T10:00:00Z" },
+                { "providerId": "p", "modelId": "b", "at": "2026-09-30T10:05:00Z" }
+            ]
+        });
+        let lock = serde_json::from_value::<ConversationToolLock>(wire.clone())
+            .expect("a lock with every field opens");
+        assert_eq!(
+            lock.fetch_backend,
+            Some(FetchProviderSelection::Explicit {
+                provider_kind: SearchProviderKind::Jina
+            })
+        );
+        assert!(lock.web_fetch);
+        assert_eq!(lock.model_requests.len(), 2);
+        assert_eq!(serde_json::to_value(&lock).expect("serializable"), wire);
+    }
+
     /// The shaping defaults are the ones a conversation persisted before these
     /// keys existed must open on: it asked for the ordinary shaping, not for
     /// everything.
@@ -5938,11 +6270,11 @@ mod tests {
                     content: "已完成接口审查".into(),
                     created_at: "2026-07-14T00:00:01Z".into(),
                 }],
-                queued_messages: Vec::new(),
                 structured_output: None,
                 output_schema: None,
                 usage: ModelUsage::default(),
             }),
+            notice: None,
             attestation: String::new(),
             created_at: "2026-07-14T00:00:03Z".into(),
         };
@@ -6122,10 +6454,21 @@ mod tests {
     }
 
     #[test]
-    fn minimal_reasoning_effort_migrates_to_low() {
-        let effort: ReasoningEffort = serde_json::from_value(json!("minimal")).unwrap();
-        assert_eq!(effort, ReasoningEffort::Low);
-        assert_eq!(serde_json::to_value(effort).unwrap(), json!("low"));
+    fn retired_reasoning_effort_spellings_migrate() {
+        for (legacy, level, written) in [
+            ("minimal", ReasoningEffort::Low, "low"),
+            ("disabled", ReasoningEffort::Low, "low"),
+            ("xhigh", ReasoningEffort::Extra, "extra"),
+        ] {
+            let effort: ReasoningEffort = serde_json::from_value(json!(legacy)).unwrap();
+            assert_eq!(effort, level, "{legacy}");
+            assert_eq!(serde_json::to_value(effort).unwrap(), json!(written));
+        }
+        assert_eq!(
+            serde_json::to_value(ReasoningEffort::Max).unwrap(),
+            json!("max")
+        );
+        assert_eq!(ReasoningEffort::default(), ReasoningEffort::Medium);
     }
 
     /// A record's `outputSchema` document round-trips under its camelCase wire
@@ -6149,7 +6492,6 @@ mod tests {
             status: SubagentRunStatus::Completed,
             contexts: Vec::new(),
             updates: Vec::new(),
-            queued_messages: Vec::new(),
             structured_output: None,
             output_schema: Some(schema_document.clone()),
             usage: ModelUsage::default(),
@@ -6238,7 +6580,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                json!("plan"),
                 json!("request_approval"),
                 json!("allow_edits"),
                 json!("full_access"),
@@ -6256,13 +6597,12 @@ mod tests {
         assert_eq!(SecurityLevel::default(), SecurityLevel::RequestApproval);
     }
 
-    /// Plan approval switches the level in the middle of a turn, so the cell has
-    /// to survive a round trip through the byte it stores for every level, not
-    /// just the two that plan mode moves between.
+    /// The user moves the level in the middle of a turn, so the cell has to
+    /// survive a round trip through the byte it stores for every level.
     #[test]
     fn the_live_cell_round_trips_every_level() {
-        let cell = LiveSecurityLevel::new(SecurityLevel::Plan);
-        assert_eq!(cell.get(), SecurityLevel::Plan);
+        let cell = LiveSecurityLevel::new(SecurityLevel::FullAccess);
+        assert_eq!(cell.get(), SecurityLevel::FullAccess);
         for level in SecurityLevel::ALL {
             cell.set(level);
             assert_eq!(cell.get(), level);
@@ -6280,8 +6620,8 @@ mod tests {
         .expect("settings with remembered families");
         let serialized = serde_json::to_value(&settings).unwrap();
         assert!(serialized.get("rememberedToolFamilies").is_none());
-        // An unstated sandbox is the default one, and is not written out.
+        // An unstated sandbox is the default one, and none is written out.
         assert!(serialized.get("sandbox").is_none());
-        assert_eq!(settings.sandbox, SandboxSettings::default());
+        assert_eq!(settings.legacy_sandbox, SandboxSettings::default());
     }
 }

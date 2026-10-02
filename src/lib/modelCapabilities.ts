@@ -105,6 +105,8 @@ export function knownFamilySettings(family: ProviderFamily): readonly FamilySett
 /** Capability catalog in chip-rendering order, matching Rust `ModelCapability::CATALOG`. */
 export const MODEL_CAPABILITIES: readonly ModelCapability[] = [
   "image_recognition",
+  "tool_append",
+  "system_append",
 ];
 
 /** Reasoning-form catalog in selector-rendering order, matching Rust `ReasoningContent::CATALOG`. */
@@ -177,17 +179,182 @@ export function promptCacheTakesEffect(family: ProviderFamily): boolean {
   return family === "anthropic";
 }
 
+/** Models the Messages API takes `tool_addition` from. Mirrors Rust `ANTHROPIC_TOOL_CHANGE_MODELS`. */
+const ANTHROPIC_TOOL_CHANGE_MODELS = ["fable-5", "mythos-5", "opus-5", "opus-4-8", "sonnet-5-5"] as const;
+/** Earlier Claude models the same documentation leaves out. Mirrors Rust `ANTHROPIC_EARLIER_MODELS`. */
+const ANTHROPIC_EARLIER_MODELS = [
+  "claude-instant", "claude-2", "claude-3", "opus-4", "sonnet-4", "haiku-4", "haiku-3",
+] as const;
+/** Current models documented without it, as released. Mirrors Rust `ANTHROPIC_RELEASES_WITHOUT`. */
+const ANTHROPIC_RELEASES_WITHOUT = ["sonnet-5"] as const;
+/** Models Claude Code appends tools for itself. Mirrors Rust `CLAUDE_CODE_TOOL_CHANGE_MODELS`. */
+const CLAUDE_CODE_TOOL_CHANGE_MODELS = ["fable-5", "mythos-5", "opus-5", "opus-4-8"] as const;
+
 /**
- * Whether a conversation on this family may gain a tool it did not start with.
- * Messages and Responses re-declare the whole tool set on every request, so a
- * later round can carry a wider one. Every other dialect is treated as pinned
- * for the life of the transcript: rather than send a request the upstream may
- * reject, the composer asks the user to drop the addition or change models.
+ * Whether `modelId` names one of `families`, followed by whatever `restOk`
+ * accepts, the family appearing whole (at the start or after a `-`). Case,
+ * `.` for `-` and Claude Code's `[1m]` suffix do not matter. Mirrors Rust
+ * `tool_append::names_model_with`.
  */
-export function acceptsMidConversationTools(family: ProviderFamily): boolean {
+function namesModelWith(modelId: string, families: readonly string[], restOk: (rest: string) => boolean): boolean {
+  const id = modelId.toLowerCase().replaceAll(".", "-").replace(/\[1m\]$/, "");
+  return families.some((family) => {
+    let at = id.indexOf(family);
+    while (at !== -1) {
+      if ((at === 0 || id[at - 1] === "-") && restOk(id.slice(at + family.length))) return true;
+      at = id.indexOf(family, at + 1);
+    }
+    return false;
+  });
+}
+
+/** The family followed by the end of the id or another `-` segment. Mirrors Rust `names_model`. */
+function namesModel(modelId: string, families: readonly string[]): boolean {
+  return namesModelWith(modelId, families, (rest) => rest === "" || rest.startsWith("-"));
+}
+
+/** The family as released: the end of the id or a dated snapshot. Mirrors Rust `names_release`. */
+function namesRelease(modelId: string, families: readonly string[]): boolean {
+  return namesModelWith(modelId, families, (rest) => rest === "" || /^-\d{8}$/u.test(rest));
+}
+
+/**
+ * Whether `baseUrl` is the vendor's own endpoint for `family`; empty is the
+ * provider's default, which is. Mirrors Rust `host_append::at_vendor_endpoint`.
+ */
+export function atVendorEndpoint(family: ProviderFamily, baseUrl: string): boolean {
+  const trimmed = baseUrl.trim();
+  if (!trimmed) return true;
+  let host: string;
+  try {
+    host = new URL(trimmed).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  switch (family) {
+    case "anthropic":
+      return host === "api.anthropic.com";
+    case "openai_responses":
+    case "openai_codex":
+    case "azure":
+    case "openai_chat":
+      return host === "api.openai.com"
+        || host === "chatgpt.com"
+        || [".openai.azure.com", ".cognitiveservices.azure.com", ".services.ai.azure.com"]
+          .some((suffix) => host.endsWith(suffix));
+    default:
+      return false;
+  }
+}
+
+/** What Anthropic documents for this model at its own endpoint. Mirrors Rust `tool_append::anthropic_documents`. */
+function anthropicDocuments(modelId: string): boolean | null {
+  if (namesModel(modelId, ANTHROPIC_TOOL_CHANGE_MODELS)) return true;
+  if (namesModel(modelId, ANTHROPIC_EARLIER_MODELS) || namesRelease(modelId, ANTHROPIC_RELEASES_WITHOUT)) return false;
+  return null;
+}
+
+/**
+ * What Mework knows about this model taking a tool mid-conversation at this
+ * endpoint; `null` is the user's to say (a relay, a model the vendor's
+ * documentation does not cover). Mirrors Rust `tool_append::known`.
+ */
+export function knownToolAppend(family: ProviderFamily, baseUrl: string, modelId: string): boolean | null {
+  const vendor = atVendorEndpoint(family, baseUrl);
+  switch (family) {
+    case "openai_codex":
+      return true;
+    case "openai_responses":
+    case "azure":
+      return vendor ? true : null;
+    case "anthropic":
+      return vendor ? anthropicDocuments(modelId) : null;
+    case "claude_agent":
+      return namesModel(modelId, CLAUDE_CODE_TOOL_CHANGE_MODELS);
+    default:
+      return false;
+  }
+}
+
+/**
+ * What Mework knows about this model taking a system message mid-conversation
+ * at this endpoint; `null` is the user's to say. Mirrors Rust
+ * `system_append::known`.
+ */
+export function knownSystemAppend(family: ProviderFamily, baseUrl: string, modelId: string): boolean | null {
+  const vendor = atVendorEndpoint(family, baseUrl);
+  switch (family) {
+    case "openai_responses":
+    case "openai_codex":
+    case "azure":
+      return true;
+    case "openai_chat":
+      return vendor ? true : null;
+    case "anthropic":
+      return vendor ? anthropicDocuments(modelId) : null;
+    case "openai_compatible":
+    case "xai":
+      return null;
+    default:
+      return false;
+  }
+}
+
+/**
+ * The append capabilities Mework declares for a model it fills in itself:
+ * those it knows the model has at this endpoint. Mirrors Rust
+ * `model_discovery::known_append_capabilities`.
+ */
+export function knownAppendCapabilities(
+  provider: { family: ProviderFamily; baseUrl: string },
+  modelId: string
+): ModelCapability[] {
+  return [
+    ...(knownToolAppend(provider.family, provider.baseUrl, modelId) === true ? ["tool_append" as const] : []),
+    ...(knownSystemAppend(provider.family, provider.baseUrl, modelId) === true ? ["system_append" as const] : []),
+  ];
+}
+
+/**
+ * Whether this family has a tool-append interface, so the `tool_append`
+ * capability is read. Mirrors Rust `ProviderFamily::tool_append_takes_effect`.
+ */
+export function toolAppendTakesEffect(family: ProviderFamily): boolean {
   return family === "anthropic"
     || family === "openai_responses"
-    || family === "openai_codex";
+    || family === "openai_codex"
+    || family === "azure"
+    || family === "claude_agent";
+}
+
+/**
+ * Whether this family can carry a system message mid-conversation, so the
+ * `system_append` capability is read. Mirrors Rust
+ * `ProviderFamily::system_append_takes_effect`.
+ */
+export function systemAppendTakesEffect(family: ProviderFamily): boolean {
+  return family === "anthropic"
+    || family === "openai_responses"
+    || family === "openai_codex"
+    || family === "azure"
+    || family === "openai_chat"
+    || family === "openai_compatible"
+    || family === "xai";
+}
+
+/**
+ * Whether a conversation on this model can take a tool mid-conversation at all:
+ * the model declares `tool_append` — filled in by Mework where it knows, by the
+ * user everywhere else — and its protocol has an append interface. Where it
+ * cannot, the conversation's tool surface is fixed from its first request on —
+ * the settings lock it gray — and auto-compact and MCP tool discovery, which
+ * both add tools mid-run, are unavailable. Mirrors Rust `tool_append::appends_tools`.
+ */
+export function appendsTools(
+  provider: { family: ProviderFamily },
+  model: { capabilities?: readonly ModelCapability[] }
+): boolean {
+  return toolAppendTakesEffect(provider.family) && (model.capabilities ?? []).includes("tool_append");
 }
 
 /**

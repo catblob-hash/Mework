@@ -101,6 +101,31 @@ describe("TerminalTabBar", () => {
     expect(onReorder).toHaveBeenCalledExactlyOnceWith(["terminal-2", "terminal-1"]);
   });
 
+  it("leads with the read-only page, which keeps its place, takes no name, and closes as itself", async () => {
+    const user = userEvent.setup();
+    const onReorder = vi.fn();
+    const { onClose } = setup({
+      tabs: [
+        { id: "read-only", label: "bash", title: "npm test", readOnly: true },
+        { id: "terminal-1", label: "终端 1" }
+      ],
+      onReorder
+    });
+
+    expect(screen.getAllByRole("tab").map((element) => element.textContent)).toEqual(["bash", "终端 1"]);
+    expect(tab("bash")).toHaveAttribute("title", "npm test");
+    tab("bash").focus();
+    await user.keyboard("{Control>}{Shift>}{ArrowRight}{/Shift}{/Control}");
+    tab("终端 1").focus();
+    await user.keyboard("{Control>}{Shift>}{ArrowLeft}{/Shift}{/Control}");
+    expect(onReorder).not.toHaveBeenCalled();
+    await user.dblClick(tab("bash"));
+    expect(screen.queryByRole("textbox", { name: "重命名终端" })).not.toBeInTheDocument();
+    await user.click(within(tab("bash").closest(".page-tab") as HTMLElement)
+      .getByRole("button", { name: "关闭只读终端" }));
+    expect(onClose).toHaveBeenCalledExactlyOnceWith("read-only");
+  });
+
   describe("renaming", () => {
     it("commits a new name on Enter", async () => {
       const user = userEvent.setup();

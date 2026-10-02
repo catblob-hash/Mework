@@ -2,7 +2,7 @@
 
 ## Approval
 
-Reading the host's own server registry is a local browser observation (`browser.local_observation`, low risk, read effect), scoped to the workspace and the application's data directory. No security level asks for it, Plan mode included, so no approval card ever appears.
+Reading the host's own server registry is a local browser observation (`browser.local_observation`, low risk, read effect), scoped to the workspace and the application's data directory. No security level asks for it, so no approval card ever appears.
 
 ## Behavior and limits
 

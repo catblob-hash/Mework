@@ -26,7 +26,7 @@ export const SHELL_BACKENDS_BY_OS: Record<MachineOs, readonly ShellBackend[]> = 
 };
 
 /** Every backend, in the order its tools are listed. Mirrors `ShellBackend::ALL`. */
-export const SHELL_BACKENDS: readonly ShellBackend[] = ["bash", "zsh", "sh", "powershell"];
+const SHELL_BACKENDS: readonly ShellBackend[] = ["bash", "zsh", "sh", "powershell"];
 
 export function isShellBackend(value: unknown): value is ShellBackend {
   return typeof value === "string" && (SHELL_BACKENDS as readonly string[]).includes(value);
@@ -233,6 +233,31 @@ export function withDefaultAgentShell(
   if (configuredAgentShell(machine, assets)) return assets;
   const preferred = preferredBackend(shells.os, shells.shells.map((shell) => shell.backend));
   return preferred ? withAgentShell(assets, machine, preferred) : assets;
+}
+
+/**
+ * The address an SSH machine is reached at: host, port and key, as one
+ * comparable value. `null` for any other machine, and for an SSH machine the
+ * catalog no longer has. A machine keeps its id when its settings are edited,
+ * so this, not the id, says whether a probe still describes it. Mirrors
+ * `machine_shells::Endpoint`.
+ */
+export function sshEndpoint(
+  assets: ExecutionEnvironmentAssets | undefined,
+  machine: RunTarget | null
+): string | null {
+  if (machine?.kind !== "ssh") return null;
+  const config = assets?.sshMachines.find((entry) => entry.id === machine.machineId);
+  return config ? JSON.stringify([config.host, config.port, config.identityFile]) : null;
+}
+
+/** `probes` without the answer kept under `key`; the same object when there is none. */
+export function withoutProbe(
+  probes: Record<string, MachineShells>,
+  key: string
+): Record<string, MachineShells> {
+  if (!Object.hasOwn(probes, key)) return probes;
+  return Object.fromEntries(Object.entries(probes).filter(([entry]) => entry !== key));
 }
 
 /** The machine an environment key names, or `null` for this machine and anything unrecognized. */

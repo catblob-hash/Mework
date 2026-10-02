@@ -6,7 +6,7 @@
 /* Hidden rather than removed while the wheels turn: it is still what sets the
    width the overlay is laid out against. */
 .rolling-number--rolling > .rolling-number__value { color: transparent; }
-.rolling-number__roll { position: absolute; inset: 0; display: flex; align-items: flex-start; overflow: hidden; user-select: none; pointer-events: none; }
+.rolling-number__roll { position: absolute; inset: 0; display: flex; align-items: flex-start; overflow: hidden; -webkit-user-select: none; user-select: none; pointer-events: none; }
 .rolling-number__roll > * { flex: 0 0 auto; height: 1lh; }
 .rolling-number__glyph::before { content: attr(data-glyph); }
 .rolling-number__digit { overflow: hidden; }

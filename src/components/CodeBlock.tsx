@@ -8,7 +8,7 @@ import { IconButton } from "./Common";
 import "./CodeBlock.css";
 
 /** Past this many lines code is shown uncoloured: the spans cost more than the colour is worth. */
-export const MAX_HIGHLIGHTED_LINES = 8000;
+const MAX_HIGHLIGHTED_LINES = 8000;
 
 export function splitCodeLines(content: string): string[] {
   const lines = content.split("\n");
@@ -130,9 +130,9 @@ export function NumberedCode({
       className={`numbered-code${className ? ` ${className}` : ""}`}
       tabIndex={0}
       aria-label={label}
-      // The gutter is sized for the widest number the file has, so it does not
-      // shift when scrolling from line 99 to line 100.
-      style={{ ["--numbered-code-digits" as string]: String(Math.max(2, digits)) }}
+      // The gutter is exactly as wide as the widest number the file has, so it
+      // does not shift when scrolling from line 99 to line 100.
+      style={{ ["--numbered-code-digits" as string]: String(digits) }}
     >
       {lines.map((line, index) => (
         <span

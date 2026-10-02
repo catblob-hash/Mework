@@ -985,8 +985,9 @@ fn the_seed_rows_carry_their_table_limits_and_vision() {
     assert_eq!(models.len(), CLAUDE_AGENT_SEED_MODELS.len());
     assert_eq!(models[0].id, "claude-fable-5-1");
     assert_eq!(models[0].name, "Claude Fable 5.1");
-    // The built-in preset's Opus role is bound to this one, so it has to ship.
+    // The built-in preset's Opus and Sonnet roles are bound to these, so they have to ship.
     assert_eq!(limits("claude-opus-5-5"), (Some(1_000_000), Some(128_000)));
+    assert_eq!(limits("claude-sonnet-5-5"), (Some(1_000_000), Some(128_000)));
     // The catalog lists a 1M window for `claude-opus-5`; the table says 200k and wins.
     assert_eq!(limits("claude-opus-5"), (Some(200_000), Some(128_000)));
     assert_eq!(limits("claude-sonnet-5"), (Some(1_000_000), Some(128_000)));

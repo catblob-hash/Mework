@@ -1244,15 +1244,29 @@ describe("document normalization", () => {
     const persisted = createSeedDocument() as unknown as Record<string, unknown>;
     (persisted.globalSettings as Record<string, unknown>).lastReasoningEffort = "high";
     const persistedWorkspaces = persisted.workspaces as Array<{ conversations: Array<{ settings: Record<string, unknown> }> }>;
-    persistedWorkspaces[0].conversations[0].settings.reasoningEffort = "low";
-    // `minimal` is not a valid level, so reject the setting and fall back to the most
-    // recent global level.
-    persistedWorkspaces[0].conversations[1].settings.reasoningEffort = "minimal";
+    persistedWorkspaces[0].conversations[0].settings.reasoningEffort = "max";
+    // An unknown level is rejected and falls back to the most recent global level.
+    persistedWorkspaces[0].conversations[1].settings.reasoningEffort = "ultra";
 
     const normalized = normalizeDocument(persisted);
     expect(normalized.globalSettings.lastReasoningEffort).toBe("high");
-    expect(normalized.workspaces[0].conversations[0].settings.reasoningEffort).toBe("low");
+    expect(normalized.workspaces[0].conversations[0].settings.reasoningEffort).toBe("max");
     expect(normalized.workspaces[0].conversations[1].settings.reasoningEffort).toBe("high");
+  });
+
+  it("reads the retired effort spellings as the host does", () => {
+    // Mirrors the serde aliases on Rust `ReasoningEffort`: thinking-off and
+    // `minimal` are the lowest level now, `xhigh` is `extra`.
+    for (const [legacy, level] of [["disabled", "low"], ["minimal", "low"], ["xhigh", "extra"]] as const) {
+      const persisted = createSeedDocument() as unknown as Record<string, unknown>;
+      (persisted.globalSettings as Record<string, unknown>).lastReasoningEffort = legacy;
+      const persistedWorkspaces = persisted.workspaces as Array<{ conversations: Array<{ settings: Record<string, unknown> }> }>;
+      persistedWorkspaces[0].conversations[0].settings.reasoningEffort = legacy;
+
+      const normalized = normalizeDocument(persisted);
+      expect(normalized.globalSettings.lastReasoningEffort).toBe(level);
+      expect(normalized.workspaces[0].conversations[0].settings.reasoningEffort).toBe(level);
+    }
   });
 
   it("uses the approval-first policy when security data is missing or invalid", () => {
@@ -1369,6 +1383,7 @@ describe("document normalization", () => {
       "activeProviderId",
       "appLanguage",
       "appearance",
+      "autoCompact",
       "environmentTools",
       "lastReasoningEffort",
       "resolvedAppLanguage",
@@ -1765,7 +1780,7 @@ describe("document normalization", () => {
       .toBe(false);
   });
 
-  it("sends disabled thinking as a mode and omits thinking effort", async () => {
+  it("sends every level as thinking effort, with no thinking-off mode", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
       value: { transformCallback: vi.fn(() => 1) }
@@ -1791,7 +1806,7 @@ describe("document normalization", () => {
     const request = {
       provider,
       model,
-      reasoningEffort: "disabled" as const,
+      reasoningEffort: "low" as const,
       conversationId: document.workspaces[0].conversations[0].id,
       workspacePath: document.workspaces[0].path,
       systemPrompt: "",
@@ -1800,22 +1815,22 @@ describe("document normalization", () => {
       tools: document.tools
     };
 
-    await runModel(request, vi.fn(), "disabled-thinking");
-    await runModel({ ...request, reasoningEffort: "high" }, vi.fn(), "high-thinking");
+    await runModel(request, vi.fn(), "low-thinking");
+    await runModel({ ...request, reasoningEffort: "max" }, vi.fn(), "max-thinking");
 
-    const disabledRequest = (tauriMocks.invoke.mock.calls[0][1] as {
+    const lowRequest = (tauriMocks.invoke.mock.calls[0][1] as {
       request: Record<string, unknown>;
     }).request;
-    expect(disabledRequest).toMatchObject({ thinkingMode: "disabled" });
-    expect(disabledRequest).not.toHaveProperty("thinkingEffort");
-    expect(disabledRequest).not.toHaveProperty("reasoningEffort");
+    expect(lowRequest).toMatchObject({ thinkingEffort: "low" });
+    expect(lowRequest).not.toHaveProperty("thinkingMode");
+    expect(lowRequest).not.toHaveProperty("reasoningEffort");
 
-    const highRequest = (tauriMocks.invoke.mock.calls[1][1] as {
+    const maxRequest = (tauriMocks.invoke.mock.calls[1][1] as {
       request: Record<string, unknown>;
     }).request;
-    expect(highRequest).toMatchObject({ thinkingEffort: "high" });
-    expect(highRequest).not.toHaveProperty("thinkingMode");
-    expect(highRequest).not.toHaveProperty("reasoningEffort");
+    expect(maxRequest).toMatchObject({ thinkingEffort: "max" });
+    expect(maxRequest).not.toHaveProperty("thinkingMode");
+    expect(maxRequest).not.toHaveProperty("reasoningEffort");
   });
 
   it("fetches the model catalog for a provider that is not enabled yet", async () => {

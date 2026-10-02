@@ -11,10 +11,10 @@
  * failures rather than silent loss of reasoning and pause-turn data. Any
  * wire-shape change bumps this constant and the matching host-side literal.
  */
-export const PROTOCOL_VERSION = 13;
+export const PROTOCOL_VERSION = 15;
 
-/** Maximum line size (16 MiB); mirrors the host constant `MAX_SSE_LINE`. */
-const MAX_LINE_BYTES = 16 * 1024 * 1024;
+/** Maximum line size (128 MiB); mirrors the host constant `MAX_LINE_BYTES`. */
+const MAX_LINE_BYTES = 128 * 1024 * 1024;
 
 /** Maximum accumulated visible text per request (16 MiB); mirrors the host constant `MAX_STREAM_TEXT`. */
 export const MAX_STREAM_TEXT = 16 * 1024 * 1024;
@@ -81,7 +81,16 @@ export interface AgentSession {
   executable: string;
   cwd: string;
   env?: Record<string, string>;
+  /**
+   * Per step: whether Claude Code appends tools mid-session for this step's
+   * model (its declared `tool_append` capability). Only then does a rebuilt session
+   * get the history's tool additions; absent means no.
+   */
+  toolChanges?: boolean;
 }
+
+/** The step's reasoning level, lowest first (Rust `step.rs::reasoning_level`). */
+export type ReasoningLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface StepRequest {
   family: ProviderFamily;
@@ -121,11 +130,12 @@ export interface StepRequest {
    */
   contextWindow?: number;
   /**
-   * Reasoning effort in the AI SDK 7 vocabulary, not a provider dialect. Each
-   * provider maps it to its own controls, including unsupported-level fallback.
-   * The host supplies only the level and never branches by model name.
+   * Reasoning effort: AI SDK 7's levels plus `max`, which the SDK has no shared
+   * name for. Not a provider dialect: `reasoning.ts` maps it per family and
+   * model, clamping to what the model takes. The host supplies only the level
+   * and never branches by model name. There is no "off".
    */
-  reasoning?: "none" | "low" | "medium" | "high" | "xhigh";
+  reasoning?: ReasoningLevel;
   /**
    * Reasoning representation for this model. The host resolves protocol defaults,
    * so this is determinate when present; absence means the family has no consumer.
@@ -155,6 +165,23 @@ export interface StepRequest {
   nativeFetch?: { maxUses: number; toolType?: string };
   /** Present only for the `claude-agent` family; see [`AgentSession`]. */
   agent?: AgentSession;
+  /**
+   * Whether this model, at this endpoint, takes a tool appended
+   * mid-conversation through the protocol's interface (Rust
+   * `tool_append::appends_tools`: the model's declared `tool_append`
+   * capability, which Mework fills in where it knows and the user everywhere
+   * else). Absent means it does not, and every host marker is dropped with the
+   * tool left declared (`tool-append.ts`). The host's word is the whole of it:
+   * a relay the user declared it for gets the interface too.
+   */
+  toolAppend?: boolean;
+  /**
+   * Whether this model, at this endpoint, takes a system message in the middle
+   * of the conversation (Rust `system_append::appends_system`, decided the
+   * same way). Absent means it does not, and every appended system prompt is
+   * lifted into the system prompt (`system-append.ts`).
+   */
+  systemAppend?: boolean;
 }
 
 /** Separator between the stable system prompt and its tail; mirrors the host's. */
@@ -340,21 +367,32 @@ export function decodeHostFrame(line: string): HostFrame {
  * delimiter is only `\n`. A JSON body containing `\r` must remain one frame.
  */
 export function createLineSplitter(onLine: (line: string) => void, onOverflow: (bytes: number) => void) {
-  let buffer: Buffer = Buffer.alloc(0);
+  // What follows the last newline, kept as the chunks it came in and joined
+  // once, when its newline arrives: a frame of many chunks costs its length,
+  // not its length times the number of chunks.
+  let pending: Buffer[] = [];
+  let pendingBytes = 0;
   return (chunk: Buffer) => {
-    buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
     let start = 0;
     for (;;) {
-      const index = buffer.indexOf(0x0a, start);
+      const index = chunk.indexOf(0x0a, start);
       if (index === -1) break;
-      const line = buffer.subarray(start, index).toString("utf8");
+      const tail = chunk.subarray(start, index);
+      const line = (pending.length === 0 ? tail : Buffer.concat([...pending, tail], pendingBytes + tail.length))
+        .toString("utf8");
+      pending = [];
+      pendingBytes = 0;
       start = index + 1;
       if (line.length > 0) onLine(line);
     }
-    buffer = buffer.subarray(start);
-    if (buffer.length > MAX_LINE_BYTES) {
-      const bytes = buffer.length;
-      buffer = Buffer.alloc(0);
+    if (start < chunk.length) {
+      pending.push(chunk.subarray(start));
+      pendingBytes += chunk.length - start;
+    }
+    if (pendingBytes > MAX_LINE_BYTES) {
+      const bytes = pendingBytes;
+      pending = [];
+      pendingBytes = 0;
       onOverflow(bytes);
     }
   };

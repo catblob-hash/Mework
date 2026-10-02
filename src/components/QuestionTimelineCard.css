@@ -79,6 +79,7 @@
   margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  -webkit-user-select: text; user-select: text;
 }
 
 .question-history__prompt p {
@@ -115,6 +116,7 @@
 
 .question-history__raw-output--error {
   color: var(--danger);
+  -webkit-user-select: text; user-select: text;
 }
 
 .question-history--answered .question-history__header > svg {

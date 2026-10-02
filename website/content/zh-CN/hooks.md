@@ -11,7 +11,7 @@
 <workspace>/.mework/hooks.json       工作区范围——仅该工作区
 ```
 
-（当 `.mework` 文件不存在时，会改为读取 `~/.naiword/hooks.json`。）技能、MCP 服务器和语言服务器遵循同样的双位置模型，各自有自己的文件：`skills/` 下的 `SKILL.md` 文件夹、一个 `mcp.json` 和一个 `lsp.json`。全新安装会向 `~/.mework/hooks.json` 写入三个示例处理器——一个报告 git 分支的 `SessionStart`、一个拒绝 `write` 或 `edit` `.env` 文件的 `PreToolUse`、一个把 shell 调用追加到 `.mework/shell-hook.log` 的 `PostToolUse`——但一个都不勾选。
+（当 `.mework` 文件不存在时，会改为读取 `~/.naiword/hooks.json`。）技能、MCP 服务器和语言服务器遵循同样的双位置模型，各自有自己的文件：`skills/` 下的 `SKILL.md` 文件夹、一个 `mcp.json` 和一个 `lsp.json`。Mework 自己不写这些文件：每个钩子都是你自己写的。
 
 对话抽屉的**钩子**页面会列出每个处理器及其事件，有匹配器时还会列出匹配器，作为它的说明；工具条上有一个**重新扫描**按钮，以及打开全局 `~/.mework` 与（当对话有工作区时）该工作区 `.mework` 的按钮。没有任何东西监视这些文件，所以编辑之后请按**重新扫描**（重启应用也会重新读取）。每个处理器都是一个可选条目；对话会在 `hookIds` 下从全局文件加上它自己工作区的文件中选择想要的处理器（预设会被提供整个目录，但运行时只会解析那两个层级）。未被选中时，什么都不会运行；某一行上的删除按钮会把该处理器从它的 `hooks.json` 中移除。处理器的 id 由它在文件中的位置派生（`#/hooks/<event>/<group>/hooks/<handler>`），因此删除或重排处理器会给其余处理器重新编号，被移动的那些的勾选就不再能解析。所选 id 已不在目录中时，运行会**失败**，直到你修好文件或取消勾选——这与被悄悄跳过的悬空技能或 MCP 服务器不同。
 
@@ -69,12 +69,12 @@
   "cwd": "<workspace path>",
   "hook_event_name": "PreToolUse",
   "model": "<model id>",
-  "permission_mode": "default | acceptEdits | plan | bypassPermissions",
+  "permission_mode": "default | acceptEdits | bypassPermissions",
   "turn_id": "<uuid>"
 }
 ```
 
-`permission_mode` 映射对话的安全层级：`request_approval` → `default`，`allow_edits` → `acceptEdits`，`plan`（计划模式）→ `plan`，`full_access` → `bypassPermissions`。事件专属字段：
+`permission_mode` 映射对话的安全层级：`request_approval` → `default`，`allow_edits` → `acceptEdits`，`full_access` → `bypassPermissions`。计划模式是工具开关而不是层级，所以不会出现在这里。事件专属字段：
 
 | 事件 | 额外字段 |
 |---|---|
@@ -82,7 +82,7 @@
 | `UserPromptSubmit` | `prompt` — 最后一条真实用户消息。 |
 | `PreToolUse` | `tool_name`、`tool_use_id`、`tool_input` |
 | `PermissionRequest` | `tool_name`、`tool_input`、`permission_suggestions: []` — 仅针对原本会显示批准卡的调用、或被 `PreToolUse` 钩子强制要求询问的调用触发。 |
-| `PostToolUse` | `tool_name`、`tool_use_id`、`tool_input`、`tool_response`（结果的公开投影） |
+| `PostToolUse` | `tool_name`、`tool_use_id`、`tool_input`、`tool_response`（模型收到的结果） |
 | `Stop` | `stop_hook_active`（模型是否正因先前的 Stop 钩子而继续），`last_assistant_message` |
 | `InstructionsLoaded` | `file_path`、`memory_type`（`User` / `Project` / `Local` / `Managed`）、`load_reason`（`session_start` / `nested_traversal` / `path_glob_match` / `include`），以及相关时的 `globs`、`trigger_file_path`、`parent_file_path`。不包含指令正文。 |
 
@@ -128,7 +128,7 @@
 
 如果 Stop 钩子输出任何内容，就必须使用 JSON 作答。钩子输出上限为 64 KiB；在一个回合中，所有同步钩子工作除每个处理器超时外，还共享 5 分钟的总预算。匹配同一事件的每个处理器并行运行，它们的决定会被合并。
 
-以下两项保证源自“对实际将要运行的内容分类”：一个 `allow` 绝不会覆盖另一个钩子的 `ask` 或 `deny`，且执行前被拒绝的调用绝不会触发 `PostToolUse`。`PostToolUse` 无法撤销已运行的工具（文件写入已落盘）；它的拒绝仅会改变向模型告知的内容，且回执会如此说明（`hook.post_tool_not_rolled_back`）。[`todo`](tools/todo.html) 和 [`tool_search`](tools/tool_search.html) 不一样：它们的全部效果都是宿主侧的回合状态，所以阻止会把它们收回去。[批准](working.html#tools-and-approvals)下列出的强制确认无法由钩子预先批准。
+以下两项保证源自“对实际将要运行的内容分类”：一个 `allow` 绝不会覆盖另一个钩子的 `ask` 或 `deny`，且执行前被拒绝的调用绝不会触发 `PostToolUse`。`PostToolUse` 无法撤销已运行的工具（文件写入已落盘）；它的拒绝仅会改变向模型告知的内容，且回执会如此说明（`hook.post_tool_not_rolled_back`）。[`tool_search`](tools/tool_search.html) 不一样：它的全部效果都是宿主侧的回合状态，所以阻止会把它收回去。[批准](working.html#tools-and-approvals)下列出的强制确认无法由钩子预先批准。
 
 `InstructionsLoaded` 仅用于观察，且在回合之外运行：它的退出代码、stdout 和 JSON 都会被丢弃，既到不了模型，也到不了时间线。
 

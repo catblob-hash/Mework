@@ -13,7 +13,7 @@
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -212,6 +212,9 @@ const HOST_PROMPT = "You are Mework's assistant. HOST PROMPT MARKER 7f3a.";
 const UPSTREAM_KEY = "sk-ant-fake-selfcheck";
 /** Key placed on the request only. Nothing it touches may ever leave the sidecar. */
 const REQUEST_ONLY_KEY = "sk-ant-request-only-a41c";
+/** A 1×1 PNG for the `@`-mention probe. */
+const PNG_1X1_PROBE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
 const TOOLS = [
   {
     name: "read_file",
@@ -226,7 +229,12 @@ const TOOLS = [
   {
     name: "box",
     description: "Inert delivery box for host notifications",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    inputSchema: {
+      type: "object",
+      properties: { none: { type: "array", items: { type: "string" }, maxItems: 0 } },
+      required: ["none"],
+      additionalProperties: false,
+    },
   },
 ];
 
@@ -275,6 +283,47 @@ function isEffortMarker(message) {
   return extra.length === 1 && extra[0] === "output_config";
 }
 
+/** The host's tool-append marker (Rust `tool_append::marker_message`). */
+function toolAdditionMarker(tools) {
+  return { role: "system", content: "", providerOptions: { mework: { toolAddition: tools } } };
+}
+
+/**
+ * `value` as the API reads it: object keys in one order (a request is parsed,
+ * not hashed as text) and no prompt-cache breakpoints, which move from request
+ * to request by design.
+ */
+function canonicalRequest(value) {
+  if (Array.isArray(value)) return value.map(canonicalRequest);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value).filter((key) => key !== "cache_control").sort().map((key) => [key, canonicalRequest(value[key])]),
+  );
+}
+
+/**
+ * Whether request `next` only extends request `previous`: the same system
+ * prompt and tool list, and `previous`'s messages as the start of its own —
+ * what lets the prompt cache `previous` wrote serve `next`. `tools: false`
+ * leaves the tool list out, for a step that appends a tool (a deferred tool is
+ * outside the cache key; the declared ones are compared separately).
+ */
+function extendsRequest(previous, next, { tools = true } = {}) {
+  const before = canonicalRequest(previous ?? {});
+  const after = canonicalRequest(next ?? {});
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const earlier = Array.isArray(before.messages) ? before.messages : [];
+  const later = Array.isArray(after.messages) ? after.messages : [];
+  const differsAt = earlier.findIndex((message, index) => !same(message, later[index]));
+  const sameSystem = same(before.system, after.system);
+  const sameTools = !tools || same(before.tools, after.tools);
+  return {
+    ok: sameSystem && sameTools && earlier.length > 0 && later.length > earlier.length && differsAt === -1,
+    detail: `system=${sameSystem} tools=${sameTools} lengths=${earlier.length}/${later.length} differsAt=${differsAt}`
+      + (differsAt === -1 ? "" : ` was=${JSON.stringify(earlier[differsAt]).slice(0, 240)} now=${JSON.stringify(later[differsAt] ?? null).slice(0, 240)}`),
+  };
+}
+
 function describe(frame) {
   return frame.type === "done" ? JSON.stringify(frame.result).slice(0, 300) : JSON.stringify(frame.error ?? frame).slice(0, 300);
 }
@@ -307,7 +356,7 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
       messages,
       tools: TOOLS,
       maxSteps: 1,
-      reasoning: "none",
+      reasoning: "low",
       agent: agentFor(session),
       ...extra,
     },
@@ -411,9 +460,9 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
     JSON.stringify(toolNames),
   );
   check(
-    "30 claude-agent：thinking 被 reasoning:none 关掉",
-    call1?.thinking === undefined || call1?.thinking?.type === "disabled",
-    JSON.stringify(call1?.thinking ?? null),
+    "30 claude-agent：reasoning:low → output_config.effort=low，没有关掉思考的档位",
+    call1?.output_config?.effort === "low" && call1?.thinking?.type !== "disabled",
+    JSON.stringify({ thinking: call1?.thinking ?? null, output_config: call1?.output_config ?? null }),
   );
 
   // 30c: continuation — the parked handler receives the host's result plus a folded notice.
@@ -427,7 +476,7 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
       role: "tool",
       content: [{ type: "tool-result", toolCallId: "toolu_01", toolName: "read_file", output: { type: "text", value: "hello from a.txt" } }],
     },
-    { role: "assistant", content: [{ type: "tool-call", toolCallId: noticeBoxId, toolName: "box", input: {} }] },
+    { role: "assistant", content: [{ type: "tool-call", toolCallId: noticeBoxId, toolName: "box", input: { none: [] } }] },
     {
       role: "tool",
       content: [{ type: "tool-result", toolCallId: noticeBoxId, toolName: "box", output: { type: "text", value: NOTIFICATION } }],
@@ -553,7 +602,7 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
     stepFrame("ca-box", "ca-box", [
       { role: "user", content: "kick off the background job" },
       { role: "assistant", content: [{ type: "text", text: "Started it." }] },
-      { role: "assistant", content: [{ type: "tool-call", toolCallId: wakeBoxId, toolName: "box", input: {} }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: wakeBoxId, toolName: "box", input: { none: [] } }] },
       {
         role: "tool",
         content: [{
@@ -618,6 +667,223 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
     JSON.stringify(results7).slice(0, 300),
   );
   sc.send({ v: V, type: "release", session: "ca-run-4" });
+
+  // 30f': a tool joins while a round is parked. The live session lists it
+  // (`tools/list_changed`) instead of being rebuilt: the resumed request carries
+  // the parked result as-is — no continue notice — and declares the new tool.
+  upstream.push({ blocks: [{ type: "tool_use", id: "toolu_w1", name: "read_file", input: { path: "w.txt" } }] });
+  sc.send(stepFrame("ca-w1", "ca-run-widen", [{ role: "user", content: "read w" }]));
+  const widen1 = await sc.wait(terminal("ca-w1"), 60000);
+  upstream.push({ blocks: [{ type: "text", text: "listed the new tool" }] });
+  const LATE = { name: "late_tool", description: "Joined mid-run", inputSchema: { type: "object", properties: {} } };
+  sc.send(
+    stepFrame("ca-w2", "ca-run-widen", [
+      { role: "user", content: "read w" },
+      widen1.type === "done" ? widen1.result.responseMessages[0] : { role: "assistant", content: [] },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "toolu_w1", toolName: "read_file", output: { type: "text", value: "w" } }],
+      },
+    ], { tools: [...TOOLS, LATE] }),
+  );
+  const widen2 = await sc.wait(terminal("ca-w2"), 60000);
+  const callW2 = upstream.calls.at(-1)?.body;
+  const lastW2 = lastTurnMessage(callW2?.messages);
+  const resumedInPlace = Array.isArray(lastW2?.content)
+    && lastW2.content.some((block) => block.type === "tool_result" && block.tool_use_id === "toolu_w1")
+    && !JSON.stringify(callW2?.messages ?? []).includes("[SYSTEM NOTIFICATION - NOT USER INPUT]");
+  check(
+    "30 claude-agent：回合中途加入的工具由活会话重新列出，不重建会话",
+    widen2.type === "done" && widen2.result.text === "listed the new tool" && resumedInPlace
+      && (callW2?.tools ?? []).some((tool) => tool.name === "late_tool"),
+    `resumedInPlace=${resumedInPlace} tools=${JSON.stringify((callW2?.tools ?? []).map((tool) => tool.name))} ${describe(widen2)}`,
+  );
+  sc.send({ v: V, type: "release", session: "ca-run-widen" });
+
+  // 30f-addition: the same widening on a model the CLI knows takes tool changes,
+  // and on an endpoint it treats as first-party (`ENABLE_TOOL_SEARCH` stands in
+  // for the real host the stub is not). The CLI hands the tool over itself: a
+  // mid-conversation system message with a `tool_addition` and the one line of
+  // text it always puts beside it, the tool declared `defer_loading` — the
+  // declared list the earlier requests cached is left as it was. `toolChanges`
+  // is what the host sends for this model (Rust `tool_append::appends_tools`).
+  const additionAgent = (session, toolChanges = true) => {
+    const agent = agentFor(session);
+    return { ...agent, env: { ...agent.env, ENABLE_TOOL_SEARCH: "true" }, toolChanges };
+  };
+  upstream.push({ blocks: [{ type: "tool_use", id: "toolu_a1", name: "read_file", input: { path: "a.txt" } }] });
+  sc.send(stepFrame("ca-a1", "ca-run-addition", [{ role: "user", content: "read a" }], {
+    modelId: "claude-opus-5-5",
+    agent: additionAgent("ca-run-addition"),
+  }));
+  const addition1 = await sc.wait(terminal("ca-a1"), 60000);
+  const callA1 = upstream.calls.at(-1);
+  upstream.push({ blocks: [{ type: "text", text: "took the addition" }] });
+  sc.send(
+    stepFrame("ca-a2", "ca-run-addition", [
+      { role: "user", content: "read a" },
+      addition1.type === "done" ? addition1.result.responseMessages[0] : { role: "assistant", content: [] },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "toolu_a1", toolName: "read_file", output: { type: "text", value: "a" } }],
+      },
+    ], { modelId: "claude-opus-5-5", agent: additionAgent("ca-run-addition"), tools: [...TOOLS, LATE] }),
+  );
+  const addition2 = await sc.wait(terminal("ca-a2"), 60000);
+  const callA2 = upstream.calls.at(-1);
+  const additionMessage = (callA2?.body?.messages ?? []).find((message) => message.role === "system"
+    && Array.isArray(message.content)
+    && message.content.some((block) => block.type === "tool_addition" && block.tool?.name === "late_tool"));
+  const declaredA1 = (callA1?.body?.tools ?? []).filter((tool) => tool.defer_loading !== true).map((tool) => tool.name).sort();
+  const declaredA2 = (callA2?.body?.tools ?? []).filter((tool) => tool.defer_loading !== true).map((tool) => tool.name).sort();
+  const lateDeclared = (callA2?.body?.tools ?? []).find((tool) => tool.name === "late_tool");
+  check(
+    "30 claude-agent：回合中途加入的工具以 CLI 自己的 tool_addition 送达，声明列表不变",
+    addition2.type === "done" && addition2.result.text === "took the addition" && additionMessage !== undefined
+      && lateDeclared?.defer_loading === true
+      && JSON.stringify(declaredA1) === JSON.stringify(declaredA2)
+      && String(callA2?.headers?.["anthropic-beta"] ?? "").includes("mid-conversation-tool-changes-2026-07-01"),
+    `addition=${JSON.stringify(additionMessage ?? null).slice(0, 300)} late=${JSON.stringify(lateDeclared ?? null).slice(0, 120)} before=${JSON.stringify(declaredA1)} after=${JSON.stringify(declaredA2)} ${describe(addition2)}`,
+  );
+  sc.send({ v: V, type: "release", session: "ca-run-addition" });
+
+  // 30f-rebuild: the next user turn is a run of its own, and its session is
+  // rebuilt from the host's history, where the addition is the host's marker
+  // behind the tool result. The CLI gets it back as its own record of the
+  // addition, so the rebuilt request only extends the last one: `late_tool`
+  // still deferred, its `tool_addition` where it was, the cache behind it
+  // intact. Dropping the marker would declare `late_tool` with the rest.
+  const additionHistory = [
+    { role: "user", content: "read a" },
+    addition1.type === "done" ? addition1.result.responseMessages[0] : { role: "assistant", content: [] },
+    {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "toolu_a1", toolName: "read_file", output: { type: "text", value: "a" } }],
+    },
+    toolAdditionMarker(["late_tool"]),
+    addition2.type === "done" ? addition2.result.responseMessages[0] : { role: "assistant", content: [] },
+  ];
+  upstream.push({ blocks: [{ type: "text", text: "rebuilt with the addition" }] });
+  sc.send(stepFrame("ca-r1", "ca-run-rebuild", [...additionHistory, { role: "user", content: "again" }], {
+    modelId: "claude-opus-5-5",
+    agent: additionAgent("ca-run-rebuild"),
+    tools: [...TOOLS, LATE],
+  }));
+  const rebuilt = await sc.wait(terminal("ca-r1"), 60000);
+  const rebuiltExtends = extendsRequest(callA2?.body, upstream.calls.at(-1)?.body);
+  check(
+    "30 claude-agent：重建的会话把历史里追加过的工具交还 CLI，请求原样延续上一请求",
+    rebuilt.type === "done" && rebuilt.result.text === "rebuilt with the addition" && rebuiltExtends.ok,
+    `${rebuiltExtends.detail} ${describe(rebuilt)}`,
+  );
+  sc.send({ v: V, type: "release", session: "ca-run-rebuild" });
+
+  // 30f-between: a tool the user enabled between two turns. The host marks it
+  // right behind the new prompt; the rebuilt session hands it to the CLI there,
+  // and the request keeps the last one's declared list and messages, the tool
+  // deferred and added behind the prompt. The turn after that, rebuilt again
+  // from the same history, extends it in turn.
+  const BETWEEN = { name: "between_tool", description: "Enabled between turns", inputSchema: { type: "object", properties: { q: { type: "string" } } } };
+  upstream.push({ blocks: [{ type: "text", text: "hi there" }] });
+  sc.send(stepFrame("ca-b1", "ca-run-between-1", [{ role: "user", content: "hello" }], {
+    modelId: "claude-opus-5-5",
+    agent: additionAgent("ca-run-between-1"),
+  }));
+  const between1 = await sc.wait(terminal("ca-b1"), 60000);
+  const callB1 = upstream.calls.at(-1);
+  sc.send({ v: V, type: "release", session: "ca-run-between-1" });
+  const betweenHistory = [
+    { role: "user", content: "hello" },
+    between1.type === "done" ? between1.result.responseMessages[0] : { role: "assistant", content: [] },
+    { role: "user", content: "use the new tool" },
+    toolAdditionMarker(["between_tool"]),
+  ];
+  upstream.push({ blocks: [{ type: "text", text: "it is here" }] });
+  sc.send(stepFrame("ca-b2", "ca-run-between-2", betweenHistory, {
+    modelId: "claude-opus-5-5",
+    agent: additionAgent("ca-run-between-2"),
+    tools: [...TOOLS, BETWEEN],
+  }));
+  const between2 = await sc.wait(terminal("ca-b2"), 60000);
+  const callB2 = upstream.calls.at(-1);
+  sc.send({ v: V, type: "release", session: "ca-run-between-2" });
+  const b2Messages = callB2?.body?.messages ?? [];
+  const promptAt = b2Messages.findIndex((message) => textOf(message) === "use the new tool");
+  const behindPrompt = b2Messages[promptAt + 1];
+  const betweenDeclared = (callB2?.body?.tools ?? []).find((tool) => tool.name === "between_tool");
+  const declaredB1 = (callB1?.body?.tools ?? []).filter((tool) => tool.defer_loading !== true).map((tool) => tool.name).sort();
+  const declaredB2 = (callB2?.body?.tools ?? []).filter((tool) => tool.defer_loading !== true).map((tool) => tool.name).sort();
+  check(
+    "30 claude-agent：两轮之间启用的工具紧跟新提示以 tool_addition 送达，声明列表不变",
+    between2.type === "done" && between2.result.text === "it is here"
+      && promptAt !== -1
+      && behindPrompt?.role === "system"
+      && Array.isArray(behindPrompt.content)
+      && behindPrompt.content.some((block) => block.type === "tool_addition" && block.tool?.name === "between_tool")
+      && betweenDeclared?.defer_loading === true
+      && JSON.stringify(declaredB1) === JSON.stringify(declaredB2),
+    `behind=${JSON.stringify(behindPrompt ?? null).slice(0, 300)} declared=${JSON.stringify(betweenDeclared ?? null).slice(0, 120)} before=${JSON.stringify(declaredB1)} after=${JSON.stringify(declaredB2)} ${describe(between2)}`,
+  );
+  upstream.push({ blocks: [{ type: "text", text: "still here" }] });
+  sc.send(stepFrame("ca-b3", "ca-run-between-3", [
+    ...betweenHistory,
+    between2.type === "done" ? between2.result.responseMessages[0] : { role: "assistant", content: [] },
+    { role: "user", content: "and again" },
+  ], { modelId: "claude-opus-5-5", agent: additionAgent("ca-run-between-3"), tools: [...TOOLS, BETWEEN] }));
+  const between3 = await sc.wait(terminal("ca-b3"), 60000);
+  sc.send({ v: V, type: "release", session: "ca-run-between-3" });
+  const betweenFirstExtends = extendsRequest(callB1?.body, callB2?.body, { tools: false });
+  const betweenExtends = extendsRequest(callB2?.body, upstream.calls.at(-1)?.body);
+  check(
+    "30 claude-agent：两轮之间的追加不动上一请求的前缀，下一轮重建后原样延续",
+    between3.type === "done" && betweenFirstExtends.ok && betweenExtends.ok,
+    `first: ${betweenFirstExtends.detail} next: ${betweenExtends.detail} ${describe(between3)}`,
+  );
+
+  // 30f-no-changes: on a model the CLI does not take tool changes for, the host
+  // says so and the markers are dropped. The CLI would otherwise announce the
+  // tool in words of its own; instead it is declared with the rest, and nothing
+  // the host did not write reaches the model.
+  upstream.push({ blocks: [{ type: "text", text: "declared plainly" }] });
+  sc.send(stepFrame("ca-n1", "ca-run-no-changes", betweenHistory, {
+    modelId: "claude-opus-5-5",
+    agent: additionAgent("ca-run-no-changes", false),
+    tools: [...TOOLS, BETWEEN],
+  }));
+  const noChanges = await sc.wait(terminal("ca-n1"), 60000);
+  sc.send({ v: V, type: "release", session: "ca-run-no-changes" });
+  const callN1 = upstream.calls.at(-1)?.body;
+  const plainDeclared = (callN1?.tools ?? []).find((tool) => tool.name === "between_tool");
+  const n1Text = JSON.stringify(callN1?.messages ?? []);
+  check(
+    "30 claude-agent：不接受工具变更的模型丢弃追加标记，工具照常声明且没有 CLI 自写的公告",
+    noChanges.type === "done" && plainDeclared !== undefined && plainDeclared.defer_loading !== true
+      && !n1Text.includes("tool_addition") && !n1Text.includes("between_tool"),
+    `declared=${JSON.stringify(plainDeclared ?? null).slice(0, 120)} messages=${n1Text.slice(0, 300)} ${describe(noChanges)}`,
+  );
+
+  // 30f-mention: the attachment pipeline is on for that addition, and nothing
+  // else it makes may reach the model — an `@` mention of a local image or file
+  // in the user's text included, which the context plugin cannot see when it is
+  // an image.
+  const mentionDir = mkdtempSync(path.join(os.tmpdir(), "mework-mention-"));
+  const mentionImage = path.join(mentionDir, "probe.png");
+  const mentionText = path.join(mentionDir, "probe.txt");
+  writeFileSync(mentionImage, Buffer.from(PNG_1X1_PROBE, "base64"));
+  writeFileSync(mentionText, "PROBE-MENTIONED-FILE-CONTENT\n");
+  upstream.push({ blocks: [{ type: "text", text: "mentions seen" }] });
+  sc.send(stepFrame("ca-m1", "ca-run-mention", [
+    { role: "user", content: `compare @${mentionImage} with @${mentionText}` },
+  ]));
+  const mention = await sc.wait(terminal("ca-m1"), 60000);
+  const callM1 = JSON.stringify(upstream.calls.at(-1)?.body?.messages ?? []);
+  check(
+    "30 claude-agent：用户消息里 @ 提及的本地图片与文件不进上游请求",
+    mention.type === "done" && !callM1.includes('"type":"image"') && !callM1.includes("PROBE-MENTIONED-FILE-CONTENT"),
+    callM1.slice(0, 600),
+  );
+  sc.send({ v: V, type: "release", session: "ca-run-mention" });
+  rmSync(mentionDir, { recursive: true, force: true });
 
   // 30g: cancel while the upstream stalls → cancelled, and the session is gone.
   upstream.push({ delayMs: 20000, blocks: [{ type: "text", text: "never" }] });
@@ -698,6 +964,19 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
   );
   sc.send({ v: V, type: "release", session: "ca-effort" });
 
+  // 30j: `max`, the level the AI SDK has no shared name for, reaches the CLI
+  // as itself; there is no level that turns thinking off.
+  upstream.push({ blocks: [{ type: "text", text: "max ok" }] });
+  sc.send(stepFrame("ca-max", "ca-max", [{ role: "user", content: "hi" }], { reasoning: "max" }));
+  const maxEffort = await sc.wait(terminal("ca-max"), 60000);
+  const maxBody = upstream.calls.at(-1)?.body;
+  check(
+    "30 claude-agent：reasoning:max → output_config.effort=max + adaptive thinking",
+    maxEffort.type === "done" && maxBody?.output_config?.effort === "max" && maxBody?.thinking?.type === "adaptive",
+    JSON.stringify({ thinking: maxBody?.thinking, output_config: maxBody?.output_config }),
+  );
+  sc.send({ v: V, type: "release", session: "ca-max" });
+
   // 30p: the host sends a bare model id plus its window; the sidecar asks for
   // the CLI's 1M budget only when the window exceeds 200k, and an id installed
   // with the suffix by an earlier version passes through. The stub key is a
@@ -769,6 +1048,31 @@ export async function runClaudeAgentChecks({ sc, check, V, executable }) {
     JSON.stringify(imageResult).slice(0, 400),
   );
   sc.send({ v: V, type: "release", session: "ca-img" });
+
+  // 30j': a short PDF the host sends as the document itself, as Claude Code's
+  // Read hands one to the model, reaches upstream as a `document` block.
+  const PDF_BASE64 = Buffer.from("%PDF-1.4\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n").toString("base64");
+  upstream.push({ blocks: [{ type: "text", text: "read the pdf" }] });
+  sc.send(stepFrame("ca-pdf-1", "ca-pdf", [{
+    role: "user",
+    content: [
+      { type: "text", text: "<attached_file name=\"r.pdf\" type=\"pdf\" pages=\"1\" content=\"the PDF document, attached after this element\"></attached_file>" },
+      { type: "file", data: `data:application/pdf;base64,${PDF_BASE64}`, mediaType: "application/pdf", filename: "r.pdf" },
+      { type: "text", text: "Summarize." },
+    ],
+  }]));
+  const pdfDone = await sc.wait(terminal("ca-pdf-1"), 60000);
+  const pdfDocuments = (upstream.calls.at(-1)?.body?.messages ?? [])
+    .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+    .filter((block) => block.type === "document");
+  check(
+    "30 claude-agent：PDF 文件部件以 document 块到达上游",
+    pdfDone.type === "done" && pdfDocuments.length === 1
+      && pdfDocuments[0].source?.type === "base64" && pdfDocuments[0].source?.media_type === "application/pdf"
+      && pdfDocuments[0].source?.data === PDF_BASE64 && pdfDocuments[0].title === "r.pdf",
+    `${describe(pdfDone)} ${JSON.stringify(pdfDocuments).slice(0, 300)}`,
+  );
+  sc.send({ v: V, type: "release", session: "ca-pdf" });
 
   // 30k: a missing executable fails fast, and says what it means — the bundled
   // CLI is part of the install, so its absence is a broken install, not
@@ -932,7 +1236,7 @@ export async function runClaudeAgentShutdownCheck({ startSidecar, check, V, exec
       messages: [{ role: "user", content: "park" }],
       tools: TOOLS,
       maxSteps: 1,
-      reasoning: "none",
+      reasoning: "low",
       agent: {
         session: "ca-park",
         executable,

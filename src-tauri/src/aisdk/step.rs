@@ -12,13 +12,10 @@ use serde_json::{json, Value};
 
 use crate::api::Exchange;
 use crate::file_attachments::{FileAttachmentStore, FILE_PART_TYPE};
-use crate::image_attachments::{
-    hydrate_ai_sdk_images, ImageAttachmentStore, MAX_REQUEST_IMAGES, MAX_REQUEST_IMAGE_BYTES,
-    MAX_REQUEST_IMAGE_PIXELS,
-};
+use crate::image_attachments::{hydrate_ai_sdk_images, ImageAttachmentStore};
 use crate::model::{ContextItem, FileAttachment, ReasoningContent, RunModelRequest};
-use crate::wire_ledger::{
-    WireAudit, PART_MESSAGE, PART_SYSTEM, PART_SYSTEM_DYNAMIC, PART_TOOLS,
+use crate::history::{
+    RequestAudit, PART_MESSAGE, PART_SYSTEM, PART_SYSTEM_DYNAMIC, PART_TOOLS,
 };
 
 use super::project::project_messages;
@@ -29,106 +26,67 @@ use super::tools::{enabled_tools, tool_schema};
 /// sidecar joins the two halves with the same bytes.
 const SYSTEM_SECTION_SEPARATOR: &str = "\n\n";
 
-/// The one preview tool that reads `.mework/launch.json` and starts a server.
-/// Its presence is what "the host offers the launch tools" means here.
-const PREVIEW_START_TOOL: &str = "preview_start";
-
 /// The system prompt in Claude Code's two halves: the stable prefix assembled
-/// once at run start, and the tail that can change from one step to the next.
+/// once at run start, and the conversation's own tail.
 ///
-/// Claude Code marks its `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` so the text before
-/// it keeps its cache entry when the text after it changes. Here the boundary
-/// falls after `request.assembled_system_prompt`: the host-rendered capability
-/// addendum is fixed for the run, while conversation system
-/// contexts, the plan-mode section, the web-safety section and the preview
-/// verification section come and go.
+/// The stable half is `request.assembled_system_prompt`, the host's sections
+/// (environment, skills, MCP servers, …). The tail is, in this order, the
+/// system prompt the user gave the conversation ([`conversation_system_prompt`])
+/// and the notebook index a continuation holds as a system card — which the
+/// handoff gives it only on a model that reads its tools first
+/// (`host_append::tools_precede_system`), so the tools and the host's sections
+/// stay the prefix shared with any other conversation of the same setup.
+/// Nothing else joins it, whatever the provider. A system prompt appended
+/// mid-conversation (`system_append.rs`) is not part of it either: it travels
+/// in the messages, at the point it applies from.
 pub(crate) fn system_prompt_parts(request: &RunModelRequest) -> (Option<String>, Option<String>) {
     let stable = request.assembled_system_prompt.trim();
     let stable = (!stable.is_empty()).then(|| stable.to_owned());
     let mut prompts = Vec::new();
-    for context in &request.contexts {
-        if let ContextItem::System {
+    if let Some(prompt) = conversation_system_prompt(&request.contexts) {
+        if stable.as_deref() != Some(prompt) {
+            prompts.push(prompt.to_owned());
+        }
+    }
+    let handoff_index = request.contexts.iter().find_map(|context| match context {
+        ContextItem::System {
+            id,
             content,
             local_only: false,
             ..
-        } = context
-        {
-            let content = content.trim();
-            if !content.is_empty()
-                && stable.as_deref() != Some(content)
-                && !prompts.iter().any(|prompt| prompt == content)
-            {
-                prompts.push(content.to_owned());
-            }
+        } if id == crate::handoff::INDEX_CONTEXT_ID => {
+            Some(content.trim()).filter(|content| !content.is_empty())
         }
-    }
-    // Wire layer, not `assemble_system_prompt`: the section has to disappear on
-    // the very next step after the user approves the plan, must never enter a
-    // fork snapshot, and a child agent needs its own shorter variant.
-    if request.effective_security_level() == crate::model::SecurityLevel::Plan {
-        let key = if request.subagent_depth == 0 {
-            crate::prompt_profile::PromptKey::SystemPlanMode
-        } else {
-            crate::prompt_profile::PromptKey::SystemPlanModeSubagent
-        };
-        let section = request.prompt_profile.text(key).trim();
-        if !section.is_empty() {
-            prompts.push(section.to_owned());
-        }
-    }
-    if enabled_tools(request)
-        .iter()
-        .any(|tool| tool.name == crate::api::WEB_SEARCH_TOOL)
-    {
-        let boundary = request
-            .prompt_profile
-            .text(crate::prompt_profile::PromptKey::SystemWebSafety)
-            .trim();
-        if !boundary.is_empty() {
-            prompts.push(boundary.to_owned());
-        }
-    }
-    if preview_verification_applies(request) {
-        let section = request
-            .prompt_profile
-            .text(crate::prompt_profile::PromptKey::SystemPreviewTools)
-            .trim();
-        if !section.is_empty() {
-            prompts.push(section.to_owned());
-        }
-    }
+        _ => None,
+    });
+    prompts.extend(handoff_index.map(str::to_owned));
     let dynamic = (!prompts.is_empty()).then(|| prompts.join(SYSTEM_SECTION_SEPARATOR));
     (stable, dynamic)
 }
 
-/// Whether this step gets the `<preview_tools>` section.
-///
-/// Two conditions, both from the source: the host has to offer the launch tools
-/// at all, and the project has to want the verification workflow. `preview_start`
-/// standing in for the first is not a shorthand — it is the only tool that reads
-/// `.mework/launch.json` and brings a server up, so without it step 1 of the
-/// workflow the section teaches cannot be performed. The second is that file's
-/// own `autoVerify`; a project with no usable launch.json has neither a server
-/// to start nor anywhere to record the preference, and answers `false` for both
-/// reasons at once.
-///
-/// Read per step, alongside the plan-mode and web-safety sections, rather than
-/// frozen into the run's stable prompt: the file can change mid-run, and a
-/// project that turns `autoVerify` off must stop receiving the section on the
-/// next step instead of at the next turn.
-fn preview_verification_applies(request: &RunModelRequest) -> bool {
-    if !enabled_tools(request)
-        .iter()
-        .any(|tool| tool.name == PREVIEW_START_TOOL)
-    {
-        return false;
+/// The system prompt the user gave this conversation: its first context, when
+/// that is a system card the user wrote — not a host-local record, a hook's, an
+/// appended system prompt, a tool addition, a skill an older build delivered as
+/// a system card, or a continuation's notebook index. A system card anywhere
+/// else in the timeline is no system prompt, and the model is not sent it.
+pub(crate) fn conversation_system_prompt(contexts: &[ContextItem]) -> Option<&str> {
+    match contexts.first()? {
+        context @ ContextItem::System {
+            id,
+            content,
+            local_only: false,
+            hook_execution: None,
+            tools_added,
+            ..
+        } if tools_added.is_empty()
+            && !crate::system_append::is_appended(context)
+            && !crate::wire_history::is_legacy_skill_card(context)
+            && id != crate::handoff::INDEX_CONTEXT_ID =>
+        {
+            Some(content.trim()).filter(|content| !content.is_empty())
+        }
+        _ => None,
     }
-    let workspace = request.workspace_path.trim();
-    !workspace.is_empty()
-        && crate::preview_launch_config::LaunchConfigDiscovery::new(Path::new(workspace))
-            .discover(None)
-            .config()
-            .is_some_and(|config| config.auto_verify)
 }
 
 /// Build the system prompt using host-owned prompt composition rules: both
@@ -183,19 +141,22 @@ fn exchange_messages(family: Family, exchanges: &[Exchange], out: &mut Vec<Value
         if !bridge.is_empty() {
             out.push(json!({ "role": "user", "content": bridge }));
         }
-        // Background results settle after the tool results the round still owes,
-        // so they follow them here. The same builder runs on replay, so the
-        // fabricated call keeps its id once the card takes over as the carrier.
+        // Background results and host notices settle after the tool results the
+        // round still owes, so they follow them here. The same builder runs on
+        // replay, so the fabricated call keeps its id once the card takes over
+        // as the carrier.
         for delivery in &exchange.host_deliveries {
             super::project::host_delivery_messages(family, delivery, out);
         }
-        // Plain host instructions — the continue-after-truncation nudge — stay
-        // user-role text: they are directions for the next turn, not a result.
-        for notice in &exchange.host_notices {
-            let notice = notice.trim();
-            if !notice.is_empty() {
-                out.push(json!({ "role": "user", "content": notice }));
-            }
+        // System prompts appended at this boundary, then the tools that joined
+        // there, come last, after everything the round still owed the model —
+        // the same places their records take in the timeline, so the replay
+        // projects the same bytes.
+        for content in &exchange.system_appends {
+            out.push(crate::system_append::marker_message(content));
+        }
+        for tools in &exchange.tool_additions {
+            out.push(crate::tool_append::marker_message(tools));
         }
     }
 }
@@ -258,11 +219,11 @@ fn with_read_first_rule(mut schema: Value, tool_name: &str, request: &RunModelRe
     schema
 }
 
-/// Apply image admission checks and hydrate placeholders.
+/// Hydrate image placeholders, once the model is known to take images.
 ///
-/// Validate after projection but before sending, when the actual image count,
-/// bytes, and pixels are known. Check `supports_vision` first because it is a
-/// user-correctable configuration error; the remaining limits are quotas.
+/// A request carries every image its history holds: there is no per-request
+/// count, byte or pixel budget, so what a provider will not take is its own
+/// error to report.
 #[cfg(test)]
 pub(crate) fn hydrate_images_for_test(
     request: &RunModelRequest,
@@ -279,29 +240,12 @@ fn hydrate_images(request: &RunModelRequest, messages: Vec<Value>) -> Result<Vec
     if !request.model.supports_vision() {
         return Err(format!("模型 {} 未启用图片输入能力", request.model.id));
     }
-    if stats.count > MAX_REQUEST_IMAGES {
-        return Err(format!(
-            "单次模型请求最多包含 {MAX_REQUEST_IMAGES} 张图片，当前为 {} 张",
-            stats.count
-        ));
-    }
-    if stats.bytes > MAX_REQUEST_IMAGE_BYTES {
-        return Err(format!(
-            "单次模型请求图片总量超过 {} MiB 限制",
-            MAX_REQUEST_IMAGE_BYTES / 1024 / 1024
-        ));
-    }
-    if stats.pixels > MAX_REQUEST_IMAGE_PIXELS {
-        return Err(format!(
-            "单次模型请求图片总像素超过 {} MP 限制",
-            MAX_REQUEST_IMAGE_PIXELS / 1024 / 1024
-        ));
-    }
     let store = ImageAttachmentStore::new(Path::new(&request.app_data_path));
     hydrate_ai_sdk_images(&messages, &store)
 }
 
-/// Replace file attachment placeholders with the files' text.
+/// Replace file attachment placeholders with the files' text — or, for a
+/// model that reads PDFs as documents, a short PDF with the document itself.
 ///
 /// Runs after the wire-ledger copy is taken, so the ledger keeps the
 /// placeholder, and before the frame budget is measured, so the budget sees
@@ -309,16 +253,88 @@ fn hydrate_images(request: &RunModelRequest, messages: Vec<Value>) -> Result<Vec
 /// message's content are recognized, for the same reason image slots are:
 /// tool input and continuation blocks are model-controlled JSON.
 fn hydrate_files(request: &RunModelRequest, messages: Vec<Value>) -> Result<Vec<Value>, String> {
-    hydrate_file_parts(
+    hydrate_files_within_frame(
         messages,
         &FileAttachmentStore::new(Path::new(&request.app_data_path)),
+        reads_pdf_documents(
+            Family::for_format(request.provider.family),
+            request.model.supports_vision(),
+        ),
     )
 }
 
+/// Whether a request's model reads a PDF as the document itself, as Claude
+/// Code's Read hands it one.
+///
+/// Only families whose wire has a document part the AI SDK (or, for Claude
+/// Agent, the sidecar) fills from a `file` part: Anthropic's `document`,
+/// Responses' `input_file` (which Codex and Azure speak too), OpenAI Chat's
+/// `file` and Gemini's `inlineData`. The generic compatible Chat family serves
+/// relays with no such part (DeepSeek's, for one), and xAI and Bedrock stay on
+/// text too. The model must take images, since every such reader works from
+/// the pages' images; a model without eyes gets the text.
+fn reads_pdf_documents(family: Family, supports_vision: bool) -> bool {
+    supports_vision
+        && matches!(
+            family,
+            Family::Anthropic
+                | Family::ClaudeAgent
+                | Family::OpenaiResponses
+                | Family::OpenaiCodex
+                | Family::Azure
+                | Family::OpenaiChat
+                | Family::Google
+                | Family::Vertex
+        )
+}
+
+/// How PDFs travel in one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PdfDelivery {
+    /// Every attachment as its text.
+    Text,
+    /// PDFs of at most `MAX_NATIVE_PDF_PAGES` pages as the document itself,
+    /// oldest first, while their base64 alone still fits one frame.
+    Native,
+}
+
+/// The documents themselves go only while the whole request still fits one
+/// sidecar frame; past it, every PDF falls back to its text, and the frame
+/// check that follows is the one that decides.
+fn hydrate_files_within_frame(
+    messages: Vec<Value>,
+    store: &FileAttachmentStore,
+    native: bool,
+) -> Result<Vec<Value>, String> {
+    if native {
+        let (hydrated, sent_documents) =
+            hydrate_file_parts_as(messages.clone(), store, PdfDelivery::Native)?;
+        if !sent_documents || super::project::enforce_frame_budget(&hydrated).is_ok() {
+            return Ok(hydrated);
+        }
+    }
+    hydrate_file_parts_as(messages, store, PdfDelivery::Text).map(|(hydrated, _)| hydrated)
+}
+
+#[cfg(test)]
 fn hydrate_file_parts(
-    mut messages: Vec<Value>,
+    messages: Vec<Value>,
     store: &FileAttachmentStore,
 ) -> Result<Vec<Value>, String> {
+    hydrate_file_parts_as(messages, store, PdfDelivery::Text).map(|(hydrated, _)| hydrated)
+}
+
+/// Also says whether any PDF went as the document itself.
+fn hydrate_file_parts_as(
+    mut messages: Vec<Value>,
+    store: &FileAttachmentStore,
+    delivery: PdfDelivery,
+) -> Result<(Vec<Value>, bool), String> {
+    let mut document_room = match delivery {
+        PdfDelivery::Native => (super::protocol::MAX_LINE_BYTES / 2 / 4 * 3) as u64,
+        PdfDelivery::Text => 0,
+    };
+    let mut sent_documents = false;
     for message in &mut messages {
         if message.get("role").and_then(Value::as_str) != Some("user") {
             continue;
@@ -326,9 +342,16 @@ fn hydrate_file_parts(
         let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        let mut hydrated = false;
-        for part in parts.iter_mut() {
+        if !parts
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some(FILE_PART_TYPE))
+        {
+            continue;
+        }
+        let mut hydrated = Vec::with_capacity(parts.len() + 1);
+        for part in parts.drain(..) {
             if part.get("type").and_then(Value::as_str) != Some(FILE_PART_TYPE) {
+                hydrated.push(part);
                 continue;
             }
             let file: FileAttachment = part
@@ -339,25 +362,46 @@ fn hydrate_file_parts(
                     serde_json::from_value(file)
                         .map_err(|error| format!("附件占位无效，无法发送：{error}"))
                 })?;
-            let text = store.model_text(&file).map_err(|error| {
+            let unreadable = |error: String| {
                 format!(
                     "附件 {} 的内容已不存在或已损坏，无法发送：{error}",
                     file.name
                 )
-            })?;
-            *part = json!({
+            };
+            let as_document = file.format == crate::model::FileAttachmentFormat::Pdf
+                && file
+                    .pages
+                    .is_some_and(|pages| pages <= crate::file_attachments::MAX_NATIVE_PDF_PAGES)
+                && file.bytes <= document_room;
+            if as_document {
+                let data = store.pdf_data_url(&file).map_err(unreadable)?;
+                document_room -= file.bytes;
+                sent_documents = true;
+                hydrated.push(json!({
+                    "type": "text",
+                    "text": crate::file_attachments::render_native_pdf_marker(&file),
+                }));
+                hydrated.push(json!({
+                    "type": "file",
+                    "data": data,
+                    "mediaType": "application/pdf",
+                    "filename": file.name,
+                }));
+                continue;
+            }
+            let text = store.model_text(&file).map_err(unreadable)?;
+            hydrated.push(json!({
                 "type": "text",
                 "text": crate::file_attachments::render_for_model(&file, &text),
-            });
-            hydrated = true;
+            }));
         }
+        *parts = hydrated;
         // Text-only providers are most reliable with string content, which is
         // why `project::user_message` sends a plain message as a string; a
         // message whose files were its only non-text parts goes out the same way.
-        if hydrated
-            && parts
-                .iter()
-                .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        if parts
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
         {
             let joined = parts
                 .iter()
@@ -367,21 +411,21 @@ fn hydrate_file_parts(
             message["content"] = Value::String(joined);
         }
     }
-    Ok(messages)
+    Ok((messages, sent_documents))
 }
 
-/// Map reasoning effort to the AI SDK 7 vocabulary. Provider-specific mappings
-/// and unsupported-level fallback belong to the provider implementation.
+/// Map reasoning effort to the step wire vocabulary: AI SDK 7's levels plus
+/// `max`, which the SDK has no shared name for. What each level becomes for a
+/// family and model, and where a model lacks it, is the sidecar's mapping
+/// (`aisdk-service/src/reasoning.ts`), the one place that knows both.
 fn reasoning_level(effort: crate::model::ReasoningEffort) -> Option<&'static str> {
     use crate::model::ReasoningEffort;
     Some(match effort {
-        // Send `none`, rather than omitting the field, because omission selects
-        // the provider default and can re-enable explicitly disabled reasoning.
-        ReasoningEffort::Disabled => "none",
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
-        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Extra => "xhigh",
+        ReasoningEffort::Max => "max",
     })
 }
 
@@ -414,18 +458,14 @@ fn responses_options_key(family: Family) -> Option<&'static str> {
 fn provider_options(
     family: Family,
     _reasoning_content: ReasoningContent,
-    reasoning_effort: crate::model::ReasoningEffort,
     conversation_id: &str,
 ) -> Option<Value> {
     let key = responses_options_key(family)?;
     let mut options = json!({ "store": false });
     // The SDK defaults `reasoning.summary` to `detailed` whenever an effort other
-    // than `none` is sent; Codex omits the field, so send an explicit null to
-    // suppress it. With reasoning disabled the SDK never emits a summary and the
-    // request must stay free of every reasoning dial.
-    if !matches!(reasoning_effort, crate::model::ReasoningEffort::Disabled) {
-        options["reasoningSummary"] = Value::Null;
-    }
+    // than `none` is sent, and every level is one; Codex omits the field, so send
+    // an explicit null to suppress it.
+    options["reasoningSummary"] = Value::Null;
     // Deliberately only the encrypted-reasoning include. The consulted-source
     // list a native search needs (`web_search_call.action.sources`) is NOT asked
     // for here: `@ai-sdk/openai` appends it by itself whenever the Responses
@@ -451,13 +491,7 @@ mod responses_defaults_tests {
         for family in [Family::OpenaiResponses, Family::OpenaiCodex, Family::Azure] {
             for mode in [ReasoningContent::Plaintext, ReasoningContent::Encrypted] {
                 let key = responses_options_key(family).unwrap();
-                let options = provider_options(
-                    family,
-                    mode,
-                    crate::model::ReasoningEffort::High,
-                    "conversation",
-                )
-                .unwrap();
+                let options = provider_options(family, mode, "conversation").unwrap();
                 assert_eq!(
                     options[key]["include"],
                     json!(["reasoning.encrypted_content"])
@@ -467,39 +501,11 @@ mod responses_defaults_tests {
     }
 
     #[test]
-    fn disabled_reasoning_sends_no_summary_dial() {
-        for family in [Family::OpenaiResponses, Family::OpenaiCodex, Family::Azure] {
-            let key = responses_options_key(family).unwrap();
-            let options = provider_options(
-                family,
-                ReasoningContent::Plaintext,
-                crate::model::ReasoningEffort::Disabled,
-                "conversation",
-            )
-            .unwrap();
-            assert!(!options[key]
-                .as_object()
-                .unwrap()
-                .contains_key("reasoningSummary"));
-            assert_eq!(
-                options[key]["include"],
-                json!(["reasoning.encrypted_content"])
-            );
-        }
-    }
-
-    #[test]
     fn responses_summary_default_is_explicit_null() {
         for family in [Family::OpenaiResponses, Family::OpenaiCodex, Family::Azure] {
             let key = responses_options_key(family).unwrap();
             for mode in [ReasoningContent::Plaintext, ReasoningContent::Encrypted] {
-                let options = provider_options(
-                    family,
-                    mode,
-                    crate::model::ReasoningEffort::High,
-                    "conversation",
-                )
-                .unwrap();
+                let options = provider_options(family, mode, "conversation").unwrap();
                 assert!(options[key]
                     .as_object()
                     .unwrap()
@@ -512,14 +518,12 @@ mod responses_defaults_tests {
         assert!(provider_options(
             Family::Anthropic,
             ReasoningContent::Plaintext,
-            crate::model::ReasoningEffort::High,
             "conversation"
         )
         .is_none());
         assert!(provider_options(
             Family::OpenaiChat,
             ReasoningContent::Plaintext,
-            crate::model::ReasoningEffort::High,
             "conversation"
         )
         .is_none());
@@ -611,6 +615,108 @@ mod file_hydration_tests {
         ];
         let hydrated = hydrate_file_parts(messages.clone(), &store).unwrap();
         assert_eq!(hydrated, messages);
+    }
+
+    fn pdf_file(
+        store: &FileAttachmentStore,
+        name: &str,
+        bytes: &[u8],
+        pages: u32,
+    ) -> FileAttachment {
+        store
+            .import(
+                name,
+                bytes,
+                FileAttachmentFormat::Pdf,
+                Some("page text"),
+                Some(pages),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_short_pdf_goes_as_the_document_itself_to_a_model_that_reads_documents() {
+        use base64::Engine as _;
+
+        let (_temp, store) = store();
+        let short = b"%PDF-1.7\n%%EOF\n";
+        let pdf = pdf_file(&store, "report.pdf", short, 3);
+        let long = pdf_file(&store, "book.pdf", b"%PDF-1.7\n% long\n%%EOF\n", 11);
+        let messages = vec![json!({
+            "role": "user",
+            "content": [placeholder(&pdf), placeholder(&long), { "type": "text", "text": "Summarize." }],
+        })];
+        let hydrated = hydrate_files_within_frame(messages.clone(), &store, true).unwrap();
+        let parts = hydrated[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(
+            parts[0],
+            json!({
+                "type": "text",
+                "text": "<attached_file name=\"report.pdf\" type=\"pdf\" pages=\"3\" content=\"the PDF document, attached after this element\"></attached_file>",
+            })
+        );
+        assert_eq!(
+            parts[1],
+            json!({
+                "type": "file",
+                "data": format!(
+                    "data:application/pdf;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(short)
+                ),
+                "mediaType": "application/pdf",
+                "filename": "report.pdf",
+            })
+        );
+        // Past ten pages Claude Code reads a PDF only in ranges; here it is text.
+        assert_eq!(
+            parts[2]["text"],
+            "<attached_file name=\"book.pdf\" type=\"pdf\" pages=\"11\" content=\"text extracted from the PDF\">\npage text\n</attached_file>"
+        );
+        assert_eq!(parts[3]["text"], "Summarize.");
+
+        // For a model that does not read documents, both are text, in one string.
+        let text = hydrate_files_within_frame(messages, &store, false).unwrap();
+        assert!(text[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("<attached_file name=\"report.pdf\" type=\"pdf\" pages=\"3\" content=\"text extracted from the PDF\">"));
+    }
+
+    #[test]
+    fn documents_that_would_overflow_the_frame_fall_back_to_their_text() {
+        let (_temp, store) = store();
+        let mut padded = b"%PDF-1.7\n%".to_vec();
+        padded.extend(std::iter::repeat(b'x').take(64 * 1024));
+        let pdf = pdf_file(&store, "scan.pdf", &padded, 1);
+        let filler = "y".repeat(super::super::protocol::MAX_LINE_BYTES / 2 - 32 * 1024);
+        let messages = vec![json!({
+            "role": "user",
+            "content": [placeholder(&pdf), { "type": "text", "text": filler }],
+        })];
+        let hydrated = hydrate_files_within_frame(messages, &store, true).unwrap();
+        assert!(hydrated[0]["content"].is_string(), "fell back to text");
+        assert!(super::super::project::enforce_frame_budget(&hydrated).is_ok());
+    }
+
+    #[test]
+    fn only_families_with_a_document_part_and_a_model_with_eyes_read_pdfs() {
+        for family in [
+            Family::Anthropic,
+            Family::ClaudeAgent,
+            Family::OpenaiResponses,
+            Family::OpenaiCodex,
+            Family::OpenaiChat,
+            Family::Azure,
+            Family::Google,
+            Family::Vertex,
+        ] {
+            assert!(reads_pdf_documents(family, true), "{family:?}");
+            assert!(!reads_pdf_documents(family, false), "{family:?}");
+        }
+        for family in [Family::OpenaiCompatible, Family::Xai, Family::Bedrock] {
+            assert!(!reads_pdf_documents(family, true), "{family:?}");
+        }
     }
 
     #[test]
@@ -726,7 +832,7 @@ pub(crate) fn sidecar_base_url(base_url: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-/// Builds one step's request together with the copy the wire ledger records.
+/// Builds one step's request together with the copy the history records.
 ///
 /// The audit copy is taken here, and nowhere else, because this is the only
 /// point where both of its invariants hold at once. The messages are still in
@@ -749,7 +855,7 @@ pub(crate) fn build_step_request_audited(
     api_key: Option<String>,
     max_steps: u32,
     adjust: impl FnOnce(&mut StepRequest),
-) -> Result<(StepRequest, WireAudit), String> {
+) -> Result<(StepRequest, RequestAudit), String> {
     let mut messages = Vec::new();
     let family = Family::for_format(request.provider.family);
     // Ephemeral contexts precede history because they apply only to this request
@@ -787,7 +893,6 @@ pub(crate) fn build_step_request_audited(
         provider_options: provider_options(
             family,
             request.model.reasoning_content,
-            request.reasoning_effort,
             &request.conversation_id,
         ),
         native_search: native_search(request, family),
@@ -795,6 +900,8 @@ pub(crate) fn build_step_request_audited(
         // Minted per run by the caller (`SessionLease`), never per step: the
         // sidecar keys its parked CLI session by it.
         agent: None,
+        tool_append: crate::tool_append::appends_tools(&request.provider, &request.model),
+        system_append: crate::system_append::appends_system(&request.provider, &request.model),
     };
 
     // Every per-continuation adjustment happens here, before the copy is taken.
@@ -814,19 +921,19 @@ pub(crate) fn build_step_request_audited(
 /// The system prompt and the tool specs are parts rather than envelope fields
 /// because they are as much "what was sent" as the messages are, and because
 /// they are what changes when the model's behaviour changes for no visible
-/// reason — a plan-mode section that vanished, a tool that left the surface.
+/// reason — a section that vanished, a tool that left the surface.
 fn wire_audit(
     step: &StepRequest,
     system: &Option<String>,
     system_dynamic: &Option<String>,
     tools: &[ToolSpec],
     messages: Vec<Value>,
-) -> WireAudit {
+) -> RequestAudit {
     let mut envelope = serde_json::to_value(step).unwrap_or_else(|_| json!({}));
     if let Some(object) = envelope.as_object_mut() {
         // Named rather than silently absent. These fields are never recorded at
         // all — not dropped from a copy that once held them — and a reader of the
-        // ledger has to be able to see that the gap is deliberate.
+        // history has to be able to see that the gap is deliberate.
         object.insert(
             "$notRecorded".into(),
             json!(["apiKey", "headers", "agent"]),
@@ -850,7 +957,7 @@ fn wire_audit(
             .into_iter()
             .map(|message| (PART_MESSAGE, message)),
     );
-    WireAudit { envelope, parts }
+    RequestAudit { envelope, parts }
 }
 
 /// [`build_step_request_audited`] without the ledger copy. Every path that

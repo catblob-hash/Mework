@@ -142,6 +142,13 @@ fn event_cost(event: &ModelStreamEvent) -> usize {
         ModelStreamEvent::TextDelta { delta, .. }
         | ModelStreamEvent::ReasoningDelta { delta, .. } => EVENT_OVERHEAD + delta.len(),
         ModelStreamEvent::UserInputReceived { content, .. } => EVENT_OVERHEAD + content.len(),
+        // A delivered background result can be as long as the task's output.
+        ModelStreamEvent::HostContextAdded { context, .. } => {
+            EVENT_OVERHEAD
+                + serde_json::to_string(context)
+                    .map(|s| s.len())
+                    .unwrap_or(4096)
+        }
         ModelStreamEvent::ToolCallArgumentsReady { input, .. } => {
             EVENT_OVERHEAD
                 + serde_json::to_string(input)

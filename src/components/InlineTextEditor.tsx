@@ -1,14 +1,13 @@
 import { Bot, BrainCircuit, Check, Shield, UserRound, X } from "lucide-react";
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { useAttachmentDropZone } from "../lib/attachmentDrop";
 import {
-  isLongPaste,
   mergeFileAttachments,
-  pastedTextFile,
   type AddMessageAttachments,
   type AttachmentRejection
 } from "../lib/fileAttachments";
+import { expandPastedTexts, type PastedText } from "../lib/pastedText";
 import {
   textWithoutAppendedImagePlaceholders,
   withImagePlaceholders
@@ -18,6 +17,7 @@ import { AttachmentDropOverlay, AttachmentNotice } from "./AttachmentFeedback";
 import { ComposerAddFiles } from "./ComposerAddMenu";
 import { IconButton, PlainField } from "./Common";
 import { ImageStrip } from "./ImageStrip";
+import { usePastedTextTags } from "./PastedTextTags";
 
 type TextKind = Exclude<InsertableContextKind, "tool">;
 
@@ -91,6 +91,14 @@ export function InlineTextEditor({
       ? textWithoutAppendedImagePlaceholders(initialContent, initialImages)
       : initialContent
   ));
+  // A long paste folds into a tag here as it does in the composer, and saves as its text.
+  const [pastes, setPastes] = useState<PastedText[]>([]);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const updatePastes = useCallback(
+    (update: (current: readonly PastedText[]) => PastedText[]) => setPastes((current) => update(current)),
+    []
+  );
+  const pasteTags = usePastedTextTags({ textareaRef, value: content, pastes, onPastesChange: updatePastes });
   // The latest attachments, for a batch that lands after others were added or removed.
   const attachmentsRef = useRef({ images, files });
   attachmentsRef.current = { images, files };
@@ -124,7 +132,7 @@ export function InlineTextEditor({
 
   const save = () => {
     if (!savable) return;
-    const text = content.trim();
+    const text = expandPastedTexts(content, pastes).trim();
     if (kind !== "user") {
       onSave(text);
       return;
@@ -165,19 +173,18 @@ export function InlineTextEditor({
         label={meta.title(t)}
         placeholder={meta.placeholder(t)}
         onChange={setContent}
-        onPaste={acceptsAttachments ? (event) => {
+        textareaRef={textareaRef}
+        pasteLayer={kind === "user" ? pasteTags.layer : undefined}
+        onPaste={kind === "user" ? (event) => {
           const pasted = Array.from(event.clipboardData.files);
           const text = event.clipboardData.getData("text/plain");
-          if (pasted.length) {
+          if (pasted.length && acceptsAttachments) {
             // A clipboard carrying both keeps its text; the file rides along.
             if (!text) event.preventDefault();
             attach(pasted);
             return;
           }
-          if (text && isLongPaste(text)) {
-            event.preventDefault();
-            attach([pastedTextFile(text, files)]);
-          }
+          pasteTags.onPaste(event);
         } : undefined}
         onKeyDown={(event) => {
           if ((event.ctrlKey || event.metaKey) && event.key === "Enter") save();

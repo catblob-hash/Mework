@@ -4,6 +4,7 @@ import { useI18n } from "../i18n";
 import { externalHttpUrl } from "../lib/externalLinks";
 import { codeLanguage, fileViewerKind, hasSourceForm } from "../lib/fileViewers";
 import { splitFrontMatter } from "../lib/frontMatter";
+import { memoryPool, pooledFetch } from "../lib/memoryPool";
 import { fileAttachmentData } from "../lib/runtime";
 import type { FileAttachment } from "../types";
 import { MarkdownCodeBlock, NumberedCode } from "./CodeBlock";
@@ -18,28 +19,9 @@ import { MarkdownContent } from "./MarkdownContent";
 import "./FilePreview/FilePreview.css";
 import "./FileAttachmentPreview.css";
 
-const fileDataCache = new Map<string, Promise<string>>();
-/** Files run larger than thumbnails; a handful of recent ones is plenty to reopen quickly. */
-const FILE_DATA_CACHE_LIMIT = 6;
-
+/** A file's bytes, low-priority data in the shared pool: only this preview reads them. */
 function fileData(file: FileAttachment): Promise<string> {
-  const cached = fileDataCache.get(file.id);
-  if (cached) {
-    fileDataCache.delete(file.id);
-    fileDataCache.set(file.id, cached);
-    return cached;
-  }
-  const request = fileAttachmentData(file.id).catch((error) => {
-    fileDataCache.delete(file.id);
-    throw error;
-  });
-  fileDataCache.set(file.id, request);
-  while (fileDataCache.size > FILE_DATA_CACHE_LIMIT) {
-    const oldest = fileDataCache.keys().next().value as string | undefined;
-    if (!oldest) break;
-    fileDataCache.delete(oldest);
-  }
-  return request;
+  return pooledFetch(memoryPool, "fileData", file.id, () => fileAttachmentData(file.id));
 }
 
 /** An attachment is not in the workspace, so a page in it reads nothing beside itself. */
@@ -80,7 +62,7 @@ function onDocumentClick(event: MouseEvent<HTMLDivElement>): void {
   }
 }
 
-export function formatTokenEstimate(tokens: number): string {
+function formatTokenEstimate(tokens: number): string {
   if (tokens < 1000) return String(tokens);
   const thousands = tokens / 1000;
   return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k`;
@@ -184,7 +166,7 @@ export function FileAttachmentPreview({ file, onClose }: { file: FileAttachment;
     let active = true;
     setLoaded({ status: "loading" });
     // A retry asks the host again rather than replaying the failure it cached.
-    if (attempt > 0) fileDataCache.delete(file.id);
+    if (attempt > 0) memoryPool.delete("fileData", file.id);
     fileData(file).then(
       (source) => {
         if (active) setLoaded({ status: "ready", source });

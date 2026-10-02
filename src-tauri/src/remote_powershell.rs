@@ -457,6 +457,43 @@ Quit 0
     script
 }
 
+/// Plan mode's question about a write target: `repository` when Git would
+/// count writing it as a change — tracked, or inside a work tree and not
+/// ignored — and `free` otherwise, Git missing included. The POSIX form is
+/// `remote_files::REPOSITORY_PROBE`.
+///
+/// The path goes to `git check-ignore --stdin` rather than on the command line,
+/// because Windows PowerShell 5.1 re-splits a native program's arguments on
+/// spaces and quotes; `-q` is not allowed with `--stdin`, so the listing is
+/// dropped instead and only the status read.
+pub(crate) fn repository_probe(target: &Target<'_>, path: &str) -> String {
+    let mut script = prologue(target, path, Mode::ForWrite);
+    script.push_str(
+        r#"$MeworkAnswer = 'free'
+$A = [System.IO.Path]::GetDirectoryName($C)
+$R = [System.IO.Path]::GetFileName($C)
+while ($A -and -not [System.IO.Directory]::Exists($A)) {
+  $R = [System.IO.Path]::GetFileName($A) + '/' + $R
+  $A = [System.IO.Path]::GetDirectoryName($A)
+}
+if ($A -and (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {
+  $MeworkEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  foreach ($MeworkVar in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT')) { Remove-Item -LiteralPath ('Env:' + $MeworkVar) -ErrorAction SilentlyContinue }
+  $env:GIT_OPTIONAL_LOCKS = '0'
+  Push-Location -LiteralPath $A
+  try {
+    $R | & git -c core.fsmonitor=false check-ignore --stdin 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 1) { $MeworkAnswer = 'repository' }
+  } catch { $MeworkAnswer = 'free' } finally { Pop-Location; $ErrorActionPreference = $MeworkEap }
+}
+Out-Line $MeworkAnswer
+Quit 0
+"#,
+    );
+    script
+}
+
 /// Reads the whole of standard input as bytes.
 const READ_INPUT: &str = r#"function Read-Input {
   if ($PSVersionTable.PSVersion.Major -ge 6) { $in = [Console]::OpenStandardInput() } else {

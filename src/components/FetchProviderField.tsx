@@ -4,6 +4,7 @@ import { SEARCH_PROVIDERS } from "../lib/searchProviders";
 import type { FetchProviderSelection, NativeFetchTool, WebSearchAssets } from "../types";
 import { NATIVE_FETCH_TOOLS } from "../types";
 import { Field } from "./Common";
+import { LockMark, lockedFieldHint, lockToneClass, type BackendLock } from "./LockTone";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuItem, PopoverMenuSection } from "./PopoverMenu";
 
@@ -27,10 +28,12 @@ interface FetchProviderFieldProps {
   /** Whether to offer the parent-selection option. Conversations have no parent. */
   inheritOption?: boolean;
   hint?: string;
-  /** Draws the selection as settled rather than removable. */
-  disabled?: boolean;
-  /** Replaces the standing advice while disabled, to say why it cannot move. */
-  disabledHint?: string;
+  /**
+   * How the conversation's lock draws this selector: gray cannot move, and its
+   * note replaces the standing advice to say why; orange moves, and its note
+   * says what moving it costs.
+   */
+  lock?: BackendLock | null;
   /** Opens the native row into a second step naming the wire tool version. */
   nativeToolChoice?: NativeFetchToolChoice;
 }
@@ -51,8 +54,7 @@ export function FetchProviderField({
   webSearchAssets,
   inheritOption = false,
   hint,
-  disabled = false,
-  disabledHint,
+  lock,
   nativeToolChoice
 }: FetchProviderFieldProps) {
   const { t } = useI18n();
@@ -127,27 +129,27 @@ export function FetchProviderField({
     ]
   }];
 
+  const disabled = lock?.tone === "hard";
   return <Field
     label={t("抓取提供商", "Fetch provider")}
-    hint={disabled && disabledHint
-      ? disabledHint
-      : unavailable
-        ? t(
-          "已选抓取提供商未启用，抓取网页当前无法执行。请改选原生、一个已启用的提供商，或「不启用」；旧选择不会被静默恢复。",
-          "The selected fetch provider is disabled, so page fetching cannot run. Choose native, an enabled provider, or “Off”; the old selection is not silently restored."
-        )
-        : hint ?? t(
-          "抓取网页与联网搜索是两件事，可以分别指定后端。选「原生」是交给当前模型自己的提供商：像 Anthropic 那样把抓取拆成独立服务端工具的，会多出抓取网页这个工具；像 OpenAI 那样把抓取并进搜索的，则不会多出工具，抓取在搜索内部完成。选「不启用」则模型只看得到联网搜索。",
-          "Fetching a page and searching the web are two capabilities, and each can name its own backend. “Native” hands it to the conversation's own model provider: a provider that splits retrieval into its own server tool, as Anthropic does, gains a page-fetch tool; one that folds retrieval into search, as OpenAI does, gains no second tool and fetches inside the search call. Choose “Off” and the model sees web search alone."
-        )}
+    hint={lockedFieldHint(lock, unavailable
+      ? t(
+        "已选抓取提供商未启用，抓取网页当前无法执行。请改选原生、一个已启用的提供商，或「不启用」；旧选择不会被静默恢复。",
+        "The selected fetch provider is disabled, so page fetching cannot run. Choose native, an enabled provider, or “Off”; the old selection is not silently restored."
+      )
+      : hint ?? t(
+        "抓取网页与联网搜索是两件事，可以分别指定后端。选「原生」是交给当前模型自己的提供商：像 Anthropic 那样把抓取拆成独立服务端工具的，会多出抓取网页这个工具；像 OpenAI 那样把抓取并进搜索的，则不会多出工具，抓取在搜索内部完成。选「不启用」则模型只看得到联网搜索。",
+        "Fetching a page and searching the web are two capabilities, and each can name its own backend. “Native” hands it to the conversation's own model provider: a provider that splits retrieval into its own server tool, as Anthropic does, gains a page-fetch tool; one that folds retrieval into search, as OpenAI does, gains no second tool and fetches inside the search call. Choose “Off” and the model sees web search alone."
+      ))}
   >
     <PopoverMenu
       rootClassName="popover-select"
-      triggerClassName={`input popover-select__trigger${unavailable ? " input--error" : ""}`}
+      triggerClassName={`input popover-select__trigger${unavailable ? " input--error" : ""}${lockToneClass("popover-select__trigger", lock?.tone)}`}
       triggerLabel={t("抓取提供商：{value}", "Fetch provider: {value}", { value: triggerLabel })}
       trigger={<>
         <span className="popover-select__value">{triggerLabel}</span>
         {triggerVersion && <span className="popover-select__note">{triggerVersion}</span>}
+        <LockMark tone={lock?.tone} />
         <ChevronDown size={14} className="popover-select__chevron" aria-hidden="true" />
       </>}
       disabled={disabled}

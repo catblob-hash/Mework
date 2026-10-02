@@ -32,7 +32,6 @@ use crate::{
     model::{JsonObject, ResolvedLanguage, ResourceSource},
     remote_files::{self, Confinement, ExitWording, RemoteShell, RemoteWorkspace, TargetMode},
     run_environment::{self, ShellRunner},
-    tool_executor::{optional_string, optional_u64_value, required_string, MAX_PATH_CHARS},
 };
 
 /// One probe reads the file and both configuration files; a language server
@@ -142,19 +141,9 @@ pub(crate) fn run_with(
     )
 }
 
-/// The tool arguments, validated the way the host leg validates them.
+/// The tool arguments, read the way the host leg reads them.
 fn parse_input(input: &JsonObject) -> Result<LspCall, String> {
-    let operation = required_string(input, "operation", 64, false)?;
-    let requested = required_string(input, "filePath", MAX_PATH_CHARS, false)?;
-    let line = optional_u64_value(input, "line")?
-        .ok_or_else(|| "line is required; it is 1-based, as shown in editors".to_owned())?;
-    let character = optional_u64_value(input, "character")?
-        .ok_or_else(|| "character is required; it is 1-based, as shown in editors".to_owned())?;
-    let query = match input.get("query") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(_) => Some(optional_string(input, "query", "", 1024, true)?),
-    };
-    lsp::parse_call(&operation, requested, line, character, query)
+    lsp::parse_input(input)
 }
 
 // ---------------------------------------------------------------------------

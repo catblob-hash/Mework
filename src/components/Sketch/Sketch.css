@@ -8,7 +8,7 @@
 .sketch-overlay__backdrop {
   position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: cover; object-position: left top;
-  user-select: none; pointer-events: none;
+  -webkit-user-select: none; user-select: none; pointer-events: none;
 }
 .sketch-overlay__backdrop--blank { background: var(--subtle); }
 .sketch-overlay__canvas { width: 100%; height: 100%; }

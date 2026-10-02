@@ -171,7 +171,7 @@ describe("ToolApprovalDock", () => {
     expect(onDecide).toHaveBeenNthCalledWith(2, "deny", undefined);
   });
 
-  it("asks the exit question instead of a tool question, and offers both ways to start", () => {
+  it("asks for approval or feedback instead of a tool question", () => {
     render(
       <ToolApprovalDock
         pending={prompt({ toolName: "exit_plan_mode", label: "退出计划模式", kind: "plan_exit", summary: "分三步替换旧的审批闸" })}
@@ -179,50 +179,42 @@ describe("ToolApprovalDock", () => {
       />
     );
 
-    const dialog = screen.getByRole("dialog", { name: "计划已就绪，是否开始实施？" });
+    const dialog = screen.getByRole("dialog", { name: "计划已就绪，批准或提意见" });
     expect(dialog).toHaveAttribute("data-approval-kind", "plan_exit");
     // The card is about the conversation, not about one call: no risk, no label.
     expect(dialog).not.toHaveTextContent("风险");
     expect(dialog).not.toHaveTextContent("退出计划模式");
 
+    // No refusal and no security level among the answers: approve, or reply.
     const actions = Array.from(dialog.querySelectorAll("footer button"))
       .map((button) => button.textContent);
-    expect(actions).toEqual(["否，继续规划", "是，手动批准编辑", "是，自动接受编辑"]);
+    expect(actions).toEqual(["发送意见", "批准"]);
+    expect(screen.getByRole("textbox", { name: "修改意见" })).toBeInTheDocument();
   });
 
-  it("distinguishes the two ways to start implementing", async () => {
+  it("approves a plan without touching the security level", async () => {
     const user = userEvent.setup();
-    const manual = vi.fn();
-    const { unmount } = render(
-      <ToolApprovalDock pending={prompt({ kind: "plan_exit" })} onDecide={manual} />
-    );
-    await user.click(screen.getByRole("button", { name: "是，手动批准编辑" }));
-    expect(manual).toHaveBeenCalledWith("allow_once", undefined);
-    unmount();
-
-    const auto = vi.fn();
-    render(<ToolApprovalDock pending={prompt({ kind: "plan_exit" })} onDecide={auto} />);
-    await user.click(screen.getByRole("button", { name: "是，自动接受编辑" }));
-    expect(auto).toHaveBeenCalledWith("allow_always", undefined);
+    const onDecide = vi.fn();
+    render(<ToolApprovalDock pending={prompt({ kind: "plan_exit" })} onDecide={onDecide} />);
+    await user.click(screen.getByRole("button", { name: "批准" }));
+    expect(onDecide).toHaveBeenCalledWith("allow_once", undefined);
+    expect(screen.getByRole("status")).toHaveTextContent("已批准，模型开始实施");
   });
 
-  it("collects what to change before sending a plan back", async () => {
+  it("sends what to change from the card's reply box", async () => {
     const user = userEvent.setup();
     const onDecide = vi.fn();
     render(<ToolApprovalDock pending={prompt({ kind: "plan_exit" })} onDecide={onDecide} />);
 
-    expect(screen.queryByRole("textbox", { name: "修改意见" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "否，继续规划" }));
-    // Revealing the box is not yet an answer; the model is still waiting.
-    expect(onDecide).not.toHaveBeenCalled();
-
-    const send = screen.getByRole("button", { name: "提交反馈" });
+    const send = screen.getByRole("button", { name: "发送意见" });
     expect(send).toBeDisabled();
     await user.type(screen.getByRole("textbox", { name: "修改意见" }), "  先补迁移脚本  ");
+    // Typing is not yet an answer; the model is still waiting.
+    expect(onDecide).not.toHaveBeenCalled();
     await user.click(send);
 
     expect(onDecide).toHaveBeenCalledTimes(1);
     expect(onDecide).toHaveBeenCalledWith("deny", "先补迁移脚本");
-    expect(screen.getByRole("status")).toHaveTextContent("已退回计划，等待模型修改");
+    expect(screen.getByRole("status")).toHaveTextContent("已发送意见");
   });
 });

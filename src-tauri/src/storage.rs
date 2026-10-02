@@ -31,20 +31,75 @@ use crate::{
 /// newer schema only adds keys with serde defaults, reviewed as such, and naming
 /// its source version as a literal. Fields removed in past schemas must not be
 /// resurrected through serde defaults when this version changes.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 const TEMPORARY_WORKSPACE_ID: &str = "__temporary__";
 const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WEB_SEARCHES_PER_CALL: u32 = 99_999;
 const MAX_AGENT_DEFINITIONS: usize = 256;
 const MAX_RETAINED_AGENT_DEFINITION_IDENTITIES: usize = 4096;
 const MAX_AGENT_DEFINITION_SOURCE_KEY_CHARS: usize = 256;
+/// How many workspaces' variable tables one document may hold, and separately
+/// how many workspaces' sandboxes: one per workspace rather than per machine,
+/// so the bound leaves room for many projects of up to sixteen workspaces each.
+const MAX_WORKSPACE_TABLES: usize = 1024;
 /// Limits prevent malformed documents from causing unbounded startup work.
 const MAX_ENVIRONMENT_TOOLS: usize = 128;
 const MAX_ENVIRONMENT_TOOL_NAME_CHARS: usize = 64;
 const MAX_ENVIRONMENT_TOOL_ARGUMENTS: usize = 8;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// What the loaders do with the conversation bodies they read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bodies {
+    /// Check each body, note what it references, and drop it: the document
+    /// comes back without bodies, and at most two are ever alive while it is
+    /// assembled (see [`scan_bodies`]). What the app loads.
+    Discard,
+    /// Keep every body on the document, for tests that read them back.
+    #[cfg(test)]
+    Keep,
+}
+
+/// A document as a loader hands it over, with what the bodies it read
+/// referenced — the document snapshot keeps no bodies, and attachment
+/// reclamation needs to know them (`attachment_refs`).
+pub(crate) struct LoadedDocument {
+    pub document: AppDocument,
+    pub refs: crate::attachment_refs::AttachmentRefs,
+    /// Conversations whose main timeline ends in a user message.
+    unanswered: Vec<String>,
+    /// Whether this load wrote the seed for a brand-new install: no anchor and
+    /// no stored conversations. A rebuilt anchor (missing or unreadable, with
+    /// history in the store) is a recovery, not a first launch.
+    pub fresh_install: bool,
+}
+
+impl LoadedDocument {
+    /// Forgets what was noted about conversations a later pass dropped.
+    fn retain_present(&mut self) {
+        let present = self
+            .document
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.conversations.iter())
+            .map(|conversation| conversation.id.clone())
+            .collect::<HashSet<_>>();
+        self.refs.retain_conversations(&present);
+        self.unanswered.retain(|id| present.contains(id));
+    }
+}
+
+/// [`load_or_initialize`] as the app runs it: the document without bodies.
+pub(crate) fn load_or_initialize_scanned(path: &Path) -> Result<LoadedDocument, String> {
+    load_or_initialize_with(path, Bodies::Discard)
+}
+
+#[cfg(test)]
 pub fn load_or_initialize(path: &Path) -> Result<AppDocument, String> {
+    load_or_initialize_with(path, Bodies::Keep).map(|loaded| loaded.document)
+}
+
+fn load_or_initialize_with(path: &Path, bodies: Bodies) -> Result<LoadedDocument, String> {
     if !path.exists() {
         let store = crate::conversation_store::store_for(path)?;
         let has_existing_conversations = store
@@ -66,6 +121,7 @@ pub fn load_or_initialize(path: &Path) -> Result<AppDocument, String> {
                     content: "数据锚文件缺失；已重建锚，并按对话库里记录的工作区绑定收养现存对话（原工作区不存在时移入临时工作区）。".into(),
                     local_only: true,
                     hook_execution: None,
+                    tools_added: Vec::new(),
                     created_at: Utc::now()
                         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 }];
@@ -74,9 +130,11 @@ pub fn load_or_initialize(path: &Path) -> Result<AppDocument, String> {
         seed_conversations(&store, &document)?;
         install_builtin_preset(path, &mut document)?;
         save_unchecked(path, &document)?;
-        return read_document(path);
+        let mut loaded = read_document_with(path, bodies)?;
+        loaded.fresh_install = !has_existing_conversations;
+        return Ok(loaded);
     }
-    read_document(path).map_err(|load_error| {
+    read_document_with(path, bodies).map_err(|load_error| {
         let diagnostic = match preserve_corrupt_document(path) {
             Ok(()) => "；已另外复制诊断副本",
             Err(_) => "；无法复制诊断副本",
@@ -92,19 +150,14 @@ pub fn load_or_initialize(path: &Path) -> Result<AppDocument, String> {
 ///
 /// Runs on every start, not only the first: the preset is part of the build
 /// (see [`crate::catalog::BUILTIN_PRESET_ID`]), so whatever an earlier build
-/// left is replaced rather than merged. The two parts only this machine can
-/// supply are filled in here — the built-in capability ids, which hash absolute
-/// paths ([`crate::capability_seed`]), and the one shell, which takes a probe.
-/// A result that would not validate leaves `document` as it was.
+/// left is replaced rather than merged. The one part only this machine can
+/// supply is filled in here: the one shell, which takes a probe. A result that
+/// would not validate leaves `document` as it was.
 pub fn install_builtin_preset(path: &Path, document: &mut AppDocument) -> Result<bool, String> {
-    let selection = path
-        .parent()
-        .map(crate::capability_seed::seed_builtin_capabilities)
-        .unwrap_or_default();
     let local = crate::machine_shells::probe_local();
     let shell = seeded_shell(local.os, &local.backends());
     let mut installed = document.clone();
-    let changed = put_builtin_preset(&mut installed, &selection, shell);
+    let changed = put_builtin_preset(&mut installed, shell);
     if changed {
         validate_shape(&installed)
             .map_err(|error| format!("内置对话预设无法写入文档：{error}"))?;
@@ -132,22 +185,14 @@ pub fn install_builtin_preset(path: &Path, document: &mut AppDocument) -> Result
 /// seeded presets, and points a default that no longer resolves at it.
 fn put_builtin_preset(
     document: &mut AppDocument,
-    selection: &crate::capability_seed::BuiltinCapabilitySelection,
     shell: Option<crate::shell_backend::ShellBackend>,
 ) -> bool {
     let before = document.presets.clone();
-    let mut preset = crate::catalog::builtin_preset(
+    let preset = crate::catalog::builtin_preset(
         &document.assets.api_providers,
         &document.tools,
         shell,
     );
-    // Hooks are deliberately absent: a hook id is a hash of its position in
-    // `hooks.json`, so any edit to that file renumbers the rest, and a selected
-    // hook id that no longer resolves fails every run of the conversation
-    // closed. Skills and MCP servers dangle harmlessly by comparison —
-    // discovery skips an id it cannot find and the run continues.
-    preset.settings.skill_ids = selection.skill_ids.clone();
-    preset.settings.mcp_ids = selection.mcp_ids.clone();
     let library = &mut document.presets;
     library.conversation_presets.retain(|preset| {
         !crate::catalog::RETIRED_SEEDED_PRESETS
@@ -287,47 +332,46 @@ fn write_builtin_preset_template(
             // written and then never sent.
             local_only: false,
             hook_execution: None,
+            tools_added: Vec::new(),
             created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         }],
     )?;
     Ok(())
 }
 
+/// [`load_or_recover`] as the app runs it: the document without bodies.
+pub(crate) fn load_or_recover_scanned(path: &Path) -> Result<LoadedDocument, String> {
+    load_or_recover_with(path, Bodies::Discard)
+}
+
 /// Loads at startup, rebuilding from a seed document after banking any failed load.
+#[cfg(test)]
 pub fn load_or_recover(path: &Path) -> Result<AppDocument, String> {
-    let load_error = match load_or_initialize(path) {
-        Ok(mut document) => {
+    load_or_recover_with(path, Bodies::Keep).map(|loaded| loaded.document)
+}
+
+fn load_or_recover_with(path: &Path, bodies: Bodies) -> Result<LoadedDocument, String> {
+    let load_error = match load_or_initialize_with(path, bodies) {
+        Ok(mut loaded) => {
             // Startup cannot have an in-flight run; mark an unanswered trailing user message.
-            let markers = mark_orphaned_trailing_user_contexts(&mut document);
-            if !markers.is_empty() {
-                match crate::conversation_store::store_for(path) {
-                    Ok(store) => {
-                        for (conversation_id, marker) in &markers {
-                            if let Err(error) = store.upsert_contexts(
-                                conversation_id,
-                                std::slice::from_ref(marker),
-                                crate::conversation_store::ContextStatus::Settled,
-                            ) {
-                                eprintln!("孤儿消息标记未能落库：{error}");
-                            }
-                        }
-                    }
-                    Err(error) => eprintln!("孤儿消息标记未能落库：{error}"),
-                }
-            }
+            mark_unanswered_conversations(path, &mut loaded);
+            let lifted = lift_conversation_sandboxes(&mut loaded.document);
             // Every start, because each build ships its own version of the
             // preset. A failure here keeps the preset the document already had
             // rather than failing the start over it.
-            match install_builtin_preset(path, &mut document) {
-                Ok(true) => {
-                    if let Err(error) = save_unchecked(path, &document) {
-                        eprintln!("内置对话预设已更新，但未能落盘，下次保存时写入：{error}");
-                    }
+            let installed = match install_builtin_preset(path, &mut loaded.document) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    eprintln!("内置对话预设未能更新：{error}");
+                    false
                 }
-                Ok(false) => {}
-                Err(error) => eprintln!("内置对话预设未能更新：{error}"),
+            };
+            if lifted || installed {
+                if let Err(error) = save_unchecked(path, &loaded.document) {
+                    eprintln!("启动时对文档的更新未能落盘，下次保存时写入：{error}");
+                }
             }
-            return Ok(document);
+            return Ok(loaded);
         }
         Err(error) => error,
     };
@@ -363,6 +407,7 @@ pub fn load_or_recover(path: &Path) -> Result<AppDocument, String> {
             content: notice,
             local_only: true,
             hook_execution: None,
+            tools_added: Vec::new(),
             created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         }];
         conversation.branches.clear();
@@ -376,10 +421,20 @@ pub fn load_or_recover(path: &Path) -> Result<AppDocument, String> {
     seed_conversations(&store, &document)?;
     install_builtin_preset(path, &mut document)?;
     save_unchecked(path, &document)?;
-    read_document(path)
+    read_document_with(path, bodies)
 }
 
+/// [`read_document`] as the app runs it: the document without bodies.
+pub(crate) fn read_document_scanned(path: &Path) -> Result<LoadedDocument, String> {
+    read_document_with(path, Bodies::Discard)
+}
+
+#[cfg(test)]
 pub fn read_document(path: &Path) -> Result<AppDocument, String> {
+    read_document_with(path, Bodies::Keep).map(|loaded| loaded.document)
+}
+
+fn read_document_with(path: &Path, bodies: Bodies) -> Result<LoadedDocument, String> {
     let file = File::open(path).map_err(|error| format!("无法打开数据文档: {error}"))?;
     if file
         .metadata()
@@ -405,12 +460,14 @@ pub fn read_document(path: &Path) -> Result<AppDocument, String> {
         ));
     }
     // The accepted older formats differ only by additions: schema 1 lacks a
-    // host-owned SQLite fork-intent table, and schema 2 lacks the model
+    // host-owned SQLite fork-intent table, schema 2 lacks the model
     // `promptCache` key, which `migrate_persisted_models` fills with its
-    // default below. Their anchor configuration remains unchanged, so preserve
-    // it in place.
-    if original_schema == 1 || original_schema == 2 {
+    // default below, and schema 3 lacks the `tool_append` / `system_append`
+    // capabilities, declared once below from what Mework knows. Their anchor
+    // configuration remains unchanged, so preserve it in place.
+    if (1..=3).contains(&original_schema) {
         value["schemaVersion"] = serde_json::json!(SCHEMA_VERSION);
+        declare_known_append_capabilities(&mut value);
     } else if original_schema < SCHEMA_VERSION {
         return Err(format!(
             "数据由旧版 schema {original_schema} 写入，历史迁移已在未发布阶段删除，当前仅支持 schema {SCHEMA_VERSION}"
@@ -420,24 +477,89 @@ pub fn read_document(path: &Path) -> Result<AppDocument, String> {
     // nor `ModelCapability` can still read every value older archives wrote, and a
     // retired capability slug fails the whole document rather than one field.
     migrate_persisted_models(&mut value);
-    let mut document = assemble_layout(path, value)?;
-    canonicalize_temporary_workspace(&mut document);
-    canonicalize_provider_model_ids(&mut document);
+    // Plan mode used to be a security level; presets and a workspace's last
+    // settings may still say so.
+    crate::model::migrate_legacy_plan_level(&mut value);
+    let mut loaded = assemble_layout(path, value, bodies)?;
+    let document = &mut loaded.document;
+    canonicalize_temporary_workspace(document);
+    canonicalize_provider_model_ids(document);
     // The document on disk was written in canonical number form, but reading
     // it back is itself a parse, and this crate's float parser is not exact on
     // every literal it accepts. Re-canonicalizing makes the loaded document
     // equal to the one that was saved, which is what the unchanged-card fast
-    // path in `validate_tool_results` compares against.
-    canonicalize_tool_payload_numbers(&mut document);
+    // path in `validate_tool_results` compares against. (The scan already did
+    // this to each body it kept.)
+    canonicalize_tool_payload_numbers(document);
     // The two role shaping numbers are result shaping, not capability
     // selection: a document written past the ceiling is pulled back onto it
     // rather than failed, and the run applies the clamped answer.
-    canonicalize_agent_definition_shaping(&mut document);
-    isolate_invalid_loaded_conversations(&mut document);
-    canonicalize_draft_conversation(&mut document);
-    validate_shape(&document)?;
+    canonicalize_agent_definition_shaping(document);
+    // Bodies were checked one by one as the scan read them; this pass checks
+    // what every conversation keeps, after the document-level shaping above.
+    isolate_invalid_loaded_conversations(document);
+    canonicalize_draft_conversation(document);
+    validate_shape(document)?;
+    loaded.retain_present();
     prime_layout_write_cache(path);
-    Ok(document)
+    Ok(loaded)
+}
+
+/// Hands the sandbox each conversation had on to the workspaces it works in.
+///
+/// The sandbox was a setting of each conversation; it is a setting of each
+/// workspace now. A conversation that had it on gives a copy to every
+/// workspace it works in — its project's, then those it attached — that has
+/// no sandbox entry yet, so commands that ran confined stay confined. Where
+/// two conversations disagree the first one read wins; either is a sandbox. A
+/// temporary project has no workspace to hold one, so its conversations'
+/// sandboxes end here.
+///
+/// Each conversation's copy is cleared in memory and never written back, but
+/// its stored settings keep the old key until the conversation is next
+/// written, so this runs on every start. It only fills entries that are
+/// missing — and the settings page records "off" as an entry, not as none —
+/// so a workspace whose sandbox has been decided is never given another.
+/// Returns whether any workspace was given one.
+fn lift_conversation_sandboxes(document: &mut AppDocument) -> bool {
+    let sandboxes = &mut document.assets.execution_environments.sandboxes;
+    let mut lifted = false;
+    for project in &mut document.workspaces {
+        let directory = project.kind == WorkspaceKind::Directory;
+        let registered: Vec<crate::model::AttachedWorkspace> =
+            std::iter::once(crate::model::AttachedWorkspace {
+                machine: project.machine.clone(),
+                path: project.path.clone(),
+            })
+            .chain(project.member_workspaces().iter().cloned())
+            .collect();
+        for conversation in &mut project.conversations {
+            let sandbox = std::mem::take(&mut conversation.settings.legacy_sandbox);
+            // An invalid copy would fail the next save of the whole document.
+            if !directory || !sandbox.enabled || validate_sandbox_settings("", &sandbox).is_err() {
+                continue;
+            }
+            for workspace in registered
+                .iter()
+                .cloned()
+                .chain(conversation.effective_attached_workspaces())
+            {
+                let key = crate::run_environment::workspace_env_key(
+                    workspace.machine.as_ref(),
+                    &workspace.path,
+                );
+                if !valid_workspace_key(&key)
+                    || sandboxes.contains_key(&key)
+                    || sandboxes.len() >= MAX_WORKSPACE_TABLES
+                {
+                    continue;
+                }
+                sandboxes.insert(key, sandbox.clone());
+                lifted = true;
+            }
+        }
+    }
+    lifted
 }
 
 fn canonicalize_temporary_workspace(document: &mut AppDocument) {
@@ -553,7 +675,7 @@ pub fn validate_save_transition(
         let workspace_id = proposal.workspaces[index].id.clone();
         let mut conversations = std::mem::take(&mut proposal.workspaces[index].conversations);
         for conversation in &mut conversations {
-            validate_incoming_conversation(previous, &workspace_id, conversation, state)?;
+            validate_incoming_conversation(previous, &workspace_id, conversation, None, state)?;
         }
         proposal.workspaces[index].conversations = conversations;
     }
@@ -746,6 +868,7 @@ fn replace_tool_with_marker(contexts: &mut Vec<ContextItem>, entry: &UnattestedT
         ),
         local_only: true,
         hook_execution: None,
+        tools_added: Vec::new(),
         created_at,
     };
     true
@@ -765,6 +888,14 @@ fn replace_tool_with_marker(contexts: &mut Vec<ContextItem>, entry: &UnattestedT
 /// This runs before validation on purpose: it must be what gets attested and
 /// what gets written, or the next save would have to redo it.
 fn canonicalize_tool_payload_numbers(document: &mut AppDocument) {
+    for workspace in &mut document.workspaces {
+        for conversation in &mut workspace.conversations {
+            canonicalize_conversation_tool_payload_numbers(conversation);
+        }
+    }
+}
+
+fn canonicalize_conversation_tool_payload_numbers(conversation: &mut Conversation) {
     fn walk(contexts: &mut [ContextItem]) {
         for context in contexts {
             let ContextItem::Tool {
@@ -789,13 +920,9 @@ fn canonicalize_tool_payload_numbers(document: &mut AppDocument) {
         }
     }
 
-    for workspace in &mut document.workspaces {
-        for conversation in &mut workspace.conversations {
-            walk(&mut conversation.contexts);
-            for branch in &mut conversation.branches {
-                walk(&mut branch.contexts);
-            }
-        }
+    walk(&mut conversation.contexts);
+    for branch in &mut conversation.branches {
+        walk(&mut branch.contexts);
     }
 }
 
@@ -894,6 +1021,68 @@ fn migrate_persisted_models(value: &mut serde_json::Value) {
     }
 }
 
+/// Declares the `tool_append` / `system_append` capabilities on the models of
+/// a document written before they existed, from what Mework knows of each
+/// model at its provider's endpoint — what a fetch of the model would declare
+/// today (`model_discovery::known_append_capabilities`). A model Mework does
+/// not know, a relay's above all, declares neither until the user ticks them.
+///
+/// Once, at the schema edge: after that the declaration is the model's, and
+/// a capability the user took off stays off.
+fn declare_known_append_capabilities(value: &mut serde_json::Value) {
+    let Some(providers) = value
+        .pointer_mut("/assets/apiProviders")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for provider in providers {
+        let Some(family) = provider
+            .get("family")
+            .cloned()
+            .and_then(|family| serde_json::from_value::<crate::model::ProviderFamily>(family).ok())
+        else {
+            continue;
+        };
+        let base_url = provider
+            .get("baseUrl")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(models) = provider
+            .get_mut("models")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for model in models.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+            let Some(id) = model.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let tool = crate::tool_append::known(family, &base_url, id) == Some(true);
+            let system = crate::system_append::known(family, &base_url, id) == Some(true);
+            let declared = [(tool, "tool_append"), (system, "system_append")]
+                .into_iter()
+                .filter_map(|(known, slug)| known.then_some(slug))
+                .collect::<Vec<_>>();
+            if declared.is_empty() {
+                continue;
+            }
+            let capabilities = model
+                .entry("capabilities")
+                .or_insert_with(|| serde_json::json!([]));
+            let Some(capabilities) = capabilities.as_array_mut() else {
+                continue;
+            };
+            for slug in declared {
+                if !capabilities.iter().any(|existing| existing == slug) {
+                    capabilities.push(serde_json::json!(slug));
+                }
+            }
+        }
+    }
+}
+
 fn canonicalize_provider_model_ids(document: &mut AppDocument) {
     document.global_settings.active_provider_id = document
         .global_settings
@@ -920,23 +1109,27 @@ fn canonicalize_provider_model_ids(document: &mut AppDocument) {
 /// in conversation presets and in each conversation's materialized settings, so
 /// both surfaces are walked.
 fn canonicalize_agent_definition_shaping(document: &mut AppDocument) {
-    let clamp = |definition: &mut AgentDefinition| {
-        definition.max_results = definition.max_results.min(MAX_SEARCH_MAX_RESULTS);
-        definition.compression_cutoff =
-            definition.compression_cutoff.min(MAX_SEARCH_CUTOFF_LIMIT);
-    };
     for preset in &mut document.presets.conversation_presets {
         for definition in &mut preset.settings.agent_definitions {
-            clamp(definition);
+            clamp_agent_definition_shaping(definition);
         }
     }
     for workspace in &mut document.workspaces {
         for conversation in &mut workspace.conversations {
-            for definition in &mut conversation.settings.agent_definitions {
-                clamp(definition);
-            }
+            clamp_conversation_agent_definitions(conversation);
         }
     }
+}
+
+fn clamp_conversation_agent_definitions(conversation: &mut Conversation) {
+    for definition in &mut conversation.settings.agent_definitions {
+        clamp_agent_definition_shaping(definition);
+    }
+}
+
+fn clamp_agent_definition_shaping(definition: &mut AgentDefinition) {
+    definition.max_results = definition.max_results.min(MAX_SEARCH_MAX_RESULTS);
+    definition.compression_cutoff = definition.compression_cutoff.min(MAX_SEARCH_CUTOFF_LIMIT);
 }
 
 fn validate_workspace_authorizations(
@@ -1419,29 +1612,25 @@ fn validate_conversation_id(id: &str) -> Result<(), String> {
 
 /// Assembles an in-memory document from the anchor and conversation store.
 ///
-/// Conversations with missing workspace owners move to the temporary workspace; malformed rows are isolated.
-fn assemble_layout(path: &Path, value: serde_json::Value) -> Result<AppDocument, String> {
+/// Conversations with missing workspace owners move to the temporary workspace;
+/// malformed ones are isolated. Every body is read once, straight from the
+/// database rather than through the shared memory pool, and handed over one at
+/// a time (see [`scan_bodies`]): each is canonicalized and checked, its
+/// attachment references and trailing unanswered message noted, and — with
+/// [`Bodies::Discard`] — dropped before the one after next is read.
+fn assemble_layout(
+    path: &Path,
+    value: serde_json::Value,
+    bodies: Bodies,
+) -> Result<LoadedDocument, String> {
     let anchor: PersistedAnchor =
         serde_json::from_value(value).map_err(|error| format!("数据文档 JSON 无效: {error}"))?;
     let store = crate::conversation_store::store_for(path)?;
 
-    let mut seen = HashSet::new();
-    let mut workspaces = Vec::with_capacity(anchor.workspaces.len());
-    for shell in anchor.workspaces {
-        let conversations = match store.workspace_conversations(&shell.id) {
-            Ok(conversations) => conversations,
-            Err(error) => {
-                eprintln!(
-                    "工作区 {} 的对话无法装配（{error}），本次按空列表处理",
-                    shell.id
-                );
-                Vec::new()
-            }
-        };
-        for conversation in &conversations {
-            seen.insert(conversation.id.clone());
-        }
-        workspaces.push(Workspace {
+    let workspaces = anchor
+        .workspaces
+        .into_iter()
+        .map(|shell| Workspace {
             id: shell.id,
             name: shell.name,
             kind: shell.kind,
@@ -1451,10 +1640,9 @@ fn assemble_layout(path: &Path, value: serde_json::Value) -> Result<AppDocument,
             created_at: shell.created_at,
             default_conversation_preset_id: shell.default_conversation_preset_id,
             last_conversation_settings: shell.last_conversation_settings,
-            conversations,
-        });
-    }
-
+            conversations: Vec::new(),
+        })
+        .collect::<Vec<_>>();
     let mut document = AppDocument {
         schema_version: anchor.schema_version,
         global_settings: anchor.global_settings,
@@ -1465,39 +1653,254 @@ fn assemble_layout(path: &Path, value: serde_json::Value) -> Result<AppDocument,
         capabilities: anchor.capabilities,
     };
 
-    adopt_unowned_conversations(&store, &mut document, &seen);
-    Ok(document)
+    // Where each conversation goes: every workspace's own, in sidebar order,
+    // then the ones whose workspace is gone.
+    let mut placement: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
+    for workspace in &document.workspaces {
+        match store.workspace_conversation_ids(&workspace.id) {
+            Ok(ids) => {
+                for id in ids {
+                    seen.insert(id.clone());
+                    placement.push((workspace.id.clone(), id));
+                }
+            }
+            Err(error) => eprintln!(
+                "工作区 {} 的对话无法装配（{error}），本次按空列表处理",
+                workspace.id
+            ),
+        }
+    }
+    placement.extend(unowned_conversations(&store, &mut document, &seen));
+
+    let tool_names_owned = document
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    let tool_names = tool_names_owned
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut refs = crate::attachment_refs::AttachmentRefs::default();
+    let mut unanswered = Vec::new();
+    let ids = placement
+        .iter()
+        .map(|(_, id)| id.clone())
+        .collect::<Vec<_>>();
+    scan_bodies(
+        &ids,
+        |id| store.conversation_from_disk(id),
+        |index, read| {
+            let (workspace_id, id) = &placement[index];
+            let mut conversation = match read {
+                Ok(Some(conversation)) => conversation,
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("对话 {id} 的正文无法装配，已跳过：{error}");
+                    return;
+                }
+            };
+            canonicalize_conversation_tool_payload_numbers(&mut conversation);
+            clamp_conversation_agent_definitions(&mut conversation);
+            if let Err(error) = validate_loaded_conversation(&conversation, &tool_names) {
+                eprintln!("对话 {id} 未通过装载校验（{error}），本次不装配");
+                return;
+            }
+            refs.record(&conversation);
+            if matches!(conversation.contexts.last(), Some(ContextItem::User { .. })) {
+                unanswered.push(id.clone());
+            }
+            if bodies == Bodies::Discard {
+                crate::attachment_refs::strip_body(&mut conversation);
+            }
+            if let Some(workspace) = document
+                .workspaces
+                .iter_mut()
+                .find(|workspace| &workspace.id == workspace_id)
+            {
+                workspace.conversations.push(conversation);
+            }
+        },
+    );
+    Ok(LoadedDocument {
+        document,
+        refs,
+        unanswered,
+        fresh_install: false,
+    })
 }
 
-/// Re-reads every conversation body from the store into an already-assembled
-/// document, in place.
+/// Hands every body to `visit` in order, one at a time, each dropped before
+/// the one after next is read.
 ///
-/// The in-memory snapshot's bodies stop at the last conversation *command*: a
-/// run writes its rows straight to the store from the thread that owns the
-/// model stream and deliberately never commits a whole-document snapshot for
-/// them (`docs/persistence.md`, 「下一次运行读哪一份」). So the snapshot's idea
-/// of a conversation ends at the user message that started the round, and any
-/// path that hands a whole document *back to the renderer* has to re-read the
-/// bodies — otherwise it answers with a conversation that is one round short,
-/// the question without its answer.
-///
-/// A store that will not open, or a workspace that will not read, keeps the
-/// snapshot's own bodies: a stale body beats no body, the same posture
-/// `stored_conversation` takes when the authoritative read fails.
-pub fn refresh_conversation_bodies(path: &Path, document: &mut AppDocument) {
+/// Loading has to look at every body — its shape, the attachments it names,
+/// whether it ends unanswered — but nothing needs two at once. So a reader
+/// thread parses the next body while `visit` works on the current one, then
+/// waits on a rendezvous channel until `visit` is done and takes it: double
+/// buffering. At most two bodies are alive at any moment, however many the
+/// store holds, and the peak is the two largest rather than the sum of all.
+/// Without a thread to spare, the same happens one body at a time.
+fn scan_bodies<T: Send>(
+    ids: &[String],
+    load: impl Fn(&str) -> T + Sync,
+    mut visit: impl FnMut(usize, T),
+) {
+    let load = &load;
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(usize, T)>(0);
+        let reader = std::thread::Builder::new()
+            .name("mework-body-scan".into())
+            .spawn_scoped(scope, move || {
+                for (index, id) in ids.iter().enumerate() {
+                    if sender.send((index, load(id))).is_err() {
+                        break;
+                    }
+                }
+            });
+        match reader {
+            Ok(_) => {
+                for (index, value) in receiver {
+                    visit(index, value);
+                }
+            }
+            Err(error) => {
+                eprintln!("无法启动正文扫描线程（{error}），改为逐条读取");
+                for (index, id) in ids.iter().enumerate() {
+                    visit(index, load(id));
+                }
+            }
+        }
+    });
+}
+
+/// Conversations the store holds under a workspace the anchor no longer has,
+/// each with the workspace it is adopted into: the one it records if that
+/// still exists, else the temporary workspace. This is the channel through
+/// which a rebuilt anchor finds its conversations again.
+fn unowned_conversations(
+    store: &crate::conversation_store::ConversationStore,
+    document: &mut AppDocument,
+    seen: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let Ok(owners) = store.conversation_workspaces() else {
+        return Vec::new();
+    };
+    let mut orphans = owners
+        .into_iter()
+        .filter(|(id, _)| !seen.contains(id))
+        .collect::<Vec<_>>();
+    if orphans.is_empty() {
+        return Vec::new();
+    }
+    orphans.sort();
+    canonicalize_temporary_workspace(document);
+    orphans
+        .into_iter()
+        .filter_map(|(id, workspace_id)| {
+            let target = if document
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id)
+            {
+                workspace_id
+            } else if document
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == TEMPORARY_WORKSPACE_ID)
+            {
+                TEMPORARY_WORKSPACE_ID.to_owned()
+            } else {
+                return None;
+            };
+            eprintln!("对话 {id} 不属于任何现存工作区，已按其记录的工作区绑定收养");
+            Some((target, id))
+        })
+        .collect()
+}
+
+/// Marks each conversation left ending in a user message nobody answered, so
+/// the next turn is not a silent re-answer of a message a crash cut off. Only
+/// at startup, when no run can be in flight. The marker is written to the
+/// store; a body the document still carries gets it too.
+fn mark_unanswered_conversations(path: &Path, loaded: &mut LoadedDocument) {
+    if loaded.unanswered.is_empty() {
+        return;
+    }
     let store = match crate::conversation_store::store_for(path) {
         Ok(store) => store,
         Err(error) => {
-            eprintln!("对话库无法打开（{error}），本次沿用内存快照的对话正文");
+            eprintln!("孤儿消息标记未能落库：{error}");
             return;
+        }
+    };
+    for conversation_id in std::mem::take(&mut loaded.unanswered) {
+        let marker = ContextItem::System {
+            id: format!("ctx_orphan_{}", uuid::Uuid::new_v4().simple()),
+            content: "上一次会话在此中断，上面这条消息尚未得到回答。".into(),
+            local_only: true,
+            hook_execution: None,
+            tools_added: Vec::new(),
+            created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        if let Err(error) = store.upsert_contexts(
+            &conversation_id,
+            std::slice::from_ref(&marker),
+            crate::conversation_store::ContextStatus::Settled,
+        ) {
+            eprintln!("孤儿消息标记未能落库：{error}");
+            continue;
+        }
+        if let Some(conversation) = loaded
+            .document
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.conversations.iter_mut())
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            if matches!(conversation.contexts.last(), Some(ContextItem::User { .. })) {
+                conversation.contexts.push(marker);
+            }
+        }
+    }
+}
+
+/// Re-reads every conversation from the store into an already-assembled
+/// document, in place, without contexts, and returns the ids of those whose
+/// contexts were left out.
+///
+/// This is what a renderer that (re)loads is handed. Its conversation list,
+/// settings and queued messages come from here; a body comes separately, when
+/// the renderer opens the conversation (`load_conversation`, read through the
+/// shared memory pool). Re-reading from the store rather than serving the
+/// snapshot matters: a run writes its rows — and drops the queued messages it
+/// took — straight to the store without committing a snapshot.
+///
+/// A store that will not open, or a workspace that will not read, keeps the
+/// snapshot's own entries, and every conversation then counts as having a
+/// body: a renderer that believed one empty would hide it from the sidebar.
+pub fn refresh_conversation_shells(path: &Path, document: &mut AppDocument) -> HashSet<String> {
+    let every_conversation = |document: &AppDocument| {
+        document
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.conversations.iter())
+            .map(|conversation| conversation.id.clone())
+            .collect::<HashSet<_>>()
+    };
+    let store = match crate::conversation_store::store_for(path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("对话库无法打开（{error}），本次沿用内存快照的对话列表");
+            return every_conversation(document);
         }
     };
     let mut seen = HashSet::new();
     for workspace in &mut document.workspaces {
-        match store.workspace_conversations(&workspace.id) {
+        match store.workspace_conversation_shells(&workspace.id) {
             Ok(conversations) => workspace.conversations = conversations,
             Err(error) => eprintln!(
-                "工作区 {} 的对话正文无法重读（{error}），本次沿用内存快照",
+                "工作区 {} 的对话无法重读（{error}），本次沿用内存快照",
                 workspace.id
             ),
         }
@@ -1505,51 +1908,31 @@ pub fn refresh_conversation_bodies(path: &Path, document: &mut AppDocument) {
             seen.insert(conversation.id.clone());
         }
     }
-    adopt_unowned_conversations(&store, document, &seen);
-    // The same shaping `read_document` applies to bodies it assembles. Skipping
-    // it would hand the renderer contexts that no longer compare equal to the
-    // ones it last saw, which is what the unchanged-card fast path relies on.
-    canonicalize_tool_payload_numbers(document);
+    for (workspace_id, id) in unowned_conversations(&store, document, &seen) {
+        match store.conversation_shell(&id) {
+            Ok(Some(shell)) => {
+                if let Some(workspace) = document
+                    .workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == workspace_id)
+                {
+                    workspace.conversations.push(shell);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("对话 {id} 的外壳无法装配，已跳过：{error}"),
+        }
+    }
     canonicalize_agent_definition_shaping(document);
     isolate_invalid_loaded_conversations(document);
-}
-
-/// Adopts store conversations whose workspace owner is absent into the temporary workspace.
-fn adopt_unowned_conversations(
-    store: &crate::conversation_store::ConversationStore,
-    document: &mut AppDocument,
-    seen: &HashSet<String>,
-) {
-    let Ok(owners) = store.conversation_workspaces() else {
-        return;
-    };
-    let mut orphans = owners
-        .into_iter()
-        .filter(|(id, _)| !seen.contains(id))
-        .collect::<Vec<_>>();
-    if orphans.is_empty() {
-        return;
-    }
-    orphans.sort();
-    canonicalize_temporary_workspace(document);
-    for (id, workspace_id) in orphans {
-        let Ok(Some(conversation)) = store.conversation(&id) else {
-            eprintln!("对话 {id} 的正文无法装配，已跳过");
-            continue;
-        };
-        eprintln!("对话 {id} 不属于任何现存工作区，已按其记录的工作区绑定收养");
-        let target_index = document
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.id == workspace_id)
-            .or_else(|| {
-                document
-                    .workspaces
-                    .iter()
-                    .position(|workspace| workspace.id == TEMPORARY_WORKSPACE_ID)
-            });
-        if let Some(index) = target_index {
-            document.workspaces[index].conversations.push(conversation);
+    match store.conversations_with_contexts() {
+        Ok(with_contexts) => every_conversation(document)
+            .into_iter()
+            .filter(|id| with_contexts.contains(id))
+            .collect(),
+        Err(error) => {
+            eprintln!("无法确认哪些对话有正文（{error}），本次按全部有正文处理");
+            every_conversation(document)
         }
     }
 }
@@ -1587,25 +1970,17 @@ fn canonicalize_context_timestamps(document: &mut AppDocument) {
     }
 }
 
-/// Marks unanswered trailing user contexts during startup because no run can be in flight.
-fn mark_orphaned_trailing_user_contexts(document: &mut AppDocument) -> Vec<(String, ContextItem)> {
-    let mut marked = Vec::new();
-    for workspace in &mut document.workspaces {
-        for conversation in &mut workspace.conversations {
-            if matches!(conversation.contexts.last(), Some(ContextItem::User { .. })) {
-                let marker = ContextItem::System {
-                    id: format!("ctx_orphan_{}", uuid::Uuid::new_v4().simple()),
-                    content: "上一次会话在此中断，上面这条消息尚未得到回答。".into(),
-                    local_only: true,
-                    hook_execution: None,
-                    created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                };
-                conversation.contexts.push(marker.clone());
-                marked.push((conversation.id.clone(), marker));
-            }
-        }
-    }
-    marked
+/// The load-time check of one conversation: its shape, and its role list.
+fn validate_loaded_conversation(
+    conversation: &Conversation,
+    tool_names: &HashSet<&str>,
+) -> Result<(), String> {
+    validate_conversation_shape(conversation, tool_names).and_then(|()| {
+        validate_agent_definition_list(
+            &format!("对话 {}", conversation.id),
+            &conversation.settings.agent_definitions,
+        )
+    })
 }
 
 /// Isolates malformed conversations after assembly while preserving their stored rows.
@@ -1622,12 +1997,7 @@ fn isolate_invalid_loaded_conversations(document: &mut AppDocument) {
     let mut failures = Vec::new();
     for (workspace_index, workspace) in document.workspaces.iter().enumerate() {
         for (conversation_index, conversation) in workspace.conversations.iter().enumerate() {
-            let result = validate_conversation_shape(conversation, &tool_names).and_then(|()| {
-                validate_agent_definition_list(
-                    &format!("对话 {}", conversation.id),
-                    &conversation.settings.agent_definitions,
-                )
-            });
+            let result = validate_loaded_conversation(conversation, &tool_names);
             if let Err(error) = result {
                 failures.push((
                     workspace_index,
@@ -2664,6 +3034,31 @@ fn validate_agent_definition_list_transition(
     Ok(())
 }
 
+/// Whether `machine` is a machine's key: `local`, `wsl:<distro>` or
+/// `ssh:<id>`. An SSH key may dangle, so a removed machine does not invalidate
+/// the document.
+fn valid_machine_key(machine: &str) -> bool {
+    machine == "local"
+        || machine
+            .strip_prefix("wsl:")
+            .is_some_and(|distro| crate::run_environment::validate_wsl_distro_name(distro).is_ok())
+        || machine
+            .strip_prefix("ssh:")
+            .is_some_and(|id| !id.trim().is_empty() && id.len() <= 128)
+}
+
+/// Whether `key` is a workspace's key: `<machine key>|<path>`, see
+/// `run_environment::workspace_env_key`. Keys of removed workspaces may dangle.
+fn valid_workspace_key(key: &str) -> bool {
+    const MAX_PATH_FIELD_CHARS: usize = 4096;
+    key.split_once('|').is_some_and(|(machine, path)| {
+        valid_machine_key(machine)
+            && !path.trim().is_empty()
+            && path.chars().count() <= MAX_PATH_FIELD_CHARS
+            && !path.chars().any(char::is_control)
+    })
+}
+
 /// Validates execution-environment assets.
 ///
 /// Limits prevent malformed documents from causing unbounded startup work.
@@ -2671,9 +3066,6 @@ fn validate_execution_environments(
     assets: &crate::model::ExecutionEnvironmentAssets,
 ) -> Result<(), String> {
     const MAX_SSH_MACHINES: usize = 64;
-    // One table per workspace rather than per machine, so the bound leaves room
-    // for many projects of up to sixteen workspaces each.
-    const MAX_ENV_TABLES: usize = 1024;
     const MAX_ENV_VARS_PER_TABLE: usize = 128;
     const MAX_ENV_VALUE_CHARS: usize = 8192;
     const MAX_HOST_CHARS: usize = 512;
@@ -2720,34 +3112,14 @@ fn validate_execution_environments(
             }
         }
     }
-    if assets.env_vars.len() > MAX_ENV_TABLES {
-        return Err(format!("运行环境变量表不能超过 {MAX_ENV_TABLES} 份"));
+    if assets.env_vars.len() > MAX_WORKSPACE_TABLES {
+        return Err(format!("运行环境变量表不能超过 {MAX_WORKSPACE_TABLES} 份"));
     }
     for (key, table) in &assets.env_vars {
-        // Allow dangling SSH environment tables so removed machines do not invalidate the document.
-        let valid_machine_key = |machine: &str| {
-            machine == "local"
-                || machine.strip_prefix("wsl:").is_some_and(|distro| {
-                    crate::run_environment::validate_wsl_distro_name(distro).is_ok()
-                })
-                || machine
-                    .strip_prefix("ssh:")
-                    .is_some_and(|id| !id.trim().is_empty() && id.len() <= 128)
-        };
-        // A table belongs to a workspace: `<machine key>|<path>`, see
-        // `run_environment::workspace_env_key`. A bare machine key is a table
-        // from before variables moved onto workspaces; the renderer spreads it
-        // over that machine's workspaces on load, and until it saves, the key is
-        // tolerated but never read. Tables of removed workspaces may dangle.
-        let valid_key = match key.split_once('|') {
-            Some((machine, path)) => {
-                valid_machine_key(machine)
-                    && !path.trim().is_empty()
-                    && path.chars().count() <= MAX_PATH_FIELD_CHARS
-                    && !path.chars().any(char::is_control)
-            }
-            None => valid_machine_key(key),
-        };
+        // A bare machine key is a table from before variables moved onto
+        // workspaces; the renderer spreads it over that machine's workspaces on
+        // load, and until it saves, the key is tolerated but never read.
+        let valid_key = valid_workspace_key(key) || (!key.contains('|') && valid_machine_key(key));
         if !valid_key {
             return Err(format!("运行环境键 {key:?} 不合法"));
         }
@@ -2780,6 +3152,15 @@ fn validate_execution_environments(
                 ));
             }
         }
+    }
+    if assets.sandboxes.len() > MAX_WORKSPACE_TABLES {
+        return Err(format!("工作区沙箱设置不能超过 {MAX_WORKSPACE_TABLES} 份"));
+    }
+    for (key, sandbox) in &assets.sandboxes {
+        if !valid_workspace_key(key) {
+            return Err(format!("工作区沙箱的键 {key:?} 不合法"));
+        }
+        validate_sandbox_settings(&format!("工作区 {key} "), sandbox)?;
     }
     // A WSL distribution runs POSIX shells only, so its agent shell must be one.
     if assets.wsl_agent_shells.len() > 256 {
@@ -2962,8 +3343,8 @@ fn validate_capability_ids(label: &str, kind: &str, ids: &[String]) -> Result<()
 /**
  * Validates shared conversation settings used by conversations, workspace snapshots, and template presets.
  */
-/// A conversation's or a preset's sandbox. Its lists reach every machine's
-/// agent with every command, so they are bounded.
+/// A workspace's sandbox. Its lists reach the machine's agent with every
+/// command, so they are bounded.
 fn validate_sandbox_settings(
     owner: &str,
     sandbox: &crate::model::SandboxSettings,
@@ -3034,7 +3415,6 @@ fn validate_conversation_settings_shape(
     }
     // Document validation does not bind external selections to assets; runtime execution fails closed.
     validate_conversation_web_search(label, &settings.web_search)?;
-    validate_sandbox_settings(label, &settings.sandbox)?;
     Ok(())
 }
 
@@ -3062,7 +3442,6 @@ fn validate_conversation_preset_settings(
     }
     // Preset web-search settings use the same numeric bounds as conversation settings.
     validate_conversation_web_search(label, &settings.web_search)?;
-    validate_sandbox_settings(label, &settings.sandbox)?;
     Ok(())
 }
 
@@ -3377,19 +3756,6 @@ fn validate_context_scope<'a>(
                         }
                         validate_subagent_definition_binding(id, binding)?;
                     }
-                    if subagent.queued_messages.len() > 100 {
-                        return Err(format!("工具上下文 {id} 的子代理排队消息超过 100 条限制"));
-                    }
-                    for queued in &subagent.queued_messages {
-                        if queued.content.trim().is_empty() {
-                            return Err(format!("工具上下文 {id} 的子代理排队消息不能为空"));
-                        }
-                        if queued.content.chars().count() > 32 * 1024 {
-                            return Err(format!(
-                                "工具上下文 {id} 的子代理排队消息超过 32768 字符限制"
-                            ));
-                        }
-                    }
                     // A subagent record is a fork snapshot, not another archive location in the
                     // parent timeline. It may therefore retain the exact IDs it inherited from
                     // that timeline. Keep uniqueness strict inside each fork while sharing the
@@ -3417,10 +3783,16 @@ fn conversation_context_roots(conversation: &Conversation) -> impl Iterator<Item
 }
 
 /// Validates a renderer-proposed conversation synchronously at the command boundary, including tool-card provenance.
+///
+/// `stored` is the conversation as the store holds it, body included. The
+/// document snapshot carries no bodies, so without it the tool-card check
+/// would see no previous cards; `None` falls back to the snapshot's entry,
+/// which is right for a conversation that does not exist yet.
 pub(crate) fn validate_incoming_conversation(
     document: &AppDocument,
     workspace_id: &str,
     conversation: &mut Conversation,
+    stored: Option<&Conversation>,
     state: &AppState,
 ) -> Result<(), String> {
     let committed = document
@@ -3451,13 +3823,20 @@ pub(crate) fn validate_incoming_conversation(
         .iter()
         .find(|candidate| candidate.id == workspace_id)
         .ok_or_else(|| format!("工作区 {workspace_id} 不存在"))?;
-    let previous_entry = document.workspaces.iter().find_map(|workspace| {
+    let snapshot_entry = document.workspaces.iter().find_map(|workspace| {
         workspace
             .conversations
             .iter()
             .find(|candidate| candidate.id == conversation.id)
             .map(|candidate| (workspace.id.as_str(), candidate))
     });
+    let previous_entry = match stored {
+        Some(stored) => Some((
+            snapshot_entry.map_or(workspace_id, |(owner, _)| owner),
+            stored,
+        )),
+        None => snapshot_entry,
+    };
     let unattested =
         validate_conversation_tool_cards(previous_entry, workspace, conversation, state);
     if let Some(first) = unattested.first() {
@@ -4287,7 +4666,7 @@ mod tests {
             };
         }
         let workspace_id = committed.workspaces[0].id.clone();
-        validate_incoming_conversation(&committed, &workspace_id, &mut conversation, &state)
+        validate_incoming_conversation(&committed, &workspace_id, &mut conversation, None, &state)
             .expect("一条过期的绑定不该挡住整个对话的写入");
         for definition in &conversation.settings.agent_definitions {
             assert_eq!(
@@ -4471,6 +4850,57 @@ mod tests {
                 assert_eq!(model.prompt_cache, expected, "{name} on {provider_id}");
             }
         }
+    }
+
+    /// The append capabilities are newer than schema 3. A schema-3 archive has
+    /// them declared once on load, from what Mework knows of each model at its
+    /// endpoint — never on a relay, whose user declares them — and a schema-4
+    /// archive is the user's: a capability taken off stays off.
+    #[test]
+    fn an_archive_from_before_the_append_capabilities_declares_what_mework_knows_once() {
+        use crate::model::ModelCapability::{ImageRecognition, SystemAppend, ToolAppend};
+        let load = |base_url: &str, model_id: &str, schema: u32| {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("document.v1.json");
+            let mut document = default_document();
+            let provider = document
+                .assets
+                .api_providers
+                .iter_mut()
+                .find(|provider| provider.id == "anthropic_messages")
+                .expect("种子文档里有这个提供商");
+            provider.base_url = base_url.into();
+            let mut model = test_model(model_id);
+            model.capabilities = [ImageRecognition].into();
+            provider.models = vec![model];
+            provider.active_model_id = Some(model_id.into());
+            save_all(&path, &document).unwrap();
+            let mut anchor: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            anchor["schemaVersion"] = serde_json::json!(schema);
+            fs::write(&path, serde_json::to_vec_pretty(&anchor).unwrap()).unwrap();
+            read_document(&path)
+                .unwrap()
+                .assets
+                .api_providers
+                .into_iter()
+                .find(|provider| provider.id == "anthropic_messages")
+                .unwrap()
+                .models
+                .remove(0)
+                .capabilities
+        };
+        let official = "https://api.anthropic.com/v1";
+        assert_eq!(
+            load(official, "claude-opus-5-5", 3),
+            [ImageRecognition, ToolAppend, SystemAppend].into()
+        );
+        assert_eq!(load(official, "claude-sonnet-5", 3), [ImageRecognition].into());
+        assert_eq!(
+            load("https://relay.example.com/v1", "claude-opus-5-5", 3),
+            [ImageRecognition].into()
+        );
+        assert_eq!(load(official, "claude-opus-5-5", SCHEMA_VERSION), [ImageRecognition].into());
     }
 
     /// `reasoningContent` used to be omissible and to have an `auto` variant that
@@ -4660,6 +5090,7 @@ mod tests {
             capabilities: Default::default(),
             reasoning_content: Default::default(),
             prompt_cache: true,
+            cache_ttl_minutes: None,
         }
     }
 
@@ -4780,6 +5211,7 @@ mod tests {
                 duration_ms: 1,
             },
             subagent: None,
+            notice: None,
             attestation: String::new(),
             created_at: "2026-07-21T00:00:01Z".into(),
         };
@@ -4830,15 +5262,16 @@ mod tests {
             .unwrap(),
             result: ToolResult {
                 success: true,
-                output: crate::prompt_profile::PromptKey::TaskAskUserPending
-                    .builtin_en()
-                    .into(),
+                // What an `ask_user` result read like while answers still
+                // arrived as the next user message.
+                output: "Asked the user; this turn is paused.".into(),
                 images: Vec::new(),
                 diff: None,
                 executed_at: "2026-01-01T00:02:00Z".into(),
                 duration_ms: 0,
             },
             subagent: None,
+            notice: None,
             attestation: String::new(),
             created_at: "2026-01-01T00:02:00Z".into(),
         }
@@ -4877,11 +5310,11 @@ mod tests {
                 status: SubagentRunStatus::Completed,
                 contexts,
                 updates: Vec::new(),
-                queued_messages: Vec::new(),
                 structured_output: None,
                 output_schema: None,
                 usage: ModelUsage::default(),
             }),
+            notice: None,
             attestation: String::new(),
             created_at: "2026-01-01T00:02:00Z".into(),
         }
@@ -4908,6 +5341,7 @@ mod tests {
                 duration_ms: 2,
             },
             subagent: None,
+            notice: None,
             attestation: String::new(),
             created_at: "2026-07-24T00:00:00Z".into(),
         }
@@ -5071,6 +5505,150 @@ b"
             validate_shape(&dangling_machine).is_ok(),
             "悬空的机器绑定在持久层放行，由派发时报错"
         );
+    }
+
+    /// A workspace's sandbox is keyed like its variables, and its lists are
+    /// held to the same rules a conversation's were.
+    #[test]
+    fn validate_shape_bounds_workspace_sandboxes() {
+        let base = default_document();
+        let on = crate::model::SandboxSettings {
+            enabled: true,
+            writable: vec!["~/shared".into()],
+            ..Default::default()
+        };
+        let mut valid = base.clone();
+        for key in ["local|/work/app", "wsl:Ubuntu|/home/dev/app", "ssh:gone|~/app"] {
+            valid
+                .assets
+                .execution_environments
+                .sandboxes
+                .insert(key.into(), on.clone());
+        }
+        valid
+            .assets
+            .execution_environments
+            .sandboxes
+            .insert("local|/work/off".into(), Default::default());
+        assert!(validate_shape(&valid).is_ok(), "{:?}", validate_shape(&valid));
+
+        // A sandbox belongs to a workspace, never to a bare machine.
+        for key in ["local", "ssh:gone", "local|", "docker:x|/srv", "local|a\nb"] {
+            let mut bad_key = base.clone();
+            bad_key
+                .assets
+                .execution_environments
+                .sandboxes
+                .insert(key.into(), on.clone());
+            assert!(validate_shape(&bad_key).is_err(), "沙箱键 {key:?} 必须被拒绝");
+        }
+
+        let mut relative = base.clone();
+        relative.assets.execution_environments.sandboxes.insert(
+            "local|/work/app".into(),
+            crate::model::SandboxSettings {
+                writable: vec!["build".into()],
+                ..on.clone()
+            },
+        );
+        assert!(validate_shape(&relative).is_err(), "可写目录必须是绝对路径");
+
+        let mut url = base.clone();
+        let mut network = crate::model::SandboxNetworkSettings::default();
+        network.allow.push("https://example.com/".into());
+        url.assets.execution_environments.sandboxes.insert(
+            "local|/work/app".into(),
+            crate::model::SandboxSettings { network, ..on },
+        );
+        assert!(validate_shape(&url).is_err(), "网络规则必须是主机名");
+    }
+
+    /// The sandbox used to be a setting of each conversation. One that was on
+    /// moves onto every workspace the conversation works in that has not been
+    /// decided yet — and never onto one whose sandbox has been.
+    #[test]
+    fn a_conversations_old_sandbox_moves_onto_its_workspaces() {
+        let ssh = Some(crate::model::RunTarget::Ssh { machine_id: "devbox".into() });
+        let mut document = default_document();
+        let template = document.workspaces[0].conversations[0].clone();
+        document.workspaces[0].kind = WorkspaceKind::Directory;
+        document.workspaces[0].path = "/work/app".into();
+        document.workspaces[0].additional_workspaces = vec![crate::model::AttachedWorkspace {
+            machine: ssh.clone(),
+            path: "/srv/api".into(),
+        }];
+        let sandbox = crate::model::SandboxSettings {
+            enabled: true,
+            writable: vec!["~/shared".into()],
+            ..Default::default()
+        };
+        let mut sandboxed = template.clone();
+        sandboxed.id = "conv-sandboxed".into();
+        sandboxed.settings.legacy_sandbox = sandbox.clone();
+        sandboxed.attached_workspaces = vec![
+            crate::model::AttachedWorkspace { machine: None, path: "/work/extra".into() },
+            crate::model::AttachedWorkspace { machine: None, path: "/work/decided".into() },
+        ];
+        let mut unsandboxed = template.clone();
+        unsandboxed.id = "conv-plain".into();
+        unsandboxed.attached_workspaces = vec![crate::model::AttachedWorkspace {
+            machine: None,
+            path: "/work/plain".into(),
+        }];
+        document.workspaces[0].conversations = vec![unsandboxed, sandboxed];
+        // A temporary project has no workspace to hold one.
+        let mut temporary = template;
+        temporary.id = "conv-temporary".into();
+        temporary.settings.legacy_sandbox = sandbox.clone();
+        document
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.kind == WorkspaceKind::Temporary)
+            .expect("the temporary project")
+            .conversations
+            .push(temporary);
+        let decided = crate::model::SandboxSettings::default();
+        document
+            .assets
+            .execution_environments
+            .sandboxes
+            .insert("local|/work/decided".into(), decided.clone());
+
+        assert!(lift_conversation_sandboxes(&mut document));
+
+        let sandboxes = &document.assets.execution_environments.sandboxes;
+        assert_eq!(
+            sandboxes.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["local|/work/app", "local|/work/decided", "local|/work/extra", "ssh:devbox|/srv/api"]
+        );
+        assert_eq!(sandboxes["local|/work/app"], sandbox);
+        assert_eq!(sandboxes["ssh:devbox|/srv/api"], sandbox);
+        assert_eq!(sandboxes["local|/work/extra"], sandbox);
+        assert_eq!(sandboxes["local|/work/decided"], decided);
+        assert!(document
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.conversations)
+            .all(|conversation| conversation.settings.legacy_sandbox == Default::default()));
+        assert!(validate_shape(&document).is_ok(), "{:?}", validate_shape(&document));
+        // Nothing is left to move on the next start.
+        assert!(!lift_conversation_sandboxes(&mut document));
+    }
+
+    /// The old key is read, and never written back.
+    #[test]
+    fn a_conversations_old_sandbox_is_read_and_not_written() {
+        let settings: ConversationSettings = serde_json::from_value(serde_json::json!({
+            "enabledTools": [],
+            "sandbox": { "enabled": true, "network": { "mode": "open" } }
+        }))
+        .expect("settings with a sandbox");
+        assert!(settings.legacy_sandbox.enabled);
+        assert_eq!(
+            settings.legacy_sandbox.network.mode,
+            crate::model::SandboxNetworkMode::Open
+        );
+        assert!(serde_json::to_value(&settings).unwrap().get("sandbox").is_none());
     }
 
     #[test]
@@ -5417,7 +5995,7 @@ b"
     }
 
     #[test]
-    fn persisted_image_lists_enforce_aggregate_limits_for_every_owner() {
+    fn persisted_image_lists_are_not_budgeted_but_every_image_is_validated() {
         fn image(index: usize, bytes: u64, width: u32, height: u32) -> ImageAttachment {
             ImageAttachment {
                 id: format!("{:064x}", index + 1),
@@ -5429,8 +6007,8 @@ b"
                 short_id: None,
             }
         }
-
-        let exact_limit = (0..4)
+        // Past the old per-message budget of 20 images, 20 MiB and 64 MP.
+        let many = (0..25)
             .map(|index| {
                 image(
                     index,
@@ -5440,57 +6018,24 @@ b"
                 )
             })
             .collect::<Vec<_>>();
-        let mut exact = default_document();
-        exact.workspaces[0].conversations[0]
-            .contexts
-            .push(ContextItem::User {
-                id: "aggregate-user-exact".into(),
-                content: String::new(),
-                images: exact_limit.clone(),
-                files: Vec::new(),
-                created_at: "2026-07-24T00:00:00Z".into(),
-            });
-        assert!(validate_shape(&exact).is_ok());
 
-        let mut oversized_user = default_document();
-        oversized_user.workspaces[0].conversations[0]
-            .contexts
-            .push(ContextItem::User {
-                id: "aggregate-user-bytes".into(),
-                content: String::new(),
-                images: (0..5)
-                    .map(|index| {
-                        image(
-                            index,
-                            crate::image_attachments::MAX_IMAGE_ATTACHMENT_BYTES as u64,
-                            1,
-                            1,
-                        )
-                    })
-                    .collect(),
-                files: Vec::new(),
-                created_at: "2026-07-24T00:00:00Z".into(),
-            });
-        let error = validate_shape(&oversized_user).unwrap_err();
-        assert!(error.contains("用户上下文 aggregate-user-bytes"));
-        assert!(error.contains("20 MiB"));
-
-        let mut oversized_queue = default_document();
-        oversized_queue.workspaces[0].conversations[0]
-            .queued_messages
-            .push(QueuedMessage {
-                id: "aggregate-queue-pixels".into(),
-                content: String::new(),
-                images: (0..5).map(|index| image(index, 1, 4096, 4096)).collect(),
-                files: Vec::new(),
-                created_at: "2026-07-24T00:00:00Z".into(),
-            });
-        let error = validate_shape(&oversized_queue).unwrap_err();
-        assert!(error.contains("排队消息 aggregate-queue-pixels"));
-        assert!(error.contains("64 MP"));
-
-        let mut oversized_tool = default_document();
-        let ContextItem::Tool { result, .. } = oversized_tool.workspaces[0].conversations[0]
+        let mut document = default_document();
+        let conversation = &mut document.workspaces[0].conversations[0];
+        conversation.contexts.push(ContextItem::User {
+            id: "many-user-images".into(),
+            content: String::new(),
+            images: many.clone(),
+            files: Vec::new(),
+            created_at: "2026-07-24T00:00:00Z".into(),
+        });
+        conversation.queued_messages.push(QueuedMessage {
+            id: "many-queued-images".into(),
+            content: String::new(),
+            images: many.clone(),
+            files: Vec::new(),
+            created_at: "2026-07-24T00:00:00Z".into(),
+        });
+        let ContextItem::Tool { result, .. } = conversation
             .contexts
             .iter_mut()
             .find(|context| matches!(context, ContextItem::Tool { .. }))
@@ -5498,12 +6043,22 @@ b"
         else {
             unreachable!()
         };
-        result.images = (0..=crate::image_attachments::MAX_REQUEST_IMAGES)
-            .map(|index| image(index, 1, 1, 1))
-            .collect();
-        let error = validate_shape(&oversized_tool).unwrap_err();
-        assert!(error.contains("工具上下文"));
-        assert!(error.contains("more than 20 image attachments"), "{error}");
+        result.images = (0..120).map(|index| image(index, 1, 1, 1)).collect();
+        assert_eq!(validate_shape(&document), Ok(()));
+
+        let mut invalid = default_document();
+        invalid.workspaces[0].conversations[0]
+            .contexts
+            .push(ContextItem::User {
+                id: "invalid-user-image".into(),
+                content: String::new(),
+                images: vec![image(0, 0, 1, 1)],
+                files: Vec::new(),
+                created_at: "2026-07-24T00:00:00Z".into(),
+            });
+        let error = validate_shape(&invalid).unwrap_err();
+        assert!(error.contains("用户上下文 invalid-user-image"), "{error}");
+        assert!(error.contains("has an invalid image attachment"), "{error}");
     }
 
     #[test]
@@ -5550,27 +6105,65 @@ b"
             .unwrap();
 
         let mut snapshot = document.clone();
-        assert!(!snapshot.workspaces[0].conversations[0]
-            .contexts
-            .iter()
-            .any(|context| context.id() == answer.id()));
-
-        refresh_conversation_bodies(&path, &mut snapshot);
+        let unloaded = refresh_conversation_shells(&path, &mut snapshot);
+        // The reload hands over the conversation without its body, marked as
+        // having one; the body it then loads is the store's, answer included.
+        assert!(unloaded.contains(&conversation_id));
+        assert!(snapshot.workspaces[0].conversations[0].contexts.is_empty());
         assert_eq!(
-            snapshot.workspaces[0].conversations[0]
+            crate::conversations::load(&path, &conversation_id)
+                .unwrap()
+                .unwrap()
                 .contexts
                 .last()
                 .map(ContextItem::id),
             Some(answer.id())
         );
-        // Only the bodies are re-read. Settings reach the renderer from the
-        // snapshot, which is the one place they are ever edited.
+        // Settings reach the renderer from the snapshot, which is the one
+        // place they are ever edited.
         assert_eq!(snapshot.presets, document.presets);
         assert_eq!(snapshot.global_settings, document.global_settings);
     }
 
     #[test]
-    fn refreshed_bodies_follow_the_store_even_when_it_is_shorter() {
+    fn a_reload_follows_the_store_for_queues_and_marks_only_nonempty_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state").join("document.v1.json");
+        let mut document = default_document();
+        let mut empty = document.workspaces[0].conversations[0].clone();
+        empty.id = "conv_empty".into();
+        empty.contexts.clear();
+        empty.branches.clear();
+        document.workspaces[0].conversations.push(empty);
+        document.workspaces[0].conversations[0]
+            .queued_messages
+            .push(crate::model::QueuedMessage {
+                id: "q1".into(),
+                content: "later".into(),
+                images: Vec::new(),
+                files: Vec::new(),
+                created_at: "2026-09-19T02:00:00.000Z".into(),
+            });
+        let store = crate::conversation_store::store_for(&path).unwrap();
+        seed_conversations(&store, &document).unwrap();
+        save_all(&path, &document).unwrap();
+        let conversation_id = document.workspaces[0].conversations[0].id.clone();
+        // A run took the queued message: the store drops it, the snapshot does not.
+        store
+            .remove_queued_messages(&conversation_id, &["q1".into()])
+            .unwrap();
+
+        let mut snapshot = document.clone();
+        let unloaded = refresh_conversation_shells(&path, &mut snapshot);
+        assert!(snapshot.workspaces[0].conversations[0]
+            .queued_messages
+            .is_empty());
+        assert!(unloaded.contains(&conversation_id));
+        assert!(!unloaded.contains("conv_empty"), "an empty body is not unloaded");
+    }
+
+    #[test]
+    fn a_reload_never_hands_back_the_snapshot_body() {
         // The store is authoritative, not longer: a user who deleted the tail
         // of a conversation must not have it handed back by the next reload.
         let directory = tempfile::tempdir().unwrap();
@@ -5594,16 +6187,12 @@ b"
                 created_at: "2026-09-19T02:00:00.000Z".into(),
             });
 
-        refresh_conversation_bodies(&path, &mut snapshot);
-        assert_eq!(
-            snapshot.workspaces[0].conversations[0].contexts,
-            store
-                .conversation(&conversation_id)
-                .unwrap()
-                .unwrap()
-                .contexts
-        );
-        assert!(!snapshot.workspaces[0].conversations[0]
+        refresh_conversation_shells(&path, &mut snapshot);
+        assert!(snapshot.workspaces[0].conversations[0].contexts.is_empty());
+        assert!(!store
+            .conversation(&conversation_id)
+            .unwrap()
+            .unwrap()
             .contexts
             .iter()
             .any(|context| context.id() == "ctx-deleted-answer"));
@@ -5757,11 +6346,7 @@ b"
             "without a probe the preset lists every backend's command tool"
         );
         let mut narrowed = product.clone();
-        put_builtin_preset(
-            &mut narrowed,
-            &Default::default(),
-            Some(ShellBackend::Bash),
-        );
+        put_builtin_preset(&mut narrowed, Some(ShellBackend::Bash));
         let narrowed = builtin_preset_of(&narrowed);
         assert_eq!(shells_of(narrowed), vec!["bash"]);
         assert_eq!(
@@ -5831,6 +6416,7 @@ b"
                     content: "上一个版本的提示词".into(),
                     local_only: false,
                     hook_execution: None,
+                    tools_added: Vec::new(),
                     created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 }],
             )
@@ -5875,6 +6461,7 @@ b"
                         content: "出厂提示词".into(),
                         local_only: false,
                         hook_execution: None,
+                        tools_added: Vec::new(),
                         created_at: Utc::now()
                             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     }],
@@ -5901,7 +6488,7 @@ b"
         assert_eq!(document.presets.conversation_presets[0], own);
         let installed = builtin_preset_of(&document);
         assert_eq!(installed.name, "mework");
-        assert_eq!(installed.settings.agent_definitions.len(), 3);
+        assert_eq!(installed.settings.agent_definitions.len(), 4);
         assert!(installed.settings.web_search_enabled);
         assert_eq!(
             document.presets.default_conversation_preset_id,
@@ -5926,38 +6513,26 @@ b"
         assert_eq!(document.presets.default_conversation_preset_id, "preset_own");
     }
 
-    /// The built-in capability ids reach the built-in preset and no other, and
-    /// hooks stay unselected — a dangling hook id fails every run closed, and
-    /// the built-in hooks exist to be deletable.
+    /// The app ships no skill, MCP server or hook, so the built-in preset
+    /// selects none — including where an earlier build left ids selecting the
+    /// ones it used to seed.
     #[test]
-    fn builtin_capability_ids_select_skills_and_servers_but_never_hooks() {
+    fn the_builtin_preset_selects_no_capabilities() {
         let mut document = crate::catalog::product_default_document();
-        let mut own = builtin_preset_of(&document).clone();
-        own.id = "preset_own".into();
-        document.presets.conversation_presets.push(own);
-        put_builtin_preset(
-            &mut document,
-            &crate::capability_seed::BuiltinCapabilitySelection {
-                skill_ids: vec!["skill_user_demo_0000000a".into()],
-                mcp_ids: vec!["mcp_user_demo_0000000b".into()],
-            },
-            None,
-        );
-        let installed = builtin_preset_of(&document);
-        assert_eq!(installed.settings.skill_ids, vec!["skill_user_demo_0000000a"]);
-        assert_eq!(installed.settings.mcp_ids, vec!["mcp_user_demo_0000000b"]);
-        assert!(installed.settings.hook_ids.is_empty());
-        let own = &document.presets.conversation_presets[1];
-        assert_eq!(own.id, "preset_own");
-        assert!(own.settings.skill_ids.is_empty());
-        assert!(own.settings.mcp_ids.is_empty());
-
-        // A platform with no home directory, or a seeding failure, starts with
-        // no built-ins selected rather than with ids nothing can resolve.
-        put_builtin_preset(&mut document, &Default::default(), None);
+        let index = document
+            .presets
+            .conversation_presets
+            .iter()
+            .position(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
+            .unwrap();
+        let earlier = &mut document.presets.conversation_presets[index].settings;
+        earlier.skill_ids = vec!["skill_user_demo_0000000a".into()];
+        earlier.mcp_ids = vec!["mcp_user_demo_0000000b".into()];
+        assert!(put_builtin_preset(&mut document, None));
         let installed = builtin_preset_of(&document);
         assert!(installed.settings.skill_ids.is_empty());
         assert!(installed.settings.mcp_ids.is_empty());
+        assert!(installed.settings.hook_ids.is_empty());
     }
 
     /// A role whose provider row is missing is left out rather than bound to
@@ -5969,14 +6544,14 @@ b"
             .assets
             .api_providers
             .retain(|provider| provider.family != crate::model::ProviderFamily::OpenaiCodex);
-        put_builtin_preset(&mut document, &Default::default(), None);
+        put_builtin_preset(&mut document, None);
         let roles = builtin_preset_of(&document)
             .settings
             .agent_definitions
             .iter()
             .map(|role| role.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(roles, vec!["Opus"]);
+        assert_eq!(roles, vec!["Opus", "Sonnet"]);
         validate_shape(&document).unwrap();
     }
 
@@ -6029,11 +6604,7 @@ b"
 
         // The one shell a probe chose survives the recomputation.
         let mut narrowed = previous.clone();
-        put_builtin_preset(
-            &mut narrowed,
-            &Default::default(),
-            Some(crate::shell_backend::ShellBackend::Zsh),
-        );
+        put_builtin_preset(&mut narrowed, Some(crate::shell_backend::ShellBackend::Zsh));
         let saved = validate_save_transition(&narrowed, &narrowed, &AppState::default()).unwrap();
         assert_eq!(shells_of(builtin_preset_of(&saved)), vec!["zsh"]);
     }
@@ -6109,6 +6680,7 @@ b"
             crate::mework_memory::is_memory_tool(name)
                 || crate::agents::is_task_runtime_tool_name(name)
                 || crate::plan_mode::is_plan_mode_tool_name(name)
+                || crate::handoff::is_handoff_tool_name(name)
                 || name == crate::capabilities::SKILL_TOOL
                 || name == crate::capabilities::TOOL_SEARCH_TOOL
         };
@@ -6131,9 +6703,10 @@ b"
         // body and schema into the system prompt.
         assert!(preset.settings.skill_tool_enabled);
         assert!(preset.settings.mcp_tool_discovery_enabled);
-        // A dangling hook id fails every run of the conversation closed, and
-        // the built-in hooks are meant to be deletable, so the preset names none.
+        // The app ships no skill, MCP server or hook, so the preset names none.
         assert!(preset.settings.hook_ids.is_empty());
+        assert!(preset.settings.skill_ids.is_empty());
+        assert!(preset.settings.mcp_ids.is_empty());
         // Both legs are native. Nothing is borrowed from a catalog provider by
         // default, and nothing resolves to a backend chosen somewhere else.
         assert_eq!(
@@ -6162,7 +6735,7 @@ b"
                 .iter()
                 .map(|role| role.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Opus", "Sol", "Luna"]
+            vec!["Opus", "Sonnet", "Sol", "Luna"]
         );
         for role in roles {
             // Every role follows the preset's list rather than keeping its own,
@@ -6192,10 +6765,24 @@ b"
             "Opus 绑定的模型要在种子表里，新装即可用"
         );
         assert_eq!(
+            binding("Sonnet"),
+            AgentModelSelection::Explicit {
+                provider_id: claude_provider.id.clone(),
+                model_id: "claude-sonnet-5-5".into(),
+            }
+        );
+        assert!(
+            claude_provider
+                .models
+                .iter()
+                .any(|model| model.id == "claude-sonnet-5-5"),
+            "Sonnet 绑定的模型要在种子表里，新装即可用"
+        );
+        assert_eq!(
             binding("Sol"),
             AgentModelSelection::Explicit {
                 provider_id: codex_provider.id.clone(),
-                model_id: "gpt-6-sol".into(),
+                model_id: "gpt-6.1-sol".into(),
             },
             "未登录的 Codex 绑定必须原样活过一次存取"
         );
@@ -6647,11 +7234,12 @@ b"
 
     /// The accepted older anchor shapes preserve configuration: schema 1 gains
     /// only the host-owned fork-intent table, schema 2 only the model
-    /// `promptCache` key with its default.
+    /// `promptCache` key with its default, schema 3 nothing (the model's
+    /// append answers start unanswered).
     #[test]
     fn released_older_schemas_preserve_configuration_in_place() {
-        assert_eq!(SCHEMA_VERSION, 3, "抬版本时重新判断要不要就地迁移");
-        for older in [1, 2] {
+        assert_eq!(SCHEMA_VERSION, 4, "抬版本时重新判断要不要就地迁移");
+        for older in [1, 2, 3] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("document.json");
             let mut document = default_document();
@@ -6664,7 +7252,7 @@ b"
             fs::write(&path, &original).unwrap();
 
             let restored = load_or_initialize(&path).unwrap();
-            assert_eq!(restored.schema_version, 3, "schema {older}");
+            assert_eq!(restored.schema_version, 4, "schema {older}");
             for preset in &restored.presets.conversation_presets {
                 assert_eq!(preset.settings.web_search.max_results, 42, "schema {older}");
             }
@@ -6822,6 +7410,28 @@ b"
                 )
             });
         assert!(has_notice);
+    }
+
+    /// Only the start that writes the seed for a brand-new install is a first
+    /// launch; the renderer runs its first-launch setup on that answer alone.
+    #[test]
+    fn only_seeding_a_brand_new_install_is_a_fresh_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.v1.json");
+        assert!(load_or_recover_scanned(&path).unwrap().fresh_install);
+        // The next start reads the anchor the first one wrote.
+        assert!(!load_or_recover_scanned(&path).unwrap().fresh_install);
+
+        // An anchor lost while the store still holds conversations is a recovery.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.v1.json");
+        save_all(&path, &default_document()).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(!load_or_recover_scanned(&path).unwrap().fresh_install);
+
+        // So is an anchor that no longer loads.
+        fs::write(&path, b"{ definitely broken").unwrap();
+        assert!(!load_or_recover_scanned(&path).unwrap().fresh_install);
     }
 
     #[test]
@@ -7590,6 +8200,7 @@ b"
             &document,
             &document.workspaces[0].id,
             &mut proposal,
+            None,
             &state,
         )
         .expect_err("a mutated card must not be accepted");
@@ -7608,6 +8219,7 @@ b"
                 &document,
                 &document.workspaces[0].id,
                 &mut proposal,
+                None,
                 &state,
             )
             .expect("unchanged conversation stays writable");
@@ -8956,5 +9568,222 @@ b"
         let state = AppState::default();
         state.authorize_remote_workspace("ssh:m1", "/srv/app");
         assert!(prepare_save_transition(&previous, &changed, &state).is_err());
+    }
+
+    /// Loading reads every body but never holds more than two: while one is
+    /// checked the reader parses the next and waits for it to be taken.
+    #[test]
+    fn the_body_scan_holds_at_most_two_and_reads_ahead_of_the_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Body {
+            index: usize,
+            live: Arc<AtomicUsize>,
+        }
+        impl Drop for Body {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let ids = (0..64).map(|index| index.to_string()).collect::<Vec<_>>();
+        let mut order = Vec::new();
+        let mut read_ahead = false;
+        scan_bodies(
+            &ids,
+            |id| {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                Body {
+                    index: id.parse().unwrap(),
+                    live: Arc::clone(&live),
+                }
+            },
+            |index, body| {
+                assert_eq!(index, body.index);
+                order.push(index);
+                if index == 0 {
+                    // The next body arrives while this one is still being checked.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while live.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    read_ahead = live.load(Ordering::SeqCst) == 2;
+                }
+            },
+        );
+        assert_eq!(order, (0..64).collect::<Vec<_>>());
+        assert!(read_ahead, "the reader works one body ahead");
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "never more than two bodies alive");
+        assert_eq!(live.load(Ordering::SeqCst), 0, "every body is dropped after use");
+    }
+
+    /// The app's load hands over no bodies, and fills no cache with them: what
+    /// it needed from each — attachment references, a trailing unanswered
+    /// message — it noted while the body was in hand.
+    #[test]
+    fn the_app_loads_every_body_once_and_keeps_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state").join("document.v1.json");
+        let mut document = default_document();
+        let image = crate::model::ImageAttachment {
+            id: "a".repeat(64),
+            name: "look.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 68,
+            short_id: None,
+        };
+        let mut answered = document.workspaces[0].conversations[0].clone();
+        answered.id = "conv_answered".into();
+        let asking = &mut document.workspaces[0].conversations[0];
+        asking.contexts.push(ContextItem::User {
+            id: "ctx_unanswered".into(),
+            content: "look at this".into(),
+            images: vec![image.clone()],
+            files: Vec::new(),
+            created_at: "2026-09-30T00:00:00.000Z".into(),
+        });
+        let asking_id = asking.id.clone();
+        document.workspaces[0].conversations.push(answered);
+        let store = crate::conversation_store::store_for(&path).unwrap();
+        seed_conversations(&store, &document).unwrap();
+        save_all(&path, &document).unwrap();
+
+        let loaded = load_or_recover_scanned(&path).unwrap();
+        let conversations = loaded
+            .document
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.conversations.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(conversations.len(), 2);
+        assert!(conversations
+            .iter()
+            .all(|conversation| !crate::attachment_refs::has_body(conversation)));
+        assert!(loaded.refs.image_ids(&loaded.document).contains(&image.id));
+        assert!(!store.body_is_cached("conv_answered"), "the load does not fill the pool");
+        let stored = store.conversation_from_disk(&asking_id).unwrap().unwrap();
+        assert!(
+            matches!(stored.contexts.last(), Some(ContextItem::System { id, .. }) if id.starts_with("ctx_orphan_")),
+            "the unanswered message is marked in the store"
+        );
+    }
+
+    /// A body that fails its check is still isolated by the scan, as it was by
+    /// the whole-document pass.
+    #[test]
+    fn the_scan_isolates_a_conversation_whose_body_fails_its_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state").join("document.v1.json");
+        let mut document = default_document();
+        let mut broken = document.workspaces[0].conversations[0].clone();
+        broken.id = "conv_broken".into();
+        // A branch hung off a message the timeline does not have: a body shape
+        // error the store keeps as written.
+        broken.branches = vec![ConversationBranch {
+            id: "orphan-branch".into(),
+            fork_context_id: "no-such-message".into(),
+            active: true,
+            contexts: Vec::new(),
+            created_at: "2026-07-20T00:00:00Z".into(),
+            updated_at: "2026-07-20T00:00:00Z".into(),
+        }];
+        document.workspaces[0].conversations.push(broken);
+        let store = crate::conversation_store::store_for(&path).unwrap();
+        seed_conversations(&store, &document).unwrap();
+        save_all(&path, &document).unwrap();
+        let loaded = read_document_scanned(&path).unwrap();
+        let ids = loaded
+            .document
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.conversations.iter())
+            .map(|conversation| conversation.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&"conv_broken"));
+        assert_eq!(ids.len(), 1);
+    }
+
+    fn branched_document() -> AppDocument {
+        let mut document = default_document();
+        let conversation = &mut document.workspaces[0].conversations[0];
+        let fork_context_id = conversation
+            .contexts
+            .iter()
+            .find_map(|context| match context {
+                ContextItem::User { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        conversation.branches = vec![
+            ConversationBranch {
+                id: "hidden".into(),
+                fork_context_id: fork_context_id.clone(),
+                active: false,
+                contexts: vec![user_context("hidden-suffix")],
+                created_at: "2026-07-20T00:00:00Z".into(),
+                updated_at: "2026-07-20T00:00:01Z".into(),
+            },
+            ConversationBranch {
+                id: "active".into(),
+                fork_context_id,
+                active: true,
+                contexts: Vec::new(),
+                created_at: "2026-07-20T00:00:02Z".into(),
+                updated_at: "2026-07-20T00:00:02Z".into(),
+            },
+        ];
+        document
+    }
+
+    /// Branch records are body. Kept on a conversation whose timeline was
+    /// stripped, each would point at a fork message that is not there, and the
+    /// snapshot would fail every save's shape check.
+    #[test]
+    fn a_conversation_with_branches_survives_the_hollow_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("document.v1.json");
+        let state = AppState::default();
+        state
+            .document_store
+            .acquire_process_authority(&anchor)
+            .unwrap();
+        state.document_store.commit(&anchor, branched_document()).unwrap();
+        let snapshot = state.document_store.current_snapshot(&anchor).unwrap();
+        let conversation = &snapshot.workspaces[0].conversations[0];
+        assert!(conversation.contexts.is_empty() && conversation.branches.is_empty());
+        validate_shape(&snapshot).expect("a hollow snapshot is a valid document");
+        let mut proposal = (*snapshot).clone();
+        for workspace in &mut proposal.workspaces {
+            workspace.conversations.clear();
+        }
+        prepare_save_transition(&snapshot, &proposal, &state).expect("the renderer's save goes through");
+    }
+
+    /// A reload lists a branched conversation, marked as having a body.
+    #[test]
+    fn a_reload_keeps_a_branched_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state").join("document.v1.json");
+        let document = branched_document();
+        let store = crate::conversation_store::store_for(&path).unwrap();
+        seed_conversations(&store, &document).unwrap();
+        save_all(&path, &document).unwrap();
+        let id = document.workspaces[0].conversations[0].id.clone();
+        let mut snapshot = document.clone();
+        let unloaded = refresh_conversation_shells(&path, &mut snapshot);
+        assert!(unloaded.contains(&id));
+        let listed = snapshot.workspaces[0]
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .expect("not isolated");
+        assert!(listed.branches.is_empty());
+        assert_eq!(store.conversation(&id).unwrap().unwrap().branches.len(), 2);
     }
 }

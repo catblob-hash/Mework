@@ -1,6 +1,6 @@
 import type { SubagentView } from "./subagents";
 import type { TaskItem, TaskItemState } from "./taskContainer";
-import { taskStateForStatus } from "./taskContainer";
+import { promptPreview, taskStateForStatus } from "./taskContainer";
 import type { WorkflowProgressView } from "./workflowProgress";
 
 /**
@@ -73,6 +73,11 @@ export interface WorkflowRunStep {
   agentId: string | null;
   /** Configured role name, or null when the step named none. */
   role: string | null;
+  /**
+   * What the run asked this step to do, as one line. Null for a slot no agent
+   * has taken yet: the plan's prompt only reaches the renderer with the agent.
+   */
+  task: string | null;
   /**
    * Exact model the step answers on.
    *
@@ -240,6 +245,7 @@ export function deriveWorkflowRun(
       state: taskStateForStatus(step.status),
       agentId: step.id,
       role: step.role?.name ?? null,
+      task: promptPreview(step.task) || null,
       modelId: step.modelId ?? step.role?.modelId ?? null,
       tokens: metrics?.tokens ?? null,
       elapsedMs: metrics?.elapsedMs ?? null,
@@ -265,6 +271,7 @@ export function deriveWorkflowRun(
       state: entry.row.skipped ? "failed" : ledgerState(entry.row.state, entry.row.blocked),
       agentId: null,
       role: null,
+      task: null,
       modelId: null,
       tokens: null,
       elapsedMs: null,
@@ -287,6 +294,7 @@ export function deriveWorkflowRun(
     state: slot.state,
     agentId: slot.agentId,
     role: slot.role,
+    task: slot.task,
     modelId: slot.modelId,
     tokens: slot.tokens,
     elapsedMs: slot.elapsedMs,

@@ -299,10 +299,14 @@ pub(crate) fn discover_levels(
     skills_out.sort_by(resource_sort);
     mcps.sort_by(resource_sort);
     hooks.sort_by(resource_sort);
+    // The built-in skill is not a level either. Every scan lists it, whatever
+    // levels it read, and lists it first, like the built-in prompt profile.
+    let mut skills = skills::builtin_skills(language);
+    skills.extend(skills_out);
     DiscoveredCapabilities {
         catalog: CapabilityCatalog {
             hooks,
-            skills: skills_out,
+            skills,
             mcps,
             lsps,
             tool_description_files: Vec::new(),
@@ -482,6 +486,7 @@ fn runtime_context_from_discovery(
             } else {
                 added_skills.push(AddedSkill {
                     resource_id: resource_id.clone(),
+                    name: name.clone(),
                     content: profile.render(
                         PromptKey::SystemSkillAddedTrigger,
                         &[("name", &name), ("trigger", &parsed.trigger)],
@@ -502,6 +507,7 @@ fn runtime_context_from_discovery(
             } else {
                 added_skills.push(AddedSkill {
                     resource_id: resource_id.clone(),
+                    name: descriptor.name.clone(),
                     content: profile.render(
                         PromptKey::SystemSkillAddedBody,
                         &[("name", &descriptor.name), ("body", &parsed.body)],
@@ -632,8 +638,12 @@ fn runtime_context_from_discovery(
 /// Skill directory: the parent of its body file.
 ///
 /// Skills can include `scripts/` and `references/` addressed relative to `SKILL.md`;
-/// providing the directory lets the model resolve those references.
+/// providing the directory lets the model resolve those references. A built-in
+/// skill has none, and its pseudo-location is not a path to hand the model.
 fn skill_directory(descriptor: &ResourceDescriptor) -> String {
+    if descriptor.source == ResourceSource::Builtin {
+        return "none (this skill is built into Mework and has no files on disk)".to_owned();
+    }
     Path::new(&descriptor.location)
         .parent()
         .map(|parent| parent.to_string_lossy().into_owned())
@@ -1054,8 +1064,12 @@ fn extend_unique(target: &mut Vec<String>, values: &[String]) {
 }
 
 /// Reads a skill body. Symlinks and reparse points are rejected: following one would
-/// delegate the catalog snapshot's trust boundary to the link owner.
+/// delegate the catalog snapshot's trust boundary to the link owner. A built-in
+/// skill's body is compiled in.
 fn read_skill_body(descriptor: &ResourceDescriptor) -> Result<String, String> {
+    if let Some(source) = skills::builtin_manifest(descriptor) {
+        return Ok(source);
+    }
     let path = Path::new(&descriptor.location);
     let bytes = memory_archive_file::read_bounded_nofollow_labeled(
         path,
@@ -1751,33 +1765,101 @@ mod tests {
         );
     }
 
-    /// A document with no user or workspace skills must discover no skills and must
-    /// not fall back to bundled entries.
+    /// The app ships exactly one skill, Mework SDK, and selects it nowhere: the
+    /// scan lists it as the only built-in entry (the global level is the real
+    /// `~/.mework`, so nothing is said about the rest), and the default
+    /// conversation selects no skill, server or hook and runs with none.
     #[test]
-    fn discovery_ships_no_builtin_skills() {
+    fn discovery_ships_only_the_mework_sdk_skill_and_selects_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let mut document = crate::catalog::default_document();
         for workspace in &mut document.workspaces {
             workspace.path = directory.path().to_string_lossy().into_owned();
         }
         let conversation = &document.workspaces[0].conversations[0];
+        assert!(conversation.settings.skill_ids.is_empty());
+        assert!(conversation.settings.mcp_ids.is_empty());
+        assert!(conversation.settings.hook_ids.is_empty());
 
         let catalog = discover(&document, &directory.path().join("app-data"));
-        assert!(catalog
+        let builtin = catalog
             .skills
             .iter()
-            .all(|skill| skill.source != ResourceSource::Builtin));
+            .filter(|skill| skill.source == ResourceSource::Builtin)
+            .collect::<Vec<_>>();
+        assert_eq!(builtin.len(), 1);
+        assert_eq!(builtin[0].id, skills::MEWORK_SDK_ID);
+        assert_eq!(builtin[0].name, "Mework SDK");
+        assert!(builtin[0].available);
+        assert!(builtin[0].workspace_id.is_none());
+        assert_eq!(skills::directory_name_of(builtin[0]), "mework-sdk");
 
-        let hook_definitions = HashMap::new();
         let profile = PromptProfile::builtin_english();
-        let addendum = runtime_context_from_discovery(
+        let context = runtime_context_from_discovery(
             conversation,
-            &discovered(catalog.clone(), hook_definitions.clone()),
+            &discovered(catalog, HashMap::new()),
             &profile,
         )
-        .unwrap()
-        .addendum;
-        assert!(!addendum.contains("capability installation guide"));
+        .unwrap();
+        assert!(context.addendum.is_empty());
+        assert!(context.skills.is_empty() && context.added_skills.is_empty());
+    }
+
+    /// Selected, the built-in skill resolves like a folder would — pasted into
+    /// the prompt, or loaded by the `skill` tool under its directory name —
+    /// from the compiled text, stamped with this build's version, and with no
+    /// directory to hand the model.
+    #[test]
+    fn the_mework_sdk_skill_resolves_from_the_compiled_text_in_both_modes() {
+        let mut document = crate::catalog::default_document();
+        document.workspaces[0].conversations[0].settings.skill_ids =
+            vec![skills::MEWORK_SDK_ID.to_owned()];
+        let catalog = CapabilityCatalog {
+            hooks: Vec::new(),
+            skills: skills::builtin_skills(ResolvedLanguage::ZhCn),
+            mcps: Vec::new(),
+            lsps: Vec::new(),
+            tool_description_files: Vec::new(),
+        };
+        assert!(catalog.skills[0].description.contains("内置"));
+        let profile = PromptProfile::builtin_english();
+        let version = format!("Mework {}", env!("CARGO_PKG_VERSION"));
+
+        document.workspaces[0].conversations[0]
+            .settings
+            .skill_tool_enabled = false;
+        let pasted = runtime_context_from_discovery(
+            &document.workspaces[0].conversations[0],
+            &discovered(catalog.clone(), HashMap::new()),
+            &profile,
+        )
+        .unwrap();
+        assert!(
+            pasted.addendum.starts_with("# Mework SDK"),
+            "{}",
+            pasted.addendum
+        );
+        assert!(pasted.addendum.contains(&version));
+        assert!(!pasted.addendum.contains("{{MEWORK_VERSION}}"));
+
+        document.workspaces[0].conversations[0]
+            .settings
+            .skill_tool_enabled = true;
+        let on_demand = runtime_context_from_discovery(
+            &document.workspaces[0].conversations[0],
+            &discovered(catalog, HashMap::new()),
+            &profile,
+        )
+        .unwrap();
+        assert_eq!(on_demand.skills.len(), 1);
+        let skill = &on_demand.skills[0];
+        assert_eq!(skill.name, "mework-sdk");
+        assert!(skill.trigger.starts_with("How to configure Mework itself"));
+        assert!(skill.body.contains(&version));
+        assert!(!skill.directory.contains("builtin:"), "{}", skill.directory);
+        assert!(on_demand
+            .addendum
+            .contains("- mework-sdk: How to configure Mework itself"));
     }
 
     #[test]
@@ -2262,9 +2344,11 @@ mod tests {
 
         let level = ConfigLevel::workspace(&document.workspaces[0]).unwrap();
         let scan = discover_levels(std::slice::from_ref(&level), ResolvedLanguage::EnUs);
-        assert_eq!(scan.catalog.skills.len(), 1);
-        assert_eq!(scan.catalog.skills[0].name, "Review");
-        assert!(scan.catalog.skills[0]
+        // The built-in skill heads every scan; the workspace's own follows it.
+        assert_eq!(scan.catalog.skills.len(), 2);
+        assert_eq!(scan.catalog.skills[0].id, skills::MEWORK_SDK_ID);
+        assert_eq!(scan.catalog.skills[1].name, "Review");
+        assert!(scan.catalog.skills[1]
             .id
             .starts_with("skill_workspace_review_"));
         assert_eq!(scan.catalog.mcps.len(), 2);
@@ -2287,6 +2371,7 @@ mod tests {
             .catalog
             .skills
             .iter()
+            .skip(1)
             .chain(&scan.catalog.mcps)
             .chain(&scan.catalog.hooks)
         {
@@ -2397,7 +2482,14 @@ mod tests {
         document.workspaces[0].path = directory.path().to_string_lossy().into_owned();
         let level = ConfigLevel::workspace(&document.workspaces[0]).unwrap();
         let scan = discover_levels(std::slice::from_ref(&level), ResolvedLanguage::EnUs);
-        let skill_id = scan.catalog.skills[0].id.clone();
+        let skill_id = scan
+            .catalog
+            .skills
+            .iter()
+            .find(|row| row.name == "Gone")
+            .unwrap()
+            .id
+            .clone();
         let drop_id = scan
             .catalog
             .mcps
@@ -2410,6 +2502,9 @@ mod tests {
         delete_skill(&document, &skill_id).unwrap();
         assert!(!config.join("skills").join("gone").exists());
         assert!(delete_skill(&document, &skill_id).is_err());
+        // The built-in skill is in the same scan, and is refused.
+        let error = delete_skill(&document, skills::MEWORK_SDK_ID).unwrap_err();
+        assert!(error.contains("built-in"), "{error}");
 
         delete_mcp_server(&document, &drop_id).unwrap();
         let remaining = discover_levels(std::slice::from_ref(&level), ResolvedLanguage::EnUs);
