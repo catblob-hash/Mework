@@ -33,21 +33,26 @@ API Key 或订阅由你自己提供，其余一切都在你的机器上运行和
 - **会验收的浏览器。** Mework 拉起项目的开发服务器，打开它渲染的页面，让模型读控制台和网络请求、检查元素、点击、输入、截图——然后把结果拿给你看，而不是让你自己去检查。同一个面板也是一个你可以自己操作的普通浏览器。
 - **看得懂的审批卡。** 每个有风险的调用都会显示完整命令或路径，以及为什么被这样归类；四档安全级别，从逐条批准到完全放行。
 - **沿用你已有的格式。** 技能是 `SKILL.md` 目录，与 Claude Code、Codex 和公开技能库同一格式，可开局加载，也可按需加载。MCP 服务器支持 stdio 与 Streamable HTTP，写在与 Claude Code 同形状的 `mcp.json` 里，工具 schema 可以开局声明，也可以按需发现。钩子在七个生命周期节点执行 shell 命令，从 Claude Code 复制过来的 `hooks` 块可直接使用。
-- **模型你选，Key 你管。** 支持 OpenAI、Anthropic、Google、Azure OpenAI、Amazon Bedrock、Google Vertex、xAI 以及任何 OpenAI 兼容端点。另有两家登录即用：**OpenAI Codex** 用你的 ChatGPT 订阅，**Claude Agent** 用 Mework 自带的那份 Claude Code，配你本机已有的 Claude Code 登录——不必再单独装一份、也不用操心版本对不上（受 [Claude Code 使用条款](https://code.claude.com/docs/en/legal-and-compliance)约束）。Key 保存在 Windows 凭据管理器，绝不写进配置文件。
-- **不打扰。** 关窗即缩到托盘，子代理、工作流和 shell 任务照常运行。应用从 GitHub Releases 自动更新；可选的本地小模型在你自己的电脑上给对话起标题、给 shell 命令写一行说明、说清失败的调用为什么失败。
+- **模型你选，Key 你管。** 支持 OpenAI、Anthropic、Google、Azure OpenAI、Amazon Bedrock、Google Vertex、xAI 以及任何 OpenAI 兼容端点。另有两家登录即用：**OpenAI Codex** 用你的 ChatGPT 订阅，**Claude Agent** 用 Mework 自带的那份 Claude Code，配你本机已有的 Claude Code 登录——不必再单独装一份、也不用操心版本对不上（受 [Claude Code 使用条款](https://code.claude.com/docs/en/legal-and-compliance)约束）。Key 保存在 Windows 凭据管理器；在 Mac 上存进一个由登录钥匙串条目加密的保险库——绝不写进配置文件。
+- **不打扰。** 关窗即缩到托盘，子代理、工作流和 shell 任务照常运行。Windows 上应用从 GitHub Releases 自动更新（Mac 上会提示你去下载新版本）；可选的本地小模型在你自己的电脑上给对话起标题、给 shell 命令写一行说明、说清失败的调用为什么失败。
 
-## 安装（Windows）
+## 安装
 
-从 [Releases](../../releases) 任选其一：
+全部在 [Releases](../../releases)。
+
+**Windows**（Windows 10 或 11，x64；MSIX 需 2004 及以上版本）任选其一：
 
 - **安装器** —— `Mework_1.0.0_x64-setup.exe`（按机器安装）。
 - **便携版** —— `Mework_1.0.0_x64_portable.zip`：解压即用，运行 `mework.exe`（`mework-aisdk.exe` 需与其同目录）。
+- **MSIX** —— `Mework_1.0.0_x64.msix`，用 Mework 自己的证书签名：先把 `Mework_msix_signing.cer` 导入「本地计算机 → 受信任人」（只需一次），再打开安装包。同一个包即将上架 Microsoft Store，由商店负责更新。
 
-两者都依赖 Microsoft Edge WebView2 Runtime（当前 Windows 10/11 已预装；安装器可在缺失时自动引导安装）。「便携」指的是免安装，不是不落盘：应用仍会写入 `%APPDATA%\com.mework.app`、`%LOCALAPPDATA%\com.mework.app` 与 Windows 凭据管理器。
+三者都依赖 Microsoft Edge WebView2 Runtime（当前 Windows 10/11 已预装；安装器可在缺失时自动引导安装）。「便携」指的是免安装，不是不落盘：应用仍会写入 `%APPDATA%\com.mework.app`、`%LOCALAPPDATA%\com.mework.app` 与 Windows 凭据管理器。
+
+**macOS**（13 及以上，Apple 芯片）—— `Mework_1.0.0_aarch64.dmg`，带 Developer ID 签名并经 Apple 公证：打开后把 Mework 拖进「应用程序」。数据在 `~/Library/Application Support/com.mework.app`，Key 在 `~/.mework/credential-vault`，由登录钥匙串里的「Mework Safe Storage」条目加密。
 
 **首次运行：** 打开「全局设置 → 提供商 → 模型提供商」，添加提供商与 Key（Codex、Claude Agent 两家是登录式），从发现页添加模型，然后在输入框下方选择它。
 
-**更新：** 「设置 → 版本更新」会检查 GitHub Releases。安装版下载新的安装程序并以更新模式运行，保留设置和数据；便携版把新的 zip 下载好，由你解压覆盖旧文件。
+**更新：** 「设置 → 版本更新」会检查 GitHub Releases。安装版下载新的安装程序并以更新模式运行，保留设置和数据；便携版把新的 zip 下载好，由你解压覆盖旧文件。MSIX 版不检查（由 Windows 或商店更新）；Mac 版会带你去发布页下载新的 `.dmg`。
 
 ## 从源码构建
 

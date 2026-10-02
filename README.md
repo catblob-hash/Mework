@@ -33,21 +33,26 @@ You bring your own API key or subscription. Everything else runs and stays on yo
 - **A browser that verifies the work.** Mework starts your project's dev server, opens the page it serves, and lets the model read the console and network, inspect elements, click, type and take screenshots — then show you the result instead of asking you to check. The same pane is a normal browser you can drive yourself.
 - **Approval cards you can read.** Every risky call shows the exact command or path and why it was classified that way, under four security levels from approve-everything to full access.
 - **The formats you already have.** Skills are `SKILL.md` folders in the format Claude Code, Codex and the public registries use, loaded up front or on demand. MCP servers, stdio or Streamable HTTP, go in an `mcp.json` shaped like Claude Code's, with tool schemas declared up front or discovered on demand. Hooks run shell commands at seven lifecycle points, and a `hooks` block copied from Claude Code works as it is.
-- **Your models, your keys.** OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, Google Vertex, xAI and any OpenAI-compatible endpoint. Two sign in instead: **OpenAI Codex** with your ChatGPT subscription, and **Claude Agent**, which runs the Claude Code build Mework ships against the Claude Code login already on your machine — no separate install to keep in step (subject to the [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance)). Keys live in Windows Credential Manager, never in a settings file.
-- **Stays out of the way.** Closing the window sends Mework to the tray; subagents, workflows and shell tasks keep running. The app updates itself from GitHub Releases, and an optional small model running on your own computer names conversations, captions shell commands and says why a failed call failed.
+- **Your models, your keys.** OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, Google Vertex, xAI and any OpenAI-compatible endpoint. Two sign in instead: **OpenAI Codex** with your ChatGPT subscription, and **Claude Agent**, which runs the Claude Code build Mework ships against the Claude Code login already on your machine — no separate install to keep in step (subject to the [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance)). Keys live in Windows Credential Manager, or on a Mac in a vault sealed by one login-keychain item — never in a settings file.
+- **Stays out of the way.** Closing the window sends Mework to the tray; subagents, workflows and shell tasks keep running. On Windows the app updates itself from GitHub Releases (on a Mac it points you to the new release), and an optional small model running on your own computer names conversations, captions shell commands and says why a failed call failed.
 
-## Install (Windows)
+## Install
 
-Grab either flavor from [Releases](../../releases):
+Everything is on [Releases](../../releases).
+
+**Windows** (10 or 11, x64; the MSIX needs version 2004 or later) — pick one:
 
 - **Installer** — `Mework_1.0.0_x64-setup.exe` (per-machine).
 - **Portable** — `Mework_1.0.0_x64_portable.zip`: unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
+- **MSIX** — `Mework_1.0.0_x64.msix`, signed with Mework's own certificate: import `Mework_msix_signing.cer` into *Local Machine → Trusted People* once, then open the package. The same package is coming to the Microsoft Store, which updates it for you.
 
-Both require the Microsoft Edge WebView2 Runtime, which is preinstalled on current Windows 10/11; the installer can bootstrap it if missing. "Portable" means no installer, not no state: the app still writes to `%APPDATA%\com.mework.app`, `%LOCALAPPDATA%\com.mework.app` and Windows Credential Manager.
+All three require the Microsoft Edge WebView2 Runtime, which is preinstalled on current Windows 10/11; the installer can bootstrap it if missing. "Portable" means no installer, not no state: the app still writes to `%APPDATA%\com.mework.app`, `%LOCALAPPDATA%\com.mework.app` and Windows Credential Manager.
+
+**macOS** (13 or later, Apple silicon) — `Mework_1.0.0_aarch64.dmg`, signed with a Developer ID and notarized by Apple: open it and drag Mework to Applications. Data lives in `~/Library/Application Support/com.mework.app`, and keys in `~/.mework/credential-vault`, sealed by the *Mework Safe Storage* login-keychain item.
 
 **First run:** open *Settings → Providers → Model providers*, add a provider and its key (or sign in for Codex and Claude Agent), add a model from the discovery page, and pick it under the composer.
 
-**Updates:** *Settings → Updates* checks GitHub Releases. The installer flavor downloads and runs the new setup in update mode, keeping your settings and data; the portable flavor downloads the new zip for you to unzip over the old files.
+**Updates:** *Settings → Updates* checks GitHub Releases. The installer flavor downloads and runs the new setup in update mode, keeping your settings and data; the portable flavor downloads the new zip for you to unzip over the old files. The MSIX package never checks (Windows or the Store updates it), and a Mac is sent to the release page for the new `.dmg`.
 
 ## Build from source
 
