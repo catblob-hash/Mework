@@ -6,9 +6,9 @@
 
 📖 **文档站：** [catblob-hash.github.io/Mework](https://catblob-hash.github.io/Mework/zh-CN/index.html)
 
-![Mework 功能导览：一个项目同时包含 Mac 本地目录和 SSH 连接的 Linux 电脑；子代理和脚本工作流跑在不同厂商的模型上；计划模式与审批；两台机器上的改动审阅、终端和内置浏览器；文件预览；编辑模型看到的内容；预设、设置和中文界面](.github/assets/demo.gif)
+![Mework：一个任务六个面板（浏览器、审阅、子代理、文件、终端、任务），逐个放大查看；Claude 与 GPT 子代理；一个项目横跨 Mac 与 Windows PC](.github/assets/demo.gif)
 
-<sub>两分钟功能导览：主 Agent 用 DeepSeek，子代理用 Claude 和 GPT 模型，一个项目同时包含 Mac 本地目录和 SSH 连接的 Linux 电脑。macOS 上录制，等待部分已剪掉，较长的步骤已加速。</sub>
+<sub>三十秒，一个任务：主 Agent 用 Claude Opus，工作流把子代理分给 Claude 和 GPT 模型，一个项目同时包含 Mac 本地目录和 SSH 连接的 Windows 电脑。macOS 上录制，打开面板的过程已加速。</sub>
 
 Mework 是一个桌面端编程 Agent，它的特点只有一个：模型看到什么、能做什么，都由你掌控，而且掌控起来很自然。
 
