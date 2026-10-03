@@ -182,11 +182,23 @@ async function purge(urls) {
   if (!body.success) throw new Error(`purging the CDN cache: ${JSON.stringify(body.errors)}`);
 }
 
-/** The public address must answer with the stored size, which also proves the custom domain works. */
-async function checkPublic(url, size) {
-  const response = await request(url, { method: "HEAD", headers: { "user-agent": "mework-release-mirror" } });
+/**
+ * The public address must serve the stored file, which also proves the custom domain works. A
+ * small file is read whole and hashed; a large one must report its size. Uncompressed, because
+ * Cloudflare compresses text for a client that asks and then sends no length.
+ */
+async function checkPublic(url, size, sha256) {
+  const small = size <= 1e6;
+  const headers = { "user-agent": "mework-release-mirror", "accept-encoding": "identity" };
+  const response = await request(url, { method: small ? "GET" : "HEAD", headers });
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  if (small) {
+    const actual = sha256Hex(Buffer.from(await response.arrayBuffer()));
+    if (actual !== sha256) throw new Error(`${url}: serves SHA-256 ${actual} instead of ${sha256}`);
+    return;
+  }
   const length = Number(response.headers.get("content-length"));
-  if (!response.ok || length !== size) throw new Error(`${url}: HTTP ${response.status}, ${length} bytes instead of ${size}`);
+  if (length !== size) throw new Error(`${url}: reports ${length} bytes instead of ${size}`);
 }
 
 // --- Run --------------------------------------------------------------------
@@ -239,7 +251,7 @@ try {
   // Readable at the public address before latest.json can send anyone there. A
   // replaced file is purged first, or the edge would answer with the old copy.
   if (replaced.length) await purge(replaced);
-  for (const asset of assets) await checkPublic(mirrorUrl(release.tag_name, asset.name), asset.size);
+  for (const asset of assets) await checkPublic(mirrorUrl(release.tag_name, asset.name), asset.size, expected.get(asset.name));
 
   const summary = [`### ${release.tag_name} on ${MIRROR.origin}`, "", ...assets.map((asset) => `- [${asset.name}](${mirrorUrl(release.tag_name, asset.name)}) — ${megabytes(asset.size)}, \`${expected.get(asset.name)}\``)];
   if (isLatest) {
