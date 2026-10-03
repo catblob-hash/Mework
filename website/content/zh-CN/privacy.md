@@ -18,7 +18,7 @@ Mework 不收集任何数据。没有 Mework 账号，没有遥测、统计分�
 - **OpenAI Codex** 用你的 ChatGPT 账号在 OpenAI 登录。**Claude Agent** 提供商运行随 Mework 附带的 Claude Code，用你的 Anthropic 账号登录；Mework 关闭了它的遥测与错误上报。
 - **联网搜索与抓取**：你配置的搜索服务会收到查询词；智能体抓取的网站、你在内置浏览器里打开的页面会收到普通的网页请求。
 - 你添加的 **MCP 服务器、钩子和 SSH 机器** 会收到你配置给它们的内容。
-- **更新检查**：Windows 安装版、便携版与 macOS 版在你打开「设置 → 版本更新」时向 GitHub（`api.github.com`）查询最新发布，GitHub 会看到你的 IP 地址与应用版本号。Microsoft Store 版从不检查，由 Store 负责更新。
+- **更新检查**：Windows 安装版、便携版与 macOS 版在你打开「设置 → 版本更新」时向 GitHub（`api.github.com`）查询最新发布，GitHub 会看到你的 IP 地址与应用版本号。GitHub 无法应答时，改从 Mework 在 Cloudflare 上的下载镜像 `dl.mework.dev` 读取同样的信息。在该页面开始的下载来自 `dl.mework.dev`，镜像失败时改从 GitHub 下载，对应的主机同样会看到你的 IP 地址与应用版本号。Microsoft Store 版从不检查，由 Store 负责更新。
 - **本地小模型**：你选择安装时，其文件从 Hugging Face 下载；若你选用镜像源，则从 hf-mirror.com 下载。
 
 ## 儿童

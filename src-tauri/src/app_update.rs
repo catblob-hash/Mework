@@ -1,4 +1,4 @@
-//! In-app updates sourced from GitHub Releases.
+//! In-app updates sourced from GitHub Releases and their download mirror.
 //!
 //! Mework has no update server. A release is a GitHub Release tagged `v<version>` that carries
 //! the NSIS installer (`*-setup.exe`), the portable archive (`*_portable.zip`) and, optionally,
@@ -7,9 +7,18 @@
 //! process launch is a pure function here so it can be tested; the Tauri commands in `lib.rs`
 //! only wire them to the app handle.
 //!
-//! Trust model: TLS to GitHub is the integrity anchor, exactly as when a user downloads from
-//! the release page by hand. `SHA256SUMS` comes from the same origin, so it catches a corrupt
-//! or truncated transfer, not a compromised account. There is no signature scheme.
+//! Every release is also copied, byte for byte, to [`MIRROR_ORIGIN`] (`scripts/release-mirror.mjs`
+//! uploads a file only when it matches GitHub's digest and `SHA256SUMS`). The mirror is a
+//! Cloudflare R2 bucket, reachable where GitHub's asset CDN is slow or blocked. A download tries
+//! it first and falls back to GitHub; the update check asks GitHub's API first and reads the
+//! mirror's `latest.json` only when the API cannot answer, so a mirror that stopped updating can
+//! never hide a newer release.
+//!
+//! Trust model: TLS to the origin is the integrity anchor, exactly as when a user downloads from
+//! the release page by hand. Both origins are the publisher's own. Each download is checked
+//! against the `SHA256SUMS` from the same origin, which catches a corrupt or truncated transfer,
+//! not a compromised account. There is no signature scheme. Whatever the renderer hands back, the
+//! host only ever fetches this repository's canonical release paths and their mirror copies.
 //!
 //! Installer hand-off mirrors tauri-plugin-updater: the downloaded NSIS installer is started
 //! through `ShellExecuteW` with `/P /UPDATE /R` (passive UI, keep user data and shortcuts,
@@ -47,6 +56,11 @@ use crate::host_platform::HostPlatform;
 
 /// Source repository as declared in Cargo.toml. Releases are read from its GitHub API.
 pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// The download mirror: every release file at `{MIRROR_ORIGIN}/{tag}/{name}`, and the latest
+/// release at `{MIRROR_ORIGIN}/latest.json` in the shape of GitHub's release object.
+pub const MIRROR_ORIGIN: &str = "https://dl.mework.dev";
+const MIRROR_HOST: &str = "dl.mework.dev";
 
 /// GitHub answers unauthenticated API calls quickly; a slow answer means a proxy problem the
 /// user should see rather than wait through.
@@ -525,9 +539,10 @@ fn user_agent(current_version: &str) -> String {
     format!("Mework/{current_version} (+{REPOSITORY_URL})")
 }
 
-/// Only GitHub and its asset CDN may be contacted, on HTTPS. Release JSON is fetched from the
-/// API host; `browser_download_url` lives on `github.com` and redirects to
-/// `objects.githubusercontent.com` (or `release-assets.githubusercontent.com`).
+/// Only GitHub, its asset CDN and the mirror may be contacted, on HTTPS. Release JSON is fetched
+/// from the API host; `browser_download_url` lives on `github.com` and redirects to
+/// `objects.githubusercontent.com` (or `release-assets.githubusercontent.com`); the mirror
+/// answers directly.
 pub fn is_allowed_download_url(url: &Url) -> bool {
     if url.scheme() != "https" {
         return false;
@@ -538,6 +553,7 @@ pub fn is_allowed_download_url(url: &Url) -> bool {
             host == "github.com"
                 || host == "api.github.com"
                 || host.ends_with(".githubusercontent.com")
+                || host == MIRROR_HOST
         }
         None => false,
     }
@@ -606,14 +622,64 @@ fn rate_limit_message(response: &Response) -> Option<String> {
     })
 }
 
+/// Why GitHub's API gave no release. Only the ways that say nothing about the release itself
+/// send the check on to the mirror.
+enum ApiFailure {
+    /// GitHub answered, and the answer stands: no release yet, a malformed reply, a refusal.
+    Final(String),
+    /// GitHub could not be reached, or failed on its side.
+    Unavailable(String),
+    /// The anonymous quota is spent; the release pages still answer.
+    RateLimited(String),
+}
+
+/// `GET /repos/{owner}/{repo}/releases/latest`.
+fn latest_release_from_api(
+    client: &Client,
+    owner: &str,
+    repo: &str,
+) -> Result<GithubRelease, ApiFailure> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+    let response = client
+        .get(&url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|error| ApiFailure::Unavailable(format!("无法连接 GitHub 检查更新: {error}")))?;
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Err(ApiFailure::Final(format!(
+            "{owner}/{repo} 还没有正式发布的版本"
+        )));
+    }
+    if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(message) = rate_limit_message(&response) {
+            return Err(ApiFailure::RateLimited(message));
+        }
+    }
+    if !status.is_success() {
+        let body = read_limited(response, MAX_RELEASE_BODY).unwrap_or_default();
+        let message = crate::http_util::api_error_message(status, &body);
+        return Err(if status.is_server_error() {
+            ApiFailure::Unavailable(message)
+        } else {
+            ApiFailure::Final(message)
+        });
+    }
+    let body = read_limited(response, MAX_RELEASE_BODY).map_err(ApiFailure::Unavailable)?;
+    serde_json::from_slice::<GithubRelease>(&body)
+        .map_err(|error| ApiFailure::Final(format!("GitHub 发布信息无法解析: {error}")))
+}
+
 /// Asks GitHub for the latest non-prerelease, non-draft release and compares it with
 /// `current_version`.
 ///
 /// The REST API is the primary source because it names the assets and carries the release
-/// notes. Its anonymous quota is 60 calls an hour per address, and a developer machine or a
-/// shared office egress can exhaust that with unrelated traffic; when it is exhausted the
-/// redirect-based fallback below still answers the one question that matters — is there a
-/// newer version, and where is its file — without the notes.
+/// notes, and because it is the record the mirror is copied from. When it cannot answer — GitHub
+/// unreachable, failing, or out of anonymous quota (60 calls an hour per address, which a shared
+/// office egress can spend on unrelated traffic) — the mirror's `latest.json` carries the same
+/// release with its notes. Out of quota, the redirect-based fallback below still answers the one
+/// question that matters — is there a newer version, and where is its file — without the notes.
 pub fn check_for_update(
     current_version: &str,
     flavor: InstallFlavor,
@@ -621,46 +687,80 @@ pub fn check_for_update(
     require_updates_in_app(flavor)?;
     let (owner, repo) = repository_slug(REPOSITORY_URL)?;
     let platform = crate::host_platform::host_platform();
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
     let client = client(API_TIMEOUT, current_version)?;
+    let checked = |release| {
+        build_update_check(
+            current_version,
+            platform,
+            flavor,
+            arch_token(),
+            release,
+            chrono::Utc::now().to_rfc3339(),
+        )
+    };
+    let (api_message, rate_limited) = match latest_release_from_api(&client, &owner, &repo) {
+        Ok(release) => return checked(release),
+        Err(ApiFailure::Final(message)) => return Err(message),
+        Err(ApiFailure::Unavailable(message)) => (message, false),
+        Err(ApiFailure::RateLimited(message)) => (message, true),
+    };
+    let mirror_message = match latest_release_from_mirror(&client, &owner, &repo) {
+        Ok(release) => return checked(release),
+        Err(message) => message,
+    };
+    if !rate_limited {
+        return Err(format!(
+            "{api_message}；改从 {MIRROR_HOST} 检查也失败了：{mirror_message}"
+        ));
+    }
+    check_via_release_redirects(&client, &owner, &repo, current_version, platform, flavor)
+        .map_err(|fallback| {
+            format!("{api_message}；{MIRROR_HOST} 也失败了：{mirror_message}；改走发布页也失败了：{fallback}")
+        })
+}
+
+/// The mirror's `latest.json`, rebuilt into the release GitHub would have returned.
+fn latest_release_from_mirror(
+    client: &Client,
+    owner: &str,
+    repo: &str,
+) -> Result<GithubRelease, String> {
     let response = client
-        .get(&url)
-        .header(ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
+        .get(format!("{MIRROR_ORIGIN}/latest.json"))
+        .header(ACCEPT, "application/json")
         .send()
-        .map_err(|error| format!("无法连接 GitHub 检查更新: {error}"))?;
-    let status = response.status();
-    if status == StatusCode::NOT_FOUND {
-        return Err(format!("{owner}/{repo} 还没有正式发布的版本"));
-    }
-    if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
-        if let Some(message) = rate_limit_message(&response) {
-            return check_via_release_redirects(
-                &client,
-                &owner,
-                &repo,
-                current_version,
-                platform,
-                flavor,
-            )
-            .map_err(|fallback| format!("{message}；改走发布页也失败了：{fallback}"));
-        }
-    }
-    if !status.is_success() {
-        let body = read_limited(response, MAX_RELEASE_BODY).unwrap_or_default();
-        return Err(crate::http_util::api_error_message(status, &body));
+        .map_err(|error| format!("无法连接: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status().as_u16()));
     }
     let body = read_limited(response, MAX_RELEASE_BODY)?;
-    let release = serde_json::from_slice::<GithubRelease>(&body)
-        .map_err(|error| format!("GitHub 发布信息无法解析: {error}"))?;
-    build_update_check(
-        current_version,
-        platform,
-        flavor,
-        arch_token(),
-        release,
-        chrono::Utc::now().to_rfc3339(),
-    )
+    let manifest = serde_json::from_slice::<GithubRelease>(&body)
+        .map_err(|error| format!("latest.json 无法解析: {error}"))?;
+    Ok(release_from_mirror(manifest, owner, repo))
+}
+
+/// A mirror manifest as the release it copies. Only its facts are kept — tag, names, sizes,
+/// notes; every address is rebuilt as this repository's canonical one, so `latest.json` can
+/// never point the updater anywhere else. Files with names the updater would refuse are dropped.
+pub fn release_from_mirror(manifest: GithubRelease, owner: &str, repo: &str) -> GithubRelease {
+    let tag = manifest.tag_name;
+    GithubRelease {
+        html_url: format!("https://github.com/{owner}/{repo}/releases/tag/{tag}"),
+        assets: manifest
+            .assets
+            .into_iter()
+            .filter(|asset| validate_asset_file_name(&asset.name).is_ok())
+            .map(|asset| GithubReleaseAsset {
+                browser_download_url: format!(
+                    "https://github.com/{owner}/{repo}/releases/download/{tag}/{}",
+                    asset.name
+                ),
+                ..asset
+            })
+            .collect(),
+        tag_name: tag,
+        ..manifest
+    }
 }
 
 /// The tag a `/releases/latest` redirect landed on: `/owner/repo/releases/tag/<tag>`.
@@ -1003,24 +1103,68 @@ pub fn prune_stale_downloads(directory: &Path, keep_name: &str) {
     }
 }
 
-fn fetch_checksums(
-    client: &Client,
-    asset: &ReleaseAsset,
-    release_tag: &str,
-) -> Result<Vec<(String, String)>, String> {
+/// The checksum list that goes with a download: it must be this repository's canonical file and
+/// come from the very release the file came from; a list from another release would either fail
+/// to match or, worse, vouch for the wrong bytes.
+fn validate_checksums_asset(asset: &ReleaseAsset, release_tag: &str) -> Result<Url, String> {
     validate_asset_file_name(&asset.name)?;
     let url = Url::parse(&asset.download_url)
         .map_err(|error| format!("校验和文件的下载地址无法解析: {error}"))?;
-    // The checksum list must come from the very release the file came from; a list from
-    // another release would either fail to match or, worse, vouch for the wrong bytes.
     let tag = validate_release_download_url(&url, &asset.name)?;
     if tag != release_tag {
         return Err(format!(
             "校验和文件来自发布 {tag}，而下载的文件来自 {release_tag}"
         ));
     }
+    Ok(url)
+}
+
+/// One place a release file can be downloaded from, with the checksum list from that same place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadSource {
+    /// Names the origin in messages: `dl.mework.dev` or `GitHub`.
+    pub label: &'static str,
+    pub asset: Url,
+    pub checksums: Option<Url>,
+}
+
+/// The mirror's copy of a canonical release file: `{MIRROR_ORIGIN}/{tag}/{name}`.
+pub fn mirror_url(release_tag: &str, name: &str) -> Result<Url, String> {
+    validate_asset_file_name(name)?;
+    if Version::parse(release_tag).is_none() || release_tag.contains('/') {
+        return Err(format!("{release_tag} 不是版本标签"));
+    }
+    Url::parse(&format!("{MIRROR_ORIGIN}/{release_tag}/{name}"))
+        .map_err(|error| format!("镜像地址无法构造: {error}"))
+}
+
+/// Where to fetch a validated release file from, in order: the mirror, then GitHub. Both are
+/// derived from the canonical GitHub addresses (already validated against this repository and
+/// `release_tag`), never taken from the renderer, so the mirror can only ever be asked for files
+/// of this repository's releases.
+pub fn download_sources(
+    release_tag: &str,
+    asset: (&str, &Url),
+    checksums: Option<(&str, &Url)>,
+) -> Result<Vec<DownloadSource>, String> {
+    let mirror = DownloadSource {
+        label: MIRROR_HOST,
+        asset: mirror_url(release_tag, asset.0)?,
+        checksums: checksums
+            .map(|(name, _)| mirror_url(release_tag, name))
+            .transpose()?,
+    };
+    let github = DownloadSource {
+        label: "GitHub",
+        asset: asset.1.clone(),
+        checksums: checksums.map(|(_, url)| url.clone()),
+    };
+    Ok(vec![mirror, github])
+}
+
+fn fetch_checksums(client: &Client, url: &Url) -> Result<Vec<(String, String)>, String> {
     let response = client
-        .get(url)
+        .get(url.clone())
         .send()
         .map_err(|error| format!("下载校验和文件失败: {error}"))?;
     if !response.status().is_success() {
@@ -1036,6 +1180,11 @@ fn fetch_checksums(
 /// Downloads `request.asset` into `request.destination_dir`, streaming progress and honouring
 /// `cancel`. The file is written as `<name>.part` and renamed only after the size matches and,
 /// when the release has a `SHA256SUMS`, the digest matches too.
+///
+/// The mirror is tried first and GitHub second (see [`download_sources`]). Each attempt is
+/// complete on its own — file and checksum list from the same origin — so a mirror that is
+/// unreachable, missing the file, or holding other bytes costs one failed attempt, never a bad
+/// install. Cancelling ends the whole download, not just the attempt.
 pub fn download_update(
     request: DownloadRequest,
     cancel: &AtomicBool,
@@ -1046,6 +1195,20 @@ pub fn download_update(
     require_in_app_install(crate::host_platform::host_platform())?;
     let url = validate_asset(&request.asset, request.flavor)?;
     let release_tag = validate_release_download_url(&url, &request.asset.name)?;
+    let checksums_url = request
+        .checksums_asset
+        .as_ref()
+        .map(|asset| validate_checksums_asset(asset, &release_tag))
+        .transpose()?;
+    let sources = download_sources(
+        &release_tag,
+        (&request.asset.name, &url),
+        request
+            .checksums_asset
+            .as_ref()
+            .zip(checksums_url.as_ref())
+            .map(|(asset, url)| (asset.name.as_str(), url)),
+    )?;
     fs::create_dir_all(&request.destination_dir).map_err(|error| {
         format!(
             "无法创建下载目录 {}: {error}",
@@ -1055,15 +1218,35 @@ pub fn download_update(
     if request.flavor == InstallFlavor::Installer {
         prune_stale_downloads(&request.destination_dir, &request.asset.name);
     }
+    let client = client(DOWNLOAD_TIMEOUT, &request.current_version)?;
+    let mut failures = Vec::new();
+    for source in &sources {
+        match download_from(&client, source, &request, cancel, &mut progress) {
+            Ok(downloaded) => return Ok(downloaded),
+            Err(message) if message == CANCELLED_MESSAGE => return Err(message),
+            Err(message) => failures.push(format!("{}：{message}", source.label)),
+        }
+    }
+    Err(failures.join("；"))
+}
+
+/// One complete attempt from one origin: download, size check, digest, checksum list, rename.
+/// Leaves nothing behind but the finished file.
+fn download_from(
+    client: &Client,
+    source: &DownloadSource,
+    request: &DownloadRequest,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(DownloadEvent),
+) -> Result<DownloadedUpdate, String> {
     let final_path = request.destination_dir.join(&request.asset.name);
     let part_path = request
         .destination_dir
         .join(format!("{}.part", request.asset.name));
     remove_if_exists(&part_path);
 
-    let client = client(DOWNLOAD_TIMEOUT, &request.current_version)?;
     let mut response = client
-        .get(url)
+        .get(source.asset.clone())
         .header(ACCEPT, "application/octet-stream")
         .header(USER_AGENT, user_agent(&request.current_version))
         .send()
@@ -1082,7 +1265,7 @@ pub fn download_update(
     {
         if length != request.asset.size {
             return Err(format!(
-                "GitHub 返回的文件大小 {length} 与发布信息中的 {} 不一致",
+                "返回的文件大小 {length} 与发布信息中的 {} 不一致",
                 request.asset.size
             ));
         }
@@ -1147,10 +1330,10 @@ pub fn download_update(
     });
     let digest = hex(&hasher.finalize());
 
-    let verification = match &request.checksums_asset {
-        Some(checksums_asset) => {
+    let verification = match &source.checksums {
+        Some(checksums_url) => {
             progress(DownloadEvent::Verifying);
-            let entries = match fetch_checksums(&client, checksums_asset, &release_tag) {
+            let entries = match fetch_checksums(client, checksums_url) {
                 Ok(entries) => entries,
                 Err(message) => {
                     remove_if_exists(&part_path);
@@ -1190,7 +1373,7 @@ pub fn download_update(
     })?;
     Ok(DownloadedUpdate {
         path: final_path.display().to_string(),
-        file_name: request.asset.name,
+        file_name: request.asset.name.clone(),
         size_bytes: received,
         sha256: digest,
         verification,
@@ -1975,12 +2158,14 @@ mod tests {
     }
 
     #[test]
-    fn download_hosts_are_github_only_over_https() {
+    fn download_hosts_are_github_and_the_mirror_over_https() {
         for allowed in [
             "https://github.com/catblob-hash/Mework/releases/download/v1.0.0/a.exe",
             "https://objects.githubusercontent.com/github-production-release-asset/abc",
             "https://release-assets.githubusercontent.com/x",
             "https://api.github.com/repos/catblob-hash/Mework/releases/latest",
+            "https://dl.mework.dev/v1.0.0/a.exe",
+            "https://DL.mework.dev/latest.json",
         ] {
             assert!(
                 is_allowed_download_url(&Url::parse(allowed).unwrap()),
@@ -1993,6 +2178,10 @@ mod tests {
             "https://evilgithubusercontent.com/a.exe",
             "https://example.com/a.exe",
             "file:///C:/a.exe",
+            "http://dl.mework.dev/v1.0.0/a.exe",
+            "https://dl.mework.dev.evil.example/a.exe",
+            "https://evil-dl.mework.dev/a.exe",
+            "https://mework.dev/a.exe",
         ] {
             assert!(
                 !is_allowed_download_url(&Url::parse(refused).unwrap()),
@@ -2388,5 +2577,127 @@ mod tests {
             portable
         );
         assert_eq!(select_checksums_asset(&assets).unwrap().name, checksums);
+    }
+
+    #[test]
+    fn downloads_try_the_mirror_first_then_github() {
+        let name = "Mework_1.1.0_x64-setup.exe";
+        let canonical = Url::parse(&format!(
+            "https://github.com/catblob-hash/Mework/releases/download/v1.1.0/{name}"
+        ))
+        .unwrap();
+        let sums = Url::parse(
+            "https://github.com/catblob-hash/Mework/releases/download/v1.1.0/SHA256SUMS",
+        )
+        .unwrap();
+        let sources =
+            download_sources("v1.1.0", (name, &canonical), Some(("SHA256SUMS", &sums))).unwrap();
+        assert_eq!(
+            sources,
+            vec![
+                DownloadSource {
+                    label: "dl.mework.dev",
+                    asset: Url::parse(&format!("https://dl.mework.dev/v1.1.0/{name}")).unwrap(),
+                    checksums: Some(Url::parse("https://dl.mework.dev/v1.1.0/SHA256SUMS").unwrap()),
+                },
+                DownloadSource {
+                    label: "GitHub",
+                    asset: canonical.clone(),
+                    checksums: Some(sums),
+                },
+            ]
+        );
+        // Every source stays on a host the redirect policy admits.
+        for source in &sources {
+            assert!(is_allowed_download_url(&source.asset));
+            assert!(is_allowed_download_url(source.checksums.as_ref().unwrap()));
+        }
+        // Without a checksum list neither origin claims one.
+        let bare = download_sources("v1.1.0", (name, &canonical), None).unwrap();
+        assert!(bare.iter().all(|source| source.checksums.is_none()));
+        // The mirror address is built only from a version tag and a plain file name.
+        assert!(mirror_url("nightly", name).is_err());
+        assert!(mirror_url("v1.1.0/..", name).is_err());
+        assert!(mirror_url("v1.1.0", "../evil.exe").is_err());
+        assert!(mirror_url("v1.1.0", "a/b.exe").is_err());
+        assert_eq!(
+            mirror_url("v1.1.0-beta.1", "SHA256SUMS").unwrap().as_str(),
+            "https://dl.mework.dev/v1.1.0-beta.1/SHA256SUMS"
+        );
+    }
+
+    /// `latest.json` is written by `scripts/release-mirror.mjs` in the shape of GitHub's release
+    /// object, its download addresses pointing at the mirror.
+    #[test]
+    fn the_mirror_manifest_reads_as_the_release_with_canonical_addresses() {
+        let json = serde_json::json!({
+            "tag_name": "v1.1.0",
+            "name": "Mework 1.1.0",
+            "html_url": "https://evil.example/release",
+            "published_at": "2026-10-03T04:00:00Z",
+            "draft": false,
+            "prerelease": false,
+            "body": "## Notes",
+            "assets": [
+                {
+                    "name": "Mework_1.1.0_x64-setup.exe",
+                    "size": 143973780,
+                    "digest": "sha256:ee22a7867b08fa74e8f7239bf5855d0a7c5e3582078a53e5e6d3e7a8d441c663",
+                    "content_type": "application/vnd.microsoft.portable-executable",
+                    "browser_download_url": "https://dl.mework.dev/v1.1.0/Mework_1.1.0_x64-setup.exe",
+                    "github_download_url": "https://github.com/catblob-hash/Mework/releases/download/v1.1.0/Mework_1.1.0_x64-setup.exe"
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "size": 458,
+                    "browser_download_url": "https://evil.example/SHA256SUMS"
+                },
+                {
+                    "name": "../escape.exe",
+                    "size": 1,
+                    "browser_download_url": "https://dl.mework.dev/v1.1.0/escape.exe"
+                }
+            ],
+            "mirrored_at": "2026-10-03T05:00:00Z"
+        });
+        let manifest: GithubRelease = serde_json::from_value(json).unwrap();
+        let release = release_from_mirror(manifest, "catblob-hash", "Mework");
+        assert_eq!(
+            release.html_url,
+            "https://github.com/catblob-hash/Mework/releases/tag/v1.1.0"
+        );
+        let names = release
+            .assets
+            .iter()
+            .map(|asset| asset.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Mework_1.1.0_x64-setup.exe", "SHA256SUMS"]);
+        let check = build_update_check(
+            "1.0.0",
+            HostPlatform::Windows,
+            InstallFlavor::Installer,
+            "x64",
+            release,
+            String::new(),
+        )
+        .unwrap();
+        assert!(check.update_available);
+        assert_eq!(check.release.name, "Mework 1.1.0");
+        assert_eq!(check.release.notes, "## Notes");
+        let asset = check.asset.unwrap();
+        assert_eq!(asset.size, 143973780);
+        // Whatever the manifest said, the renderer is handed the canonical addresses, which are
+        // the only ones a download request is accepted with.
+        assert_eq!(
+            asset.download_url,
+            "https://github.com/catblob-hash/Mework/releases/download/v1.1.0/Mework_1.1.0_x64-setup.exe"
+        );
+        validate_asset(&asset, InstallFlavor::Installer).unwrap();
+        let sums = check.checksums_asset.unwrap();
+        assert_eq!(
+            validate_checksums_asset(&sums, "v1.1.0").unwrap().as_str(),
+            "https://github.com/catblob-hash/Mework/releases/download/v1.1.0/SHA256SUMS"
+        );
+        assert!(validate_checksums_asset(&sums, "v1.0.0").is_err());
     }
 }

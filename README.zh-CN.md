@@ -38,21 +38,21 @@ API Key 或订阅由你自己提供，其余一切都在你的机器上运行和
 
 ## 安装
 
-全部在 [Releases](../../releases)。
+全部在 [Releases](../../releases)。下面的文件名链接到 Mework 在 Cloudflare 上的下载镜像 `dl.mework.dev` 里的同一批文件，在 GitHub 下载慢的地方更快；每个文件都是 SHA-256 与 GitHub 记录一致后才从发布页复制过去的。
 
 **Windows**（Windows 10 或 11，x64；MSIX 需 2004 及以上版本）任选其一：
 
-- **安装器** —— `Mework_1.0.0_x64-setup.exe`（按机器安装）。
-- **便携版** —— `Mework_1.0.0_x64_portable.zip`：解压即用，运行 `mework.exe`（`mework-aisdk.exe` 需与其同目录）。
-- **MSIX** —— `Mework_1.0.0_x64.msix`，用 Mework 自己的证书签名：先把 `Mework_msix_signing.cer` 导入「本地计算机 → 受信任人」（只需一次），再打开安装包。同一个包即将上架 Microsoft Store，由商店负责更新。
+- **安装器** —— [`Mework_1.0.0_x64-setup.exe`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64-setup.exe)（按机器安装）。
+- **便携版** —— [`Mework_1.0.0_x64_portable.zip`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64_portable.zip)：解压即用，运行 `mework.exe`（`mework-aisdk.exe` 需与其同目录）。
+- **MSIX** —— [`Mework_1.0.0_x64.msix`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64.msix)，用 Mework 自己的证书签名：先把 [`Mework_msix_signing.cer`](https://dl.mework.dev/v1.0.0/Mework_msix_signing.cer) 导入「本地计算机 → 受信任人」（只需一次），再打开安装包。同一个包即将上架 Microsoft Store，由商店负责更新。
 
 三者都依赖 Microsoft Edge WebView2 Runtime（当前 Windows 10/11 已预装；安装器可在缺失时自动引导安装）。「便携」指的是免安装，不是不落盘：应用仍会写入 `%APPDATA%\com.mework.app`、`%LOCALAPPDATA%\com.mework.app` 与 Windows 凭据管理器。
 
-**macOS**（13 及以上，Apple 芯片）—— `Mework_1.0.0_aarch64.dmg`，带 Developer ID 签名并经 Apple 公证：打开后把 Mework 拖进「应用程序」。数据在 `~/Library/Application Support/com.mework.app`，Key 在 `~/.mework/credential-vault`，由登录钥匙串里的「Mework Safe Storage」条目加密。
+**macOS**（13 及以上，Apple 芯片）—— [`Mework_1.0.0_aarch64.dmg`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_aarch64.dmg)，带 Developer ID 签名并经 Apple 公证：打开后把 Mework 拖进「应用程序」。数据在 `~/Library/Application Support/com.mework.app`，Key 在 `~/.mework/credential-vault`，由登录钥匙串里的「Mework Safe Storage」条目加密。
 
 **首次运行：** 打开「全局设置 → 提供商 → 模型提供商」，添加提供商与 Key（Codex、Claude Agent 两家是登录式），从发现页添加模型，然后在输入框下方选择它。
 
-**更新：** 「设置 → 版本更新」会检查 GitHub Releases。安装版下载新的安装程序并以更新模式运行，保留设置和数据；便携版把新的 zip 下载好，由你解压覆盖旧文件。MSIX 版不检查（由 Windows 或商店更新）；Mac 版会带你去发布页下载新的 `.dmg`。
+**更新：** 「设置 → 版本更新」会检查 GitHub Releases（GitHub 的 API 不应答时改读镜像上的最新发布信息），并从 `dl.mework.dev` 下载，不通时改从 GitHub 下载。安装版下载新的安装程序并以更新模式运行，保留设置和数据；便携版把新的 zip 下载好，由你解压覆盖旧文件。MSIX 版不检查（由 Windows 或商店更新）；Mac 版会带你去发布页下载新的 `.dmg`。
 
 ## 从源码构建
 

@@ -14,7 +14,7 @@ Mework 是一款面向 Windows 的本地优先智能体工作台。你自带模�
 
 ## 安装
 
-从 [Releases](https://github.com/catblob-hash/Mework/releases) 页面下载任一版本：
+从 [Releases](https://github.com/catblob-hash/Mework/releases) 页面下载任一版本，或从它的镜像 `https://dl.mework.dev/<标签>/<文件名>` 下载（例如 `https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64-setup.exe`）。镜像经 Cloudflare 提供同一批文件，在 GitHub 下载慢的地方更快：
 
 | 版本 | 文件 | 说明 |
 |---|---|---|

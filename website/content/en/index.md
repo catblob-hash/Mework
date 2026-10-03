@@ -14,7 +14,7 @@ Mework is a local-first agent workbench for Windows. You bring your own model pr
 
 ## Install
 
-Download either flavor from the [Releases](https://github.com/catblob-hash/Mework/releases) page:
+Download either flavor from the [Releases](https://github.com/catblob-hash/Mework/releases) page, or from its mirror at `https://dl.mework.dev/<tag>/<file>` (for example `https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64-setup.exe`), which serves the same files from Cloudflare where GitHub's downloads are slow:
 
 | Flavor | File | Notes |
 |---|---|---|

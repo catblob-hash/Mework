@@ -18,7 +18,7 @@ Only to services you configure, and only when you use them:
 - **OpenAI Codex** signs in with your ChatGPT account at OpenAI. The **Claude Agent** provider runs the Claude Code executable that ships with Mework, which signs in with your Anthropic account; Mework turns its telemetry and error reporting off.
 - **Web search and fetch**: the search service you configure receives your queries; the sites the agent fetches, and the pages you open in the built-in browser, receive ordinary web requests.
 - **MCP servers, hooks and SSH machines** you add receive what you configure them to receive.
-- **Update check**: the Windows installer and portable editions and the macOS edition ask GitHub (`api.github.com`) for the latest release when you open *Settings → Updates*; GitHub sees your IP address and the app version. The Microsoft Store edition never checks; the Store updates it.
+- **Update check**: the Windows installer and portable editions and the macOS edition ask GitHub (`api.github.com`) for the latest release when you open *Settings → Updates*; GitHub sees your IP address and the app version. When GitHub cannot answer, they read the same information from `dl.mework.dev`, Mework's download mirror on Cloudflare. A download started from that page comes from `dl.mework.dev`, or from GitHub if the mirror fails, and that host sees your IP address and the app version too. The Microsoft Store edition never checks; the Store updates it.
 - **Local helper model**: when you choose to install it, its files are downloaded from Hugging Face, or from its mirror hf-mirror.com if you pick that source.
 
 ## Children

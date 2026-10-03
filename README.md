@@ -38,21 +38,21 @@ You bring your own API key or subscription. Everything else runs and stays on yo
 
 ## Install
 
-Everything is on [Releases](../../releases).
+Everything is on [Releases](../../releases). The file names below link to the same files on `dl.mework.dev`, Mework's download mirror on Cloudflare, which is faster where GitHub's downloads are slow; each file there is copied from the release only after its SHA-256 matches GitHub's.
 
 **Windows** (10 or 11, x64; the MSIX needs version 2004 or later) — pick one:
 
-- **Installer** — `Mework_1.0.0_x64-setup.exe` (per-machine).
-- **Portable** — `Mework_1.0.0_x64_portable.zip`: unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
-- **MSIX** — `Mework_1.0.0_x64.msix`, signed with Mework's own certificate: import `Mework_msix_signing.cer` into *Local Machine → Trusted People* once, then open the package. The same package is coming to the Microsoft Store, which updates it for you.
+- **Installer** — [`Mework_1.0.0_x64-setup.exe`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64-setup.exe) (per-machine).
+- **Portable** — [`Mework_1.0.0_x64_portable.zip`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64_portable.zip): unzip anywhere and run `mework.exe` (keep `mework-aisdk.exe` next to it).
+- **MSIX** — [`Mework_1.0.0_x64.msix`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_x64.msix), signed with Mework's own certificate: import [`Mework_msix_signing.cer`](https://dl.mework.dev/v1.0.0/Mework_msix_signing.cer) into *Local Machine → Trusted People* once, then open the package. The same package is coming to the Microsoft Store, which updates it for you.
 
 All three require the Microsoft Edge WebView2 Runtime, which is preinstalled on current Windows 10/11; the installer can bootstrap it if missing. "Portable" means no installer, not no state: the app still writes to `%APPDATA%\com.mework.app`, `%LOCALAPPDATA%\com.mework.app` and Windows Credential Manager.
 
-**macOS** (13 or later, Apple silicon) — `Mework_1.0.0_aarch64.dmg`, signed with a Developer ID and notarized by Apple: open it and drag Mework to Applications. Data lives in `~/Library/Application Support/com.mework.app`, and keys in `~/.mework/credential-vault`, sealed by the *Mework Safe Storage* login-keychain item.
+**macOS** (13 or later, Apple silicon) — [`Mework_1.0.0_aarch64.dmg`](https://dl.mework.dev/v1.0.0/Mework_1.0.0_aarch64.dmg), signed with a Developer ID and notarized by Apple: open it and drag Mework to Applications. Data lives in `~/Library/Application Support/com.mework.app`, and keys in `~/.mework/credential-vault`, sealed by the *Mework Safe Storage* login-keychain item.
 
 **First run:** open *Settings → Providers → Model providers*, add a provider and its key (or sign in for Codex and Claude Agent), add a model from the discovery page, and pick it under the composer.
 
-**Updates:** *Settings → Updates* checks GitHub Releases. The installer flavor downloads and runs the new setup in update mode, keeping your settings and data; the portable flavor downloads the new zip for you to unzip over the old files. The MSIX package never checks (Windows or the Store updates it), and a Mac is sent to the release page for the new `.dmg`.
+**Updates:** *Settings → Updates* checks GitHub Releases (or, when GitHub's API can't answer, the mirror's copy of the latest release) and downloads from `dl.mework.dev`, falling back to GitHub. The installer flavor downloads and runs the new setup in update mode, keeping your settings and data; the portable flavor downloads the new zip for you to unzip over the old files. The MSIX package never checks (Windows or the Store updates it), and a Mac is sent to the release page for the new `.dmg`.
 
 ## Build from source
 

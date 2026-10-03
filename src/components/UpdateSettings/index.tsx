@@ -443,8 +443,8 @@ export function UpdateSettings({
         title={t("版本更新", "Updates")}
         description={inApp
           ? t(
-            "从 GitHub Releases 检查新版本。安装版可以在应用内下载并安装；便携版下载压缩包后由你手动替换。",
-            "Check GitHub Releases for a newer version. The installer flavor downloads and installs in place; the portable flavor downloads the archive for you to unpack."
+            "从 GitHub Releases 检查新版本，从下载镜像 dl.mework.dev 下载（不通时改从 GitHub 下载）。安装版可以在应用内下载并安装；便携版下载压缩包后由你手动替换。",
+            "Check GitHub Releases for a newer version and download it from the dl.mework.dev mirror (or from GitHub when the mirror is unreachable). The installer flavor downloads and installs in place; the portable flavor downloads the archive for you to unpack."
           )
           : t("这个版本的更新由 Microsoft Store 提供。", "This edition is updated by the Microsoft Store.")}
         action={connected && inApp ? (
