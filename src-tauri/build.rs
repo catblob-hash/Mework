@@ -454,6 +454,12 @@ fn prefer_mingw_toolchain() {
 /// Renders the icon as a PNG `size` pixels square, from the full icon or, below
 /// [`APP_ICON_FULL_MIN_SIZE`], from the mark alone.
 fn render_icon_png(size: u32) -> Vec<u8> {
+    render_icon_pixmap(size)
+        .encode_png()
+        .expect("encode Mework icon PNG")
+}
+
+fn render_icon_pixmap(size: u32) -> resvg::tiny_skia::Pixmap {
     let options = resvg::usvg::Options::default();
     let (svg, what) = if size >= APP_ICON_FULL_MIN_SIZE {
         (APP_ICON_SVG, "the canonical Mework SVG icon")
@@ -469,7 +475,7 @@ fn render_icon_png(size: u32) -> Vec<u8> {
         size as f32 / tree.size().height(),
     );
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    pixmap.encode_png().expect("encode Mework icon PNG")
+    pixmap
 }
 
 /// Renders the macOS menu bar icon: the mark alone, centred on a clear canvas
@@ -516,14 +522,18 @@ fn stage_non_windows_icons(icons: &Path) {
     }
 }
 
-/// An `.icns` holding one PNG per slot macOS looks for, standard and Retina.
+/// An `.icns` holding one image per slot macOS looks for, standard and Retina,
+/// in the element types `iconutil` writes.
 ///
 /// The format is a big-endian `icns` header and length, then one
-/// `type, length, PNG` element per image; every type below takes PNG data.
+/// `type, length, data` element per image. The two 1x slots below 64px, `ic04`
+/// and `ic05`, take [`icns_argb`] data; every other type takes PNG. Don't put
+/// PNGs in `icp4`/`icp5` instead: macOS does not decode those as PNG, and
+/// Finder's 16pt list rows and 32pt icons showed the bytes as coloured noise.
 fn generated_icns() -> Vec<u8> {
     const ELEMENTS: [(&[u8; 4], u32); 10] = [
-        (b"icp4", 16),
-        (b"icp5", 32),
+        (b"ic04", 16),
+        (b"ic05", 32),
         (b"ic11", 32),
         (b"ic12", 64),
         (b"ic07", 128),
@@ -536,18 +546,67 @@ fn generated_icns() -> Vec<u8> {
     let mut rendered = std::collections::BTreeMap::new();
     let mut body = Vec::new();
     for (kind, size) in ELEMENTS {
-        let png = rendered
+        let pixmap = rendered
             .entry(size)
-            .or_insert_with(|| render_icon_png(size));
+            .or_insert_with(|| render_icon_pixmap(size));
+        let data = match kind {
+            b"ic04" | b"ic05" => icns_argb(pixmap),
+            _ => pixmap.encode_png().expect("encode Mework icon PNG"),
+        };
         body.extend_from_slice(kind);
-        body.extend_from_slice(&(8 + png.len() as u32).to_be_bytes());
-        body.extend_from_slice(png);
+        body.extend_from_slice(&(8 + data.len() as u32).to_be_bytes());
+        body.extend_from_slice(&data);
     }
     let mut icns = Vec::with_capacity(8 + body.len());
     icns.extend_from_slice(b"icns");
     icns.extend_from_slice(&(8 + body.len() as u32).to_be_bytes());
     icns.extend_from_slice(&body);
     icns
+}
+
+/// An `ic04`/`ic05` payload: `ARGB`, then the alpha, red, green and blue
+/// planes, unpremultiplied, each packed on its own with the icns run-length
+/// code — a header byte below 0x80 copies the next `header + 1` bytes, one from
+/// 0x80 up repeats the next byte `header - 125` times.
+fn icns_argb(pixmap: &resvg::tiny_skia::Pixmap) -> Vec<u8> {
+    let pixels = pixmap
+        .pixels()
+        .iter()
+        .map(|pixel| pixel.demultiply())
+        .collect::<Vec<_>>();
+    let channels: [fn(&resvg::tiny_skia::ColorU8) -> u8; 4] = [
+        |pixel| pixel.alpha(),
+        |pixel| pixel.red(),
+        |pixel| pixel.green(),
+        |pixel| pixel.blue(),
+    ];
+    let mut data = b"ARGB".to_vec();
+    for channel in channels {
+        let plane = pixels.iter().map(channel).collect::<Vec<_>>();
+        let mut at = 0;
+        while at < plane.len() {
+            let run = plane[at..]
+                .iter()
+                .take(130)
+                .take_while(|&&byte| byte == plane[at])
+                .count();
+            if run >= 3 {
+                data.extend_from_slice(&[(run + 125) as u8, plane[at]]);
+                at += run;
+                continue;
+            }
+            let start = at;
+            while at < plane.len()
+                && at - start < 128
+                && !plane[at..].starts_with(&[plane[at]; 3])
+            {
+                at += 1;
+            }
+            data.push((at - start - 1) as u8);
+            data.extend_from_slice(&plane[start..at]);
+        }
+    }
+    data
 }
 
 fn generated_icon() -> Vec<u8> {
