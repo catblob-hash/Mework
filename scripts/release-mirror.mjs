@@ -126,7 +126,7 @@ async function apiTokenId() {
     const body = await response.json().catch(() => ({}));
     if (response.ok && body.success && body.result?.id) {
       if (body.result.status !== "active") throw new Error(`the Cloudflare API token is ${body.result.status}`);
-      console.log(`${label} API token verified as a ${path.startsWith("user") ? "user" : "account"} token`);
+      console.log(`${label} API token verified as ${path.startsWith("user") ? "a user" : "an account"} token`);
       return body.result.id;
     }
   }
