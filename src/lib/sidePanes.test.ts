@@ -835,6 +835,19 @@ describe("expanded pane", () => {
     expect(expandedPane(layout(open(state, "terminal")))).toBe("terminal");
   });
 
+  it("keeps a maximized preview maximized when it switches to or adds another page", () => {
+    const state = apply(stack("preview:a", "review"), { type: "toggle_expand", conversationId, pane: "preview:a" });
+    const switched = open(state, "preview:a#2");
+    expect(expandedPane(layout(switched))).toBe("preview:a#2");
+    expect(layout(switched).focused).toBe("preview:a#2");
+    expect(expandedPane(layout(open(switched, "preview:a")))).toBe("preview:a");
+  });
+
+  it("uncovers a page opened while another pane is maximized", () => {
+    const state = apply(stack("preview:a", "review"), { type: "toggle_expand", conversationId, pane: "review" });
+    expect(expandedPane(layout(open(state, "preview:a#2")))).toBeNull();
+  });
+
   it("survives a resize and does not reach other conversations", () => {
     const state = apply(stack("review"), { type: "toggle_expand", conversationId, pane: "review" });
     const resized = apply(state, { type: "set_side_flex", conversationId, sideFlex: 5 });

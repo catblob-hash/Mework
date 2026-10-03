@@ -438,11 +438,15 @@ export function sidePanesReducer(state: SidePanesState, action: SidePanesAction)
         return layout.focused === action.pane && layout.expanded === expanded ? next
           : withLayout(next, conversationId, { ...layout, focused: action.pane, expanded });
       }
-      // A conversation shows one page at a time, so a second one takes the first one's place.
+      // A conversation shows one page at a time, so a second one takes the first one's place —
+      // its expansion included: switching pages or adding one inside a maximized preview keeps
+      // it maximized. A page opened while another pane covers the preview is uncovered instead.
       const previous = kind === "preview" ? layout.panes.find((id) => paneKind(id) === "preview") : undefined;
       if (previous !== undefined) {
         return withLayout(next, conversationId, {
-          ...withPaneRenamed(layout, previous, action.pane), focused: action.pane, expanded: null
+          ...withPaneRenamed(layout, previous, action.pane),
+          focused: action.pane,
+          expanded: layout.expanded === previous ? action.pane : null
         });
       }
       let room = layout;
