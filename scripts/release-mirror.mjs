@@ -109,8 +109,13 @@ async function download(asset) {
 
 // --- Cloudflare ---------------------------------------------------------------
 
+/** The token as pasted, without the stray whitespace a paste can carry: fetch trims it from a header, but the S3 secret hashes every byte. */
+function apiToken() {
+  return (process.env.CLOUDFLARE_API_TOKEN ?? "").trim();
+}
+
 function cloudflareHeaders() {
-  return { authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`, "content-type": "application/json" };
+  return { authorization: `Bearer ${apiToken()}`, "content-type": "application/json" };
 }
 
 /** The API token's id: a user token answers on /user, an account-owned one on its account. */
@@ -121,6 +126,7 @@ async function apiTokenId() {
     const body = await response.json().catch(() => ({}));
     if (response.ok && body.success && body.result?.id) {
       if (body.result.status !== "active") throw new Error(`the Cloudflare API token is ${body.result.status}`);
+      console.log(`${label} API token verified as a ${path.startsWith("user") ? "user" : "account"} token`);
       return body.result.id;
     }
   }
@@ -131,8 +137,8 @@ async function s3Credentials() {
   if (process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY) {
     return { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY };
   }
-  if (!process.env.CLOUDFLARE_API_TOKEN) throw new Error("set CLOUDFLARE_API_TOKEN (or R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY)");
-  return credentialsFromApiToken(await apiTokenId(), process.env.CLOUDFLARE_API_TOKEN);
+  if (!apiToken()) throw new Error("set CLOUDFLARE_API_TOKEN (or R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY)");
+  return credentialsFromApiToken(await apiTokenId(), apiToken());
 }
 
 function bucketUrl(key) {
@@ -145,8 +151,17 @@ async function headObject(credentials, key) {
   const empty = sha256Hex("");
   const response = await request(url, { method: "HEAD", headers: signS3Request({ method: "HEAD", url, payloadSha256: empty, credentials }) });
   if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`HEAD ${key}: HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`HEAD ${key}: HTTP ${response.status}${await s3ErrorDetail(credentials, key)}`);
   return { size: Number(response.headers.get("content-length")), sha256: response.headers.get("x-amz-meta-sha256") };
+}
+
+/** A HEAD answer has no body; the same request as a one-byte GET says why S3 refused it. */
+async function s3ErrorDetail(credentials, key) {
+  const url = bucketUrl(key);
+  const headers = signS3Request({ method: "GET", url, headers: { range: "bytes=0-0" }, payloadSha256: sha256Hex(""), credentials });
+  const text = await (await request(url, { headers })).text().catch(() => "");
+  const field = (name) => new RegExp(`<${name}>([^<]*)</${name}>`).exec(text)?.[1];
+  return field("Code") ? ` (${field("Code")}: ${field("Message") ?? ""})` : "";
 }
 
 /** Uploads `bytes` signed with their SHA-256, so R2 stores them only if they arrive intact. */
