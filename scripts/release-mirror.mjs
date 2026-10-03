@@ -149,7 +149,9 @@ function bucketUrl(key) {
 async function headObject(credentials, key) {
   const url = bucketUrl(key);
   const empty = sha256Hex("");
-  const response = await request(url, { method: "HEAD", headers: signS3Request({ method: "HEAD", url, payloadSha256: empty, credentials }) });
+  // Uncompressed, or a text object comes back without its length (see checkPublic).
+  const headers = { ...signS3Request({ method: "HEAD", url, payloadSha256: empty, credentials }), "accept-encoding": "identity" };
+  const response = await request(url, { method: "HEAD", headers });
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`HEAD ${key}: HTTP ${response.status}${await s3ErrorDetail(credentials, key)}`);
   return { size: Number(response.headers.get("content-length")), sha256: response.headers.get("x-amz-meta-sha256") };
