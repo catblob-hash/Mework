@@ -6,9 +6,9 @@
 
 📖 **Documentation:** [catblob-hash.github.io/Mework](https://catblob-hash.github.io/Mework/en/index.html)
 
-![Mework: six panes on one task (browser, review, subagents, files, terminals and tasks), each maximized in turn, with Claude and GPT subagents and one project across a Mac and a Windows PC](.github/assets/demo.gif)
+![Mework: six panes on one task, each maximized in turn; a circle drawn on the page shows the agent where to add a card from a Windows PC's menu; Opus, Sol and Luna review it in parallel; and a new task on DeepSeek streams its thinking](.github/assets/demo.webp)
 
-<sub>Thirty seconds, one task: Claude Opus runs the main agent, a workflow runs subagents on Claude and GPT models, and one project spans a Mac folder and a Windows PC over SSH. Recorded on macOS; pane openings are sped up.</sub>
+<sub>One minute, one project across a Mac folder and a Windows PC over SSH. Claude Opus runs the main agent with six panes open. A circle drawn on the page shows it where to add a card from the PC's menu. A workflow sends the review to Opus (Claude), Sol and Luna (GPT) at once. Then a new task on DeepSeek shows its thinking as it streams. Recorded on macOS at 60 fps; the waits are sped up.</sub>
 
 Mework is a desktop coding agent built around one idea: you steer everything the model sees and does, and steering it feels natural.
 
